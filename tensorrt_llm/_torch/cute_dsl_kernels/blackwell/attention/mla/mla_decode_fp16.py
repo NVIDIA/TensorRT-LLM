@@ -143,6 +143,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         seq_len_q: int = 1,
         fold_sq: bool = False,
         emit_softmax_stats: bool = False,
+        reducer_d_tiles: int = 1,
+        reducer_prefetch_splits: int = 0,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -180,6 +182,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
             stores into the attention epilogue.
         :type emit_softmax_stats: bool
+        :param reducer_d_tiles: Number of D bands of a row that the split-KV
+            reduction combines in separate CTAs (1, 2 or 4).
+        :type reducer_d_tiles: int
+        :param reducer_prefetch_splits: When positive, the split-KV reduction
+            loads the partials of this many splits into registers before
+            accumulating them, in split order (the same multiply-adds, so the
+            output is unchanged); 0 keeps the one-split-at-a-time loop.
+        :type reducer_prefetch_splits: int
         """
 
         self.latent_dim = 512
@@ -190,6 +200,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
+        if reducer_d_tiles not in (1, 2, 4):
+            raise ValueError(f"unsupported reducer_d_tiles={reducer_d_tiles}")
+        if reducer_prefetch_splits < 0:
+            raise ValueError(
+                f"unsupported reducer_prefetch_splits={reducer_prefetch_splits}"
+            )
+        self.reducer_d_tiles = reducer_d_tiles
+        self.reducer_d_tile = self.latent_dim // reducer_d_tiles
+        self.reducer_prefetch_splits = reducer_prefetch_splits
         self.is_persistent = is_persistent
         self.page_size = page_size
         self.is_var_seq = is_var_seq
@@ -887,8 +906,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     cache_seqs,
                     block_split_kvs,
                 )
+            reduction_grid = (q_latent.shape[0], q_latent.shape[2],
+                              q_latent.shape[3])
+            if cutlass.const_expr(self.reducer_d_tiles > 1):
+                # One CTA per D band of a row: x = row * reducer_d_tiles + band.
+                reduction_grid = (reduction_grid[0] * self.reducer_d_tiles,
+                                  reduction_grid[1], reduction_grid[2])
             reduction_kernel.launch(
-                grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
+                grid=reduction_grid,
                 block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
                 smem=MAX_SPLITS * self.acc_dtype.width // 8,
                 stream=stream,
@@ -1534,6 +1559,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
 
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
+        d_tile_idx = 0
+        if cutlass.const_expr(self.reducer_d_tiles > 1):
+            # Each row takes reducer_d_tiles CTAs, one per D band.
+            d_tile_idx = bidx % self.reducer_d_tiles
+            bidx = bidx // self.reducer_d_tiles
         blk_coord = (bidx, bidy, bidz)
         local_split_kv = (max(1, min(block_split_kvs[blk_coord[2]], split_kv))
                           if self.is_var_split_kv else split_kv)
@@ -1586,7 +1616,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 global_lse = (lse_max + cute.math.log2(sum_lse, fastmath=True)
                               if not sum_lse == self.lse_dtype(0.0)
                               or sum_lse != sum_lse else self.lse_dtype.inf)
-                if tidx == 0:
+                # Thread 0 of the row's first D band stores the row's LSE.
+                lse_lane = tidx
+                if cutlass.const_expr(self.reducer_d_tiles > 1):
+                    lse_lane = tidx + d_tile_idx
+                if lse_lane == 0:
                     mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
                     if cutlass.const_expr(self.emit_softmax_stats):
                         # A rank joins the CP merge only for tokens with at least
@@ -1629,20 +1663,52 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             pipeline.sync(barrier_id=4)
 
             elements_per_thread = cute.ceil_div(
-                self.latent_dim, self.threads_per_warp * self.num_compute_warps)
+                self.reducer_d_tile,
+                self.threads_per_warp * self.num_compute_warps)
+            d_band = 0
+            if cutlass.const_expr(self.reducer_d_tiles > 1):
+                d_band = d_tile_idx * self.reducer_d_tile
             gAccO = mAccO[blk_coord[0], None, None, blk_coord[1], blk_coord[2]]
             rAccO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread),
                                           self.acc_dtype)
             rO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread),
                                        self.o_dtype)
             rAccO.fill(0.0)
-            for i in range(local_split_kv):
-                for j in cutlass.range_constexpr(elements_per_thread):
-                    element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
-                    rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+            if cutlass.const_expr(self.reducer_prefetch_splits > 0):
+                # Load a group of splits' partials (split index clamped to the
+                # last valid split, so the loads need no branch), then
+                # accumulate the valid ones in split order.
+                num_prefetch = self.reducer_prefetch_splits
+                rBuf = cute.make_rmem_tensor(
+                    cute.make_layout((num_prefetch, elements_per_thread)),
+                    self.acc_dtype)
+                for i0 in range(0, local_split_kv, num_prefetch):
+                    for u in cutlass.range_constexpr(num_prefetch):
+                        ii = cutlass.min(i0 + u, local_split_kv - 1)
+                        for j in cutlass.range_constexpr(elements_per_thread):
+                            element_idx = (tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            if cutlass.const_expr(self.reducer_d_tiles > 1):
+                                element_idx = element_idx + d_band
+                            rBuf[u, j] = gAccO[ii, element_idx]
+                    for u in cutlass.range_constexpr(num_prefetch):
+                        if cute.elem_less(i0 + u, local_split_kv):
+                            for j in cutlass.range_constexpr(
+                                    elements_per_thread):
+                                rAccO[j] += (rBuf[u, j] *
+                                             smem_lse_scale[i0 + u])
+            else:
+                for i in range(local_split_kv):
+                    for j in cutlass.range_constexpr(elements_per_thread):
+                        element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+                        if cutlass.const_expr(self.reducer_d_tiles > 1):
+                            element_idx = element_idx + d_band
+                        rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
             rO.store(rAccO.load().to(self.o_dtype))
             for j in cutlass.range_constexpr(elements_per_thread):
                 element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+                if cutlass.const_expr(self.reducer_d_tiles > 1):
+                    element_idx = element_idx + d_band
                 mO[blk_coord[0], element_idx, blk_coord[1],
                    blk_coord[2]] = rO[j]
         return

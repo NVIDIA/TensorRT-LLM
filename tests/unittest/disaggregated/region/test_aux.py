@@ -14,6 +14,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     _encode_draft_history,
     build_aux_transfer_layout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import DataType, KVCacheManagerV2
 
 pytestmark = pytest.mark.cpu_only
 
@@ -210,3 +211,46 @@ def test_draft_history_record_round_trips_the_storage_dtype(dtype):
     }
 
     assert _decode_draft_history(_encode_draft_history(history)) == history
+
+
+def _draft_manager(backend, *, head_dim=576, kv_factor=1, dtype=DataType.BF16):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.draft_layer_ids = (93,)
+    manager.layer_offsets = {93: 0}
+    manager._draft_total_num_kv_heads = 1
+    manager.num_kv_heads_per_layer = [1]
+    manager.head_dim_per_layer = [head_dim]
+    manager.dtype_per_layer = [dtype]
+    manager.kv_factor_per_layer = [kv_factor]
+    manager.draft_window_size = None
+    manager.draft_attention_backend = backend
+    return manager
+
+
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "CUTEDSL"])
+def test_standalone_draft_identity_is_the_storage_format(backend):
+    """CTX and GEN may pick different drafter attention backends over one page format."""
+    layout = _draft_manager(backend).get_draft_transfer_identity()
+
+    assert layout["attention_backend"] == "VANILLA"
+    history = {"valid_length": 1024, "position": 1024, "layout": layout}
+    assert _decode_draft_history(_encode_draft_history(history)) == history
+
+
+def test_embedded_dspark_draft_identity_keeps_its_backend():
+    """Only embedded DSpark stores a different history, so it stays distinguishable."""
+    layout = _draft_manager("DSv4", head_dim=512).get_draft_transfer_identity()
+
+    assert layout["attention_backend"] == "DSv4"
+    history = {"valid_length": 128, "position": 4096, "layout": layout}
+    assert _decode_draft_history(_encode_draft_history(history)) == history
+
+
+def test_draft_identity_names_the_storage_dtype_of_an_fp8_pool():
+    """Peers with different bytes per token must not look alike."""
+    bf16 = _draft_manager("CUTEDSL").get_draft_transfer_identity()
+    fp8 = _draft_manager("CUTEDSL", dtype=DataType.FP8).get_draft_transfer_identity()
+
+    assert bf16["dtype"] == "torch.bfloat16"
+    assert fp8["dtype"] == "torch.float8_e4m3fn"
+    assert bf16 != fp8

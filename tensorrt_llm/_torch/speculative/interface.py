@@ -32,6 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..pyexecutor.input_commit import active_input_commit
 from ..pyexecutor.resource_manager import (BaseResourceManager,
                                            ResourceManagerType)
 
@@ -50,6 +51,7 @@ from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, resolve_advanced_sampling_filters,
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .fast_block_verification import block_verify_enabled, fast_rs_verify_block
 from .fast_rejection_sampling import (fast_rs_draft_block, fast_rs_enabled,
                                       fast_rs_supported, fast_rs_verify)
 from .fast_topp_rejection_sampling import (fast_topp_rs_draft_block,
@@ -852,7 +854,12 @@ class SpecMetadata:
                                        dtype=torch.int64,
                                        device='cuda')
 
+        input_commit = active_input_commit()
+
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            if input_commit is not None:
+                input_commit.stage(dst[:len(values)], values)
+                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),
@@ -1212,6 +1219,7 @@ class SpecMetadata:
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot.
+        input_commit = active_input_commit()
         if self.use_rejection_sampling and self.batch_slot_ids is not None:
             if fast_rs_enabled() and self.draft_probs is not None:
                 # The fused kernels index draft_probs by these ids without a
@@ -1225,12 +1233,17 @@ class SpecMetadata:
                         f"draft_probs rows [0, {num_rows}) (num_seq_slots="
                         f"{self.num_seq_slots}, max_num_requests="
                         f"{self.max_num_requests})")
-            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
-                torch.tensor(per_request_slot_ids,
-                             dtype=torch.long,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            if input_commit is not None:
+                input_commit.stage(
+                    self.batch_slot_ids[:len(per_request_slot_ids)],
+                    per_request_slot_ids)
+            else:
+                self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
+                    torch.tensor(per_request_slot_ids,
+                                 dtype=torch.long,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
 
         # All-greedy: sampler takes the argmax branch (and rejection sampling
         # is also bypassed for all-greedy), so the per-token buffers are never
@@ -1249,6 +1262,11 @@ class SpecMetadata:
         if not (need_update_sampler_param
                 or need_update_expanded_sampler_param):
             return
+        if input_commit is not None:
+            # The signatures were recorded above on the assumption that the copies
+            # happen; a staged step that is aborted drops them, so the record must
+            # not claim the buffers are current.
+            input_commit.on_abort(self.invalidate_sampling_params_cache)
 
         if need_update_sampler_param:
             request_temperatures: list[float] = []
@@ -1259,23 +1277,32 @@ class SpecMetadata:
                 request_top_ks.append(tk_val)
                 request_top_ps.append(tp_val)
 
-            self.request_temperatures[:len(request_temperatures)].copy_(
-                torch.tensor(request_temperatures,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True)
-            self.request_top_ks[:len(request_top_ks)].copy_(
-                torch.tensor(request_top_ks,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
-            self.request_top_ps[:len(request_top_ps)].copy_(
-                torch.tensor(request_top_ps,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            if input_commit is not None:
+                input_commit.stage(
+                    self.request_temperatures[:len(request_temperatures)],
+                    request_temperatures)
+                input_commit.stage(self.request_top_ks[:len(request_top_ks)],
+                                   request_top_ks)
+                input_commit.stage(self.request_top_ps[:len(request_top_ps)],
+                                   request_top_ps)
+            else:
+                self.request_temperatures[:len(request_temperatures)].copy_(
+                    torch.tensor(request_temperatures,
+                                 dtype=torch.float32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True)
+                self.request_top_ks[:len(request_top_ks)].copy_(
+                    torch.tensor(request_top_ks,
+                                 dtype=torch.int32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
+                self.request_top_ps[:len(request_top_ps)].copy_(
+                    torch.tensor(request_top_ps,
+                                 dtype=torch.float32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
@@ -1296,15 +1323,23 @@ class SpecMetadata:
                 top_ks.extend(tk_val for _ in range(num_tokens))
                 top_ps.extend(tp_val for _ in range(num_tokens))
 
-            self.temperatures[:len(temperatures)].copy_(torch.tensor(
-                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
-            self.top_ks[:len(top_ks)].copy_(torch.tensor(
-                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
-            self.top_ps[:len(top_ps)].copy_(torch.tensor(
-                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.temperatures[:len(temperatures)],
+                                   temperatures)
+                input_commit.stage(self.top_ks[:len(top_ks)], top_ks)
+                input_commit.stage(self.top_ps[:len(top_ps)], top_ps)
+            else:
+                self.temperatures[:len(temperatures)].copy_(torch.tensor(
+                    temperatures,
+                    dtype=torch.float32,
+                    pin_memory=prefer_pinned()),
+                                                            non_blocking=True)
+                self.top_ks[:len(top_ks)].copy_(torch.tensor(
+                    top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
+                                                non_blocking=True)
+                self.top_ps[:len(top_ps)].copy_(torch.tensor(
+                    top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                                non_blocking=True)
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, int]]
@@ -2084,6 +2119,19 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         return True
 
+    def _warn_block_verify_needs_fast_rs(self) -> None:
+        """Block verification is a verifier of the fused path: say once per
+        worker that ``TLLM_SPEC_BLOCK_VERIFY=1`` has no effect without
+        ``TLLM_SPEC_FAST_RS=1``."""
+        if getattr(self, "_block_verify_checked", False):
+            return
+        self._block_verify_checked = True
+        if block_verify_enabled():
+            logger.warning(
+                "TLLM_SPEC_BLOCK_VERIFY=1 needs TLLM_SPEC_FAST_RS=1 (block "
+                "verification is a verifier of the fused rejection-sampling "
+                "path); ignoring it.")
+
     def _fast_rs_applies(self,
                          spec_metadata: SpecMetadata,
                          logits,
@@ -2100,12 +2148,14 @@ class SpecWorkerBase(nn.Module, ABC):
         need a shared draft/target vocabulary, full-vocab fp32 logits, no
         synthetic acceptance override and no guided decoding (not validated
         with the fused path). Host-side checks only, so the decision is CUDA-
-        graph safe. With the flag off nothing else is read, so the reference
+        graph safe. With the flag off nothing else is read (apart from the
+        one-time notice about ``TLLM_SPEC_BLOCK_VERIFY``), so the reference
         dispatch is unchanged. The first decision of each call site (``site``)
         is logged once per worker, so a run's log shows which path the opt-in
         took.
         """
         if not fast_rs_enabled():
+            self._warn_block_verify_needs_fast_rs()
             return False
         mode = spec_metadata.advanced_sampling_mode
         applies = (mode.skips_top_k and self._d2t is None
@@ -2120,10 +2170,17 @@ class SpecWorkerBase(nn.Module, ABC):
         if site not in reported:
             reported.add(site)
             if applies:
+                kernels = 'temperature' if mode.skips_top_p else 'top-p'
+                if site == "verify" and block_verify_enabled():
+                    if mode.skips_top_p:
+                        kernels += ", block verification"
+                    else:
+                        logger.warning(
+                            "TLLM_SPEC_BLOCK_VERIFY=1 does not cover top-p "
+                            "sampling (advanced_sampling_mode=no_topk); the "
+                            "nucleus verifier stays token-wise.")
                 logger.info("TLLM_SPEC_FAST_RS=1: fused rejection sampling "
-                            f"active ({site}; "
-                            f"{'temperature' if mode.skips_top_p else 'top-p'}"
-                            " kernels).")
+                            f"active ({site}; {kernels} kernels).")
             else:
                 logger.warning(
                     "TLLM_SPEC_FAST_RS=1 but the fused rejection sampling does "
@@ -2168,8 +2225,11 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.request_offsets[num_contexts:batch_size],
         )
         if spec_metadata.advanced_sampling_mode.skips_top_p:
-            gen_accepted, gen_num_accepted = fast_rs_verify(
-                *rows_args, *req_args)
+            # TLLM_SPEC_BLOCK_VERIFY=1: block verification in place of the
+            # token-wise accept loop (same inputs, same outputs).
+            verify = (fast_rs_verify_block
+                      if block_verify_enabled() else fast_rs_verify)
+            gen_accepted, gen_num_accepted = verify(*rows_args, *req_args)
         else:
             # Top-p honoured (no_topk): verify against the targets' nuclei.
             gen_accepted, gen_num_accepted = fast_topp_rs_verify(

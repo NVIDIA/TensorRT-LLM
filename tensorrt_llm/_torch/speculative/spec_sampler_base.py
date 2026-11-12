@@ -29,6 +29,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ..pyexecutor.input_commit import gen_host_bundle_kernels_enabled, scatter_spec_store
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -168,6 +169,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
         )
+        # TRTLLM_GEN_HOST_BUNDLE=1: one kernel for the four store scatters, and the
+        # slot tensor reused while the batch's slots do not change.
+        self._fused_scatter = gen_host_bundle_kernels_enabled()
+        self._slots_key: Optional[list] = None
+        self._slots_device: Optional[torch.Tensor] = None
 
     def _request_common_handling(
         self,
@@ -289,8 +295,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             for r in sampling_requests
         ]
 
-        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
-        slots = slots.to(device="cuda", non_blocking=True)
+        slot_list = [r.py_seq_slot for r in sampling_requests]
+        if self._fused_scatter and slot_list == self._slots_key:
+            # The previous upload of these slots; the tensor is never written after it.
+            slots = self._slots_device
+        else:
+            slots = torch.as_tensor(slot_list, dtype=torch.long)
+            slots = slots.to(device="cuda", non_blocking=True)
+            if self._fused_scatter:
+                self._slots_key, self._slots_device = slot_list, slots
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -326,10 +339,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
         # Use index_copy_ for efficient copying (slots are unique)
-        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
-        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
-        self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
-        self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
+        if not (
+            self._fused_scatter
+            and scatter_spec_store(
+                slots,
+                self.store.new_tokens.squeeze(-1),
+                self.store.next_new_tokens.squeeze(-1),
+                self.store.new_tokens_lens,
+                self.store.next_draft_tokens,
+                o_new_tokens,
+                o_next_new_tokens,
+                o_new_tokens_lens,
+                o_next_draft_tokens,
+            )
+        ):
+            self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
+            self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
+            self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
+            self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(

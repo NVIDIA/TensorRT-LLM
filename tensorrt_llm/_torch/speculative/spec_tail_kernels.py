@@ -469,6 +469,7 @@ def _store_mla_context_kernel(
     mask_ptr,
     head_dim,
     BLOCK_D: tl.constexpr,
+    POOL_FP8: tl.constexpr,
 ):
     tok = tl.program_id(0)
     layer = tl.program_id(1)
@@ -481,6 +482,9 @@ def _store_mla_context_kernel(
     vals = tl.load(src + offs, mask=dmask, other=0.0)
     # Same bf16 multiply as the eager k.mul_(mask): exact for x * 1, signed zero for x * 0.
     vals = (vals.to(tl.float32) * keep).to(vals.dtype)
+    if POOL_FP8:
+        # to_draft_fp8: saturated E4M3 at unit scale, round to nearest even.
+        vals = tl.minimum(tl.maximum(vals.to(tl.float32), -448.0), 448.0).to(tl.float8e4nv)
     pool = tl.load(pool_ptrs_ptr + layer).to(tl.pointer_type(vals.dtype))
     dst = pool + page * stride_pool_page + off * stride_pool_off
     tl.store(dst + offs, vals, mask=dmask)
@@ -504,13 +508,17 @@ def store_mla_context_latents(
         pool_ptrs: ``[L]`` int64 base addresses of ``pools``.
         pages, offsets: ``[N]`` destination page and in-page offset.
         mask: ``[N]`` int8 write mask (0 writes a zeroed latent, as eagerly).
+
+    An FP8 E4M3 pool stores ``to_draft_fp8`` of the masked latent.
     """
     num_tokens, num_layers, head_dim = latent.shape
     if num_tokens == 0:
         return
     pool0 = pools[0]
     assert latent.stride(-1) == 1 and pool0.stride(-1) == 1
-    assert all(p.stride() == pool0.stride() for p in pools)
+    assert all(p.stride() == pool0.stride() and p.dtype == pool0.dtype for p in pools)
+    pool_fp8 = pool0.dtype == torch.float8_e4m3fn
+    assert pool_fp8 or pool0.dtype == latent.dtype
     _store_mla_context_kernel[(num_tokens, num_layers)](
         latent,
         latent.stride(0),
@@ -523,6 +531,7 @@ def store_mla_context_latents(
         mask,
         head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        POOL_FP8=pool_fp8,
         num_warps=4,
     )
 
@@ -538,6 +547,7 @@ def _scatter_rows_kernel(
     offsets_ptr,
     width,
     BLOCK_D: tl.constexpr,
+    POOL_FP8: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_D)
@@ -545,6 +555,9 @@ def _scatter_rows_kernel(
     page = tl.load(pages_ptr + row)
     off = tl.load(offsets_ptr + row)
     vals = tl.load(src_ptr + row.to(tl.int64) * stride_src + offs, mask=mask)
+    if POOL_FP8:
+        # to_draft_fp8: saturated E4M3 at unit scale, round to nearest even.
+        vals = tl.minimum(tl.maximum(vals.to(tl.float32), -448.0), 448.0).to(tl.float8e4nv)
     tl.store(dst_ptr + page * stride_dst_page + off * stride_dst_off + offs, vals, mask=mask)
 
 
@@ -553,12 +566,15 @@ def scatter_rows_to_pool(
 ) -> None:
     """``pool[pages[i], offsets[i]] = src[i]`` for a ``[pages, page_size, D]`` pool view.
 
-    The same writes as the eager advanced-index assignment (a pure copy).
+    The same writes as the eager advanced-index assignment (a pure copy); an
+    FP8 E4M3 pool stores ``to_draft_fp8(src[i])``.
     """
     rows, width = src.shape
     if rows == 0:
         return
     assert src.stride(-1) == 1 and pool.stride(-1) == 1 and pool.shape[-1] == width
+    pool_fp8 = pool.dtype == torch.float8_e4m3fn
+    assert pool_fp8 or pool.dtype == src.dtype
     _scatter_rows_kernel[(rows,)](
         src,
         src.stride(0),
@@ -569,6 +585,7 @@ def scatter_rows_to_pool(
         offsets,
         width,
         BLOCK_D=triton.next_power_of_2(width),
+        POOL_FP8=pool_fp8,
         num_warps=4,
     )
 

@@ -130,3 +130,18 @@ def validate_dflash_trtllm_gen_runtime(
         raise RuntimeError(
             f"DFlash TRTLLM context attention does not support head dimension {head_dim}."
         )
+
+
+# FP8 E4M3 storage of an MLA drafter's context latent: one per-tensor scale of
+# 1.0 for the latent and for the query that reads it -- the scheme of the
+# target MLA's FP8 KV cache without calibrated kv scales (quant_scale_kv and
+# quant_scale_q default to 1, bmm1_scale = softmax_scale * dq_q * dq_kv,
+# bmm2_scale = dq_kv). Values saturate at the format's largest finite value, as
+# the target's FP8 cache writes do, instead of overflowing to NaN.
+DRAFT_FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+DRAFT_FP8_KV_SCALE = 1.0
+
+
+def to_draft_fp8(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as saturated FP8 E4M3 at the drafter's unit per-tensor scale."""
+    return x.clamp(-DRAFT_FP8_MAX, DRAFT_FP8_MAX).to(torch.float8_e4m3fn)

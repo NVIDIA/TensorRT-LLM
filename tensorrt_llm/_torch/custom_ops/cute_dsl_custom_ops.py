@@ -21,6 +21,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_kernels import (fc1_situ_fast, log_moe_weight_evict_first,
+                                moe_compact_epilogue, moe_fc2_pdl,
                                 moe_weight_evict_first, mxfp8_stationary,
                                 sm_reserve)
 from ..cute_dsl_kernels.rubin.streamk_layout import mailbox_bytes
@@ -8634,6 +8635,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
         1/true/yes/on and False for 0/false/no/off (anything else raises)."""
         return get_env_flag(name)
 
+    def _reduction_prefetch_max_rows_env(name: str, default: int) -> int:
+        """Row cap of the MLA reduction prefetch, read at import: ``default``
+        when unset or blank, else a non-negative integer (0: no cap; anything
+        else raises)."""
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            value = -1
+        if value < 0:
+            raise ValueError(
+                f"{name} must be a non-negative integer, got {raw!r}")
+        return value
+
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
 
@@ -8681,6 +8698,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # CTA waves the split targets: with one wave, the longest request of a
         # skewed decode batch sets the kernel time.
         _SPLIT_KV_WAVES = 8
+        # TLLM_CUTE_DSL_MLA_REDUCTION_PREFETCH=1 (read at import): the split-KV
+        # reduction prefetches _REDUCTION_PREFETCH_SPLITS splits' partials and
+        # reduces 4 D bands per row while that grid fits
+        # _REDUCTION_D_BAND_MAX_WAVES SM waves (see get_reducer_d_tiles).
+        _REDUCTION_PREFETCH = os.environ.get(
+            "TLLM_CUTE_DSL_MLA_REDUCTION_PREFETCH", "0") == "1"
+        _REDUCTION_PREFETCH_SPLITS = 32
+        _REDUCTION_D_BAND_MAX_WAVES = 12
+        # TLLM_CUTE_DSL_MLA_REDUCTION_PREFETCH_MAX_ROWS (read at import): with
+        # the switch on, both effects above (the prefetch and the D bands)
+        # apply only to launches of at most this many query rows
+        # (B * S_q * H per rank); larger launches take the default reduction.
+        # The default is 288, i.e. 24 query tokens at 12 heads per rank; 0
+        # removes the cap.
+        _REDUCTION_PREFETCH_MAX_ROWS = _reduction_prefetch_max_rows_env(
+            "TLLM_CUTE_DSL_MLA_REDUCTION_PREFETCH_MAX_ROWS", 288)
+        # TLLM_CUTE_DSL_MLA_FILL_SPLIT=1 (read at import, default off): a batch
+        # of at most _PLAN_FILL_MAX_ROWS query rows (B * folded S_q) plans up to
+        # _PLAN_FILL_MAX_SPLIT splits per request instead of _MAX_SPLIT_KV, and
+        # the grid of a launch that carries such a plan and the split-KV
+        # workspace grow to match. Larger batches keep the default split and
+        # workspace. Outputs differ from the default within the FP8 attention
+        # tolerance (a request merges in more pieces), they are not bitwise equal.
+        _PLAN_FILL_SPLIT = os.environ.get("TLLM_CUTE_DSL_MLA_FILL_SPLIT",
+                                          "0") == "1"
+        _PLAN_FILL_MAX_SPLIT = 64
+        _PLAN_FILL_MAX_ROWS = 2
         # FP8 kernel: TRTLLM_MLA_BALANCED_SPLIT=1 runs every batch of up to
         # BALANCED_MAX_REQUESTS requests with the balanced split, 0 keeps the
         # uniform split; unset, only attention-DP decode takes the balanced
@@ -8795,6 +8839,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_heads, seq_len_q, cls._MMA_TILE_M)
 
         @classmethod
+        def get_split_plan_geometry(cls, num_heads: int,
+                                    seq_len_q: int) -> Tuple[int, int]:
+            """``(rows_per_request, wave_clusters)`` for the per-request split
+            plan (``launch_mla_split_kv_plan``) of the launch ``forward``
+            makes: every split of a request takes one 2-CTA cluster per folded
+            query row, and one wave holds ``max_active_blocks`` CTAs. Rows are
+            counted by the integer fold; the FP8 kernel's flat fold
+            (``get_fold_layout``) can use fewer, which makes the plan
+            conservative there."""
+            return (cls.get_folded_seq_len_q(num_heads, seq_len_q),
+                    max(
+                        cls._get_max_active_blocks() //
+                        cls._CLUSTER_SHAPE_MNK[0], 1))
+
+        @classmethod
         def get_split_kv_rows_per_request(cls, num_heads: int,
                                           seq_len_q: int) -> int:
             """FP8 kernel split-KV workspace rows per request and split,
@@ -8812,6 +8871,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
             two; ``S`` is the folded query length."""
             target = cls._SPLIT_KV_WAVES * max_active_blocks / (2 * B * S)
             return min(cls._MAX_SPLIT_KV, 1 << max(0, round(math.log2(target))))
+
+        @classmethod
+        def get_plan_fill_split(cls, B: int, S: int) -> int:
+            """Split cap of the fill switch for a batch of ``B`` requests of
+            folded query length ``S``; 0 when the switch is off or the batch
+            has more than ``_PLAN_FILL_MAX_ROWS`` query rows."""
+            if cls._PLAN_FILL_SPLIT and B * S <= cls._PLAN_FILL_MAX_ROWS:
+                return cls._PLAN_FILL_MAX_SPLIT
+            return 0
+
+        @classmethod
+        def reduction_prefetch_active(cls, rows: int) -> bool:
+            """Whether the prefetching reduction applies to a launch of
+            ``rows`` = B * S * H query rows: the switch is on and the launch
+            is within ``_REDUCTION_PREFETCH_MAX_ROWS`` (0: no cap)."""
+            return cls._REDUCTION_PREFETCH and (
+                cls._REDUCTION_PREFETCH_MAX_ROWS <= 0
+                or rows <= cls._REDUCTION_PREFETCH_MAX_ROWS)
+
+        @classmethod
+        def get_reducer_d_tiles(cls, rows: int) -> int:
+            """D bands per reduction row (``rows`` = B * S * H query rows):
+            4 with the prefetching reduction while the 4-band grid fits
+            ``_REDUCTION_D_BAND_MAX_WAVES`` SM waves, else 1."""
+            if cls.reduction_prefetch_active(rows) and 4 * rows <= (
+                    cls._REDUCTION_D_BAND_MAX_WAVES * _get_num_sms()):
+                return 4
+            return 1
+
+        @classmethod
+        def get_reducer_prefetch_splits(cls, rows: int) -> int:
+            """Splits the reduction prefetches per row (0: no prefetch)."""
+            return (cls._REDUCTION_PREFETCH_SPLITS
+                    if cls.reduction_prefetch_active(rows) else 0)
 
         @staticmethod
         def get_split_kv_candidates(B: int, S: int,
@@ -8849,6 +8942,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 while bucket <= max(1, max_batch_size):
                     split_kv = cls.get_default_split_kv(bucket, folded_s,
                                                         max_active_blocks)
+                    split_kv = max(split_kv,
+                                   cls.get_plan_fill_split(bucket, folded_s))
                     if split_kv > 1:
                         rows = max(rows, bucket * s * split_kv)
                     bucket *= 2
@@ -8878,6 +8973,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 while bucket <= max(1, max_batch_size):
                     split_kv = cls.get_default_split_kv(bucket, folded_s,
                                                         max_active_blocks)
+                    split_kv = max(split_kv,
+                                   cls.get_plan_fill_split(bucket, folded_s))
                     if split_kv > 1:
                         rows = max(rows,
                                    bucket * split_kv * rows_per_request[s - 1])
@@ -9293,7 +9390,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional scalar softmax_scale and output_scale values
-                    for the FP16/BF16 runner.
+                    for the FP16/BF16 runner; ``plan_max_split``: the split cap
+                    of ``block_split_kvs`` when it exceeds the tuned grid.
 
             Returns:
                 torch.Tensor: Output tensor of shape (H, D, S_q, B). The LSE
@@ -9409,6 +9507,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # The workspace fits each batch bucket's split; a batch between
                 # two buckets shrinks its split to fit instead of JIT-compiling
                 # a variant.
+                if block_split_kvs is not None:
+                    # A plan wider than the tuned grid says its cap (only the
+                    # fill switch's plan does); a plan capped at the default
+                    # split passes none and keeps the tuned grid.
+                    split_kv = max(split_kv,
+                                   int(kwargs.get("plan_max_split", 0)))
                 fitting_split_kv = self.get_fitting_split_kv(
                     batch_size, max_batch_size)
                 use_workspace = split_kv > 1 and fitting_split_kv >= 1
@@ -9452,6 +9556,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_lookahead = (
                 self._fp8_mma_lookahead(balanced_split) if self.kernel_class
                 is BlackwellMultiHeadLatentAttentionForwardFP8 else None)
+            # The split-KV reduction kernel runs only for a workspace launch
+            # without the balanced split (which combines with its own kernel).
+            split_reduction = use_workspace and not balanced_split
+            reduction_rows = batch_size * seq_len_q * self.num_heads
+            reducer_d_tiles = (self.get_reducer_d_tiles(reduction_rows)
+                               if split_reduction else 1)
+            reducer_prefetch_splits = (
+                self.get_reducer_prefetch_splits(reduction_rows)
+                if split_reduction else 0)
             # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -9464,6 +9577,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 rows_per_request,
                 balanced_split,
                 mma_lookahead,
+                reducer_d_tiles,
+                reducer_prefetch_splits,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -9504,6 +9619,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_len_q=seq_len_q,
                     fold_sq=fold_sq,
                     emit_softmax_stats=self.emit_softmax_stats,
+                    reducer_d_tiles=reducer_d_tiles,
+                    reducer_prefetch_splits=reducer_prefetch_splits,
                     **kernel_kwargs,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
@@ -9646,6 +9763,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor] = None,
         kv_bounds: Optional[torch.Tensor] = None,
         block_split_kvs: Optional[torch.Tensor] = None,
+        plan_max_split: int = 0,
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103/SM107).
 
@@ -9653,6 +9771,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         attention bounds of shape (B * seq_len_q,), int32.
         block_split_kvs: optional per-request split-KV counts of shape (B,),
         int32, planned on the device for the step's KV lengths.
+        plan_max_split: the split cap of ``block_split_kvs`` when it exceeds
+        the tuned grid, 0 otherwise (see the runner).
         """
         if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
@@ -9690,6 +9810,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         runner(
             inputs,
             tactic=best_tactic,
+            plan_max_split=plan_max_split,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp8_blackwell")
@@ -9711,6 +9832,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor] = None,
         kv_bounds: Optional[torch.Tensor] = None,
         block_split_kvs: Optional[torch.Tensor] = None,
+        plan_max_split: int = 0,
     ) -> None:
         return None
 
@@ -9738,6 +9860,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kv_bounds: Optional[torch.Tensor] = None,
         block_split_kvs: Optional[torch.Tensor] = None,
         max_split_kv: int = 0,
+        plan_max_split: int = 0,
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103/SM107).
 
@@ -9746,6 +9869,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_split_kv: cap on split_kv for batches of at least
         ``CuteDSLNVMlaDecodeBlackwellRunner._SPLIT_CAP_MIN_BATCH`` requests,
         0 for none (see the runner).
+        plan_max_split: the split cap of ``block_split_kvs`` when it exceeds
+        the tuned grid, 0 otherwise (see the runner).
         """
         if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
@@ -9803,6 +9928,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tactic=best_tactic,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
+            plan_max_split=plan_max_split,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp16_blackwell")
@@ -9825,6 +9951,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kv_bounds: Optional[torch.Tensor] = None,
         block_split_kvs: Optional[torch.Tensor] = None,
         max_split_kv: int = 0,
+        plan_max_split: int = 0,
     ) -> None:
         return None
 
@@ -13474,12 +13601,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                      self.num_experts,
                                                      self.num_local_experts,
                                                      self.tile_size)
+                compact_epilogue = (bool(moe_compact_epilogue() & 1)
+                                    and mma_inst_shape[0] == 128
+                                    and mma_tiler[0] == 128
+                                    and not ugpu_half_gemm and
+                                    is_gated_activation(self.activation_type))
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, raster_along_m, ugpu_half_gemm,
                              a_path, int(self.activation_type), self.situ_beta,
                              self.situ_linear_beta, max_active_clusters,
                              situ_fast, evict_first)
+                if compact_epilogue:
+                    cache_key += ("compact_epilogue", )
+                early_trigger = moe_fc2_pdl() and _trtllm_pdl_enabled()
+                if early_trigger:
+                    cache_key += ("early_launch_dependents", )
                 if cache_key not in self.__class__.kernel_cache:
                     log_moe_weight_evict_first("FC1", evict_first, orig_m)
                     if situ_fast:
@@ -13503,6 +13640,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         situ_linear_beta=self.situ_linear_beta,
                         situ_fast=situ_fast,
                         weight_evict_first=evict_first,
+                        compact_epilogue=compact_epilogue,
+                        early_launch_dependents=early_trigger,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,
@@ -15393,6 +15532,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 """Return whether the kernel can cover N without a tail tile."""
                 return n % (mma_n * cluster_n) == 0
 
+            @staticmethod
+            def _inputs_pre_hook(
+                    helper: GroupedGemmInputsHelper,
+                    inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+                """The tuning inputs, complete before the first profiled run under TRTLLM_CUTEDSL_MOE_FC2_PDL.
+
+                The FC2 kernel built with the switch reads its tile tables before its dependency wait,
+                so they must be complete when it launches. In the MoE the FC1 GEMM runs between the sort
+                and FC2; here the sort that writes them is the last kernel before the first profiled run.
+                """
+                inputs = helper.inputs_pre_hook_finalize_fusion(inputs)
+                if moe_fc2_pdl() and _trtllm_pdl_enabled():
+                    torch.cuda.current_stream().synchronize()
+                return inputs
+
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
@@ -15501,7 +15655,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             ConstraintSpec(10, 0,
                                            helper.infer_shape_num_tokens),
                         ),
-                        inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
+                        inputs_pre_hook=functools.partial(
+                            self._inputs_pre_hook, helper),
                     )
                 return self.__class__.tuning_config_cache[key]
 
@@ -15625,10 +15780,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                      self.num_experts,
                                                      self.num_local_experts,
                                                      self.tile_size)
+                compact_epilogue = (bool(moe_compact_epilogue() & 2)
+                                    and mma_inst_shape[0] == 128
+                                    and mma_tiler[0] == 128)
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, raster_along_m, ugpu_half_gemm,
                              max_active_clusters, evict_first)
+                if compact_epilogue:
+                    cache_key += ("compact_epilogue", )
+                pdl_preload_weights = (moe_fc2_pdl() and _trtllm_pdl_enabled()
+                                       and mma_inst_shape[0] == 128)
+                if pdl_preload_weights:
+                    cache_key += ("pdl_preload_weights", )
                 if cache_key not in self.__class__.kernel_cache:
                     log_moe_weight_evict_first("FC2", evict_first, num_tokens)
                     gemm = self.__class__.kernel_class(
@@ -15639,6 +15803,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         raster_along_m=raster_along_m,
                         topK=self.top_k,
                         weight_evict_first=evict_first,
+                        compact_epilogue=compact_epilogue,
+                        pdl_preload_weights=pdl_preload_weights,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,

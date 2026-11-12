@@ -2338,6 +2338,43 @@ class MLA(nn.Module):
         else:
             raise RuntimeError("MLA absorption requires k_b_proj_trans")
 
+        return self._attend_absorbed_generation(
+            fused_q,
+            attn_metadata,
+            output,
+            position_ids=position_ids,
+            latent_cache=latent_cache,
+            q_pe=q_pe,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            mla_bmm1_scale=mla_bmm1_scale,
+            mla_bmm2_scale=mla_bmm2_scale,
+            quant_q_buffer=quant_q_buffer,
+            **kwargs,
+        )
+
+    def _attend_absorbed_generation(
+        self,
+        fused_q: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        *,
+        position_ids: Optional[torch.Tensor],
+        latent_cache: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        fmha_scheduler_counter: torch.Tensor,
+        mla_bmm1_scale: Optional[torch.Tensor],
+        mla_bmm2_scale: Optional[torch.Tensor],
+        quant_q_buffer: Optional[torch.Tensor],
+        **kwargs,
+    ) -> torch.Tensor:
+        """Generation attention on the absorbed query ``fused_q`` ``[tokens, heads * (kv_lora_rank +
+        qk_rope_head_dim)]`` (or its FP8 twin ``quant_q_buffer``), then the V up-projection into
+        ``output``."""
+        num_tokens = fused_q.shape[0]
         helix_v_up = self._helix_v_up_enabled()
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
@@ -2363,13 +2400,13 @@ class MLA(nn.Module):
 
         if helix_v_up:
             # The V up-projection already ran before the all-to-all.
-            assert attn_out_latent.shape == (q.shape[0], self.num_heads_tp_cp * self.v_head_dim)
+            assert attn_out_latent.shape == (num_tokens, self.num_heads_tp_cp * self.v_head_dim)
             output.view(attn_out_latent.shape).copy_(attn_out_latent)
             return output
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (
-            attn_out_latent.shape[0] == q.shape[0]
+            attn_out_latent.shape[0] == num_tokens
             and attn_out_latent.shape[1] == self.num_heads_tp_cp * self.kv_lora_rank
         )
 

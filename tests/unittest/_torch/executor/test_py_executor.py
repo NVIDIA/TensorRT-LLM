@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
     LlmResponse,
     SamplingConfig,
+    executor_request_to_llm_request,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -50,6 +51,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
@@ -3120,6 +3122,8 @@ class TestPendingTransferResponseFlush:
         executor.is_benchmark_disagg = False
         executor._handle_disagg_cache_errors_synced = Mock()
         executor._flush_pending_transfer_responses = Mock()
+        # The overlap loop reads the executor phase log (None: off).
+        executor._phase_log = None
         return executor
 
     @staticmethod
@@ -3386,6 +3390,102 @@ class TestOneModelMTPDraftTokenScheduling:
 
         assert gen.py_draft_tokens == sampler_drafts
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+
+
+class TestDisaggGenHandoffPlaceholderDrafts:
+    """The cases of ``test_disagg_gen_placeholder_drafts.py`` on a real generation-only request.
+
+    The request is built from the context server's ``ContextPhaseParams`` as a generation server
+    builds it, admitted by ``_prepare_and_schedule_batch`` in ``DISAGG_GENERATION_INIT`` and handed
+    off by ``_prepare_disagg_gen_transmission_complete`` once its KV has arrived. The C++ request
+    adopts a non-empty context draft list, so admission requests the one-hot row only for a request
+    that arrived without drafts; zero placeholders from the context server are flagged at the
+    hand-off. One-model speculative decoding (no separate drafter, as for DSpark) takes the same
+    admission path as the one-model MTP executor used here.
+    """
+
+    K = TestOneModelMTPDraftTokenScheduling.MAX_TOTAL_DRAFT_TOKENS
+    PLACEHOLDERS = pytest.mark.parametrize(
+        "ctx_draft_tokens", [None, [], [0] * K], ids=["none", "empty", "zeros"]
+    )
+
+    @classmethod
+    def _hand_off(cls, ctx_draft_tokens, rejection, spec_decode=True, flag_before_hand_off=False):
+        """Admit and hand off a generation-only request; returns it and whether admission flagged
+        it."""
+        request_id = 42
+        context_phase_params = trtllm.ContextPhaseParams(
+            [100], request_id, None, ctx_draft_tokens, None, None
+        )
+        executor_request = trtllm.Request(
+            input_token_ids=[1, 2, 3],
+            max_tokens=10,
+            type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=context_phase_params,
+        )
+        req = executor_request_to_llm_request(
+            request_id, executor_request, child_req_ids=[], exclude_last_generation_logits=False
+        )
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+        ex = TestOneModelMTPDraftTokenScheduling._make_one_model_mtp_executor(
+            [req], use_rejection_sampling=rejection
+        )
+        if not spec_decode:
+            ex.model_engine.is_spec_decode = False
+            ex.model_engine.spec_config = None
+        ex._prepare_and_schedule_batch()
+        flagged_at_admission = req.py_needs_onehot_draft_probs
+        if flag_before_hand_off:
+            req.py_needs_onehot_draft_probs = True
+
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        ex.model_engine.enable_spec_decode = spec_decode
+        ex.resource_manager = types.SimpleNamespace(
+            resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
+        )
+        ex._setup_sampler_step = Mock()
+        ex._maybe_prepend_logprobs_and_logits = Mock()
+        batch = ScheduledRequests()
+        batch.append_generation_request(req)
+        ex._prepare_disagg_gen_transmission_complete(batch)
+        assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+        assert req.get_tokens(0)[-1] == 100
+        return req, flagged_at_admission
+
+    @PLACEHOLDERS
+    def test_rejection_sampling_pairs_placeholder_drafts_with_onehot_rows(self, ctx_draft_tokens):
+        req, flagged_at_admission = self._hand_off(ctx_draft_tokens, rejection=True)
+
+        assert req.py_draft_tokens == [0] * self.K
+        assert req.py_needs_onehot_draft_probs
+        # Only zero placeholders from the context server pass admission unflagged.
+        assert flagged_at_admission == (not ctx_draft_tokens)
+
+    @PLACEHOLDERS
+    def test_strict_acceptance_needs_no_onehot_rows(self, ctx_draft_tokens):
+        req, _ = self._hand_off(ctx_draft_tokens, rejection=False)
+
+        assert req.py_draft_tokens == [0] * self.K
+        assert not req.py_needs_onehot_draft_probs
+
+    @pytest.mark.parametrize("rejection", [True, False], ids=["rejection", "strict"])
+    def test_real_drafts_keep_their_rows(self, rejection):
+        drafts = [5, 0, 9]
+        req, _ = self._hand_off(list(drafts), rejection)
+
+        assert req.py_draft_tokens == drafts
+        assert not req.py_needs_onehot_draft_probs
+
+    def test_flag_already_set_is_kept(self):
+        req, _ = self._hand_off([3] * self.K, rejection=True, flag_before_hand_off=True)
+
+        assert req.py_needs_onehot_draft_probs
+
+    def test_no_spec_decode_has_no_drafts(self):
+        req, _ = self._hand_off(None, rejection=False, spec_decode=False)
+
+        assert req.py_draft_tokens == []
+        assert not req.py_needs_onehot_draft_probs
 
 
 class TestAdpBalanceExcludesPadDummies:

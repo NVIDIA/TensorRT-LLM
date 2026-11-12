@@ -65,6 +65,7 @@ from .kv_cache_manager_v2 import (DECODE_ONLY_DRAFT_KV_ENV, KVCacheManagerV2,
                                   compute_decode_only_draft_kv_slack,
                                   decode_only_draft_kv_requested,
                                   decode_only_draft_kv_tokens_per_request,
+                                  draft_context_limit_from_env,
                                   legacy_kv_estimation_enabled)
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse, LlmRequestState
@@ -87,11 +88,17 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
+from .standalone_draft_cache import draft_context_window_from_env
 
 if TYPE_CHECKING:
     import transformers
 
 GB = 1 << 30
+
+# Opt-in (default off): keep a standalone MLA DSpark drafter's context KV in the
+# target's KV cache manager V2 (unified draft cache) and transfer it with the
+# prompt KV in disaggregated serving.
+UNIFIED_MLA_DRAFT_CACHE_ENV = "TLLM_DSPARK_UNIFIED_MLA_DRAFT_CACHE"
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -1656,17 +1663,117 @@ class KvCacheCreator:
         return os.environ.get("TLLM_DSPARK_DISABLE_UNIFIED_DRAFT_CACHE",
                               "0") == "1"
 
+    @staticmethod
+    def _unified_mla_draft_cache_requested() -> bool:
+        # Opt-in: without it an MLA drafter keeps the legacy drafter state
+        # (no draft history is transferred from the context to the generation
+        # worker).
+        return os.environ.get(UNIFIED_MLA_DRAFT_CACHE_ENV, "0") == "1"
+
     def _uses_unified_standalone_draft_cache(self) -> bool:
         if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
                 or not self._is_kv_cache_manager_v2
                 or self._unified_draft_cache_disabled_by_env()):
             return False
-        # Drafters the unified cache cannot hold (MLA) keep legacy state in
-        # both aggregate and disaggregated serving instead of failing startup.
+        # Drafters the unified cache is not enabled for (MLA without the
+        # opt-in) keep legacy state in both aggregate and disaggregated
+        # serving instead of failing startup.
         return self._unified_draft_cache_unsupported_reason() is None
+
+    def _uses_unified_mla_draft_cache(self) -> bool:
+        """The opt-in unified cache of a standalone MLA drafter."""
+        return (self._is_standalone_dspark()
+                and is_mla(self._draft_config.pretrained_config)
+                and self._uses_unified_standalone_draft_cache())
+
+    def _validate_draft_context_window(self, window, limit) -> None:
+        """TLLM_DSPARK_DRAFT_CONTEXT_WINDOW refines the limit's empty context."""
+        if limit is None:
+            raise ValueError(
+                "TLLM_DSPARK_DRAFT_CONTEXT_WINDOW sets the drafter context of a "
+                "prompt above TLLM_DSPARK_DRAFT_CONTEXT_LIMIT; set the limit "
+                "as well.")
+        if window.length > limit:
+            raise ValueError(
+                "TLLM_DSPARK_DRAFT_CONTEXT_SINK + "
+                f"TLLM_DSPARK_DRAFT_CONTEXT_WINDOW ({window.length}) must not "
+                f"exceed TLLM_DSPARK_DRAFT_CONTEXT_LIMIT ({limit}): the window "
+                "of a prompt above the limit must not overlap its first "
+                "tokens.")
+        if not self._uses_unified_mla_draft_cache():
+            raise ValueError(
+                "TLLM_DSPARK_DRAFT_CONTEXT_WINDOW rebases the RoPE positions of "
+                "an MLA drafter's context latents; it needs a standalone MLA "
+                f"drafter with the unified draft cache "
+                f"({UNIFIED_MLA_DRAFT_CACHE_ENV}=1).")
 
     def _validate_standalone_draft_cache(self) -> None:
         """Validate manager-owned DSpark history for disaggregated serving."""
+        if (self._uses_unified_mla_draft_cache()
+                and os.environ.get("TLLM_DRAFT_KV_GPU_BUDGET_GIB")):
+            raise ValueError(
+                "TLLM_DRAFT_KV_GPU_BUDGET_GIB caps the separate draft KV cache "
+                "manager; the DSpark drafter keeps its context KV in the "
+                "target's KV cache manager V2 here, so unset it.")
+        if (getattr(self._speculative_config, "context_kv_only", False)
+                and not (self._uses_unified_standalone_draft_cache()
+                         and self._is_disagg)):
+            raise ValueError(
+                "speculative_config.context_kv_only is for disaggregated context "
+                "servers with kv_cache_config.use_kv_cache_manager_v2=True and "
+                f"the unified draft cache ({UNIFIED_MLA_DRAFT_CACHE_ENV}=1 for "
+                "an MLA drafter, and not "
+                "TLLM_DSPARK_DISABLE_UNIFIED_DRAFT_CACHE=1).")
+        disagg_role = os.environ.get("TRTLLM_DISAGG_ROLE", "")
+        if (getattr(self._speculative_config, "context_kv_only", False)
+                and disagg_role not in ("", "context")):
+            raise ValueError(
+                "speculative_config.context_kv_only is for context servers, "
+                f"but this server's role is {disagg_role!r}: it never drafts, "
+                "so it cannot serve generation requests.")
+        if (getattr(self._speculative_config, "context_kv_dtype", "auto")
+                != "auto" and not self._uses_unified_standalone_draft_cache()):
+            raise ValueError(
+                "speculative_config.context_kv_dtype sets the storage of the "
+                "drafter's context KV in the unified draft cache; it needs "
+                "kv_cache_config.use_kv_cache_manager_v2=True and the unified "
+                f"draft cache ({UNIFIED_MLA_DRAFT_CACHE_ENV}=1 for an MLA "
+                "drafter, and not TLLM_DSPARK_DISABLE_UNIFIED_DRAFT_CACHE=1).")
+        draft_context_limit = draft_context_limit_from_env()
+        draft_context_window = draft_context_window_from_env()
+        if draft_context_window is not None:
+            self._validate_draft_context_window(draft_context_window,
+                                                draft_context_limit)
+        if draft_context_limit is not None:
+            if not (self._is_standalone_dspark()
+                    and self._uses_unified_standalone_draft_cache()
+                    and self._is_disagg):
+                raise ValueError(
+                    "TLLM_DSPARK_DRAFT_CONTEXT_LIMIT makes a disaggregated "
+                    "generation worker draft long prompts without the drafter "
+                    "context the context worker transfers; it needs a "
+                    "standalone drafter with "
+                    "kv_cache_config.use_kv_cache_manager_v2=True and the "
+                    f"unified draft cache ({UNIFIED_MLA_DRAFT_CACHE_ENV}=1 for "
+                    "an MLA drafter, and not "
+                    "TLLM_DSPARK_DISABLE_UNIFIED_DRAFT_CACHE=1) on a "
+                    "disaggregated server.")
+            if draft_context_window is None:
+                logger.info(
+                    f"TLLM_DSPARK_DRAFT_CONTEXT_LIMIT={draft_context_limit}: a "
+                    "generation worker drafts prompts longer than "
+                    f"{draft_context_limit} tokens from an empty drafter "
+                    "context; a context worker ignores the limit.")
+            else:
+                logger.info(
+                    f"TLLM_DSPARK_DRAFT_CONTEXT_LIMIT={draft_context_limit}: a "
+                    "generation worker drafts prompts longer than "
+                    f"{draft_context_limit} tokens from their first "
+                    f"{draft_context_window.sink} and last "
+                    f"{draft_context_window.recent} tokens "
+                    "(TLLM_DSPARK_DRAFT_CONTEXT_SINK, "
+                    "TLLM_DSPARK_DRAFT_CONTEXT_WINDOW); a context worker "
+                    "ignores all three.")
         if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
                 or not self._is_disagg
                 or self._unified_draft_cache_disabled_by_env()):
@@ -1680,13 +1787,15 @@ class KvCacheCreator:
             logger.warning(
                 f"{reason} Falling back to legacy drafter state: the "
                 "generation worker drafts without the prompt history, which "
-                "lowers acceptance (NVIDIA/TensorRT-LLM#20010 transfers it).")
+                "lowers acceptance.")
 
     def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
         """Shared admission requirements for unified aggregate and disagg KV."""
         if (self._is_standalone_dspark()
-                and is_mla(self._draft_config.pretrained_config)):
-            return "Unified DSpark KV cache does not yet support MLA drafters."
+                and is_mla(self._draft_config.pretrained_config)
+                and not self._unified_mla_draft_cache_requested()):
+            return ("The unified DSpark KV cache for MLA drafters is opt-in "
+                    f"({UNIFIED_MLA_DRAFT_CACHE_ENV}=1).")
         return None
 
     def _get_draft_mapping(self) -> Mapping:
@@ -1713,14 +1822,22 @@ class KvCacheCreator:
                 draft_window_size=int(draft._attn_params["window_size"]),
             )
         config = self._draft_config.pretrained_config
-        num_heads = config.num_attention_heads
-        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-        head_dim = getattr(config, "head_dim", None)
-        if head_dim is None:
-            head_dim = config.hidden_size // num_heads
-        draft_mapping = self._get_draft_mapping()
-        attention_tp_size = (1 if draft_mapping.enable_attention_dp else
-                             draft_mapping.tp_size)
+        mla = getattr(draft, "_kv_factor", 2) == 1
+        if mla:
+            # One latent per token and layer, not sharded over TP ranks.
+            num_layers = draft._num_attn_layers
+            num_kv_heads = attention_tp_size = 1
+            head_dim = draft._head_dim
+        else:
+            num_layers = config.num_hidden_layers
+            num_heads = config.num_attention_heads
+            num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
+            head_dim = getattr(config, "head_dim", None)
+            if head_dim is None:
+                head_dim = config.hidden_size // num_heads
+            draft_mapping = self._get_draft_mapping()
+            attention_tp_size = (1 if draft_mapping.enable_attention_dp else
+                                 draft_mapping.tp_size)
         attention_backend = self._speculative_config.attention_backend
         if attention_backend == "AUTO":
             attention_backend = draft.dflash_attention_backend
@@ -1730,12 +1847,16 @@ class KvCacheCreator:
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
                 "Standalone draft KV supports FP16 and BF16 storage")
-        if attention_backend == "TRTLLM":
+        if attention_backend == "TRTLLM" and not mla:
             # The TRTLLM drafter attention reads FP8 pages with FP8 queries;
             # the drafter's history is stored at half the BF16 footprint.
             dtype = torch.float8_e4m3fn
+        if mla and getattr(draft, "context_kv_fp8", False):
+            # speculative_config.context_kv_dtype="fp8": FP8 E4M3 latents.
+            dtype = torch.float8_e4m3fn
         return dict(
-            draft_num_layers=config.num_hidden_layers,
+            draft_num_layers=num_layers,
+            draft_kv_factor=1 if mla else 2,
             draft_num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
             attention_tp_size,
             draft_head_dim=head_dim,

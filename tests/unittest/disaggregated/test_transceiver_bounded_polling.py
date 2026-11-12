@@ -397,14 +397,17 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
     transceiver._dist = SimpleNamespace(
-        tp_allgather=lambda payload: [payload, [[], [], []]],
+        tp_allgather=lambda payload: [payload, [[], [], [], []]],
     )
 
-    cancelled, failed, completed = transceiver._ctx_consensus_outcome([21], [], [], [21])
+    cancelled, failed, completed, timed_out = transceiver._ctx_consensus_outcome(
+        [21], [], [], [21], [], []
+    )
 
     assert cancelled == []
     assert failed == []
     assert completed == []
+    assert timed_out == []
 
 
 def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
@@ -413,14 +416,17 @@ def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver._ctx_need_pp_sync = True
     transceiver._dist = SimpleNamespace(
         tp_allgather=Mock(side_effect=AssertionError("TP allgather must be skipped")),
-        pp_allgather=lambda payload: [payload, [[], [], []]],
+        pp_allgather=lambda payload: [payload, [[], [], [], []]],
     )
 
-    cancelled, failed, completed = transceiver._ctx_consensus_outcome([22], [], [], [22])
+    cancelled, failed, completed, timed_out = transceiver._ctx_consensus_outcome(
+        [22], [], [], [22], [], []
+    )
 
     assert cancelled == []
     assert failed == []
     assert completed == []
+    assert timed_out == []
     transceiver._dist.tp_allgather.assert_not_called()
 
 
@@ -450,7 +456,7 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     transceiver._dist.allreduce = Mock(return_value=0)
     transceiver._ctx_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._close_failed_sessions = Mock()
 
@@ -997,7 +1003,7 @@ def test_check_context_runs_consensus_after_a_send() -> None:
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_consensus = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
 
     transceiver.check_context_transfer_status(0)
     transceiver._ctx_consensus.assert_called_once()

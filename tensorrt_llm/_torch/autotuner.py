@@ -420,6 +420,13 @@ class AutoTunerStatistics:
         return stats_str
 
 
+# A cache file that the ranks replace (tmp file + rename) can be missing for an
+# instant to a rank on another node of a shared file system: load_cache waits up
+# to this long for the file before it reports it as missing.
+_CACHE_FILE_WAIT_SECONDS = 5.0
+_CACHE_FILE_POLL_SECONDS = 0.05
+
+
 @contextlib.contextmanager
 def _exclusive_cache_lock(lock_path: Path):
     """Cross-node-correct exclusive lock used by save_cache/load_cache.
@@ -712,6 +719,30 @@ class AutoTunerProfilingCache:
             os.fsync(f.fileno())
         os.rename(tmp_path, file_path)
 
+    def _read_cache_file(self, file_path: Path) -> Dict[str, Any]:
+        """Read the JSON document of a cache file under the cache lock.
+
+        The ranks replace the file with a rename, and a rank on another node of
+        a shared file system can find the name missing for an instant (the other
+        ranks then wait for it in a collective). A missing file is therefore
+        waited for, up to `_CACHE_FILE_WAIT_SECONDS`, before FileNotFoundError
+        is raised.
+        """
+        lock_path = self._lock_path_for(file_path)
+        deadline = time.monotonic() + _CACHE_FILE_WAIT_SECONDS
+        while True:
+            try:
+                if not file_path.exists():
+                    raise FileNotFoundError(
+                        f"Cache file not found: {file_path}")
+                with _exclusive_cache_lock(lock_path):
+                    with open(file_path, "r") as f:
+                        return json.load(f)
+            except FileNotFoundError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_CACHE_FILE_POLL_SECONDS)
+
     def load_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Load the profiling cache from disk in JSON format.
 
@@ -723,7 +754,8 @@ class AutoTunerProfilingCache:
             rank: The rank of the current process
 
         Raises:
-            FileNotFoundError: If cache file doesn't exist
+            FileNotFoundError: If the cache file does not exist (it is waited
+                for a few seconds first, see `_read_cache_file`)
             IOError: If file cannot be read
 
         Note:
@@ -731,14 +763,8 @@ class AutoTunerProfilingCache:
             from JSON format.
         """
         file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"Cache file not found: {file_path}")
-
-        lock_path = self._lock_path_for(file_path)
         try:
-            with _exclusive_cache_lock(lock_path):
-                with open(file_path, "r") as f:
-                    current_cache_contents = json.load(f)
+            current_cache_contents = self._read_cache_file(file_path)
             self._deserialize_metadata(
                 current_cache_contents.get("metadata", {}))
 

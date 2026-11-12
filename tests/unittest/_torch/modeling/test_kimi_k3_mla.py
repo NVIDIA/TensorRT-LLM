@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -472,3 +473,134 @@ def test_k3_mla_fp8_kv_decode_q_absorb() -> None:
     assert torch.equal(new["bmm1"], old["bmm1"]) and torch.equal(new["bmm2"], old["bmm2"])
     assert torch.equal(new["kv"].view(torch.uint8), old["kv"].view(torch.uint8))
     assert new["kv"].view(torch.uint8).any()
+
+
+def _prefill_metadata(mapping, config, batch: int, context_length: int):
+    """A KV-cache manager and the metadata of ``batch`` context requests of ``context_length``."""
+    scenario = SimpleNamespace(
+        ctx_len=context_length,
+        batch=batch,
+        kv_cache_tokens_per_block=64,
+        num_layers=1,
+        kv_cache_dtype=torch.bfloat16,
+    )
+    return setup_kv_and_metadata(
+        scenario,
+        mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+    )
+
+
+def _mla_extra_attrs(runtime, metadata) -> dict:
+    return {
+        "attention_metadata": weakref.ref(metadata),
+        "mla_layers": {runtime.mixer.layer_idx_str: weakref.ref(runtime.mixer)},
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "fp8", [False, pytest.param(True, marks=skip_pre_blackwell)], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
+def test_k3_mla_padded_prefill_matches_unpadded(fp8: bool, gate: bool) -> None:
+    """Rows after a prefill batch's tokens (the padding of a prefill CUDA graph) leave as zeros
+    and leave the real rows as an unpadded forward computes them."""
+    mapping, config, _, runtime = _k3_mla_case(fp8, gate)
+    batch, context_length, pad = 2, 40, 24
+    tokens = batch * context_length
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    hidden = torch.randn(
+        tokens + pad, config.hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    outputs = []
+    for rows in (tokens, tokens + pad):
+        manager, metadata = _prefill_metadata(mapping, config, batch, context_length)
+        try:
+            with model_extra_attrs(_mla_extra_attrs(runtime, metadata)):
+                outputs.append(runtime(hidden[:rows].contiguous(), metadata))
+        finally:
+            manager.shutdown()
+    unpadded, padded = outputs
+
+    assert padded.shape[0] == tokens + pad
+    _assert_matches_reference(padded[:tokens], unpadded, fp8)
+    assert not padded[tokens:].any()
+
+
+class _MLABody(torch.nn.Module):
+    """The model body the runner patches: one K3 MLA layer on the batch of the moment."""
+
+    def __init__(self, runtime):
+        super().__init__()
+        self.runtime = runtime
+        self.metadata = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.runtime(hidden_states, self.metadata)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "fp8", [False, pytest.param(True, marks=skip_pre_blackwell)], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
+@torch.no_grad()
+def test_k3_mla_breakable_graph_replay_matches_eager(fp8: bool, gate: bool) -> None:
+    """A bucket captured on a dummy batch and replayed on a live one gives the eager result:
+    the attention runs eagerly on the live metadata, the rest of the layer is replayed."""
+    mapping, config, _, runtime = _k3_mla_case(fp8, gate)
+    bucket, batch, context_length = 128, 2, 40
+    tokens = batch * context_length
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    hidden = torch.randn(
+        tokens, config.hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    managers = []
+
+    def prefill_metadata(batch_size: int, length: int):
+        manager, metadata = _prefill_metadata(mapping, config, batch_size, length)
+        managers.append(manager)
+        return metadata
+
+    try:
+        eager_metadata = prefill_metadata(batch, context_length)
+        with model_extra_attrs(_mla_extra_attrs(runtime, eager_metadata)):
+            expected = runtime(hidden, eager_metadata)
+
+        # The engine captures a bucket on a dummy batch of exactly the bucket's tokens ...
+        dummy_metadata = prefill_metadata(1, bucket)
+        body = _MLABody(runtime)
+        body.metadata = dummy_metadata
+        runner = BreakableCUDAGraphRunner(body)
+        static_input = torch.randn(
+            bucket, config.hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+        extra_attrs = _mla_extra_attrs(runtime, dummy_metadata)
+
+        def engine_forward() -> torch.Tensor:
+            if runner.is_capturing:
+                return runner.capture_model_body(lambda: body(static_input))
+            return body(static_input)
+
+        try:
+            with model_extra_attrs(extra_attrs):
+                runner.capture(bucket, engine_forward)
+                # ... and replays it on a live batch whose padding rows hold arbitrary values.
+                live_metadata = prefill_metadata(batch, context_length)
+                extra_attrs["attention_metadata"] = weakref.ref(live_metadata)
+                static_input.copy_(torch.randn_like(static_input))
+                static_input[:tokens] = hidden
+                actual = runner.execute(bucket, lambda: body(static_input)).clone()
+                torch.cuda.synchronize()
+        finally:
+            runner.clear()
+    finally:
+        for manager in managers:
+            manager.shutdown()
+
+    assert actual.shape[0] == bucket
+    _assert_matches_reference(actual[:tokens], expected, fp8)
+    assert not actual[tokens:].any()

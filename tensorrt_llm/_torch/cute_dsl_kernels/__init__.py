@@ -19,6 +19,8 @@ _SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
 _FC1_SITU_FAST_ENV = "TRTLLM_CUTEDSL_FC1_SITU_FAST"
 _MXFP8_STATIONARY_ENV = "TRTLLM_CUTEDSL_MXFP8_STATIONARY"
 _MOE_WEIGHT_EVICT_FIRST_ENV = "TRTLLM_CUTEDSL_MOE_WEIGHT_EVICT_FIRST"
+_MOE_COMPACT_EPILOGUE_ENV = "TRTLLM_CUTEDSL_MOE_COMPACT_EPILOGUE"
+_MOE_FC2_PDL_ENV = "TRTLLM_CUTEDSL_MOE_FC2_PDL"
 _EVICT_FIRST_MAX_TOKENS = 512
 _EVICT_FIRST_MAX_LOCAL_EXPERTS = 512
 _announced = set()
@@ -64,6 +66,40 @@ def mxfp8_stationary() -> bool:
     the runner's autotuner cache key.
     """
     return _switch(_MXFP8_STATIONARY_ENV)
+
+
+def moe_compact_epilogue() -> int:
+    """Compact epilogues of the Rubin NVFP4 routed-expert GEMMs: a bit mask, 0 = off (default).
+
+    A routing tile with few valid rows is finished by all epilogue threads working on those rows only:
+    the default epilogues spend one thread per tile row, valid or not, so their time does not shrink
+    with the number of valid rows. ``TRTLLM_CUTEDSL_MOE_COMPACT_EPILOGUE`` bit 1: the FC1 kernel (gather
+    GEMM + gated activation + FP4 quantization); the valid rows of its output and of its scale factors
+    are bitwise equal to the default kernel's, and the padding rows of a compact tile are not written
+    (no consumer reads them). Bit 2: the FC2 kernel (GEMM + finalize); each valid row is scaled and
+    converted exactly as by the default kernel and reduced into the output the same way. 1-CTA tactics
+    with a 128-row tile only. Read when a kernel is built and part of its cache key.
+    """
+    value = os.environ.get(_MOE_COMPACT_EPILOGUE_ENV, "0").strip()
+    if value not in ("0", "1", "2", "3"):
+        raise ValueError(
+            f"{_MOE_COMPACT_EPILOGUE_ENV} must be 0, 1, 2 or 3, got {value!r}")
+    return int(value)
+
+
+def moe_fc2_pdl() -> bool:
+    """Overlap the start of the Rubin NVFP4 routed-expert FC2 kernel with the end of FC1.
+
+    ``TRTLLM_CUTEDSL_MOE_FC2_PDL=1`` (default 0 = off): the FC1 kernel (gather GEMM + activation) lets
+    its dependent kernel launch right after its own dependency wait, and the FC2 kernel (GEMM +
+    finalize) is launched with programmatic dependent launch. FC2 CTAs that start on SMs released by
+    FC1 set up and load the weights of their first tile while FC1 still runs, and wait for FC1 only
+    before loading its output. No value changes. FC2 reads its tile tables before that wait, so they
+    must be complete when it launches: in the MoE, FC1 waits for the sort that writes them, and the
+    FC2 tuning input hook waits for its own sort. 1-CTA FC2 tactics, not the die-local layout; needs
+    ``TRTLLM_ENABLE_PDL`` (on by default). Read when a kernel is built and part of its cache key.
+    """
+    return _switch(_MOE_FC2_PDL_ENV)
 
 
 def moe_weight_evict_first(num_tokens: int,

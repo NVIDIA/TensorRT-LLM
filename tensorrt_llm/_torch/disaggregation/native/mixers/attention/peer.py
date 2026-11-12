@@ -671,8 +671,18 @@ class AttentionPolicy:
     def validate_peer_compatible(
         self_page_table: KVCachePageTable | None,
         peer_page_table: KVCachePageTable | None,
+        self_tokens_per_block: int | None = None,
+        peer_tokens_per_block: int | None = None,
     ) -> None:
-        """Validate standalone draft storage on overlapping layers."""
+        """Validate standalone draft storage on overlapping layers.
+
+        Given both sides' tokens per block, the draft pages must also hold the
+        same bytes per token and KV head: they are copied as bytes, so a storage
+        dtype that differs between the peers (a DSpark drafter's
+        ``speculative_config.context_kv_dtype``) would be reinterpreted. Peers
+        may hold different numbers of heads per rank (a TP context rank and an
+        attention-DP generation rank), which the head routing accounts for.
+        """
         if self_page_table is not None and peer_page_table is not None:
             local_layers = get_layer_to_layer_group(self_page_table)
             peer_layers = get_layer_to_layer_group(peer_page_table)
@@ -687,6 +697,37 @@ class AttentionPolicy:
                     raise ValueError("Attention peers disagree on full-sequence CP-to-TP storage")
                 if local.cp_as_tp and local.total_kv_head_num != peer.total_kv_head_num:
                     raise ValueError("Standalone draft peers have different global KV head counts")
+                if local.cp_as_tp and self_tokens_per_block and peer_tokens_per_block:
+                    local_bytes = AttentionPolicy._draft_bytes_per_token_and_head(
+                        local, self_tokens_per_block
+                    )
+                    peer_bytes = AttentionPolicy._draft_bytes_per_token_and_head(
+                        peer, peer_tokens_per_block
+                    )
+                    if local_bytes != peer_bytes:
+                        raise ValueError(
+                            f"Standalone draft peers store layer {layer} with different bytes "
+                            f"per token and KV head (local {local_bytes}, peer {peer_bytes}); "
+                            "set the same speculative_config.context_kv_dtype on the context "
+                            "and generation servers."
+                        )
+
+    @staticmethod
+    def _draft_bytes_per_token_and_head(
+        layer_group: AttentionLayerGroup, tokens_per_block: int
+    ) -> dict:
+        """Bytes per token and KV head of each role's page in a standalone draft layer group.
+
+        A page holds the heads of one rank, so its size follows the rank's share
+        of the heads; dividing it out leaves the storage format.
+        """
+        heads_per_rank = max(int(layer_group.kv_head_num_per_rank), 1)
+        return {
+            "/".join(sorted(view.pool_role)): view.bytes_per_layer
+            / (tokens_per_block * heads_per_rank)
+            for view in layer_group.pool_views
+            if view.bytes_per_layer is not None
+        }
 
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention
