@@ -270,23 +270,23 @@ AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.USER_THROUGHPUT:
     re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
-    re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.MEDIAN_FIRST_TOKEN_TIME:
-    re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.P99_FIRST_TOKEN_TIME:
-    re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.INTER_TOKEN_TIME:
-    re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.MEDIAN_INTER_TOKEN_TIME:
-    re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.P99_INTER_TOKEN_TIME:
-    re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
-    re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME:
-    re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.P99_OUTPUT_TOKEN_TIME:
-    re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+|N/A)"),
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.MEDIAN_INFERENCE_TIME:
@@ -1692,9 +1692,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
                                        mpi_cmd)
 
-    def get_perf_result(self, outputs: Dict[int, str]) -> float:
+    def get_perf_result(self, outputs: Dict[int, str]) -> float | None:
         """
-        Get perf metric result from test output logs.
+        Get a measured value, or None for an explicitly unavailable metric.
         """
         metric = self._current_metric
         cmd_idx = metric.cmd_idx
@@ -1714,6 +1714,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             for line in outputs[cmd_idx].split("\n")
         ]
         metric_values = []
+        unavailable = False
         for match in regex_matches:
             if match:
                 # Handle multiple capture groups - use the first non-None group
@@ -1722,8 +1723,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if match.group(i) is not None:
                         value = match.group(i)
                         break
-                if value is not None:
+                if value == "N/A":
+                    unavailable = True
+                elif value is not None:
                     metric_values.append(float(value))
+
+        if not metric_values and unavailable:
+            print_info(f"Metric {metric_name} is N/A; skip recording it.")
+            return None
 
         if len(metric_values) == 0:
             if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
