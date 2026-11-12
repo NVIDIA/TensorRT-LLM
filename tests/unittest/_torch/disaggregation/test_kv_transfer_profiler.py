@@ -929,6 +929,44 @@ def test_wrapper_overrides_every_public_transceiver_method(
     assert not missing, f"Wrapper inherits transceiver defaults: {sorted(missing)}"
 
 
+def test_context_peer_readiness_tracks_backend_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preserve the backend's peer-wait and timeout-start observations."""
+    backend = _v2_owner()
+    session = SimpleNamespace(status=SessionStatus.INIT, receiver_ready=False, peer_ready_time=None)
+    backend._send_sessions = {17: session}
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+
+    assert wrapper.context_transfer_is_waiting_for_peer(req) is True
+    assert wrapper.context_transfer_peer_ready_time(req) is None
+
+    session.status = SessionStatus.TRANSFERRING
+    session.receiver_ready = True
+    session.peer_ready_time = 7.25
+    assert wrapper.context_transfer_is_waiting_for_peer(req) is False
+    assert wrapper.context_transfer_peer_ready_time(req) == 7.25
+
+    backend._send_sessions.clear()
+    assert wrapper.context_transfer_is_waiting_for_peer(req) is False
+    assert wrapper.context_transfer_peer_ready_time(req) is None
+
+
+@pytest.mark.parametrize(
+    "method", ["context_transfer_is_waiting_for_peer", "context_transfer_peer_ready_time"]
+)
+def test_context_peer_readiness_errors_are_preserved(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """Propagate backend readiness errors unchanged."""
+    backend = Mock(spec=KvCacheTransceiver)
+    wrapper = _wrap(backend, monkeypatch)
+    error = RuntimeError("backend readiness failure")
+    getattr(backend, method).side_effect = error
+    with pytest.raises(RuntimeError) as caught:
+        getattr(wrapper, method)(_request())
+    assert caught.value is error
+
+
 def test_deferred_receive_counts_are_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = Mock(spec=KvCacheTransceiver)
     backend.set_gen_deferred_receives.return_value = None
