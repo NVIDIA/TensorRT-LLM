@@ -1555,8 +1555,9 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 self.assertEqual(partition.miss_indices, [0, 1])
                 warning_once.assert_called_once()
 
-    def test_encoder_cache_reuses_full_video_hits_and_reencodes_partial_hits(self):
-        """Gemma4 video reuses full hits and re-encodes complete partial-hit requests."""
+    @pytest.mark.cpu_only
+    def test_encoder_cache_reuses_video_hits_and_encodes_only_missed_videos(self):
+        """Gemma4 video reuses full and partial hits; a partial hit encodes the missed video."""
         model = _Gemma4EncoderCacheHarness()
         shared_hash = [1] * 8
         first = model._get_or_encode_multimodal_embeddings([_make_keyed_video_param([shared_hash])])
@@ -1573,13 +1574,40 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             [_make_keyed_video_param([shared_hash, [2] * 8])]
         )
 
-        warning_once.assert_called_once()
+        warning_once.assert_not_called()
         self.assertEqual(model.encoder_calls, 2)
         torch.testing.assert_close(full_hit, first)
         torch.testing.assert_close(first, torch.ones(2, model.embedding_dim))
-        torch.testing.assert_close(partial_hit, torch.full((4, model.embedding_dim), 2.0))
+        # The cached first video, then the missed one encoded alone (one frame, two rows).
+        torch.testing.assert_close(
+            partial_hit,
+            torch.cat(
+                [torch.ones(2, model.embedding_dim), torch.full((2, model.embedding_dim), 2.0)]
+            ),
+        )
         torch.testing.assert_close(repeated, partial_hit)
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
+    @pytest.mark.cpu_only
+    def test_encoder_cache_video_partial_hit_without_partitions_becomes_full_miss(self):
+        """A video payload that declares no frame partitions still re-encodes the request."""
+        model = _Gemma4EncoderCacheHarness()
+        shared_hash = [1] * 8
+        model._get_or_encode_multimodal_embeddings([_make_keyed_video_param([shared_hash])])
+        param = _make_keyed_video_param([shared_hash, [2] * 8])
+        video = param.multimodal_data["video"]
+        # Three frames for two videos and no frame counts: no item axis to select by.
+        video["pixel_values"] = torch.arange(3).reshape(3, 1, 1)
+        param.item_metadata.input_partitions.clear()
+
+        with unittest.mock.patch(
+            "tensorrt_llm._torch.models.modeling_gemma4mm.logger.warning_once"
+        ) as warning_once:
+            partition = model.partition_encoder_cache(param, model._multimodal_encoder_cache)
+
+        self.assertTrue(partition.is_full_miss)
+        self.assertEqual(partition.miss_indices, [0, 1])
+        warning_once.assert_called_once()
 
     def test_chunked_prefill_reuses_cached_vision_embeddings(self):
         """Later active chunks slice cached features without rerunning vision."""

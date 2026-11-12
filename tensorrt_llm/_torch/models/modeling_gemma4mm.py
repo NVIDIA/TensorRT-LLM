@@ -284,6 +284,20 @@ def _gemma4_input_partitions(
     return partitions
 
 
+def _gemma4_video_partitions(param: MultimodalParams) -> dict[str, MultimodalItemPartition]:
+    """The video partitions a request declares or `_gemma4_input_partitions` derives, if any."""
+    metadata = param.item_metadata
+    if metadata is None:
+        return {}
+    partitions = metadata.input_partitions.get("video")
+    if partitions is None:
+        try:
+            partitions = _gemma4_input_partitions(param.multimodal_data, metadata).get("video")
+        except ValueError:
+            return {}
+    return partitions or {}
+
+
 def _fill_gemma4_implicit_inputs(
     multimodal_data: dict[str, Any],
     metadata: MultimodalItemMetadata,
@@ -1096,7 +1110,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "audio.audio_features",
         ]
 
-    # TODO(TRTLLM-14981): Implement finer-grained caching for videos.
     @classmethod
     def partition_encoder_cache(
         cls,
@@ -1111,13 +1124,15 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             and partition is not None
             and not partition.is_full_hit
             and not partition.is_full_miss
+            and not _gemma4_video_partitions(param)
         ):
-            # Gemma4 flattens each video's frames into dim 0 before encoding, so the persistent
-            # cache cannot (yet) rebuild a partial-hit input by video item. Re-encode the complete
-            # video payload while retaining cache lookup and reuse for full hits.
+            # Gemma4 flattens each video's frames into dim 0 before encoding. Videos whose frame
+            # spans are declared select their missed items like images do; without them the cache
+            # cannot rebuild a partial-hit input by video item, so re-encode the complete video
+            # payload while retaining cache lookup and reuse for full hits.
             logger.warning_once(
-                "Gemma4 video encoder cache has a partial hit, but frame slicing is not "
-                "supported; re-encoding the complete video payload.",
+                "Gemma4 video encoder cache has a partial hit, but the video payload declares "
+                "no frame partitions; re-encoding the complete video payload.",
                 key="gemma4_video_encoder_cache_partial_hit_unsupported",
             )
             return EncoderCachePartition(
