@@ -421,6 +421,17 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         self._apply_kv_cache_scales(kv_cache_scales)
         return self.load_record
 
+    def validate_request(self, request: LlmRequest) -> None:
+        """Reject invalid requests at admission, before they can fail a shared batch."""
+        vocab_size = self.model.vocab_size
+        end_id = request.py_end_id
+        if end_id is not None and not -1 <= end_id < vocab_size:
+            raise ValueError(f"EndId ({end_id}) is not within acceptable range [-1, {vocab_size}).")
+        if not request.check_token_id_range(vocab_size):
+            raise ValueError("Token ID out of range")
+        if getattr(request, "lora_task_id", None) is not None:
+            raise ValueError("LoRA requests are not supported by this Beam target")
+
     def _check_kv_cache_scales(self, table: Optional[dict]) -> None:
         if self.kv_cache_quant_algo != QuantAlgo.FP8:
             if table is not None:

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU routing diagnostics; no model construction or checkpoint allocation."""
+"""CPU admission and routing diagnostics; no model or checkpoint allocation."""
 
 import builtins
 import sys
@@ -267,3 +267,34 @@ def test_loader_admission_precedes_checkpoint_access(monkeypatch):
             is target
         )
     assert reads.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "ids,end_id,lora,error",
+    [
+        ([0, 9], None, None, None),
+        ([9], -1, None, None),
+        ([0], 9, None, None),
+        ([-1], None, None, "Token ID out of range"),
+        ([10], None, None, "Token ID out of range"),
+        ([0], -2, None, "EndId"),
+        ([0], 10, None, "EndId"),
+        ([0], None, 0, "LoRA requests are not supported"),
+    ],
+)
+def test_request_admission(ids, end_id, lora, error):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.modeling import (  # noqa: E501
+        ModelingV2BeamFullModelNvfp4Sm103Tp4 as Target,
+    )
+
+    target = NS(model=NS(vocab_size=10))
+    request = NS(
+        py_end_id=end_id,
+        lora_task_id=lora,
+        check_token_id_range=lambda n: all(0 <= token < n for token in ids),
+    )
+    if error is None:
+        Target.validate_request(target, request)
+    else:
+        with pytest.raises(ValueError, match=error):
+            Target.validate_request(target, request)
