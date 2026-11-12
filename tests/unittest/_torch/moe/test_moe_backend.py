@@ -61,10 +61,13 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
+    ActivationParamShape,
     MoEActivation,
+    MoEActivationSupport,
     SiTuActivation,
     SwigluActivation,
     SwigluBiasActivation,
+    install_activation_params,
     materialize_activation_params,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
@@ -101,6 +104,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
     trtllm_gen_leaf,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -145,6 +149,7 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
+    MXFP4WeightTRTLLMGenFusedMoEMethod,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     NVFP4MegaMoECuteDslMethod,
@@ -7036,3 +7041,145 @@ def test_configurable_moe_exposes_the_backend_lora_state():
     assert getattr(moe, "_moe_lora_enabled", False) is True
     moe.backend = SimpleNamespace()
     assert getattr(moe, "_moe_lora_enabled", False) is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("meta_init", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("gptoss", [False, True])
+@pytest.mark.parametrize(
+    "loading_mode",
+    [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ],
+)
+def test_mxfp4_fp8_trtllm_gen_accumulator_params(
+    monkeypatch: pytest.MonkeyPatch,
+    bias: bool,
+    gptoss: bool,
+    loading_mode: MoEWeightLoadingMode,
+    meta_init: bool,
+) -> None:
+    method = W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
+
+    class WeightOwner(MoEWeightOwnerMixin, torch.nn.Module):
+        activation_support = MoEActivationSupport(
+            kinds=frozenset({ActivationType.Swiglu, ActivationType.SwigluBias}),
+            alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
+            limit=ActivationParamShape.PER_EXPERT_TENSOR,
+        )
+
+        def _get_quant_method(self) -> W4A8MXFP4FP8TRTLLMGenFusedMoEMethod:
+            return method
+
+    def create_module() -> WeightOwner:
+        owner = WeightOwner()
+        owner.num_experts = 4
+        owner.expert_size_per_partition = 2
+        owner.initial_local_expert_ids = [1, 3]
+        owner.weight_loading_mode = loading_mode
+        owner.bias = bias
+        owner.activation = (
+            SwigluBiasActivation(
+                gate_sigmoid_scale=torch.tensor([1.702, 1.5], device="cpu"),
+                linear_offset=torch.tensor([1.0, 2.0], device="cpu"),
+                clamp=torch.tensor([7.0, 9.0], device="cpu"),
+            )
+            if gptoss
+            else DEFAULT_MOE_ACTIVATION
+        )
+        install_activation_params(owner)
+        return owner
+
+    def create_weight_storage(
+        self: MXFP4WeightTRTLLMGenFusedMoEMethod, module: torch.nn.Module
+    ) -> None:
+        module.register_parameter("w3_w1_weight", torch.nn.Parameter(torch.zeros(2, 4, 2)))
+        module.register_parameter("w2_weight", torch.nn.Parameter(torch.zeros(2, 2, 2)))
+        module.register_buffer("w3_w1_bias", torch.zeros(2, 4) if bias else None)
+        module.register_buffer("w2_bias", torch.zeros(2, 2) if bias else None)
+
+    def load_experts(
+        module: torch.nn.Module,
+        weights: dict[str, torch.Tensor],
+        mode: MoEWeightLoadingMode,
+        expert_ids: list[int],
+        w31: torch.Tensor,
+        w2: torch.Tensor,
+        b31: torch.Tensor | None,
+        b2: torch.Tensor | None,
+    ) -> None:
+        if bias:
+            assert b31 is not None and b2 is not None
+            b31.copy_(weights["fc1_bias"])
+            b2.copy_(weights["fc2_bias"])
+
+    # Weight packing is orthogonal to the scale contract and requires CUDA.
+    monkeypatch.setattr(MXFP4WeightTRTLLMGenFusedMoEMethod, "create_weights", create_weight_storage)
+    monkeypatch.setattr(MXFP4WeightTRTLLMGenFusedMoEMethod, "load_quant_scales", lambda *a: None)
+    monkeypatch.setattr(
+        MXFP4WeightTRTLLMGenFusedMoEMethod,
+        "cache_derived_state",
+        FusedMoEMethodBase.cache_derived_state,
+    )
+    monkeypatch.setattr(method, "load_expert_weights_to_dst", load_experts)
+    with torch.device("meta" if meta_init else "cpu"):
+        module = create_module()
+        module.create_weights()
+    if meta_init:
+        module.to_empty(device="cpu")
+
+    raw_beta = torch.tensor([1.0, 2.0])
+    raw_clamp = torch.tensor([7.0, 9.0])
+    fc1_bias = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
+    fc2_bias = torch.arange(1, 5, dtype=torch.float32).reshape(2, 2)
+    for fc1_scale, fc2_scale in ((0.5, 0.25), (0.25, 0.5)):
+        weights = {"fc1_bias": fc1_bias, "fc2_bias": fc2_bias}
+        if loading_mode == MoEWeightLoadingMode.VANILLA:
+            for expert in range(module.num_experts):
+                weights[f"{expert}.w1.input_scale"] = torch.tensor(fc1_scale)
+                weights[f"{expert}.w3.input_scale"] = torch.tensor(fc1_scale)
+                weights[f"{expert}.w2.input_scale"] = torch.tensor(fc2_scale)
+        else:
+            weights["gate_up_proj_input_scale"] = torch.tensor(fc1_scale)
+            weights["down_proj_input_scale"] = torch.tensor(fc2_scale)
+
+        module.load_weights([weights])
+        module.post_load_weights()
+        module.post_load_weights()
+        module.process_weights_after_loading()
+
+        torch.testing.assert_close(
+            module.fc31_input_dequant, torch.full((2,), fc1_scale / fc2_scale)
+        )
+        if gptoss:
+            torch.testing.assert_close(module.act_alpha, torch.tensor([1.702, 1.5]))
+            torch.testing.assert_close(module.act_beta, raw_beta / fc1_scale)
+            torch.testing.assert_close(module.act_clamp, raw_clamp / fc1_scale)
+        else:
+            assert module.act_beta is None
+            assert module.act_clamp is None
+        if bias:
+            torch.testing.assert_close(module.w3_w1_bias, fc1_bias / fc1_scale)
+            torch.testing.assert_close(module.w2_bias, fc2_bias / fc2_scale)
+        assert not hasattr(module, "_act_beta_unscaled")
+        assert not hasattr(module, "_act_clamp_unscaled")
+
+        # Runtime weights omit the non-persistent activation configuration.
+        with torch.device("meta" if meta_init else "cpu"):
+            restored = create_module()
+            restored.create_weights()
+        if meta_init:
+            restored.to_empty(device="cpu")
+        restored.load_state_dict(module.state_dict())
+        # A receiver can rebuild derived state without loading checkpoint weights.
+        restored.cache_derived_state()
+        restored.cache_derived_state()
+        if gptoss:
+            torch.testing.assert_close(restored.act_alpha, torch.tensor([1.702, 1.5]))
+            torch.testing.assert_close(restored.act_beta, raw_beta / fc1_scale)
+            torch.testing.assert_close(restored.act_clamp, raw_clamp / fc1_scale)
+        else:
+            assert restored.act_beta is None
+            assert restored.act_clamp is None
+        if bias:
+            torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
+            torch.testing.assert_close(restored.w2_bias, module.w2_bias)

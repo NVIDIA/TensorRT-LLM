@@ -854,10 +854,12 @@ never from the checkpoint:
   (`MoERejectReason.ACTIVATION_UNSUPPORTED`) whenever the layer's activation
   fills that register, so a backend that can serve it is still reachable.
 
-`W4A8_MXFP4_FP8` keeps non-persistent copies of beta and clamp in their
-semantic units. Each full weight load derives the kernel registers from
-these copies and the new FC1 dequant scale, so reload does not compound
-the conversion. FC1 and FC2 biases use their respective dequant scales.
+`W4A8_MXFP4_FP8` rebuilds its non-persistent activation registers from
+`module.activation` in `cache_derived_state`, including after meta-device
+materialization and runtime-weight transfer. Beta and clamp are divided by
+the FC1 dequant scale, so repeated cache-state rebuilds do not compound the
+conversion. FC1 and FC2 biases are converted during checkpoint loading using
+their respective dequant scales.
 
 `clamp_after_silu=True` is a separate execution capability rather than a
 register shape. The resolver declines a backend unless its declaration opts in,

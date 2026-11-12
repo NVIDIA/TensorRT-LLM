@@ -46,6 +46,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from .activation import (materialize_activation_params,
+                         resolve_activation_support)
 from .interface import MoEWeightLoadingMode
 
 # The declarations aligns with moe_kernels.h
@@ -7616,15 +7618,6 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
         self._online_eplb_not_supported(module)
 
-        # Keep the semantic constants across reloads; the kernel buffers are
-        # converted to accumulator units whenever new input scales are loaded.
-        for name in ("act_beta", "act_clamp"):
-            value = getattr(module, name)
-            module.register_buffer(
-                f"_{name}_unscaled",
-                value.detach().clone() if value is not None else None,
-                persistent=False)
-
     def load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
             self, w1_input_scale, w3_input_scale, w2_input_scale,
             dst_fc31_input_scale: torch.Tensor,
@@ -7671,26 +7664,32 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         # Step2: Load weight block scales.
         super().load_quant_scales(module, weights)
 
-        # Bias, beta and clamp are consumed before the GEMM dequant scale.
+        # Bias is consumed before the GEMM dequant scale.
         # FC1's output scale includes FC2 quantization, so use its gate scale
         # (the FC1 dequant scale alone) for the accumulator-unit conversion.
         if module.bias:
             module.w3_w1_bias.data.div_(
                 module.fc31_input_gate_dequant.view(-1, 1))
             module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
-        self._scale_activation_params(module)
 
     def cache_derived_state(self, module: torch.nn.Module) -> None:
         super().cache_derived_state(module)
-        self._scale_activation_params(module)
-
-    def _scale_activation_params(self, module: torch.nn.Module) -> None:
-        for name in ("act_beta", "act_clamp"):
-            value = getattr(module, name)
+        # Rebuild non-persistent registers from semantic activation constants,
+        # including after meta materialization or a runtime-weight transfer.
+        params = materialize_activation_params(
+            module.activation,
+            resolve_activation_support(module),
+            num_local_experts=module.expert_size_per_partition,
+            device=module.fc31_input_gate_dequant.device,
+            owner=type(module).__name__,
+        )
+        if params.alpha is not None:
+            module.act_alpha.data.copy_(params.alpha)
+        for name, value in (("act_beta", params.beta), ("act_clamp",
+                                                        params.clamp)):
             if value is not None:
-                value.data.copy_(
-                    getattr(module, f"_{name}_unscaled") /
-                    module.fc31_input_gate_dequant)
+                getattr(module,
+                        name).data.copy_(value / module.fc31_input_gate_dequant)
 
 
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
