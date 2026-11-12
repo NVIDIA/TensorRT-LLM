@@ -66,10 +66,15 @@ def _install_trace(directory: str | None) -> None:
 
 @contextlib.contextmanager
 def traced_llm(model: str, trace: Path, **kwargs):
-    """Use the normal MPI substrate, with a scoped observer on every worker."""
+    """Use the normal MPI substrate, with a scoped observer on every worker.
+
+    ``env_overrides`` is required: the engine is built inside its environment scope.
+    """
     from tensorrt_llm import LLM
     from tensorrt_llm.executor.utils import create_mpi_comm_session, get_spawn_proxy_process_env
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    from ._env import scoped_env_overrides
 
     trace.mkdir()
     world = kwargs["tensor_parallel_size"]
@@ -82,7 +87,10 @@ def traced_llm(model: str, trace: Path, **kwargs):
     try:
         session.submit_sync(_install_trace, str(trace))
         installed = True
-        with LLM(model, _mpi_session=session, **kwargs) as llm:
+        with (
+            scoped_env_overrides(kwargs.pop("env_overrides")) as rank_env,
+            LLM(model, _mpi_session=session, env_overrides=rank_env, **kwargs) as llm,
+        ):
             yield llm
     finally:
         try:

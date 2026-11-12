@@ -805,7 +805,7 @@ def test_model_loader_lets_a_model_read_its_own_checkpoint(
 
     checkpoint_loader = MagicMock(checkpoint_format=CheckpointFormat.MISTRAL)
     metrics = {}
-    startup_metadata = {}
+    startup_metadata = {"checkpoint_io_policy": "stale"}
     weight_mapper, weights_preloaded = load_model_from_auto_load_format(
         checkpoint_loader,
         "/checkpoint",
@@ -824,6 +824,7 @@ def test_model_loader_lets_a_model_read_its_own_checkpoint(
     assert events == [("load_checkpoint", "/checkpoint")]
     checkpoint_loader.get_initialized_weight_mapper.assert_not_called()
     checkpoint_loader.load_weights.assert_not_called()
+    # No checkpoint loader read the files, so no checkpoint IO policy applied.
     assert startup_metadata["checkpoint_io_policy"] is None
     assert "weight_population_seconds" in metrics
     assert "checkpoint_preparation_seconds" not in metrics
