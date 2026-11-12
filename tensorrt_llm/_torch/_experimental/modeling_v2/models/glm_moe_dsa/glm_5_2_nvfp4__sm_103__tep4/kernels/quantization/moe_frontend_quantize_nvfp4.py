@@ -26,6 +26,9 @@ _SCALE_BLOCK = 16
 _SCALES_PER_ROW = _HIDDEN // _SCALE_BLOCK
 _FP4_BYTES_PER_ROW = _HIDDEN // 2
 _BF16_PER_ZERO_STORE = 8
+# One CTA per row and the row count compiled in, so a larger count is one more variant: up
+# to 64 for MTP1 decode, 65..512 for the MTP3 / MTP5 decode widths (32 x 4, 32 x 6 rows).
+_MAX_TOKENS = 512
 
 QuantizeFn = Callable[..., None]
 _CACHE: dict[tuple[int, int, bool, bool, bool, int, int], QuantizeFn] = {}
@@ -246,8 +249,8 @@ def _validate(
     if input_tensor.ndim != 2 or input_tensor.shape[1] != _HIDDEN:
         raise ValueError(f"input must have shape [T,{_HIDDEN}], got {tuple(input_tensor.shape)}")
     token_count = int(input_tensor.shape[0])
-    if not 1 <= token_count <= 64:
-        raise ValueError(f"input T must be in [1,64], got {token_count}")
+    if not 1 <= token_count <= _MAX_TOKENS:
+        raise ValueError(f"input T must be in [1,{_MAX_TOKENS}], got {token_count}")
     if input_tensor.dtype != torch.bfloat16 or not input_tensor.is_contiguous():
         raise TypeError("input must be contiguous BF16")
     if global_scale.dtype != torch.float32 or global_scale.numel() != 1:

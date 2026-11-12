@@ -68,7 +68,7 @@ TestQwen3_5_35B_A3B::test_bf16_mtp_flashinfer_ring_replay:
 TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload:
   ref_al: 1.890148
   min_al: 1.7956406
-TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload:
+TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm:
   ref_al: 3.297978021978022
   min_al: 3.133079120879121
 # The usual 95% tolerance for these low values is below the no-acceptance
@@ -137,6 +137,12 @@ ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3:
 TestGLM53FlashFP8::test_mtp:
   ref_al: 3.384
   min_al: 3.215
+# GLM-5.3-Flash NVFP4, the modeling_v2 MTP-fused target: the checkpoint's MTP layer
+# chained for 3 drafts in the target's forward, B200 TP4/EP4, GSM8K under the harness
+# protocol. min_al is 95% of the measured value.
+TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp:
+  ref_al: 3.396
+  min_al: 3.226
 # Measured on B200, 1P1D TP1 with target and draft KV in one manager.
 # min_al is 95% of the measured value.
 TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv:
@@ -153,6 +159,15 @@ ModelingV2Glm52Nvfp4Sm103Tep4::mtp1:
   # self-referential; min_al is the automatic 95% of it.
   ref_al: 1.942036
   min_al: 1.844935
+# Read by TestModelingV2Glm52Nvfp4Sm103Tep4::test_mtp3_gsm8k_and_acceptance,
+# keyed as the mtp1 entry above. max_draft_len is 3, so acceptance length lives
+# in [1.0, 4.0].
+ModelingV2Glm52Nvfp4Sm103Tep4::mtp3:
+  # Full gsm8k on B300 under the test's MTP3 config: stock (modeling_v2="off")
+  # 3.367, modeling_v2 3.345. ref_al is the STOCK reading; min_al is the
+  # automatic 95% of it.
+  ref_al: 3.367398
+  min_al: 3.199028
 # Read by the tp1 acceptance-length cases of TestModelingV2Qwen38FlashNextNvfp4Sm103Default
 # (test_qwen4_exp.py, the `test_tp1_*` cases: the target at one rank). Keyed by target, layout
 # and variant for the same reason as the

@@ -10,12 +10,17 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm.logger import logger
 
 from ...kernels.gemm import self_attn_indexer_pre_indexer_proj_m64_n160_k6144_tf32 as _kernel
+from ...kernels.gemm import self_attn_indexer_prefill_wk_split_f32 as _wk_split
 from ...kernels.gemm import self_attn_prefill_projections_bf16 as _prefill
 
 #: Decode row counts the target compiles this entry for.
 ROWS = (1, 2, 4, 8, 16, 32, 48, 64)
+#: The MTP3 / MTP5 decode row counts (32 sequences x 4 / 6): the same kernel over two or
+#: three 64-row tiles, compiled only for an engine drafting more than one token.
+MTP_ROWS = (128, 192)
 
 #: Hidden 6144; 128 key columns, then 32 head-weight columns.
 _K, _KEY, _HEADS = _kernel.K, _kernel.INDEXER_K_DIM, _kernel.INDEXER_WEIGHT_DIM
@@ -28,10 +33,13 @@ PREFILL_MAX_ROWS = _prefill.MAX_ROWS
 @dataclass(frozen=True)
 class PrefillSplitHandle:
     """The prefill GEMM's `indexer_wk_weights` entry, any row count 1..`max_rows`.
-    `launch(x, weight, out)` writes the fp32 `[M, 160]` product into `out`."""
+    `launch(x, weight, out)` writes the fp32 `[M, 160]` product into `out`;
+    `split(out, key, head_weights)`, when built, writes its two column ranges to the
+    two buffers in one launch (keys rounded to bf16 as `Tensor.copy_` does)."""
 
     max_rows: int
     launch: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], object]
+    split: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None = None
 
 
 def compile(device_id: int, rows: int) -> _kernel.CompiledSplitOutputs:
@@ -54,20 +62,50 @@ def compile(device_id: int, rows: int) -> _kernel.CompiledSplitOutputs:
     return compiled
 
 
+def compile_ragged(device_id: int, max_rows: int = MTP_ROWS[-1]) -> _kernel.CompiledSplitOutputs:
+    """Compile the same kernel once on a symbolic row count: one handle for every row count
+    in `1..max_rows`, each row bitwise what a handle compiled for that count (or for 128 /
+    192 on a padded input) writes for it. For an engine drafting more than one token: its
+    decode row counts above 64 without an `MTP_ROWS` handle (a batch of fewer than 32
+    sequences, e.g. 96 / 144 rows at 24 requests).
+
+    Costs one CuTe DSL compile and two launches on zeros (`max_rows` and 65 rows), so the
+    module is loaded before any CUDA graph capture. Raises if the compile fails.
+    """
+    dev = torch.device("cuda", device_id)
+    with torch.cuda.device(device_id):
+        compiled = _kernel.compile_split_outputs_runtime_m(int(max_rows), "bf16")
+        weight = torch.zeros([_KEY + _HEADS, _K], dtype=torch.bfloat16, device=dev)
+        for rows in (int(max_rows), min(int(max_rows), 65)):
+            x = torch.zeros([rows, _K], dtype=torch.bfloat16, device=dev)
+            key = torch.empty([rows, _KEY], dtype=torch.bfloat16, device=dev)
+            head_weights = torch.empty([rows, _HEADS], dtype=torch.float32, device=dev)
+            _kernel.run_split_outputs(compiled, x, weight, key, head_weights)
+    return compiled
+
+
 def build_prefill(weight: torch.Tensor) -> PrefillSplitHandle:
     """Build the context-row handle against `weight`, the bf16 `[160, 6144]` operand the
     decode handles take, of any one indexer layer. Call at load.
 
     The handle takes the weight per call, so one serves every indexer layer. Costs
     one CuTe DSL compile (one schedule serves every row count) and one launch on
-    zeros. Raises if the vendored kernel has no such entry or the build fails.
+    zeros, plus the same for the one-launch column split. Raises if the vendored
+    kernel has no such entry or the GEMM build fails; if only the split fails to
+    build, the handle keeps the two copies.
     """
     dev = weight.device
     with torch.cuda.device(dev):
         launch = _prefill.build(_PREFILL_ENTRY, weight)
         x = torch.zeros([1, _K], dtype=torch.bfloat16, device=dev)
         launch(x, weight, torch.empty([1, _KEY + _HEADS], dtype=torch.float32, device=dev))
-    return PrefillSplitHandle(PREFILL_MAX_ROWS, launch)
+        try:
+            _wk_split.warm(dev)
+            split = _wk_split.split_
+        except Exception as e:  # noqa: BLE001 -- the handle keeps the two copies
+            logger.warning(f"modeling_v2 GLM-5.2: indexer column-split build failed ({e})")
+            split = None
+    return PrefillSplitHandle(PREFILL_MAX_ROWS, launch, split)
 
 
 def compile_all(
@@ -80,7 +118,10 @@ def compile_all(
     for m in rows:
         try:
             handles[int(m)] = compile(device_id, m)
-        except Exception:  # noqa: BLE001 -- that row count takes the fp32 projection
+        except Exception as e:  # noqa: BLE001 -- that row count takes the fp32 projection
+            logger.warning(
+                f"modeling_v2 GLM-5.2: indexer pre-projection build at {m} rows failed ({e})"
+            )
             continue
     return handles
 
@@ -97,7 +138,8 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
 
     With a `PrefillSplitHandle` the same product runs on the prefill GEMM (one
     fp32 accumulation per tile, no split-K) into an fp32 `[M, 160]` scratch,
-    then two copies: the keys rounded to bf16, the head weights as they are.
+    then one split launch writes the keys rounded to bf16 and the head weights as
+    they are (two `copy_` calls if the split kernel did not build).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -109,6 +151,8 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
         Cell(why="MTP width 2, one sequence", spec=dict(rows=2)),
         Cell(why="a mid decode row count, a quarter of the tile", spec=dict(rows=16)),
         Cell(why="the full decode batch, one whole 64-row tile", spec=dict(rows=64)),
+        Cell(why="MTP3's decode batch, 32 x 4 rows: two 64-row tiles", spec=dict(rows=128)),
+        Cell(why="MTP5's decode batch, 32 x 6 rows: three 64-row tiles", spec=dict(rows=192)),
         Cell(
             why="prefill, 65 rows: the first context row count, one partial 128-row tile",
             spec=dict(rows=65, prefill=True),
@@ -122,7 +166,9 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
 
     note = """
     The target compiles one decode handle per row count in `ROWS` (1, 2, 4, 8,
-    16, 32, 48, 64) and one prefill handle, which it uses above 64 rows. If the
+    16, 32, 48, 64) and one prefill handle, which it uses above 64 rows; an engine
+    drafting more than one token also compiles `MTP_ROWS` (128, 192) and uses them
+    for a decode step's rows only (a context step keeps the prefill handle). If the
     prefill build failed, those rows go to the fp32 `cute_dsl_projection`
     "ix_fused" kernel (or cuBLAS past it) at the target's call site.
 
@@ -146,8 +192,11 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
         if isinstance(compiled, PrefillSplitHandle):
             full = torch.empty([x.shape[0], _KEY + _HEADS], dtype=torch.float32, device=x.device)
             compiled.launch(x, weight, full)
-            key.copy_(full[:, :_KEY])
-            head_weights.copy_(full[:, _KEY:])
+            if compiled.split is not None:
+                compiled.split(full, key, head_weights)
+            else:
+                key.copy_(full[:, :_KEY])
+                head_weights.copy_(full[:, _KEY:])
         else:
             _kernel.run_split_outputs(compiled, x, weight, key, head_weights)
         return key, head_weights
@@ -201,3 +250,25 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
 
 
 cute_dsl_indexer_pre_proj_split = CuteDslIndexerPreProjSplit()
+
+
+def project_unsplit(
+    x: torch.Tensor, weight: torch.Tensor, compiled: PrefillSplitHandle
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The context-row product without the column split: one fp32 `[M, 160]` output and its
+    two column views `(keys [M, 128], head_weights [M, 32])`, row pitch 160. For consumers
+    that read them in place (the indexer K write's and q side's pitch-160 launchers, which
+    round the keys to bf16 on load as the split does). Same validity as the op's prefill
+    path; the weight must be the bf16 `[160, 6144]` operand of `build_prefill`."""
+    rows = int(x.shape[0])
+    assert 1 <= rows <= compiled.max_rows, (
+        f"the prefill handle serves 1..{compiled.max_rows} rows, got {rows}"
+    )
+    assert (
+        tuple(weight.shape) == (_KEY + _HEADS, _K)
+        and weight.is_contiguous()
+        and weight.dtype == torch.bfloat16
+    ), f"weight must be contiguous bf16 [{_KEY + _HEADS}, {_K}], got {tuple(weight.shape)}"
+    full = torch.empty([rows, _KEY + _HEADS], dtype=torch.float32, device=x.device)
+    compiled.launch(x, weight, full)
+    return full[:, :_KEY], full[:, _KEY:]

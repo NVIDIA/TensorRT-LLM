@@ -61,10 +61,10 @@ from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
-                           get_layer_attention_window, is_hybrid_linear,
-                           is_kimi_linear, is_mla, is_nemotron_hybrid,
-                           is_qwen3_hybrid, is_qwen4_exp, resolve_vocab_size,
-                           uses_vswa_kv_cache_layout)
+                           get_layer_attention_window, is_decode_only,
+                           is_hybrid_linear, is_kimi_linear, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+                           resolve_vocab_size, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
@@ -980,17 +980,19 @@ def _derive_draft_max_attention_window(
     return None
 
 
-def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
+def _fit_draft_pool_ratio(
+        draft_kv_config: KvCacheConfig,
+        has_mixed_precision_high_layers: bool = False) -> None:
     """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
     if draft_kv_config.pool_ratio is None:
         return
-    if draft_kv_config.mixed_precision_kv is not None:
-        # An MTP draft manager with mixed-precision KV has its own pool plus a
-        # mixed-precision high pool, so the target's pool_ratio does not fit it.
+    if (draft_kv_config.mixed_precision_kv is not None
+            or has_mixed_precision_high_layers):
+        # A mixed-precision draft manager has a high pool too; the target's ratio does not fit.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
-            "target KV cache only; the mixed-precision MTP draft KV cache sizes "
-            "its pools automatically.")
+            "target KV cache only; the MTP draft KV cache with mixed-precision "
+            "high layers sizes its pools automatically.")
         draft_kv_config.pool_ratio = None
     elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
           and len(draft_kv_config.pool_ratio) != 1):
@@ -1090,6 +1092,9 @@ class KvCacheCreator:
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
+        # Built once; the estimation build and the real build share it.
+        self._cold_page_codec_provider = None
+        self._cold_page_codec_provider_built = False
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
@@ -1254,6 +1259,7 @@ class KvCacheCreator:
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
                 is_disagg=self._is_disagg,
+                disable_overlap_scheduler=self._disable_overlap_scheduler,
                 **extra_kwargs))
         if include_request_cost:
             if cost.bytes_per_request is None:
@@ -2088,10 +2094,12 @@ class KvCacheCreator:
         # A completed chunk-aware profiling run already prices the cached-KV
         # staging buffers in the measured peak. Do not subtract an additional
         # workspace reserve or install an attended-KV admission cap for it.
+        # A decode-only worker never runs the context-MLA gather at all.
         profiled_mla_chunks = (py_executor is not None and not self._skip_est
                                and self._mla_chunked_profile_length is not None)
-        w_bytes_per_token = (0 if profiled_mla_chunks else
-                             get_attention_workspace_bytes_per_token(
+        w_bytes_per_token = (0 if profiled_mla_chunks
+                             or is_decode_only(self._sparse_attention_config)
+                             else get_attention_workspace_bytes_per_token(
                                  self._model_engine.model.model_config,
                                  self._mapping))
         workspace_is_chunked_prefill_bounded = True
@@ -2793,7 +2801,15 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
-        _fit_draft_pool_ratio(draft_kv_config)
+        # An MTP draft manager under the cold-page window has high layers too.
+        cold_page_window = getattr(cold_page_codec_provider,
+                                   "mixed_precision_high_window", None)
+        draft_has_high_layers = (
+            self._speculative_config.spec_dec_mode.is_mtp_one_model()
+            and cold_page_window is not None)
+        _fit_draft_pool_ratio(
+            draft_kv_config,
+            has_mixed_precision_high_layers=draft_has_high_layers)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -3515,6 +3531,29 @@ class KvCacheCreator:
             return kv_cache_config
         return kv_cache_config.model_copy(update=dropped)
 
+    def _create_kv_cache_compression_manager(
+            self, kv_cache_config: KvCacheConfig
+    ) -> Optional[KVCacheCompressionManager]:
+        """Build the configured KV-cache compression manager.
+
+        The cold-page codec provider is built once: the estimation build needs
+        its first/last-N window too, and it loads the ModelOpt KV scales. The
+        other managers are built per build, as the estimation one is shut down.
+        """
+        config = self._llm_args.kv_cache_compression_config
+        if config is None or config.algorithm != "quantization_for_cold_page":
+            return create_kv_cache_compression_manager(
+                config,
+                model_engine=self._model_engine,
+                kv_cache_config=kv_cache_config)
+        if not self._cold_page_codec_provider_built:
+            self._cold_page_codec_provider = create_kv_cache_compression_manager(
+                config,
+                model_engine=self._model_engine,
+                kv_cache_config=kv_cache_config)
+            self._cold_page_codec_provider_built = True
+        return self._cold_page_codec_provider
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
@@ -3577,13 +3616,8 @@ class KvCacheCreator:
         if not estimating_kv_cache:
             self._warn_if_admitted_concurrency_outruns_graph_capture()
 
-        compression_config = self._llm_args.kv_cache_compression_config
-        compression_manager = create_kv_cache_compression_manager(
-            compression_config,
-            model_engine=self._model_engine,
-            kv_cache_config=self_kv_cache_config,
-            estimating_kv_cache=estimating_kv_cache and not self._skip_est,
-        )
+        compression_manager = self._create_kv_cache_compression_manager(
+            self_kv_cache_config)
         cold_page_codec_provider = (
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)
@@ -4321,7 +4355,6 @@ def create_kv_cache_compression_manager(
     *,
     model_engine: ModelEngine,
     kv_cache_config: KvCacheConfig,
-    estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
     """Validate, select, and construct the configured manager before KVCM."""
     if config is None:
@@ -4335,8 +4368,6 @@ def create_kv_cache_compression_manager(
         if config.quant != "nvfp4":
             raise NotImplementedError(
                 f"Unsupported cold-page quantization format {config.quant!r}")
-        if estimating_kv_cache:
-            return None
         quant_config = model_engine.model.model_config.quant_config
         if (quant_config is not None and getattr(
                 quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4):
@@ -5054,6 +5085,7 @@ def create_torch_sampler_args(
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
     max_num_sequences: int,
+    watermark_config=None,
 ):
     # The sampler's per-slot state is indexed by sequence slots, so it must
     # be sized identically to the executor's slot pool.
@@ -5071,6 +5103,7 @@ def create_torch_sampler_args(
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
+        watermark_config=watermark_config,
     )
 
 
@@ -5104,6 +5137,7 @@ def instantiate_sampler(
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
         max_num_sequences=max_num_sequences,
+        watermark_config=getattr(llm_args, "watermark_config", None),
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
