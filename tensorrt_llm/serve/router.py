@@ -867,6 +867,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
                  enable_tokenization_cache: bool = False,
+                 checkpoint_format: Optional[str] = None,
                  **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -876,7 +877,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             tokenizer_dir,
             use_harmony=use_harmony,
             model_path=model_path,
-            enable_tokenization_cache=enable_tokenization_cache)
+            enable_tokenization_cache=enable_tokenization_cache,
+            checkpoint_format=checkpoint_format)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size

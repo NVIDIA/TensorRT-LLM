@@ -528,6 +528,12 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
         model_path = server_cfg.get("model")
         if model_path is not None:
             args["model_path"] = model_path
+    # The cache-aware router loads the servers' tokenizer and prompt renderer
+    # the way they do, which depends on the checkpoint format.
+    if router_type == "kv_cache_aware" and "checkpoint_format" not in args:
+        checkpoint_format = server_cfg.get("checkpoint_format")
+        if checkpoint_format is not None:
+            args["checkpoint_format"] = checkpoint_format
 
     # add fields that are not specific to router
     extract_keys = [
