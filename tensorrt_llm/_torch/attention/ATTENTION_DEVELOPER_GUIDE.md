@@ -507,12 +507,8 @@ preserve its routing semantics. The PrimTS sparse MLA library
 generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
 decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
 removes it. With sparse KV cache offload, it reads the compress-ratio-4
-layers' compressed rows from the sparse cache arena (§3.2.5). Two SM90 generation
-libraries are opt-in as well: `flash_attn4_generation` (FlashAttention-4 decode
-and linear speculative verification) and `sampling_shared_prefix` (shared-prefix
-attention for `n`-sample requests on KV Cache Manager V2), enabled together with
-`TLLM_FMHA_LIBS=+sampling_shared_prefix,+flash_attn4_generation`. Delta entries
-update the default membership and follow canonical registry order, while an exact list
+layers' compressed rows from the sparse cache arena (§3.2.5). Delta entries update the
+default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
 request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
@@ -571,7 +567,10 @@ while a phased library that supports the whole batch (the thop op,
 `pairs_with_whole_batch_context`; the manager then pairs the two in a
 `CombinedFmha`, and each step `serves_mixed_generation_rows(metadata)` decides
 whether the generation library takes that step's (uniform) generation rows or
-the whole-batch library serves the whole batch.
+the whole-batch library serves the whole batch. A library that serves only
+generation rows with the same number of query tokens sets
+`requires_uniform_generation_rows`; the manager then keys selection on
+`generation_rows_uniform`.
 
 For a configuration a library would serve *incorrectly* rather than not at
 all -- a failure inside the library's own kernels that selection cannot see
@@ -597,20 +596,7 @@ The FMHA package is split by role:
   in `key_input`/`value_input`, and `output` holds the phase's output view.
   MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
-  for non-MLA mixed batches, including the whole-batch pairing above.
-- `fmha/flash_attn4_kernels.py` holds the FlashAttention-4 (CuTe DSL, SM90)
-  generation kernels shared by the FA4 libraries: the FA4 loader, the step's
-  RoPE and paged K/V write, split-KV tables, split calls (with caller-owned
-  workspaces) and their merge.
-- `fmha/flash_attn4_generation.py` implements `flash_attn4_generation`: FA4
-  paged decode and linear speculative verification, including the EAGLE-3
-  draft layer and, when the cache is long enough, the generation rows of mixed
-  batches.
-- `fmha/sampling_shared_prefix.py` implements `sampling_shared_prefix`: per
-  step (`plan_step`) it groups the rows whose block tables start with the same
-  pages, and per layer `fmha/shared_prefix_fa4.py` attends each group's shared
-  pages once and every row's private pages, merging the two by log-sum-exp.
-  It keeps the `sharedPrefixAttnStats` counters.
+  for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
   batch state, cache storage, and kernels live in `fp4_mla/`. The absorption
@@ -876,6 +862,19 @@ argument because the runtime chooses it independently of the KV cache dtype,
 and the probe fixes the mask, layout and head ratio, so its answer does not by
 itself describe the configuration a given model will run. The context preparation check
 above is the authoritative check.
+
+#### 3.2.7 Opt-in SM90 generation libraries
+
+Two libraries are off by default and enabled together with
+`TLLM_FMHA_LIBS=+sampling_shared_prefix,+flash_attn4_generation`; see
+[Shared-Prefix Attention for n-Sample Requests](../../../docs/source/features/sampling-shared-prefix-attention.md).
+
+- `flash_attn4_generation` (`fmha/flash_attn4_generation.py`): FlashAttention-4
+  decode and linear speculative verification, with the kernels in
+  `fmha/flash_attn4_kernels.py`.
+- `sampling_shared_prefix` (`fmha/sampling_shared_prefix.py`,
+  `fmha/shared_prefix_fa4.py`): plans each step (`plan_step`) by grouping rows
+  that share leading KV pages, and attends each group's shared pages once.
 
 ## 4. Evaluating New Attention
 

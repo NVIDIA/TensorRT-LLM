@@ -24,10 +24,10 @@ This feature is a prototype: its settings and metrics may change.
 - H100 (SM90) GPUs. Other GPUs run the regular attention.
 - PyTorch backend, KV cache manager V2 (`use_kv_cache_manager_v2: true`), KV cache block
   reuse, bf16 KV cache.
-- Qwen2-architecture models (dense MHA/GQA, head size 64 or 128, no sliding window).
+- Dense MHA/GQA models with head size 64 or 128 and no sliding window, such as Qwen2 and Qwen3.
 - Linear speculative decoding (for example EAGLE-3) with at least 3 draft tokens per step.
 - CUDA graphs and the overlap scheduler.
-- Decode-only steps. A step that also carries a prefill runs the regular attention.
+- Decode-only steps. A step that also carries a prefill does not use shared-prefix attention.
 
 ## Usage
 

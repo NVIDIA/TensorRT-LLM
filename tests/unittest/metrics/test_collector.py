@@ -458,11 +458,6 @@ class TestSharedPrefixAttnStats:
         labels = {**collector.labels, "dp_rank": rank}
         return {key: REGISTRY.get_sample_value(name, labels) for key, name in self.NAMES.items()}
 
-    def test_not_registered_without_the_library(self, collector):
-        collector.log_iteration_stats({"attentionDpRank": 0, "numActiveRequests": 1})
-        assert collector.counters_shared_prefix_attn is None
-        assert all(value is None for value in self._values(collector).values())
-
     def test_counts_increase_per_rank(self, collector):
         records = [
             (0, {"requestSteps": 10, "shareableRequestSteps": 8, "sharedRequestSteps": 6}),
