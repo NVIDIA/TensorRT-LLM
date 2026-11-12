@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._errors import ConfigInputError, UnsupportedError
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
@@ -24,10 +25,12 @@ from ..distributed import AllReduce
 from ..modules.logits_processor import scale_and_soft_cap_logits
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
-    DFLASH_CONTEXT_LOWERING,
+    DFLASH_FOLDED_DECODE_LOWERING,
+    DFlashTrtllmGenOps,
     dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
+    get_dflash_folded_decode_chunk_size,
     get_dflash_paged_append,
     get_dflash_trtllm_gen_ops,
 )
@@ -157,7 +160,7 @@ def dflash_trtllm_windowed_block_attention(
     """Block attention through the trtllm-gen decode kernel, into ``out``.
 
     Serves a causal layer (windowed or not) and a non-causal windowed one; a
-    non-causal unwindowed layer takes the context kernel instead. trtllm-gen
+    non-causal unwindowed layer folds block queries into decode heads. trtllm-gen
     windows only causal attention, so the non-causal windowed case runs the
     causal decode with its log-sum-exp and then adds the block keys after each
     query (:func:`dflash_merge_future_block_attention`).
@@ -201,8 +204,79 @@ def dflash_trtllm_windowed_block_attention(
         lse = decoded[1] * TRTLLM_GEN_LSE_LN2
         out.copy_(
             dflash_merge_future_block_attention(
-                out, lse, query, block_key, block_value, head_dim**-0.5, window_right
+                out,
+                lse,
+                query,
+                block_key.to(layer_cache.dtype),
+                block_value.to(layer_cache.dtype),
+                head_dim**-0.5,
+                window_right,
             )
+        )
+
+
+def dflash_trtllm_folded_block_attention(
+    trtllm_gen_ops: DFlashTrtllmGenOps,
+    query: torch.Tensor,
+    layer_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    workspace: torch.Tensor,
+    counters: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Full non-causal attention with bounded chunks of folded query heads.
+
+    Args:
+        query: [B, block, Hq, D] block queries.
+        layer_cache: [pages, 2, Hkv, page_size, D] HND pages containing
+            the complete context and draft block.
+        block_tables: [B, max_pages] page indices for each request.
+        seq_lens: [B] context plus block lengths, shared by all query chunks.
+        out: [B * block, Hq, D] output in the original query order.
+    """
+    batch, block_size, num_heads, head_dim = query.shape
+    num_kv_heads = layer_cache.shape[2]
+    chunk_size = get_dflash_folded_decode_chunk_size(block_size, num_heads, num_kv_heads)
+    group = num_heads // num_kv_heads
+    grouped_query = query.reshape(batch, block_size, num_kv_heads, group, head_dim)
+    grouped_out = out.view(batch, block_size, num_kv_heads, group, head_dim)
+    for start in range(0, block_size, chunk_size):
+        end = min(start + chunk_size, block_size)
+        tokens = end - start
+        q_folded = (
+            grouped_query[:, start:end]
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch, num_kv_heads * tokens * group, head_dim)
+            .contiguous()
+        )
+        out_folded = q_folded.new_empty(q_folded.shape, dtype=out.dtype)
+        trtllm_gen_ops.batch_decode_with_kv_cache(
+            query=q_folded,
+            kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=head_dim**-0.5,
+            bmm2_scale=1.0,
+            window_left=-1,
+            out=out_folded,
+            sinks=None,
+            enable_pdl=False,
+            kv_layout="HND",
+            backend="trtllm-gen",
+            q_len_per_req=1,
+            max_q_len=None,
+            cum_seq_lens_q=None,
+            kv_cache_sf=None,
+            uses_shared_paged_kv_idx=True,
+            bmm1_scale_log2=None,
+            multi_ctas_kv_counter_buffer=counters,
+        )
+        grouped_out[:, start:end].copy_(
+            out_folded.view(batch, num_kv_heads, tokens, group, head_dim).permute(0, 2, 1, 3, 4)
         )
 
 
@@ -597,7 +671,7 @@ class DFlashForCausalLM(nn.Module):
         pretrained_cfg = draft_config.pretrained_config
         try:
             DraftModelClass, _ = get_model_architecture(pretrained_cfg)
-        except RuntimeError:
+        except (RuntimeError, ConfigInputError, UnsupportedError):
             model_type = pretrained_cfg.model_type
             arch_name = "".join(w.capitalize() for w in model_type.split("_")) + "ForCausalLM"
             logger.info(
@@ -635,7 +709,6 @@ class DFlashForCausalLM(nn.Module):
         )
 
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
-        # Upstream keeps the dflash_config override; rubin-advance dropped it.
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
@@ -1581,7 +1654,7 @@ class DFlashForCausalLM(nn.Module):
             elif window_size[0] >= 0:
                 lowering = "causal decode + future-block merge"
             else:
-                lowering = DFLASH_CONTEXT_LOWERING
+                lowering = DFLASH_FOLDED_DECODE_LOWERING
             logger.info_once(
                 f"DFlash draft layer {layer_idx}: causal={causal}, "
                 f"window={window_size}, TRTLLM lowering: {lowering}.",
@@ -1601,16 +1674,25 @@ class DFlashForCausalLM(nn.Module):
         head_dim: int,
     ) -> None:
         trtllm_gen_ops = self._dflash_trtllm_gen_ops
-        workspace_bytes = trtllm_gen_ops.get_workspace_size(
-            dtype=dtype,
-            num_tokens=max_batch_size * block_size,
-            num_gen_tokens=max_batch_size * block_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_dim,
-            max_num_requests=max_batch_size,
-            rotary_embedding_dim=0,
-            fp8_context_fmha=False,
+        shapes = [(max_batch_size * block_size, num_heads)]
+        if DFLASH_FOLDED_DECODE_LOWERING in self.validate_block_attention_windows():
+            folded_chunk_size = get_dflash_folded_decode_chunk_size(
+                block_size, num_heads, num_kv_heads
+            )
+            shapes.append((max_batch_size, num_heads * folded_chunk_size))
+        workspace_bytes = max(
+            trtllm_gen_ops.get_workspace_size(
+                dtype=dtype,
+                num_tokens=tokens,
+                num_gen_tokens=tokens,
+                num_heads=heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_dim,
+                max_num_requests=max_batch_size,
+                rotary_embedding_dim=0,
+                fp8_context_fmha=False,
+            )
+            for tokens, heads in shapes
         )
         device = torch.device(device)
         is_capturing = torch.cuda.is_current_stream_capturing()
@@ -1643,7 +1725,7 @@ class DFlashForCausalLM(nn.Module):
 
         sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
-            num_heads, max_batch_size, sm_count
+            max(heads for _, heads in shapes), max_batch_size, sm_count
         )
         counters = self._dflash_trtllm_gen_counters
         counters_need_allocation = (
@@ -1740,6 +1822,11 @@ class DFlashForCausalLM(nn.Module):
                 raise RuntimeError(
                     f"DFlash {self.dflash_attention_backend} requires a paged "
                     "context cache and page table."
+                )
+            if any(cache.dtype != noise_embedding.dtype for cache in ctx_kv_cache):
+                raise ValueError(
+                    "DFlash paged KV cache must use the draft activation dtype; "
+                    "quantized context-cache writes are not supported."
                 )
             trtllm_gen_ops = self._dflash_trtllm_gen_ops
             fa4_fwd = self._dflash_fa4_fwd
@@ -1965,7 +2052,7 @@ class DFlashForCausalLM(nn.Module):
                 if causal or window_left >= 0:
                     dflash_trtllm_windowed_block_attention(
                         trtllm_gen_ops,
-                        Q_bshd,
+                        q_flat.view_as(Q_bshd),
                         k_noise_bshd,
                         v_noise_bshd,
                         layer_cache,
@@ -1979,41 +2066,16 @@ class DFlashForCausalLM(nn.Module):
                         out_flat,
                     )
                 else:
-                    cum_seq_lens_q = torch.arange(
-                        0,
-                        (B + 1) * block_size,
-                        block_size,
-                        dtype=torch.int32,
-                        device=hidden_states.device,
-                    )
-                    cum_seq_lens_kv = torch.cat(
-                        (
-                            torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
-                            seq_lens_after.cumsum(0, dtype=torch.int32),
-                        )
-                    )
-                    trtllm_gen_ops.batch_context_with_kv_cache(
-                        query=q_flat,
-                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
-                        workspace_buffer=self._dflash_trtllm_gen_workspace,
-                        block_tables=block_tables,
-                        seq_lens=seq_lens_after,
-                        max_q_len=block_size,
-                        max_kv_len=pages_per_slot * page_size,
-                        bmm1_scale=head_dim**-0.5,
-                        bmm2_scale=1.0,
-                        batch_size=B,
-                        cum_seq_lens_q=cum_seq_lens_q,
-                        cum_seq_lens_kv=cum_seq_lens_kv,
-                        window_left=window_left,
-                        out=out_flat,
-                        sinks=None,
-                        enable_pdl=False,
-                        kv_layout="HND",
-                        kv_cache_sf=None,
-                        uses_shared_paged_kv_idx=True,
-                        causal=False,
-                        multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                    dflash_trtllm_folded_block_attention(
+                        trtllm_gen_ops,
+                        q_flat.view(B, block_size, num_heads_per_rank, head_dim),
+                        layer_cache,
+                        block_tables,
+                        seq_lens_after,
+                        pages_per_slot * page_size,
+                        self._dflash_trtllm_gen_workspace,
+                        self._dflash_trtllm_gen_counters,
+                        out_flat,
                     )
             elif self.dflash_attention_backend == "FA4":
                 layer_cache = ctx_kv_cache[layer_idx]

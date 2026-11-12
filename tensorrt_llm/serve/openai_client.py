@@ -18,7 +18,6 @@ import errno
 import json
 import os
 import traceback
-import zlib
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager, aclosing
 from types import TracebackType
@@ -50,6 +49,7 @@ from tensorrt_llm.serve.disagg_auth import (
     build_subagent_affinity_headers,
     request_requires_internal_disagg_auth,
 )
+from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -240,6 +240,11 @@ def _server_base_url(server: str) -> str:
     return f"http://{server}".rstrip("/")
 
 
+def _server_netloc(server_or_url: str) -> str:
+    """Return host:port of a router server entry or of a URL built from one."""
+    return urlsplit(_server_base_url(server_or_url)).netloc
+
+
 class _ResponseStartBound:
     """Wrap a worker request so that its response must start within a time limit.
 
@@ -336,7 +341,7 @@ class OpenAIHttpClient(OpenAIClient):
         self._refused_affinity_ports: dict[str, float] = {}
 
     def _url_server(self, server: str, request: UCompletionRequest) -> str:
-        """host:port to send a request routed to server to.
+        """Server entry to send a request routed to server to, with the scheme of server kept.
 
         With frontend affinity, a request carrying a conversation id goes to
         the affinity port of the frontend picked by crc32(conversation_id) % K;
@@ -351,14 +356,15 @@ class OpenAIHttpClient(OpenAIClient):
         if not conversation_id:
             return server
         num_frontends, stride = self._frontend_affinity
-        host, _, port = server.rpartition(":")
-        frontend = zlib.crc32(conversation_id.encode()) % num_frontends
+        host, _, port = server.rstrip("/").rpartition(":")
+        frontend = frontend_of_conversation(conversation_id, num_frontends)
         affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
-        refused_at = self._refused_affinity_ports.get(affinity_server)
+        refused_key = _server_netloc(affinity_server)
+        refused_at = self._refused_affinity_ports.get(refused_key)
         if refused_at is not None:
             if get_steady_clock_now_in_seconds() - refused_at < _REFUSED_AFFINITY_PORT_BYPASS_SECS:
                 return server
-            del self._refused_affinity_ports[affinity_server]
+            del self._refused_affinity_ports[refused_key]
         return affinity_server
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
@@ -703,7 +709,7 @@ class OpenAIHttpClient(OpenAIClient):
                         f"Context frontend affinity port of {url} refused the connection: "
                         f"{e} - sending to the shared port {fallback_url}"
                     )
-                    self._refused_affinity_ports[urlsplit(url).netloc] = (
+                    self._refused_affinity_ports[_server_netloc(url)] = (
                         get_steady_clock_now_in_seconds()
                     )
                     url, fallback_url = fallback_url, None

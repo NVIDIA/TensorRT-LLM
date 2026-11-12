@@ -24,6 +24,9 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_vanilla import VanillaMoE
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     PostTransformQualificationDecision,
@@ -37,6 +40,10 @@ ReceiverPreparer = Callable[[nn.Module, nn.Module], None]
 ProducerPreparer = Callable[[nn.Module], None]
 StateProbe = Callable[[nn.Module], object]
 OutputProbe = Callable[[nn.Module], object]
+
+# Runtime constraints that a profile qualifying a model with routed experts
+# must pin: the routed-expert layout depends on the MoE backend and partition.
+_MOE_RUNTIME_CONSTRAINTS = ("moe_backends", "moe_tp_sizes", "moe_ep_sizes", "moe_cluster_sizes")
 
 
 class AllReduceStub(nn.Module):
@@ -95,6 +102,46 @@ def module_state_snapshot(model: nn.Module) -> dict[str, object]:
                 seen_configs.add(id(value))
                 state[key] = value.to_dict()
     return state
+
+
+def keep_factory_parameters(
+    prepare_producer: ProducerPreparer,
+) -> tuple[ProducerPreparer, dict[str, torch.Tensor]]:
+    """Wrap `prepare_producer` to copy the factory parameters before it overwrites them.
+
+    Returns the wrapped preparer for `PostTransformQualificationCase` and the
+    copies, keyed by parameter name, for `assert_every_parameter_was_loaded`.
+    """
+    factory_parameters: dict[str, torch.Tensor] = {}
+
+    def prepare(model: nn.Module) -> None:
+        factory_parameters.update(
+            (name, parameter.detach().clone()) for name, parameter in model.named_parameters()
+        )
+        prepare_producer(model)
+
+    return prepare, factory_parameters
+
+
+def assert_every_parameter_was_loaded(
+    producer: nn.Module, factory_parameters: dict[str, torch.Tensor]
+) -> None:
+    """Assert that `prepare_producer` overwrote every parameter of the factory fill.
+
+    The lifecycle probes then compare bytes that came from the checkpoint
+    through the weight mapper rather than the factory's placeholder values.
+    `factory_parameters` comes from `keep_factory_parameters`.
+    """
+    assert factory_parameters, "The producer was never prepared"
+    # Look parameters up by the factory's canonical names: after
+    # `setup_aliases()` the producer also reaches some of them through
+    # `next_layer_layernorm` alias names.
+    unchanged = [
+        name
+        for name, factory_parameter in factory_parameters.items()
+        if torch.equal(producer.get_parameter(name), factory_parameter)
+    ]
+    assert unchanged == [], f"Parameters not written by the producer load: {unchanged}"
 
 
 def copy_post_transform_parameters(producer: nn.Module, receiver: nn.Module) -> None:
@@ -238,6 +285,26 @@ def _assert_named_tensors_equal(
             raise AssertionError(f"Post-transform {tensor_kind} {name!r} bytes differ")
 
 
+def _holds_routed_experts(model: nn.Module) -> bool:
+    return any(
+        is_moe_weight_owner(module) or isinstance(module, VanillaMoE) for module in model.modules()
+    )
+
+
+def _runs_real_transform(module: nn.Module) -> bool:
+    """Whether `ModelLoader._walk_transform` would run a transform on `module`.
+
+    Reads the hook from the class, because the call recorders replace it on the
+    instance; the no-op default of `DecoderModelForCausalLM` transforms nothing.
+    """
+    hook = getattr(type(module), "transform_weights", None)
+    return (
+        hook is not None
+        and hook is not DecoderModelForCausalLM.transform_weights
+        and not getattr(module, "_weights_removed", False)
+    )
+
+
 def _install_transform_call_recorders(model: nn.Module) -> list[str]:
     calls: list[str] = []
     for name, module in model.named_modules():
@@ -279,6 +346,16 @@ def assert_post_transform_lifecycle_equivalent(
     )
     assert decision.profile is not None
     assert decision.profile.profile_id == case.profile_id
+    # MoE-ness comes from the constructed model, not from the profile, so a
+    # profile that leaves the routed-expert backend or partition open cannot
+    # pass as a dense one.
+    if _holds_routed_experts(receiver):
+        constraints = decision.profile.runtime_constraints
+        unpinned = [name for name in _MOE_RUNTIME_CONSTRAINTS if getattr(constraints, name) is None]
+        assert not unpinned, (
+            f"Profile {case.profile_id!r} qualifies a model with routed experts but leaves "
+            f"{unpinned} unconstrained"
+        )
 
     unqualified_model = case.unqualified_model_factory()
     unqualified_decision = case.qualify_model(unqualified_model)
@@ -308,6 +385,16 @@ def assert_post_transform_lifecycle_equivalent(
     ModelLoader._walk_cache_state(receiver)
 
     assert transform_calls == [], f"Staged receiver invoked transform_weights(): {transform_calls}"
+    # Staged finalization marks only modules that already carry the guard, and
+    # a later transform walk runs every module left unmarked, so each module
+    # with a transform must declare the guard before any weight load.
+    unmarked = [
+        name or type(module).__name__
+        for name, module in receiver.named_modules()
+        if _runs_real_transform(module)
+        and getattr(module, "_weights_transformed", False) is not True
+    ]
+    assert unmarked == [], f"Staged finalization left transform modules unmarked: {unmarked}"
     assert _transform_guard_state(receiver) == _transform_guard_state(producer)
 
     _assert_named_tensors_equal(

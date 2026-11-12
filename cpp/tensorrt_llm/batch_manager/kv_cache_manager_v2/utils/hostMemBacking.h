@@ -56,6 +56,12 @@ struct HostMemBackingOptions
     //! fails rather than silently running with first-touch placement, which
     //! would take a remote page instead of refusing.
     bool allowRemoteNumaFallback = true;
+
+    //! Whether the range asks for transparent huge pages. Only a range that is large,
+    //! long-lived and walked sequentially gains from them; any other host range stays on
+    //! small pages so it neither inflates its footprint nor stalls on compaction.
+    //! TLLM_KV_CACHE_MANAGER_V2_THP overrides this for every range (see hostUseThp).
+    bool useThp = false;
 };
 
 //! Physical backing for the host tier: an address range reserved on

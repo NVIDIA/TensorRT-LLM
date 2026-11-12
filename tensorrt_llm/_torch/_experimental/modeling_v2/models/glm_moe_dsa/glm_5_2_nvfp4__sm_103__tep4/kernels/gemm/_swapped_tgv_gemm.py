@@ -76,6 +76,38 @@ class CompiledSwappedTgvGemm:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled_bmm(a, b, c, None, stream)
 
+    def launch_rows(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Launch on ``1..compiled M`` rows: the same compiled object at a runtime row count.
+
+        The grid (``ceil_div`` of the output's dynamic shape), the TMA descriptors and the
+        epilogue's bounds predicate all take the row count from the tensors, so a row's
+        output is bitwise what the compiled M computes for it. Feature dimensions and the
+        weight must match the compile.
+
+        :raises ValueError: If a feature dimension or the weight differs from the compile,
+            or the row count is outside ``1..compiled M``.
+        """
+        rows = int(input_tensor.shape[0])
+        if (
+            not 0 < rows <= int(self.input_shape[0])
+            or tuple(input_tensor.shape[1:]) != tuple(self.input_shape[1:])
+            or weight.shape != self.weight_shape
+            or tuple(output.shape) != (rows, int(self.output_shape[1]))
+        ):
+            raise ValueError(
+                "compiled TGV projection runtime-M mismatch: compiled input/weight/output="
+                f"{(self.input_shape, self.weight_shape, self.output_shape)}, got "
+                f"{(input_tensor.shape, weight.shape, output.shape)}"
+            )
+        a, b, c = _make_runtime_arguments(input_tensor, weight, output, self.element_spec)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self.compiled_bmm(a, b, c, None, stream)
+
 
 def _make_runtime_arguments(
     input_tensor: torch.Tensor,

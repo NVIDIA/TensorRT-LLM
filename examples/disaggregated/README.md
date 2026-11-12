@@ -76,7 +76,7 @@ Set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` to select the NIXL LIBFABRIC backend
 - The source build requires the `pkg-config` command to discover hwloc. Ubuntu container base setup installs the `pkg-config` package; standalone builds must provide it as well.
 - NIXL's LIBFABRIC build requires development files for hwloc 2.3 or later.
 - NGC PyTorch 26.09 builds reuse HPC-X hwloc 2.7.1 under `/usr/local/mpi`, with `/usr/local/mpi/lib/pkgconfig` prepended to `PKG_CONFIG_PATH`. Non-NGC SBSA Ubuntu 24.04 builds reuse system hwloc 2.10.0. Neither configuration rebuilds hwloc when these development files are present.
-- If `pkg-config` cannot find a suitable version, the installer builds and retains hwloc 2.12.2 under `/usr/local`. This applies to Rocky 8's older hwloc 2.2.0. The system RPM and files remain installed, but the loader cache prefers the new library; this also affects other hwloc consumers, including Open MPI.
+- If `pkg-config` cannot find a suitable version, the installer builds and retains hwloc 2.12.2 under `/opt/nvidia/nixl-deps/hwloc`, exposing it to the NIXL build through `PKG_CONFIG_PATH`. This applies to Rocky 8's older hwloc 2.2.0. The fallback does not change the system hwloc installation or global runtime library search configuration. Running the NIXL LIBFABRIC backend requires a compatible hwloc runtime supplied separately.
 - Custom installations must provide compatible development and runtime libraries and expose `hwloc.pc` through `PKG_CONFIG_PATH`.
 
 **GDRCopy (for the source-build installer)**
@@ -551,6 +551,13 @@ disagg_cluster:
     generation_servers: 1
   heartbeat_interval_sec: 5
   inactive_interval_sec: 10
+  # Only for an etcd:// cluster_uri, see below:
+  # user: <etcd user>
+  # password: <etcd password>
+  # ca_cert: /path/to/ca.pem
+  # cert_key: /path/to/client-key.pem
+  # cert_cert: /path/to/client-cert.pem
+  # record_auth_key: <shared secret>
 ```
 - `cluster_uri`: the http address of disagg-server like `http://<your-disagg-server-host>:<your-disagg-server-port>` or a pre-configured Etcd server address like `etcd://<your-etcd-host>:2379`.
 - `cluster_name` : optional namespace to isolate multiple disagg-clusters in Etcd.
@@ -558,6 +565,10 @@ disagg_cluster:
 the active context/generation servers is below the corresponding threshold.
 - `heartbeat_interval_sec`: frequency at which context/generation servers send heartbeats to the disagg-server.
 - `inactive_interval_sec`: A server is marked inactive if no heartbeat is received within this interval (set higher than the heartbeat interval).
+
+To use an ETCD server with TLS, set `ca_cert` to the path of the PEM file of the CA certificate, and for a client certificate set `cert_key` and `cert_cert` to the paths of the PEM files of the client key and certificate. To use ETCD authentication, set `user` and `password` together with `ca_cert`: the etcd client sends its authentication token only over a TLS connection, and the configuration is rejected if `user` and `password` are set without `ca_cert`. These settings apply to an `etcd://` `cluster_uri` only and are read from the configuration file, not from the command line. The ETCD user needs read and write permission on the `/trtllm-disagg/` key prefix. The servers connect to ETCD on first use and log in again when ETCD stops accepting the authentication token. When a watch stream to ETCD ends, for example when ETCD restarts, the disaggregated server watches again and catches up with the servers that registered or left meanwhile.
+
+Set `record_auth_key` to the same non-empty secret in the `disagg_cluster` section of the disaggregated server and of every context/generation server: servers then sign the records they register, and readers ignore records without a valid signature. A valid signature shows that a server with the key wrote the record, not that the record is current: a client that can write to ETCD can store a record again after its server has left. Access control of the store itself comes from the ETCD server, for example with the authentication above.
 
 Note that the disaggregated server and all the context/generation servers should have the same `disagg_cluster` configuration values, or the disaggregated server may not be able to keep alive or detect inactivity the other servers properly. If `disagg_cluster` section is specified, 
 the disaggregated server and all context/generation worker configs should also set the

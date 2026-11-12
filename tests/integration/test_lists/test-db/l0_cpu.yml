@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 version: 0.0.1
 l0_cpu:
 - condition:
@@ -14,8 +16,8 @@ l0_cpu:
   tests:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
-  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_eagle3_worker_api.py
-  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_spec_tail_contracts.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_modeling_v2_spec_tail_contracts.py
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_drafter_fullctx_cells.py
   # MiniMax-M3 target unit tests.
@@ -38,12 +40,37 @@ l0_cpu:
   - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
+  # Disagg cancellation stress harness: marathon config validation and attach-mode
+  # setup against local stubs, no GPUs. The marathon itself runs from QA's stress list.
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_all_marathon_yamls_parse_and_validate
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_accepts_supported_modes[log_only]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_accepts_supported_modes[full_cancel_poison]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_defaults_to_python
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_rejects_v1_with_python
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_rejects_non_python_transceiver[cpp]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_rejects_non_python_transceiver[auto]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_rejects_non_python_transceiver[unknown]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_stress_config_rejects_unknown_mode
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_external_cluster_config_parses_without_env
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_external_cluster_rejects_full_cancel_poison
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_external_cluster_rejects_bad_worker_role
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_binds_endpoint_and_log_specs
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_fails_on_unset_env
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_requires_readable_logs[ctx]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_requires_readable_logs[gen]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_requires_readable_logs[server]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_rejects_an_unhealthy_orchestrator[http_500]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_rejects_an_unhealthy_orchestrator[refused]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_rejects_an_unhealthy_orchestrator[timeout]
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_external_cluster_log_scanner_trips_on_pattern
+  - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_log_only_thread_sends_probe_and_stops
   - examples/visual_gen/test_media_deps_install.py::test_install_ffmpeg_via_apt_installs_ffmpeg
   # ModelExpress accuracy-canary guard (reference entries and worker argv, no GPUs):
   # catches a pruned reference before the post-merge canary does.
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   - unittest/others/test_http_utils_fail_fast.py
+  - unittest/others/test_sparse_offload_accuracy.py
   # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
   - unittest/others/test_perf_sanity_port_reservation.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
@@ -54,17 +81,35 @@ l0_cpu:
   # kernels/parallel_hw_agnostic/test_fused_qk_norm_rope.py.
   # The GPU lists' attention/ entries run -m "not cpu_only", so hw_agnostic/ runs only here.
   - unittest/_torch/attention
-  # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_decode_view.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_launch.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_pool_layout.py
+  # Kimi K3 host-side checks on CPU tensors (MLA decode view and launch, KDA pool layout, MoE front geometry):
+  # every test is cpu_only.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_decode_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_launch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/test_k3_kda_pool_layout.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_moe_front_geometry.py
+  # Kimi K3 kernel source checks (cluster-scope mailbox waits, tcgen05 fences): read the kernel sources only.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/test_k3_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_decode_gemv/test_k3_decode_gemv_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_drafter/test_k3_drafter_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_fused_moe_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_attn/test_k3_kda_attn_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/test_k3_kda_verify_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_sandwich/test_k3_sandwich_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_engines_source_checks.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
+  # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
+  # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
+  - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
@@ -74,15 +119,13 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
-  # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
+  # modeling_v2 routing and routing-table checks: config shapes and a monkeypatched
   # compute capability, no device. The default targets' shard tests: small CPU
-  # tensors and the CPU block_scale_interleave. The qwen4_exp entries are the target's
-  # tests that run on the source text, stubbed weights and meta tensors: its multimodal
-  # splice and admission check on a stub tower, the KV pool contract, its KV storage
-  # derivation and attention-call arguments, its routed-expert scalars and its weight table.
-  # The rest of unittest/_torch/modeling_v2 needs a GPU.
-  - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
+  # tensors and the CPU block_scale_interleave. The rest of unittest/_torch/modeling_v2
+  # needs a GPU.
+  - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
   - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
@@ -91,17 +134,21 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
-  # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_step.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mnnvl_workspace.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_decode_worker.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_capture_view.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_ctx_rows_start.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_draft_block_rows.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_drafter_comm.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
-  - unittest/_torch/modeling_v2/models/deepseek_v3/test_modeling_v2_deepseek_default_shards.py
-  - unittest/_torch/modeling_v2/models/gpt_oss/test_modeling_v2_gpt_oss_default_shards.py
+  # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_mnnvl_workspace.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_k3_decode_worker.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_capture_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_ctx_rows_start.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_draft_block_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_drafter_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_spec_worker_gate.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
+  - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
@@ -109,13 +156,6 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_multimodal_embeds.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_moe_scalars.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_validate_request.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_pool_contract.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_kv_quant.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_thop_attention_calls.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_weight_table.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
@@ -150,7 +190,17 @@ l0_cpu:
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
+  # MiniMax-M3 compressed-tensors NVFP4 MoE packaging: config expansion and
+  # index-projection quantization.
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_projection_declares_its_checkpoint_names
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_expands_to_mixed_precision
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_a_quantized_head
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_partly_excluded_fused_projections
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_unsupported_expert_recipes
+  - unittest/_torch/models/test_minimax_m3.py::test_uniform_mxfp8_and_bf16_configs_are_unchanged
+  - unittest/_torch/models/test_minimax_m3.py::test_modelopt_mixed_precision_map_is_normalized
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/modeling/test_modeling_pplx_decider.py
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
@@ -168,6 +218,7 @@ l0_cpu:
   - unittest/_torch/test_connector_adp.py
   - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
   - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
+  - unittest/_torch/models/test_modeling_utils.py::test_quantization_passes_match_declared_fused_checkpoint_names
   - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_moe_deterministic_config.py
@@ -191,6 +242,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_attention_importable.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_executor_lifecycle.py
+  - unittest/_torch/visual_gen/test_fastwan_dmd_math.py
   - unittest/_torch/visual_gen/test_flux2_load_weights.py
   - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
@@ -200,11 +252,13 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_ltx23_pipeline_config.py
   - unittest/_torch/visual_gen/test_ltx23_retake_initialization.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
+  - unittest/_torch/visual_gen/test_minimax_h3_vsa.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
   - unittest/_torch/visual_gen/test_model_loader.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_step_precision.py
+  - unittest/_torch/visual_gen/test_cosmos3_sigma_grid.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
   - unittest/_torch/visual_gen/test_sleep.py
   - unittest/_torch/visual_gen/test_teacache.py
@@ -220,6 +274,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
   - unittest/_torch/visual_gen/test_wan_i2v_reference_conditioning.py
   - unittest/_torch/visual_gen/test_wan_timestep_routing.py
+  - unittest/_torch/visual_gen/test_wan_fixed_latent.py
   - unittest/_torch/weight_sharing
   - unittest/api_stability
   - unittest/bindings
@@ -280,10 +335,15 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
+  # test_musespark_chat_template.py reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.
+  - unittest/llmapi/apps/test_musespark_chat_template.py
+  - unittest/llmapi/apps/test_musespark_serve_extensions.py
+  - unittest/llmapi/apps/test_musespark_tool_parser.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py
+  - unittest/llmapi/apps/test_openai_server_graceful_shutdown.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_render_callers.py
@@ -313,16 +373,19 @@ l0_cpu:
   - unittest/llmapi/test_config_overrides.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
+  - unittest/llmapi/test_embedding_arch_routing.py
   - unittest/llmapi/test_gc_utils.py
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_kv_hints.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_llm.py::test_startup_metrics_by_server_info
   - unittest/llmapi/test_gms_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
   # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.
   - unittest/llmapi/test_musespark_open_tokenizer.py
+  - unittest/llmapi/test_musespark_reasoning_parser.py
   - unittest/llmapi/test_llm_quant.py
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py
@@ -342,12 +405,15 @@ l0_cpu:
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_frontend_affinity.py
+  - unittest/llmapi/test_serve_context_only_settings.py
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
+  - unittest/llmapi/test_serve_tokenization_owners.py
   - unittest/llmapi/test_serve_num_frontends_default.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
+  - unittest/llmapi/test_startup_checks.py
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_tokenizer_decode.py
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
@@ -360,6 +426,11 @@ l0_cpu:
   - unittest/quantization/test_nvfp4_plus_format.py
   - unittest/scaffolding
   - unittest/scripts
+  - unittest/serve
+  # VisualGen serve tests are also collected by the entry above. This entry keeps
+  # them for VisualGen-only PRs, where CBTS keeps only entries containing visual_gen/
+  # (with the trailing slash).
+  - unittest/serve/api/visual_gen/
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py

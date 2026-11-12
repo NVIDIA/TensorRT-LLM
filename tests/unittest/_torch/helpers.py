@@ -3,6 +3,7 @@
 
 from typing import Dict, Optional, Tuple
 
+import pytest
 import torch
 import torch.nn.functional as F
 import triton
@@ -346,3 +347,15 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
     sampled = temperatures >= greedy_threshold
     return torch.where(sampled, scores.argmax(-1),
                        logits.float().argmax(-1)).to(torch.int32)
+
+
+def triton_num_compiled(kernel) -> int:
+    """Specializations of a ``triton.jit`` kernel compiled in this process.
+
+    A launch that raises the count compiled a new variant of the kernel. Skips
+    the calling test when this Triton does not expose the per-device caches.
+    """
+    caches = getattr(kernel, "device_caches", None)
+    if caches is None:
+        pytest.skip("this Triton has no JITFunction.device_caches")
+    return sum(len(cache[0]) for cache in caches.values())

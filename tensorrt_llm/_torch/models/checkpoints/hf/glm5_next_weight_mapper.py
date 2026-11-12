@@ -30,6 +30,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 # Match dotted namespaces exactly so unrelated decoder weights are not ignored.
@@ -155,8 +156,8 @@ def glm5_next_weight_owner(dest: str, num_layers: int) -> Any:
     return None
 
 
-@register_mapper("HF", "Glm5NextForConditionalGeneration")
-@register_mapper("HF", "Glm5NextForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Glm5NextForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Glm5NextForCausalLM")
 class Glm5NextHfWeightMapper(HfWeightMapper):
     """Resolve checkpoint destinations and owners for the model's custom loader.
 
