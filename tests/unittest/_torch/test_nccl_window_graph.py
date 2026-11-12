@@ -538,6 +538,35 @@ def test_tensor_scope_skips_computed_dataclass_properties():
     assert tensors == [hidden_states]
 
 
+@pytest.mark.parametrize("value", [None, False, 0, 1, 1.25, complex(1, 2), "text", b"bytes"])
+def test_tensor_scope_skips_scalar_leaves(value, monkeypatch):
+    def unexpected_dataclass_check(_value):
+        raise AssertionError("Scalar leaves must not require dataclass inspection")
+
+    monkeypatch.setattr(nccl_window_tensor_scope, "is_dataclass", unexpected_dataclass_check)
+    tensors = []
+    visited = set()
+    nccl_window_tensor_scope._cuda_tensors(value, tensors, visited)
+    assert tensors == []
+    assert visited == set()
+
+
+def test_tensor_scope_collects_tensors_from_scalar_subclass():
+    @dataclass
+    class ScalarMetadata(int):
+        hidden_states: torch.Tensor
+
+        def __new__(cls, hidden_states):
+            return int.__new__(cls, 0)
+
+    with FakeTensorMode():
+        hidden_states = torch.empty(4, device="cuda")
+    tensors = []
+    nccl_window_tensor_scope._cuda_tensors(ScalarMetadata(hidden_states), tensors)
+    assert len(tensors) == 1
+    assert tensors[0] is hidden_states
+
+
 def test_eager_decoder_layer_hooks_scope_each_invocation(tensor_scope_events):
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 
