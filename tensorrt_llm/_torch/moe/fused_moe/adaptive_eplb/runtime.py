@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from .balancer import AdaptiveMoeLayerLoadBalancer
     from .transport import PeerSlotTransport
 
-    Gather = Callable[[torch.Tensor, list[torch.Tensor]], None]
+    Gather = Callable[[torch.Tensor, list[torch.Tensor], threading.Event], None]
     GenerationProgress = Callable[[int, int], tuple[int, int, int]]
 
 _DECISION_MAIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decision_main.py")
@@ -62,6 +62,10 @@ lasts as many forwards as the previous window's rows per forward need to reach i
 lasts one forward; with fewer rows than that it only measures the rows per forward."""
 REQUESTS_PER_CALL = 64
 """int: Generation requests whose progress one call reads (about 20 us of main-thread time)."""
+CLOSE_WAIT_S = 30.0
+"""float: Seconds a close waits for the worker thread, again after telling it to leave."""
+GATHER_SLICE_S = 1.0
+"""float: Seconds of one wait in an all-gather between looks at whether to leave it."""
 FIELDS = (
     "remaining",
     "requests",
@@ -397,17 +401,14 @@ class _WorkerThread(threading.Thread):
                 self.inbox.append(result)
             self.jobs.task_done()
 
-    def close(self) -> None:
-        self.jobs.put(None)
-        self.join(timeout=30)
-
 
 class AdaptiveRuntime:
     """Statistics windows, decisions and installs of all balanced layers of one rank.
 
-    ``gather(send, rows)`` all-gathers ``send`` (the window statistics of this rank, or a float64
-    :data:`ROW`) into ``rows``, one per EP rank; ``tables`` are the layers' ``[L, 2 * (experts + slots)]`` route
-    tables and ``statistics`` their :func:`~.policy.statistics_buffers`.
+    ``gather(send, rows, leave)`` all-gathers ``send`` (the window statistics of this rank, or a
+    float64 :data:`ROW`) into ``rows``, one per EP rank, until ``leave`` is set; ``tables`` are the
+    layers' ``[L, 2 * (experts + slots)]`` route tables and ``statistics`` their
+    :func:`~.policy.statistics_buffers`.
 
     One update is in flight at a time: its route tables apply before the next window opens, and the
     worker waits for the statistics copy of that window's close before it gathers it. The pinned
@@ -438,6 +439,8 @@ class AdaptiveRuntime:
         self.copy_stream = copy_stream
         self.decision = decision
         self.gather = gather
+        self.leave = threading.Event()
+        self.gathers_posted = self._gathers_run = 0  # all-gathers posted to / run by the worker
         self.worker = _WorkerThread()
         # Closed before the interpreter finalizes even without a shutdown: a daemon worker that
         # returns from a collective while the interpreter finalizes ends inside the C++ call, and
@@ -485,18 +488,27 @@ class AdaptiveRuntime:
         self._copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
         self._copy_end = torch.cuda.Event(enable_timing=True, blocking=True)
 
-    def close(self) -> None:
-        """End the worker thread after the jobs it was given, then the decision process; once,
-        from the balancer's shutdown or else at interpreter exit."""
+    def close(self, gathers: int = 0) -> None:
+        """End the worker thread after its jobs, then the decision process; once, from the balancer's
+        shutdown (``gathers``: the most all-gathers any EP rank posted) or at interpreter exit."""
         if self._closed:
             return
         self._closed = True
         atexit.unregister(self.close)
-        self.worker.close()
+        self.worker.jobs.put(None)
+        self.worker.join(timeout=CLOSE_WAIT_S)
+        # Zeros for the all-gathers its worker missed: a window's statistics, then an install's ROW.
+        for index in range(self._gathers_run, 0 if self.worker.is_alive() else gathers):
+            row = torch.zeros(len(ROW), dtype=torch.float64)
+            send = row if index % 2 else torch.zeros_like(self._own_stats)
+            self.gather(send, [torch.empty_like(send) for _ in self._gathered], self.leave)
+        if self.worker.is_alive():
+            self.leave.set()
+            self.worker.join(timeout=CLOSE_WAIT_S)
         if self.worker.is_alive():
             from tensorrt_llm.logger import logger
 
-            logger.warning("adaptive EPLB: the worker thread did not end within 30 s of its close")
+            logger.warning("adaptive EPLB: the worker thread did not end at its close")
         self.decision.close()
 
     def counters(self) -> dict[str, int]:
@@ -576,6 +588,7 @@ class AdaptiveRuntime:
                     copy_items=update.copy_items,
                 )
                 worker.post(lambda update=update: self._install(update))
+                self.gathers_posted += 1
         if self.pending_updates and self.pending_updates[0][0] <= call:
             self._apply_tables(call, self.pending_updates.popleft()[1])
         if self.close_at is None and self.open_at is not None and call >= self.open_at:
@@ -592,6 +605,7 @@ class AdaptiveRuntime:
             totals = self.request_totals.copy()
             window = self.window
             worker.post(lambda: self._gather_window(copied, totals, window))
+            self.gathers_posted += 1
 
     def _event(self, event: str, **data: object) -> None:
         """Log an event of the windows, decisions and installs at debug level: its scalars and
@@ -638,7 +652,8 @@ class AdaptiveRuntime:
         own[n * (experts + 1) : n * (experts + 2)] = self.applied_window
         stats_copy_ms = self._stats_copy_begin.elapsed_time(self._stats_copy_end)
         own[n * (experts + 2) :] = (*totals, stats_copy_ms, *self.last_applied)
-        self.gather(self._own_stats, self._gathered)
+        self._gathers_run += 1
+        self.gather(self._own_stats, self._gathered, self.leave)
         self._event(
             "window",
             window=window,
@@ -680,7 +695,8 @@ class AdaptiveRuntime:
             ms = self._copy_begin.elapsed_time(self._copy_end)
         row = (self.call, len(update.moved), ms, update.digest)
         rows = torch.zeros(len(self._gathered), len(ROW), dtype=torch.float64)
-        self.gather(torch.tensor(row, dtype=torch.float64), list(rows))
+        self._gathers_run += 1
+        self.gather(torch.tensor(row, dtype=torch.float64), list(rows), self.leave)
         return ("copied", update, rows.numpy())
 
     def _apply_tables(self, call: int, update: LayoutUpdate) -> None:

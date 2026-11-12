@@ -100,7 +100,7 @@ class FakeGroup:
     def gather(self, rank: int):
         counts = [0]
 
-        def start(send, rows) -> None:
+        def start(send, rows, leave=None) -> None:
             key = counts[0]
             counts[0] += 1
             with self.ready:
@@ -664,11 +664,42 @@ def test_shutdown_agrees_over_the_ep_group_then_stops_the_process_and_the_copies
     calls = []
     for peer_safe, done in ((False, False), (True, True)):
         balancer = manager()
-        balancer.runtime = SimpleNamespace(close=lambda: calls.append("worker"))
+        balancer.runtime = SimpleNamespace(gathers_posted=3, close=calls.append)
         balancer.copy_stream = SimpleNamespace(synchronize=lambda: calls.append("stream"))
-        balancer.transport = SimpleNamespace(allgather=lambda safe, peer=peer_safe: [safe, peer])
+        balancer.transport = SimpleNamespace(allgather=lambda vote, p=peer_safe: [vote, (p, 4)])
         assert balancer.shutdown() is done and balancer.is_shutdown is done
-    assert calls == ["worker", "stream"]
+    assert calls == [4, "stream"]  # the runtime closes at the most all-gathers any rank posted
+
+
+@pytest.mark.parametrize("rank_0_failed", [False, True], ids=["rank_0_stopped", "rank_0_failed"])
+def test_shutdown_completes_an_all_gather_that_only_some_ranks_posted(host_cuda, rank_0_failed):
+    """Rank 1's worker waits in the all-gather of window 0's install, which rank 0 never posts:
+    rank 0 stopped first, or its worker failed. Rank 0's shutdown runs it, and both workers end."""
+    clock = [0]
+    decisions = [FakeDecision(rank) for rank in range(R)]
+    if rank_0_failed:
+        decisions[0].script = {}.__getitem__  # the decision of window 0 fails
+    ranks = make_ranks(decisions, clock)
+    run(ranks, clock, 2)  # window 0 opens at call 0 and closes at call 1
+    for runtime in ranks:  # call 2 posts the window's all-gather
+        runtime.add_request_progress(*executor_progress([]))
+        runtime.boundary()
+    deadline = time.monotonic() + 30
+    while not (ranks[1].worker.inbox and (ranks[0].worker.inbox or ranks[0].worker.failure)):
+        assert time.monotonic() < deadline, "window 0 was not decided"
+    for runtime in ranks[0 if rank_0_failed else 1 :]:  # call 3: rank 1 posts the install's
+        runtime.boundary()
+    votes = [(True, 1), (True, 2)]  # the all-gathers each rank posted
+    for rank, runtime in enumerate(ranks):
+        balancer = manager()
+        balancer.runtime, balancer.copy_stream = runtime, SimpleNamespace(synchronize=lambda: None)
+
+        def allgather(vote, r=rank):  # this rank's own vote among the others'
+            return votes[:r] + [vote] + votes[r + 1 :]
+
+        balancer.transport = SimpleNamespace(allgather=allgather)
+        assert balancer.shutdown() is True and not runtime.worker.is_alive()
+    assert ranks[1].worker.failure is None and ranks[1].worker.inbox[-1][0] == "copied"
 
 
 _EXIT_SCRIPT = """
@@ -678,27 +709,32 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import runtime as rt
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import ep_gather
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     ExpertGeometry, TimeModel, statistics_buffers)
 
-rank, store, exiting = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+rank, store, exiting, peer_joins = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == "1"
 dist.init_process_group("gloo", store=dist.FileStore(store, 2), rank=rank, world_size=2)
 send, rows = torch.full((4,), float(rank)), [torch.empty(4) for _ in range(2)]
-if rank == 1:  # a peer that reaches the same all-gather while rank 0 exits
+if rank == 1:  # a peer that reaches the same all-gather while rank 0 exits, or never does
     while not os.path.exists(exiting):
         time.sleep(0.01)
     time.sleep(0.5)
-    dist.all_gather(rows, send)
+    if peer_joins:
+        dist.all_gather(rows, send)
+    while not os.path.exists(exiting + ".done"):  # rank 0 exited
+        time.sleep(0.01)
     sys.exit(0)
+rt.CLOSE_WAIT_S = 3.0  # longer than a slice of the all-gather's wait
 torch.cuda.Event = lambda **kwargs: SimpleNamespace()
 geometry = ExpertGeometry(8, 12, 2)
 homes = np.tile(geometry.home_layout(), (2, 1))
 config = rt.DecisionConfig(geometry, TimeModel(1, 1, 1, 0.5, 1, 128), homes, 0, 1)
 decision = rt.DecisionProcess(config)
 runtime = rt.AdaptiveRuntime(
-    [None, None], None, None, decision, lambda send, rows: dist.all_gather(rows, send),
+    [None, None], None, None, decision, ep_gather(dist.group.WORLD),
     torch.device("cpu"), torch.zeros(2, 40, dtype=torch.int32), statistics_buffers(2, 8, "cpu"))
-runtime.worker.post(lambda: runtime.gather(send, rows))  # the worker waits in the all-gather
+runtime.worker.post(lambda: runtime.gather(send, rows, runtime.leave))  # it waits in the all-gather
 print("decision", decision.process.pid, flush=True)
 
 
@@ -712,14 +748,15 @@ open(exiting, "w").close()
 """
 
 
-def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tmp_path):
+@pytest.mark.parametrize("peer_joins", ["1", "0"], ids=["peer_joins", "peer_never_joins"])
+def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tmp_path, peer_joins):
     """A rank that exits without a balancer shutdown, its worker inside an all-gather that a peer
-    completes while the rank exits: the worker must end before the interpreter finalizes, where
-    a thread returning from the collective would abort the process, and the decision process
-    must end with it."""
+    completes while the rank exits, or never: the worker must end before the interpreter
+    finalizes, where a thread returning from the collective would abort the process, and the
+    decision process must end with it."""
     script = tmp_path / "exit.py"
     script.write_text(_EXIT_SCRIPT)
-    args = [str(tmp_path / "store"), str(tmp_path / "exiting")]
+    args = [str(tmp_path / "store"), str(tmp_path / "exiting"), peer_joins]
     # Two plain processes: no MPI or PMIx of a launcher, and no core file if one aborts.
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PMIX", "PMI_", "OMPI_"))}
     env["TLLM_DISABLE_MPI"] = "1"
@@ -732,8 +769,10 @@ def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tm
         timeout=120,
         **run,
     )
+    (tmp_path / "exiting.done").touch()
     peer.wait(timeout=60)
     assert done.returncode == 0, done.stderr[-4000:]
+    assert "did not end" not in done.stdout + done.stderr
     pid = int(done.stdout.split("decision", 1)[1].split()[0])
     for _ in range(100):
         if not os.path.exists(f"/proc/{pid}"):

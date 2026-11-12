@@ -13,7 +13,9 @@ import hashlib
 import json
 import math
 import socket
+import threading
 from collections.abc import Callable, Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,7 +39,7 @@ from .policy import (
     build_route_tables,
     statistics_buffers,
 )
-from .runtime import AdaptiveRuntime, DecisionConfig, DecisionProcess
+from .runtime import GATHER_SLICE_S, AdaptiveRuntime, DecisionConfig, DecisionProcess
 from .transport import (
     PeerSlotTransport,
     _plan_layer,
@@ -183,6 +185,22 @@ def load_time_model(
             f"{path} was measured with TensorRT LLM {doc['measurement'].get('trtllm_version')}"
         )
     return TimeModel(**dict(fields, scale=by_rows[-1][1]), scales=by_rows), None
+
+
+def ep_gather(group: dist.ProcessGroup) -> Callable:
+    """``gather(send, rows, leave)`` on ``group``, waiting in slices until done or ``leave`` is set."""
+
+    def gather(send: torch.Tensor, rows: list[torch.Tensor], leave: threading.Event) -> None:
+        work = dist.all_gather(rows, send, group=group, async_op=True)
+        while not work.is_completed():
+            try:
+                work.wait(timeout=timedelta(seconds=GATHER_SLICE_S))
+            except RuntimeError:  # the slice timed out, or the all-gather failed
+                if leave.is_set() and not work.is_completed():
+                    raise
+        work.wait()  # raises the all-gather's error
+
+    return gather
 
 
 NO_LAYER = "no MoE layer runs on an implementation that supports adaptive EPLB"
@@ -513,16 +531,13 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         ranks = sorted(self.transport.allgather(dist.get_rank()))
         group = dist.new_group(ranks, backend="gloo", use_local_synchronization=True)
 
-        def gather(send: torch.Tensor, rows: list[torch.Tensor]) -> None:
-            dist.all_gather(rows, send, group=group)
-
         device = torch.device("cuda", torch.cuda.current_device())
         self.runtime = AdaptiveRuntime(
             self.layers,
             self.transport,
             self.copy_stream,
             decision,
-            gather,
+            ep_gather(group),
             device,
             self.route_tables(device),
             self.statistics(device),
@@ -598,12 +613,14 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         if self.is_shutdown:
             return True
         local_safe = bool(local_safe and not self.in_iter)
+        gathers = 0 if self.runtime is None else self.runtime.gathers_posted
         if self.transport is not None:
-            local_safe = all(self.transport.allgather(local_safe))
+            votes = self.transport.allgather((local_safe, gathers))  # and the most all-gathers
+            local_safe, gathers = all(v[0] for v in votes), max(v[1] for v in votes)
         if not local_safe:
             return False
         if self.runtime is not None:
-            self.runtime.close()
+            self.runtime.close(gathers)
         if self.transport is not None:
             self.copy_stream.synchronize()
         self.is_shutdown = True
