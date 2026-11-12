@@ -13,10 +13,9 @@ of that same call is captured, and each of its steps is compared with the op's o
 expert ids are compared exactly, in order. Each fixture also states the decision it was
 built to force, independently of either implementation.
 
-Invocation (fp32 needs the TF32 overrides removed before torch is imported)::
+Invocation (the fixture enforces and probes IEEE fp32)::
 
-    env -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE -u NVIDIA_TF32_OVERRIDE \\
-        python -m pytest tests/unittest/_torch/modeling_v2/models/beam/moe_router_bf16__sm_103__tp1
+    python -m pytest tests/unittest/_torch/modeling_v2/models/beam/moe_router_bf16__sm_103__tp1
 
 Optional environment:
 
@@ -115,10 +114,9 @@ def router_config(**overrides) -> types.SimpleNamespace:
 
 
 @pytest.fixture(scope="module", autouse=True)
-def no_tf32_override():
-    """The router's fp32 steps are IEEE fp32; these variables substitute TF32 regardless of
-    what torch is told."""
-    support.assert_no_tf32_override()
+def ieee_fp32():
+    """Enforce IEEE fp32 and check the actual GEMM precision."""
+    yield from support.ieee_fp32_session(_write_evidence)
 
 
 # ----------------------------------------------------------------------------- evidence

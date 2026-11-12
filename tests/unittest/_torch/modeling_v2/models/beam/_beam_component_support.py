@@ -40,21 +40,11 @@ import tensorrt_llm
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-#: Environment variables that substitute TF32 for fp32 GEMMs whatever torch is told.
-TF32_OVERRIDES = ("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "NVIDIA_TF32_OVERRIDE")
-
 #: CPU op names of PyTorch's SDPA paths, and CUDA kernel names of attention kernels.
 SDPA_OPS = re.compile(r"scaled_dot_product|_flash_attention|_efficient_attention|_cudnn_attention")
 ATTENTION_KERNEL = re.compile(r"(?i)fmha|attention")
 
 # -------------------------------------------------- precision and environment
-
-
-def assert_no_tf32_override() -> None:
-    for var in TF32_OVERRIDES:
-        assert var not in os.environ, (
-            f"{var} is set and substitutes TF32 for fp32 GEMMs; run with `env -u {var}`"
-        )
 
 
 def fp32_gemm_probe() -> float:
@@ -70,35 +60,43 @@ def fp32_gemm_probe() -> float:
 def math_state() -> dict:
     return {
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
         "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
         "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
     }
 
 
 def ieee_fp32_session(write_evidence):
-    """Body of a module-scoped ``ieee_fp32`` fixture: refuse a process that substitutes TF32,
-    both before the module's tests and after them; yields the session's math state."""
-    assert_no_tf32_override()
+    """Enforce IEEE fp32 and verify it before and after the module's tests."""
+    matmul = torch.backends.cuda.matmul
     saved = (
         torch.get_float32_matmul_precision(),
-        torch.backends.cuda.matmul.allow_tf32,
+        matmul.allow_tf32,
         torch.backends.cudnn.allow_tf32,
+        matmul.fp32_precision,
+        torch.backends.cudnn.fp32_precision,
     )
-    torch.set_float32_matmul_precision("highest")
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    before = fp32_gemm_probe()
-    assert before <= 1e-5, f"fp32 GEMM is not IEEE fp32 (relative error {before:.3g})"
-    state = {"math": math_state(), "fp32_gemm_probe_before": before}
-    yield state
-    after = fp32_gemm_probe()
-    state.update(math_after=math_state(), fp32_gemm_probe_after=after)
-    write_evidence("fp32-session", {"fixture": "ieee_fp32", "math": state})
-    precision, allow_matmul, allow_cudnn = saved
-    torch.set_float32_matmul_precision(precision)
-    torch.backends.cuda.matmul.allow_tf32 = allow_matmul
-    torch.backends.cudnn.allow_tf32 = allow_cudnn
-    assert after <= 1e-5, f"fp32 GEMM stopped being IEEE fp32 (relative error {after:.3g})"
+    try:
+        torch.set_float32_matmul_precision("highest")
+        matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        matmul.fp32_precision = "ieee"
+        before = fp32_gemm_probe()
+        assert before <= 1e-5, f"fp32 GEMM is not IEEE fp32 (relative error {before:.3g})"
+        state = {"math": math_state(), "fp32_gemm_probe_before": before}
+        yield state
+        after = fp32_gemm_probe()
+        state.update(math_after=math_state(), fp32_gemm_probe_after=after)
+        write_evidence("fp32-session", {"fixture": "ieee_fp32", "math": state})
+        assert after <= 1e-5, f"fp32 GEMM stopped being IEEE fp32 (relative error {after:.3g})"
+    finally:
+        # Legacy setters can also change the newer precision controls.
+        precision, allow_matmul, allow_cudnn, matmul_precision, cudnn_precision = saved
+        torch.set_float32_matmul_precision(precision)
+        matmul.allow_tf32 = allow_matmul
+        torch.backends.cudnn.allow_tf32 = allow_cudnn
+        matmul.fp32_precision = matmul_precision
+        torch.backends.cudnn.fp32_precision = cudnn_precision
 
 
 def git_revision() -> str | None:
