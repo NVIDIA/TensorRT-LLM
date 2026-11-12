@@ -15,7 +15,7 @@ How the touch DB is turned into a decision about which cases to run. Collection 
 Tier 1  rules      every changed file claimed by a rule → narrow per the rule
    │               some file left unclaimed (residual)
    ▼
-Tier 2  coverage   residual is all core Python and all present in the DB → scope=coverage
+Tier 2  coverage   residual is all Python with test-attributed DB rows → scope=coverage
    │               any condition unmet → decline
    ▼
         full fallback                                                     scope=null
@@ -53,12 +53,33 @@ of:
 
 | Gate | Condition |
 |---|---|
-| Non-core file | `path` is not a `.py` under `tensorrt_llm/` (checked on the **repo path**, not `canon()`) |
-| File absent from the DB | `file_has_touch_rows(cf)` is false — new or uninstrumented, so "who touches it" is unknown rather than empty |
+| Non-Python file | `path` is not a `.py`; the selector requires Python source to map changed lines to qualnames |
+| Shared pytest state | changed symbols reach non-function/unknown-scope fixtures, session/collection hooks, cached helpers, unresolved decorators, or explicit persistent-state mutations; local and imported dependencies are followed |
+| File without attributed coverage | `file_has_touch_rows(cf)` is false — absent, uninstrumented, or recorded only under the empty test context, so "who touches it" is unknown rather than empty |
 | **Unbounded import-executed change** | a changed line lands on a class body, signature / decorator, or unsupported module statement; the conservative exceptions are below |
 | No usable patch | the forge API omitted the diff (binary / rename / oversized), so the changed scope is unknown |
 | Unparsable source | the AST walk failed, so lines cannot be mapped to qualnames |
 | Closure change with no wider row set | see the next section |
+
+Python paths in `examples/`, `scripts/`, and other repository directories use the same
+coverage and impact checks as `tensorrt_llm/`, including `conftest.py` and test helpers.
+AST checks distinguish ordinary helper/function-fixture body edits from changes that reach
+shared fixtures, session/collection hooks, or cached/stateful helpers. Only the latter decline,
+because execution rows omit cached consumers (COLLECTION.md §5.4). Fixture scope is resolved
+from its decorator; nonliteral/unknown scopes and unrecognized decorators decline. Local dependencies,
+fixture parameters, and repository-visible imported helpers propagate this restriction.
+Class method references include qualified dependencies; aliases, inherited methods, and
+unresolved attribute dispatch conservatively include same-named local methods.
+Module/class initialization assignments are shared bindings: a helper body change reaching
+one declines even if the imports occur inside individual tests. Function-local assignments
+remain per-call. Both source images are checked, including removed shared dependencies.
+Unrelated shared fixtures in the same file do not block ordinary helper edits.
+Coverage explicitly requests diffs for all Python files, as DocsRule already does.
+Repository-relative DB keys retain their full path, so
+`examples/tensorrt_llm/x.py` cannot borrow coverage from `tensorrt_llm/x.py`.
+Existing Tier-1 forced fallbacks, missing/tainted test capture, and the residual patch
+compatibility check still apply. File-level records do not waive the import-time or
+changed-scope checks below.
 
 ## 4. Bounding low-risk import-executed changes
 
@@ -266,7 +287,8 @@ GET Artifactory pin at <PR number>/<PR head>:
 when no pin:
    Jenkins REST lastBuild                        → newest build number N
    for b in N .. N-49:                            (_MAX_PROBE)
-      ranged GET both architecture tarballs      → skip b unless both exist
+      read helper --exists, both tarballs         → skip b unless both exist,
+                                                    or when a read fails in transfer
       GET build_info.txt, parse `commit=`         → sha; skip when absent
       first complete pair with a known sha        → latest coverage DB
    Python writes the build/commit pin locally
@@ -345,8 +367,8 @@ large DB artifacts are downloaded. If it passes, Tier 2 uses the original forge 
 After Tier 1 computes the residual, `--resolve-pin FILE` returns a reuse/create/decline plan.
 Groovy uploads `FILE` only for a create plan, before any large download. `--prepare DIR --build
 BUILD --paths-json PATH` then resolves the PR base, validates the pinned pair's residual
-compatibility, streams both tarballs down, unpacks their identically named SQLite files
-separately, and unions them with `compact_db.merge_databases`.
+compatibility, downloads both tarballs with the read helper, unpacks their identically named
+SQLite files separately, and unions them with `compact_db.merge_databases`.
 It writes the selection JSON
 beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
 credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.

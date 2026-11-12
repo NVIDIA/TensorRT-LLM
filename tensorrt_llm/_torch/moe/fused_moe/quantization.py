@@ -61,6 +61,11 @@ FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_K = 0
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_MN = 1
 TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K = 2
+# The NVFP4 AWQ loader keeps one pre_quant_scale per MoE layer, so the experts of
+# a layer must agree on it within this tolerance. DWDP setup, where each rank
+# loads its own experts, holds the ranks' copies to the same tolerance.
+PRE_QUANT_SCALE_RTOL = 1e-5
+PRE_QUANT_SCALE_ATOL = 1e-8
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -3122,7 +3127,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 (all_w3[i], w3_reference, "w3.pre_quant_scale"),
                 (all_w1[i], w1_reference, "w1.pre_quant_scale")
             ]:
-                if not torch.allclose(scale, ref, rtol=1e-5, atol=1e-8):
+                if not torch.allclose(scale,
+                                      ref,
+                                      rtol=PRE_QUANT_SCALE_RTOL,
+                                      atol=PRE_QUANT_SCALE_ATOL):
                     max_diff = (scale - ref).abs().max()
                     msg = (
                         f"MoE pre_quant_scale: expert {expert_ids[i]} {name} "
@@ -3138,7 +3146,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # loader, ``fc31_act_scale.device`` for ``load_quant_scales``, which
         # keys its own staging off this same parameter -- and
         # ``_ensure_fc31_act_scale`` is the one place that chooses the device.
-        fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+        fc31_checkpoint_scale = torch.max(w3_reference, w1_reference)
+        # The cast below drops the dtype the checkpoint stores the scale in;
+        # DWDP setup compares the ranks' copies by it.
+        module.fc31_act_scale_checkpoint_dtype = fc31_checkpoint_scale.dtype
+        fc31_pre_quant_scale = fc31_checkpoint_scale.to(
             dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 

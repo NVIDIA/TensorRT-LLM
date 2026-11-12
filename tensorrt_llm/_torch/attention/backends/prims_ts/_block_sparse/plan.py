@@ -17,6 +17,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 import functools
+import math
 import _thread
 from typing import Concatenate, Literal, ParamSpec, Protocol, TypeVar, cast
 
@@ -24,7 +25,12 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from ..sage import SageAttentionConfig, sage_scale_shapes
+from .._scales import GlobalScale, normalize_scale, scale_types
+from ..sage.config import (
+    SageAttentionConfig,
+    sage_scale_shapes,
+    _validate_int8_qk_device,
+)
 from .common import (
     _SIGNED_INT32_MAX,
     _block_sparse_proxy_summary_geometry,
@@ -35,28 +41,11 @@ from .config import (
     _BlockSparseStaticProfile,
     _resolve_block_sparse_launch_spec,
 )
-from ..sage import _SageScaleLayout
+from ..sage.layout import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-
-# Only SM100 has the INT8 tcgen05 MMA kind; later GPUs use E4M3 Q/K.
-_INT8_QK_COMPUTE_CAPABILITIES = ((10, 0),)
-
-
-def _validate_int8_qk_device(q_dtype: torch.dtype, device_index: int) -> None:
-    """Reject Int8 Q/K on GPUs without the INT8 tcgen05 MMA."""
-
-    if q_dtype != torch.int8:
-        return
-    capability = torch.cuda.get_device_capability(device_index)
-    if capability not in _INT8_QK_COMPUTE_CAPABILITIES:
-        raise NotImplementedError(
-            "Int8 Q/K Sage attention requires an SM100a/B200 GPU, whose tcgen05 "
-            "MMA supports INT8 operands; use the torch.float8_e4m3fn Q/K recipe "
-            f"on device cuda:{device_index} with compute capability {capability}"
-        )
 
 
 class _PlanLockOwner(Protocol):
@@ -155,6 +144,8 @@ class _BlockSparsePlanState:
     ready_event: torch.cuda.Event
     ready_stream_handle: int
     share_pattern_across_kv_heads: bool = False
+    sm_scale: GlobalScale = 1.0
+    output_scale: GlobalScale = 1.0
 
 
 def _allocate_dummy_kv_valid_bits(
@@ -254,9 +245,17 @@ def _build_block_sparse_plan_state(
     plan_stream: torch.cuda.Stream,
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
+    sm_scale: GlobalScale | None = None,
+    output_scale: GlobalScale = 1.0,
 ) -> _BlockSparsePlanState:
     """Build one format- and route-specialized plan atomically."""
 
+    sm_scale = normalize_scale(
+        1.0 / math.sqrt(static.head_dim) if sm_scale is None else sm_scale,
+        "sm_scale",
+        device,
+    )
+    output_scale = normalize_scale(output_scale, "output_scale", device)
     if static.page_size is not None:
         assert sparse_format == "bsr" and not use_proxy_routes
     _validate_int8_qk_device(static.q_dtype, device_index)
@@ -303,6 +302,7 @@ def _build_block_sparse_plan_state(
             out_dtype_key=static.out_dtype_key,
             v_dtype_key=static.v_dtype_key,
             sage=static.sage,
+            scale_types=scale_types(sm_scale, output_scale),
             softmax_rescale_threshold_log2=static.softmax_rescale_threshold_log2,
         )
         policy = (
@@ -362,6 +362,8 @@ def _build_block_sparse_plan_state(
         use_kv_valid_bits=static.use_kv_valid_bits,
         page_size=static.page_size,
         sage=static.sage,
+        sm_scale=sm_scale,
+        output_scale=output_scale,
         sage_scale_shapes=scale_shapes,
         dummy_kv_valid_bits=dummy_kv_valid_bits,
         row_route_offsets=row_route_offsets,

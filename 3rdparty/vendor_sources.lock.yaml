@@ -10,19 +10,19 @@ vendors:
     - kda_chunked_bt16.py
     - kda_chunked_bt16_small_bh.py
     patch: 3rdparty/vendor_patches/flashinfer-kda-bt16.patch
-    patch_digest: sha256:91065b6ce01c2c502a12daf51557be06c0fac42ceaf2709394b9c70a499bde57
-    digest: sha256-tree-v1:b88b7a1a190a09ecc9d10e622604398597e641994fdac11dd72f10883e22450b
+    patch_digest: sha256:42e8306de30fef448378066321977aeb7b42c3405dc883f9527e256590a58b46
+    digest: sha256-tree-v1:12eb5c011c3fef1831aeba02691df8e2f5bff323f9da9c58c0f31e80883a9f06
   flashinfer-prims-ts:
-    url: https://github.com/harrisonzhy/flashinfer.git
-    branch: harrisonzhy/trtllm-prims-ts-dev_vc-attn-20261029
-    commit: 7087b06c22ceb116b2236a938038a00b39f752d1
+    url: https://github.com/yuxianq/flashinfer.git
+    branch: trtllm-prims-ts-dev-20261107
+    commit: 911d6a9d62308b6c8a5249e8dc4aabc7518020f1
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:b4e502ee5bf3d4b4477d42d96d6fa953f1819e82398b40d17812f6fda7165b22
-    digest: sha256-tree-v1:de7e56b151091c462d22b3c578cc6703167d0a7de995807f83cd25f3f5736354
+    patch_digest: sha256:f35ef4d096314a21c710b849b0a1f731cf1edbf50d32cdee46b635f45fe6b47a
+    digest: sha256-tree-v1:bf74c7664256a1c7064163ca417a6c589f8ab8f47bb478444bb1b3c402c856ee
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

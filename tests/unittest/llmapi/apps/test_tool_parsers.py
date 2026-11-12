@@ -28,7 +28,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      forced_tool_arguments_end)
-from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+from tensorrt_llm.serve.tool_parser.base_tool_parser import (_MAX_FINISH_PASSES,
+                                                             BaseToolParser)
 from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
                                                        StructureInfo)
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
@@ -42,6 +43,7 @@ from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m3_parser import MiniMaxM3ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
@@ -361,20 +363,62 @@ class TestBaseToolParser:
         assert "test_function" in info.begin
         assert info.trigger == "[TOOL_CALLS]"
 
-    def test_finish_default_noop(self, sample_tools):
-        """The default finalization hook emits nothing and keeps state.
+    def test_finish_keeps_a_buffer_that_cannot_progress(self, sample_tools):
+        """Only part of the start token is buffered: no increment could report anything."""
+        from unittest.mock import patch
 
-        Existing parsers manage ``self._buffer`` incrementally; the
-        end-of-stream hook must not change their behavior.
-        """
         parser = ConcreteToolParser()
-        parser._buffer = '[TOOL_CALLS] {"name":"get_weather"'
+        parser._buffer = "[TOOL_"
 
-        result = parser.finish(sample_tools)
+        with patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger"
+                   ) as mock_logger:
+            result = parser.finish(sample_tools)
 
         assert result.normal_text == ""
         assert result.calls == []
-        assert parser._buffer == '[TOOL_CALLS] {"name":"get_weather"'
+        assert parser._buffer == "[TOOL_"
+        mock_logger.warning_once.assert_not_called()
+
+    def test_finish_warns_when_the_parser_never_converges(self, sample_tools):
+        """Every pass changes the state: finish() stops at the bound and warns once, naming the parser."""
+        from unittest.mock import patch
+
+        class NeverConvergingParser(ConcreteToolParser):
+
+            def __init__(self):
+                super().__init__()
+                self.passes = 0
+
+            def parse_streaming_increment(self, new_text, tools):
+                self.passes += 1
+                self._buffer += "x"
+                return StreamingParseResult()
+
+        parser = NeverConvergingParser()
+
+        with patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger"
+                   ) as mock_logger:
+            parser.finish(sample_tools)
+
+        assert parser.passes == _MAX_FINISH_PASSES
+        assert mock_logger.warning_once.call_count == 1
+        warning = mock_logger.warning_once.call_args
+        assert "NeverConvergingParser" in warning.args[0]
+        # De-duplicated per parser class, so a broken parser cannot log once
+        # per request.
+        assert "NeverConvergingParser" in warning.kwargs["key"]
+
+    def test_finish_reports_the_call_the_last_increment_brought(
+            self, sample_tools):
+        """A whole call arrives in the last increment: finish() reports its arguments too."""
+        parser = ConcreteToolParser()
+        text = '[TOOL_CALLS] {"name": "get_weather", "arguments": {"location": "Paris"}}'
+
+        assert _streamed_calls(parser, [text],
+                               sample_tools) == [("get_weather", {
+                                   "location": "Paris"
+                               })]
+        assert parser.finish(sample_tools).calls == []
 
     def test_extracts_forced_tool_calls_default_false(self):
         """Forced tool_choice extraction is opt-in per parser."""
@@ -384,6 +428,37 @@ class TestBaseToolParser:
 # ============================================================================
 # Qwen3ToolParser Tests
 # ============================================================================
+
+
+def _streamed_calls(parser, increments, tools):
+    """The calls a client assembles from the increments and finish(): (name, arguments).
+
+    A client appends every name delta of a tool index, so a second name for an
+    index fails here instead of replacing the first.
+    """
+    results = [
+        parser.parse_streaming_increment(piece, tools) for piece in increments
+    ]
+    results.append(parser.finish(tools))
+    names, arguments = {}, {}
+    for result in results:
+        for call in result.calls:
+            if call.name:
+                assert call.tool_index not in names, (
+                    f"tool {call.tool_index} named twice: "
+                    f"{names[call.tool_index]!r}, then {call.name!r}")
+                names[call.tool_index] = call.name
+            if call.parameters:
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters)
+    return [(names.get(index), json.loads(arguments.get(index) or "{}"))
+            for index in sorted(names.keys() | arguments.keys())]
+
+
+def _whole_calls(parser, text, tools):
+    """The calls detect_and_parse reads from the whole text: (name, arguments)."""
+    return [(call.name, json.loads(call.parameters or "{}"))
+            for call in parser.detect_and_parse(text, tools).calls]
 
 
 class ToolParserTestCases(NamedTuple):
@@ -439,6 +514,18 @@ class BaseToolParserTestClass:
     @pytest.fixture(scope="class")
     def tool_parser_test_cases(self) -> ToolParserTestCases:
         return self.make_tool_parser_test_cases()
+
+    def test_finish_reports_the_calls_of_a_reply_in_one_increment(
+            self, sample_tools, parser, tool_parser_test_cases):
+        """A reply in one increment: the stream and finish() give its calls.
+
+        The calls are those detect_and_parse reads from the same text.
+        """
+        text = tool_parser_test_cases.detect_and_parse_single_tool[0]
+
+        streamed = _streamed_calls(parser, [text], sample_tools)
+
+        assert streamed == _whole_calls(self.make_parser(), text, sample_tools)
 
     def test_has_tool_call_false(self, parser):
         """Test has_tool_call returns False when no tool call present."""
@@ -6965,6 +7052,259 @@ class TestForcedToolChoicePostprocessing:
         assert finish_reasons[-1] == "stop"
 
 
+class TestChatStreamFinishChunk:
+    """A streamed choice ends with a chunk of its own carrying the finish.
+
+    Clients may stop reading a choice at its first ``finish_reason``, so
+    output sharing that chunk -- the last content, or the closing fragment of
+    a tool call's arguments -- would never reach them. Each case streams a few
+    inline deltas through the real ``chat_stream_post_processor``; the last
+    iteration finishes the choice.
+    """
+
+    SECTION = TestForcedToolChoicePostprocessing.WEATHER_CALL_SECTION
+    # Cut before the end tag, so the parser releases the call only when the
+    # stream finishes.
+    UNCLOSED_SECTION = SECTION[:-len(TestForcedToolChoicePostprocessing.EOT)]
+    WEATHER_CALL = ("get_weather", {"location": "NYC"})
+
+    @staticmethod
+    def _make_args(sample_tools,
+                   tool_parser=None,
+                   forced_tool_name=None,
+                   **overrides):
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools,
+            tool_parser=tool_parser,
+            forced_tool_name=forced_tool_name,
+            stream=True)
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @staticmethod
+    def _stream(args, steps, finish_reason="stop", **final_fields):
+        """Feed ``steps`` through ``chat_stream_post_processor``.
+
+        Each step is the text one iteration generated, or a dict mapping each
+        choice index to it. The last step finishes every choice, and its
+        outputs also get ``final_fields``. Returns the decoded SSE payloads.
+        """
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        payloads = []
+        for step_index, step in enumerate(steps):
+            last = step_index == len(steps) - 1
+            texts = step if isinstance(step, dict) else {0: step}
+            outputs = []
+            for index, text in texts.items():
+                fields = dict(index=index,
+                              text_diff=text,
+                              token_ids_diff=[step_index],
+                              logprobs_diff=[-0.5],
+                              finish_reason=None,
+                              stop_reason=None,
+                              length=step_index + 1,
+                              disaggregated_params=None)
+                if last:
+                    fields.update(finish_reason=finish_reason, **final_fields)
+                outputs.append(SimpleNamespace(**fields))
+            rsp = SimpleNamespace(outputs=outputs,
+                                  cached_tokens=0,
+                                  id="test-request",
+                                  _done=last)
+            for line in chat_stream_post_processor(rsp, args):
+                payloads.append(json.loads(line[len("data: "):]))
+        return payloads
+
+    @staticmethod
+    def _choices(payloads, index=0):
+        return [
+            choice for payload in payloads for choice in payload["choices"]
+            if choice["index"] == index
+        ]
+
+    @staticmethod
+    def _has_output(choice):
+        delta = choice["delta"]
+        return bool(
+            delta.get("content") or delta.get("reasoning_content")
+            or delta.get("tool_calls")
+            or (choice.get("logprobs") or {}).get("content"))
+
+    @staticmethod
+    def _read_until_finish(payloads, index=0):
+        """Return what a client has when it stops at the choice's finish.
+
+        Such a client acts on the first ``finish_reason`` without reading the
+        rest of that chunk. It keeps the content, the tool-call name and the
+        tool-call arguments (parsed when they are complete JSON) of the
+        chunks before it.
+        """
+        content = name = arguments = ""
+        for choice in TestChatStreamFinishChunk._choices(payloads, index):
+            if choice.get("finish_reason") is not None:
+                try:
+                    return content, name, json.loads(arguments)
+                except json.JSONDecodeError:
+                    return content, name, arguments
+            content += choice["delta"].get("content") or ""
+            for call in choice["delta"].get("tool_calls") or []:
+                function = call.get("function") or {}
+                name += function.get("name") or ""
+                arguments += function.get("arguments") or ""
+        raise AssertionError(f"choice {index} never received a finish_reason")
+
+    @pytest.mark.parametrize(
+        "tool_parser, forced_tool_name, steps, expected",
+        [
+            pytest.param("qwen3",
+                         "get_weather", ['{"location"', ': "NY', 'C"}'],
+                         ("", *WEATHER_CALL),
+                         id="forced_call_arguments_in_fragments"),
+            pytest.param(
+                "kimi_k3",
+                None, ["Sure. ", UNCLOSED_SECTION[:30], UNCLOSED_SECTION[30:]],
+                ("Sure. ", *WEATHER_CALL),
+                id="k3_call_flushed_at_finish"),
+            pytest.param("kimi_k3",
+                         "get_weather",
+                         ["Let me check. ", SECTION[:40], SECTION[40:]],
+                         ("Let me check. ", *WEATHER_CALL),
+                         id="forced_k3_call"),
+            pytest.param(None,
+                         None, ["Good ", "morning"], ("Good morning", "", ""),
+                         id="content"),
+        ],
+    )
+    def test_finish_reason_arrives_on_its_own_empty_chunk(
+            self, sample_tools, tool_parser, forced_tool_name, steps, expected):
+        args = self._make_args(sample_tools,
+                               tool_parser=tool_parser,
+                               forced_tool_name=forced_tool_name)
+        payloads = self._stream(args, steps)
+
+        assert self._read_until_finish(payloads) == expected, (
+            "a client that stops reading at finish_reason must already have "
+            "all of the content and every tool-call fragment")
+        choices = self._choices(payloads)
+        last_output = [c for c in choices if self._has_output(c)][-1]
+        assert last_output.get("finish_reason") is None, (
+            "the last chunk with output must not carry finish_reason")
+        *earlier, last = choices
+        early_finishes = [c for c in earlier if c.get("finish_reason")]
+        assert not early_finishes, "only the last chunk may carry finish_reason"
+        assert last.get("finish_reason") and last["delta"] == {}, (
+            "the last chunk must carry finish_reason with an empty delta")
+
+    def test_a_finish_without_new_output_stays_one_chunk(self, sample_tools):
+        choices = self._choices(
+            self._stream(self._make_args(sample_tools),
+                         ["Good ", "morning", ""]))
+
+        assert choices[-2]["delta"]["content"] == "morning"
+        assert choices[-2].get("finish_reason") is None
+        assert choices[-1]["finish_reason"] == "stop"
+        assert not self._has_output(choices[-1])
+
+    def test_continuous_usage_is_on_the_output_and_the_finish_chunk(
+            self, sample_tools):
+        from tensorrt_llm.serve.openai_protocol import StreamOptions
+
+        args = self._make_args(sample_tools,
+                               stream_options=StreamOptions(
+                                   include_usage=True,
+                                   continuous_usage_stats=True))
+        payloads = self._stream(args, ["Good ", "morning"],
+                                finish_reason="length")
+
+        *_, output_chunk, finish_chunk, usage_chunk = payloads
+        assert output_chunk["choices"][0]["delta"]["content"] == "morning"
+        assert "finish_reason" not in output_chunk["choices"][0]
+        assert finish_chunk["choices"] == [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "length"
+        }]
+        assert usage_chunk["choices"] == []
+        # Every chunk of such a stream reports the usage so far.
+        assert all(payload.get("usage") for payload in payloads)
+        assert output_chunk["usage"] == finish_chunk["usage"]
+        assert finish_chunk["usage"]["completion_tokens"] == 2
+
+    def test_final_reasoning_precedes_the_finish_chunk(self, sample_tools):
+        # deepseek-r1 reads all output before "</think>" as reasoning, so the
+        # last delta carries reasoning_content and no content.
+        args = self._make_args(sample_tools, reasoning_parser="deepseek-r1")
+        *earlier, last = self._choices(self._stream(args,
+                                                    ["Let me ", "think."]))
+
+        assert earlier[-1]["delta"]["reasoning_content"] == "think."
+        assert not earlier[-1]["delta"].get("content")
+        assert not [c for c in earlier if c.get("finish_reason")]
+        assert last == {"index": 0, "delta": {}, "finish_reason": "stop"}
+
+    @pytest.mark.parametrize(
+        "steps, content, token",
+        [
+            pytest.param(
+                ["Good ", "morning"], "morning", "<1>", id="with_final_text"),
+            # The last token decodes to no text but still has logprobs.
+            pytest.param(
+                ["Good ", "morning", ""], "", "<2>", id="without_final_text"),
+        ],
+    )
+    def test_logprobs_stay_with_the_output_and_the_stop_with_the_finish(
+            self, sample_tools, steps, content, token):
+        from types import SimpleNamespace
+
+        args = self._make_args(
+            sample_tools,
+            return_logprobs=True,
+            tokenizer=SimpleNamespace(decode=lambda token_id: f"<{token_id}>"),
+            return_spec_decode_stats=True)
+        counters = SimpleNamespace(spec_dec_totals=(3, 4),
+                                   per_pos_accepted=[2, 1],
+                                   per_pos_drafted=[2, 2])
+        payloads = self._stream(args,
+                                steps,
+                                stop_reason="END",
+                                _spec_dec_counters=counters)
+
+        *_, output_chunk, finish_chunk = payloads
+        output_choice, = output_chunk["choices"]
+        finish_choice, = finish_chunk["choices"]
+        assert (output_choice["delta"].get("content") or "") == content
+        tokens = [e["token"] for e in output_choice["logprobs"]["content"]]
+        assert tokens == [token]
+        for key in ("finish_reason", "stop_reason", "speculative_decoding"):
+            assert key not in output_choice
+        assert finish_choice["delta"] == {}
+        assert "logprobs" not in finish_choice
+        assert finish_choice["finish_reason"] == "stop"
+        assert finish_choice["stop_reason"] == "END"
+        assert finish_choice["speculative_decoding"][
+            "total_accepted_draft_tokens"] == 3
+
+    def test_each_choice_ends_with_its_own_finish_chunk(self, sample_tools):
+        args = self._make_args(sample_tools, num_choices=2)
+        steps = [{0: "Good ", 1: "Good "}, {0: "morning", 1: "evening"}]
+        payloads = self._stream(args, steps)
+
+        for index, text in ((0, "Good morning"), (1, "Good evening")):
+            *earlier, last = self._choices(payloads, index)
+            assert not [c for c in earlier if c.get("finish_reason")]
+            assert last == {
+                "index": index,
+                "delta": {},
+                "finish_reason": "stop"
+            }
+            assert self._read_until_finish(payloads, index) == (text, "", "")
+
+
 class TestConfigureParserSpecialTokenDecoding:
     """Test parser-specific detokenization settings in the OpenAI server."""
 
@@ -7412,14 +7752,18 @@ class TestUnparsedToolCallWarning:
 # ============================================================================
 
 
-def _glm_tool(name, properties=None):
-    """One declared tool; `properties` is its JSON-schema property map."""
+def _glm_tool(name, properties=None, definitions=None):
+    """One declared tool; `properties` is its JSON-schema property map.
+
+    `definitions` adds keywords such as ``$defs`` to the parameters schema.
+    """
     return ChatCompletionToolsParam(type="function",
                                     function=FunctionDefinition(
                                         name=name,
                                         parameters={
                                             "type": "object",
                                             "properties": properties or {},
+                                            **(definitions or {}),
                                         }))
 
 
@@ -7522,14 +7866,125 @@ def _glm_parity(parser_cls, text, tools, chunkings=None):
     return whole.normal_text, expected
 
 
+# The definitions the "$ref" schemas below name, laid out as schema generators
+# such as Pydantic emit nested models and enums (draft-07 uses `definitions`),
+# plus names that a reference must percent-encode or escape.
+_GLM_DEFINITIONS = {
+    "$defs": {
+        "Opts": {
+            "type": "object",
+            "properties": {
+                "verbose": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "Mode": {
+            "enum": ["fast", "1"]
+        },
+        "Loop": {
+            "$ref": "#/$defs/Loop"
+        },
+        "My Opts": {
+            "type": "object"
+        },
+        "My/Opts": {
+            "type": "object"
+        },
+        "Choices": {
+            "anyOf": [{
+                "type": "object"
+            }, {
+                "type": "string"
+            }]
+        },
+    },
+    "definitions": {
+        "Opts": {
+            "type": "object"
+        }
+    },
+}
+
 _GLM_SCHEMAS = {
     kind: dict(type=kind)
-    for kind in ("string", "integer", "number", "boolean", "object", "array")
+    for kind in ("string", "integer", "number", "boolean", "object", "array",
+                 "null")
 }
-_GLM_SCHEMAS.update({"any": {}, "$ref": {"$ref": "#/$defs/F"}, "none": None})
+_GLM_SCHEMAS.update({
+    "any": {},
+    "none": None,
+    "$ref object": {
+        "$ref": "#/$defs/Opts"
+    },
+    "$ref object, described": {
+        "$ref": "#/$defs/Opts",
+        "description": "options"
+    },
+    "allOf $ref object": {
+        "allOf": [{
+            "$ref": "#/$defs/Opts"
+        }],
+        "description": "options"
+    },
+    "optional $ref object": {
+        "anyOf": [{
+            "$ref": "#/$defs/Opts"
+        }, {
+            "type": "null"
+        }],
+        "default": None
+    },
+    "definitions $ref object": {
+        "$ref": "#/definitions/Opts"
+    },
+    "$ref enum": {
+        "$ref": "#/$defs/Mode"
+    },
+    "optional $ref enum": {
+        "anyOf": [{
+            "$ref": "#/$defs/Mode"
+        }, {
+            "type": "null"
+        }]
+    },
+    "dangling $ref": {
+        "$ref": "#/$defs/Missing"
+    },
+    "cyclic $ref": {
+        "$ref": "#/$defs/Loop"
+    },
+    "$ref percent-encoded name": {
+        "$ref": "#/$defs/My%20Opts"
+    },
+    "$ref percent-encoded escape": {
+        "$ref": "#/$defs/My%7E1Opts"
+    },
+    "$ref invalid encoding": {
+        "$ref": "#/$defs/%FF"
+    },
+    "$ref array index": {
+        "$ref": "#/$defs/Choices/anyOf/0"
+    },
+    "$ref array index, leading zero": {
+        "$ref": "#/$defs/Choices/anyOf/00"
+    },
+    "$ref array index, out of range": {
+        "$ref": "#/$defs/Choices/anyOf/2"
+    },
+    "$ref array index, past the end": {
+        "$ref": "#/$defs/Choices/anyOf/-"
+    },
+    "$ref array index, superscript digit": {
+        "$ref": "#/$defs/Choices/anyOf/²"
+    },
+    "$ref array index, non-ASCII decimal digit": {
+        "$ref": "#/$defs/Choices/anyOf/٠"
+    },
+})
 
-# Declared strings are delivered verbatim, whatever they look like, markup
-# included.
+# Declared strings, and values with no resolvable type, are delivered verbatim,
+# whatever they look like, markup included.
 _GLM_STRING_VALUES = [
     "99797", "true", "1e3", "null", "0099797", " padded \n", "", "北京",
     'say "hi"', "C:\\Users\\test.txt", "line one\nline two", '{"k": "v"}',
@@ -7543,10 +7998,12 @@ _GLM_STRING_VALUES = [
     "almost the whole tag </arg_value", "a</arg_value><"
 ]
 
-# (raw value, schema, delivered value). Other declared types decode, keeping
-# the text when the result is not strict JSON; with no resolvable type ("none",
-# "any", "$ref") only strict JSON decodes.
-_GLM_TYPED_VALUES = [(value, "string", value) for value in _GLM_STRING_VALUES]
+# (raw value, schema, delivered value). A declared string and a value with no
+# resolvable type ("none", "any", a "$ref" that names no definition) are
+# delivered as written; other declared types decode, keeping the text when the
+# result is not strict JSON. A "$ref" is typed by the definition it names.
+_GLM_TYPED_VALUES = [(value, schema, value) for schema in ("string", "none")
+                     for value in _GLM_STRING_VALUES]
 _GLM_TYPED_VALUES += [
     ("42", "integer", 42),
     ('"42"', "integer", 42),
@@ -7569,19 +8026,51 @@ _GLM_TYPED_VALUES += [
     ("1j", "number", "1j"),
     ("b'x'", "array", "b'x'"),
     ("not json", "object", "not json"),
-    ("8000", "none", 8000),
-    ('{"a": [1, 2]}', "none", dict(a=[1, 2])),
-    ("true", "none", True),
-    ("null", "none", None),
+    ("null", "null", None),
+    ("8000", "null", 8000),
+    ("8000", "none", "8000"),
+    ('{"a": [1, 2]}', "none", '{"a": [1, 2]}'),
     ("ls -la", "none", "ls -la"),
-    ("", "none", ""),
     ("NaN", "none", "NaN"),
     ("'single'", "none", "'single'"),
-    ('{"a": 1}', "any", dict(a=1)),
-    ('{"a": 1}', "$ref", dict(a=1)),
+    ('{"a": 1}', "any", '{"a": 1}'),
+    ('{"verbose": true}', "$ref object", dict(verbose=True)),
+    ('{"verbose": true}', "$ref object, described", dict(verbose=True)),
+    ('{"verbose": true}', "allOf $ref object", dict(verbose=True)),
+    ('{"verbose": true}', "optional $ref object", dict(verbose=True)),
+    ('{"verbose": true}', "definitions $ref object", dict(verbose=True)),
+    ("1", "$ref enum", "1"),
+    ("1", "optional $ref enum", "1"),
+    ('{"a": 1}', "dangling $ref", '{"a": 1}'),
+    ('{"a": 1}', "cyclic $ref", '{"a": 1}'),
+    ('{"verbose": true}', "$ref percent-encoded name", dict(verbose=True)),
+    ('{"verbose": true}', "$ref percent-encoded escape", dict(verbose=True)),
+    ('{"a": 1}', "$ref invalid encoding", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index", dict(a=1)),
+    ('{"a": 1}', "$ref array index, leading zero", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, out of range", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, past the end", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, superscript digit", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, non-ASCII decimal digit", '{"a": 1}'),
 ]
 
 _GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})
+
+# (declared tool, call name, key, raw value, delivered value). Only a type the
+# schema gives the key decodes its value; without one the value is the text the
+# model wrote.
+_UNTYPED_PROPERTY = {"description": "free-form"}
+_GLM_TYPING_CASES = [
+    (_glm_typed_tool("f", n="integer"), "no_such_tool", "n", "42", "42"),
+    (_glm_typed_tool("f", n="integer"), "f", "extra", '{"a":1}', '{"a":1}'),
+    (_glm_tool("f", {"v": _UNTYPED_PROPERTY}), "f", "v", "true", "true"),
+    (_glm_typed_tool("f", n="integer"), "f", "n", "42", 42),
+    (_glm_typed_tool("f", flag="boolean"), "f", "flag", "true", True),
+]
+_GLM_TYPING_CASE_IDS = [
+    "undeclared tool", "undeclared key", "property without a type",
+    "declared integer", "declared boolean"
+]
 
 _GLM_TOOLS = [_glm_typed_tool("f", code="string", n="integer", opts="object")]
 
@@ -7603,10 +8092,11 @@ _GLM_ARGUMENT_TEXTS = [
     (_glm_pairs(("n", "3"), ("code", "a<")), dict(n=3, code="a<")),
     (_glm_pairs(("code", "a</arg_valu"),
                 ("n", "3")), dict(code="a</arg_valu", n=3)),
-    # Each argument is typed alone, and an object value still closes the call.
+    # Each argument is typed alone (`budget` is undeclared, so it stays text),
+    # and an object value still closes the call.
     (_glm_pairs(("code", "w"), ("n", "3"), ("budget", "8000"), ("note", ""),
                 ("opts", '{"verbose": true}')),
-     dict(code="w", n=3, budget=8000, note="", opts=dict(verbose=True))),
+     dict(code="w", n=3, budget="8000", note="", opts=dict(verbose=True))),
     ("<arg_key>code</arg_key><arg_value>ls -la", None),
     ("<arg_key>n</arg_key><arg_value>5", None),
     ("<arg_key>code</arg_key><arg_value>ls</think>", None),
@@ -7672,8 +8162,9 @@ class TestGlmStreamingMatchesWholeParse:
     def test_argument_typing(self, parser_cls, value, schema, expected):
         properties = {"v": _GLM_SCHEMAS[schema]} if schema != "none" else {}
         text = _glm_call(parser_cls, "f", ("v", value))
+        tool = _glm_tool("f", properties, _GLM_DEFINITIONS)
 
-        _, calls = _glm_parity(parser_cls, text, [_glm_tool("f", properties)])
+        _, calls = _glm_parity(parser_cls, text, [tool])
 
         assert calls == [("f", dict(v=expected))]
 
@@ -7682,8 +8173,20 @@ class TestGlmStreamingMatchesWholeParse:
         text = _glm_call(parser_cls, "f", ("v", value))
         for schema in _GLM_SCHEMAS.values():
             properties = {} if schema is None else {"v": schema}
-            _glm_parity(parser_cls, text, [_glm_tool("f", properties)],
+            _glm_parity(parser_cls, text,
+                        [_glm_tool("f", properties, _GLM_DEFINITIONS)],
                         [("whole", [text]), ("per character", list(text))])
+
+    @pytest.mark.parametrize("tool,name,key,raw,expected",
+                             _GLM_TYPING_CASES,
+                             ids=_GLM_TYPING_CASE_IDS)
+    def test_only_a_declared_type_decodes_a_value(self, parser_cls, tool, name,
+                                                  key, raw, expected):
+        text = _glm_call(parser_cls, name, (key, raw))
+
+        _, calls = _glm_parity(parser_cls, text, [tool])
+
+        assert calls == [(name, {key: expected})]
 
     @pytest.mark.parametrize("argument_text,expected", _GLM_ARGUMENT_TEXTS)
     def test_argument_text(self, parser_cls, argument_text, expected):
@@ -8125,3 +8628,100 @@ def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
     assert content == "Checking."
     assert parser_cls().detect_and_parse(text,
                                          sample_tools).normal_text == content
+
+
+@pytest.mark.parametrize("test_class",
+                         [TestQwen3ToolParser, TestGemma4ToolParser])
+def test_finish_reports_every_call_of_a_reply_in_one_increment(
+        sample_tools, test_class):
+    """Several calls in the last increment: finish() delivers all of them.
+
+    The calls are those detect_and_parse reads from the same text.
+    """
+    test = test_class()
+    text = test.make_tool_parser_test_cases().detect_and_parse_multiple_tools[0]
+
+    streamed = _streamed_calls(test.make_parser(), [text], sample_tools)
+
+    assert len(streamed) > 1
+    assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
+
+
+@pytest.mark.parametrize("test_class",
+                         [TestDeepSeekV3Parser, TestDeepSeekV31Parser])
+@pytest.mark.parametrize("last_increment",
+                         ["reply", "both_calls", "second_call_tail"])
+def test_deepseek_streaming_reports_each_call_of_the_last_increment(
+        sample_tools, test_class, last_increment):
+    """Calls that arrive together keep their own names and arguments.
+
+    The last increment brings the whole reply, both calls, or the second call
+    from its separator on. The calls are those detect_and_parse reads from the
+    same text.
+    """
+    test = test_class()
+    text = test.make_tool_parser_test_cases().detect_and_parse_multiple_tools[0]
+    call_begin, sep = "<｜tool▁call▁begin｜>", "<｜tool▁sep｜>"
+    cut = {
+        "reply": 0,
+        "both_calls": text.index(call_begin),
+        "second_call_tail": text.index(sep, text.rindex(call_begin)) + len(sep),
+    }[last_increment]
+    increments = [text[:cut], text[cut:]] if cut else [text]
+
+    streamed = _streamed_calls(test.make_parser(), increments, sample_tools)
+
+    assert len(streamed) > 1
+    assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
+
+
+def _minimax_m2_invoke(name, key, value):
+    """A MiniMax-M2 invocation of ``name`` with one parameter."""
+    return (f'<invoke name="{name}">'
+            f'<parameter name="{key}">{value}</parameter></invoke>')
+
+
+def _minimax_m3_invoke(name, key, value):
+    """A MiniMax-M3 invocation of ``name`` with one parameter."""
+    ns = "]<]minimax[>["
+    return (f'{ns}<invoke name="{name}">'
+            f'{ns}<{key}>{value}{ns}</{key}>{ns}</invoke>')
+
+
+# Per MiniMax format: the parser, the tags that open and close a tool-call
+# block, and the invocation builder.
+_MINIMAX_FORMATS = {
+    "m2": (MiniMaxM2ToolParser, "<minimax:tool_call>", "</minimax:tool_call>",
+           _minimax_m2_invoke),
+    "m3": (MiniMaxM3ToolParser, "]<]minimax[>[<tool_call>",
+           "]<]minimax[>[</tool_call>", _minimax_m3_invoke),
+}
+
+
+@pytest.mark.parametrize("model", ["m2", "m3"])
+@pytest.mark.parametrize(
+    "calls", ["one_call", "two_calls_in_a_block", "a_block_per_call"])
+def test_minimax_streaming_reports_each_call_of_a_reply_in_one_increment(
+        sample_tools, model, calls):
+    """A reply in one increment: the stream and finish() give each call once.
+
+    The calls share one tool-call block or each have their own. They are those
+    detect_and_parse reads from the same text.
+    """
+    parser_cls, opener, closer, invoke = _MINIMAX_FORMATS[model]
+    weather = invoke("get_weather", "location", "NYC")
+    search = invoke("search_web", "query", "AI news")
+
+    def block(*invokes):
+        return opener + "".join(invokes) + closer
+
+    text = "Checking. " + {
+        "one_call": block(weather),
+        "two_calls_in_a_block": block(weather, search),
+        "a_block_per_call": block(weather) + block(search),
+    }[calls]
+
+    streamed = _streamed_calls(parser_cls(), [text], sample_tools)
+
+    assert len(streamed) == (1 if calls == "one_call" else 2)
+    assert streamed == _whole_calls(parser_cls(), text, sample_tools)

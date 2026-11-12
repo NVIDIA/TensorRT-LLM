@@ -37,9 +37,15 @@ import triton
 import triton.language as tl
 
 _BLOCK_TABLE_BLOCK = 2048
+# Rows per program of _strict_accept_kernel. Fixed, like the arguments in its do_not_specialize list, so
+# one compiled variant per draft length serves every batch: serving changes the request counts on every
+# iteration, and a new variant compiles and loads a module on the sampling path.
+_STRICT_ACCEPT_BLOCK_B = 128
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["draft_ptr", "stride_draft_row", "stride_draft_col", "num_ctx", "num_gen"]
+)
 def _strict_accept_kernel(
     target_ptr,
     draft_ptr,
@@ -108,7 +114,7 @@ def strict_accept(
     num_accepted = torch.empty((batch_size,), dtype=torch.int32, device=device)
     if batch_size == 0:
         return accepted, num_accepted
-    block_b = min(triton.next_power_of_2(max(num_contexts, num_gens, 1)), 128)
+    block_b = _STRICT_ACCEPT_BLOCK_B
     grid = (triton.cdiv(max(num_contexts, num_gens, 1), block_b),)
     _strict_accept_kernel[grid](
         target_tokens,
@@ -232,7 +238,14 @@ class PagedLatentPrepare(NamedTuple):
     rebase_pages: torch.Tensor  # [G] int64, row entries the block decode skips
 
 
-@triton.jit
+# The generation count, the first generation row and the slot view sliced at
+# that row follow the batch composition. Specializing them (a count of 1 or a
+# multiple of 16, a 16-byte-aligned pointer) would compile kernel variants
+# mid-serving.
+@triton.jit(
+    do_not_specialize=["num_gens", "first_row"],
+    do_not_specialize_on_alignment=["slots_ptr"],
+)
 def _paged_latent_prepare_kernel(
     num_accepted_ptr,
     accepted_ptr,
