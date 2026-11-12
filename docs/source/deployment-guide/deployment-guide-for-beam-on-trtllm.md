@@ -27,6 +27,10 @@ and `modeling_v2="require"`. Use the concrete `BeamFastTokenizer` for prompts.
 The public `examples/llm-api/eval_gsm8k.py` evaluator can score an existing compatible
 endpoint; see its adjacent `gsm8k_eval/README.md` for arguments and resume behavior.
 
+Set `max_num_tokens` to an integer from 1 through 8192; `null` is not supported.
+Paged-context attention (cache reuse, chunked prefill)
+requires `kv_cache_config.tokens_per_block: 32`.
+
 This baseline does not enable speculative decoding, FP8 KV, disaggregated serving,
 Dynamo, CUDA graphs or overlap scheduling. Those configurations require separate qualification.
 
