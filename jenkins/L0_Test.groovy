@@ -7205,6 +7205,13 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     // SLURM dispatcher pods opt in to off-pod resource reconciliation: on a
     // mid-run pod death their SLURM job / Jenkins node would otherwise leak.
     boolean slurmDispatcher = opts.slurmDispatcher ?: false
+    def testRunner = runner
+    runner = { attemptTag, isFinalAttempt, retryContext ->
+        trtllm_utils.postStagePodInfo(
+            pipeline, stageName, attemptTag, slurmDispatcher ? "slurm_dispatcher" : "test"
+        )
+        testRunner(attemptTag, isFinalAttempt, retryContext)
+    }
     // Per-stage override of the K8s pod-level infra-retry budget (opts.infraRetryMax,
     // 0 = no retry) so resource-scarce pools can cap or disable stage retries. Applies
     // to the outer test-pod retry loop below; the singleAttempt launch-retry keeps the
