@@ -2757,7 +2757,7 @@ def _set_fp4_mla_decode_env(
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, str(int(enable_4x)))
-    if enable_4x is not False:
+    if enable_4x:
         # the test caches are small batches: lift the production floor on pair tasks (dispatch is tested on CPU)
         from tensorrt_llm._torch.attention.backends.fp4_mla import (
             fp4_mla_cutedsl_4x_host as host_4x,
@@ -3042,7 +3042,9 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
     query_len_per_seq: int,
     seq_lens: list[int],
 ) -> None:
-    """4x one-wave kernel (the 4x switches on) on the shapes inside its envelope."""
+    """4x one-wave kernel (the 4x switches on, the path forced) on the shapes inside its envelope."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+
     calls: list[str] = []
     run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
     run_2x = fp4_mla_decode._run_cutedsl_packed_decode
@@ -3067,6 +3069,8 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
         query_len_per_seq=query_len_per_seq,
         packed_queries=True,
         enable_4x=True,
+        # the skewed batch is too uneven for the automatic choice of a FULL 4x wave
+        env={fp4_mla_dispatch.DECODE_PATH_ENV: "4x"},
     )
     assert calls == ["4x"], calls
 
@@ -3078,7 +3082,8 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
         (
             128,
             4,
-            [131, 512],
+            # a page table of more than two KV tiles: the 4x paths may take the call
+            [131, 1024] * 8,
             (
                 ({}, "4x"),
                 ({fp4_mla_config.FP4_MLA_CUTEDSL_4X_H128_ENV: "0"}, "2x"),
@@ -3088,7 +3093,7 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
         (
             96,
             8,
-            [131, 2100, 513],
+            [131, 2100, 513] * 3,
             (
                 ({}, "2x"),
                 ({fp4_mla_config.FP4_MLA_CUTEDSL_4X_ENV: "1"}, "4x"),
@@ -3105,8 +3110,8 @@ def test_fp4_mla_attention_decode_cutedsl_4x_switch_goes_by_the_head_count(
     seq_lens: list[int],
     cases: tuple,
 ) -> None:
-    """With neither 4x switch set a 128-head call inside the envelope takes the 4x kernel and a call of another
-    head count the packed 2x path; each switch moves the calls of its own head counts and not the other's."""
+    """In a clean environment a 128-head call the production envelope admits takes the 4x kernel and a call of
+    another head count the packed 2x path; each switch moves the calls of its own head counts and not the other's."""
     calls: list[str] = []
     run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
     run_2x = fp4_mla_decode._run_cutedsl_packed_decode
@@ -3282,8 +3287,8 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_one_wave_split(
         backend="cutedsl",
         fused_v_transpose=False,
         num_heads=num_heads,
-        # non-uniform KV from the floor of the one-wave split
-        seq_lens=[fp4_mla_dispatch.FLOOR_KV_ONE_WAVE_SPLIT + 7 * i for i in range(num_requests)],
+        # non-uniform KV, each request 7 tokens longer than the one before
+        seq_lens=[768 + 7 * i for i in range(num_requests)],
         seed=45,
         query_len_per_seq=query_len_per_seq,
         packed_queries=True,
@@ -3480,6 +3485,7 @@ def test_fp4_mla_attention_decode_cutedsl_4x_split_matches_reference(
     """4x split mode (device plan + FP32 partials + packed reducer) on batches above one wave, skewed KV
     lengths and the rows-mode head count; the multi-wave KV floor is lifted so the test caches qualify."""
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_twostream as ts
 
     calls: list[str] = []
     run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
@@ -3505,7 +3511,7 @@ def test_fp4_mla_attention_decode_cutedsl_4x_split_matches_reference(
     monkeypatch.setattr(fp4_mla_decode_4x, "_fp4_mla_4x_split_buffers", spy_buffers)
     env = {host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0"}
     if one_wave_min_kv is not None:
-        env[host_4x.SPLIT_MIN_KV_ONEWAVE_ENV] = one_wave_min_kv
+        env[ts.SPLIT_MIN_KV_ONEWAVE_ENV] = one_wave_min_kv
     _assert_fp4_mla_attention_decode_accuracy(
         monkeypatch,
         backend="cutedsl",

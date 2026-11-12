@@ -145,6 +145,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         py_batch_idx=None,
         lora_task_id=None,
         is_dummy=False,
+        is_cuda_graph_dummy=False,
         max_beam_num_tokens=prompt_len,
         state="context",
         py_llm_request_type="context_and_generation",

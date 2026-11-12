@@ -21,7 +21,15 @@ HELIX = {"helix": True, "softmax_stats": True}  # the two inputs of a Helix deco
 
 
 def _choose(
-    num_requests, query_len, kv_capacity, *, num_heads=128, live=None, unavailable=None, **kw
+    num_requests,
+    query_len,
+    kv_capacity,
+    *,
+    num_heads=128,
+    live=None,
+    mean=None,
+    unavailable=None,
+    **kw,
 ):
     rows = num_heads * query_len
     return dp.choose_decode_strategy(
@@ -33,6 +41,7 @@ def _choose(
         sm_count=SM,
         envelope_reason=host_4x.envelope_reason_static,
         live_max_kv=live,
+        live_mean_kv=mean,
         four_x_unavailable=unavailable,
         **kw,
     )
@@ -50,7 +59,7 @@ def _clean_env(monkeypatch):
         "TRTLLM_FP4_MLA_TWOSTREAM_R2",
         host_4x.MIN_PAIRS_ENV,
         host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV,
-        host_4x.SPLIT_MIN_KV_ONEWAVE_ENV,
+        ts.SPLIT_MIN_KV_ONEWAVE_ENV,
         host_4x.HELIX_ENV,
     ):
         monkeypatch.delenv(name, raising=False)
@@ -413,7 +422,7 @@ def test_helix_never_takes_the_two_stream_split(monkeypatch):
     """The two-stream arms carry neither KV bounds nor softmax statistics: where a non-Helix call splits, a Helix
     call of the same shape runs plain 4x (one wave) or stays on 2x (more than one wave)."""
     monkeypatch.setenv(host_4x.HELIX_ENV, "1")
-    one_wave, many_waves = (20, 4, 14208), (96, 4, 30080)
+    one_wave, many_waves = (20, 4, 14208), (48, 4, 30080)
     monkeypatch.setenv("TRTLLM_FP4_MLA_TWOSTREAM_R2", "2")
     assert _choose(*one_wave).path == dp.PATH_TWO_STREAM
     s = _choose(*one_wave, **HELIX)
@@ -490,8 +499,9 @@ def _regimes(num_requests, query_len, capacity, num_heads=128):
 
 
 def test_kv_regimes_for_batch(monkeypatch):
-    # one wave: 4x-eligible at every KV, a single regime; more waves: the 2x regime ends under the floor
-    assert _regimes(16, 4, 30080) == (30080,)
+    # one wave: 4x at every mean KV, behind the 2x regime of the steps too uneven for its FULL wave; more waves:
+    # the 2x regime ends under the floor
+    assert _regimes(16, 4, 30080) == (dp.KV_REGIME_UNEVEN, 30080)
     assert _regimes(32, 4, 30080) == (2047, 30080)
     assert _regimes(48, 4, 30080) == (4095, 30080)
     assert _regimes(64, 4, 30080) == (4095, 30080)
@@ -536,14 +546,15 @@ def test_kv_regimes_for_batch(monkeypatch):
     monkeypatch.setenv(dp.KV_REGIME_GRID_ENV, "0")
     assert _regimes(128, 4, 30080) == (8191, 30080)
     monkeypatch.delenv(dp.KV_REGIME_GRID_ENV)
-    # a flat floor knob moves the 2x regime of every shape; 0 or a floor above the capacity leaves one regime
+    # a flat floor knob moves the 2x regime of every shape; a floor above the capacity leaves one regime, and so
+    # does 0, but for the 2x regime of the steps too uneven for an uncut launch (B128/q4 splits at this calibration)
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "12288")
     assert _regimes(16, 4, 30080) == (12287, 30080)
     assert _regimes(128, 4, 30080) == (12287, 30080)
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "40000")
     assert _regimes(128, 4, 30080) == (30080,)
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "0")
-    assert _regimes(128, 4, 30080) == (30080,)
+    assert _regimes(128, 4, 30080) == (dp.KV_REGIME_UNEVEN, 30080)
     monkeypatch.delenv(dp.MIN_KV_4X_ENV)
     # a forced 2x or 4x path never looks at the KV length; a forced two-stream still plans on it
     monkeypatch.setenv(dp.DECODE_PATH_ENV, "2x")
@@ -605,28 +616,18 @@ def test_extra_wave_floor_follows_the_wave_arithmetic():
 def test_first_window(num_heads, query_len, full, last):
     rows = num_heads * query_len
     for cap in (30080, 163840):
-        # the one-wave split needs a FULL-launch 4x wave: whole requests fill it exactly (1 or 2 pair tasks per
-        # request), or the page table is under the bound from which the host launches an under-filled wave in
-        # split mode
-        one_wave = 46 % (rows // 256) == 0 or cap < host_4x.SPLIT_MIN_KV_ONEWAVE_DEFAULT
         for num_requests in range(full + 1, last + 1):
             assert math.ceil(dp.four_x_waves(num_requests, rows, SM)) == 2
             assert dp.two_x_waves(num_requests, rows, SM) == 1
             assert dp.extra_wave_floor_kv(num_requests, rows, SM) == 12288
-            for live in (768, 1024, 2047, 2048, 4096, 8192, 12287):
+            for live in (1, 256, 768, 1024, 2047, 2048, 4096, 8192, 12287):
                 s = _choose(num_requests, query_len, cap, live=live, num_heads=num_heads)
-                if one_wave:
-                    # one FULL 4x wave on the 4x kernel, the other requests on the 2x kernel, from the split's
-                    # own floor up to 12K: also under the 2K graded floor of these batches
-                    assert s.path == dp.PATH_TWO_STREAM and s.r2 == num_requests - full, (live, s)
-                    assert s.plan.waves_4x == 1 and s.plan.rounds_2x == 1
-                    assert "one wave of the machine" in s.reason
-                    assert s.record_tag == f"ts{num_requests - full}|kv{live}"
-                else:
-                    # the wave of whole requests is under-filled (45 or 44 pair tasks) and this page table
-                    # launches it in split mode: no split, 2x keeps the call
-                    assert s.path == dp.PATH_2X, (num_requests, live, s)
-                    assert live < 2048 or "a wave more than the 2x" in s.reason
+                # one FULL 4x wave on the 4x kernel (an under-filled one too: it is launched for the step's KV),
+                # the other requests on the 2x kernel, up to 12K: also under the 2K graded floor of these batches
+                assert s.path == dp.PATH_TWO_STREAM and s.r2 == num_requests - full, (live, s)
+                assert s.plan.waves_4x == 1 and s.plan.rounds_2x == 1
+                assert "one wave of the machine" in s.reason
+                assert s.record_tag == f"ts{num_requests - full}|kv{live}"
             # plain 4x from the window floor
             for live in (12288, 16384, 30080):
                 s = _choose(num_requests, query_len, cap, live=live, num_heads=num_heads)
@@ -634,25 +635,24 @@ def test_first_window(num_heads, query_len, full, last):
         # one 4x wave: plain 4x at every KV, no window
         assert dp.extra_wave_floor_kv(full, rows, SM) == 0
         assert _choose(full, query_len, cap, live=1024, num_heads=num_heads).path == dp.PATH_4X
-        # one request past the window the 2x kernel needs its second wave too: the graded floor of 2K, as before
+        # one request past the window the 2x kernel needs its second wave too: the graded floor of 2K
         assert dp.extra_wave_floor_kv(last + 1, rows, SM) == 0
         assert _choose(last + 1, query_len, cap, live=2047, num_heads=num_heads).path == dp.PATH_2X
         assert _choose(last + 1, query_len, cap, live=2048, num_heads=num_heads).path == dp.PATH_4X
 
 
 def test_one_wave_split_follows_the_host_launch(monkeypatch):
-    # the planner repeats the host's bound for the split-mode launch of an under-filled wave: same knob, same default
-    assert ts.SPLIT_MIN_KV_ONEWAVE_ENV == host_4x.SPLIT_MIN_KV_ONEWAVE_ENV
-    assert ts.SPLIT_MIN_KV_ONEWAVE_DEFAULT == host_4x.SPLIT_MIN_KV_ONEWAVE_DEFAULT
+    # the planner splits where the host launches its 4x wave FULL, the host asked with the KV length of the decision,
+    # whatever the page table
     for knob in (None, "0", "32768", str(1 << 20)):
         if knob is not None:
-            monkeypatch.setenv(host_4x.SPLIT_MIN_KV_ONEWAVE_ENV, knob)
+            monkeypatch.setenv(ts.SPLIT_MIN_KV_ONEWAVE_ENV, knob)
         for num_heads, query_len, full, last in WAVE_SHAPES:
             for cap in (8192, 32768, 65535, 65536, 163840):
                 for num_requests in range(full + 1, last + 1):
                     s = _choose(num_requests, query_len, cap, live=2048, num_heads=num_heads)
                     full_launch = not host_4x.use_split_mode(
-                        num_heads=num_heads, query_len=query_len, num_requests=full, max_kv_len=cap
+                        num_heads=num_heads, query_len=query_len, num_requests=full, max_kv_len=2048
                     )
                     # a split exactly where the host launches its 4x wave FULL, else 2x
                     assert (s.path == dp.PATH_TWO_STREAM) == full_launch, (
@@ -666,7 +666,7 @@ def test_one_wave_split_follows_the_host_launch(monkeypatch):
 
 def test_second_window_keeps_2x_up_to_its_floor():
     cap = 30080
-    # 3 against 2 waves (q4 B47-53).  B47-49: the planner's split drops the extra wave with one 2x round; unchanged
+    # 3 against 2 waves (q4 B47-53).  B47-49: the planner's split drops the extra wave with one 2x round
     for num_requests, r2 in ((47, 1), (48, 2), (49, 3)):
         assert _choose(num_requests, 4, cap, live=4095).path == dp.PATH_2X
         for live in (4096, 6143, 6144, 8192):
@@ -687,7 +687,7 @@ def test_second_window_keeps_2x_up_to_its_floor():
 
 
 def test_a_split_that_drops_no_wave_is_plain_4x():
-    # batches that fill their 4x waves exactly: the planner used to hand one request to the 2x kernel
+    # a split must drop a whole 4x wave: batches that fill their 4x waves exactly run plain 4x
     cap = 30080
     for num_requests, query_len, num_heads in (
         (46, 4, 128),
@@ -703,7 +703,7 @@ def test_a_split_that_drops_no_wave_is_plain_4x():
 
 def test_extra_wave_window_knobs(monkeypatch):
     cap = 30080
-    # a flat floor replaces every per-batch floor, the window's too: plain 4x from it, as before the rule
+    # a flat floor replaces every per-batch floor, the window's too: plain 4x from it
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "0")
     assert dp.extra_wave_floor_kv(24, ROWS_Q4, SM) == 0
     assert _choose(24, 4, cap, live=2048).path == dp.PATH_4X
@@ -733,37 +733,37 @@ def test_extra_wave_window_knobs(monkeypatch):
     assert _choose(24, 4, cap, live=2048).path == dp.PATH_4X
     assert _regimes(24, 4, cap) == (cap,)
     monkeypatch.setenv(dp.DECODE_PATH_ENV, "twostream")
-    # a forced two-stream asks the planner alone, which has no split here: plain 4x, as before
+    # a forced two-stream asks the planner alone, which has no split here: plain 4x
     assert _choose(24, 4, cap, live=2048).path == dp.PATH_4X
     monkeypatch.delenv(dp.DECODE_PATH_ENV)
     # what keeps a call on 2x everywhere keeps it here
     assert _choose(24, 4, cap, live=2048, helix=True).path == dp.PATH_2X
     assert _choose(24, 4, cap, live=2048, softmax_stats=True).path == dp.PATH_2X
     assert _choose(24, 4, cap, live=2048, unavailable="no 4x kernel").path == dp.PATH_2X
-    # a page table under the multi-wave gate of the envelope (8K) keeps the whole batch on 2x, as before
+    # a page table under the multi-wave gate of the envelope (8K) keeps the whole batch on 2x
     assert _choose(24, 4, 4096).path == dp.PATH_2X
 
 
 def test_kv_regimes_of_the_extra_wave_windows(monkeypatch):
-    # first window: 2x under the floor of the one-wave split, the split up to 12287 and plain 4x above (three
-    # graphs); where there is no one-wave split, 2x up to 12287 (two graphs, as before: 2047 | capacity)
-    for num_requests, query_len, num_heads, path_160k in (
-        (24, 4, 128, dp.PATH_TWO_STREAM),
-        (26, 4, 128, dp.PATH_TWO_STREAM),
-        (53, 2, 128, dp.PATH_TWO_STREAM),
-        (16, 8, 96, dp.PATH_2X),  # 45 of 46 pair tasks: a split-mode launch on a 160K page table
-        (13, 8, 128, dp.PATH_2X),  # 44 of 46
+    # first window: the one-wave split up to 12287 and plain 4x above, behind the 2x regime of the steps too uneven
+    # for the split (three graphs)
+    uneven = dp.KV_REGIME_UNEVEN
+    for num_requests, query_len, num_heads in (
+        (24, 4, 128),
+        (26, 4, 128),
+        (53, 2, 128),
+        # 45 of 46 pair tasks: an under-filled wave, launched FULL for the KV of these steps
+        (16, 8, 96),
+        (13, 8, 128),  # 44 of 46
     ):
-        split_160k = (767,) if path_160k == dp.PATH_TWO_STREAM else ()
-        assert _regimes(num_requests, query_len, 32768, num_heads) == (767, 12287, 32768)
-        assert _regimes(num_requests, query_len, 163840, num_heads) == split_160k + (12287, 163840)
-        assert _regimes(num_requests, query_len, 12288, num_heads) == (767, 12287, 12288)
-        s = _choose(num_requests, query_len, 32768, live=12287, num_heads=num_heads)
-        assert s.path == dp.PATH_TWO_STREAM
-        s = _choose(num_requests, query_len, 163840, live=12287, num_heads=num_heads)
-        assert s.path == path_160k
-        # a page table that ends under 12K: 2x under the split's floor, the split above
-        assert _regimes(num_requests, query_len, 8192, num_heads) == (767, 8192)
+        assert _regimes(num_requests, query_len, 32768, num_heads) == (uneven, 12287, 32768)
+        assert _regimes(num_requests, query_len, 163840, num_heads) == (uneven, 12287, 163840)
+        assert _regimes(num_requests, query_len, 12288, num_heads) == (uneven, 12287, 12288)
+        for cap in (32768, 163840):
+            s = _choose(num_requests, query_len, cap, live=12287, num_heads=num_heads)
+            assert s.path == dp.PATH_TWO_STREAM
+        # a page table that ends under 12K: the split up to it
+        assert _regimes(num_requests, query_len, 8192, num_heads) == (uneven, 8192)
     # second window: 2x up to 6143 where the planner has no split (the 4095 ceiling would separate 2x from 2x),
     # 2x up to 4095 and its two-stream above where it has one
     for num_requests in (50, 52, 53):
@@ -773,7 +773,7 @@ def test_kv_regimes_of_the_extra_wave_windows(monkeypatch):
     # further windows: the graded floor is the many-wave floor already (B96: 5 against 4 waves)
     assert dp.extra_wave_floor_kv(96, ROWS_Q4, SM) == dp.four_x_floor_kv(96, ROWS_Q4, SM) == 8192
     assert _regimes(96, 4, 30080) == (8191, 30080)
-    # a batch that fills its waves exactly has no two-stream regime any more
+    # a batch that fills its waves exactly has no two-stream regime
     assert _regimes(46, 4, 32768) == (4095, 32768)
     # every boundary sits where the decision changes, and each graph decides like the steps of its regime
     for num_requests, query_len, num_heads, cap in (
@@ -792,7 +792,7 @@ def test_kv_regimes_of_the_extra_wave_windows(monkeypatch):
             return s.path, s.r2
 
         low = 0
-        for ceiling in regimes:
+        for ceiling in (regime for regime in regimes if regime != dp.KV_REGIME_UNEVEN):
             assert label(low + 1) == label((low + 1 + ceiling) // 2) == label(ceiling), (
                 num_requests,
                 ceiling,
@@ -803,83 +803,127 @@ def test_kv_regimes_of_the_extra_wave_windows(monkeypatch):
             low = ceiling
     # the regime grid still adds its points
     monkeypatch.setenv(dp.KV_REGIME_GRID_ENV, "4096,16384")
-    assert _regimes(24, 4, 32768) == (767, 4096, 12287, 16384, 32768)
+    assert _regimes(24, 4, 32768) == (dp.KV_REGIME_UNEVEN, 4096, 12287, 16384, 32768)
     assert _regimes(52, 4, 32768) == (6143, 16384, 32768)
 
 
-@pytest.mark.parametrize("num_heads,query_len,full,last", WAVE_SHAPES)
-def test_one_wave_split_floor(num_heads, query_len, full, last):
-    # the 2x kernel's time steps up between 512 and 768 tokens and the split's cost is flat there: under the
-    # split's floor a first-window call keeps the 2x kernel, as it did before the extra-wave rule
-    bound = dp.FLOOR_KV_ONE_WAVE_SPLIT
-    rows = num_heads * query_len
-    assert bound == 768 < dp.four_x_floor_kv(last, rows, SM) == 2048
-    for cap in (8192, 32768, 163840):
-        one_wave = 46 % (rows // 256) == 0 or cap < host_4x.SPLIT_MIN_KV_ONEWAVE_DEFAULT
-        for num_requests in range(full + 1, last + 1):
-
-            def label(kv):
-                s = _choose(num_requests, query_len, cap, live=kv, num_heads=num_heads)
-                return s.path, s.r2
-
-            for live in (1, 256, 512, bound - 1):
-                s = _choose(num_requests, query_len, cap, live=live, num_heads=num_heads)
-                assert s.path == dp.PATH_2X and s.plan is None, (num_requests, live, s)
-                assert f"KV {live} < 2048 (floor of" in s.reason
-            # at that floor and above it the rule is the window's: the split where there is one, else 2x
-            split = (dp.PATH_TWO_STREAM, num_requests - full) if one_wave else (dp.PATH_2X, 0)
-            for live in (bound, bound + 1, 1024, 2047, 2048, 12287):
-                assert label(live) == split, (num_requests, live)
-            assert label(cap) == ((dp.PATH_4X, 0) if cap >= 12288 else split)
-            # the split's floor ends a KV regime exactly where the split exists, so the graph a step replays
-            # decides like the step itself on both sides of it
-            regimes = _regimes(num_requests, query_len, cap, num_heads)
-            assert (regimes[0] == bound - 1) == one_wave, (num_requests, cap, regimes)
-            for live in (1, 512, bound - 1, bound, bound + 1, 2047, 2048, 8192, 12287, 12288, cap):
-                assert label(live) == label(dp.kv_regime_for_step(live, regimes)), (
-                    num_requests,
-                    live,
-                    regimes,
-                )
-        # outside the window: one 4x wave is plain 4x at every KV, and past the window the graded floor alone
-        # decides
-        assert _choose(full, query_len, cap, live=1, num_heads=num_heads).path == dp.PATH_4X
-        assert _regimes(full, query_len, cap, num_heads) == (cap,)
-        assert _regimes(last + 1, query_len, cap, num_heads) == (2047, cap)
-
-
-def test_one_wave_split_floor_regimes_and_knobs(monkeypatch):
-    bound = dp.FLOOR_KV_ONE_WAVE_SPLIT
-    # the page table as the decision KV (no live KV): the split's floor applies to it as well (the envelope admits
-    # a page table this short only with its multi-wave gate lifted)
-    monkeypatch.setenv(host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV, "0")
-    assert _choose(24, 4, bound - 1).path == dp.PATH_2X
-    s = _choose(24, 4, bound)
-    assert s.path == dp.PATH_TWO_STREAM and s.r2 == 1 and s.kv_source == "capacity"
-    # a page table shorter than the graded floor: the split's floor still ends the 2x regime
-    assert _regimes(24, 4, bound - 1) == (bound - 1,)
-    assert _regimes(24, 4, bound) == (bound - 1, bound)
-    assert _regimes(24, 4, 1024) == (bound - 1, 1024)
-    assert _regimes(24, 4, 2048) == (bound - 1, 2048)
-    # an under-filled 4x wave on a long page table has no one-wave split, and no regime for its floor
-    assert _regimes(16, 8, 163840, 96) == (12287, 163840)
-    monkeypatch.delenv(host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV)
-    # the second window has no one-wave split either
-    assert _regimes(50, 4, 32768) == (6143, 32768)
-    assert _choose(50, 4, 32768, live=bound).path == dp.PATH_2X
-    # without the two-stream there is no split and nothing for its floor to separate
-    monkeypatch.setenv("TRTLLM_FP4_MLA_TWOSTREAM", "0")
-    assert _choose(24, 4, 32768, live=bound).path == dp.PATH_2X
-    assert _regimes(24, 4, 32768) == (12287, 32768)
-    monkeypatch.delenv("TRTLLM_FP4_MLA_TWOSTREAM")
-    # a flat floor replaces the whole extra-wave rule, the split's floor with it: the 4x paths from the flat floor
+def test_page_table_floor(monkeypatch):
+    # a page table of two KV tiles keeps every call on 2x (an eager step narrows it to its longest KV); one tile more
+    # and the 4x paths take the call
+    for num_requests, query_len in ((16, 4), (23, 4), (32, 2)):
+        s = _choose(num_requests, query_len, dp.NARROW_KV_CAPACITY)
+        assert s.path == dp.PATH_2X and "page table" in s.reason, s
+        assert _choose(num_requests, query_len, dp.NARROW_KV_CAPACITY + 128).path == dp.PATH_4X
+    # the flat floor replaces it, a forced path ignores it
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "0")
-    for live in (1, bound - 1, bound):
-        assert _choose(24, 4, 32768, live=live).path != dp.PATH_2X
-    assert _regimes(24, 4, 32768) == (32768,)
+    assert _choose(16, 4, dp.NARROW_KV_CAPACITY).path == dp.PATH_4X
     monkeypatch.delenv(dp.MIN_KV_4X_ENV)
-    # forced paths ignore the split's floor as they ignore the others
-    monkeypatch.setenv(dp.DECODE_PATH_ENV, "twostream")
-    for live in (1, bound - 1, bound):
-        assert _choose(24, 4, 32768, live=live).path != dp.PATH_2X
-    assert _regimes(24, 4, 32768) == (2047, 32768)
+    monkeypatch.setenv(dp.DECODE_PATH_ENV, "4x")
+    assert _choose(16, 4, dp.NARROW_KV_CAPACITY).path == dp.PATH_4X
+
+
+# (requests, query_len, path at a mean KV of 8K-12K): the launches that run every request uncut -- one 4x wave
+# (under-filled and full), plain 4x on waves whole requests fill exactly, the one-wave split, a planner split
+UNCUT_SHAPES = [
+    (16, 4, dp.PATH_4X),
+    (23, 4, dp.PATH_4X),
+    (46, 4, dp.PATH_4X),
+    (24, 4, dp.PATH_TWO_STREAM),
+    (48, 4, dp.PATH_TWO_STREAM),
+]
+
+
+@pytest.mark.parametrize("num_requests,query_len,path", UNCUT_SHAPES)
+def test_uneven_step_leaves_an_uncut_launch_to_2x(num_requests, query_len, path):
+    cap, longest = 32768, 12000
+    for mean in (longest, longest - dp.SPREAD_MAX_UNCUT_KV):
+        s = _choose(num_requests, query_len, cap, live=longest, mean=mean)
+        assert s.path == path and s.kv_len_decision == mean, (mean, s)
+    s = _choose(
+        num_requests, query_len, cap, live=longest, mean=longest - dp.SPREAD_MAX_UNCUT_KV - 1
+    )
+    assert s.path == dp.PATH_2X and "above the mean KV" in s.reason, s
+
+
+def test_uneven_step_keeps_plain_4x_that_cuts():
+    # plain 4x with a last wave to fill cuts the long requests (device plan): an uneven step keeps it from the floor
+    # of its mean KV, and stays on 2x under it
+    s = _choose(32, 4, 30080, live=30000, mean=9000)
+    assert s.path == dp.PATH_4X and s.kv_len_decision == 9000
+    assert _choose(32, 4, 30080, live=30000, mean=2048).path == dp.PATH_4X
+    assert _choose(32, 4, 30080, live=30000, mean=2047).path == dp.PATH_2X
+    assert _choose(64, 4, 30080, live=30000, mean=4096).path == dp.PATH_4X
+    assert _choose(64, 4, 30080, live=30000, mean=4095).path == dp.PATH_2X
+
+
+def test_kv_regime_of_an_uneven_step():
+    uneven = dp.KV_REGIME_UNEVEN
+    assert dp.kv_regime_bounds(uneven) == (None, 0) and dp.kv_regime_bounds(8192) == (8192, 8192)
+
+    def graph(num_requests, query_len, cap, regime):
+        live, mean = dp.kv_regime_bounds(regime)
+        return _choose(num_requests, query_len, cap, live=live, mean=mean).path
+
+    # one wave: the regime of the mean while the step is even, the 2x regime in front once it is not
+    regimes = _regimes(16, 4, 30080)
+    assert regimes.uncut == {30080}
+    assert dp.kv_regime_for_step(30080, regimes, 30080 - dp.SPREAD_MAX_UNCUT_KV) == 30080
+    assert dp.kv_regime_for_step(30080, regimes, 1024) == uneven
+    assert graph(16, 4, 30080, uneven) == dp.PATH_2X and graph(16, 4, 30080, 30080) == dp.PATH_4X
+    # a planner split goes to the shape's own 2x regime; plain 4x that cuts keeps the regime of the mean
+    regimes = _regimes(48, 4, 32768)
+    assert regimes == (4095, 32768) and regimes.uncut == {32768}
+    assert dp.kv_regime_for_step(30000, regimes, 8000) == 4095
+    regimes = _regimes(32, 4, 30080)
+    assert not regimes.uncut and dp.kv_regime_for_step(30000, regimes, 9000) == 30080
+    # every regime's graph decides like the eager step it covers, uniform or not
+    for num_requests, query_len, cap in (
+        (16, 4, 30080),
+        (24, 4, 32768),
+        (48, 4, 32768),
+        (32, 4, 30080),
+    ):
+        regimes = _regimes(num_requests, query_len, cap)
+        for longest, mean in (
+            (30000, 30000),
+            (30000, 26000),
+            (30000, 9000),
+            (8192, 2048),
+            (12000, 12000),
+        ):
+            eager = _choose(num_requests, query_len, cap, live=longest, mean=mean)
+            regime = dp.kv_regime_for_step(longest, regimes, mean)
+            assert (eager.path == dp.PATH_2X) == (
+                graph(num_requests, query_len, cap, regime) == dp.PATH_2X
+            ), (
+                num_requests,
+                longest,
+                mean,
+                regimes,
+            )
+
+
+def test_under_filled_wave_is_launched_for_the_kv_of_its_step():
+    # the host launches an under-filled 4x wave in split mode from 65536 tokens of the decision's KV, a wave at most
+    # half full (q2 B20: 20 pair tasks) from 16384, whatever the page table; the regime that spans the bound ends
+    # under it
+    for num_requests, query_len, bound in (
+        (16, 4, ts.SPLIT_MIN_KV_ONEWAVE_DEFAULT),
+        (20, 2, ts.SPLIT_MIN_KV_HALF_WAVE_DEFAULT),
+    ):
+        assert _regimes(num_requests, query_len, 163840) == (dp.KV_REGIME_UNEVEN, bound - 1, 163840)
+        for live, split in ((2048, False), (bound - 1, False), (bound, True)):
+            s = _choose(num_requests, query_len, 163840, live=live)
+            assert s.path == dp.PATH_4X and s.kv_len_decision == live
+            assert (
+                host_4x.use_split_mode(
+                    num_heads=128,
+                    query_len=query_len,
+                    num_requests=num_requests,
+                    max_kv_len=s.kv_len_decision,
+                )
+                == split
+            )
+    assert _regimes(20, 2, 32768) == (dp.KV_REGIME_UNEVEN, 16383, 32768)
+    # a full wave is FULL at every KV
+    assert _regimes(23, 4, 163840) == (dp.KV_REGIME_UNEVEN, 163840)

@@ -148,8 +148,8 @@ class KeyType(NamedTuple):
     # retains the existing uniform graph family.
     ragged_verify_bucket: Optional[int] = None
     # Ceiling (tokens) of the KV regime the graph was captured for, when the
-    # runner keys its decode graphs by the step's longest live KV so the FP4
-    # MLA decode dispatcher decides on it. ``None`` keeps one KV family.
+    # runner keys its decode graphs by the step's live KV so the FP4 MLA
+    # decode dispatcher decides on it. ``None`` keeps one KV family.
     kv_regime: Optional[int] = None
 
 
@@ -436,7 +436,18 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         promoted_context_request_ids: frozenset[int] = frozenset()
     ) -> int:
-        """Longest total sequence length a generation row of ``batch`` reads.
+        """Longest total sequence length a generation row of ``batch`` reads."""
+        return max(self._total_seq_lens(batch, new_tensors_device,
+                                        promoted_context_request_ids),
+                   default=0)
+
+    def _total_seq_lens(
+        self,
+        batch: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> List[int]:
+        """Total sequence length every generation row of ``batch`` reads.
 
         The sequence length of the execution view: the tokens of this step
         included, ``max_draft_len`` more for speculative rows, one more for a
@@ -450,7 +461,7 @@ class CUDAGraphRunner:
             if isinstance(new_tensors_device, SampleStateTensorsSpec):
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens
         overlap_scheduler_enabled = new_tokens_device is not None
-        max_total_seq_len = 0
+        total_seq_lens = []
         for request in batch.generation_requests:
             is_spec_request = get_draft_token_length(
                 request) > 0 or next_draft_tokens_device is not None
@@ -469,8 +480,8 @@ class CUDAGraphRunner:
             # Other cases
             else:
                 total_seq_len = request.max_beam_num_tokens + num_draft_tokens + 1
-            max_total_seq_len = max(max_total_seq_len, total_seq_len)
-        return max_total_seq_len
+            total_seq_lens.append(total_seq_len)
+        return total_seq_lens
 
     def _get_seq_len_mode(
         self,
@@ -677,12 +688,15 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         promoted_context_request_ids: frozenset[int] = frozenset()
     ) -> Optional[int]:
-        """Ceiling of the KV regime ``batch`` replays; None without regimes.
+        """Ceiling of the KV regime ``batch`` replays; None without regimes or
+        without a generation request of the batch's own.
 
         Pinned during a capture pass, so the graph records the dispatcher's
-        decision for that regime; otherwise, among the regimes of the batch's
-        graph shape, the one covering the step's longest live KV, an upper
-        bound the captured decision was taken on.
+        decision for that regime; otherwise the regime of the batch's graph
+        shape the dispatcher maps the step's longest and mean live KV to. The
+        mean is the one of the batch's own requests: a row that pads the batch
+        to a captured size reads a few tokens and would make a step of long
+        requests look uneven (``fp4_mla_dispatch.SPREAD_MAX_UNCUT_KV``).
         """
         resolver = self.kv_regime_resolver
         if resolver is None:
@@ -696,11 +710,19 @@ class CUDAGraphRunner:
         # One-engine speculation reads max_draft_len - 1 KV tokens beyond the
         # row's sequence length (the sparse short/long split counts them too).
         from ..speculative import get_num_extra_kv_tokens
-        max_kv_len = self._max_total_seq_len(
-            batch, new_tensors_device,
-            promoted_context_request_ids) + get_num_extra_kv_tokens(
-                self.spec_config)
-        return fp4_mla_dispatch.kv_regime_for_step(max_kv_len, ceilings)
+        extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
+        seq_lens = self._total_seq_lens(batch, new_tensors_device,
+                                        promoted_context_request_ids)
+        own_seq_lens = [
+            seq_len
+            for seq_len, request in zip(seq_lens, batch.generation_requests)
+            if not request.is_cuda_graph_dummy
+        ]
+        if not own_seq_lens:
+            return None
+        return fp4_mla_dispatch.kv_regime_for_step(
+            max(seq_lens) + extra_kv_tokens, ceilings,
+            sum(own_seq_lens) / len(own_seq_lens) + extra_kv_tokens)
 
     def _get_compatible_kv_regime_key(self, key: KeyType) -> KeyType:
         """Round the KV regime up to a captured graph key.
@@ -884,11 +906,12 @@ class CUDAGraphRunner:
             num_sequences_in_batch, False, key.draft_len,
             self.cuda_graph_meta_buffers)
         if key.kv_regime is not None:
-            # The FP4 MLA decode dispatcher decides on the regime ceiling, an
-            # upper bound of the live KV, instead of the page-table capacity.
+            # The FP4 MLA decode dispatcher decides on the KV lengths of the
+            # regime instead of the page-table capacity.
             fp4_mla_state = getattr(graph_attn_metadata, "fp4_mla_state", None)
             if fp4_mla_state is not None:
-                fp4_mla_state.kv_regime_max_kv = key.kv_regime
+                (fp4_mla_state.kv_regime_max_kv, fp4_mla_state.kv_regime_mean_kv
+                 ) = fp4_mla_dispatch.kv_regime_bounds(key.kv_regime)
         if is_mixed_encoder_decoder:
             generation_query_len = key.draft_len + 1
             graph_attn_metadata.seq_lens = torch.tensor(
@@ -1265,9 +1288,9 @@ class CUDAGraphRunner:
         fp4_mla_state = getattr(stored_meta["attn_metadata"], "fp4_mla_state",
                                 None)
         assert (fp4_mla_state is None
-                or fp4_mla_state.kv_regime_max_kv == key.kv_regime), (
+                or fp4_mla_state.kv_regime_mean_kv == key.kv_regime), (
                     f"CUDA graph {key} replays attention metadata of KV "
-                    f"regime {fp4_mla_state.kv_regime_max_kv}")
+                    f"regime {fp4_mla_state.kv_regime_mean_kv}")
 
     def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
         """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.

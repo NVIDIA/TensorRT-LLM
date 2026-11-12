@@ -92,10 +92,12 @@ def run_cutedsl_twostream_decode(
     v_page_offset: int,
     run_4x: Callable[..., None],
     run_2x: Callable[..., None],
+    launch_kv_len: int | None = None,
 ) -> None:
-    """Run ``run_4x`` (``decode_4x._run_cutedsl_4x_decode``) on the first ``num_requests - num_requests_2x``
-    requests and ``run_2x`` (``decode._run_cutedsl_packed_decode``, one split, no stats) on the last
-    ``num_requests_2x`` on two streams; returns once both are joined back to the current stream."""
+    """Run ``run_4x`` (``decode_4x._run_cutedsl_4x_decode``, its wave launched for ``launch_kv_len``) on the first
+    ``num_requests - num_requests_2x`` requests and ``run_2x`` (``decode._run_cutedsl_packed_decode``, one split,
+    no stats) on the last ``num_requests_2x`` on two streams; returns once both are joined back to the current
+    stream."""
     r2 = int(num_requests_2x)
     r4 = int(num_requests) - r2
     if not 0 < r2 < num_requests:
@@ -170,6 +172,7 @@ def run_cutedsl_twostream_decode(
             sm_scale=sm_scale,
             v_page_offset=v_page_offset,
             metadata=metadata,
+            launch_kv_len=launch_kv_len,
         )
     with torch.cuda.stream(low):
         run_2x(

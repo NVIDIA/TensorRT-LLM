@@ -47,9 +47,12 @@ class Fp4MlaState:
     # re-plans when it changes. Monotonic across steps, never reset.
     generation_lengths_serial: int = 0
     plan_4x_key: tuple | None = None
-    # Longest live KV (tokens) of the regime this metadata serves, set by a graph runner that keys its decode graphs
-    # by KV regime (fp4_mla_dispatch.kv_regimes_for_batch); None = decide on the page-table capacity.
+    # Longest and mean live KV (tokens) the decode dispatcher decides on (fp4_mla_dispatch.choose_decode_strategy):
+    # a graph runner that keys its decode graphs by KV regime sets both to its regime's
+    # (fp4_mla_dispatch.kv_regime_bounds), an eager step both to those of its generation requests.  None = the
+    # page-table capacity.
     kv_regime_max_kv: int | None = None
+    kv_regime_mean_kv: float | None = None
     generation_cache_scattered: bool = False
     device_page_table: bool = False
     device_page_table_valid: bool = False

@@ -75,11 +75,15 @@ ROWS_PER_4X_ITEM = 256
 ROWS_PER_2X_ITEM = 128
 DEFAULT_MIN_GAIN = 0.03
 DEFAULT_MAX_R2 = 36
-# Page-table capacity (tokens) from which the host launches a 4x wave of fewer than ``LANES_4X`` pair tasks in split
-# mode instead of the FULL-only launch (``fp4_mla_cutedsl_4x_host.use_split_mode``: the same knob and default,
-# repeated here because this module stays importable without the kernel host; the dispatch tests hold the two equal).
+# KV length (tokens) from which the host (``fp4_mla_cutedsl_4x_host.use_split_mode``, asked with the KV length the
+# dispatcher decided on) launches a 4x wave of fewer than ``LANES_4X`` pair tasks in split mode instead of the
+# FULL-only launch: ``split_launch_min_kv``.  A wave at most half full, whose plan can cut every request in two,
+# from a lower bound: measured (graph replays, 128 heads q2, 20 pair tasks, uniform KV) split mode 0.56 / 0.50 of
+# the 2x time at 16K / 30K against 0.60 / 0.64 for the FULL launch, which is ahead up to 12K.  The knob replaces
+# both bounds.
 SPLIT_MIN_KV_ONEWAVE_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MIN_KV_ONEWAVE"
 SPLIT_MIN_KV_ONEWAVE_DEFAULT = 65536
+SPLIT_MIN_KV_HALF_WAVE_DEFAULT = 16384
 
 
 class TwoStreamPlan(NamedTuple):
@@ -196,12 +200,20 @@ def makespan_us(
     return max(arm_4x, arm_2x), waves_4x, rounds_2x
 
 
+def split_launch_min_kv(pair_tasks: int) -> int:
+    """KV length (tokens) from which a 4x wave of ``pair_tasks`` < ``LANES_4X`` is launched in split mode."""
+    value = _env_int(SPLIT_MIN_KV_ONEWAVE_ENV)
+    if value is not None:
+        return value
+    half_wave = 2 * pair_tasks <= LANES_4X
+    return SPLIT_MIN_KV_HALF_WAVE_DEFAULT if half_wave else SPLIT_MIN_KV_ONEWAVE_DEFAULT
+
+
 def one_wave_split(
     *,
     num_requests: int,
     rows_per_request: int,
     max_kv_len: int,
-    kv_capacity: int,
     sm_count: int,
     lanes_4x: int = LANES_4X,
 ) -> Optional[TwoStreamPlan]:
@@ -212,18 +224,15 @@ def one_wave_split(
     two per four-CTA cluster of the 4x wave plus the unpaired SMs, so such a batch is one the 2x kernel serves in one
     wave and the 4x kernel no longer does (212 SMs: 47 to 53 pair tasks), and its 2x arm always fits.
 
-    The 4x wave must be a FULL launch: one that whole requests fill exactly, or an under-filled one on a page table
-    (``kv_capacity``) under the host's split-mode bound (``SPLIT_MIN_KV_ONEWAVE_ENV``).  In split mode the wave pays
+    The 4x wave must be a FULL launch: one that whole requests fill exactly, or an under-filled one launched for a
+    KV length (``max_kv_len``) under the host's split-mode bound (``split_launch_min_kv``).  In split mode the wave pays
     the plan and the reducer and its tasks take the cluster slots a FULL launch leaves to the 2x arm: measured
     11-28 % slower than 2x up to KV 2K, and 44-62 % at every KV once the 2x arm no longer fits the pairs left.
 
     Wave arithmetic only.  ``plan_two_stream`` declines this split because its model has one contended 2x round
     outlast one 4x wave; but what the call runs without it is not a 4x arm with the 2x arm off its critical path: it
-    is a second 4x wave in split mode, or the 2x kernel alone, whose own single wave bounds the 2x arm.  Measured
-    against the 2x kernel (graph replays, requests of 1 to 4 pair tasks): the split is 14-30 % faster up to KV 2K
-    and level with 2x or ahead up to 30K (+2 % at worst), where the plain 4x path is 11-51 % slower up to 4K; the
-    plain path ties the split at 12K (16K with one pair task per request) and wins beyond.  The KV span the split
-    serves is the caller's (``fp4_mla_dispatch.extra_wave_floor_kv``).
+    is a second 4x wave in split mode, or the 2x kernel alone, whose own single wave bounds the 2x arm.  The KV span
+    the split serves is the caller's (``fp4_mla_dispatch.extra_wave_floor_kv``).
 
     ``TRTLLM_FP4_MLA_TWOSTREAM=0``, a forced ``TRTLLM_FP4_MLA_TWOSTREAM_R2`` and ``TRTLLM_FP4_MLA_TWOSTREAM_MAX_R2``
     are honoured (None: the planner's answer stands).  The modelled times of the plan are informational.
@@ -235,9 +244,7 @@ def one_wave_split(
         return None
     requests_4x = lanes_4x // items_4x
     pairs_4x = requests_4x * items_4x
-    split_mode_kv = _env_int(SPLIT_MIN_KV_ONEWAVE_ENV)
-    split_mode_kv = SPLIT_MIN_KV_ONEWAVE_DEFAULT if split_mode_kv is None else split_mode_kv
-    if pairs_4x < lanes_4x and kv_capacity >= split_mode_kv:
+    if pairs_4x < lanes_4x and max_kv_len >= split_launch_min_kv(pairs_4x):
         return None  # the host launches this under-filled wave in split mode
     r2 = num_requests - requests_4x
     max_r2 = _env_int(TWOSTREAM_MAX_R2_ENV)

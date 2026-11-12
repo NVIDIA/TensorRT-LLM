@@ -230,12 +230,14 @@ def _run_cutedsl_4x_decode(
     metadata: Any = None,
     helix_kv_bounds: Optional[torch.Tensor] = None,
     softmax_stats_tensor: Optional[torch.Tensor] = None,
+    launch_kv_len: Optional[int] = None,
 ) -> None:
     """Four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x_host): same tensors as the packed path, whose packed Q layout
     (row = token * heads + head, heads * query_len % 256 == 0) is the layout the 4x entry takes.
 
     One wave of pair tasks at short KV runs the FULL-only launch (output written directly). Larger
-    batches (and under-filled waves at long KV) run the split mode: a device plan gives every request its own
+    batches (and under-filled waves at long KV: ``launch_kv_len``, the KV length the dispatcher decided on, else
+    the page-table capacity ``max_kv_len``) run the split mode: a device plan gives every request its own
     KV split (whole requests fill the full waves, the tail is cut to fill the leftover cluster slots), the kernel
     writes FP32 partials for the split requests and ``reduce_packed_splits`` merges them.
 
@@ -253,7 +255,7 @@ def _run_cutedsl_4x_decode(
         num_heads=num_heads,
         query_len=query_len,
         num_requests=num_requests,
-        max_kv_len=max_kv_len,
+        max_kv_len=max_kv_len if launch_kv_len is None else launch_kv_len,
         helix=helix_kv_bounds is not None or softmax_stats_tensor is not None,
     ):
         if metadata is None:

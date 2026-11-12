@@ -1275,10 +1275,11 @@ def run_fp4_mla_attention_decode(
                 )
 
         if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled(num_heads):
-            # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
+            # Path selection (fp4_mla_dispatch): 2x packed; the four-CTA-cluster kernel, or the
             # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
-            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself may use
-            # the step's longest live KV when a graph runner provides it (Fp4MlaState.kv_regime_max_kv).
+            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself uses the
+            # step's longest and mean live KV where the state carries them (an eager step's own mean, a graph's KV
+            # regime), and a 4x wave is launched for the KV length of that choice.
             from . import fp4_mla_cutedsl_4x_host as _host_4x
 
             max_kv_len_4x = max_pages * metadata.page_size
@@ -1291,6 +1292,7 @@ def run_fp4_mla_attention_decode(
                 sm_count=_get_sm_count(q.device),
                 envelope_reason=_host_4x.envelope_reason_static,
                 live_max_kv=getattr(metadata.fp4_mla_state, "kv_regime_max_kv", None),
+                live_mean_kv=getattr(metadata.fp4_mla_state, "kv_regime_mean_kv", None),
                 helix=helix_kv_bounds is not None,
                 softmax_stats=softmax_stats_tensor is not None,
                 v_packed=core_v_packed is not None,
@@ -1329,6 +1331,7 @@ def run_fp4_mla_attention_decode(
                     num_requests_2x=strategy.num_requests_2x,
                     rows_per_seq=packed_rows_per_seq,
                     max_kv_len=max_kv_len_4x,
+                    launch_kv_len=strategy.kv_len_decision,
                     sm_scale=float(sm_scale),
                     v_page_offset=v_page_offset,
                     run_4x=_decode_4x._run_cutedsl_4x_decode,
@@ -1353,6 +1356,7 @@ def run_fp4_mla_attention_decode(
                     query_len=query_len_per_seq,
                     num_requests=num_gen_seqs,
                     max_kv_len=max_kv_len_4x,
+                    launch_kv_len=strategy.kv_len_decision,
                     sm_scale=float(sm_scale),
                     v_page_offset=v_page_offset,
                     metadata=metadata,

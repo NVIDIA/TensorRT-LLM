@@ -125,14 +125,19 @@ def _kv_regime_length_passes(
     For each warm-up length (the engine's maximum, plus the sparse short length when the
     sparse attention keeps short and long graph families apart) a step can land in every
     regime whose ceiling lies below that length and in the regime covering the length
-    itself. The warm-up request's longest row fills the regime, so the dispatcher decision
-    a graph captures is the one of its regime.
+    itself. The warm-up request fills the regime (the regime of the steps too uneven for
+    the others, ceiling 0, is warmed up at the length itself); the decision a graph
+    captures is the one of its pinned regime.
     """
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
 
     passes: set[tuple[int, int]] = set()
     for max_seq_len in max_seq_len_list:
-        passes.update((ceiling, ceiling) for ceiling in kv_regime_ceilings if ceiling < max_seq_len)
+        passes.update(
+            (ceiling or max_seq_len, ceiling)
+            for ceiling in kv_regime_ceilings
+            if ceiling < max_seq_len
+        )
         passes.add(
             (max_seq_len, fp4_mla_dispatch.kv_regime_for_step(max_seq_len, kv_regime_ceilings))
         )
@@ -779,8 +784,8 @@ class DecoderCudaGraphs:
         """KV regimes the decode graphs are keyed by, per graph shape; None for every backend but FP4 MLA 4x.
 
         The FP4 MLA decode dispatcher (``fp4_mla_dispatch``) then decides on the
-        regime ceiling, the step's longest live KV rounded up, instead of the
-        page-table capacity. Resolved at capture, once the KV cache exists; the
+        regime of the step's mean and longest live KV instead of the page-table
+        capacity. Resolved at capture, once the KV cache exists; the
         regimes of a shape are those its 2x | 4x | two-stream decision can tell
         apart (``kv_regimes_for_batch``), one for most shapes. None as well
         with Helix and on a device that cannot host the 4x kernel. Such a
@@ -790,6 +795,14 @@ class DecoderCudaGraphs:
         ``TRTLLM_FP4_MLA_4X_MIN_KV`` is then compared with the page-table
         capacity.
         """
+        # Only an FP4 MLA KV cache gets regimes (the predicate under which the
+        # attention metadata carries an fp4_mla_state); every other model returns
+        # here, before any FP4 MLA module is imported or probed.
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
+            return None
         from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
         from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
             FP4_MLA_TOKENS_PER_BLOCK,
@@ -798,7 +811,7 @@ class DecoderCudaGraphs:
             _fp4_mla_packed_rows_per_seq,
         )
 
-        # The 4x switch first: where it is off nothing else is touched. The
+        # The 4x switch next: where it is off nothing else is resolved. The
         # head count picks the switch, so the model's heads are read for it.
         # The dispatcher runs only for the packed-Q cutedsl decode, and under
         # Helix no regime could change its choice (see the docstring), so
@@ -809,12 +822,6 @@ class DecoderCudaGraphs:
         if not (_fp4_mla_cutedsl_4x_enabled(num_heads) and _fp4_mla_packed_q_enabled()):
             return None
         if self.mapping.has_cp_helix():
-            return None
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
-        # The predicate under which the attention metadata carries an fp4_mla_state.
-        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
             return None
         # A device that cannot host the 4x kernel decodes every step on 2x: no
         # regimes either (the host logs the reason once per device).

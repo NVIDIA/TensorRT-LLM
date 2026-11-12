@@ -137,12 +137,14 @@ FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
 # the decode (_fp4_mla_cutedsl_4x_enabled). This one governs every head count but
 # _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS: off unless set to 1.
 FP4_MLA_CUTEDSL_4X_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X"
-# The switch of a decode of _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS heads: on unless set to 0, which gives it the 2x path.
+# The switch of a decode of _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS heads: on unless set to a non-empty value other than
+# 1, true, yes or on (0, for example), which gives it the 2x path.
 FP4_MLA_CUTEDSL_4X_H128_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X_H128"
 # The head count that takes the 4x path without being asked: the one that fills the kernel's 128-row M tile, on
 # which the dispatcher's KV floors and the two-stream cost model were measured (the q2 and q4 MTP shapes of
 # DeepSeek R1, for example). Any other head count inside the envelope (96 heads at q8, Kimi K3 for example) keeps
 # the 2x path, its decode graphs and its workspaces until FP4_MLA_CUTEDSL_4X_ENV is set to 1.
+# Head counts are the rank's (MLA.num_heads_tp): tensor parallelism divides them, attention DP does not.
 _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS = 128
 # Packed decode: each request owns a 128-row-padded block of [query token, head]
 # Q rows, the kernel splits KV across grid.z tasks and reads per-row causal
@@ -157,8 +159,9 @@ def _fp4_mla_cutedsl_4x_enabled(num_heads: int) -> bool:
     """Whether the 4x kernel may replace the packed 2x decode of ``num_heads`` heads inside its envelope.
 
     Two switches, each for its own head counts and never read for the other's: a decode of
-    ``_FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS`` heads follows ``TRTLLM_FP4_MLA_CUTEDSL_4X_H128`` (on unless set to 0), a
-    decode of any other head count follows ``TRTLLM_FP4_MLA_CUTEDSL_4X`` (off unless set to 1).
+    ``_FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS`` heads follows ``TRTLLM_FP4_MLA_CUTEDSL_4X_H128`` (on unless set to a
+    non-empty value other than 1, true, yes or on), a decode of any other head count follows
+    ``TRTLLM_FP4_MLA_CUTEDSL_4X`` (off unless set to 1).
     """
     if num_heads == _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS:
         return _env_enabled_default(FP4_MLA_CUTEDSL_4X_H128_ENV, True)

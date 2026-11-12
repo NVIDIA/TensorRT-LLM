@@ -423,6 +423,8 @@ def test_kv_regime_length_passes_cover_every_family_a_step_can_key() -> None:
         (16384, 16384),
         (12287, 12287),
     ]
+    # the regime of the steps too uneven for the others (ceiling 0) is warmed up at the length itself
+    assert _kv_regime_length_passes([30080], (0, 30080)) == [(30080, 30080), (30080, 0)]
     # a sparse short/long split adds the short family in the regime covering the short length only
     assert _kv_regime_length_passes([30080, 2044], (12287, 16384, 30080)) == [
         (30080, 30080),
@@ -447,10 +449,17 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
     resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
     config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
 
-    # with the 4x switch off nothing resolves and the KV cache is never looked at
+    # a KV cache without the FP4 MLA page table (every other model) resolves nothing and never
+    # probes the FP4 MLA switches, even when they are set
+    resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
+    with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True) as enabled:
+        assert runner._kv_regime_resolver(resource_manager) is None
+    enabled.assert_not_called()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+
+    # with the 4x switch off nothing resolves
     with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=False):
         assert runner._kv_regime_resolver(resource_manager) is None
-    resource_manager.get_resource_manager.assert_not_called()
 
     with (
         patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
@@ -460,10 +469,11 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
     ):
         resolver = runner._kv_regime_resolver(resource_manager)
         # capacity = blocks per sequence x 128 tokens; the regimes of a shape follow its 4x KV floor: 128 requests
-        # of q = 4 (5.6 waves) split at 8K, 16 requests (one wave) and q = 1 (no 4x path) keep one regime
+        # of q = 4 (5.6 waves) split at 8K, 16 requests (one wave) keep the capacity behind the 2x regime of the
+        # steps too uneven for the wave, q = 1 (no 4x path) keeps one regime
         assert resolver(128, 3) == (8191, 30080)
         assert resolver(32, 3) == (2047, 30080)
-        assert resolver(16, 3) == (30080,)
+        assert resolver(16, 3) == (0, 30080)
         assert resolver(128, 0) == (30080,)
         # a KV cache without the FP4 MLA page table carries no fp4_mla_state: no regimes
         resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
@@ -552,14 +562,16 @@ def test_kv_regimes_follow_the_fp4_mla_4x_switch_of_the_head_count(
     ):
         resolver = runner._kv_regime_resolver(resource_manager)
         if not keyed:
-            # no resolver: no batch shape of the model is keyed by a KV regime, and the KV cache was not asked
+            # no resolver: no batch shape of the model is keyed by a KV regime
             assert resolver is None
-            resource_manager.get_resource_manager.assert_not_called()
             return
-        # one 4x wave holds 46 pair tasks of 256 rows: the batches inside it keep the single regime of the
-        # capacity, larger ones get a 2x regime under their KV floor
+        # one 4x wave holds 46 pair tasks of 256 rows: the batches inside it keep the regime of the capacity,
+        # behind the 2x regime of the steps too uneven for the wave where the 4x kernel takes them; larger ones get
+        # a 2x regime under their KV floor
         one_wave = 46 * 256 // (num_heads * (draft_len + 1))
-        assert all(resolver(batch, draft_len) == (30080,) for batch in range(1, one_wave + 1))
+        assert all(
+            resolver(batch, draft_len) in ((30080,), (0, 30080)) for batch in range(1, one_wave + 1)
+        )
         assert all(len(resolver(batch, draft_len)) > 1 for batch in range(one_wave + 1, 129))
 
 

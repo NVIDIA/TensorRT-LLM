@@ -29,6 +29,8 @@ from typing import Any
 
 import torch
 
+from .fp4_mla_twostream import split_launch_min_kv
+
 __all__ = [
     "EnvelopeGeometry",
     "FULL_ONLY_MAX_PAIRS",
@@ -100,11 +102,9 @@ SPLIT_ENV = "TRTLLM_FP4_MLA_4X_SPLIT"  # default on; 0 keeps the one-wave FULL-o
 SPLIT_MAX_PAIRS = 512  # partial workspace bound (<= ~0.5 GB of FP32 partials at 128 heads x q4)
 # Below these KV lengths the per-task fixed cost (~9.5 us) beats the fill: 2x stays. Measured (Rubin, real
 # fixtures): B32/Q4 breaks even at ~9K tokens (-2.5 % at 8,704); an under-filled single wave (33 pairs) gains from a
-# split only at long KV (-22 % at 135K, nothing at 30K).
+# split only at long KV (-22 % at 135K, nothing at 30K; ``fp4_mla_twostream.split_launch_min_kv``).
 SPLIT_MIN_KV_MULTIWAVE_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MIN_KV_MULTIWAVE"
 SPLIT_MIN_KV_MULTIWAVE_DEFAULT = 8192
-SPLIT_MIN_KV_ONEWAVE_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MIN_KV_ONEWAVE"
-SPLIT_MIN_KV_ONEWAVE_DEFAULT = 65536
 # Under-filled single waves: the 2x packed planner cuts every request in two whenever the two-piece plan still fits
 # one wave of its 2-CTA clusters (2 x requests x m_tiles <= sm_count // 2, m_tiles = heads x q / 128 packed rows;
 # fp4_mla_packed_reduce.packed_plan_kernel), which halves its makespan while a one-wave 4x launch cannot. Measured
@@ -165,9 +165,7 @@ def use_split_mode(
     pairs = pair_tasks(num_heads, query_len, num_requests)
     if pairs > FULL_ONLY_MAX_PAIRS:
         return True
-    return pairs < FULL_ONLY_MAX_PAIRS and max_kv_len >= _env_int(
-        SPLIT_MIN_KV_ONEWAVE_ENV, SPLIT_MIN_KV_ONEWAVE_DEFAULT
-    )
+    return pairs < FULL_ONLY_MAX_PAIRS and max_kv_len >= split_launch_min_kv(pairs)
 
 
 INT32_MAX = 2147483647

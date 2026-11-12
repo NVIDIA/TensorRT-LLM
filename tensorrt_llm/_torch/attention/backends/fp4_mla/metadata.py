@@ -558,6 +558,9 @@ def configure_fp4_mla_device_page_table(
     )
     if eager_context and num_generation_sequences > 0 and not host_kv_lens_available:
         return False
+    if not is_cuda_graph:
+        # An eager step decides on its own KV lengths; a graph keeps the ones of its KV regime.
+        metadata.fp4_mla_state.kv_regime_max_kv = metadata.fp4_mla_state.kv_regime_mean_kv = None
     if not is_cuda_graph and host_kv_lens_available:
         generation_tokens_per_sequence = (
             num_generation_tokens // num_generation_sequences if num_generation_sequences > 0 else 0
@@ -573,6 +576,14 @@ def configure_fp4_mla_device_page_table(
             max_page_capacity,
             max(1, _ceil_div(max_kv_len, FP4_MLA_TOKENS_PER_BLOCK)),
         )
+        if num_generation_sequences > 0:
+            generation_kv_lens = kv_lens[num_contexts:num_sequences].double()
+            metadata.fp4_mla_state.kv_regime_max_kv = (
+                int(generation_kv_lens.max()) + generation_tokens_per_sequence - 1
+            )
+            metadata.fp4_mla_state.kv_regime_mean_kv = (
+                float(generation_kv_lens.mean()) + generation_tokens_per_sequence - 1
+            )
         if num_contexts > 0:
             max_context_len = int(kv_lens[:num_contexts].max().item())
             max_context_pages = _ceil_div(

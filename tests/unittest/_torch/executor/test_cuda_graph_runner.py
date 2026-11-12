@@ -16,6 +16,7 @@ import torch
 from _torch.executor.engine_test_utils import _make_request_stub
 
 import tensorrt_llm._torch.pyexecutor.cuda_graph_runner as cuda_graph_runner_module
+from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     EncoderCUDAGraphRunner,
@@ -495,9 +496,9 @@ class SparseGraphKeyTestCase(unittest.TestCase):
 
 
 class KvRegimeGraphKeyTestCase(unittest.TestCase):
-    """Decode graphs keyed by the KV regime of the step's longest live KV (FP4 MLA dispatcher)."""
+    """Decode graphs keyed by the KV regime of the step's live KV (FP4 MLA dispatcher)."""
 
-    CEILINGS = (8192, 16384, 32768)
+    CEILINGS = fp4_mla_dispatch.KvRegimes((8192, 16384, 32768))
 
     def _runner(self, ceilings: tuple[int, ...] | None = CEILINGS) -> CUDAGraphRunner:
         runner = object.__new__(CUDAGraphRunner)
@@ -521,24 +522,45 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         batch.generation_requests = list(requests)
         return batch
 
+    def test_batch_without_generation_requests_has_no_regime(self) -> None:
+        # attention DP asks every rank for the regime of its batch, also a rank with only context requests
+        self.assertIsNone(self._runner()._kv_regime_for_batch(self._batch()))
+
     def test_key_without_regimes_is_unchanged(self) -> None:
         runner = self._runner(ceilings=None)
         key = runner.get_graph_key(self._batch(_make_request_stub(1, prompt_len=9000)))
         self.assertEqual(key, KeyType(batch_size=1, draft_len=0))
         self.assertIsNone(key.kv_regime)
 
-    def test_key_rounds_the_longest_live_kv_up_to_a_regime(self) -> None:
+    def test_key_rounds_the_mean_live_kv_up_to_a_regime(self) -> None:
         runner = self._runner()
         short = _make_request_stub(1, prompt_len=100)
         long = _make_request_stub(2, prompt_len=9000)
         self.assertEqual(runner.get_graph_key(self._batch(short)).kv_regime, 8192)
-        self.assertEqual(runner.get_graph_key(self._batch(short, long)).kv_regime, 16384)
+        self.assertEqual(runner.get_graph_key(self._batch(short, long)).kv_regime, 8192)
+        self.assertEqual(runner.get_graph_key(self._batch(long, long)).kv_regime, 16384)
         beyond = _make_request_stub(3, prompt_len=40000)
         self.assertEqual(runner.get_graph_key(self._batch(beyond)).kv_regime, 32768)
         self.assertEqual(
             runner.get_graph_key(self._batch(short)),
             KeyType(batch_size=1, draft_len=0, kv_regime=8192),
         )
+
+    def test_uneven_step_and_padding_rows(self) -> None:
+        # a step too uneven for the uncut launch of its mean's regime replays the first regime
+        regimes = fp4_mla_dispatch.KvRegimes((0, 8192, 16384, 32768), uncut=(16384,))
+        runner = self._runner(ceilings=regimes)
+        long = _make_request_stub(1, prompt_len=9000)
+        longer = _make_request_stub(2, prompt_len=14000)
+        self.assertEqual(runner.get_graph_key(self._batch(long, longer)).kv_regime, 16384)
+        longest = _make_request_stub(3, prompt_len=30000)
+        self.assertEqual(runner.get_graph_key(self._batch(long, long, longest)).kv_regime, 0)
+        # rows that pad the batch to a captured size do not count in the mean
+        padding = _make_request_stub(4, prompt_len=4)
+        padding.is_cuda_graph_dummy = True
+        self.assertEqual(runner.get_graph_key(self._batch(long, long, padding)).kv_regime, 16384)
+        padding.is_cuda_graph_dummy = False
+        self.assertEqual(runner.get_graph_key(self._batch(long, long, padding)).kv_regime, 8192)
 
     def test_key_counts_overlap_draft_and_promoted_rows(self) -> None:
         runner = self._runner()
@@ -695,8 +717,9 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
             )
 
         self.assertEqual(result, (graph_metadata, None, key))
-        # the dispatcher of the captured graph decides on the regime ceiling, not the capacity
+        # the dispatcher of the captured graph decides on the regime, not the capacity
         self.assertEqual(fp4_mla_state.kv_regime_max_kv, 8192)
+        self.assertEqual(fp4_mla_state.kv_regime_mean_kv, 8192)
 
     def test_lookup_rounds_a_missing_regime_up_to_a_captured_graph(self) -> None:
         runner = self._lookup_runner()
@@ -720,10 +743,10 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
     def test_strict_replay_rejects_metadata_of_another_regime(self) -> None:
         key = KeyType(batch_size=1, draft_len=0, kv_regime=8192)
         same = {
-            "attn_metadata": SimpleNamespace(fp4_mla_state=SimpleNamespace(kv_regime_max_kv=8192))
+            "attn_metadata": SimpleNamespace(fp4_mla_state=SimpleNamespace(kv_regime_mean_kv=8192))
         }
         other = {
-            "attn_metadata": SimpleNamespace(fp4_mla_state=SimpleNamespace(kv_regime_max_kv=16384))
+            "attn_metadata": SimpleNamespace(fp4_mla_state=SimpleNamespace(kv_regime_mean_kv=16384))
         }
         no_state = {"attn_metadata": SimpleNamespace(fp4_mla_state=None)}
         with patch.object(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", True):

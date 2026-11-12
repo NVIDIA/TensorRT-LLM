@@ -159,19 +159,18 @@ def test_one_wave_split(monkeypatch):
         128 * 6: (15, 17, 45),
     }
     for rows, (full, last, pairs) in shapes.items():
-        # an under-filled wave is a FULL launch only on a page table under the host's split-mode bound
-        for kv_capacity in (8192, 32768, 65535, 65536, 163840):
+        # an under-filled wave is a FULL launch only for a KV length under the host's split-mode bound
+        for max_kv_len in (4096, 32768, 65535, 65536, 163840):
             for num_requests in range(1, 2 * last + 1):
                 plan = ts.one_wave_split(
                     num_requests=num_requests,
                     rows_per_request=rows,
-                    max_kv_len=4096,
-                    kv_capacity=kv_capacity,
+                    max_kv_len=max_kv_len,
                     sm_count=SM_COUNT,
                 )
-                full_launch = pairs == ts.LANES_4X or kv_capacity < ts.SPLIT_MIN_KV_ONEWAVE_DEFAULT
+                full_launch = pairs == ts.LANES_4X or max_kv_len < ts.SPLIT_MIN_KV_ONEWAVE_DEFAULT
                 if not (full < num_requests <= last and full_launch):
-                    assert plan is None, (rows, num_requests, kv_capacity, plan)
+                    assert plan is None, (rows, num_requests, max_kv_len, plan)
                     continue
                 # one FULL 4x wave, the other requests in one round on the 2-CTA pairs it leaves free: the unpaired
                 # SMs and two pairs per cluster slot the wave leaves idle
@@ -183,16 +182,16 @@ def test_one_wave_split(monkeypatch):
                 # the planner declines these splits: its 2x arm is the modelled critical path
                 assert _plan(num_requests, rows, 4096).r2 == 0
     # the bound is the host's knob
-    kw = dict(num_requests=16, rows_per_request=96 * 8, max_kv_len=4096, sm_count=SM_COUNT)
-    assert ts.one_wave_split(**kw, kv_capacity=32768).r2 == 1
-    assert ts.one_wave_split(**kw, kv_capacity=163840) is None
+    kw = dict(num_requests=16, rows_per_request=96 * 8, sm_count=SM_COUNT)
+    assert ts.one_wave_split(**kw, max_kv_len=4096).r2 == 1
+    assert ts.one_wave_split(**kw, max_kv_len=65536) is None
     monkeypatch.setenv(ts.SPLIT_MIN_KV_ONEWAVE_ENV, "0")
-    assert ts.one_wave_split(**kw, kv_capacity=32768) is None
-    # a wave that whole requests fill exactly is a FULL launch on every page table
+    assert ts.split_launch_min_kv(45) == 0 and ts.one_wave_split(**kw, max_kv_len=4096) is None
+    # a wave that whole requests fill exactly is a FULL launch at every KV length
     exact = {**kw, "num_requests": 24, "rows_per_request": ROWS_Q4}
-    assert ts.one_wave_split(**exact, kv_capacity=163840).r2 == 1
+    assert ts.one_wave_split(**exact, max_kv_len=163840).r2 == 1
     monkeypatch.setenv(ts.SPLIT_MIN_KV_ONEWAVE_ENV, str(1 << 20))
-    assert ts.one_wave_split(**kw, kv_capacity=163840).r2 == 1
+    assert ts.one_wave_split(**kw, max_kv_len=163840).r2 == 1
 
 
 def test_one_wave_split_knobs(monkeypatch):
@@ -200,7 +199,6 @@ def test_one_wave_split_knobs(monkeypatch):
         num_requests=25,
         rows_per_request=ROWS_Q4,
         max_kv_len=4096,
-        kv_capacity=32768,
         sm_count=SM_COUNT,
     )
     assert ts.one_wave_split(**kw).r2 == 2

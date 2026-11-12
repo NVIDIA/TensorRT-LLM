@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FP4 MLA decode path selection: ``2x`` packed (default) | ``4x`` four-CTA-cluster | ``twostream`` (4x arm + 2x arm).
+"""FP4 MLA decode path selection: ``2x`` packed | ``4x`` four-CTA-cluster | ``twostream`` (4x arm + 2x arm).
 
-The decision is host arithmetic on static shapes plus the KV length, so it is the same in the eager warm-up, at
-CUDA-graph capture and (through the graph that was captured) at replay.  Measured basis (hecate0358/0369, Rubin
+The decision is host arithmetic on static shapes plus the step's KV lengths, so it is the same in the eager warm-up,
+at CUDA-graph capture and (through the graph that was captured) at replay.  Measured basis (hecate0358/0369, Rubin
 212 SMs, 128 heads, graph replays, 2026-11-02; see the two-stream planner for the item cost model):
 
 ======================================  ==========  ===========  ===================  ===================
@@ -69,14 +69,11 @@ re-fitted to this kernel: see the note at ``T4_FIXED_US`` in ``fp4_mla_twostream
 
 Extra-wave windows.  A 4x wave holds fewer requests than a 2x wave (46 pair tasks of 256 rows against
 ``sm_count // 2`` m-tiles of 128, i.e. 53 pair tasks on 212 SMs), so for the batches in between the 4x paths need a
-wave more than the 2x kernel, and the plain 4x path pays for that wave at short KV.  Measured against 2x (graph
-replays): two waves against one are 34-51 % slower up to KV 2K, 23-30 % at 4K, 7-12 % at 8K and level at 12K; three
-against two 14-27 % slower up to 2K, 5-12 % at 4K, 0-7 % at 6K and level from 7K (requests of a single pair task
-cross earlier: level at 6K and at 5K).  Under ``extra_wave_floor_kv`` such a call is therefore taken only by a
+wave more than the 2x kernel, and the plain 4x path pays for that wave at short KV.  Under ``extra_wave_floor_kv``
+such a call is therefore taken only by a
 two-stream split that drops the extra wave: the one-wave split of ``fp4_mla_twostream.one_wave_split`` where the
-host launches its 4x wave FULL (the call is then one wave of the machine, which needs no graded floor, only the few
-hundred tokens of ``FLOOR_KV_ONE_WAVE_SPLIT`` under which the 2x kernel is still ahead), else the planner's split
-from the graded floor, else 2x.
+host launches its 4x wave FULL (the call is then one wave of the machine, which needs no floor), else the planner's
+split from the graded floor, else 2x.
 
 Above the floor the static 4x envelope (``fp4_mla_cutedsl_4x_host.envelope_reason_static``:
 small-batch rules, Helix / softmax-stats / packed-V requirements, split-mode bounds) decides whether the 4x kernel
@@ -89,14 +86,19 @@ cannot as ``four_x_unavailable`` (``fp4_mla_cutedsl_4x_host.device_unsupported_r
 the device, today the shared memory a block may use), and every call then stays on ``2x`` with that reason.  A graph
 runner on such a device keys its decode graphs by no KV regime, as it does for Helix.
 
-KV length used for the decision: ``live_max_kv`` when the caller knows the step's real longest KV (eager mode
-narrows the page-table capacity to it; a graph runner that keys its graphs by KV regime can pass the regime
-ceiling through ``Fp4MlaState.kv_regime_max_kv``), otherwise the page-table capacity.  The kernels themselves are
-always compiled and planned for the capacity.
+KV lengths used for the decision: the longest (``live_max_kv``) and the mean (``live_mean_kv``) KV of the step's
+requests where the caller knows them (an eager step its own; a graph runner that keys its graphs by KV regime the
+regime's, ``kv_regime_bounds``), otherwise the page-table capacity for both.  The floors, the split plans and the
+launch of an under-filled 4x wave are taken on the mean: a floor weighs a fixed cost per task against a gain per KV
+tile, and the tiles a kernel runs are the mean's, whichever request holds them.  The longest decides one thing
+more.  A launch that runs every request uncut (``_runs_uncut``) lasts as long as its longest request, which the plan
+of the 2x kernel cuts into pieces for the clusters the shorter requests leave idle: such a launch takes a step only
+while its longest request is at most ``SPREAD_MAX_UNCUT_KV`` above the mean, and a more uneven step stays on 2x.
+The kernels themselves are always compiled and planned for the capacity.
 
 Environment:
 ``TRTLLM_FP4_MLA_CUTEDSL_4X_H128``  master switch of the 128-head decode, the head count of the tables above: on
-                                    unless set to ``0``.
+                                    unless set to a non-empty value other than ``1``, ``true``, ``yes`` or ``on``.
 ``TRTLLM_FP4_MLA_CUTEDSL_4X``       master switch of every other head count: off unless set to ``1``. Neither
                                     switch is read for the other's head counts. Both are honoured by the callers
                                     (``decode.py`` and the decode graphs): where the switch of a call is off this
@@ -106,8 +108,9 @@ Environment:
                                     4x kernel, ``four_x_unavailable``; ``twostream`` falls back to ``4x`` when the
                                     planner finds no useful split).
 ``TRTLLM_FP4_MLA_4X_MIN_KV``        one flat KV length (tokens) below which every call stays on ``2x``, replacing
-                                    the per-batch floor of ``four_x_floor_kv`` (0 / 2048 / 4096 / 8192 by 4x waves)
-                                    and the extra-wave rule of ``extra_wave_floor_kv``.
+                                    the per-batch floor of ``four_x_floor_kv`` (0 / 2048 / 4096 / 8192 by 4x waves),
+                                    the extra-wave rule of ``extra_wave_floor_kv`` and the page-table floor
+                                    ``NARROW_KV_CAPACITY``.
 ``TRTLLM_FP4_MLA_KV_REGIME_GRID``   extra KV regime ceilings (tokens, comma-separated) a graph runner keys its
                                     decode graphs by between a batch's floor and the capacity (default none: one 2x
                                     regime under the floor and one 4x-eligible regime up to the capacity): see
@@ -118,15 +121,17 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Callable, NamedTuple, Optional, Sequence
+from typing import Callable, NamedTuple, Optional
 
 from .fp4_mla_twostream import (
+    KV_TILE,
     LANES_4X,
     ROWS_PER_2X_ITEM,
     ROWS_PER_4X_ITEM,
     TwoStreamPlan,
     one_wave_split,
     plan_two_stream,
+    split_launch_min_kv,
 )
 
 DECODE_PATH_ENV = "TRTLLM_FP4_MLA_DECODE_PATH"
@@ -141,23 +146,36 @@ FLOOR_KV_4X_MANY_WAVES = 8192
 # ``FLOOR_KV_4X_MANY_WAVES`` beyond.  Two waves against one: plain 4x ties both 2x and the one-wave split at 12K.
 # Three against two: it ties 2x at 7K, and before 6K when a request is a single pair task, which sets the floor.
 FLOOR_KV_4X_EXTRA_WAVE = ((1, 12288), (2, 6144))
-# KV floor (tokens) of the one-wave split; shorter steps keep the 2x kernel.  The 2x kernel's time steps up between
-# 512 and 768 tokens while the split's cost is flat there: measured against 2x (graph replays, eight first-window
-# batches of 128 heads q2 / q4 and 96 heads q8) the split is 20-29 % slower at 256 tokens, 5-15 % at 512 and
-# 16-28 % faster at 768.  The step lies under 640 tokens (the split is 15-28 % ahead there on three of the
-# batches), so this floor errs towards the 2x kernel.
-FLOOR_KV_ONE_WAVE_SPLIT = 768
+# Page-table capacity (tokens) up to which every call stays on the 2x kernel.  On a page table of two KV tiles an
+# eager 2x launch is one task per request, without plan or reducer (``packed_plan._select_packed_split_count``).
+# Measured against 2x at 128 to 512 tokens (graph replays, 128 heads, q2 / q4): on such a page table the one-wave
+# split is 1-30 % slower and a FULL-launched 4x wave from 3 % faster to 26 % slower; at the same KV on page tables of
+# 640 tokens and more both are ahead (by 11-30 % and 14-66 %).  So a short step stays on 2x in an eager call, which
+# runs on its page table narrowed to the step, and may take a 4x path in a graph, which runs on the engine's.
+NARROW_KV_CAPACITY = 2 * KV_TILE
+# Tokens the longest request of a step may be above the step's mean KV for a launch that runs every request uncut
+# (``_runs_uncut``) to take the step.  Measured against 2x (graph replays, 128 heads, q2 to q8; one request to half
+# the batch longer than the others, ramps, heavy tails): up to the bound the uncut launches are ahead or level, but
+# for one 4x wave of 14 to 17 q4 requests whose others hold at most two KV tiles, which is level at 4000 tokens
+# above the mean and up to 6 % behind at the bound.  A lower bound loses more than it saves: ramps to 8K run
+# 0.42-0.50 of 2x at 3900-4090 tokens above their mean.  From 4096 tokens the first layouts are up to 6 % behind,
+# from 5120 up to 17 %, and one request of 30K among 256-token ones costs 1.5x to 3.2x.
+SPREAD_MAX_UNCUT_KV = 4096
 
 PATH_2X = "2x"
 PATH_4X = "4x"
 PATH_TWO_STREAM = "twostream"
 PATHS = (PATH_2X, PATH_4X, PATH_TWO_STREAM)
 
-# KV regimes a graph runner can key its decode graphs by (tokens): ``kv_regimes_for_batch`` lists the regimes worth
-# a graph for one batch shape, ``kv_regime_for_step`` maps a step's longest live KV onto them; the page-table
-# capacity itself is always the last regime, the grid adds optional points between a batch's floor and the capacity.
+# KV regimes a graph runner can key its decode graphs by (tokens of mean KV): ``kv_regimes_for_batch`` lists the
+# regimes worth a graph for one batch shape, ``kv_regime_for_step`` maps a step's mean and longest live KV onto
+# them; the page-table capacity itself is always the last regime, the grid adds optional points between a batch's
+# floor and the capacity.
 KV_REGIME_GRID_ENV = "TRTLLM_FP4_MLA_KV_REGIME_GRID"
 DEFAULT_KV_REGIME_GRID: tuple[int, ...] = ()
+# The regime of mean KV 0, which no step has: the 2x regime of the steps too uneven for an uncut launch, on a batch
+# shape with no 2x regime of its own (``kv_regime_bounds``).
+KV_REGIME_UNEVEN = 0
 
 
 class DecodeStrategy(NamedTuple):
@@ -235,8 +253,8 @@ def extra_wave_floor_kv(num_requests: int, rows_per_seq: int, sm_count: int) -> 
     on the 2x kernel; 0 for every other call, and under ``TRTLLM_FP4_MLA_4X_MIN_KV`` (one flat floor for all).
 
     Shorter steps of such a call go to a two-stream split that drops the extra wave, or stay on 2x.  Graded by the
-    2x wave count (``FLOOR_KV_4X_EXTRA_WAVE``, measured basis in the module docstring): the extra wave doubles a
-    call of one 2x wave and weighs less on every further one.  Never under ``four_x_floor_kv``, and the same floor
+    2x wave count (``FLOOR_KV_4X_EXTRA_WAVE``, measured basis at the constant): the extra wave doubles a call of one
+    2x wave and weighs less on every further one.  Never under ``four_x_floor_kv``, and the same floor
     beyond three 4x waves.
     """
     if min_kv_4x() is not None:
@@ -262,6 +280,37 @@ def kv_regime_grid() -> tuple[int, ...]:
     return tuple(ceiling for ceiling in ceilings if ceiling > 0)
 
 
+class KvRegimes(tuple):
+    """KV regimes of one batch shape (``kv_regimes_for_batch``): ceilings of the step's mean KV, ascending, the
+    page-table capacity last.  ``uncut``: the ceilings whose decision launches every request uncut
+    (``_runs_uncut``); a step too uneven for them replays the first regime (``kv_regime_for_step``)."""
+
+    uncut: frozenset = frozenset()
+
+    def __new__(cls, ceilings, uncut=()):
+        regimes = super().__new__(cls, ceilings)
+        regimes.uncut = frozenset(uncut)
+        return regimes
+
+
+def kv_regime_bounds(regime: int) -> tuple[Optional[int], int]:
+    """(longest, mean) KV the graph of a regime decides on (``choose_decode_strategy``'s ``live_max_kv``,
+    ``live_mean_kv``): every request at the ceiling, and for ``KV_REGIME_UNEVEN`` one request as long as the page
+    table among empty ones, which no uncut launch takes."""
+    if regime == KV_REGIME_UNEVEN:
+        return None, 0
+    return int(regime), int(regime)
+
+
+def _runs_uncut(path: str, pair_tasks: int) -> bool:
+    """Whether ``path`` runs every request of a call of ``pair_tasks`` whole: a two-stream split (its 2x arm plans
+    one task per request), a single 4x wave and plain 4x on waves whole requests fill exactly (the device plan of the
+    4x kernel cuts the requests of a last wave that is not full, and nothing else)."""
+    if path == PATH_TWO_STREAM:
+        return True
+    return path == PATH_4X and (pair_tasks <= LANES_4X or pair_tasks % LANES_4X == 0)
+
+
 def kv_regimes_for_batch(
     *,
     num_requests: int,
@@ -271,20 +320,23 @@ def kv_regimes_for_batch(
     kv_capacity: int,
     sm_count: int,
     envelope_reason: Callable[..., Optional[str]],
-) -> tuple[int, ...]:
+) -> KvRegimes:
     """Ceilings of the KV regimes a graph runner captures one decode graph of this batch shape for.
 
     Ascending, the page-table capacity last.  Only regimes whose graphs would decide differently earn one: a shape
     the 4x paths can never take (a forced ``2x`` / ``4x`` path, a shape outside the static envelope on the capacity,
     among them every ``query_len`` whose rows are no multiple of 256 and every batch over the split-mode pair bound)
-    or always may (floor 0) has the single regime of the capacity; otherwise the 2x regime ends right under the
+    or always may (floor 0) has the regime of the capacity; otherwise the 2x regime ends right under the
     shape's KV floor, the 4x-eligible span above it is split wherever the two-stream plan changes (the plan is taken
     on the regime ceiling, and ``plan_two_stream`` drops the split at long KV where its gain fades below the gate:
     B48/q4 keeps r2 = 2 up to ~50K and runs plain 4x beyond, so a 160K page table gets a two-stream regime for the
     short steps), ``kv_regime_grid`` adds its points, and the capacity closes the list.  In an extra-wave window
-    (``extra_wave_floor_kv``) that floor and the floor of the one-wave split (``FLOOR_KV_ONE_WAVE_SPLIT``) end a
-    regime as well, and each of the three does only where the decision changes across it: the one-wave split runs
-    under the graded floor, a planner split through the window floor.
+    (``extra_wave_floor_kv``) that floor ends a regime as well, and each of the two floors does only where the
+    decision changes across it: the one-wave split runs under the graded floor, a planner split through the window
+    floor.  The host's bound for the split-mode launch of an under-filled 4x wave (``split_launch_min_kv``) ends the
+    regime that spans it where that regime launches such a wave.  Where a regime launches every request uncut, a
+    step too uneven for it replays a 2x regime (``KvRegimes``): the shape's own under its floor, else
+    ``KV_REGIME_UNEVEN`` in front of the list.
     ``envelope_reason`` as in ``choose_decode_strategy``.  A runner whose steps no regime can move keys its graphs
     by none and does not ask: Helix (only one-wave shapes leave ``2x``; their graded floor is 0 and they are in no
     extra-wave window; a flat ``TRTLLM_FP4_MLA_4X_MIN_KV`` is then compared with the capacity), a device where the
@@ -292,7 +344,7 @@ def kv_regimes_for_batch(
     """
     capacity = int(kv_capacity)
     if _env_path() in (PATH_2X, PATH_4X):
-        return (capacity,)
+        return KvRegimes((capacity,))
     reason = envelope_reason(
         num_heads=num_heads,
         query_len=query_len,
@@ -301,49 +353,68 @@ def kv_regimes_for_batch(
         sm_count=sm_count,
     )
     if reason is not None:
-        return (capacity,)
+        return KvRegimes((capacity,))
+
+    def decision(regime: int) -> DecodeStrategy:
+        live_max_kv, live_mean_kv = kv_regime_bounds(regime)
+        return choose_decode_strategy(
+            num_requests=num_requests,
+            query_len=query_len,
+            num_heads=num_heads,
+            rows_per_seq=rows_per_seq,
+            kv_capacity=capacity,
+            sm_count=sm_count,
+            envelope_reason=envelope_reason,
+            four_x_unavailable=None,
+            live_max_kv=live_max_kv,
+            live_mean_kv=live_mean_kv,
+        )
+
     floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
     # The extra-wave rule is the automatic choice's; in a window the one-wave split runs under the graded floor.
     window_floor = (
         extra_wave_floor_kv(num_requests, rows_per_seq, sm_count) if _env_path() == "auto" else 0
     )
-    if floor <= 1 or (capacity < floor and not window_floor):
-        return (capacity,)
-    ceilings = {floor - 1}
-    ceilings.update(ceiling for ceiling in kv_regime_grid() if floor < ceiling < capacity)
-    ceilings.update(
-        _plan_flip_ceilings(
-            num_requests=num_requests,
-            rows_per_seq=rows_per_seq,
-            floor=floor,
-            capacity=capacity,
-            sm_count=sm_count,
+    ceilings = set()
+    if floor > 1 and (capacity >= floor or window_floor):
+        ceilings = {floor - 1}
+        ceilings.update(ceiling for ceiling in kv_regime_grid() if floor < ceiling < capacity)
+        ceilings.update(
+            _plan_flip_ceilings(
+                num_requests=num_requests,
+                rows_per_seq=rows_per_seq,
+                floor=floor,
+                capacity=capacity,
+                sm_count=sm_count,
+            )
         )
-    )
     if window_floor:
         # Extra-wave window: a boundary of its rule stays only where the decision changes across it.
-        def decision(kv: int) -> tuple[str, int]:
-            strategy = choose_decode_strategy(
-                num_requests=num_requests,
-                query_len=query_len,
-                num_heads=num_heads,
-                rows_per_seq=rows_per_seq,
-                kv_capacity=capacity,
-                sm_count=sm_count,
-                envelope_reason=envelope_reason,
-                four_x_unavailable=None,
-                live_max_kv=kv,
-            )
-            return strategy.path, strategy.r2
-
-        floors = {floor - 1, window_floor - 1, FLOOR_KV_ONE_WAVE_SPLIT - 1}
+        floors = {floor - 1, window_floor - 1}
         ordered = sorted(ceiling for ceiling in ceilings | floors if ceiling < capacity)
         ceilings = {
             ceiling
             for ceiling, following in zip(ordered, ordered[1:] + [capacity])
-            if ceiling not in floors or decision(ceiling) != decision(following)
+            if ceiling not in floors or decision(ceiling)[:2] != decision(following)[:2]
         }
-    return tuple(sorted(ceilings)) + (capacity,)
+    regimes = sorted(ceilings) + [capacity]
+    pair_tasks = num_requests * rows_per_seq // ROWS_PER_4X_ITEM
+    bounds = sorted({split_launch_min_kv(1) - 1, split_launch_min_kv(LANES_4X - 1) - 1})
+    for split_bound in bounds:
+        if not 0 < split_bound < capacity or split_bound in regimes:
+            continue
+        spanning = decision(min(regime for regime in regimes if regime > split_bound))
+        arm = pair_tasks - spanning.r2 * (rows_per_seq // ROWS_PER_4X_ITEM)
+        launched_by_kv = spanning.path != PATH_2X and arm < LANES_4X
+        if launched_by_kv and split_launch_min_kv(arm) - 1 == split_bound:
+            regimes = sorted(regimes + [split_bound])
+    if _env_path() != "auto" or capacity <= SPREAD_MAX_UNCUT_KV:
+        # the uneven rule is the automatic choice's, on a page table with room for it
+        return KvRegimes(regimes)
+    uncut = [regime for regime in regimes if _runs_uncut(decision(regime).path, pair_tasks)]
+    if uncut and decision(regimes[0]).path != PATH_2X:
+        regimes.insert(0, KV_REGIME_UNEVEN)
+    return KvRegimes(regimes, uncut)
 
 
 # Candidate KV lengths (tokens) the two-stream plan is probed at between a shape's floor and its capacity: a power
@@ -397,16 +468,17 @@ def _plan_flip_ceilings(
     return flips
 
 
-def kv_regime_for_step(max_kv_len: int, ceilings: Sequence[int]) -> int:
-    """Regime of a step whose longest live KV is ``max_kv_len``: the smallest ceiling covering it.
-
-    Shorter steps share the first regime; a step beyond the list (never, when ``ceilings`` ends with the
-    capacity) gets the last one, the graph of the capacity.
-    """
-    for ceiling in ceilings:
-        if max_kv_len <= ceiling:
-            return int(ceiling)
-    return int(ceilings[-1])
+def kv_regime_for_step(
+    max_kv_len: int, ceilings: KvRegimes, mean_kv_len: Optional[float] = None
+) -> int:
+    """Regime of a step whose longest live KV is ``max_kv_len`` and whose mean is ``mean_kv_len`` (the longest when
+    not given): the smallest ceiling covering the mean, else the last.  A step too uneven for the uncut launch of
+    that regime, by the test of ``choose_decode_strategy``, replays the first regime, the 2x regime of its shape."""
+    mean_kv_len = max_kv_len if mean_kv_len is None else mean_kv_len
+    regime = next((int(c) for c in ceilings if mean_kv_len <= c), int(ceilings[-1]))
+    if max_kv_len - math.ceil(mean_kv_len) > SPREAD_MAX_UNCUT_KV and regime in ceilings.uncut:
+        return int(ceilings[0])
+    return regime
 
 
 def choose_decode_strategy(
@@ -420,6 +492,7 @@ def choose_decode_strategy(
     envelope_reason: Callable[..., Optional[str]],
     four_x_unavailable: Optional[str],
     live_max_kv: Optional[int] = None,
+    live_mean_kv: Optional[float] = None,
     helix: bool = False,
     softmax_stats: bool = False,
     v_packed: bool = True,
@@ -430,14 +503,21 @@ def choose_decode_strategy(
     importable without the kernel host); it is always evaluated on the page-table capacity, the geometry the
     kernels are compiled for.  ``four_x_unavailable`` is why the 4x kernel cannot run at all where the call executes
     (None when it can; required, so that no caller assumes it can by omission): it wins over a forced path, and
-    becomes the strategy's reason.
+    becomes the strategy's reason.  ``live_max_kv`` / ``live_mean_kv``: the step's longest and mean KV (module
+    docstring); the strategy's ``kv_len_decision`` is the mean, the KV length its 4x wave is launched for.
     """
     forced = _env_path()
     kv_source = "capacity"
-    kv_decision = int(kv_capacity)
+    kv_longest = int(kv_capacity)
     if live_max_kv is not None and live_max_kv > 0:
-        kv_decision = min(int(live_max_kv), int(kv_capacity))
+        kv_longest = min(int(live_max_kv), int(kv_capacity))
         kv_source = "live"
+    kv_decision = kv_longest
+    if live_mean_kv is not None:
+        kv_decision = min(max(1, math.ceil(live_mean_kv)), kv_longest)
+        kv_source = "live"
+    # Too uneven for a launch that runs every request uncut; the rule is the automatic choice's.
+    uneven = forced == "auto" and kv_longest - kv_decision > SPREAD_MAX_UNCUT_KV
 
     def two_x(reason: str) -> DecodeStrategy:
         return DecodeStrategy(PATH_2X, 0, reason, kv_decision, kv_source, None)
@@ -448,18 +528,22 @@ def choose_decode_strategy(
         return DecodeStrategy(
             PATH_2X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None
         )
+    if forced == "auto" and min_kv_4x() is None and kv_capacity <= NARROW_KV_CAPACITY:
+        return two_x(
+            f"page table of {int(kv_capacity)} tokens: the 2x packed kernel runs one task per request there; "
+            f"{MIN_KV_4X_ENV} overrides"
+        )
     floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
     # Extra-wave window: under its floor only a two-stream split that drops the extra wave takes the call, and the
-    # one-wave split does so from its own floor, under the graded floor too.
+    # one-wave split does so under the graded floor too.
     window_floor = extra_wave_floor_kv(num_requests, rows_per_seq, sm_count)
     under_window_floor = forced == "auto" and kv_decision < window_floor
     plan = None
-    if under_window_floor and kv_decision >= FLOOR_KV_ONE_WAVE_SPLIT:
+    if under_window_floor:
         plan = one_wave_split(
             num_requests=num_requests,
             rows_per_request=rows_per_seq,
             max_kv_len=kv_decision,
-            kv_capacity=kv_capacity,
             sm_count=sm_count,
         )
     if forced == "auto" and kv_decision < floor and plan is None:
@@ -521,6 +605,17 @@ def choose_decode_strategy(
                 r2=0,
                 reason=f"4x prefix of {plan.num_requests_4x} requests outside the envelope: {prefix_reason}",
             )
+    if under_window_floor and not plan.enabled:
+        return two_x(
+            f"KV {kv_decision} < {window_floor}: the 4x paths need a wave more than the 2x packed kernel and no "
+            f"two-stream split drops it ({plan.reason}); {MIN_KV_4X_ENV} overrides"
+        )
+    path = PATH_TWO_STREAM if plan.enabled else PATH_4X
+    if uneven and _runs_uncut(path, num_requests * rows_per_seq // ROWS_PER_4X_ITEM):
+        return two_x(
+            f"longest KV {kv_longest} is more than {SPREAD_MAX_UNCUT_KV} above the mean KV {kv_decision}: "
+            f"{path} would run it uncut, the 2x packed plan cuts it"
+        )
     if plan.enabled:
         return DecodeStrategy(
             PATH_TWO_STREAM,
@@ -529,11 +624,6 @@ def choose_decode_strategy(
             kv_decision,
             kv_source if forced == "auto" else "forced",
             plan,
-        )
-    if under_window_floor:
-        return two_x(
-            f"KV {kv_decision} < {window_floor}: the 4x paths need a wave more than the 2x packed kernel and no "
-            f"two-stream split drops it ({plan.reason}); {MIN_KV_4X_ENV} overrides"
         )
     return DecodeStrategy(
         PATH_4X,
