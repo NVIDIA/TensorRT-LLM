@@ -18,12 +18,14 @@ each group in one launch, with the same results:
 
 * `accept`: the acceptance, the draft-0 input ids (the accepted tokens, flattened) and the
   step-0 gather rows;
-* `step`: one metadata update after a draft step: the core's length edits, then the draft
-  refresh, whose DSA part `Glm52Tep4DSAMetadata` runs on `draft_step` (`MODE_REFRESH`);
+* `step`: one metadata update after a draft step: `Glm52Tep4DSAMetadata.run_draft_step`
+  writes the draft's lengths, its DSA decode state and the next positions in one launch
+  (`draft_step`), then the draft refresh re-derives the rest;
 * `finalize`: `next_draft_tokens` and `next_new_tokens`.
 
-The domain is checked on the host before any device work (`ineligibility`,
-`step_ineligibility`); outside it the built-in code runs. `TRTLLM_GLM52_DRAFT_LOOP_VERIFY=1`
+The domain is checked on the host once per forward, before any device work (`ineligibility`
+for the forward, `draft_ineligibility` for the draft loop's metadata); outside it the built-in
+code runs. `TRTLLM_GLM52_DRAFT_LOOP_VERIFY=1`
 runs the built-in code first on the live state, restores the device state, runs the fused op
 and counts every field that differs, on the device (`DraftLoopVerify`).
 """
@@ -52,8 +54,6 @@ from .ops.sampling.cute_dsl_argmax import cute_dsl_argmax
 if TYPE_CHECKING:
     # Annotation only: `modeling.py` imports this module.
     from .modeling import GlmMoeDsaTep4ModelingV2
-
-MODE_REFRESH = _k.MODE_REFRESH
 
 
 @functools.lru_cache(maxsize=1)
@@ -122,8 +122,9 @@ def ineligibility(worker, attn_metadata, spec_metadata) -> str | None:
     return None
 
 
-def step_ineligibility(md, batch_size: int) -> str | None:
-    """Why the loop's draft refresh keeps the built-in DSA refresh, or None. Host only.
+def draft_ineligibility(md, batch_size: int) -> str | None:
+    """Why this forward's draft loop keeps the built-in metadata updates, or None. Host only;
+    checked once, on the draft metadata, before the loop's first draft step.
 
     The domain is the GEN server's pure-decode DSA metadata: no context rows, the native
     fused decode metadata, uncompressed indexer lengths, no expanded MTP buffers, no ragged
@@ -166,45 +167,74 @@ def step_ineligibility(md, batch_size: int) -> str | None:
 
 
 class Glm52Tep4DSAMetadata(DSAMetadata):
-    """The DSA metadata of this target: the draft loop's DSA refresh on `draft_step`.
+    """The DSA metadata of this target, with the fused draft-step update of its draft loop.
 
-    `refresh_from_draft_lengths` rebuilds the DSA decode state from the draft's lengths in
-    one launch (`MODE_REFRESH`) when the worker asked for it (`_fused_refresh`) and the step is
-    in the fused domain (`step_ineligibility`); otherwise it is the built-in refresh.
-    Declared in the target's `runtime_hooks`.
+    `run_draft_step` is this target's metadata update after a draft step: one `draft_step`
+    launch writes the draft's query and KV lengths (through the core's
+    `lengths_for_kernel_update`), the DSA decode state that follows them and the next step's
+    positions. The draft refresh after it (`refresh_from_draft_lengths`) then only does the
+    rest of the built-in DSA refresh: its host side, the GVR row reorder and the dense top-k
+    fallback. Any other refresh is the built-in one. `Glm52MTPEagleWorker` calls
+    `run_draft_step` on the forwards `draft_ineligibility` admits; declared in the target's
+    `runtime_hooks`.
     """
 
-    fields = frozenset({"_fused_refresh"})
-    draft_private = frozenset({"_fused_refresh"})
+    fields = frozenset({"_draft_step_written"})
+    draft_private = frozenset({"_draft_step_written"})
 
-    _fused_refresh: bool = False
+    _draft_step_written: bool = False
 
     def __init__(self, metadata, *, source=None, **config) -> None:
         super().__init__(metadata, source=source, **config)
-        self._fused_refresh = False
+        self._draft_step_written = False
+
+    def run_draft_step(
+        self,
+        step: int,
+        draft_len: int,
+        num_accepted: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        gather_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """The update after draft step `step` of a pure-decode loop, before the draft refresh.
+
+        Step 0 switches every row to one query token and takes the KV lengths back to the
+        accepted tokens (`kv += num_accepted - draft_len`); a later step advances them by one.
+        Returns `position_ids[gather_ids] + 1` (step 0) or `position_ids[:B] + 1`, or None
+        without `position_ids`."""
+        md = self.metadata
+        batch_size = md.num_seqs
+        if step == 0:
+            # The host side of the switch; the device lengths are the kernel's.
+            md.set_seq_lens(slice(0, batch_size), host=1, update_counts=True)
+            md.as_generation_rows()
+        md.lengths_for_kernel_update()
+        position_ids = _k.draft_step(
+            md,
+            mode=_k.MODE_STEP0 if step == 0 else _k.MODE_ADVANCE,
+            batch_size=batch_size,
+            draft_len=draft_len,
+            split_kv=_k.schedule_split_kv(self.num_sms, md.kv_lens_cuda.device),
+            num_accepted=num_accepted,
+            position_ids=position_ids,
+            gather_ids=gather_ids,
+        )
+        self._draft_step_written = True
+        return position_ids
 
     def refresh_from_draft_lengths(self) -> None:
-        md = self.metadata
-        if not self._fused_refresh or step_ineligibility(md, md.num_seqs) is not None:
+        if not self._draft_step_written:
             super().refresh_from_draft_lengths()
             return
-        # The built-in refresh's host side; `draft_step` writes every device buffer its
-        # `on_update_kv_lens` writes (the indexer schedule included), then the GVR row
-        # reorder and the dense top-k fallback follow, as there.
+        self._draft_step_written = False
+        md = self.metadata
+        # The built-in refresh's host side; `run_draft_step` wrote every device buffer its
+        # `on_update_kv_lens` writes (the indexer schedule included). The GVR row reorder
+        # and the dense top-k fallback follow, as there.
         self._invalidate_length_prefixes()
         self.max_gen_seq_len = md.seq_lens[: md.num_seqs].max().item()
         self.indexer_schedule_stale = False
         self._invalidate_pool_view_cache()
-        _k.draft_step(
-            md,
-            mode=MODE_REFRESH,
-            batch_size=md.num_seqs,
-            draft_len=self.max_draft_tokens,
-            split_kv=_k.schedule_split_kv(self.num_sms, md.kv_lens_cuda.device),
-            num_accepted=None,
-            position_ids=None,
-            gather_ids=None,
-        )
         self.gen_indexer_kv_lens_cuda_runtime = self.get_indexer_kv_lens(
             md.kv_lens_cuda[: md.num_seqs]
         )
@@ -216,29 +246,28 @@ class Glm52Tep4DSAMetadata(DSAMetadata):
 def run_step(
     worker, md, step, batch_size, draft_len, num_accepted, position_ids, gather_ids, fused
 ):
-    """The metadata update after draft step `step` (the built-in loop's, for a batch without
-    context rows): the core's length edits and the draft refresh, its DSA part on `draft_step`
-    when `fused`. Returns the next step's positions, or None without `position_ids`."""
+    """The metadata update after draft step `step` of a pure-decode loop, then the draft
+    refresh: on `Glm52Tep4DSAMetadata.run_draft_step` when `fused`, else the built-in loop's
+    (the core's length edits and the built-in refresh). Returns the next step's positions, or
+    None without `position_ids`."""
     from tensorrt_llm._torch.speculative.mtp import _select_mtp_position_ids
 
-    new_position_ids = None
-    if position_ids is not None:
-        rows = gather_ids if step == 0 else slice(0, batch_size)
-        new_position_ids = _select_mtp_position_ids(position_ids, rows) + 1
-    if step == 0:
-        md.set_seq_lens(slice(0, batch_size), host=1, device=1, update_counts=True)
-        md.as_generation_rows()
-        md.adjust_kv_lens(slice(0, batch_size), num_accepted[:batch_size] - draft_len)
+    if fused:
+        new_position_ids = md.ext(Glm52Tep4DSAMetadata).run_draft_step(
+            step, draft_len, num_accepted, position_ids, gather_ids
+        )
     else:
-        md.adjust_kv_lens(slice(0, batch_size), 1)
-    dsa = md.find_ext(Glm52Tep4DSAMetadata)
-    if dsa is not None:
-        dsa._fused_refresh = fused
-    try:
-        worker.refresh_draft()
-    finally:
-        if dsa is not None:
-            dsa._fused_refresh = False
+        new_position_ids = None
+        if position_ids is not None:
+            rows = gather_ids if step == 0 else slice(0, batch_size)
+            new_position_ids = _select_mtp_position_ids(position_ids, rows) + 1
+        if step == 0:
+            md.set_seq_lens(slice(0, batch_size), host=1, device=1, update_counts=True)
+            md.as_generation_rows()
+            md.adjust_kv_lens(slice(0, batch_size), num_accepted[:batch_size] - draft_len)
+        else:
+            md.adjust_kv_lens(slice(0, batch_size), 1)
+    worker.refresh_draft()
     if step == 0:
         set_use_spec_decoding(md, False)
     return new_position_ids
@@ -260,8 +289,6 @@ class DraftLoop:
         self.input_ids: torch.Tensor | None = None
         self.gather_ids: torch.Tensor | None = None
         self.next_new_tokens: torch.Tensor | None = None
-        # The metadata state is per forward: once a step declines, the rest stay built-in.
-        self.steps_engaged = True
 
     def accept(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The target's tokens (the worker's own pick), then the fused acceptance.
@@ -314,20 +341,13 @@ class DraftLoop:
         return self.accepted, self.num_accepted
 
     def step(self, md, step: int, position_ids) -> torch.Tensor | None:
-        """The metadata update after draft step `step`; the next step's positions."""
+        """The fused metadata update after draft step `step`; the next step's positions."""
         gather_ids = self.gather_ids if step == 0 else None
-        fused = self.steps_engaged
-        if fused:
-            reason = step_ineligibility(md, self.batch_size)
-            self._worker._glm_count("draft_step", reason is None)
-            if reason is not None:
-                log_decline("the metadata update", reason)
-                self.steps_engaged = fused = False
         args = (self._worker, md, step, self.batch_size, self.draft_len, self.num_accepted,
                 position_ids, gather_ids)  # fmt: skip
-        if fused and verify_enabled():
+        if verify_enabled():
             return VERIFY.step(*args)
-        return run_step(*args, fused=fused)
+        return run_step(*args, fused=True)
 
     def finalize(self, draft_tokens: list[torch.Tensor]) -> torch.Tensor | None:
         """`next_draft_tokens [B, K]`, with `next_new_tokens [B, K+1]` kept for the worker's
@@ -648,13 +668,20 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
         accepted_tokens=None, pre_draft_seq_lens=None,
     ):  # fmt: skip
         """The built-in MTP-Eagle draft loop restricted to the fused domain (no context rows,
-        no guided decoding, SA enhancer or LM-head TP: `ineligibility`), with the
-        metadata updates on `DraftLoop.step` and the stack on `DraftLoop.finalize`.
+        no guided decoding, SA enhancer or LM-head TP: `ineligibility`; the draft metadata:
+        `draft_ineligibility`), with the metadata updates on `DraftLoop.step` and the stack on
+        `DraftLoop.finalize`. Outside the domain, the built-in loop.
 
         Returns `(next_draft_tokens, next_new_tokens)` like the built-in loop; the fused path
         returns None for the second, and `_prepare_next_new_tokens` hands out the loop's."""
         loop = self._glm_draft_loop
-        if loop is None or attn_metadata.find_ext(DSAMetadata) is None:
+        if loop is not None:
+            reason = draft_ineligibility(attn_metadata, batch_size)
+            self._glm_count("draft_step", reason is None)
+            if reason is not None:
+                log_decline("the metadata updates", reason)
+                loop = None
+        if loop is None:
             return super()._forward_linear_draft_loop(
                 inputs, attn_metadata, spec_metadata, draft_model, draft_kv_cache_manager,
                 num_contexts, batch_size, num_accepted_tokens, original_all_rank_num_tokens,

@@ -10,7 +10,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
 from tensorrt_llm._torch.attention.backends.sparse.dsa import custom_ops as dsa_custom_ops
 from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
-from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import forward_sparse_attn_custom_op
 from tensorrt_llm._torch.attention.backends.sparse.offload import (
     SPARSE_OFFLOAD_STATE_COPIES,
@@ -952,6 +952,26 @@ def test_overlapped_write_mapping_tracks_reordered_requests(monkeypatch, dtype, 
         manager.shutdown()
 
 
+class _OffloadMetadata:
+    """The composed DSA metadata as the offload path reads it: the core's and the MTP
+    index-share names held here, every other name forwarded to the DSA extension."""
+
+    def __init__(self, dsa: DSAMetadata, **names) -> None:
+        self.__dict__.update(names, _dsa=dsa)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_dsa"], name)
+
+    def __setattr__(self, name, value) -> None:
+        if name in self.__dict__:
+            self.__dict__[name] = value
+        else:
+            setattr(self.__dict__["_dsa"], name, value)
+
+    def find(self, name, default=None):
+        return self.__dict__.get(name, default)
+
+
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize("capture", [False, True], ids=["eager", "cuda-graph"])
 @pytest.mark.parametrize("explicit_pattern", [False, True], ids=["glm52", "glm53"])
@@ -962,33 +982,34 @@ def test_shared_layer_prefetch_preserves_history(monkeypatch, dtype, capture, ex
         config.index_topk_pattern = ["F", "S", "S", "F", "S", "F", "S"]
     manager = _manager(dtype=dtype, pretrained_config=config)
     requests = [_request(17, 1), _request(18, 1)]
-    metadata = object.__new__(DSAtrtllmAttentionMetadata)
-    metadata.kv_cache_manager = manager
-    metadata.sparse_metadata_params = SimpleNamespace(enable_kv_cache_offload=True)
-    metadata.beam_width = 1
-    metadata.max_draft_tokens = 0
-    metadata.draft_kv_cache_manager = None
-    metadata.sparse_mla_topk = TOPK
-    metadata.is_cuda_graph = False
-    metadata.cuda_graph_buffers = {}
-    metadata.get_empty = lambda buffers, shape, dtype, **kwargs: torch.empty(
-        shape, dtype=dtype, device="cuda"
+    num_requests = len(requests)
+    dsa = object.__new__(DSAMetadata)
+    dsa.sparse_mla_topk = TOPK
+    dsa.max_draft_tokens = 0
+    metadata = _OffloadMetadata(
+        dsa,
+        kv_cache_manager=manager,
+        sparse_metadata_params=SimpleNamespace(enable_kv_cache_offload=True),
+        beam_width=1,
+        is_cuda_graph=False,
+        cuda_graph_buffers={},
+        get_empty=lambda buffers, shape, dtype, **kwargs: torch.empty(
+            shape, dtype=dtype, device="cuda"
+        ),
+        num_tokens=num_requests,
+        num_seqs=num_requests,
+        num_contexts=0,
+        shared_topk_indices=torch.full((num_requests, TOPK), -1, dtype=torch.int32, device="cuda"),
+        req_idx_per_token=torch.arange(num_requests, dtype=torch.int32, device="cuda"),
+        kv_lens_cuda=torch.empty(num_requests, dtype=torch.int32, device="cuda"),
     )
-    metadata._init_dsa_sparse_offload_state()
+    dsa.metadata = metadata
+    dsa._init_dsa_sparse_offload_state()
     expected_pairs = {0: 1, 1: 2, 3: 4, 5: 6} if explicit_pattern else {2: 3, 3: 4, 4: 5}
     assert metadata.sparse_offload_next_shared_layer == expected_pairs
     state = metadata.sparse_offload_state
     # Inspect raw data and scale bytes separately; dequantization has its own test.
     state.nvfp4_scratch = None
-    num_requests = len(requests)
-    metadata._num_tokens = num_requests
-    metadata._seq_lens = torch.ones(num_requests, dtype=torch.int32)
-    metadata._num_contexts = 0
-    metadata.shared_topk_indices = torch.full(
-        (num_requests, TOPK), -1, dtype=torch.int32, device="cuda"
-    )
-    metadata.req_idx_per_token = torch.arange(num_requests, dtype=torch.int32, device="cuda")
-    metadata.kv_lens_cuda = torch.empty(num_requests, dtype=torch.int32, device="cuda")
     latent = torch.empty((num_requests, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
     token_values = torch.empty((num_requests, 3), dtype=torch.int32, device="cuda")
     arenas = {}

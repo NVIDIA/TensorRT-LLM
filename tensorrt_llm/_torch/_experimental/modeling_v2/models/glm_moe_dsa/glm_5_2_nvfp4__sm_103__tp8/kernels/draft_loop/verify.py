@@ -149,35 +149,30 @@ def _native_step_tail(
     position_ids,
     gather_ids,
 ):
-    """The native per-step tail of ``Eagle3OneModelWorker._forward_linear_draft_loop``."""
-    from tensorrt_llm._torch.speculative.mtp import _select_mtp_position_ids
+    """The native per-step tail of ``Eagle3OneModelWorker._forward_linear_draft_loop``.
 
-    from .draft_step import GlmTp8DSAMetadata
+    The draft refresh it ends with is ``DSAMetadata``'s: only ``run_draft_step``
+    makes ``GlmTp8DSAMetadata`` skip it.
+    """
+    from tensorrt_llm._torch.speculative.mtp import _select_mtp_position_ids
 
     new_position_ids = None
     if position_ids is not None:
         rows = gather_ids if i == 0 else slice(0, batch_size)
         new_position_ids = _select_mtp_position_ids(position_ids, rows) + 1
-    dsa = md.find_ext(GlmTp8DSAMetadata)
-    if dsa is not None:
-        md._force_native_refresh = True
-    try:
-        if i == 0:
-            md.set_seq_lens(slice(0, batch_size), host=1, device=1, update_counts=True)
-            md.as_generation_rows()
-            md.adjust_kv_lens(
-                slice(num_contexts, batch_size),
-                num_accepted_tokens[num_contexts:batch_size] - runtime_draft_len,
-            )
-            md.adjust_kv_lens(slice(0, num_contexts), 1)
-            refresh()
-            md.use_spec_decoding = False
-        else:
-            md.adjust_kv_lens(slice(0, batch_size), 1)
-            refresh()
-    finally:
-        if dsa is not None:
-            md._force_native_refresh = False
+    if i == 0:
+        md.set_seq_lens(slice(0, batch_size), host=1, device=1, update_counts=True)
+        md.as_generation_rows()
+        md.adjust_kv_lens(
+            slice(num_contexts, batch_size),
+            num_accepted_tokens[num_contexts:batch_size] - runtime_draft_len,
+        )
+        md.adjust_kv_lens(slice(0, num_contexts), 1)
+        refresh()
+        md.use_spec_decoding = False
+    else:
+        md.adjust_kv_lens(slice(0, batch_size), 1)
+        refresh()
     return new_position_ids
 
 

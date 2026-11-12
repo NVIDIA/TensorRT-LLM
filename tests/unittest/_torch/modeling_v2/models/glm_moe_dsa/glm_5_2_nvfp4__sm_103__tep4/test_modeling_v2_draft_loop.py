@@ -278,9 +278,13 @@ class _Metadata:
     def adjust_kv_lens(self, rows, delta) -> None:
         self.kv_lens_cuda[rows] += delta
 
+    def lengths_for_kernel_update(self) -> dict:
+        return {"seq_lens_cuda": self.seq_lens_cuda, "kv_lens_cuda": self.kv_lens_cuda}
+
 
 class _RefreshWorker:
-    """The draft loop's `refresh_draft()`: the DSA extension's refresh of the draft."""
+    """The draft loop's `refresh_draft()`: the DSA extension's refresh of the draft (the core
+    keeps no device state this metadata reads)."""
 
     def __init__(self, md: _Metadata) -> None:
         self._md = md
@@ -319,7 +323,7 @@ def _metadata(batch, draft_len, expand, seed, seq_len, skip=False, gvr=False):
     )  # fmt: skip
     dsa = object.__new__(op.Glm52Tep4DSAMetadata)
     dsa.__dict__.update(
-        _fused_refresh=False,
+        _draft_step_written=False,
         _pool_cache_valid=True,
         _group_remap_batched={},
         _ragged_mla_buffers_valid=True,
@@ -341,6 +345,8 @@ def _metadata(batch, draft_len, expand, seed, seq_len, skip=False, gvr=False):
         use_expanded_buffers_for_mtp=False,
         expand_for_dsl=expand > 1,
         dsl_expand_factor=expand,
+        dsl_kernel_atoms=1,
+        dsl_kernel_next_n=0,
         kv_lens_expanded_cuda=torch.zeros((cap * 8,), dtype=torch.int32, device=DEV),
         indexer_k_cache_block_offsets=torch.randint(
             0, 1 << 20, (cap, _MAX_BLOCKS), generator=g, dtype=torch.int32).to(DEV),
@@ -459,8 +465,8 @@ def test_domain(monkeypatch) -> None:
 
     monkeypatch.setattr(dsa, "is_dsa_cache_manager", lambda m: m is not None)
     md = _metadata(4, 5, 1, 1, 6)
-    assert op.step_ineligibility(md, 4) is None
-    assert op.step_ineligibility(md, 3) is not None  # not the batch the metadata holds
+    assert op.draft_ineligibility(md, 4) is None
+    assert op.draft_ineligibility(md, 3) is not None  # not the batch the metadata holds
     for name, value in (
         ("use_expanded_buffers_for_mtp", True),
         ("use_fp8_ds_mla", True), ("enable_ragged_verification", True),
@@ -468,32 +474,29 @@ def test_domain(monkeypatch) -> None:
     ):  # fmt: skip
         md = _metadata(4, 5, 1, 1, 6)
         setattr(md, name, value)
-        assert op.step_ineligibility(md, 4) is not None, name
+        assert op.draft_ineligibility(md, 4) is not None, name
     # The dense top-k fallback and the GVR row reorder stay in the domain.
-    assert op.step_ineligibility(_metadata(4, 5, 1, 1, 6, skip=True), 4) is None
-    assert op.step_ineligibility(_metadata(64, 5, 1, 1, 6, gvr=True), 64) is None
+    assert op.draft_ineligibility(_metadata(4, 5, 1, 1, 6, skip=True), 4) is None
+    assert op.draft_ineligibility(_metadata(64, 5, 1, 1, 6, gvr=True), 64) is None
     md = _metadata(4, 5, 1, 1, 6)
     md.num_contexts = 1
-    assert op.step_ineligibility(md, 4) is not None
+    assert op.draft_ineligibility(md, 4) is not None
 
 
-def test_step_declines_and_stays_declined(monkeypatch) -> None:
-    """Once a step declines, the loop's later steps keep the built-in update."""
-    target, draft, batch_indices = _accept_case(4, 5, 3, torch.int32)
-    spec = SimpleNamespace(
-        draft_tokens=draft, batch_indices_cuda=batch_indices, is_cuda_graph=False,
-        is_ragged_verify=False, runtime_draft_len=5,
-    )  # fmt: skip
-    worker = _Worker(target, 0.0)
-    loop = op.DraftLoop(worker, SimpleNamespace(num_seqs=4), spec)
-    reasons = iter(["declined", None])
-    monkeypatch.setattr(op, "step_ineligibility", lambda md, b: next(reasons))
-    fused_flags = []
-    monkeypatch.setattr(op, "run_step", lambda *args, fused: fused_flags.append(fused))
-    loop.step(None, 0, None)
-    loop.step(None, 1, None)
-    assert fused_flags == [False, False]
-    assert worker.counts == {("draft_step", False): 1}
+def test_declined_draft_metadata_runs_the_built_in_loop(monkeypatch) -> None:
+    """A forward whose draft metadata is outside the domain runs the built-in loop whole."""
+    worker = object.__new__(op.Glm52MTPEagleWorker)
+    counts = {}
+    worker._glm_count = lambda route, hit: counts.update({(route, hit): 1})
+    worker._glm_draft_loop = SimpleNamespace(step=None)  # a fused acceptance ran
+    monkeypatch.setattr(op, "draft_ineligibility", lambda md, b: "declined")
+    built_in = object()
+    monkeypatch.setattr(
+        op.MTPEagleWorker, "_forward_linear_draft_loop", lambda self, *args: built_in
+    )
+    args = ({}, None, None, None, None, 0, 4, None, None)
+    assert op.Glm52MTPEagleWorker._forward_linear_draft_loop(worker, *args) is built_in
+    assert counts == {("draft_step", False): 1}
 
 
 def test_worker_overrides_are_model_local() -> None:
