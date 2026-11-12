@@ -275,11 +275,12 @@ available to downstream `L0_Test-*` pods. To deliver it per stage:
 1. For an applied decision, `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
    recording the path in `result.cbts_test_db_artifact_path` (rides along
    inside `testFilter`).
-2. `renderTestDB` on the stage agent downloads and extracts that tarball
+2. `renderTestDB` on the stage agent reads that tarball through the read
+   helper (`jenkins/scripts/fetch_build_artifact.sh`) and extracts it
    into `${llmSrc}/${test_db_dir_override}`; trt-test-db then renders from
    the narrowed test-db.
 
-If the upload or the download/extraction fails, the override directory is
+If the upload, the read, or the extraction fails, the override directory is
 absent and `renderTestDB` falls back to the source test-db. Layer 2 still
 applies. For applied decisions, the tarball carries only the narrowed YAMLs,
 so no PR diff text travels between jobs.
