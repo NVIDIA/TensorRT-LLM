@@ -1152,7 +1152,7 @@ def fp4_mla_4x_full_ctm(
     sfa_ptr: cute.Pointer,
     sfb_ptr: cute.Pointer,
     page_table_ptr: cute.Pointer,
-    valid_k_ptr: cute.Pointer,
+    valid_k_ptr: cute.Pointer,  # int32 KV length per request; Helix variant: int32 KV bound per query token
     c_ptr: cute.Pointer,
     accum_ptr: cute.Pointer,  # x79 ABI slot, unused: no carry in FULL-only (host: HEADER_SCRATCH_WORDS int32 scratch)
     row_max_ptr: cute.Pointer,  # x79 ABI slot, unused: no meta
@@ -1162,7 +1162,8 @@ def fp4_mla_4x_full_ctm(
     kv_global_scale_ptr: cute.Pointer,
     plan_ptr: cute.Pointer,  # split mode: int32 packed plan (fp4_mla_packed_reduce layout); FULL mode: unused scratch
     partial_ptr: cute.Pointer,  # split mode: fp32 [task_capacity, rows_per_seq, 512] unnormalized O
-    rowmax_ptr: cute.Pointer,  # split mode: fp32 [task_capacity, rows_per_seq] row anchor (raw score units)
+    rowmax_ptr: cute.Pointer,  # split mode: fp32 [task_capacity, rows_per_seq] row anchor (raw score units);
+    # Helix variant: the caller's fp32 [rows, 2] softmax statistics, (max, sum) per packed row
     rowsum_ptr: cute.Pointer,  # split mode: fp32 [task_capacity, rows_per_seq] denominator relative to the anchor
     problem_size: tuple,
     runtime_m: ctm.Int32,
@@ -1187,6 +1188,7 @@ def fp4_mla_4x_full_ctm(
     use_ksf_gather4: ctm.Constexpr = False,
     heads: ctm.Constexpr = 128,
     split_mode: ctm.Constexpr = False,
+    helix: ctm.Constexpr = False,
 ) -> None:
     n, k = problem_size
     # n is staged here; N512 and the fair envelope are enforced by the host (full_validate_envelope).
@@ -1196,6 +1198,14 @@ def fp4_mla_4x_full_ctm(
     # 256 rows) must stay inside one request so both CTAs share the K/V tiles -> heads * q % 256 == 0.
     if cutlass.const_expr((heads * query_len_per_seq) % 256 != 0):
         raise ValueError("4x rows mode requires heads * query_len_per_seq to be a multiple of 256")
+    # Helix variant (context parallelism: a request's KV is spread over several ranks): per-token KV bounds come in
+    # through the valid_k slot and the per-row softmax statistics of the cross-rank combine go out through the rowmax
+    # slot. It is a FULL launch only: split mode stores the reducer's row state through that slot. It reads one bound
+    # per 32-row warp group, so a token must be a whole number of groups.
+    if cutlass.const_expr(helix and split_mode):
+        raise ValueError("the 4x Helix variant is the FULL launch only")
+    if cutlass.const_expr(helix and heads % 32 != 0):
+        raise ValueError("the 4x Helix variant requires heads to be a multiple of 32")
     blocks_per_seq = heads * query_len_per_seq // 128
     pairs_per_seq = heads * query_len_per_seq // 256
     rows_per_seq = heads * query_len_per_seq
@@ -1271,6 +1281,18 @@ def fp4_mla_4x_full_ctm(
         )
         rowsum_tensor = cute.make_tensor(
             cute.recast_ptr(rowsum_ptr, dtype=cutlass.Float32), cute.make_layout((1,), stride=(1,))
+        )
+    if cutlass.const_expr(helix):
+        # Helix variant: the valid_k slot carries the per-token bounds table, bounds[request * q + token] (int32),
+        # in place of the per-request KV lengths, which this variant never reads ...
+        valid_k_tensor = cute.make_tensor(
+            cute.recast_ptr(valid_k_ptr, dtype=cutlass.Int32),
+            cute.make_layout((num_requests * ctm.Int32(query_len_per_seq),), stride=(1,)),
+        )
+        # ... and the rowmax slot the caller's softmax statistics, fp32 [rows, 2] = (max, sum) per packed row.
+        rowmax_tensor = cute.make_tensor(
+            cute.recast_ptr(rowmax_ptr, dtype=cutlass.Float32),
+            cute.make_layout((batch_size * m * ctm.Int32(2),), stride=(1,)),
         )
     grid_z = batch_size // 2  # one FULL task per pair
     if cutlass.const_expr(split_mode):
@@ -1564,6 +1586,7 @@ def fp4_mla_4x_full_ctm(
         use_mixed_imlp,
         use_consecutive_page_pair,
         use_ksf_gather4,
+        helix,
     ).launch(
         grid=(
             cute.ceil_div(c_tensor.shape[0], 128) * 4,
@@ -8872,6 +8895,15 @@ def _eq_mma_elected(
 
 
 @cute.jit
+def _s34_helix_token_bound(
+    mBounds_t: cute.Tensor, token0: ctm.Int32, row_in_seq: ctm.Int32, heads: ctm.Constexpr
+) -> ctm.Int32:
+    """Helix: rank-local keys visible to the query token that owns packed row ``row_in_seq`` of the request whose
+    bounds start at ``token0``. A negative table entry counts as 0."""
+    return ctm.max(ctm.Int32(mBounds_t[token0 + row_in_seq // ctm.Int32(heads)]), ctm.Int32(0))
+
+
+@cute.jit
 def _s34_task_identity(
     bz: ctm.Int32,
     pair_rank: ctm.Int32,
@@ -8883,6 +8915,7 @@ def _s34_task_identity(
     query_len_per_seq: ctm.Constexpr,
     heads: ctm.Constexpr,
     split_mode: ctm.Constexpr,
+    helix: ctm.Constexpr,
     warp: ctm.Int32,
     lane: ctm.Int32,
 ):
@@ -8919,15 +8952,41 @@ def _s34_task_identity(
         row_in_seq = row0 - sequence * ctm.Int32(rows_per_seq)
         pair_row_in_seq = (pair * ctm.Int32(256)) % ctm.Int32(rows_per_seq)
     query = block  # 128-row block index == the Q / output "query" slot of the TMA views
-    kv = mValidK_l[sequence]
-    last_offset = ctm.Int32(query_len_per_seq - 1)
-    lane_row = row_in_seq + (warp & ctm.Int32(3)) * ctm.Int32(32) + lane
-    t_lane = lane_row // ctm.Int32(heads)
-    valid_k = ctm.max(kv - (last_offset - t_lane), ctm.Int32(0))
-    t_min = row_in_seq // ctm.Int32(heads)
-    valid_k_min = ctm.max(kv - (last_offset - t_min), ctm.Int32(0))
-    t_pair_last = (pair_row_in_seq + ctm.Int32(255)) // ctm.Int32(heads)
-    pair_valid_k = ctm.max(kv - (last_offset - t_pair_last), ctm.Int32(0))
+    if cutlass.const_expr(helix):
+        # Helix variant: mValidK_l is the per-token bounds table, bounds[sequence * q + token] = rank-local keys the
+        # token attends to. The row rule is the 2x kernel's (fp4_mla_cutedsl_mufu16: tile_max_bound,
+        # producer_valid_k): a 128-row block runs to the bound of its last token, and a row sees the keys below
+        # min(its token's bound, that bound), for any table, monotone in the token or not.
+        token0 = sequence * ctm.Int32(query_len_per_seq)
+        block_bound = _s34_helix_token_bound(mValidK_l, token0, row_in_seq + ctm.Int32(127), heads)
+        lane_row = row_in_seq + (warp & ctm.Int32(3)) * ctm.Int32(32) + lane
+        valid_k = ctm.min(_s34_helix_token_bound(mValidK_l, token0, lane_row, heads), block_bound)
+        # Smallest row bound of the block: a tile takes the unmasked pack only when every row of the block sees
+        # all of it. A 32-row warp group lies inside one token (heads % 32 == 0), and the last group holds the
+        # block's last token.
+        valid_k_min = block_bound
+        for group in ctm.range_constexpr(3):
+            valid_k_min = ctm.min(
+                valid_k_min,
+                _s34_helix_token_bound(
+                    mValidK_l, token0, row_in_seq + ctm.Int32(group * 32), heads
+                ),
+            )
+        # One tile count per cluster: the longer of its two blocks. All four CTAs read the same two entries.
+        pair_valid_k = ctm.max(
+            _s34_helix_token_bound(mValidK_l, token0, pair_row_in_seq + ctm.Int32(127), heads),
+            _s34_helix_token_bound(mValidK_l, token0, pair_row_in_seq + ctm.Int32(255), heads),
+        )
+    else:
+        kv = mValidK_l[sequence]
+        last_offset = ctm.Int32(query_len_per_seq - 1)
+        lane_row = row_in_seq + (warp & ctm.Int32(3)) * ctm.Int32(32) + lane
+        t_lane = lane_row // ctm.Int32(heads)
+        valid_k = ctm.max(kv - (last_offset - t_lane), ctm.Int32(0))
+        t_min = row_in_seq // ctm.Int32(heads)
+        valid_k_min = ctm.max(kv - (last_offset - t_min), ctm.Int32(0))
+        t_pair_last = (pair_row_in_seq + ctm.Int32(255)) // ctm.Int32(heads)
+        pair_valid_k = ctm.max(kv - (last_offset - t_pair_last), ctm.Int32(0))
     total_tiles = ctm.max((pair_valid_k + ctm.Int32(255)) // ctm.Int32(256), ctm.Int32(1))
     begin_tile = ctm.Int32(0)
     chunk_tiles = total_tiles
@@ -8981,7 +9040,7 @@ def ordered_v30_six_yield_kernel(
     mKvGlobalScale: cute.Tensor,
     mPlan_i: cute.Tensor,
     mPartial: cute.Tensor,
-    mRowMax: cute.Tensor,
+    mRowMax: cute.Tensor,  # split mode: row anchors; Helix variant: the caller's softmax statistics
     mRowSum: cute.Tensor,  # split mode
     tma_q_desc: ctm.GridConstant[cuda_tma.TensorMap],
     tma_k_page_desc: ctm.GridConstant[cuda_tma.TensorMap],
@@ -9012,6 +9071,7 @@ def ordered_v30_six_yield_kernel(
     use_mixed_imlp: ctm.Constexpr,
     use_consecutive_page_pair: ctm.Constexpr,
     use_ksf_gather4: ctm.Constexpr,
+    helix: ctm.Constexpr,
 ):
     tma_q_ptr = tma_q_desc.get_ptr()
     tma_k_page_ptr = tma_k_page_desc.get_ptr()
@@ -9070,6 +9130,7 @@ def ordered_v30_six_yield_kernel(
         query_len_per_seq,
         heads,
         split_mode,
+        helix,
         warp,
         lane,
     )
@@ -9963,6 +10024,27 @@ def ordered_v30_six_yield_kernel(
                     cute.arch.rcp_approx(denom) * pscale * ctm.Float32(1.0 / FP4_MLA_P_GLOBAL_SCALE)
                 )
             output_row = row + (bx // ctm.Int32(4)) * ctm.Int32(128)
+            if cutlass.const_expr(helix):
+                # Helix: the row's softmax statistics for the cross-rank combine, the pair the 2x kernel stores
+                # under write_softmax_stats (fp4_mla_cutedsl_mufu16): the true maximum logit in nats and the weight
+                # sum relative to that maximum. The sum is this kernel's own denominator: denom is pscale times the
+                # sum of the weights the PV product applied (FP4 codes times E4M3 group scales), relative to the
+                # lazy anchor, and it is what the output is divided by, so output * sum * e^max is the row's
+                # unnormalized numerator. (The 2x kernel reports the sum before that quantization.) A row without
+                # a visible key has denom == 0: output 0, statistics (-inf, 0). The softmax lanes of pair 0, column
+                # half 0 hold one row each and store its pair into mRowMax, in this variant the caller's tensor.
+                if pair_id == ctm.Int32(0) and half == ctm.Int32(0):
+                    stat_max = ctm.Float32(-ctm.Float32.inf)
+                    stat_sum = ctm.Float32(0.0)
+                    if denom > ctm.Float32(0.0):
+                        stat_max = running_max * softscale * ctm.Float32(1.0 / LOG2_E)
+                        stat_sum = (denom / pscale) * cute.exp2(
+                            (running_anchor - running_max) * softscale, fastmath=True
+                        )
+                    stats = ctm.make_array_view(mRowMax)
+                    stat_offset = (query * runtime_m + output_row) * ctm.Int32(2)
+                    stats.subview(stat_offset).data_ptr().store(stat_max)
+                    stats.subview(stat_offset + ctm.Int32(1)).data_ptr().store(stat_sum)
             output_offset = (
                 (query * runtime_m + output_row) * ctm.Int32(problem_size[0])
                 + pair_id * ctm.Int32(256)

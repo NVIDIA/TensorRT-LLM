@@ -1274,7 +1274,7 @@ def run_fp4_mla_attention_decode(
                     "full-pool base and page offset."
                 )
 
-        if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled():
+        if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled(num_heads):
             # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
             # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
             # certain. The kernels are compiled and planned for the page-table capacity; the choice itself may use
@@ -1304,6 +1304,10 @@ def run_fp4_mla_attention_decode(
                 tag=strategy.record_tag,
             )
             if strategy.path == _dispatch.PATH_TWO_STREAM:
+                if helix_kv_bounds is not None or softmax_stats_tensor is not None:
+                    raise RuntimeError(
+                        "FP4 MLA two-stream decode carries no Helix KV bounds or softmax stats."
+                    )
                 _decode_twostream.run_cutedsl_twostream_decode(
                     cutedsl_kernel,
                     metadata,
@@ -1352,6 +1356,8 @@ def run_fp4_mla_attention_decode(
                     sm_scale=float(sm_scale),
                     v_page_offset=v_page_offset,
                     metadata=metadata,
+                    helix_kv_bounds=helix_kv_bounds,
+                    softmax_stats_tensor=softmax_stats_tensor,
                 )
                 return
         if packed_rows_per_seq:

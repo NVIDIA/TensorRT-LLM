@@ -447,7 +447,7 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
     resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
     config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
 
-    # the default (4x off) resolves nothing and never looks at the KV cache
+    # with the 4x switch off nothing resolves and the KV cache is never looked at
     with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=False):
         assert runner._kv_regime_resolver(resource_manager) is None
     resource_manager.get_resource_manager.assert_not_called()
@@ -469,7 +469,7 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
         resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
         assert runner._kv_regime_resolver(resource_manager) is None
         resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
-        # Helix decodes on the 2x kernel: no regimes
+        # Helix: only one-wave batches leave the 2x kernel and their graded KV floor is 0, so no regimes
         with patch.object(runner.mapping, "has_cp_helix", return_value=True):
             assert runner._kv_regime_resolver(resource_manager) is None
         # a model without MLA layers (or with unequal head counts) has no FP4 MLA decode to key by
@@ -480,7 +480,7 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
         model.modules.return_value = [mla_layer, other_layer]
         assert runner._kv_regime_resolver(resource_manager) is None
         model.modules.return_value = [mla_layer]
-        # a device that cannot host the 4x kernel decodes every step on 2x: no regimes, as with Helix
+        # a device that cannot host the 4x kernel decodes every step on 2x: no regimes either
         with patch.object(
             runner, "_fp4_mla_4x_unavailable", return_value="too little shared memory"
         ):
@@ -491,6 +491,76 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
         patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=False),
     ):
         assert runner._kv_regime_resolver(resource_manager) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "switch, h128_switch, num_heads, draft_len, keyed",
+    [
+        # neither set: on for the head count the dispatcher is calibrated on and for no other,
+        # whose graphs stay as they are without the 4x kernel
+        (None, None, 128, 3, True),
+        (None, None, 96, 7, False),
+        (None, "0", 128, 3, False),  # the 128-head switch turns the 128-head decode off,
+        ("1", "0", 128, 3, False),  # whatever the switch of the other head counts says,
+        ("0", None, 128, 3, True),  # which does not turn it off
+        ("0", "1", 128, 3, True),
+        ("1", None, 96, 7, True),  # the switch of the other head counts turns them on,
+        ("1", "0", 96, 7, True),  # whatever the 128-head switch says,
+        ("0", "1", 96, 7, False),  # which turns no other head count on
+        (None, "1", 96, 7, False),
+    ],
+)
+def test_kv_regimes_follow_the_fp4_mla_4x_switch_of_the_head_count(
+    monkeypatch: pytest.MonkeyPatch,
+    switch: str | None,
+    h128_switch: str | None,
+    num_heads: int,
+    draft_len: int,
+    keyed: bool,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+        FP4_MLA_CUTEDSL_4X_ENV,
+        FP4_MLA_CUTEDSL_4X_H128_ENV,
+    )
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    for name, value in (
+        (FP4_MLA_CUTEDSL_4X_ENV, switch),
+        (FP4_MLA_CUTEDSL_4X_H128_ENV, h128_switch),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    mla_layer = Mock(spec=MLA)
+    mla_layer.num_heads_tp = num_heads
+    model = Mock()
+    model.modules.return_value = [mla_layer]
+    runner = decoder_graphs(decoder_config(), model=model)
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
+    fp4_kv_cache_manager.max_blocks_per_seq = 235
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.fp4_mla.config._fp4_mla_packed_q_enabled",
+            return_value=True,
+        ),
+        patch.object(runner, "_decode_sm_count", return_value=212),
+        patch.object(runner, "_fp4_mla_4x_unavailable", return_value=None),
+    ):
+        resolver = runner._kv_regime_resolver(resource_manager)
+        if not keyed:
+            # no resolver: no batch shape of the model is keyed by a KV regime, and the KV cache was not asked
+            assert resolver is None
+            resource_manager.get_resource_manager.assert_not_called()
+            return
+        # one 4x wave holds 46 pair tasks of 256 rows: the batches inside it keep the single regime of the
+        # capacity, larger ones get a 2x regime under their KV floor
+        one_wave = 46 * 256 // (num_heads * (draft_len + 1))
+        assert all(resolver(batch, draft_len) == (30080,) for batch in range(1, one_wave + 1))
+        assert all(len(resolver(batch, draft_len)) > 1 for batch in range(one_wave + 1, 129))
 
 
 @pytest.mark.cpu_only

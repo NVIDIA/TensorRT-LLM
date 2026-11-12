@@ -783,8 +783,12 @@ class DecoderCudaGraphs:
         page-table capacity. Resolved at capture, once the KV cache exists; the
         regimes of a shape are those its 2x | 4x | two-stream decision can tell
         apart (``kv_regimes_for_batch``), one for most shapes. None as well
-        where every step decodes on the 2x kernel whatever its KV: with Helix,
-        and on a device that cannot host the 4x kernel.
+        with Helix and on a device that cannot host the 4x kernel. Such a
+        device decodes every step on the 2x kernel. Under Helix the 4x kernel
+        takes one-wave batches only and the graded KV floor of a one-wave
+        shape is 0, so no regime could change a step's decode path; a flat
+        ``TRTLLM_FP4_MLA_4X_MIN_KV`` is then compared with the page-table
+        capacity.
         """
         from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
         from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
@@ -794,10 +798,15 @@ class DecoderCudaGraphs:
             _fp4_mla_packed_rows_per_seq,
         )
 
-        # Environment gates first: the default (4x off) touches nothing else. The
-        # dispatcher runs only for the packed-Q cutedsl decode and keeps Helix on
-        # the 2x kernel, so regimes would only multiply those graphs.
-        if not (_fp4_mla_cutedsl_4x_enabled() and _fp4_mla_packed_q_enabled()):
+        # The 4x switch first: where it is off nothing else is touched. The
+        # head count picks the switch, so the model's heads are read for it.
+        # The dispatcher runs only for the packed-Q cutedsl decode, and under
+        # Helix no regime could change its choice (see the docstring), so
+        # regimes would only multiply those graphs.
+        num_heads = self._fp4_mla_decode_heads()
+        if num_heads is None:
+            return None
+        if not (_fp4_mla_cutedsl_4x_enabled(num_heads) and _fp4_mla_packed_q_enabled()):
             return None
         if self.mapping.has_cp_helix():
             return None
@@ -807,11 +816,8 @@ class DecoderCudaGraphs:
         # The predicate under which the attention metadata carries an fp4_mla_state.
         if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
             return None
-        num_heads = self._fp4_mla_decode_heads()
-        if num_heads is None:
-            return None
-        # A device that cannot host the 4x kernel decodes every step on 2x, as
-        # Helix does: no regimes (the host logs the reason once per device).
+        # A device that cannot host the 4x kernel decodes every step on 2x: no
+        # regimes either (the host logs the reason once per device).
         if self._fp4_mla_4x_unavailable() is not None:
             return None
         from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_4x_host import (

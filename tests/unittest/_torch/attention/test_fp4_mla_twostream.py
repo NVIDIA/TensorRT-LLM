@@ -18,6 +18,7 @@ def _internal_kernel_calibration(monkeypatch):
     monkeypatch.delenv(ts.TWOSTREAM_ENV, raising=False)
     monkeypatch.delenv(ts.TWOSTREAM_MIN_GAIN_ENV, raising=False)
     monkeypatch.delenv(ts.TWOSTREAM_MAX_R2_ENV, raising=False)
+    monkeypatch.delenv(ts.SPLIT_MIN_KV_ONEWAVE_ENV, raising=False)
 
 
 def test_slower_2x_kernel_calibration(monkeypatch):
@@ -115,3 +116,106 @@ def test_degenerate_inputs():
         == 0
     )
     assert _plan(128, 384, 30080).r2 == 0  # rows not a multiple of 256
+
+
+def test_a_split_must_drop_a_4x_wave(monkeypatch):
+    # batches that fill their 4x waves exactly: the model credits r2 = 1 with the split-mode overhead of the plain
+    # path while the 4x arm keeps its waves; such a split is no plan
+    for calibration in ("1.0", "1.2"):
+        monkeypatch.setenv(ts.TWOSTREAM_T2_SCALE_ENV, calibration)
+        for num_requests, rows in (
+            (46, ROWS_Q4),
+            (69, ROWS_Q4),
+            (92, ROWS_Q2),
+            (23, 128 * 8),
+            (46, 96 * 8),
+        ):
+            for max_kv_len in (2048, 4096, 8192, 16384, 30080):
+                plan = _plan(num_requests, rows, max_kv_len)
+                assert plan.r2 == 0 and "drops a 4x wave" in plan.reason, plan
+        # whatever the planner returns drops a wave
+        for rows in (ROWS_Q2, ROWS_Q4, 96 * 8, 128 * 8):
+            for num_requests in range(2, 257):
+                for max_kv_len in (2048, 4096, 8192, 16384, 30080):
+                    plan = _plan(num_requests, rows, max_kv_len)
+                    assert plan.r2 == 0 or plan.waves_4x < plan.waves_4x_plain, plan
+    # the splits that do drop one are the ones they were
+    monkeypatch.setenv(ts.TWOSTREAM_T2_SCALE_ENV, "1.2")
+    assert _plan(47, ROWS_Q4, 4096).r2 == 1
+    assert _plan(48, ROWS_Q4, 8192).r2 == 2
+    assert _plan(49, ROWS_Q4, 8192).r2 == 3
+    # two 2x rounds next to two 4x waves: the 2x arm would be the critical path
+    assert _plan(50, ROWS_Q4, 8192).r2 == 0
+
+
+def test_one_wave_split(monkeypatch):
+    # rows per request: (requests of one 4x wave, requests of one 2x wave, pair tasks of that 4x wave)
+    shapes = {
+        ROWS_Q4: (23, 26, 46),
+        ROWS_Q2: (46, 53, 46),
+        64 * 8: (23, 26, 46),
+        96 * 8: (15, 17, 45),
+        128 * 8: (11, 13, 44),
+        128 * 6: (15, 17, 45),
+    }
+    for rows, (full, last, pairs) in shapes.items():
+        # an under-filled wave is a FULL launch only on a page table under the host's split-mode bound
+        for kv_capacity in (8192, 32768, 65535, 65536, 163840):
+            for num_requests in range(1, 2 * last + 1):
+                plan = ts.one_wave_split(
+                    num_requests=num_requests,
+                    rows_per_request=rows,
+                    max_kv_len=4096,
+                    kv_capacity=kv_capacity,
+                    sm_count=SM_COUNT,
+                )
+                full_launch = pairs == ts.LANES_4X or kv_capacity < ts.SPLIT_MIN_KV_ONEWAVE_DEFAULT
+                if not (full < num_requests <= last and full_launch):
+                    assert plan is None, (rows, num_requests, kv_capacity, plan)
+                    continue
+                # one FULL 4x wave, the other requests in one round on the 2-CTA pairs it leaves free: the unpaired
+                # SMs and two pairs per cluster slot the wave leaves idle
+                assert plan.r2 == num_requests - full and plan.num_requests_4x == full
+                assert plan.num_requests_4x * (rows // 256) == pairs
+                assert plan.waves_4x_plain == 2 and plan.waves_4x == 1 and plan.rounds_2x == 1
+                assert plan.r2 * (rows // 128) <= SM_COUNT // 2 - 2 * pairs
+                assert plan.enabled and "one wave of the machine" in plan.reason
+                # the planner declines these splits: its 2x arm is the modelled critical path
+                assert _plan(num_requests, rows, 4096).r2 == 0
+    # the bound is the host's knob
+    kw = dict(num_requests=16, rows_per_request=96 * 8, max_kv_len=4096, sm_count=SM_COUNT)
+    assert ts.one_wave_split(**kw, kv_capacity=32768).r2 == 1
+    assert ts.one_wave_split(**kw, kv_capacity=163840) is None
+    monkeypatch.setenv(ts.SPLIT_MIN_KV_ONEWAVE_ENV, "0")
+    assert ts.one_wave_split(**kw, kv_capacity=32768) is None
+    # a wave that whole requests fill exactly is a FULL launch on every page table
+    exact = {**kw, "num_requests": 24, "rows_per_request": ROWS_Q4}
+    assert ts.one_wave_split(**exact, kv_capacity=163840).r2 == 1
+    monkeypatch.setenv(ts.SPLIT_MIN_KV_ONEWAVE_ENV, str(1 << 20))
+    assert ts.one_wave_split(**kw, kv_capacity=163840).r2 == 1
+
+
+def test_one_wave_split_knobs(monkeypatch):
+    kw = dict(
+        num_requests=25,
+        rows_per_request=ROWS_Q4,
+        max_kv_len=4096,
+        kv_capacity=32768,
+        sm_count=SM_COUNT,
+    )
+    assert ts.one_wave_split(**kw).r2 == 2
+    monkeypatch.setenv(ts.TWOSTREAM_ENV, "0")
+    assert ts.one_wave_split(**kw) is None
+    monkeypatch.delenv(ts.TWOSTREAM_ENV)
+    monkeypatch.setenv(ts.TWOSTREAM_R2_ENV, "2")  # a forced r2 is the planner's answer
+    assert ts.one_wave_split(**kw) is None
+    monkeypatch.delenv(ts.TWOSTREAM_R2_ENV)
+    monkeypatch.setenv(ts.TWOSTREAM_MAX_R2_ENV, "1")
+    assert ts.one_wave_split(**kw) is None
+    monkeypatch.delenv(ts.TWOSTREAM_MAX_R2_ENV)
+    # no SM left over next to 46 clusters
+    assert ts.one_wave_split(**{**kw, "sm_count": 184}) is None
+    assert ts.one_wave_split(**{**kw, "rows_per_request": 384}) is None  # rows no multiple of 256
+    assert ts.one_wave_split(**{**kw, "num_requests": 23}) is None  # one 4x wave
+    # the 2x kernel needs a second wave too
+    assert ts.one_wave_split(**{**kw, "num_requests": 27}) is None

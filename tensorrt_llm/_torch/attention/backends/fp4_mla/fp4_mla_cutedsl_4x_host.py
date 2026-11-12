@@ -47,6 +47,7 @@ __all__ = [
     "max_shared_memory_per_block",
     "use_split_mode",
     "split_enabled",
+    "helix_enabled",
     "pair_tasks",
     "MIN_SM_COUNT",
     "SMEM_BYTES_PER_CTA",
@@ -116,6 +117,11 @@ SPLIT_MIN_KV_ONEWAVE_DEFAULT = 65536
 MIN_PAIRS_ENV = "TRTLLM_FP4_MLA_4X_MIN_PAIRS"
 MIN_PAIRS_DERIVED = -1  # default: the 2x two-piece-plan rule above
 Q2_MIN_PAIRS = 20
+# Helix (context parallelism: every rank attends to its local part of a request's KV and reports per-row softmax
+# statistics for the cross-rank combine). The kernel's Helix variant takes the per-token KV bounds and writes the
+# statistics in a one-wave FULL launch; the split mode has no Helix variant, so a Helix batch of more than one wave
+# stays on the 2x kernel. Opt-in: with the switch off every Helix call stays on the 2x kernel.
+HELIX_ENV = "TRTLLM_FP4_MLA_4X_HELIX"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -137,16 +143,24 @@ def split_enabled() -> bool:
     return _env_flag(SPLIT_ENV, True)
 
 
+def helix_enabled() -> bool:
+    """Whether a Helix decode call may run the kernel's Helix variant (``TRTLLM_FP4_MLA_4X_HELIX``, default off)."""
+    return _env_flag(HELIX_ENV, False)
+
+
 def pair_tasks(num_heads: int, query_len: int, num_requests: int) -> int:
     """256-row pair tasks of one call (rows mode: heads * query_len % 256 == 0)."""
     return num_requests * num_heads * query_len // 256
 
 
-def use_split_mode(*, num_heads: int, query_len: int, num_requests: int, max_kv_len: int) -> bool:
+def use_split_mode(
+    *, num_heads: int, query_len: int, num_requests: int, max_kv_len: int, helix: bool = False
+) -> bool:
     """Static choice between the FULL-only launch and the split mode for a call inside the envelope: split when
     the batch exceeds one wave, or when an under-filled wave runs at long KV (the plan may still keep every
-    request whole; the device planner decides per step)."""
-    if not split_enabled():
+    request whole; the device planner decides per step). A Helix call is the FULL-only launch at any page-table
+    capacity: the split mode has no Helix variant."""
+    if helix or not split_enabled():
         return False
     pairs = pair_tasks(num_heads, query_len, num_requests)
     if pairs > FULL_ONLY_MAX_PAIRS:
@@ -295,6 +309,7 @@ class EnvelopeGeometry:
     )
     task_capacity: int = 0  # split mode: plan slots (requests * splits) = plan table stride
     used_tasks: int = 0  # split mode: planned tasks launched; grid z = used_tasks * pairs_per_seq
+    helix: bool = False  # Helix variant: per-token KV bounds in, per-row softmax statistics out
 
     @property
     def compile_key(self) -> tuple:
@@ -309,6 +324,7 @@ class EnvelopeGeometry:
             self.use_ksf_gather4,
             self.num_heads,
             self.split_mode,
+            self.helix,
         )
 
 
@@ -818,9 +834,15 @@ def _header_scratch(device: torch.device) -> torch.Tensor:
     return t
 
 
-def _make_wrapper_ptrs(addresses: list[int], output_dtype: torch.dtype) -> tuple:
+def _make_wrapper_ptrs(
+    addresses: list[int], output_dtype: torch.dtype, *, helix: bool = False
+) -> tuple:
     """Wrapper args 1-20, the cute.Pointer args in order: the 16 of X79:1160-1175, typed exactly as X79:9795-9846
-    _make_fused_ptrs, then the four split-mode pointers (plan, partial, rowmax, rowsum)."""
+    _make_fused_ptrs, then the four split-mode pointers (plan, partial, rowmax, rowsum).
+
+    ``helix``: the Helix variant stores scalar FP32 statistics into a caller tensor through the rowmax slot, so that
+    slot promises FP32 alignment only (the promised alignment is part of the pointer type, hence of the compiled
+    variant)."""
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
@@ -848,7 +870,7 @@ def _make_wrapper_ptrs(addresses: list[int], output_dtype: torch.dtype) -> tuple
         (cutlass.Float32, 4),  # kv_global_scale  X79:9840-9845
         (cutlass.Int32, 16),  # plan_ptr      (split mode; scratch otherwise)
         (cutlass.Float32, 32),  # partial_ptr   (split mode)
-        (cutlass.Float32, 32),  # rowmax_ptr    (split mode)
+        (cutlass.Float32, 4 if helix else 32),  # rowmax_ptr    (split mode; Helix: statistics)
         (cutlass.Float32, 32),  # rowsum_ptr    (split mode)
     )
     return tuple(
@@ -879,7 +901,9 @@ def envelope_reason_static(
     """Dispatch predicate on STATIC shape values only (CUDA-graph buckets replay a fixed path): None when the 4x
     kernel covers the call (one-wave FULL-only launch, or the split mode for larger batches / long KV), else the
     reason it does not (the caller keeps the 2x path). Mirrors validate_envelope's shape rules without touching
-    tensors (fp4_mla/__init__.py dispatch)."""
+    tensors (fp4_mla/__init__.py dispatch). A Helix call (``helix``: per-token KV bounds, ``softmax_stats``: the
+    statistics tensor; the kernel's Helix variant takes both) is covered when ``TRTLLM_FP4_MLA_4X_HELIX`` is on
+    and its pair tasks fit one wave."""
     if query_len not in SUPPORTED_QUERY_LENS:
         return f"query_len {query_len} not in {SUPPORTED_QUERY_LENS}"
     if num_heads <= 0 or num_heads > HEADS or (num_heads * query_len) % 256 != 0:
@@ -895,10 +919,13 @@ def envelope_reason_static(
     # must offer for the kernel to launch at all is device_unsupported_reason.
     if sm_count < MIN_SM_COUNT:
         return f"sm_count {sm_count} < {MIN_SM_COUNT}"
-    if helix:
-        return "Helix per-row KV bounds are not supported"
-    if softmax_stats:
-        return "softmax stats are not emitted by the 4x kernel"
+    if helix or softmax_stats:
+        if not helix_enabled():
+            return f"Helix decode on the 4x kernel is off ({HELIX_ENV})"
+        if not (helix and softmax_stats):
+            return (
+                "the 4x Helix variant takes per-token KV bounds and a softmax-stats tensor together"
+            )
     if not v_packed:
         return "requires the persistent packed-V cache"
     pairs = pair_tasks(num_heads, query_len, num_requests)
@@ -915,6 +942,11 @@ def envelope_reason_static(
     elif pairs < min_pairs:
         return f"{pairs} pairs < {min_pairs} ({MIN_PAIRS_ENV})"
     if pairs > FULL_ONLY_MAX_PAIRS:
+        if helix:
+            return (
+                f"Helix: {pairs} pairs > one wave of {FULL_ONLY_MAX_PAIRS} "
+                "(the split mode has no Helix variant)"
+            )
         if not split_enabled():
             return f"{pairs} pairs > one wave of {FULL_ONLY_MAX_PAIRS} and {SPLIT_ENV}=0"
         if pairs > SPLIT_MAX_PAIRS:
@@ -937,7 +969,8 @@ def max_shared_memory_per_block(device: torch.device) -> int:
     limit where the CUDA driver reports one (Rubin: 327 KiB per block, taken from the L1 cache), else the opt-in limit.
 
     A limit below ``SMEM_BYTES_PER_CTA`` takes the 4x kernel away for the whole process, so it is logged, once per
-    device, together with why the oversized limit was not read when that is the cause.
+    device, together with why the oversized limit was not read when that is the cause: as a warning where the
+    environment turns the 4x path on by name, as information where the path is only the default of the head count.
     """
     if device.type != "cuda":
         raise ValueError(f"max_shared_memory_per_block needs a CUDA device, got {device}")
@@ -964,7 +997,10 @@ def max_shared_memory_per_block(device: torch.device) -> int:
         if limit < SMEM_BYTES_PER_CTA:
             from tensorrt_llm.logger import logger
 
-            logger.warning(
+            from .config import _fp4_mla_cutedsl_4x_requested
+
+            log = logger.warning if _fp4_mla_cutedsl_4x_requested() else logger.info
+            log(
                 f"FP4 MLA 4x kernel unavailable on cuda:{index}: one block needs {SMEM_BYTES_PER_CTA} B of shared "
                 f"memory, {limit} B are available"
                 + (f" (opt-in limit; {unread})" if unread else "")
@@ -1058,6 +1094,7 @@ def _constexpr_kwargs(geom: EnvelopeGeometry, enable_mxi_imlp: bool) -> dict:
         use_ksf_gather4=bool(geom.use_ksf_gather4),
         heads=int(geom.num_heads),
         split_mode=bool(geom.split_mode),
+        helix=bool(geom.helix),
     )
 
 
@@ -1079,8 +1116,8 @@ def _compile(geom: EnvelopeGeometry, ptrs: tuple, stream, enable_mxi_imlp: bool)
 
 
 def compiled_variants() -> list[tuple]:
-    """Keys of the compiled variants:
-    (n, page_size, output_dtype, q, use_consecutive_page_pair, use_ksf_gather4, use_mixed_imlp)."""
+    """Keys of the compiled variants: (n, page_size, output_dtype, q, use_consecutive_page_pair, use_ksf_gather4,
+    num_heads, split_mode, helix, use_mixed_imlp)."""
     return list(_COMPILE_CACHE)
 
 
@@ -1093,6 +1130,7 @@ def compile_variant(
     device: torch.device | int | None = None,
     num_heads: int = HEADS,
     split_mode: bool = False,
+    helix: bool = False,
 ):
     """Compile (or fetch) one variant without real inputs, using type-only exemplar pointers like
     compile_balanced_template.py:131-140.  Returns the compiled callable."""
@@ -1102,6 +1140,8 @@ def compile_variant(
         )
     if output_dtype not in (torch.bfloat16, torch.float16):
         raise TypeError("output dtype must be torch.float16 or torch.bfloat16")
+    if helix and split_mode:
+        raise EnvelopeError("the Helix variant is the FULL launch only")
     dev = torch.device(
         f"cuda:{device}" if isinstance(device, int) else (device or torch.cuda.current_device())
     )
@@ -1125,6 +1165,7 @@ def compile_variant(
             num_blocks=2,
             q_batch_blocks=2,
             split_mode=split_mode,
+            helix=helix,
             task_capacity=1,
             used_tasks=1,
             physical_k=PHYSICAL_K,
@@ -1142,7 +1183,7 @@ def compile_variant(
             max_kv_len=PHYSICAL_K,
             device=dev,
         )
-        ptrs = _make_wrapper_ptrs(addresses, output_dtype)
+        ptrs = _make_wrapper_ptrs(addresses, output_dtype, helix=helix)
         return _compile(geom, ptrs, _current_cu_stream(), enable_mxi_imlp)
 
 
@@ -1199,6 +1240,8 @@ def run_fp4_mla_decode_4x_full(
     enable_mxi_imlp: bool = True,
     validate_contents: bool | None = None,
     split: dict | None = None,
+    helix_kv_bounds: torch.Tensor | None = None,
+    softmax_stats: torch.Tensor | None = None,
     _test_only_max_pairs: int | None = None,
 ) -> EnvelopeGeometry:
     """Launch the 4x FULL-only decode on the caller's current stream.  Positional tensors and keyword names follow
@@ -1207,6 +1250,12 @@ def run_fp4_mla_decode_4x_full(
 
     ``validate_contents``: None = read the int32 tables once per new prepared call when not capturing;
     ``_test_only_max_pairs``: bypass of the 46-pair bound for the two-wave control run ONLY (never in production).
+
+    ``helix_kv_bounds`` and ``softmax_stats`` (both or neither) select the Helix variant, a one-wave FULL launch:
+    int32 ``[requests * q]`` = rank-local keys each query token attends to (the kernel then reads these instead of
+    ``kv_lens``), and contiguous float32 of ``requests * q * heads * 2`` elements (the decode path passes its
+    ``[tokens, heads, 2]`` tensor) receiving per packed row the maximum logit in nats and the softmax weight sum
+    relative to it (the denominator the row's output was divided by), (-inf, 0) for a row without a visible key.
     """
     # interface-compatible no-ops, type-checked like MUFU:8161-8171 / X79:10175-10192 and then ignored
     if type(assume_valid_k_prefix_tiles) is not int or assume_valid_k_prefix_tiles < 0:
@@ -1287,6 +1336,36 @@ def run_fp4_mla_decode_4x_full(
                 )
             _check_alignment(name, t, 32)
         geom = dataclasses.replace(geom, split_mode=True, task_capacity=cap, used_tasks=used)
+    if helix_kv_bounds is not None or softmax_stats is not None:
+        if helix_kv_bounds is None or softmax_stats is None:
+            raise EnvelopeError("Helix decode needs helix_kv_bounds and softmax_stats together")
+        if split is not None or _test_only_max_pairs is not None:
+            raise EnvelopeError("the Helix variant is the one-wave FULL launch only")
+        if (
+            helix_kv_bounds.dtype != torch.int32
+            or helix_kv_bounds.dim() != 1
+            or not helix_kv_bounds.is_contiguous()
+            or helix_kv_bounds.numel() < geom.num_queries
+            or helix_kv_bounds.device != output.device
+        ):
+            raise EnvelopeError(
+                f"helix_kv_bounds must be contiguous int32 with >= {geom.num_queries} entries on {output.device}, "
+                f"got {tuple(helix_kv_bounds.shape)} {helix_kv_bounds.dtype} on {helix_kv_bounds.device}"
+            )
+        stat_rows = geom.num_queries * geom.num_heads
+        if (
+            softmax_stats.dtype != torch.float32
+            or not softmax_stats.is_contiguous()
+            or softmax_stats.numel() != stat_rows * 2
+            or softmax_stats.device != output.device
+        ):
+            raise EnvelopeError(
+                f"softmax_stats must be contiguous float32 with {stat_rows * 2} elements on {output.device}, "
+                f"got {tuple(softmax_stats.shape)} {softmax_stats.dtype} on {softmax_stats.device}"
+            )
+        _check_alignment("helix_kv_bounds", helix_kv_bounds, 4)
+        _check_alignment("softmax_stats", softmax_stats, 4)
+        geom = dataclasses.replace(geom, helix=True)
     if q_global_scale is None:
         q_global_scale = global_scale
     import cuda.bindings.driver as cuda
@@ -1311,7 +1390,7 @@ def run_fp4_mla_decode_4x_full(
         output.data_ptr(),
         v_sf.data_ptr(),
         src_page_ids.data_ptr(),
-        kv_lens.data_ptr(),
+        (helix_kv_bounds if geom.helix else kv_lens).data_ptr(),  # valid_k slot
         output.data_ptr(),
         scratch_ptr,
         scratch_ptr,
@@ -1327,6 +1406,9 @@ def run_fp4_mla_decode_4x_full(
             split["maxima"].data_ptr(),
             split["sums"].data_ptr(),
         ]
+    elif geom.helix:
+        # the rowmax slot receives the statistics; the other three split-mode slots stay scratch
+        addresses += [scratch_ptr, scratch_ptr, softmax_stats.data_ptr(), scratch_ptr]
     else:
         addresses += [scratch_ptr] * 4
     compile_key = (*geom.compile_key, bool(enable_mxi_imlp))
@@ -1348,7 +1430,10 @@ def run_fp4_mla_decode_4x_full(
                 max_kv_len=max_kv_len,
             )
         compiled = _compile(
-            geom, _make_wrapper_ptrs(addresses, output.dtype), stream, enable_mxi_imlp
+            geom,
+            _make_wrapper_ptrs(addresses, output.dtype, helix=geom.helix),
+            stream,
+            enable_mxi_imlp,
         )
     supports_prepared = _class_defines_callables(
         compiled, "to", "generate_execution_args", "run_compiled_program"
@@ -1377,6 +1462,7 @@ def run_fp4_mla_decode_4x_full(
         geom.split_mode,
         geom.task_capacity,
         geom.used_tasks,
+        geom.helix,
     )
     if supports_prepared:
         prepared = _cache_get(_PREPARED_CACHE, prepared_key)
@@ -1390,10 +1476,19 @@ def run_fp4_mla_decode_4x_full(
         validate_contents is None and not capturing and binding_key not in _VALIDATED_BINDINGS
     ):
         # first sight of this binding: check the CSR tables once (a few KiB of int32, synchronizing copy)
+        table_lens = kv_lens
+        if geom.helix:
+            # the Helix variant sweeps a request up to its largest bound and never reads kv_lens
+            table_lens = (
+                helix_kv_bounds[: geom.num_queries]
+                .view(geom.num_sequences, -1)
+                .amax(dim=1)
+                .clamp_min(0)
+            )
         check_table_contents(
             src_page_ids,
             paged_kv_indptr_decode,
-            kv_lens,
+            table_lens,
             num_cache_pages=geom.num_cache_pages,
             max_kv_len=max_kv_len,
             page_size=page_size,
@@ -1401,7 +1496,7 @@ def run_fp4_mla_decode_4x_full(
         _VALIDATED_BINDINGS.add(binding_key)
         if len(_VALIDATED_BINDINGS) > 4 * _CACHE_CAPACITY:
             _VALIDATED_BINDINGS.clear()
-    ptrs = _make_wrapper_ptrs(addresses, output.dtype)
+    ptrs = _make_wrapper_ptrs(addresses, output.dtype, helix=geom.helix)
     runtime_args = (*ptrs, *_scalar_args(geom, stream))
     if not supports_prepared:  # X79:10529-10531
         compiled(*runtime_args)

@@ -132,9 +132,18 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
 # four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x.py): the four-CTA-cluster variant of the FP4 MLA decode kernel
 # (256 packed [token, head] rows of one request per cluster, two CTA pairs splitting the KV tiles and exchanging P
-# over DSMEM; same FP4 operands as the two-CTA packed kernel). Opt-in sub-selection of the cutedsl backend for even-q
-# MTP shapes (see fp4_mla_cutedsl_4x_host.envelope_reason_static). Default off.
+# over DSMEM; same FP4 operands as the two-CTA packed kernel). Sub-selection of the cutedsl backend for even-q
+# MTP shapes (see fp4_mla_cutedsl_4x_host.envelope_reason_static), behind one of two switches by the head count of
+# the decode (_fp4_mla_cutedsl_4x_enabled). This one governs every head count but
+# _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS: off unless set to 1.
 FP4_MLA_CUTEDSL_4X_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X"
+# The switch of a decode of _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS heads: on unless set to 0, which gives it the 2x path.
+FP4_MLA_CUTEDSL_4X_H128_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X_H128"
+# The head count that takes the 4x path without being asked: the one that fills the kernel's 128-row M tile, on
+# which the dispatcher's KV floors and the two-stream cost model were measured (the q2 and q4 MTP shapes of
+# DeepSeek R1, for example). Any other head count inside the envelope (96 heads at q8, Kimi K3 for example) keeps
+# the 2x path, its decode graphs and its workspaces until FP4_MLA_CUTEDSL_4X_ENV is set to 1.
+_FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS = 128
 # Packed decode: each request owns a 128-row-padded block of [query token, head]
 # Q rows, the kernel splits KV across grid.z tasks and reads per-row causal
 # bounds, so no Q padding/copies, no Q replication, and Helix stays split.
@@ -144,9 +153,23 @@ _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT = 2
 _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
 
 
-def _fp4_mla_cutedsl_4x_enabled() -> bool:
-    """Whether the 4x kernel may replace the packed 2x decode inside its envelope (default off)."""
+def _fp4_mla_cutedsl_4x_enabled(num_heads: int) -> bool:
+    """Whether the 4x kernel may replace the packed 2x decode of ``num_heads`` heads inside its envelope.
+
+    Two switches, each for its own head counts and never read for the other's: a decode of
+    ``_FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS`` heads follows ``TRTLLM_FP4_MLA_CUTEDSL_4X_H128`` (on unless set to 0), a
+    decode of any other head count follows ``TRTLLM_FP4_MLA_CUTEDSL_4X`` (off unless set to 1).
+    """
+    if num_heads == _FP4_MLA_CUTEDSL_4X_DEFAULT_HEADS:
+        return _env_enabled_default(FP4_MLA_CUTEDSL_4X_H128_ENV, True)
     return _env_enabled_default(FP4_MLA_CUTEDSL_4X_ENV, False)
+
+
+def _fp4_mla_cutedsl_4x_requested() -> bool:
+    """Whether the environment turns a 4x path on by name; a switch that is on by default alone is not a request."""
+    return _env_enabled_default(FP4_MLA_CUTEDSL_4X_ENV, False) or _env_enabled_default(
+        FP4_MLA_CUTEDSL_4X_H128_ENV, False
+    )
 
 
 def _fp4_mla_packed_q_enabled() -> bool:

@@ -5,8 +5,9 @@
 The kernel (``fp4_mla_cutedsl_4x``) is the four-CTA-cluster variant of the FP4 MLA decode (256 packed rows of one
 request per cluster, two CTA pairs splitting the KV tiles and exchanging P over DSMEM; same FP4 operands as the
 two-CTA packed kernel). ``run_fp4_mla_attention_decode`` hands it the packed-Q decode calls inside its static
-envelope when ``TRTLLM_FP4_MLA_CUTEDSL_4X=1`` and keeps the packed 2x path for everything else
-(``fp4_mla_cutedsl_4x_host.envelope_reason_static``)."""
+envelope where the 4x switch of the call's head count is on (``TRTLLM_FP4_MLA_CUTEDSL_4X_H128``, on by default, for
+128 heads; ``TRTLLM_FP4_MLA_CUTEDSL_4X``, off by default, for every other head count) and keeps the packed 2x path
+for everything else (``fp4_mla_cutedsl_4x_host.envelope_reason_static``)."""
 
 from __future__ import annotations
 
@@ -227,14 +228,20 @@ def _run_cutedsl_4x_decode(
     sm_scale: float,
     v_page_offset: int,
     metadata: Any = None,
+    helix_kv_bounds: Optional[torch.Tensor] = None,
+    softmax_stats_tensor: Optional[torch.Tensor] = None,
 ) -> None:
     """Four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x_host): same tensors as the packed path, whose packed Q layout
     (row = token * heads + head, heads * query_len % 256 == 0) is the layout the 4x entry takes.
 
-    One wave of pair tasks at short KV runs the FULL-only launch (output written directly, no stats). Larger
+    One wave of pair tasks at short KV runs the FULL-only launch (output written directly). Larger
     batches (and under-filled waves at long KV) run the split mode: a device plan gives every request its own
     KV split (whole requests fill the full waves, the tail is cut to fill the leftover cluster slots), the kernel
     writes FP32 partials for the split requests and ``reduce_packed_splits`` merges them.
+
+    A Helix call (``helix_kv_bounds`` = keys each query token attends to on this rank, and ``softmax_stats_tensor``
+    = the ``[tokens, heads, 2]`` tensor that receives each row's maximum logit and weight sum for the cross-rank
+    combine) runs the kernel's Helix variant: always the FULL-only launch, whatever the page-table capacity.
     """
     from . import fp4_mla_cutedsl_4x_host as host_4x
 
@@ -247,6 +254,7 @@ def _run_cutedsl_4x_decode(
         query_len=query_len,
         num_requests=num_requests,
         max_kv_len=max_kv_len,
+        helix=helix_kv_bounds is not None or softmax_stats_tensor is not None,
     ):
         if metadata is None:
             raise RuntimeError("FP4 MLA 4x split mode requires the attention metadata workspace.")
@@ -279,6 +287,8 @@ def _run_cutedsl_4x_decode(
         # the packed planner has already validated the CSR tables; never synchronize here
         validate_contents=False,
         split=split,
+        helix_kv_bounds=helix_kv_bounds,
+        softmax_stats=softmax_stats_tensor,
     )
     if split is None:
         return

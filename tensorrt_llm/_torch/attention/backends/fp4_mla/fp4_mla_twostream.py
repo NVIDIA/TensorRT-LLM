@@ -13,6 +13,9 @@ packed 535 us; B128/q4/16K 291.5 -> 275.4 us.  The gain only exists when the 4x 
 higher priority) so that it takes the pairable TPCs before the 2x pairs land on them; see ``run_two_stream`` in
 ``__init__.py``.
 
+A second split needs no cost model (``one_wave_split``): a call that is one wave for the 2x kernel and two for the 4x
+kernel runs as ONE wave of the machine, a FULL-launch 4x wave next to one 2x round on the SMs that wave leaves free.
+
 This module is host-only arithmetic (no torch import) so it can be unit-tested anywhere.  All knobs are environment
 variables read at call time:
 
@@ -72,6 +75,11 @@ ROWS_PER_4X_ITEM = 256
 ROWS_PER_2X_ITEM = 128
 DEFAULT_MIN_GAIN = 0.03
 DEFAULT_MAX_R2 = 36
+# Page-table capacity (tokens) from which the host launches a 4x wave of fewer than ``LANES_4X`` pair tasks in split
+# mode instead of the FULL-only launch (``fp4_mla_cutedsl_4x_host.use_split_mode``: the same knob and default,
+# repeated here because this module stays importable without the kernel host; the dispatch tests hold the two equal).
+SPLIT_MIN_KV_ONEWAVE_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MIN_KV_ONEWAVE"
+SPLIT_MIN_KV_ONEWAVE_DEFAULT = 65536
 
 
 class TwoStreamPlan(NamedTuple):
@@ -188,6 +196,68 @@ def makespan_us(
     return max(arm_4x, arm_2x), waves_4x, rounds_2x
 
 
+def one_wave_split(
+    *,
+    num_requests: int,
+    rows_per_request: int,
+    max_kv_len: int,
+    kv_capacity: int,
+    sm_count: int,
+    lanes_4x: int = LANES_4X,
+) -> Optional[TwoStreamPlan]:
+    """The split that runs a call as ONE wave of the machine, or None where there is none.
+
+    The whole requests that fit one 4x wave go to the 4x kernel as a FULL launch and every other request to the 2x
+    kernel, whose m-tiles must fit the 2-CTA pairs that wave leaves free.  A 2x wave is ``sm_count // 2`` clusters,
+    two per four-CTA cluster of the 4x wave plus the unpaired SMs, so such a batch is one the 2x kernel serves in one
+    wave and the 4x kernel no longer does (212 SMs: 47 to 53 pair tasks), and its 2x arm always fits.
+
+    The 4x wave must be a FULL launch: one that whole requests fill exactly, or an under-filled one on a page table
+    (``kv_capacity``) under the host's split-mode bound (``SPLIT_MIN_KV_ONEWAVE_ENV``).  In split mode the wave pays
+    the plan and the reducer and its tasks take the cluster slots a FULL launch leaves to the 2x arm: measured
+    11-28 % slower than 2x up to KV 2K, and 44-62 % at every KV once the 2x arm no longer fits the pairs left.
+
+    Wave arithmetic only.  ``plan_two_stream`` declines this split because its model has one contended 2x round
+    outlast one 4x wave; but what the call runs without it is not a 4x arm with the 2x arm off its critical path: it
+    is a second 4x wave in split mode, or the 2x kernel alone, whose own single wave bounds the 2x arm.  Measured
+    against the 2x kernel (graph replays, requests of 1 to 4 pair tasks): the split is 14-30 % faster up to KV 2K
+    and level with 2x or ahead up to 30K (+2 % at worst), where the plain 4x path is 11-51 % slower up to 4K; the
+    plain path ties the split at 12K (16K with one pair task per request) and wins beyond.  The KV span the split
+    serves is the caller's (``fp4_mla_dispatch.extra_wave_floor_kv``).
+
+    ``TRTLLM_FP4_MLA_TWOSTREAM=0``, a forced ``TRTLLM_FP4_MLA_TWOSTREAM_R2`` and ``TRTLLM_FP4_MLA_TWOSTREAM_MAX_R2``
+    are honoured (None: the planner's answer stands).  The modelled times of the plan are informational.
+    """
+    if _env_int(TWOSTREAM_R2_ENV) is not None or not two_stream_enabled():
+        return None
+    items_4x = rows_per_request // ROWS_PER_4X_ITEM
+    if rows_per_request % ROWS_PER_4X_ITEM != 0 or not 0 < items_4x <= lanes_4x:
+        return None
+    requests_4x = lanes_4x // items_4x
+    pairs_4x = requests_4x * items_4x
+    split_mode_kv = _env_int(SPLIT_MIN_KV_ONEWAVE_ENV)
+    split_mode_kv = SPLIT_MIN_KV_ONEWAVE_DEFAULT if split_mode_kv is None else split_mode_kv
+    if pairs_4x < lanes_4x and kv_capacity >= split_mode_kv:
+        return None  # the host launches this under-filled wave in split mode
+    r2 = num_requests - requests_4x
+    max_r2 = _env_int(TWOSTREAM_MAX_R2_ENV)
+    max_r2 = DEFAULT_MAX_R2 if max_r2 is None else max(0, max_r2)
+    free_pairs = lanes_2x(sm_count, pairs_4x)
+    m_tiles_2x = r2 * (rows_per_request // ROWS_PER_2X_ITEM)
+    if not 1 <= r2 <= max_r2 or m_tiles_2x > free_pairs:
+        return None
+    kv_tiles = max(1, math.ceil(max(1, int(max_kv_len)) / KV_TILE))
+    plain_us, plain_waves = plain_4x_us(num_requests, rows_per_request, kv_tiles, lanes_4x=lanes_4x)
+    us, waves_4x, rounds_2x = makespan_us(
+        num_requests, r2, rows_per_request, kv_tiles, lanes_4x=lanes_4x, lanes_2x_pairs=free_pairs
+    )
+    reason = (
+        f"one wave of the machine: {pairs_4x} four-CTA clusters on the 4x kernel, {m_tiles_2x} m-tiles on the "
+        f"{free_pairs} 2-CTA pairs they leave free"
+    )
+    return TwoStreamPlan(r2, num_requests, plain_waves, waves_4x, rounds_2x, plain_us, us, reason)
+
+
 def plan_two_stream(
     *,
     num_requests: int,
@@ -257,6 +327,10 @@ def _plan_two_stream(
       * the modelled makespan must improve by at least ``TRTLLM_FP4_MLA_TWOSTREAM_MIN_GAIN`` (3 %) over the plain 4x
         path, modelled WITH its device split plan (fractional waves + split overhead) and with the measured mutual
         slowdowns (``CONTENTION_4X_FULL_OVERLAP``, ``CONTENTION_2X``);
+      * the split must drop a whole 4x wave: with the wave count unchanged the model credits it with nothing but
+        the split-mode overhead of the plain path, which a multi-wave 4x arm pays as well (such splits measured
+        level with the plain path at best, and 5-17 % behind it at KV 4K-8K on batches that fill their 4x waves
+        exactly);
       * the smallest r2 that reaches the best 4x wave count wins (fewest requests moved);
       * ``TRTLLM_FP4_MLA_TWOSTREAM_R2`` overrides everything (0 forces the plain path).
     """
@@ -301,10 +375,10 @@ def _plan_two_stream(
         )
         if w2 * t2 * CONTENTION_2X > w4 * t4 * (1.0 + CONTENTION_4X_FULL_OVERLAP):
             break  # from here on the 2x arm is the critical path; more requests only make it worse
-        if best is None or us < best[0] - 1e-9:
+        if w4 < plain_waves and (best is None or us < best[0] - 1e-9):
             best = (us, r2)
     if best is None:
-        return result(0, "no split keeps the 2x arm off the critical path")
+        return result(0, "no split drops a 4x wave with the 2x arm off the critical path")
     gain = 1.0 - best[0] / plain_us if plain_us > 0 else 0.0
     if gain < min_gain:
         return result(0, f"modelled gain {gain:.1%} below {min_gain:.0%}")

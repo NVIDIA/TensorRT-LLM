@@ -12,6 +12,7 @@ import tensorrt_llm
 import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla as fp4_mla_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
+import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
 import tensorrt_llm._torch.attention.backends.fp4_mla.decode as fp4_mla_decode
 import tensorrt_llm._torch.attention.backends.fp4_mla.decode_4x as fp4_mla_decode_4x
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
@@ -2734,26 +2735,29 @@ def _fp4_mla_attention_decode_reference(
     return torch.stack(outputs, dim=0), torch.stack(softmax_stats, dim=0)
 
 
-def _assert_fp4_mla_attention_decode_accuracy(
+def _set_fp4_mla_decode_env(
     monkeypatch,
     *,
     backend: str,
     fused_v_transpose: bool,
-    num_heads: int,
-    seq_lens: list[int],
-    seed: int,
-    query_len_per_seq: int = 1,
-    enable_helix: bool = False,
-    enable_block_reuse: bool = False,
     packed_queries: bool = False,
     split_kv: int | None = None,
-    enable_4x: bool = False,
+    enable_4x: bool | None = False,
     env: dict[str, str] | None = None,
 ) -> None:
-    _reset_triton_allocator()
+    """Environment of one decode case; ``env`` overrides what ``enable_4x`` sets."""
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
-    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_CUTEDSL_4X_ENV, str(int(enable_4x)))
-    if enable_4x:
+    # one value for the two 4x switches (128 heads, every other head count): a case is pinned whatever its heads
+    for name in (
+        fp4_mla_config.FP4_MLA_CUTEDSL_4X_ENV,
+        fp4_mla_config.FP4_MLA_CUTEDSL_4X_H128_ENV,
+    ):
+        if enable_4x is None:
+            # unset: the default of the switch decides
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, str(int(enable_4x)))
+    if enable_4x is not False:
         # the test caches are small batches: lift the production floor on pair tasks (dispatch is tested on CPU)
         from tensorrt_llm._torch.attention.backends.fp4_mla import (
             fp4_mla_cutedsl_4x_host as host_4x,
@@ -2779,6 +2783,34 @@ def _assert_fp4_mla_attention_decode_accuracy(
     # by the existing cases, which opt out explicitly.
     monkeypatch.setenv(fp4_mla_backend.FP4_MLA_PACKED_Q_ENV, str(int(packed_queries)))
     monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "auto" if split_kv is None else str(split_kv))
+
+
+def _assert_fp4_mla_attention_decode_accuracy(
+    monkeypatch,
+    *,
+    backend: str,
+    fused_v_transpose: bool,
+    num_heads: int,
+    seq_lens: list[int],
+    seed: int,
+    query_len_per_seq: int = 1,
+    enable_helix: bool = False,
+    enable_block_reuse: bool = False,
+    packed_queries: bool = False,
+    split_kv: int | None = None,
+    enable_4x: bool | None = False,
+    env: dict[str, str] | None = None,
+) -> None:
+    _reset_triton_allocator()
+    _set_fp4_mla_decode_env(
+        monkeypatch,
+        backend=backend,
+        fused_v_transpose=fused_v_transpose,
+        packed_queries=packed_queries,
+        split_kv=split_kv,
+        enable_4x=enable_4x,
+        env=env,
+    )
     (
         kv_cache_manager,
         metadata,
@@ -3010,7 +3042,7 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
     query_len_per_seq: int,
     seq_lens: list[int],
 ) -> None:
-    """4x one-wave kernel (TRTLLM_FP4_MLA_CUTEDSL_4X=1) on the shapes inside its envelope."""
+    """4x one-wave kernel (the 4x switches on) on the shapes inside its envelope."""
     calls: list[str] = []
     run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
     run_2x = fp4_mla_decode._run_cutedsl_packed_decode
@@ -3037,6 +3069,73 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
         enable_4x=True,
     )
     assert calls == ["4x"], calls
+
+
+@_requires_cutedsl_4x
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,seq_lens,cases",
+    [
+        (
+            128,
+            4,
+            [131, 512],
+            (
+                ({}, "4x"),
+                ({fp4_mla_config.FP4_MLA_CUTEDSL_4X_H128_ENV: "0"}, "2x"),
+                ({fp4_mla_config.FP4_MLA_CUTEDSL_4X_ENV: "0"}, "4x"),
+            ),
+        ),
+        (
+            96,
+            8,
+            [131, 2100, 513],
+            (
+                ({}, "2x"),
+                ({fp4_mla_config.FP4_MLA_CUTEDSL_4X_ENV: "1"}, "4x"),
+                ({fp4_mla_config.FP4_MLA_CUTEDSL_4X_H128_ENV: "1"}, "2x"),
+            ),
+        ),
+    ],
+    ids=["h128-q4", "h96-q8"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_switch_goes_by_the_head_count(
+    monkeypatch,
+    num_heads: int,
+    query_len_per_seq: int,
+    seq_lens: list[int],
+    cases: tuple,
+) -> None:
+    """With neither 4x switch set a 128-head call inside the envelope takes the 4x kernel and a call of another
+    head count the packed 2x path; each switch moves the calls of its own head counts and not the other's."""
+    calls: list[str] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append("4x")
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    for env, path in cases:
+        del calls[:]
+        _assert_fp4_mla_attention_decode_accuracy(
+            monkeypatch,
+            backend="cutedsl",
+            fused_v_transpose=False,
+            num_heads=num_heads,
+            seq_lens=seq_lens,
+            seed=41,
+            query_len_per_seq=query_len_per_seq,
+            packed_queries=True,
+            enable_4x=None,
+            env=env,
+        )
+        assert calls == [path], (env, calls)
 
 
 @_requires_cutedsl_4x
@@ -3138,6 +3237,66 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_auto_b128(monkeypatch) -> No
     assert ("4x", 115) in calls and ("2x", 13) in calls, calls
 
 
+@_requires_cutedsl_4x
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,num_requests,requests_4x",
+    [
+        (128, 4, 24, 23),  # 48 pair tasks: one FULL wave of 46, one request on the 2x kernel
+        (128, 2, 50, 46),  # 50 pair tasks: one FULL wave of 46, four requests on the 2x kernel
+        (96, 8, 16, 15),  # 48 pair tasks: 45 of 46 (FULL on the short test page table), one request
+    ],
+    ids=["q4-b24", "q2-b50", "h96-q8-b16"],
+)
+def test_fp4_mla_attention_decode_cutedsl_twostream_one_wave_split(
+    monkeypatch, num_heads: int, query_len_per_seq: int, num_requests: int, requests_4x: int
+) -> None:
+    """A batch that is one wave for the 2x kernel and two for the 4x kernel runs as the one-wave split: one FULL 4x
+    wave and the other requests on the 2x arm; the merged output matches the reference."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+
+    calls: list[tuple[str, int]] = []
+    split_launches: list[int] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+    buffers = fp4_mla_decode_4x._fp4_mla_4x_split_buffers
+
+    def spy_4x(*args, **kwargs):
+        calls.append(("4x", kwargs["num_requests"]))
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append(("2x", kwargs["num_requests"]))
+        return run_2x(*args, **kwargs)
+
+    def spy_buffers(*args, **kwargs):
+        split = buffers(*args, **kwargs)
+        split_launches.append(int(split["task_capacity"]))
+        return split
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    monkeypatch.setattr(fp4_mla_decode_4x, "_fp4_mla_4x_split_buffers", spy_buffers)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=[131 + 7 * i for i in range(num_requests)],
+        seed=45,
+        query_len_per_seq=query_len_per_seq,
+        packed_queries=True,
+        enable_4x=True,
+        env={
+            fp4_mla_dispatch.MIN_KV_4X_ENV: "",  # the graded floors and the extra-wave rule, as in production
+            host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0",  # the test page table is short
+            "TRTLLM_FP4_MLA_TWOSTREAM": "1",
+        },
+    )
+    assert ("4x", requests_4x) in calls and ("2x", num_requests - requests_4x) in calls, calls
+    assert not split_launches, "the 4x arm of the one-wave split must be a FULL launch"
+
+
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
@@ -3195,7 +3354,7 @@ def test_fp4_mla_attention_decode_cutedsl_dispatch_forced_path(
     [
         (128, 1, False, True, [131, 512]),  # odd q: 4x needs token pairs
         (128, 4, False, False, [131, 512]),  # knob off
-        (96, 8, True, True, [131, 2100]),  # Helix bounds / stats
+        (96, 8, True, True, [131, 2100]),  # Helix bounds / stats with the Helix switch off
         (128, 4, False, True, [131] * 24),  # 48 pairs > one wave of 46 with the split mode off
         (
             96,
@@ -3241,7 +3400,7 @@ def test_fp4_mla_attention_decode_cutedsl_4x_falls_back_to_packed(
         packed_queries=True,
         split_kv=1,
         enable_4x=enable_4x,
-        env={host_4x.SPLIT_ENV: "0"},
+        env={host_4x.SPLIT_ENV: "0", host_4x.HELIX_ENV: "0"},
     )
     assert calls == ["2x"], calls
 
@@ -3362,6 +3521,237 @@ def test_fp4_mla_attention_decode_cutedsl_4x_split_matches_reference(
     assert split_launches, "the split mode was not taken"
 
 
+@_requires_cutedsl_4x
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,seq_lens",
+    [
+        (96, 8, [131, 2100, 700]),  # a 128-row block holds rows of two tokens
+        (128, 2, [131, 2100, 513, 258]),
+        (128, 4, [131, 2100]),
+        (128, 6, [131, 2100]),
+        (128, 8, [300, 2100]),
+        (64, 4, [131, 2100]),  # two tokens per block
+        (64, 8, [131, 2100]),
+        (32, 8, [131, 2100]),  # four tokens per block
+    ],
+    ids=["h96-q8", "h128-q2", "h128-q4", "h128-q6", "h128-q8", "h64-q4", "h64-q8", "h32-q8"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_helix_matches_reference(
+    monkeypatch, num_heads: int, query_len_per_seq: int, seq_lens: list[int]
+) -> None:
+    """Helix decode on the 4x kernel (TRTLLM_FP4_MLA_4X_HELIX=1): the call carries the per-token KV bounds and the
+    statistics tensor to the kernel's Helix variant; output and softmax statistics match the reference."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    calls: list[tuple] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append(
+            (
+                "4x",
+                kwargs["helix_kv_bounds"] is not None,
+                kwargs["softmax_stats_tensor"] is not None,
+            )
+        )
+        return run_4x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(
+        fp4_mla_decode, "_run_cutedsl_packed_decode", lambda *a, **k: calls.append(("2x",))
+    )
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=41,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=True,
+        packed_queries=True,
+        enable_4x=True,
+        env={host_4x.HELIX_ENV: "1"},
+    )
+    assert calls == [("4x", True, True)], calls
+
+
+@_requires_cutedsl_4x
+def test_fp4_mla_attention_decode_cutedsl_4x_helix_beyond_one_wave_runs_packed(monkeypatch) -> None:
+    """A Helix batch of more than one wave of pair tasks (48 > 46) stays on the packed 2x path, switch on."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    calls: list[str] = []
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_run_cutedsl_4x_decode", lambda *a, **k: calls.append("4x")
+    )
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=[131] * 24,
+        seed=41,
+        query_len_per_seq=4,
+        enable_helix=True,
+        packed_queries=True,
+        enable_4x=True,
+        # without the KV floor of multi-wave batches a non-Helix call of this shape runs the 4x split mode
+        env={host_4x.HELIX_ENV: "1", host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0"},
+    )
+    assert calls == ["2x"], calls
+
+
+@_requires_cutedsl_4x
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq",
+    [(96, 8), (128, 2), (128, 4), (128, 8), (32, 8)],
+    ids=["h96-q8", "h128-q2", "h128-q4", "h128-q8", "h32-q8"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_helix_follows_the_bounds_table(
+    monkeypatch, num_heads: int, query_len_per_seq: int
+) -> None:
+    """The 4x Helix variant decodes what the per-token bounds table says, as the packed 2x Helix path does.
+
+    The causal-window table reproduces the non-Helix 4x output bit for bit. For the tables a Helix rank sees (it
+    owns none or only the first of the in-flight tokens, holds no key of a request, has a KV tile edge between two
+    tokens) every row agrees with the packed 2x path, and a row without a key gets a zero output and (-inf, 0)
+    statistics. A CUDA graph captured on one table replays the table it finds in the bounds tensor.
+    """
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    _reset_triton_allocator()
+    _set_fp4_mla_decode_env(
+        monkeypatch, backend="cutedsl", fused_v_transpose=False, packed_queries=True, enable_4x=True
+    )
+    calls: list[str] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append("4x-helix" if kwargs["helix_kv_bounds"] is not None else "4x")
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+
+    q_len = query_len_per_seq
+    # KV lengths a few keys past a 256-key tile edge: the edge then lies inside the in-flight window, between the
+    # tokens of one 128-row block or between the two blocks of a cluster, where the per-token bounds decide
+    seq_lens = [769, 2054, 259, 1541]
+    kv_cache_manager, metadata, q, kv_lora_rank, qk_rope_head_dim = (
+        _build_fp4_mla_attention_decode_case(
+            seq_lens=seq_lens,
+            num_heads=num_heads,
+            seed=47,
+            query_len_per_seq=q_len,
+            enable_helix=True,
+        )
+    )
+    try:
+        output = torch.empty_like(q[..., :kv_lora_rank])
+        stats = torch.empty((*q.shape[:2], 2), dtype=torch.float32, device=q.device)
+        bounds = metadata.helix_kv_bounds  # the tensor the kernels read; rewritten in place below
+
+        def run(stats_tensor) -> None:
+            run_fp4_mla_attention_decode(
+                metadata,
+                layer_idx=0,
+                local_layer=0,
+                q=q,
+                output=output,
+                sm_scale=0.1,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                prequantized_q=metadata.fp4_mla_state.prequantized_q,
+                prequantized_q_sf=metadata.fp4_mla_state.prequantized_q_sf,
+                q_batch_capacity=metadata.fp4_mla_state.q_batch_capacity,
+                softmax_stats_tensor=stats_tensor,
+            )
+
+        def decode(expect: str, *, switch: bool = True, helix: bool = True):
+            """One eager call with the Helix switch as given; ``expect`` is the kernel path it has to take."""
+            monkeypatch.setenv(host_4x.HELIX_ENV, str(int(switch)))
+            # the packed 2x plan is keyed per step, not per bounds table: have this call plan on the table it reads
+            metadata.fp4_mla_state.packed_plan_key = None
+            output.fill_(float("nan"))
+            stats.fill_(float("nan"))
+            calls.clear()
+            run(stats if helix else None)
+            torch.cuda.synchronize()
+            assert calls == [expect], calls
+            return output.clone(), stats.clone()
+
+        causal = bounds.clone().view(len(seq_lens), q_len)
+        out_helix, _ = decode("4x-helix")
+        out_plain, _ = decode("4x", helix=False)
+        assert torch.equal(out_helix, out_plain)
+
+        context = causal[:, :1] - 1  # keys before the in-flight tokens
+        token = torch.arange(q_len, dtype=causal.dtype, device=causal.device)
+        owns_none = context.expand(-1, q_len)
+        mixed = causal.clone()
+        mixed[0] = 0  # the rank holds no key of this request
+        mixed[1] = 256 - q_len // 2 + token  # a KV tile edge between two tokens of one request
+        mixed[2] = context[2] + 1  # the rank owns the first in-flight token only
+        for table in (owns_none, mixed):
+            bounds.copy_(table.reshape(-1))
+            out_4x, stats_4x = decode("4x-helix")
+            out_2x, stats_2x = decode("2x", switch=False)
+            no_key = (table.reshape(-1) == 0)[:, None].expand(-1, num_heads)
+            assert bool((out_4x[no_key] == 0).all()) and bool((out_2x[no_key] == 0).all())
+            for row_stats in (stats_4x, stats_2x):
+                assert bool(torch.isneginf(row_stats[no_key][:, 0]).all())
+                assert bool((row_stats[no_key][:, 1] == 0).all())
+            live = ~no_key
+            cosine = torch.nn.functional.cosine_similarity(
+                out_4x[live].float(), out_2x[live].float(), dim=-1
+            )
+            assert float(cosine.min()) > 0.998, float(cosine.min())
+            torch.testing.assert_close(
+                stats_4x[live][:, 0], stats_2x[live][:, 0], atol=2e-3, rtol=0
+            )
+            # the 4x sum is the sum of the FP4-quantized weights its output was divided by, the 2x sum is taken
+            # before that rounding: a few percent apart, more on rows with a handful of keys
+            torch.testing.assert_close(stats_4x[live][:, 1], stats_2x[live][:, 1], atol=0, rtol=0.2)
+
+        # CUDA graph: captured on one table, replayed on another written into the same bounds tensor
+        bounds.copy_(mixed.reshape(-1))
+        expected_out, expected_stats = decode("4x-helix")
+        bounds.copy_(owns_none.reshape(-1))
+        calls.clear()
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                run(stats)
+        assert calls == ["4x-helix"], calls
+        bounds.copy_(mixed.reshape(-1))
+        output.fill_(float("nan"))
+        stats.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, expected_out)
+        assert torch.equal(stats, expected_stats)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
@@ -3423,7 +3813,7 @@ def test_fp4_mla_cutedsl_4x_plan_kernel_matches_host_mirror() -> None:
 
 
 def test_fp4_mla_cutedsl_4x_envelope_reason_static() -> None:
-    """CPU-only: the static dispatch predicate behind TRTLLM_FP4_MLA_CUTEDSL_4X."""
+    """CPU-only: the static dispatch predicate behind the 4x switches."""
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
 
     ok = dict(num_heads=128, query_len=4, num_requests=23, max_kv_len=30080, sm_count=212)
