@@ -2159,6 +2159,42 @@ def _site_draft_share_chunks(case, monkeypatch) -> None:
     assert torch.equal(chunked, one), "token selection"
 
 
+def _site_gen_rows_order(rows, monkeypatch) -> None:
+    """A mixed step's generation rows through `_score_and_select` with the step's `_RowOrder`:
+    past one wave of rows on the wide (65568-column) table the selection launches in that
+    order, bitwise the unordered launch, block lists and token selection alike."""
+    tpb, cr, token_topk = 32, 4, TKC_TOKEN_TOPK
+    gen, cache, table, slot_of = _index_pool(1, [2900], rows, 3000, rows)
+    table[:] = table[int(slot_of[0])]  # every request reads the same pages
+    req = torch.arange(rows, dtype=torch.int32, device=DEV)
+    logical = torch.randint(1, 2900 * tpb - 1, (rows,), generator=gen, device=DEV)
+    seq_lens = (logical + 1).to(torch.int32)
+    visible = ((logical + 1) // cr).to(torch.int32)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    q = torch.randn(rows, 6, 128, generator=gen, device=DEV).to(torch.bfloat16)[:, :4]
+    core = SimpleNamespace(compress_ratio=cr, token_topk=token_topk)
+    seen = []
+    op = M.qsa_topk_expand_decode
+
+    def spy(*args, row_order=None, **kwargs):
+        seen.append(row_order)
+        return op(*args, row_order=row_order, **kwargs)
+
+    monkeypatch.setattr(M, "qsa_topk_expand_decode", spy)
+    outs = []
+    for order in (None, M._RowOrder()):
+        topk = torch.full((rows, token_topk // cr), -7, dtype=torch.int32, device=DEV)
+        sel = torch.full((rows, token_topk + cr - 1), -7, dtype=torch.int32, device=DEV)
+        M._score_and_select(
+            core, cache, q, table, logical, req, tpb, visible, seq_lens, topk, row_starts,
+            0, rows, False, sel, order,
+        )  # fmt: skip
+        outs.append((topk, sel))
+    assert seen[0] is None and seen[1] is not None, "only the ordered call passes a row order"
+    assert torch.equal(outs[0][0], outs[1][0]), "block lists"
+    assert torch.equal(outs[0][1], outs[1][1]), "token selection"
+
+
 _SITE_CASES = [
     *(
         pytest.param(_site_prologue, (site, layout), id=f"{site} prologue {layout}")
@@ -2180,6 +2216,7 @@ _SITE_CASES = [
         (((250000, 1100),), 512, (384, 384, 332)),
         id="draft index share chunks, 250k",
     ),
+    pytest.param(_site_gen_rows_order, 300, id="generation rows in the step's row order"),
 ]
 
 
