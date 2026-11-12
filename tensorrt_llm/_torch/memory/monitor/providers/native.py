@@ -31,7 +31,6 @@ from typing import Callable
 import torch
 
 from ..schema import Basis, Category, Entry, Placement, Source
-from .trtllm_ops import trtllm_op
 
 __all__ = ["LABELS", "NativeMemoryProvider"]
 
@@ -84,7 +83,7 @@ LABELS: dict[str, _Label] = {
         Category.EPLB,
         "MoE load balancer, GPU NUMA memory",
         Basis.REQUESTED,
-        "GPU memory mapped as a host NUMA node; may not be in per-process device usage",
+        "GPU memory mapped as a host NUMA node, kept until exit; may not be in per-process device usage",
         counts=False,
     ),
     "eplb_managed": _Label(
@@ -105,7 +104,11 @@ class NativeMemoryProvider:
 
     @staticmethod
     def _op() -> Callable | None:
-        return trtllm_op("get_native_memory_usage")
+        # Imported here: the compilation package loads the custom ops, which load this package during
+        # ``import tensorrt_llm``.
+        from ....compilation.utils import get_optional_trtllm_op
+
+        return get_optional_trtllm_op("get_native_memory_usage")
 
     def available(self) -> bool:
         return self._op() is not None

@@ -36,7 +36,6 @@ from tensorrt_llm._ipc_utils import IpcMemory
 
 from ..claims import claimed_modules
 from ..schema import Basis, Category, Entry, Placement, Source
-from .trtllm_ops import trtllm_op
 
 __all__ = ["IpcMemoryProvider", "McastAllReduceProvider", "NcclWindowProvider", "SymmMemProvider"]
 
@@ -142,7 +141,11 @@ class NcclWindowProvider:
 
     @staticmethod
     def _op() -> Callable | None:
-        return trtllm_op("get_nccl_window_usage")
+        # Imported here: the compilation package loads the custom ops, which load this package during
+        # ``import tensorrt_llm``.
+        from ....compilation.utils import get_optional_trtllm_op
+
+        return get_optional_trtllm_op("get_nccl_window_usage")
 
     def available(self) -> bool:
         return self._op() is not None

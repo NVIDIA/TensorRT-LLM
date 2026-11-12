@@ -436,6 +436,8 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
     if (it != mDeviceAllocations.end())
     {
         auto const& allocInfo = it->second;
+        // The ledger reports memory that is still mapped, so only the paths that return the memory record a release.
+        bool released = true;
         if (allocInfo.memDesc)
         {
             gdrcopy::gdrCudaFree(allocInfo.memDesc, mGdrHandle);
@@ -443,7 +445,9 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
         else if (mGpuMemNumaId >= 0)
         {
             // TopologyDetector::getInstance().freeCurrentGpuNumaMemory(const_cast<void*>(it->first), allocInfo.size);
+            // The huge-page pool does not unmap freed blocks, so the memory stays in use until the process exits.
             NumaHugePagePoolAllocator::getInstance().free(const_cast<void*>(it->first));
+            released = false;
         }
         else
         {
@@ -451,8 +455,11 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
                 "HostAccessibleDeviceAllocator is not supported on the current system.");
             TLLM_CUDA_CHECK(cudaFree(ptr));
         }
-        tensorrt_llm::common::recordNativeRelease(
-            nativeMemoryLabel(allocInfo.memDesc != nullptr), mDevId, static_cast<std::int64_t>(allocInfo.size));
+        if (released)
+        {
+            tensorrt_llm::common::recordNativeRelease(
+                nativeMemoryLabel(allocInfo.memDesc != nullptr), mDevId, static_cast<std::int64_t>(allocInfo.size));
+        }
         void* hostPtr = it->second.hostPtr;
         TLLM_CHECK_WITH_INFO(mHostAllocations.count(hostPtr) == 1, "host pointer not recorded.");
         mDeviceAllocations.erase(it);

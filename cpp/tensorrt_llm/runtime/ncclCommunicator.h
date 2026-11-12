@@ -37,7 +37,9 @@ public:
         : mComm{comm} {};
 
     explicit NcclCommunicator(int worldSize, int rank, mpi::MpiComm const& mpiComm = COMM_SESSION)
-        : mComm{createComm(worldSize, rank, mpiComm, mNativeMemory)} {};
+    {
+        mComm = createComm(worldSize, rank, mpiComm, mNativeMemory);
+    }
 
     explicit NcclCommunicator(WorldConfig const& worldConfig, mpi::MpiComm const& mpiComm = COMM_SESSION)
         : NcclCommunicator{worldConfig.getSize(), worldConfig.getRank(), mpiComm} {};
@@ -68,9 +70,9 @@ private:
     static ncclComm_t createComm(
         int worldSize, int rank, mpi::MpiComm const& mpiComm, common::NativeMemoryRecord& nativeMemory);
 
-    //! Memory recorded for mComm in the native-memory ledger. Declared before mComm, whose initializer fills it.
+    //! Memory recorded for mComm in the native-memory ledger; empty for an adopted communicator.
     common::NativeMemoryRecord mNativeMemory;
-    ncclComm_t mComm;
+    ncclComm_t mComm{nullptr};
 };
 
 } // namespace tensorrt_llm::runtime

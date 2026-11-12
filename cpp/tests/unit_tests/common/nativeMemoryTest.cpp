@@ -63,13 +63,30 @@ TEST(NativeMemoryTest, ExactRecordsBalance)
     EXPECT_EQ(usageOf(label, 4).count, 0) << "records are per device";
 }
 
+TEST(NativeMemoryTest, AdjustChangesBytesButNotCount)
+{
+    char const* label = "test_adjust";
+    recordNativeAllocation(label, 3, 200);
+    adjustNativeAllocation(label, 3, -150);
+    auto usage = usageOf(label, 3);
+    EXPECT_EQ(usage.count, 1);
+    EXPECT_EQ(usage.bytes, 50);
+    recordNativeRelease(label, 3, 50);
+    usage = usageOf(label, 3);
+    EXPECT_EQ(usage.count, 0);
+    EXPECT_EQ(usage.bytes, 0);
+}
+
 TEST(NativeMemoryTest, UnreadableOrNegativeReadingMakesTheLabelUnmeasured)
 {
     char const* label = "test_measured";
     int const device = currentDevice();
 
-    // Something else freed more than this allocation took: the reading is negative.
-    auto const negative = recordNativeAllocationMeasured(label, currentDeviceFreeBytes() - (std::int64_t{1} << 40));
+    // Something else freed more than this allocation took: free memory now exceeds the earlier reading, so the
+    // drop is negative. The earlier reading must itself be valid (>= 0) to reach that rule.
+    std::int64_t const lowerReading = currentDeviceFreeBytes() - (std::int64_t{1} << 30);
+    ASSERT_GE(lowerReading, 0);
+    auto const negative = recordNativeAllocationMeasured(label, lowerReading);
     EXPECT_EQ(negative.bytes, NativeMemoryRecord::kUnmeasured);
     // A later positive reading does not hide the unknown one.
     std::int64_t const freeBefore = currentDeviceFreeBytes();

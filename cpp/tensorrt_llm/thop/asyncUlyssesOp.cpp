@@ -355,12 +355,18 @@ private:
         if (slot.sendBuf != nullptr)
         {
             (void) cudaFree(slot.sendBuf);
-            // A slot holds a send buffer and a symmetric receive buffer, both slot.size bytes. mCanonicalHandle keeps
-            // the receive buffer of the handle it was taken from mapped, so replacing that slot frees only the send
-            // buffer.
-            bool const receiveStaysMapped = slot.handle.get() == mCanonicalHandle.get();
-            tensorrt_llm::common::recordNativeRelease(
-                kSlotMemoryLabel, currentDev, (receiveStaysMapped ? 1 : 2) * static_cast<std::int64_t>(slot.size));
+            // A slot holds a send buffer and a symmetric receive buffer, both slot.size bytes, recorded as one
+            // allocation. mCanonicalHandle keeps the receive buffer of the handle it was taken from mapped, so
+            // replacing that slot frees only the send buffer and the receive buffer stays a live allocation.
+            auto const slotBytes = static_cast<std::int64_t>(slot.size);
+            if (slot.handle.get() == mCanonicalHandle.get())
+            {
+                tensorrt_llm::common::adjustNativeAllocation(kSlotMemoryLabel, currentDev, -slotBytes);
+            }
+            else
+            {
+                tensorrt_llm::common::recordNativeRelease(kSlotMemoryLabel, currentDev, 2 * slotBytes);
+            }
         }
         tensorrt_llm::common::recordNativeAllocation(
             kSlotMemoryLabel, currentDev, 2 * static_cast<std::int64_t>(requiredSize));

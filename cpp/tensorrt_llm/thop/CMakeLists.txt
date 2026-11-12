@@ -133,6 +133,7 @@ add_th_common_family(
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
   ncclCommunicatorOp.cpp
+  nativeMemoryOp.cpp
   allocateOutput.cpp
   reducescatterOp.cpp
   localityDomainAllocator.cpp

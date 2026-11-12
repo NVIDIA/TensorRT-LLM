@@ -87,6 +87,11 @@ void recordNativeRelease(NativeMemoryRecord const& record) noexcept
     }
 }
 
+void adjustNativeAllocation(char const* label, int device, std::int64_t deltaBytes) noexcept
+{
+    addNativeMemory(label, device, 0, deltaBytes, 0);
+}
+
 std::int64_t currentDeviceFreeBytes() noexcept
 {
     std::size_t freeBytes = 0;

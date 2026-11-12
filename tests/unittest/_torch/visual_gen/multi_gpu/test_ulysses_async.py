@@ -258,12 +258,13 @@ def _slot_memory_logic(rank: int, world_size: int):
     big = torch.randn(B, 2 * S_local, H, D, dtype=torch.bfloat16, device=device)
     large = big.numel() * big.element_size()
     # The first slot's handle is kept for barriers, so its receive buffer stays
-    # mapped after the resize: only the send buffer is released.
+    # mapped after the resize: only the send buffer is released, and the
+    # receive buffer is still a live allocation next to the resized slot.
     prepare(big)
-    assert recorded() == (count + 3, size + 5 * small + 2 * large)
+    assert recorded() == (count + 4, size + 5 * small + 2 * large)
     # Any other slot releases both of its buffers.
     prepare(big)
-    assert recorded() == (count + 3, size + 3 * small + 4 * large)
+    assert recorded() == (count + 4, size + 3 * small + 4 * large)
 
 
 def _run(world_size: int, test_fn: Callable):

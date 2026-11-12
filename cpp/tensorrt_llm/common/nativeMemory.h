@@ -36,7 +36,8 @@ namespace common
 //! each label is for (`tensorrt_llm/_torch/memory/monitor/providers/native.py`).
 //!
 //! Contract:
-//! - Every recorded allocation is released exactly once, by its owner, with the record or the size it recorded.
+//! - A recorded allocation is released at most once, by its owner, with the record or the size it recorded, when its
+//!   memory is returned. Memory an owner keeps mapped stays recorded.
 //! - Recording is a map update under a mutex, made only when memory is allocated or released, and never throws.
 //! - A label stays listed after its last release, with a count of 0.
 //! - The ledger is never destroyed, so releases recorded from static destructors are safe.
@@ -84,6 +85,10 @@ void recordNativeRelease(char const* label, int device, std::int64_t bytes) noex
 
 //! \brief Release what `record` added. Does nothing for a record with no label.
 void recordNativeRelease(NativeMemoryRecord const& record) noexcept;
+
+//! \brief Change the bytes recorded under `label` on `device` by `deltaBytes`, keeping its allocation count. For an
+//! owner that frees part of one recorded allocation and keeps the rest mapped.
+void adjustNativeAllocation(char const* label, int device, std::int64_t deltaBytes) noexcept;
 
 //! \brief Free memory on the current device, or -1 if it cannot be read.
 std::int64_t currentDeviceFreeBytes() noexcept;

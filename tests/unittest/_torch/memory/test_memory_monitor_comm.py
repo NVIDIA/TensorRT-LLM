@@ -18,7 +18,7 @@ Multicast buffers need several GPUs to create, so the providers' reading of
 the owning objects is checked against stand-ins shaped like them.
 """
 
-import weakref
+import threading
 
 import pytest
 import torch
@@ -138,7 +138,7 @@ def _ipc_stand_in(label, device, nbytes):
 def test_ipc_buffers_are_counted_by_purpose_on_this_device(monkeypatch):
     from tensorrt_llm._ipc_utils import IpcMemory
 
-    monkeypatch.setattr(IpcMemory, "_live", weakref.WeakSet())
+    monkeypatch.setattr(IpcMemory, "_live", {})
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     held = [
         _ipc_stand_in("custom allreduce workspace", 0, 64 * MB),
@@ -148,7 +148,7 @@ def test_ipc_buffers_are_counted_by_purpose_on_this_device(monkeypatch):
         _ipc_stand_in("custom allreduce workspace", 1, 64 * MB),
     ]
     for ipc in held:
-        IpcMemory._live.add(ipc)
+        ipc._track()
     entries = {e.owner: e for e in IpcMemoryProvider().collect()}
     assert entries["custom allreduce workspace"].size_bytes == 66 * MB
     assert entries["TP peer exchange buffers"].size_bytes == 4 * MB
@@ -156,6 +156,32 @@ def test_ipc_buffers_are_counted_by_purpose_on_this_device(monkeypatch):
     assert entries["TP peer exchange buffers"].basis is Basis.PHYSICAL_BACKING
     held.clear()
     assert IpcMemoryProvider().collect() == [], "freed buffers leave the report"
+
+
+@pytest.mark.cpu_only
+def test_ipc_buffers_can_be_read_while_other_threads_create_and_free_them(monkeypatch):
+    """Reports read the live buffers on their own threads while the executor creates and frees them."""
+    from tensorrt_llm._ipc_utils import IpcMemory
+
+    monkeypatch.setattr(IpcMemory, "_live", {})
+    stop = threading.Event()
+
+    def churn():
+        while not stop.is_set():
+            held = [_ipc_stand_in("churn", 0, MB) for _ in range(64)]
+            for ipc in held:
+                ipc._track()
+            held.clear()
+
+    writer = threading.Thread(target=churn)
+    writer.start()
+    try:
+        for _ in range(20000):
+            count, nbytes = IpcMemory.live_allocations(0).get("churn", (0, 0))
+            assert nbytes == count * MB
+    finally:
+        stop.set()
+        writer.join()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
