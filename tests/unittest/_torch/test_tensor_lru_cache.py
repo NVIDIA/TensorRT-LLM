@@ -28,10 +28,10 @@ def test_rejects_non_positive_capacity() -> None:
 
 
 def test_put_get_pop_and_clear_update_byte_accounting() -> None:
-    cache = TensorLRUCache[str](max_bytes=64)
+    cache = TensorLRUCache[str](max_bytes=32)
     tensor = torch.arange(4, dtype=torch.float32)
 
-    assert cache.max_bytes == 64
+    assert cache.max_bytes == 32
     assert cache.get("missing") is None
     assert cache.put("a", tensor)
     cached = cache.get("a")
