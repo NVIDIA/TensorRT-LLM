@@ -78,6 +78,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (VALID_MESSAGE_CONTENT_MM_PART_TYPES,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
+from tensorrt_llm.serve.disagg_request_deadline import DisaggRequestTimeoutError
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
@@ -3407,6 +3408,8 @@ def _sse_delimiter_and_markers(sample: Any) -> Tuple[Any, tuple]:
 
 def classify_stream_termination(exc: Exception) -> str:
     """Attribute a stream-ending exception to a cause."""
+    if isinstance(exc, DisaggRequestTimeoutError):
+        return "request_timeout"
     if isinstance(exc, (RequestError, EngineDeadError)):
         return STREAM_TERMINATION_ENGINE_ERROR
     # By module, to keep the HTTP client library out of this layer.
@@ -3418,9 +3421,11 @@ def classify_stream_termination(exc: Exception) -> str:
 def describe_stream_termination(exc: Exception, cause: str) -> str:
     """The client-facing detail of a stream-ending exception.
 
-    Only engine errors carry their message; transport and internal errors can
-    name internal hosts.
+    Only engine and request-deadline errors carry their message; transport and
+    internal errors can name internal hosts.
     """
+    if isinstance(exc, DisaggRequestTimeoutError):
+        return str(exc)
     if cause == STREAM_TERMINATION_ENGINE_ERROR and str(exc):
         return f"{type(exc).__name__}: {exc}"
     return type(exc).__name__
@@ -3439,6 +3444,61 @@ def stream_error_event(cause: str, detail: str,
                 param=None,
             ))
     ]
+
+
+class SseFrameBuffer:
+    """Retain incomplete LF/CRLF events across arbitrary network chunks."""
+
+    _EVENT_END = re.compile(rb"\r?\n\r?\n")
+
+    def __init__(self) -> None:
+        """Create an empty incremental event buffer."""
+        self._pending = bytearray()
+        self._scan_from = 0
+
+    def consume(self, chunk: str | bytes, on_frame: Callable[[bytes],
+                                                             bool]) -> bool:
+        """Deliver complete frames, retaining their original delimiters.
+
+        Args:
+            chunk: Stream data that may split an event or UTF-8 character.
+            on_frame: Receives each frame; return True to stop at that frame.
+
+        Returns:
+            Whether the callback stopped consumption. Any tail remains buffered.
+        """
+        self._pending.extend(
+            chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+        event_start = 0
+        scan_from = self._scan_from
+        stopped = False
+        while match := self._EVENT_END.search(self._pending, scan_from):
+            frame = bytes(self._pending[event_start:match.end()])
+            event_start = scan_from = match.end()
+            if on_frame(frame):
+                stopped = True
+                break
+        del self._pending[:event_start]
+        self._scan_from = 0 if stopped else max(0, len(self._pending) - 3)
+        return stopped
+
+    def remainder(self) -> bytes:
+        """Return the incomplete or unconsumed tail without changing the buffer."""
+        return bytes(self._pending)
+
+
+def sse_frame_data(frame: bytes) -> bytes:
+    """Extract the joined data fields from one complete SSE frame.
+
+    Args:
+        frame: Original event bytes, including its delimiter.
+
+    Returns:
+        The SSE data payload, without the field prefixes.
+    """
+    return b"\n".join(line[5:].removeprefix(b" ")
+                      for line in frame.splitlines()
+                      if line.startswith(b"data:"))
 
 
 async def guard_responses_stream(

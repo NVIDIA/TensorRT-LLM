@@ -40,6 +40,7 @@ from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
     DisaggClusterConfig,
+    DisaggRequestDeadlineConfig,
     DisaggServerConfig,
     MinimalInstances,
     ServerRole,
@@ -47,8 +48,12 @@ from tensorrt_llm.llmapi.disagg_utils import (
 from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.disagg_request_deadline import (
+    DisaggRequestDeadline,
+    DisaggRequestTimeoutError,
+)
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer, _prepare_deadline_stream
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService, _SseErrorObserver
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -78,8 +83,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_response_post_processor,
     completion_response_post_processor,
 )
-from tensorrt_llm.serve.responses_utils import _format_sse_event
-from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
+from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor, _format_sse_event
+from tensorrt_llm.serve.router import KvCacheAwareRouter, LoadBalancingRouter, Router
 
 pytestmark = pytest.mark.cpu_only
 
@@ -88,8 +93,13 @@ def _client_factory(*_args, **_kwargs):
     return AsyncMock()
 
 
-def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
-    config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
+def _make_service(
+    schedule_style: str, *, request_deadline: DisaggRequestDeadlineConfig | None = None
+) -> OpenAIDisaggregatedService:
+    """Create the real service with mocked placement and HTTP boundaries."""
+    config = DisaggServerConfig(
+        server_configs=[], schedule_style=schedule_style, request_deadline=request_deadline
+    )
     # The coordinator builds its own (empty) routers from config; override them
     # with mocks so tests can stub placement / readiness directly.
     cluster = DisaggCoordinatorService(config, client_factory=_client_factory)
@@ -2117,3 +2127,1072 @@ async def test_gen_only_stream_keeps_caller_ownership(
     service._ctx_client.send_request.assert_not_awaited()
     gen_response.__aiter__.assert_not_called()
     gen_response.aclose.assert_not_awaited()
+
+
+@pytest.fixture
+def request_deadline_service(monkeypatch: pytest.MonkeyPatch) -> OpenAIDisaggregatedService:
+    """Enable the real request deadline with only worker and routing boundaries mocked."""
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(
+        "generation_first", request_deadline=DisaggRequestDeadlineConfig(total_seconds=1.0)
+    )
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    return service
+
+
+@pytest.mark.parametrize(
+    ("schedule_style", "no_retry", "bounded_replay", "gen_only", "message"),
+    [
+        ("context_first", "1", False, "0", "generation_first"),
+        ("generation_first", "0", False, "0", "NO_RETRY=1"),
+        ("generation_first", "1", True, "0", "bounded_replay"),
+        ("generation_first", "1", False, "1", "paired CTX/GEN"),
+    ],
+    ids=["workflow", "retry", "bounded_replay", "gen_only"],
+)
+def test_request_deadline_rejects_incompatible_serving_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    schedule_style: str,
+    no_retry: str,
+    bounded_replay: bool,
+    gen_only: str,
+    message: str,
+) -> None:
+    """Opt-in deadlines must reject serving modes outside their cancellation contract."""
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", no_retry)
+    monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", gen_only)
+    config = DisaggServerConfig(
+        server_configs=[],
+        schedule_style=schedule_style,
+        bounded_replay_on_generation=bounded_replay,
+        request_deadline=DisaggRequestDeadlineConfig(total_seconds=1.0),
+    )
+    with pytest.raises(ValueError, match=message):
+        OpenAIDisaggregatedService(config, mock.Mock(), client_factory=_client_factory)
+
+
+@pytest.mark.asyncio
+async def test_request_deadline_disabled_does_not_create_timer(
+    generation_first_stream_service: OpenAIDisaggregatedService,
+) -> None:
+    """The default serving path creates no request-deadline owner."""
+    service = generation_first_stream_service
+    expected = _make_completion_response("ok", finish_reason="stop")
+    service._gen_client.send_request.return_value = expected
+    with mock.patch("tensorrt_llm.serve.openai_disagg_service.DisaggRequestDeadline") as timer:
+        actual = await service._send_disagg_request(CompletionRequest(model="m", prompt="hello"))
+    assert actual is expected
+    timer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_request_deadline_covers_routing_before_worker_dispatch(
+    request_deadline_service: OpenAIDisaggregatedService,
+) -> None:
+    """A placement wait consumes the request budget without posting either worker leg."""
+    service = request_deadline_service
+    entered, closed = asyncio.Event(), asyncio.Event()
+
+    async def wait_for_route(*args: object, **kwargs: object) -> None:
+        """Hold the external placement boundary until cancellation."""
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    service._ctx_router.get_next_server.side_effect = wait_for_route
+    task = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="m", prompt="hello"))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        with pytest.raises(DisaggRequestTimeoutError):
+            await asyncio.wait_for(task, timeout=5)
+        assert closed.is_set()
+        service._ctx_client.send_request.assert_not_awaited()
+        service._gen_client.send_request.assert_not_awaited()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waiting_role", ["context", "generation"])
+async def test_request_deadline_covers_each_nonstream_leg(
+    request_deadline_service: OpenAIDisaggregatedService, waiting_role: str
+) -> None:
+    """One completed leg cannot reset the budget for the pending paired leg."""
+    service = request_deadline_service
+    entered, closed = asyncio.Event(), asyncio.Event()
+    response = _make_completion_response("ok", finish_reason="stop")
+    service._ctx_client.send_request.return_value = response
+    service._gen_client.send_request.return_value = response
+
+    async def pending(*args: object, **kwargs: object) -> None:
+        """Represent the external worker that has not completed."""
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    client = service._ctx_client if waiting_role == "context" else service._gen_client
+    client.send_request.side_effect = pending
+    task = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="m", prompt="hello"))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        with pytest.raises(DisaggRequestTimeoutError):
+            await asyncio.wait_for(task, timeout=5)
+        assert closed.is_set()
+        service._ctx_client.send_request.assert_awaited_once()
+        service._gen_client.send_request.assert_awaited_once()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_request_deadline_preserves_successful_response(
+    request_deadline_service: OpenAIDisaggregatedService, streaming: bool
+) -> None:
+    """Successful worker completion retains the response and closes its stream."""
+    service = request_deadline_service
+    closed = asyncio.Event()
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        """Return a complete worker stream without exhausting the serving budget."""
+        try:
+            yield b'data: "ok"\n\n'
+            yield b"data: [DONE]\n\n"
+        finally:
+            closed.set()
+
+    expected = stream() if streaming else _make_completion_response("ok", finish_reason="stop")
+    service._gen_client.send_request.return_value = expected
+    response = await service._send_disagg_request(
+        CompletionRequest(model="m", prompt="hello", stream=streaming)
+    )
+    if streaming:
+        assert b"".join([chunk async for chunk in response]) == b'data: "ok"\n\ndata: [DONE]\n\n'
+        assert closed.is_set()
+    else:
+        assert response is expected
+
+
+@pytest.mark.asyncio
+async def test_request_deadline_continues_while_stream_consumer_is_paused(
+    request_deadline_service: OpenAIDisaggregatedService,
+) -> None:
+    """Returned-stream ownership must not suspend the active worker's deadline."""
+    service = request_deadline_service
+    closed = asyncio.Event()
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        """Produce a token, then wait for the remaining generation work."""
+        try:
+            yield b'data: "first"\n\n'
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    service._gen_client.send_request.return_value = stream()
+    response = await service._send_disagg_request(
+        CompletionRequest(model="m", prompt="hello", stream=True)
+    )
+    try:
+        # Do not consume or close the response until the timer stops worker work.
+        await asyncio.wait_for(closed.wait(), timeout=5)
+        assert await response.__anext__() == b'data: "first"\n\n'
+        with pytest.raises(DisaggRequestTimeoutError):
+            await asyncio.wait_for(response.__anext__(), timeout=5)
+        service._gen_client.send_request.assert_awaited_once()
+    finally:
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_deadline_drains_stream_cleanup_after_shared_expiry(
+    request_deadline_service: OpenAIDisaggregatedService,
+) -> None:
+    """Nested expiry must not interrupt GEN cleanup while the paired scope drains it."""
+    service = request_deadline_service
+    cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
+    cleanup_interrupted, gen_closed, ctx_closed = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+
+    async def ctx(*args: object, **kwargs: object) -> None:
+        """Keep the outer request scope alive until its shared deadline expires."""
+        try:
+            await asyncio.Event().wait()
+        finally:
+            ctx_closed.set()
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        """Retain worker cleanup until explicitly released after nested cancellation."""
+        try:
+            yield b'data: "first"\n\n'
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                cleanup_interrupted.set()
+                raise
+            finally:
+                gen_closed.set()
+
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.return_value = stream()
+    task = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="m", prompt="hello", stream=True))
+    )
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        await asyncio.wait_for(ctx_closed.wait(), timeout=5)
+        # Let both shared-deadline waiters process cancellation and enter their
+        # drains before allowing the worker's cleanup to finish.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert not cleanup_interrupted.is_set()
+        assert not gen_closed.is_set()
+        release_cleanup.set()
+        with pytest.raises(DisaggRequestTimeoutError):
+            await asyncio.wait_for(task, timeout=5)
+        assert gen_closed.is_set()
+        assert ctx_closed.is_set()
+    finally:
+        release_cleanup.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_request_deadline_is_not_renewed_at_stream_handoff(
+    request_deadline_service: OpenAIDisaggregatedService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Routing and a returned stream consume the same absolute serving deadline."""
+    service = request_deadline_service
+    service._request_deadline_config = DisaggRequestDeadlineConfig(total_seconds=100.0)
+    clock = SimpleNamespace(now=1000.0)
+    finish_stream = asyncio.Event()
+
+    def make_deadline(total_seconds: float) -> DisaggRequestDeadline:
+        """Control only the deadline's clock, leaving its production wait logic intact."""
+        deadline = DisaggRequestDeadline(total_seconds)
+        deadline._loop = SimpleNamespace(time=lambda: clock.now)
+        deadline._deadline = clock.now + total_seconds
+        return deadline
+
+    async def route(*args: object, **kwargs: object) -> tuple[str, dict]:
+        """Spend most of the request budget at the placement boundary."""
+        clock.now = 1075.0
+        return "ctx:9000", {"server_info": {}}
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        """Finish only when the test reaches the original deadline."""
+        yield b'data: "first"\n\n'
+        await finish_stream.wait()
+
+    factory = mock.Mock(side_effect=make_deadline)
+    monkeypatch.setattr("tensorrt_llm.serve.openai_disagg_service.DisaggRequestDeadline", factory)
+    service._ctx_router.get_next_server.side_effect = route
+    service._gen_client.send_request.return_value = stream()
+    response = await service._send_disagg_request(
+        CompletionRequest(model="m", prompt="hello", stream=True)
+    )
+    try:
+        assert await response.__anext__() == b'data: "first"\n\n'
+        clock.now = 1100.0
+        finish_stream.set()
+        # A renewed stream budget would permit completion until 1175, but the
+        # original deadline rejects completion at 1100, including equality.
+        with pytest.raises(DisaggRequestTimeoutError):
+            await asyncio.wait_for(response.__anext__(), timeout=5)
+        factory.assert_called_once_with(100.0)
+    finally:
+        finish_stream.set()
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_deadline_does_not_invoke_work_queued_until_expiry() -> None:
+    """A task queued while time remains must recheck expiry before starting work."""
+    loop = asyncio.get_running_loop()
+    clock = SimpleNamespace(now=1000.0)
+    deadline = DisaggRequestDeadline(100.0)
+    deadline._loop = SimpleNamespace(time=lambda: clock.now)
+    deadline._deadline = 1100.0
+    operation = AsyncMock()
+    loop.call_soon(setattr, clock, "now", 1100.0)
+
+    with pytest.raises(DisaggRequestTimeoutError):
+        await deadline.run(operation)
+
+    operation.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+async def test_request_deadline_checks_late_operation_outcomes(outcome: str) -> None:
+    """A late exception cannot bypass expiry; task cancellation remains cancellation."""
+    clock = SimpleNamespace(now=1000.0)
+    deadline = DisaggRequestDeadline(100.0)
+    deadline._loop = SimpleNamespace(time=lambda: clock.now)
+    deadline._deadline = 1100.0
+
+    async def operation() -> str:
+        """Complete after expiry before the deadline waiter can resume."""
+        clock.now = 1100.0
+        if outcome == "failure":
+            raise RuntimeError("late worker failure")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError("worker cancelled")
+        return "late success"
+
+    expected_error = asyncio.CancelledError if outcome == "cancelled" else DisaggRequestTimeoutError
+    with pytest.raises(expected_error):
+        await deadline.run(operation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_cleanup_started", [False, True])
+async def test_recording_failure_does_not_exempt_live_work_from_deadline(
+    other_cleanup_started: bool,
+) -> None:
+    """A worker failure or another owner's cleanup cannot exempt live HTTP work."""
+    deadline = DisaggRequestDeadline(0.05)
+    stopped = asyncio.Event()
+    worker_error = RuntimeError("original worker failure")
+
+    async def operation() -> None:
+        """Record a failure while this owner remains in live work."""
+        deadline.record_failure(worker_error)
+        if other_cleanup_started:
+            deadline.begin_failure_cleanup()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    with pytest.raises(RuntimeError) as raised:
+        await asyncio.wait_for(
+            deadline.run(operation, allow_failure_cleanup=not other_cleanup_started), timeout=5
+        )
+    assert raised.value is worker_error
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_deadline_owner_cancels_work_only_once() -> None:
+    """Repeated stop requests must not inject cancellation into worker cleanup."""
+    deadline = DisaggRequestDeadline(60.0)
+    started, cleaning, release, finished = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+
+    async def worker() -> None:
+        """Expose an interruptible cleanup after receiving its first cancellation."""
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+            finished.set()
+
+    task = asyncio.create_task(worker())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        deadline.cancel_work(task)
+        await asyncio.wait_for(cleaning.wait(), timeout=5)
+        deadline.cancel_work(task)
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert finished.is_set()
+    finally:
+        release.set()
+        deadline.cancel_work(task)
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["worker_error", "in_band_error", "caller_cancel"])
+async def test_cleanup_error_does_not_replace_selected_outcome(outcome: str) -> None:
+    """Report cleanup errors separately from the selected request outcome."""
+    deadline = DisaggRequestDeadline(60.0)
+    worker_error = ValueError("original worker error")
+    cleanup_error = RuntimeError("cleanup failed")
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def cleanup() -> None:
+        """Fail independently after the caller has selected its outcome."""
+        started.set()
+        await release.wait()
+        raise cleanup_error
+
+    async def operation() -> None:
+        """Retain either a worker failure, an in-band response, or cancellation."""
+        if outcome != "caller_cancel":
+            deadline.record_failure(worker_error if outcome == "worker_error" else None)
+            deadline.begin_failure_cleanup()
+        await deadline.run_cleanup(cleanup)
+        if outcome == "worker_error":
+            raise worker_error
+
+    loop = asyncio.get_running_loop()
+    with mock.patch.object(loop, "call_exception_handler") as report:
+        pending = asyncio.create_task(operation())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            if outcome == "caller_cancel":
+                pending.cancel()
+                await asyncio.sleep(0)
+            release.set()
+            if outcome == "in_band_error":
+                await asyncio.wait_for(pending, timeout=5)
+            else:
+                expected = ValueError if outcome == "worker_error" else asyncio.CancelledError
+                with pytest.raises(expected) as raised:
+                    await asyncio.wait_for(pending, timeout=5)
+                if outcome == "worker_error":
+                    assert raised.value is worker_error
+            report.assert_called_once()
+            assert report.call_args.args[0]["exception"] is cleanup_error
+        finally:
+            release.set()
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_in_band_error_observed_after_deadline_is_not_forwarded(
+    request_deadline_service: OpenAIDisaggregatedService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late worker error cannot produce an error frame followed by a timeout frame."""
+    service = request_deadline_service
+    clock = SimpleNamespace(now=1000.0)
+    emit_error = asyncio.Event()
+
+    def make_deadline(total_seconds: float) -> DisaggRequestDeadline:
+        """Control the observation clock without replacing production task handling."""
+        deadline = DisaggRequestDeadline(total_seconds)
+        deadline._loop = SimpleNamespace(time=lambda: clock.now)
+        deadline._deadline = 1100.0
+        return deadline
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        """Deliver a complete worker error only after the budget has expired."""
+        await emit_error.wait()
+        clock.now = 1100.0
+        yield b'data: {"error":{"message":"late failure"}}\n\n'
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service.DisaggRequestDeadline", make_deadline
+    )
+    service._gen_client.send_request.return_value = stream()
+    response = await service._send_disagg_request(
+        CompletionRequest(model="m", prompt="hello", stream=True)
+    )
+    try:
+        emit_error.set()
+        with pytest.raises(DisaggRequestTimeoutError):
+            await asyncio.wait_for(response.__anext__(), timeout=5)
+    finally:
+        emit_error.set()
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_deadline_cancellation_closes_unclaimed_stream() -> None:
+    """Cancellation racing setup's return closes a stream before caller ownership."""
+    closed = asyncio.Event()
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        """Expose whether the primed cleanup scope was closed by the deadline owner."""
+        try:
+            yield b"primed"
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    response = stream()
+    loop = asyncio.get_running_loop()
+    task: asyncio.Task[AsyncGenerator[bytes, None]]
+
+    async def complete_setup() -> AsyncGenerator[bytes, None]:
+        """Return the stream with caller cancellation queued before task delivery."""
+        assert await response.__anext__() == b"primed"
+        loop.call_soon(task.cancel)
+        return response
+
+    task = asyncio.create_task(DisaggRequestDeadline(60.0).run(complete_setup))
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert closed.is_set()
+        with pytest.raises(StopAsyncIteration):
+            await response.__anext__()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_deadline_releases_ctx_placement_before_ctx_dispatch(
+    request_deadline_service: OpenAIDisaggregatedService,
+) -> None:
+    """Expiry during GEN placement releases CTX load before an HTTP leg owns it."""
+    service = request_deadline_service
+    router = LoadBalancingRouter(ServerRole.CONTEXT, servers=["ctx:9000"])
+    service._ctx_router = router
+    gen_selecting = asyncio.Event()
+
+    async def gen_setup(*args: object, **kwargs: object) -> None:
+        """Hold the external GEN-routing boundary after actual CTX reservation."""
+        gen_selecting.set()
+        await asyncio.Event().wait()
+
+    service._gen_client.send_request.side_effect = gen_setup
+    pending = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="m", prompt="hello", stream=True))
+    )
+    try:
+        await asyncio.wait_for(gen_selecting.wait(), timeout=5)
+        assert router._server_state["ctx:9000"]._num_active_requests == 1
+        with pytest.raises(DisaggRequestTimeoutError):
+            await asyncio.wait_for(pending, timeout=5)
+        assert router._server_state["ctx:9000"]._num_active_requests == 0
+        assert router._req_routing_table == {}
+        service._ctx_client.send_request.assert_not_called()
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("failed_role", ["ctx", "gen"])
+async def test_worker_failure_survives_cleanup_past_request_deadline(
+    request_deadline_service: OpenAIDisaggregatedService,
+    monkeypatch: pytest.MonkeyPatch,
+    streaming: bool,
+    failed_role: str,
+) -> None:
+    """Cleanup after an observed worker failure cannot change its terminal cause."""
+    service = request_deadline_service
+    started = {role: asyncio.Event() for role in ("ctx", "gen")}
+    cleanup_started, release_cleanup, expired = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    interrupted = asyncio.Event()
+    worker_error = TimeoutError("earlier worker timeout")
+
+    def make_deadline(total_seconds: float) -> DisaggRequestDeadline:
+        """Observe the real deadline without replacing its clock or timer logic."""
+        deadline = DisaggRequestDeadline(total_seconds)
+        asyncio.get_running_loop().call_at(deadline._deadline, expired.set)
+        return deadline
+
+    async def worker(role: str) -> None:
+        """Fail one worker and hold the other's cancellation cleanup."""
+        started[role].set()
+        await started["gen" if role == "ctx" else "ctx"].wait()
+        if role == failed_role:
+            raise worker_error
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                interrupted.set()
+                raise
+
+    async def ctx(*args: object, **kwargs: object) -> None:
+        """Run the context boundary."""
+        await worker("ctx")
+
+    async def gen(*args: object, **kwargs: object) -> None:
+        """Run the nonstreaming generation boundary."""
+        await worker("gen")
+
+    async def chunks() -> AsyncGenerator[bytes, None]:
+        """Run the streaming generation boundary."""
+        await worker("gen")
+        yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service.DisaggRequestDeadline", make_deadline
+    )
+    service._ctx_client.send_request.side_effect = ctx
+    if streaming:
+        service._gen_client.send_request.return_value = chunks()
+    else:
+        service._gen_client.send_request.side_effect = gen
+    pending = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="m", prompt="hello", stream=streaming))
+    )
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        await asyncio.wait_for(expired.wait(), timeout=5)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not pending.done()
+        assert not interrupted.is_set()
+        release_cleanup.set()
+        with pytest.raises(TimeoutError) as raised:
+            await asyncio.wait_for(pending, timeout=5)
+        assert raised.value is worker_error
+    finally:
+        release_cleanup.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_caller", [False, True])
+@pytest.mark.parametrize("cleanup_role", ["ctx", "gen"])
+async def test_stream_failure_survives_cleanup_past_request_deadline(
+    request_deadline_service: OpenAIDisaggregatedService, cancel_caller: bool, cleanup_role: str
+) -> None:
+    """Stop failed work immediately, but do not interrupt already-started cleanup."""
+    service = request_deadline_service
+    ctx_started, cleanup_started, release_cleanup = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    gen_closed, interrupted, tail_read = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    error_frame = b'data: {"error":{"message":"worker failed"}}\n\n'
+
+    async def hold_cleanup() -> None:
+        """Keep an owner's cleanup alive and expose a second cancellation."""
+        cleanup_started.set()
+        try:
+            await release_cleanup.wait()
+        except asyncio.CancelledError:
+            interrupted.set()
+            raise
+
+    async def ctx(*args: object, **kwargs: object) -> None:
+        """Keep cancellation cleanup alive past the original serving budget."""
+        ctx_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if cleanup_role == "ctx":
+                await hold_cleanup()
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        """Expose any attempt to continue reading after the terminal failure."""
+        try:
+            await ctx_started.wait()
+            yield error_frame
+            tail_read.set()
+            await asyncio.Event().wait()
+        finally:
+            gen_closed.set()
+            if cleanup_role == "gen":
+                await hold_cleanup()
+
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.return_value = gen()
+    response = None
+
+    async def request_and_read() -> list[bytes]:
+        """Retain the stream owner while either worker is still cleaning up."""
+        nonlocal response
+        response = await service._send_disagg_request(
+            CompletionRequest(model="m", prompt="hello", stream=True)
+        )
+        return [chunk async for chunk in response]
+
+    pending = asyncio.create_task(request_and_read())
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        await asyncio.wait_for(gen_closed.wait(), timeout=5)
+        assert not tail_read.is_set()
+        if cancel_caller:
+            pending.cancel()
+            await asyncio.sleep(0)
+            pending.cancel()
+        # The fixture budget is one second; this wait is only to cross it after
+        # the error was selected. No deadline or production imports are mocked.
+        await asyncio.sleep(1.1)
+        assert not pending.done()
+        assert not interrupted.is_set()
+        release_cleanup.set()
+        if cancel_caller:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=5)
+            return
+        assert await asyncio.wait_for(pending, timeout=5) == [error_frame]
+        assert gen_closed.is_set()
+    finally:
+        release_cleanup.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        if response is not None:
+            await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fragmented", [False, True])
+@pytest.mark.parametrize("protocol", ["completion", "responses_failed"])
+async def test_stream_failure_after_handoff_stops_its_http_tail(
+    request_deadline_service: OpenAIDisaggregatedService,
+    fragmented: bool,
+    protocol: str,
+) -> None:
+    """A complete error ends GEN reads without waiting for EOF or the deadline."""
+    service = request_deadline_service
+    service._request_deadline_config = DisaggRequestDeadlineConfig(total_seconds=60.0)
+    emit_error, tail_read, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    payload = (
+        {"error": {"message": "失敗"}} if protocol == "completion" else {"type": "response.failed"}
+    )
+    error_frame = b"data: " + msgspec.json.encode(payload) + b"\r\n\r\n"
+    chunks = [bytes([byte]) for byte in error_frame] if fragmented else [error_frame]
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        """Delay the error until after CTX completion and the stream handoff."""
+        try:
+            await emit_error.wait()
+            for chunk in chunks:
+                yield chunk
+            tail_read.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    service._gen_client.send_request.return_value = gen()
+    request = (
+        CompletionRequest(model="m", prompt="hello", stream=True)
+        if protocol == "completion"
+        else ResponsesRequest(model="m", input="hello", stream=True)
+    )
+    response = await service._send_disagg_request(request)
+    try:
+        emit_error.set()
+        await asyncio.wait_for(closed.wait(), timeout=5)
+        assert not tail_read.is_set()
+        assert b"".join([chunk async for chunk in response]) == error_frame
+    finally:
+        emit_error.set()
+        await response.aclose()
+
+
+def _responses_failure_frames(
+    request: ResponsesRequest, detail: str = "worker failed"
+) -> tuple[bytes, bytes]:
+    """Build the worker's actual error notification and terminal response snapshot."""
+    processor = ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name=request.model,
+        use_harmony=False,
+    )
+    error, failed = processor.get_stream_failed_events("engine_error", detail)
+    return error.encode(), failed.encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", ["coalesced", "split", "fragmented"])
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+async def test_responses_deadline_relays_failure_terminal_without_waiting_for_eof(
+    request_deadline_service: OpenAIDisaggregatedService, layout: str, line_ending: bytes
+) -> None:
+    """Cancel CTX at error, then preserve the complete worker failure response."""
+    service = request_deadline_service
+    service._request_deadline_config = DisaggRequestDeadlineConfig(total_seconds=60.0)
+    request = ResponsesRequest(model="m", input="hello", stream=True)
+    error, failed = (
+        frame.replace(b"\n", line_ending) for frame in _responses_failure_frames(request)
+    )
+    ctx_started, ctx_cancelled, release_terminal = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    gen_closed, tail_read = asyncio.Event(), asyncio.Event()
+
+    async def ctx(*args: object, **kwargs: object) -> None:
+        """Expose immediate sibling cancellation before allowing the terminal frame."""
+        ctx_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            ctx_cancelled.set()
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        """Keep the HTTP tail open after the worker's complete failure response."""
+        try:
+            await ctx_started.wait()
+            if layout == "coalesced":
+                yield error + failed
+            else:
+                for chunk in (
+                    [bytes([byte]) for byte in error] if layout == "fragmented" else [error]
+                ):
+                    yield chunk
+                await release_terminal.wait()
+                for chunk in (
+                    [bytes([byte]) for byte in failed] if layout == "fragmented" else [failed]
+                ):
+                    yield chunk
+            tail_read.set()
+            raise RuntimeError("must not read after response.failed")
+        finally:
+            gen_closed.set()
+
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.return_value = gen()
+    pending = asyncio.create_task(service._send_disagg_request(request))
+    response = None
+    try:
+        await asyncio.wait_for(ctx_cancelled.wait(), timeout=5)
+        if layout != "coalesced":
+            assert not gen_closed.is_set()
+        release_terminal.set()
+        response = await asyncio.wait_for(pending, timeout=5)
+        response = await _prepare_deadline_stream(response, responses_api=True)
+
+        async def read_response() -> bytes:
+            """Exercise the service stream through the server's Responses framing."""
+            return b"".join([chunk async for chunk in response])
+
+        assert await asyncio.wait_for(read_response(), timeout=5) == error + failed
+        assert gen_closed.is_set()
+        assert not tail_read.is_set()
+    finally:
+        release_terminal.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        if response is not None:
+            await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_caller", [False, True])
+async def test_responses_failure_tail_expires_while_ctx_cleanup_remains_owned(
+    request_deadline_service: OpenAIDisaggregatedService,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_caller: bool,
+) -> None:
+    """CTX cleanup cannot exempt GEN reads from the original request deadline."""
+    service = request_deadline_service
+    request = ResponsesRequest(model="m", input="hello", stream=True)
+    error, _ = _responses_failure_frames(request)
+    ctx_started, cleanup_started, release_cleanup = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    tail_read, gen_closed, expired, interrupted = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    deadlines: list[DisaggRequestDeadline] = []
+
+    def make_deadline(total_seconds: float) -> DisaggRequestDeadline:
+        """Observe the real original deadline without replacing its wait behavior."""
+        deadline = DisaggRequestDeadline(total_seconds)
+        deadlines.append(deadline)
+        asyncio.get_running_loop().call_at(deadline._deadline, expired.set)
+        return deadline
+
+    async def ctx(*args: object, **kwargs: object) -> None:
+        """Retain cleanup past expiry and expose a second cancellation."""
+        ctx_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                interrupted.set()
+                raise
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        """Fail, then never provide the missing terminal response snapshot."""
+        try:
+            await ctx_started.wait()
+            yield error
+            tail_read.set()
+            await asyncio.Event().wait()
+        finally:
+            gen_closed.set()
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service.DisaggRequestDeadline", make_deadline
+    )
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.return_value = gen()
+    pending = asyncio.create_task(service._send_disagg_request(request))
+    response = None
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        await asyncio.wait_for(tail_read.wait(), timeout=5)
+        assert len(deadlines) == 1
+        original_deadline = deadlines[0]._deadline
+        if cancel_caller:
+            pending.cancel()
+            await asyncio.sleep(0)
+            pending.cancel()
+        await asyncio.wait_for(expired.wait(), timeout=5)
+        await asyncio.wait_for(gen_closed.wait(), timeout=5)
+        assert deadlines[0]._deadline == original_deadline
+        assert len(deadlines) == 1
+        assert not pending.done()
+        assert not interrupted.is_set()
+        release_cleanup.set()
+        if cancel_caller:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=5)
+            return
+        response = await asyncio.wait_for(pending, timeout=5)
+        response = await _prepare_deadline_stream(response, responses_api=True)
+
+        async def read_response() -> bytes:
+            """Do not append timeout or fabricate the worker's missing terminal event."""
+            return b"".join([chunk async for chunk in response])
+
+        assert await asyncio.wait_for(read_response(), timeout=5) == error
+    finally:
+        release_cleanup.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        if response is not None:
+            await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "truncation"), [("timeout", "json"), ("eof", "utf8"), ("reset", "crlf")]
+)
+async def test_responses_failure_tail_drops_incomplete_terminal_frame(
+    request_deadline_service: OpenAIDisaggregatedService, outcome: str, truncation: str
+) -> None:
+    """A failed HTTP tail cannot leak a partial terminal frame or replace the worker error."""
+    service = request_deadline_service
+    request = ResponsesRequest(model="m", input="hello", stream=True)
+    error, failed = _responses_failure_frames(request, detail="worker 失敗")
+    if truncation == "json":
+        partial = failed[: failed.index(b'"response"') + len(b'"response":')]
+    elif truncation == "utf8":
+        partial = failed[: failed.index("失".encode()) + 1]
+    else:
+        error = error.replace(b"\n", b"\r\n")
+        partial = failed.replace(b"\n", b"\r\n")[:-1]
+    ctx_started, ctx_cancelled, gen_closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def ctx(*args: object, **kwargs: object) -> None:
+        """Expose cancellation from the original complete worker error."""
+        ctx_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            ctx_cancelled.set()
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        """End or stall after an incomplete failure snapshot."""
+        try:
+            await ctx_started.wait()
+            yield error
+            yield partial
+            if outcome == "timeout":
+                await asyncio.Event().wait()
+            elif outcome == "reset":
+                raise ConnectionResetError("GEN connection reset")
+        finally:
+            gen_closed.set()
+
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.return_value = gen()
+    response = await service._send_disagg_request(request)
+    response = await _prepare_deadline_stream(response, responses_api=True)
+    try:
+
+        async def read_response() -> bytes:
+            """Observe only complete frames from the actual server wrapper."""
+            return b"".join([chunk async for chunk in response])
+
+        assert await asyncio.wait_for(read_response(), timeout=5) == error
+        assert ctx_cancelled.is_set()
+        assert gen_closed.is_set()
+    finally:
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["caller_cancel", "worker_timeout"])
+async def test_request_deadline_preserves_other_terminal_causes(
+    request_deadline_service: OpenAIDisaggregatedService, outcome: str
+) -> None:
+    """An earlier caller cancellation or worker timeout retains its own identity."""
+    service = request_deadline_service
+    started = [asyncio.Event(), asyncio.Event()]
+    closed = [asyncio.Event(), asyncio.Event()]
+    worker_error = TimeoutError("worker HTTP deadline")
+
+    async def ctx(*args: object, **kwargs: object) -> None:
+        """Keep CTX running until the paired request closes it."""
+        started[0].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed[0].set()
+
+    async def gen(*args: object, **kwargs: object) -> None:
+        """Expose either an external worker timeout or a cancellable GEN wait."""
+        started[1].set()
+        try:
+            await started[0].wait()
+            if outcome == "worker_timeout":
+                raise worker_error
+            await asyncio.Event().wait()
+        finally:
+            closed[1].set()
+
+    service._ctx_client.send_request.side_effect = ctx
+    service._gen_client.send_request.side_effect = gen
+    task = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="m", prompt="hello"))
+    )
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), timeout=5)
+        if outcome == "caller_cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(TimeoutError) as error:
+                await asyncio.wait_for(task, timeout=5)
+            assert error.value is worker_error
+        assert all(event.is_set() for event in closed)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

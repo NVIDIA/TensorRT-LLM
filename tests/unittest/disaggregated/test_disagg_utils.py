@@ -4,16 +4,19 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 # isort: off
 from tensorrt_llm.llmapi.disagg_utils import (
-    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig,
-    disagg_process_id_space, extract_ctx_gen_cfgs, extract_router_config,
-    extract_disagg_cfg, get_global_disagg_request_id, get_local_request_id,
-    get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
+    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggRequestDeadlineConfig,
+    DisaggServerConfig, disagg_process_id_space, extract_ctx_gen_cfgs,
+    extract_router_config, extract_disagg_cfg, get_global_disagg_request_id,
+    get_local_request_id, get_server_configs_dict, parse_disagg_config_file,
+    worker_local_process_id)
 # isort: on
 
 pytestmark = pytest.mark.cpu_only
@@ -143,6 +146,62 @@ def test_bounded_replay_on_generation_reaches_both_workers():
         for server in config.server_configs
     } == {True}
     assert config.conditional_disagg_config is None
+
+
+@pytest.mark.parametrize("total_seconds", [0.25, 30])
+def test_request_deadline_accepts_positive_finite_budget(
+        total_seconds: float) -> None:
+    """Accept fractional and whole-second budgets without changing their value."""
+    policy = DisaggRequestDeadlineConfig(total_seconds=total_seconds)
+    config = extract_disagg_cfg(**get_yaml_config(), request_deadline=policy)
+
+    assert config.request_deadline is policy
+    assert config.request_deadline.total_seconds == total_seconds
+
+
+@pytest.mark.parametrize("total_seconds", [
+    pytest.param(0, id="zero"),
+    pytest.param(-1, id="negative"),
+    pytest.param(float("nan"), id="nan"),
+    pytest.param(float("inf"), id="infinity"),
+    pytest.param(float("-inf"), id="negative-infinity"),
+    pytest.param(True, id="true"),
+    pytest.param(False, id="false"),
+    pytest.param("30", id="string"),
+    pytest.param(None, id="null"),
+])
+def test_request_deadline_rejects_invalid_budget(total_seconds: object) -> None:
+    """Reject invalid budgets during configuration extraction."""
+    with pytest.raises(ValidationError, match="total_seconds"):
+        extract_disagg_cfg(**get_yaml_config(),
+                           request_deadline={"total_seconds": total_seconds})
+
+
+@pytest.mark.parametrize("policy", [{}, {"total_seconds": 30, "typo": 1}])
+def test_request_deadline_rejects_invalid_fields(
+        policy: dict[str, float]) -> None:
+    """Require the budget and reject unknown policy keys."""
+    with pytest.raises(ValidationError):
+        extract_disagg_cfg(**get_yaml_config(), request_deadline=policy)
+
+
+def test_request_deadline_is_opt_in_and_serving_only(tmp_path: Path) -> None:
+    """Keep the default disabled and consume YAML policy only at serving level."""
+    assert DisaggServerConfig(server_configs=[]).request_deadline is None
+    assert extract_disagg_cfg(**get_yaml_config()).request_deadline is None
+    assert extract_disagg_cfg(**get_yaml_config(),
+                              request_deadline=None).request_deadline is None
+
+    source = get_yaml_config()
+    source["request_deadline"] = {"total_seconds": 12.5}
+    yaml_file = tmp_path / "request_deadline.yaml"
+    yaml_file.write_text(yaml.safe_dump(source), encoding="utf-8")
+    config = parse_disagg_config_file(str(yaml_file))
+
+    assert isinstance(config.request_deadline, DisaggRequestDeadlineConfig)
+    assert config.request_deadline.total_seconds == 12.5
+    assert all("request_deadline" not in server.other_args
+               for server in config.server_configs)
 
 
 @pytest.mark.parametrize("ctx_frontends, expected", [

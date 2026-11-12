@@ -926,6 +926,50 @@ def test_auth_key_schema_matches_runtime(schemas: dict[str, dict], value: object
                 assert validator.is_valid({section: config}) == valid
 
 
+@pytest.mark.parametrize(
+    ("deadline", "valid"),
+    [
+        (None, True),
+        ({"total_seconds": 0.25}, True),
+        ({"total_seconds": 30}, True),
+        ({}, False),
+        ({"total_seconds": 0}, False),
+        ({"total_seconds": -1}, False),
+        ({"total_seconds": True}, False),
+        ({"total_seconds": False}, False),
+        ({"total_seconds": "30"}, False),
+        ({"total_seconds": None}, False),
+        ({"total_seconds": 30, "typo": 1}, False),
+        (30, False),
+        ("30", False),
+        ([], False),
+    ],
+)
+def test_request_deadline_schema_matches_runtime(
+    schemas: dict[str, dict], deadline: object, valid: bool
+) -> None:
+    """Keep the serving-only budget schema aligned with runtime input validation."""
+    from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+
+    validator = Draft202012Validator(schemas[generator.DISAGG_SCHEMA])
+    assert validator.is_valid({"request_deadline": deadline}) == valid
+    if valid:
+        extract_disagg_cfg(request_deadline=deadline)
+    else:
+        with pytest.raises(ValueError):
+            extract_disagg_cfg(request_deadline=deadline)
+
+
+def test_request_deadline_schema_is_orchestrator_only(schemas: dict[str, dict]) -> None:
+    """The optional request budget must not be exposed as an LLM or worker setting."""
+    config = {"request_deadline": {"total_seconds": 30}}
+    assert not Draft202012Validator(schemas[generator.SERVE_SCHEMA]).is_valid(config)
+    validator = Draft202012Validator(schemas[generator.DISAGG_SCHEMA])
+    assert validator.is_valid({})
+    for section in ("context_servers", "generation_servers"):
+        assert not validator.is_valid({section: config})
+
+
 def test_disagg_router_default_is_derived(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm.llmapi import disagg_utils
 
