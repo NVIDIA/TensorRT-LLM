@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The family gated RMSNorm is ``trtllm::rms_norm_gated_token_major`` as the reference runs it.
+"""The family gated RMSNorm is a pinned copy of ``trtllm::rms_norm_gated_token_major``.
 
-* source (CPU): the kernels, their launcher and the op are those of
-  ``_torch/modules/mamba/layernorm_gated.py`` at the reference 084745cde4 token for token, pinned
-  by digest (``_k3_source_parity.function_digest`` of ``git show 084745cde4:<that file>``). Main
-  has since moved the multi-row kernel's weight load before the PDL wait and added an early PDL
-  trigger; the math is the same, the PDL order is the reference's here.
+* source (CPU): the kernels, their launcher and the op are those of a pinned
+  ``_torch/modules/mamba/layernorm_gated.py`` token for token, pinned by digest
+  (``_k3_source_parity.function_digest`` of that file). Main's current copy loads the multi-row
+  kernel's weight before the PDL wait and adds an early PDL trigger; the math is the same, and
+  every load here waits for the producer.
 * GPU: ``mv2_kimi_k3_vl::rms_norm_gated_token_major`` equals today's V1 op bitwise (same math),
   on the multi-row kernel (KDA's sigmoid gate in a column slice, several head counts and token
   counts), the one-row fallback, the FP8 output and under CUDA graph replay.
@@ -28,7 +28,7 @@ _OP = (
     "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_rms_norm_gated.op"
 )
 
-#: function -> digest of 084745cde4:tensorrt_llm/_torch/modules/mamba/layernorm_gated.py.
+#: function -> digest of the pinned tensorrt_llm/_torch/modules/mamba/layernorm_gated.py.
 _REFERENCE = {
     "_rms_norm_gated_fwd_multirow_kernel": "048d1c56a7ed9c8d0c52fd1b7b5f0576cc30974cc0f34d98d97bb898b50c0d76",
     "_layer_norm_fwd_1pass_kernel": "3d90cad0abf718992b41847a2e28c3d7f0ded55da065366b0fad3ca3ae0010d7",

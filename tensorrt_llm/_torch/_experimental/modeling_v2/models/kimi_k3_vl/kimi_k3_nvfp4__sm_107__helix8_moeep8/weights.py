@@ -792,8 +792,8 @@ class KimiK3DefaultTextWeights:
 
             if src.shape != param.shape:
                 # MLA q_b/g/o head-shard: delegate to the same Linear modules
-                # that own their COLUMN/ROW sharding policy (#17684 removed the
-                # 96->128 head padding). KV-B is handled above; KDA and
+                # that own their COLUMN/ROW sharding policy (no 96->128 head
+                # padding). KV-B is handled above; KDA and
                 # shared-expert/MLP shards were resolved in the pre-block above.
                 mla_sharded_linear = mla_head_shard_linears.get(id(param))
                 if mla_sharded_linear is not None:

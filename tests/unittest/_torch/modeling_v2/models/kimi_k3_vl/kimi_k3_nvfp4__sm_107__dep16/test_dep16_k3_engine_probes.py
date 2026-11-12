@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Engine names the dep16 target's glue probes, and the values its folded code runs.
+"""Engine names the dep16 target's glue probes, and the values its code runs.
 
 The glue reaches main's engine through duck-typed probes (``hasattr``, ``getattr(..., None)``,
 ``inspect.signature``). A probe for a name the runtime object does not have returns its fallback,
 so the switch behind it stops working without an error. Each test pins the probes of one switch
-against the class the dep16 glue gets at runtime, and the values the target folded into its code
-(the c383 GEN recipe: attention DP 16, MegaMoE EP16).
+against the class the dep16 glue gets at runtime, and the values the target builds into its code
+(the dep16 generation recipe: attention DP 16, MegaMoE EP16).
 
 CPU only: classes and signatures, no kernels.
 """
@@ -69,9 +69,9 @@ def _text_and_outer():
 def test_runtime_hooks_reach_the_engine():
     """The engine arms its hooks only from the ``RuntimeHooks`` it reads off the outermost model
     (``runtime_hooks_of``), the target's registered class. The text model declares none (no fused
-    decode head); the target class adds the 4 GiB left outside the PyTorch cap, the c383 GEN
-    KV-balanced admission planner and the family's cache manager (KDA mid-chunk snapshots off);
-    everything else stays at the default."""
+    decode head); the target class adds the 4 GiB left outside the PyTorch cap, the dep16 generation
+    recipe's KV-balanced admission planner and the family's cache manager (KDA mid-chunk snapshots
+    off); everything else stays at the default."""
     from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, runtime_hooks_of
 
     planner_cls = _dep16("modeling").K3Dep16KvBalancedAdmission
@@ -135,8 +135,8 @@ def test_drafter_declarations_reach_the_engine():
 
 
 def test_folded_values_match_the_constants_record():
-    """``constants.py`` stays as the record of what the glue was folded from; the folded code
-    runs the same values."""
+    """``CONSTANTS`` records the optimizations the target's code is built for; the code runs the
+    same values."""
     modeling = _dep16("modeling")
     record = _dep16("modeling").CONSTANTS
     outer_cls = modeling.ModelingV2KimiK3Nvfp4Sm107Dep16

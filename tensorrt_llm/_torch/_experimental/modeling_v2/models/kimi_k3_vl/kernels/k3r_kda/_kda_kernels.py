@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KDA kernels of the Kimi K3 (k3_rubin) package and their dispatch.
+"""KDA kernels of the Kimi K3 family and their dispatch.
 
 * prefill: the CuTe DSL pipeline (``KdaPrefillRunner``, ``kda_prefill`` in ``ops/ssm/_kda_prefill.py``,
   called through the ``ops/ssm/kda_prefill`` entry) on L2-normalized Q/K, with its mid-chunk
@@ -160,7 +160,7 @@ def fused_kda_post_conv(
 ):
     """Convert packed channel-major ``[3 * H * D, T]`` convolution output to KDA Q/K/V.
 
-    A contiguous ``packed`` with ``normalize_qk`` runs the branch's Triton kernel (the CuTe DSL
+    A contiguous ``packed`` with ``normalize_qk`` runs the family's Triton kernel (the CuTe DSL
     prefill path): contiguous ``[1, out_tokens, H, D]`` Q/K/V with Q and K L2-normalized, where
     ``out_tokens`` is ``padded_tokens`` when given (rows past ``T`` are exact zeros, the chunk
     padding of kda_prepad_prefill), else ``T``; with ``beta`` (``[..., T, H]``, unit head
@@ -247,7 +247,7 @@ def _fused_kda_post_conv_triton(
     padded_tokens: Optional[int],
     beta: Optional[torch.Tensor],
 ):
-    """The branch's ``fused_kda_post_conv`` (see :func:`fused_kda_post_conv`)."""
+    """The family's Triton ``fused_kda_post_conv`` (see :func:`fused_kda_post_conv`)."""
     projection_size = num_heads * head_dim
     if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
         raise ValueError(
@@ -407,7 +407,7 @@ def _kda_store_conv_rows(
     """Store ``[rows, head_dim]`` conv outputs: V as is, Q and K L2-normalized per row
     with ``NORMALIZE_QK``, else as is.
 
-    The norm is fp32 over the rounded values (the branch's Triton post-conv). Its
+    The norm is fp32 over the rounded values (the family's Triton post-conv). Its
     division compiles to a multiplication by ``rcp.approx`` of the norm for
     norms in ``[2**-126, 2**126]``; the reciprocal is taken once per row here.
     """
@@ -1364,8 +1364,8 @@ def commit_kda_pending_drafts(
       rounds the state differently from a verify that replays the drafts
       itself.
 
-    The replay-only commit is main's (``REPLAY_ONLY`` in main's verify kernel); the branch has
-    none. It reads the same replay caches the private verify ops write.
+    The replay-only commit is main's (``REPLAY_ONLY`` in main's verify kernel); the family's
+    verify kernels have none. It reads the same replay caches the private verify ops write.
     """
     num_spec = conv_q.shape[2] - conv_pool.shape[2]
     if state_tok is not None:

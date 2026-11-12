@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 dep16 MLA cached-prefix context on the Rubin FP8 split-K context FMHA
-(kimi_k3_nvfp4__sm_107__dep16/mla.py).
+(``K3MLAAttention`` of kimi_k3_nvfp4__sm_107__dep16/modeling.py).
 
 CPU: which layers and calls take the split-K path and when kv_b_proj takes the MXFP8 cache
 gather. GPU (SM89+): the partition schedule handed to the FMHA. SM107: the MXFP8 gather against

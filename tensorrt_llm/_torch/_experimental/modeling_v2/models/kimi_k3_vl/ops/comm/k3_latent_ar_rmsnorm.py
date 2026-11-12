@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 routed latent all-reduce + RMSNorm (MNNVL one-shot) that releases its programmatic
-dependents right after its own ``griddepcontrol.wait`` (CuTe DSL, ``kernels/k3_latent_ar_norm.py``)."""
+dependents right after its own ``griddepcontrol.wait`` (CuTe DSL,
+``kernels/k3r_comm/k3_latent_ar_norm.py``)."""
 
 from __future__ import annotations
 

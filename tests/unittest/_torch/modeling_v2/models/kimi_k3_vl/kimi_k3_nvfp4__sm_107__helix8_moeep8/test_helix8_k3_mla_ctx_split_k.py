@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The helix8 glue: the K3 MLA cached-prefix context on the Rubin FP8 split-K context FMHA
-(the helix8 glue's mla.py; the helix8 GEN servers' warmup and autotune run context batches).
+(``K3MLAAttention`` of the helix8 glue; the helix8 GEN servers' warmup and autotune run context
+batches).
 
 CPU: which layers and calls take the split-K path and when kv_b_proj takes the MXFP8 cache
 gather. GPU (SM89+): the partition schedule handed to the FMHA. SM107: the MXFP8 gather against

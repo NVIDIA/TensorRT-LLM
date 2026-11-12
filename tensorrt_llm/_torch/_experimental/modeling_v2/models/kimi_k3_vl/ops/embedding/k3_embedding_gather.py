@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Token-embedding lookup of a whole table as a vectorized row copy (Triton,
-``kernels/embedding_gather.py``)."""
+``kernels/k3r_spec/embedding_gather.py``)."""
 
 from __future__ import annotations
 

@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``torch.ops.mv2_kimi_k3_vl.rms_norm_gated_token_major``: gated RMSNorm with a token-major gate.
 
-The launch of ``trtllm::rms_norm_gated_token_major`` as the reference Kimi K3 SM107 runs it: the
-multi-row kernel for a power-of-two width up to 256 with dense per-token gate blocks (PDL when the
-grid is smaller than the SM count), the one-row kernel on a packed copy of the gate otherwise.
+The launch of ``trtllm::rms_norm_gated_token_major``: the multi-row kernel for a power-of-two
+width up to 256 with dense per-token gate blocks (PDL when the grid is smaller than the SM count),
+the one-row kernel on a packed copy of the gate otherwise.
 """
 
 import torch

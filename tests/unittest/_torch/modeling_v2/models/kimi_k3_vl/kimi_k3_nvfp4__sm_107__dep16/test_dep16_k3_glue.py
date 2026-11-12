@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decoder glue of the Kimi K3 dep16 target against main's helpers it replaced: bitwise.
+"""The decoder glue of the Kimi K3 dep16 target against main's helpers: bitwise.
 
 * ``_Fp8BlockScaleWeightReadLinear.from_linear`` on a ``core.Fp8BlockScaleLinear`` (loaded, or
   loaded and prepared; one rank or a COLUMN / ROW shard) gives the projection built from the codes

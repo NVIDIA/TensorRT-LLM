@@ -1318,8 +1318,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         # so the CTA budget is 96 * threads_per_cta and the per-warpgroup values
         # below must sum (x 128 threads) to within it. At 12 warps the budget is
         # 96*384 = 36864: epilogue 168 + gather 72 + mma-group 48 = 288 -> exactly
-        # 128*288 = 36864. The mma group (warps 8-11) previously never called
-        # setmaxnreg and sat at the launch default 96; reconfiguring it down to 48
+        # 128*288 = 36864. Without setmaxnreg the mma group (warps 8-11) would
+        # sit at the launch default 96; reconfiguring it down to 48
         # is what keeps epilogue at its tuned 168 while gather still gets 72.
         self.num_regs_epilogue_warps = 168
         self.num_regs_gather_a_warps = 72
@@ -3889,8 +3889,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 fc2_a_pipeline.producer_tail(fc2_a_producer_state)
 
         # MMA-group warps (8-11: mma / tma_b / sched / sync-transform relay).
-        # These previously never called setmaxnreg and sat at the launch default
-        # of 96 regs/thread. At 12 warps the CTA budget is 96*384 = 36864, so
+        # Without setmaxnreg these would sit at the launch default of 96
+        # regs/thread. At 12 warps the CTA budget is 96*384 = 36864, so
         # holding them at 96 would leave gather only 24 regs (the PTX minimum)
         # once the epilogue takes its tuned 168. Dropping this group to 48 is
         # what buys gather a workable 72. Budget: 128*(168+72+48) = 36864 exactly.

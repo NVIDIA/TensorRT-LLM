@@ -9,9 +9,9 @@ projections, so a comparison measures the convolution, recurrence and gated RMSN
 tp1 (every recipe's context servers) runs the token-major fused convolution
 (``fused_kda_conv_prefill`` on the QKVG GEMM output) and chunk-pads a single unaligned sequence
 in that kernel (with beta), with every KDA head on its rank. The channel-major convolution
-(``causal_conv1d_fwd`` + ``fused_kda_post_conv``) it replaced is the dep16 glue's; one test checks
+(``causal_conv1d_fwd`` + ``fused_kda_post_conv``) is the dep16 glue's; one test checks
 the two against each other. The prefill kernels' own tests are in
-``test_tp1_kda_prefill_kernels.py``.
+``kernels/k3r_kda/test_k3_kda_prefill_kernels.py``.
 """
 
 import math

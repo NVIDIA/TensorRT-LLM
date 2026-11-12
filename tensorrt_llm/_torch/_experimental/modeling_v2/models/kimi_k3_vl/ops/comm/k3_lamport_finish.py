@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Finish an MNNVL Lamport all-reduce whose input every rank pushed (``k3_lamport_push`` or a
 GEMM's push epilogue): poll the slots, sum them in the C++ kernel's order, re-arm the previous
-call's buffer and advance the workspace (CuTe DSL, ``kernels/k3_lamport_ar.py``)."""
+call's buffer and advance the workspace (CuTe DSL, ``kernels/k3r_comm/k3_lamport_ar.py``)."""
 
 from __future__ import annotations
 

@@ -1096,10 +1096,10 @@ class K3DFlashWorker(SpecWorkerBase):
     def _draft_tokens_per_req(self) -> int:
         """Target-forward tokens per gen request: K drafts + 1 bonus.
 
-        Previously this was 2K (K+1 accepted + K-1 mask fillers), but the
-        fillers contribute nothing beyond the K+1 prefix the acceptance
-        check and context store consume, so carrying them through every
-        target layer is wasted work that dominates step time at large batch.
+        Not 2K (K+1 accepted + K-1 mask fillers): the fillers contribute
+        nothing beyond the K+1 prefix the acceptance check and context store
+        consume, so carrying them through every target layer would be wasted
+        work that dominates step time at large batch.
         """
         return self.max_draft_len + 1
 
@@ -1492,7 +1492,7 @@ class K3DFlashWorker(SpecWorkerBase):
         ``kv_cache_block_offsets`` entries are ``pool_block_index *
         num_pool_layers * kv_factor`` plus the K/V field index. What that has to
         be divided by to index a ``get_buffers`` view depends on the manager --
-        see the stride check below; attention_backend/utils.py hardcodes the V1
+        see the stride check below; attention/backends/utils.py hardcodes the V1
         divisor and is not a general contract. A V2 manager with per-layer page
         tables also offsets every entry by the layer's K buffer within the
         physical slot (``_ctx_block_offset``).
@@ -2700,9 +2700,9 @@ class K3DFlashWorker(SpecWorkerBase):
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
-                # recorder (None here -> no calibration rows collected; the
-                # DSpark confidence-scheduled verification MR supplies the
-                # real provider, see accept_stats.py). Guarded off for
+                # recorder (None here -> no calibration rows collected; a
+                # confidence-scheduled verification supplies the real
+                # provider, see accept_stats.py). Guarded off for
                 # CUDA-graph batches and d2t vocab-mapped drafters.
                 if (
                     self._accept_stats is not None

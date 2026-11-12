@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Source parity of a family copy and the Modeling V1 code it replaces, read with ``ast``.
+"""Source parity of a family copy and the Modeling V1 code it copies, read with ``ast``.
 
 :func:`function_digest` hashes a function's signature and body (docstring, comments, formatting
 and decorators left out), so a copy whose code is the same token for token has the same digest.

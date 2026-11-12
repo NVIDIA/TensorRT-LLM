@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The target's ``mla_kv_to_fp8`` (``kernels/mla/mla_kv_fp8.py``) writes the attention op's FP8 context K / V
-bytes."""
+"""The target's ``mla_kv_to_fp8`` (``kernels/k3r_mla_ctx/mla_kv_fp8.py``) writes the attention
+op's FP8 context K / V bytes."""
 
 import pytest
 import torch

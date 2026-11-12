@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""kimi_k3_nvfp4__sm_107__helix8_moeep8: its constants are 084745cde4's ``helix8`` profile (the values
-932149's c24 run exported), it reads no environment
-variable, and its class declares no model defaults (the recipe carries the engine settings)."""
+"""kimi_k3_nvfp4__sm_107__helix8_moeep8: its constants are the helix8 generation profile, it reads
+no environment variable, and its class declares no model defaults (the recipe carries the engine
+settings)."""
 
 from __future__ import annotations
 

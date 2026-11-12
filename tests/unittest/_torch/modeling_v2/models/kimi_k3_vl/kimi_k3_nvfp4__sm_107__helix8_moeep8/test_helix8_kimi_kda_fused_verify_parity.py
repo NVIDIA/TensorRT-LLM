@@ -77,7 +77,7 @@ pytestmark = [
 ]
 
 HIDDEN = 512
-H = 8  # per-rank head count outside the drop's tuned set — general variant
+H = 8  # per-rank head count outside the tuned set {2, 12, 32} — general variant
 K = 128
 W = 4
 M = 2  # draft tokens per round

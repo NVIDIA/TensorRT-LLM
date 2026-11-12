@@ -20,7 +20,7 @@ request), with the per-batch FP4 MLA state on ``metadata.fp4_mla_state``; the de
 (``ops/attention/_fp4_mla_decode``). The default chain is the production one: the q_b low-M GEMM,
 the BF16 W_UK BMM and the fused FP4 generation update with its query rows. Checks:
 
-* The KV append without query rows (``k3_rubin/kernels/fp4_mla_kv_append``) writes the cache
+* The KV append without query rows (``kernels/k3r_fp4_mla/fp4_mla_kv_append``) writes the cache
   bytes of the backend's full update (bitwise).
 * The fused kernel's query quantization equals the Triton kernel's on the same BF16 values
   (bitwise), including the RoPE rotation with a non-identity table.

@@ -5,8 +5,8 @@
 Serves the context servers of every deployment: one rank per process (world 1, attention DP over
 that one rank), DWDP, the CUTEDSL routed experts. Context only: no CUDA graphs, the overlap
 scheduler off, chunked prefill. Its DSpark drafter only writes the context KV and keeps it in FP8
-(the drafter's ``draft_kv_dtype``). ``constants.py`` records the reference profile this code
-reproduces (``tp1`` of 084745cde4); the code below runs exactly those settings.
+(the drafter's ``draft_kv_dtype``). ``CONSTANTS`` records the optimizations this code is built
+for; the code below runs exactly those settings.
 
 The checkpoint is the vision-language model's; this target is text only. It builds no vision
 tower (its checkpoint tensors are never read, ``weights.py``) and refuses multimodal input. The
@@ -15,10 +15,10 @@ text model ``KimiK3DefaultForCausalLM``:
 * 93 decoder layers (``KimiK3DefaultDecoderLayer``): 69 KDA (Kimi Delta Attention, linear
   attention) layers and 24 MLA (absorbed MQA, NoPE) layers, per the 1-indexed
   ``linear_attn_config.kda_layers`` / ``full_attn_layers`` schedule.
-* Layer 0 has a dense SiTU MLP; layers 1..92 the latent MoE of ``moe_runtime.py``: 896 routed
+* Layer 0 has a dense SiTU MLP; layers 1..92 the latent MoE (``K3MoERuntime``): 896 routed
   experts at top-16 (sigmoid + ``e_score_correction_bias`` routing), 2 shared experts, and the
   latent down / norm / up projections around the routed experts.
-* Attention residuals (``attn_res.py``): before ``input_layernorm``, before
+* Attention residuals (``_apply_attn_res``): before ``input_layernorm``, before
   ``post_attention_layernorm`` and at the model output each token mixes a bank of earlier
   sublayer outputs; a snapshot is appended whenever ``layer_idx % attn_res_block_size == 0``.
 
@@ -151,9 +151,9 @@ class K3Sm107Constants:
     """What one Kimi K3 SM107 target runs. A field is a fixed property of the target."""
 
     # The speculative decode step's head in one kernel (``RuntimeHooks.decode_prologue``) and the
-    # token embedding as a vectorized row copy (formerly TLLM_SPEC_HEAD_FUSION).
+    # token embedding as a vectorized row copy.
     spec_head_fusion: bool
-    # MoE (moe_runtime.py, fp8_weight_read.py, modeling.py).
+    # MoE (``K3MoERuntime``, ``_Fp8BlockScaleWeightReadLinear``).
     fuse_moe_residual: bool
     fp8w_lowm_gemm: bool
     ld_fused: bool
@@ -174,16 +174,16 @@ class K3Sm107Constants:
     # loading).
     fp8_weight_read_moe_mlp: bool
     latent_ar_own_ws: bool
-    # Attention residual (attn_res.py, kernels/k3r_attn_res).
+    # Attention residual (``_apply_attn_res`` and its fused forms, kernels/k3r_attn_res).
     attn_res_pdl: bool
     attn_res_pdl_max_m: int
     attn_res_mxfp8: bool
     attn_res_early_trigger: bool
-    # KDA (kda.py).
+    # KDA (``K3KDALinearAttention``).
     kda_prepad_prefill: bool
     kda_fused_conv_prefill: bool
     kda_l2_prefetch: bool
-    # MLA and its FP4 generation decode (mla.py, ops/attention/_fp4_mla_decode.py).
+    # MLA and its FP4 generation decode (``K3MLAAttention``, ops/attention/_fp4_mla_decode.py).
     mla_q_norm_pdl: bool
     fp4_mla_page_plan: bool
     fp4_mla_reduce_pdl: bool
@@ -4544,7 +4544,7 @@ class KimiK3DefaultForCausalLM(
 
 
 # Context requests shorter than this many tokens keep their recurrent-state pages at the lowest
-# eviction priority (every reference recipe's context servers).
+# eviction priority (the context servers of every recipe).
 _LOW_PRIORITY_SNAPSHOT_PROMPT_LEN = 16384
 
 
@@ -4559,7 +4559,7 @@ class ModelingV2KimiK3Nvfp4Sm107Tp1(KimiK3DefaultWeights, PreTrainedModel):
     ``KimiK3DefaultWeights`` mixin's (``weights.py``).
     """
 
-    # The reference profile this target reproduces (a record: the code reads none of it).
+    # The optimizations this target's code is built for (a record: the code reads none of it).
     K3_CONSTANTS: ClassVar[K3Sm107Constants] = CONSTANTS
 
     _LANG_PREFIX = "language_model."

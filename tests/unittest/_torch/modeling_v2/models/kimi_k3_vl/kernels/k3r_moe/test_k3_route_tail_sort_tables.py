@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The CuTe routing tail's ``moe_sort`` tables (``ops.moe.k3_route_tail``, ``TRTLLM_K3_ROUTE_TAIL``),
+"""The CuTe routing tail's ``moe_sort`` tables (``ops.moe.k3_route_tail``),
 which the gate hands to the routed experts as ``SortTables`` in place of
 their own ``moe_sort``: for the tail's top-k, the same tiles as ``trtllm::moe_sort`` (count,
 expert, row limit) and every routed row of this rank's experts in a slot of its expert's rows

@@ -128,7 +128,7 @@ def test_each_recipe_role_routes_to_its_target(stem, role):
 
 
 def test_context_servers_of_a_dwdp12_recipe_route_to_tp1():
-    """c240 runs 12 context servers (DWDP12); the layout of each is still one rank."""
+    """A recipe with 12 context servers (DWDP12): the layout of each is still one rank."""
     worker = _worker(
         "vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_helix8_bs20_dspark5", "ctx"
     )

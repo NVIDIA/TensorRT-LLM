@@ -239,7 +239,7 @@ def fast_rcp(x, *, loc=None, ip=None):
 
 
 # ============================================================
-# Akk inverse helpers (fused from Akk_inverse_lower_triangle_bf16.py)
+# Akk inverse helpers (those of akk_inverse.py, fused in)
 # ============================================================
 @dsl_user_op
 def store_internal_barrier(*, loc=None, ip=None):

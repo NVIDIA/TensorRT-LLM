@@ -53,7 +53,7 @@ FORBIDDEN = (
     "tensorrt_llm._torch.moe",
 )
 
-#: The MXFP4 sm100 targets: written before the rule (#21910), not part of the K3 v2 plan.
+#: The MXFP4 sm100 targets: exempt from the rule.
 EXEMPT_TARGETS = frozenset(
     {
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1",

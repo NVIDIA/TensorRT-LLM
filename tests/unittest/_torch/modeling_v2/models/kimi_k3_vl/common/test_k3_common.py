@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The family's ``common/`` glue behaves as the Modeling V1 helpers it replaces.
+"""The family's ``common/`` glue behaves as the Modeling V1 helpers.
 
 * ``parallel.TensorParallelMode`` and ``modules.linear.TensorParallelMode``: same members, equal
   and hash-equal across the two classes (``LMHead.tp_mode`` is the V1 enum), same ``split_dim``

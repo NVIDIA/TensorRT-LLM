@@ -809,8 +809,8 @@ ROW_GROUPS = CLUSTER
 ROW_GROUP_THREADS = 128
 ROW_THREADS = ROW_GROUPS * ROW_GROUP_THREADS
 ROW_WARPS = ROW_THREADS // 32
-#: Largest row count of the row kernel (one CTA per row). c240: 128 (was 64), for the helix8 b16
-#: mtp5 verify step (96 rows); the kernel itself has no row limit.
+#: Largest row count of the row kernel (one CTA per row): 128 covers the helix8 batch-16
+#: DSpark-5 verify step (96 rows); the kernel itself has no row limit.
 ROW_MAX_M = 128
 #: World sizes of the row kernel (one bit per rank of the arrival mask).
 ROW_WORLD_SIZES = (2, 4, 8, 16)
@@ -854,7 +854,7 @@ class K3LatentArRowKernel:
     * CTA 0 rotates the buffers right after its first polling round when every warp of the grid
       has counted itself by then (as a rule), so that the acquire load and the state stores are
       not on the grid's tail; otherwise it waits for the count at the end, like the cluster kernel.
-    * ``early_state`` (ULL2 coll): the rotation state read, the warps' arrival count and the
+    * ``early_state``: the rotation state read, the warps' arrival count and the
       re-arm of the previous call's buffer (nobody polls it any more) run before
       ``griddepcontrol.wait``, while the producer of ``x`` still runs: the previous call on the
       workspace completed before that producer started (stream order), so the state is final.
@@ -887,7 +887,7 @@ class K3LatentArRowKernel:
         self.use_pdl = use_pdl
         self.norm = norm
         self.mxfp8 = mxfp8
-        # c240: 0 stores the UE8M0 exponents row-major [M, 3584 / 32] (the low-M MXFP8 GEMM's
+        # 0 stores the UE8M0 exponents row-major [M, 3584 / 32] (the low-M MXFP8 GEMM's
         # operand); > 0 in the mid-M GEMM's tcgen05 atoms [3584 / 128][sf_blocks][512 B]
         # (k3_fp8w_lowm_gemm.K3MxFp8QuantKernel's layout), rows M .. 128 sf_blocks - 1 neutral.
         self.sf_blocks = sf_blocks
@@ -1258,11 +1258,11 @@ def run_k3_latent_ar_norm_row(
     for up to :data:`ROW_MAX_M` rows). Each Lamport buffer of the workspace must hold the rows of
     every rank (``M x world_size x 3584 x 2`` bytes, as the one-shot sizing of the MNNVL
     workspace guarantees for the one-shot sizes; see :func:`can_run_row`). ``sf_blocks`` > 0
-    (c240) stores ``mxfp8_out``'s scales ``[(3584 / 128) * sf_blocks * 512]`` in the mid-M GEMM's
+    stores ``mxfp8_out``'s scales ``[(3584 / 128) * sf_blocks * 512]`` in the mid-M GEMM's
     layout (``k3_fp8w_lowm_gemm.mid_prequant_plan``) instead of row-major ``[M, 112]``.
     ``prepushed``: the producer of ``x`` already stored it into this rank's slot of every rank's
     current buffer (an in-kernel all-reduce push); the kernel skips its push.
-    ``early_state`` (ULL2 coll): the state read, the arrival count and the re-arm of the previous
+    ``early_state``: the state read, the arrival count and the re-arm of the previous
     buffer run before the kernel's ``griddepcontrol.wait`` (see :class:`K3LatentArRowKernel`)."""
     mxfp8 = mxfp8_out is not None
     if sf_blocks and not (mxfp8 and x.shape[0] <= sf_blocks * 128):

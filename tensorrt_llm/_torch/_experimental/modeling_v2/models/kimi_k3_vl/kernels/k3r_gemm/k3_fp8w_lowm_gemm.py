@@ -2262,7 +2262,7 @@ class K3Fp8wMidMGemmKernel(_FusedStoreMixin):
     weight ring once every CTA of the cluster has finished its mainloop. ``epilogue`` selects
     the output as in :class:`K3Fp8wLowMGemmKernel`.
 
-    ``ar_push`` (``AR_PUSH_TWO_SHOT`` / ``AR_PUSH_ONE_SHOT``, ``ar_world`` ranks; c240,
+    ``ar_push`` (``AR_PUSH_TWO_SHOT`` / ``AR_PUSH_ONE_SHOT``, ``ar_world`` ranks;
     :meth:`call_ar_push`): the staged BF16 rows go into the Lamport slots of the next all-reduce
     on a workspace instead of the output (:meth:`_push_staged_rows`, the low-M kernel's push),
     and the dependent grid is released from the activation warp after its
@@ -2991,7 +2991,7 @@ class K3Fp8wMidMGemmKernel(_FusedStoreMixin):
         flags: Int64,
         ar_rank: Int32,
     ):
-        """c240 all-reduce push of the staged BF16 rows (token ``t`` at ``stage_base + t * 256``):
+        """All-reduce push of the staged BF16 rows (token ``t`` at ``stage_base + t * 256``):
         rows ``r < nrows``, i.e. token ``r`` or with split-K this rank's ``r``-th owned token, go
         out as the BF16 store's 16-byte vectors through ``k3_lamport_ar.push_slot`` /
         ``push_v4`` (``-0`` sent as ``+0``), so every (token, feature) vector is pushed once.
@@ -3682,7 +3682,7 @@ def _run_mid(
 
 
 def mid_prequant_plan(m: int, n: int, k: int) -> Optional[Tuple[K3MidMTactic, int]]:
-    """c240: ``(tactic, sf_blocks)`` of the mid-M path :func:`run_k3_fp8w_lowm_gemm` runs for ``m``
+    """``(tactic, sf_blocks)`` of the mid-M path :func:`run_k3_fp8w_lowm_gemm` runs for ``m``
     rows of an ``[N, K]`` weight (its default tactic), or None where it runs the low-M kernel.
 
     A producer that stores the MXFP8 form of those rows exactly as :class:`K3MxFp8QuantKernel`
@@ -3707,7 +3707,7 @@ def run_mid_prequantized(
     tactic: K3MidMTactic,
     use_pdl: bool = True,
 ) -> torch.Tensor:
-    """c240: :func:`_run_mid` without its quantization kernel: the mid-M GEMM (BF16 epilogue into
+    """:func:`_run_mid` without its quantization kernel: the mid-M GEMM (BF16 epilogue into
     ``out [M, N]``) on the MXFP8 operand ``xq`` (E4M3 ``[M, K]``) / ``xs`` (UE8M0,
     ``(K / 128) * sf_blocks * 512`` bytes, see :func:`mid_prequant_plan`). With ``use_pdl`` it
     launches as a programmatic dependent of the producer and streams its weights before its
@@ -3731,7 +3731,7 @@ def run_mid_prequantized(
 def quantize_mid_operand(
     x: torch.Tensor, tactic: K3MidMTactic, use_pdl: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """c240: the MXFP8 operand of the mid-M GEMM (``tactic``) for the BF16 rows ``x [M, K]``, as
+    """The MXFP8 operand of the mid-M GEMM (``tactic``) for the BF16 rows ``x [M, K]``, as
     :func:`run_k3_fp8w_lowm_gemm` quantizes them (:class:`K3MxFp8QuantKernel`): E4M3 ``[M, K]`` and
     UE8M0 scales ``[(K / 128) * sf_blocks * 512]`` in that GEMM's layout, for
     :func:`run_mid_prequantized` (``_ar_push``). With one scale block (``tactic.mma_n <= 128``)
@@ -3751,7 +3751,7 @@ def quantize_mid_operand(
 
 
 def mid_ar_push_tactic(m: int, n: int, k: int) -> Optional[K3MidMTactic]:
-    """c240: the mid-M tactic :func:`run_k3_fp8w_lowm_gemm` runs for ``m`` rows of an ``[N, K]``
+    """The mid-M tactic :func:`run_k3_fp8w_lowm_gemm` runs for ``m`` rows of an ``[N, K]``
     weight (:func:`mid_prequant_plan`), which the mid-M all-reduce push epilogue runs with the
     same bits; None where the low-M kernel serves ``m`` (see :func:`ar_push_tactic`) or above
     the mid-M range."""
@@ -3786,7 +3786,7 @@ def run_mid_prequantized_ar_push(
     tactic: K3MidMTactic,
     use_pdl: bool = True,
 ) -> None:
-    """c240: :func:`run_mid_prequantized` with the all-reduce push epilogue: ``bf16(xq @ W^T)``
+    """:func:`run_mid_prequantized` with the all-reduce push epilogue: ``bf16(xq @ W^T)``
     goes into the Lamport slots of the next all-reduce on ``ws`` instead of an output tensor;
     :func:`k3_lamport_ar.run_lamport_finish` with the same ``one_shot`` (or a consumer that
     finishes it) completes it, bitwise the GEMM followed by the MNNVL all-reduce of its
@@ -4085,7 +4085,7 @@ def run_k3_fp8w_lowm_gemm_ar_push(
     tactic and rounding as :func:`run_k3_fp8w_lowm_gemm` (:func:`run_k3_fp8w_lowm_gemm_gated`),
     so the pair is bitwise that GEMM followed by the MNNVL all-reduce of its output.
 
-    c240: above the low-M range (no gate) the mid-M path runs, its quantization kernel then the
+    Above the low-M range (no gate) the mid-M path runs, its quantization kernel then the
     mid-M GEMM with the push epilogue (:func:`mid_ar_push_tactic`).
     """
     m, k = x.shape

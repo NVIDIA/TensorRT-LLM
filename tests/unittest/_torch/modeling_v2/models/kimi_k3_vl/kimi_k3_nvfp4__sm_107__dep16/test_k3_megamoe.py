@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The dep16 target's MegaMoE routed experts (``kimi_k3_nvfp4__sm_107__dep16/megamoe.py``)
-against the V1 fused-MoE path they replace (``create_moe`` -> ``ConfigurableMoE`` -> the MegaMoE
-CuTe DSL impl), one process per GPU at EP4 with attention DP (4 GPUs of one node, SM100 / SM103 /
-SM107).
+"""The dep16 target's MegaMoE routed experts (``K3MegaMoE`` of
+``kimi_k3_nvfp4__sm_107__dep16/modeling.py``) against the V1 fused-MoE path (``create_moe`` ->
+``ConfigurableMoE`` -> the MegaMoE CuTe DSL impl), one process per GPU at EP4 with attention DP (4
+GPUs of one node, SM100 / SM103 / SM107).
 
 One MoE layer of random checkpoint-format NVFP4 experts (E2M1 codes and power-of-two E4M3 block
 scales drawn directly, weight global scales 1, per-expert power-of-two FC2 input scales) streams

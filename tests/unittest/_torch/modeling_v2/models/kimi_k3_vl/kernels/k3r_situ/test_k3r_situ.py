@@ -3,7 +3,7 @@
 """The family SiTU kernel is ``trtllm::situ_and_mul``'s, launched the same way, bit for bit.
 
 * source (CPU): the Triton kernel and the op's launch code are V1's token for token
-  (``_torch/modules/situ.py``, unchanged since the reference 084745cde4).
+  (``_torch/modules/situ.py``).
 * GPU: ``mv2_kimi_k3_vl::situ_and_mul`` equals ``trtllm::situ_and_mul`` bitwise on Kimi K3's
   widths and caps, other dtypes, a row-strided input, and under CUDA graph replay.
 """

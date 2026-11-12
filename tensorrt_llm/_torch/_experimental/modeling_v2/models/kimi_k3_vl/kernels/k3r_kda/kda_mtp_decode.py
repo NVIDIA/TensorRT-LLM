@@ -14,11 +14,10 @@
 
 """CuTe DSL device kernel for KDA multi-token speculative verify (conv-MTP).
 
-Source-integrated from the ``KDA_decode_mtp`` kernel drop ("readable KDA
-conv-MTP") and restructured for the latency-bound production regime (one CTA
-per (head, request), or a cluster pair of CTAs while the batch is small; TEP8
-launches only ``H * N = 24`` tiles on a 212-SM Rubin). Specialized for the
-benchmarked contract: conv enabled, no bias, optional BF16 gated RMSNorm
+Built for the latency-bound production regime (one CTA per (head, request),
+or a cluster pair of CTAs while the batch is small; TEP8 launches only
+``H * N = 24`` tiles on a 212-SM Rubin). Specialized for the production
+contract: conv enabled, no bias, optional BF16 gated RMSNorm
 output, lower_bound gate, Q/K L2 norm, beta sigmoid, W=4, K == V == 128,
 HV == H, ``TILE_V == V`` (one V pass), 512 threads.
 
@@ -75,14 +74,11 @@ is a strided slice of a larger buffer). The state may be fp32 or bf16; a bf16
 state is exact in tf32 (the ``S0_lo`` sweep is skipped) and the committed state
 is rounded to nearest on the way out.
 
-Measured on Rubin (nsys, state L2-resident) against the previous CUDA-core
-kernel at H=12/num_spec=7 with mixed acceptance: N=2 8.61 us -> 7.07 us,
-N=16 11.78 us -> 9.06 us; H=96/N=16 91.1 us -> 74.2 us. The committed state
-is within 2e-6 of the fp32 kernel (3xTF32), the FP8 output codes differ in
-~0.2 % of the elements by one step; the conv pools and replay caches are
-bit-exact.
+The committed state is within 2e-6 of an fp32 CUDA-core recurrence (3xTF32),
+the FP8 output codes differ in ~0.2 % of the elements by one step; the conv
+pools and replay caches are bit-exact.
 
-``BF16_MMA`` (``TRTLLM_KDA_MTP_BF16_MATH=1``) trades that precision for the
+``BF16_MMA`` (``_BF16_MATH`` of ``mtp_ops.py``) trades that precision for the
 bf16-operand / fp32-accumulate scheme of the prefill kernel: S0 packed as bf16
 in TMEM (64 columns), bf16 K-major smem tiles and K = 16 per instruction (18
 MMAs per CTA instead of 76). Gates, cumulative gates, exponents, reductions
@@ -178,7 +174,7 @@ C_OFF_STAGE = 8192  # phase A staging, after the bf16 S0 box
 
 def swz128(n, k, rows):
     """Element offset of (row n, col k) in a K-major 128B-swizzled fp32 tile with
-    `rows` rows and 128 columns (canonical UMMA layout, see probe_swizzle.py)."""
+    `rows` rows and 128 columns (canonical UMMA layout)."""
     off = n * 32 + (k % 32) + (k // 32) * (rows * 32)
     return off ^ (((off >> 5) & 7) << 2)
 

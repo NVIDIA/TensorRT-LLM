@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Push a BF16 tensor into the Lamport slots of the next MNNVL all-reduce on a workspace (the
-C++ kernels' first phase as a kernel of its own; CuTe DSL, ``kernels/k3_lamport_ar.py``)."""
+C++ kernels' first phase as a kernel of its own; CuTe DSL, ``kernels/k3r_comm/k3_lamport_ar.py``)."""
 
 from __future__ import annotations
 

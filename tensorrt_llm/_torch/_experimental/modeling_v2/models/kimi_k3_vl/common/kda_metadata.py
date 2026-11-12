@@ -52,7 +52,7 @@ __all__ = [
 ]
 
 
-# Granularity of the branch's mid-chunk snapshot offsets (the CuTe DSL prefill kernel's chunk).
+# Granularity of the mid-chunk snapshot offsets (the CuTe DSL prefill kernel's chunk).
 KDA_PREFILL_CHUNK_SIZE = 64
 #: The step alignment of the mid-chunk snapshots the family's cache manager plans
 #: (``KimiK3Sm107MidchunkCacheManager``): offsets are multiples of the prefill chunk.
@@ -195,7 +195,7 @@ class K3MambaMetadata(Mamba2Metadata):
         )
         self.generation_state_indices: torch.Tensor | None = None
 
-        # Rubin agentic branch: an int64 mirror of the state indices, refreshed once per step.
+        # An int64 mirror of the state indices, refreshed once per step.
         self._state_indices_long = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
         self.state_indices_long = self._state_indices_long[:0]
         # The CuTe DSL prefill's varlen chunk table ([num_chunks, 2]: sequence, chunk in it),
@@ -271,7 +271,7 @@ class K3MambaMetadata(Mamba2Metadata):
         )
         self._kda_schedule.copy_(host_schedule, non_blocking=True)
 
-        # The CuTe DSL prefill's varlen chunk table (the branch's, 64-token chunks).
+        # The CuTe DSL prefill's varlen chunk table (64-token chunks).
         num_chunks = sum(
             (length + KDA_PREFILL_CHUNK_SIZE - 1) // KDA_PREFILL_CHUNK_SIZE
             for length in context_lengths

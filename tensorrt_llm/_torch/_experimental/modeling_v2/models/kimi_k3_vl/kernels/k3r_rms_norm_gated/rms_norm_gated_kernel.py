@@ -24,9 +24,8 @@
   fallback for shapes the multi-row kernel does not take.
 * ``_layer_norm_fwd``: the launcher of both for a row-aligned ``z``.
 
-These are the kernels of ``trtllm::rms_norm_gated_token_major`` as the reference Kimi K3 SM107
-runs (``_torch/modules/mamba/layernorm_gated.py`` at 084745cde4); ``test_k3r_rms_norm_gated.py``
-pins them.
+These are the kernels of ``trtllm::rms_norm_gated_token_major``
+(``_torch/modules/mamba/layernorm_gated.py``); ``test_k3r_rms_norm_gated.py`` pins them by digest.
 """
 
 import functools
