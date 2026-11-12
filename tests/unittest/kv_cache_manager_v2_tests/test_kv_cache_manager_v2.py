@@ -9609,7 +9609,7 @@ class TestInitRatioConfig(unittest.TestCase):
         resplit.shutdown()
 
     def test_cold_typical_step_config(self):
-        """cold_typical_step survives replace(), rejects an empty step and floors pageless groups.
+        """cold_typical_step survives replace(), clears to None and rejects an empty step.
 
         A step that gives a pool group no pages still leaves that group a share of the host tier.
         """
@@ -9618,6 +9618,8 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertEqual(
             replace(cfg, layers=cfg.layers).cold_typical_step.kv_caches[0].capacity, 128
         )
+        cfg.cold_typical_step = None
+        self.assertIsNone(cfg.cold_typical_step)
         with self.assertRaises(RuntimeError):
             self._make_hybrid_config(host_quota=64 << 20, cold_typical_step=BatchDesc(kv_caches=[]))
         no_pages = BatchDesc(kv_caches=[KVCacheDesc(capacity=0, history_length=0)])

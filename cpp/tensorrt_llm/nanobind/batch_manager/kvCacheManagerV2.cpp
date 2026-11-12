@@ -2027,6 +2027,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("cold_typical_step", &kv::KVCacheManagerConfig::coldTypicalStep,
+            nb::for_setter(nb::arg("value").none()),
             "Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's "
             "per-layer-group slot-count proportions at cold page sizes.")
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
