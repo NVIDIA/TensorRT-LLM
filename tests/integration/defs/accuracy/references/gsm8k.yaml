@@ -379,6 +379,13 @@ moonshotai/Kimi-K3:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: NVFP4
     accuracy: 95.4
+  # The same NVFP4 KV with DSpark, which verifies against the target: the
+  # disaggregated SM107 modeling_v2 targets
+  # (accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__*/test_accuracy.py).
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: DSpark
+    accuracy: 95.4
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8
