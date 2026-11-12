@@ -83,6 +83,7 @@ def time_layer_copy(
 
 CALIBRATION = ("tensorrt_llm.adaptive_eplb.decode_time_model", 1)
 """Schema and version of a calibration file of the decode time model."""
+TERMS = ("per_active_slot_us", "route_us")  # a calibration file's optional costs per bucket (us)
 
 
 def nvlink_domain_error(comm: object) -> tuple[str | None, int]:
@@ -130,10 +131,10 @@ def calibration_identity(backend: object, ep_size: int, hosts: int, tokens: Sequ
 def load_time_model(
     backend: object, path: str | None, expert_bytes: int, identity: dict, tokens: Sequence[int]
 ) -> tuple[TimeModel | None, str | None]:
-    """The decode time model of ``backend`` from the calibration file at ``path``, a scale per
-    CUDA graph bucket, or else its built-in calibration, which is matched by GPU model only;
-    ``(None, why)`` when neither holds for the ``identity`` of this run or a decode bucket of
-    ``tokens`` tokens per GPU. ``ValueError`` when the file does not have a calibration's layout."""
+    """The decode time model of ``backend`` from the calibration file at ``path`` (per CUDA graph
+    bucket a scale and, where it gives them, :data:`TERMS`), or else its built-in calibration, which
+    is matched by GPU model only; ``(None, why)`` when neither holds for the ``identity`` of this run
+    or a decode bucket of ``tokens`` tokens per GPU. ``ValueError`` when the file is malformed."""
     device = identity["device"]
     if path is None:
         if backend.has_decode_time_model(device):
@@ -155,29 +156,37 @@ def load_time_model(
     reals = {f"rates.{k}": parts[1].get(k) for k in ("hbm_bytes_per_s", "fp4_dense_flops_per_s")}
     reals.update({f"buckets[{i}].scale": b.get("scale") for i, b in enumerate(buckets)})
     bad = [key for key, x in reals.items() if type(x) not in (int, float) or not 0 < x < math.inf]
+    terms = [(f"buckets[{i}].{k}", b[k]) for i, b in enumerate(buckets) for k in TERMS if k in b]
+    bad += [key for key, x in terms if type(x) not in (int, float) or not 0 <= x < math.inf]
     sizes = {f"buckets[{i}].tokens": b.get("tokens") for i, b in enumerate(buckets)}
     bad += [key for key, x in sizes.items() if type(x) is not int or x <= 0]
-    if bad:
-        raise ValueError(f"{path}: {', '.join(bad)} must be positive and finite, tokens integers")
+    if bad:  # rates and scales positive, the per-bucket costs non-negative, tokens integers
+        raise ValueError(f"{path}: {', '.join(bad)} out of range")
     theirs = doc["identity"]
     wrong = [key for key in identity if key != "tactics" and theirs.get(key) != identity[key]]
-    scales = {int(b["tokens"]): float(b["scale"]) for b in doc["buckets"]}
-    wrong += [f"bucket {t}" for t in tokens if t not in scales]
+    bucket_of = {b["tokens"]: b for b in buckets}
+    wrong += [f"bucket {t}" for t in tokens if t not in bucket_of]
     wrong += [
         f"tactic of bucket {t}"
         for t in tokens
-        if t in scales and theirs["tactics"].get(str(t)) != identity["tactics"][str(t)]
+        if t in bucket_of and theirs["tactics"].get(str(t)) != identity["tactics"][str(t)]
     ]
     if wrong:
         return None, f"{path} does not hold for this run: {', '.join(wrong)} differ or are missing"
     rates = (doc["rates"]["hbm_bytes_per_s"], doc["rates"]["fp4_dense_flops_per_s"], 1.0)
     fields = backend.decode_time_model(expert_bytes, device, rates)
-    by_rows = tuple((t * identity["top_k"], k) for t, k in sorted(scales.items()))
+    own = dict(zip(TERMS, (fields["per_active_slot_us"], 0.0)))  # a bucket without them keeps these
+    by_rows = tuple(
+        (t * identity["top_k"], float(b["scale"]), *(float(b.get(k, x)) for k, x in own.items()))
+        for t, b in sorted(bucket_of.items())
+    )
     if doc["measurement"].get("trtllm_version") != tensorrt_llm.__version__:
         logger.warning(
             f"{path} was measured with TensorRT LLM {doc['measurement'].get('trtllm_version')}"
         )
-    return TimeModel(**dict(fields, scale=by_rows[-1][1]), scales=by_rows), None
+    _, scale, read, route = by_rows[-1]
+    fields.update(scale=scale, per_active_slot_us=read)
+    return TimeModel(**fields, scales=by_rows, route_us=route), None
 
 
 def ep_gather(group: dist.ProcessGroup) -> Callable:

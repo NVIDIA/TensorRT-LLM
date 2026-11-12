@@ -5,6 +5,7 @@
 import math
 import subprocess
 import sys
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -275,6 +276,10 @@ def test_evaluate_gains_replica_of_hot_expert_pays():
     assert _gains(load, home, replicated, solved)[0] == pytest.approx((t_cur - t_solved) / 1e3)
     empty = np.zeros((0, GEOMETRY.num_slots), dtype=np.int64)
     assert _gains(np.zeros((0, 16)), empty, empty).shape == (0,)
+    a, b = np.stack([home, replicated]), np.stack([replicated, home])  # a replica pays route_us
+    args = (np.stack([load] * 2), a, even_shares(a), b, even_shares(b))
+    got = evaluate_gains(*args, replace(MODEL, route_us=7.0), GEOMETRY)
+    assert got == pytest.approx([gains[0] - 7e-3, 7e-3 - gains[0]])
 
 
 def test_choose_layers_to_install():
@@ -351,13 +356,9 @@ def test_rate_floor_follows_the_reading_interval():
     assert fresh.plan(5, 5, 2, [1.0], [], CostGrowth(-0.5, 1, 1), None).interval == 3
 
 
-def test_a_step_takes_the_scale_of_the_bucket_it_pads_to():
-    model = TimeModel(1.0, 2.0, 3.0, 4.0, 1.0, 8, scales=((40.0, 0.8), (160.0, 1.1)))
-    assert [model.at(rows).scale for rows in (1.0, 40.0, 41.0, 160.0, 1e6)] == [
-        0.8,
-        0.8,
-        1.1,
-        1.1,
-        1.1,
-    ]
-    assert model.at(41.0).scales == () and model.at(41.0).at(1.0).scale == 1.1
+def test_a_step_takes_the_costs_of_the_bucket_it_pads_to():
+    buckets = ((40.0, 0.8, 5.0, 1.5), (160.0, 1.1, 0.0, 2.0))
+    at = [TimeModel(1.0, 2.0, 3.0, 4.0, 1.0, 8, buckets).at(r) for r in (1, 40, 41, 160, 1e6)]
+    want = [buckets[0][1:]] * 2 + [buckets[1][1:]] * 3
+    assert [(m.scale, m.per_active_slot_us, m.route_us) for m in at] == want
+    assert at[2].scales == () and at[2].at(1.0).scale == 1.1

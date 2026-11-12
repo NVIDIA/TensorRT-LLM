@@ -61,9 +61,11 @@ class TimeModel:
     A GPU's time is ``scale`` times the sum of: ``per_active_slot_us`` for every slot that receives
     rows (streaming its weights), ``per_extra_tile_us`` for every tile of ``tile_rows`` rows a slot
     needs beyond its first, ``per_row_us`` for every row, and ``hot_slot_extra_tile_us`` for every
-    tile beyond the first of the GPU's busiest slot. A layer takes its busiest GPU's time.
-    ``scales`` holds ``(rows, scale)`` per calibrated CUDA graph bucket, ascending by the rows a
-    GPU's tokens route per forward in it (:meth:`at`); empty, ``scale`` holds at every size.
+    tile beyond the first of the GPU's busiest slot. A layer takes its busiest GPU's time, and
+    ``route_us`` more while it holds a replica: the route op's path that spreads an expert's rows.
+    ``scales`` holds ``(rows, scale, per_active_slot_us, route_us)`` per calibrated CUDA graph
+    bucket, ascending by the rows a GPU's tokens route per forward in it (:meth:`at`); empty, the
+    fields hold at every size.
     """
 
     per_active_slot_us: float
@@ -72,15 +74,17 @@ class TimeModel:
     hot_slot_extra_tile_us: float
     scale: float
     tile_rows: int
-    scales: tuple[tuple[float, float], ...] = ()
+    scales: tuple[tuple[float, float, float, float], ...] = ()
+    route_us: float = 0.0
 
     def at(self, rows: float) -> TimeModel:
-        """The model at the scale of the smallest bucket of at least ``rows`` rows per GPU per
-        forward, the bucket a step of that size pads to (the largest bucket beyond them)."""
+        """The model of the smallest bucket of at least ``rows`` rows per GPU per forward, the
+        bucket a step of that size pads to (the largest bucket beyond them)."""
         if not self.scales:
             return self
-        i = bisect.bisect_left([size for size, _ in self.scales], rows)
-        return replace(self, scale=self.scales[min(i, len(self.scales) - 1)][1], scales=())
+        i = bisect.bisect_left([size for size, *_ in self.scales], rows)
+        _, scale, read, route = self.scales[min(i, len(self.scales) - 1)]
+        return replace(self, scale=scale, per_active_slot_us=read, route_us=route, scales=())
 
     @property
     def slope_us(self) -> float:
@@ -114,9 +118,7 @@ def slot_rows(load: np.ndarray, layout: np.ndarray, shares: np.ndarray) -> np.nd
     return rows
 
 
-# ------------------------------------------------------------------------------------------------
-# Layout planner
-# ------------------------------------------------------------------------------------------------
+# --- Layout planner ---
 
 
 def active_slots(geometry: ExpertGeometry) -> int:
@@ -377,9 +379,7 @@ def _one_install(
     return [tuple(sorted(slots)) for slots in kept]
 
 
-# ------------------------------------------------------------------------------------------------
-# Install decisions
-# ------------------------------------------------------------------------------------------------
+# --- Install decisions ---
 
 
 def evaluate_gains(
@@ -395,9 +395,12 @@ def evaluate_gains(
     ms per decode step, for ``load``; an install applies a layout and its shares together."""
     if not len(load):
         return np.zeros(0)
-    t_cur = model.layer_time_us(slot_rows(load, layout, shares), geometry.ep_size)
-    t_new = model.layer_time_us(slot_rows(load, new_layout, new_shares), geometry.ep_size)
-    return (t_cur - t_new) / 1e3
+
+    def time_us(layout: np.ndarray, shares: np.ndarray) -> np.ndarray:  # a replica adds route_us
+        moe = model.layer_time_us(slot_rows(load, layout, shares), geometry.ep_size)
+        return moe + model.route_us * ((layout >= 0).sum(1) > geometry.num_experts)
+
+    return (time_us(layout, shares) - time_us(new_layout, new_shares)) / 1e3
 
 
 def choose_layers_to_install(
@@ -570,12 +573,10 @@ class EvaluationScheduler:
         return EvaluationPlan(interval, open_after)
 
 
-# ------------------------------------------------------------------------------------------------
-# Operands of the ops: the route op (``trtllm::adaptive_eplb_route_into``) maps every routed expert
-# to one of its slots by the tables of build_route_tables and adds the routes to statistics laid out
-# by statistics_buffers; the record op (``trtllm::adaptive_eplb_record``) adds routes alone; the
-# share solver (``trtllm::adaptive_eplb_solve_shares``) splits the rows of replicated experts.
-# ------------------------------------------------------------------------------------------------
+# --- Operands of the ops: the route op (``trtllm::adaptive_eplb_route_into``) maps every routed
+# expert to one of its slots by the tables of build_route_tables and adds the routes to statistics
+# laid out by statistics_buffers; the record op (``trtllm::adaptive_eplb_record``) adds routes alone;
+# the share solver (``trtllm::adaptive_eplb_solve_shares``) splits the rows of replicated experts.
 
 _UINT32_MAX = (1 << 32) - 1
 

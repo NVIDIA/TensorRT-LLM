@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests of the adaptive EPLB balancer and of the hooks the MoE modules call on it."""
 
-import importlib.util
 import json
 import multiprocessing
 import os
+import runpy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -230,7 +230,8 @@ def _calibration(tmp_path, **identity) -> str:
     doc = dict(zip(("schema", "version"), module.CALIBRATION))
     doc.update(identity=dict(dict(mine, tactics={"8": "a", "16": "a"}), **identity))
     doc.update(rates=dict(hbm_bytes_per_s=4e12, fp4_dense_flops_per_s=1e16))
-    doc.update(buckets=[dict(tokens=8, scale=0.8), dict(tokens=16, scale=1.1)])
+    doc.update(buckets=[dict(tokens=8, scale=0.8, per_active_slot_us=0, route_us=1.5)])
+    doc["buckets"].append(dict(tokens=16, scale=1.1))  # without its own costs: the model's
     doc.update(measurement=dict(trtllm_version=tensorrt_llm.__version__))
     (tmp_path / "calibration.json").write_text(json.dumps(doc))
     return str(tmp_path / "calibration.json")
@@ -249,7 +250,7 @@ def test_a_calibration_file_prices_every_decode_bucket_at_its_own_scale(monkeypa
     _, _, seen, warnings = _prepare(monkeypatch, path, device="B200")
     model = seen["start"][0]
     assert seen["priced"][2] == (4e12, 1e16, 1.0) and not warnings
-    assert model.scales == ((16, 0.8), (32, 1.1)) and model.at(20).scale == 1.1
+    assert model.scales == ((16, 0.8, 0.0, 1.5), (32, 1.1, 1.0, 0.0)) and model.route_us == 0.0
 
 
 @pytest.mark.parametrize(
@@ -299,6 +300,7 @@ def test_without_a_file_a_gpu_without_a_built_in_calibration_stays_off(monkeypat
         lambda doc: dict(doc, buckets=[]),
         lambda doc: dict(doc, rates=dict(doc["rates"], hbm_bytes_per_s=0)),
         lambda doc: dict(doc, buckets=[dict(tokens=float("inf"), scale=0.8)]),
+        lambda doc: dict(doc, buckets=[dict(tokens=8, scale=0.8, route_us=-1.0)]),
     ],
 )
 def test_a_file_of_another_layout_ends_in_the_vote(monkeypatch, tmp_path, broken):
@@ -384,12 +386,22 @@ def test_the_nvml_fabric_query_fills_this_gpus_view(monkeypatch):
     assert sent[0][0] is True and sent[0][2] == ("0709" + "00" * 14, 5)
 
 
-def test_a_bucket_is_refused_when_its_held_out_designs_disagree():
+def _tool() -> SimpleNamespace:
     tool = Path(__file__).parents[4] / "examples" / "wide_ep" / "ep_load_balancer"
-    tool = tool / "measure_adaptive_eplb_time_model.py"
-    spec = importlib.util.spec_from_file_location("measure_adaptive_eplb_time_model", tool)
-    measure = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(measure)
+    return SimpleNamespace(**runpy.run_path(str(tool / "measure_adaptive_eplb_time_model.py")))
+
+
+@pytest.mark.parametrize("read", [0.0, 2.0, 4.0])
+def test_a_read_cost_is_fitted_where_the_held_out_designs_confirm_it(read):
+    rng = np.random.default_rng(0)  # 96 designs of 8 GPUs: slots with rows, other terms, zeros
+    terms = np.dstack([rng.integers(1, 17, (96, 8)), rng.uniform(20, 140, (96, 8))]) @ np.eye(2, 4)
+    y = 50.0 + 0.9 * (read * terms[..., 0] + terms[..., 1]).max(1) + rng.normal(0, 0.5, 96)
+    theta, fitted, own = _tool().read_cost(terms, np.r_[4.0, 1, 0, 0], y)
+    assert theta == pytest.approx(read, abs=0.1) and (fitted < own or theta == 4.0)
+
+
+def test_a_bucket_is_refused_when_its_held_out_designs_disagree():
+    measure = _tool()
     rng = np.random.default_rng(0)
     p = rng.uniform(40.0, 160.0, 128)
     y = 70.0 + 0.9 * p + rng.normal(0.0, 0.5, 128)

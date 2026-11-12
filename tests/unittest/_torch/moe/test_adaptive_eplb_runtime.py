@@ -820,7 +820,8 @@ def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tm
 
 def test_a_window_prices_at_the_scale_of_the_bucket_its_busiest_rank_pads_to(monkeypatch):
     gains = []
-    for scales in ((), ((100.0, 2.0), (200.0, 3.0))):
+    read = MODEL.per_active_slot_us  # the buckets differ in their scales alone
+    for scales in ((), ((100.0, 2.0, read, 0.0), (200.0, 3.0, read, 0.0))):
         seen = {}
         spy(monkeypatch, seen)
         decider = FakeDecision(0).decider
