@@ -69,7 +69,12 @@ def _flash_config(**text_overrides) -> PretrainedConfig:
         norm_topk_prob=True,
         n_shared_experts=1,
         tie_word_embeddings=False,
-        linear_attn_config={"num_heads": 64, "head_dim": 128, "gate_lower_bound": -5.0},
+        linear_attn_config={
+            "num_heads": 64,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+        },
     )
     text_config.update(text_overrides)
     return PretrainedConfig(
@@ -394,9 +399,45 @@ def test_fp8_engine_settings_it_does_not_run_are_declined(llm_kwargs, missed):
         (dict(text_overrides=dict(hc_mult=2)), {}, r"text_config geometry .*'hc_mult': 2"),
         (dict(text_overrides=dict(scoring_func="softmax")), {}, "MoE routing .*softmax"),
         (
-            dict(text_overrides=dict(linear_attn_config={"num_heads": 64, "head_dim": 128})),
+            dict(
+                text_overrides=dict(
+                    linear_attn_config={
+                        "num_heads": 64,
+                        "head_dim": 128,
+                        "short_conv_kernel_size": 4,
+                    }
+                )
+            ),
             {},
             "a KDA gate without gate_lower_bound",
+        ),
+        (
+            dict(
+                text_overrides=dict(
+                    linear_attn_config={
+                        "num_heads": 64,
+                        "head_dim": 64,
+                        "short_conv_kernel_size": 4,
+                        "gate_lower_bound": -5.0,
+                    }
+                )
+            ),
+            {},
+            r"KDA .*'head_dim': 64",
+        ),
+        (
+            dict(
+                text_overrides=dict(
+                    linear_attn_config={
+                        "num_heads": 64,
+                        "head_dim": 128,
+                        "short_conv_kernel_size": 3,
+                        "gate_lower_bound": -5.0,
+                    }
+                )
+            ),
+            {},
+            r"KDA .*'short_conv_kernel_size': 3",
         ),
         (
             dict(text_overrides=dict(tie_word_embeddings=True)),
@@ -424,6 +465,8 @@ def test_fp8_engine_settings_it_does_not_run_are_declined(llm_kwargs, missed):
         "mhc-streams",
         "softmax-routing",
         "unbounded-gate",
+        "kda-head-dim",
+        "kda-conv-width",
         "tied-embeddings",
         "mtp2",
         "vanilla-mtp",

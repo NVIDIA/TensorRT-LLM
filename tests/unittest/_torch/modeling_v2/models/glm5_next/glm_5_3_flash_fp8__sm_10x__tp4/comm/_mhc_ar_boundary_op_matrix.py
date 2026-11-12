@@ -43,6 +43,7 @@ WORKSPACE: Any = None
 RANK = 0
 WORLD = 1
 HOST_GROUP: Any = None
+MAPPING: Any = None
 
 MULT, HIDDEN, MIX = 4, 4096, 24
 NORM_EPS, HC_EPS, SINKHORN_EPS, POST_MULT, LAYER_INPUT_EPS = 1e-6, 1e-6, 1e-6, 2.0, 1e-5
@@ -61,6 +62,21 @@ class _HostExchange:
         gathered: List[Any] = [None] * WORLD
         dist.all_gather_object(gathered, obj, group=HOST_GROUP)
         return gathered
+
+
+class _TunerExchange(_HostExchange):
+    """The collectives the autotuner's distributed tuning makes, over the host group."""
+
+    def tp_cp_allgather(self, obj: Any) -> List[Any]:
+        return self.tp_allgather(obj)
+
+    def tp_barrier(self) -> None:
+        dist.barrier(group=HOST_GROUP)
+
+    def tp_cp_broadcast(self, obj: Any, root: int = 0) -> Any:
+        box = [obj]
+        dist.broadcast_object_list(box, src=root, group=HOST_GROUP)
+        return box[0]
 
 
 def _partial(rank: int, rows: int, seed: int) -> torch.Tensor:
@@ -237,6 +253,95 @@ def check_the_gate_discriminates_a_wrong_reduction() -> None:
         raise AssertionError("the band accepted a reduction that dropped a rank")
 
 
+def _partial_with_zero_words(rank: int, rows: int, seed: int) -> torch.Tensor:
+    """``_partial`` with BF16 zero pairs in its first 192 columns: ``(+0.0, -0.0)`` pairs, whose 32-bit
+    word is the Lamport protocol's empty-slot sentinel ``0x80000000``, then ``(+0.0, +0.0)`` and
+    ``(-0.0, -0.0)`` pairs."""
+    partial = _partial(rank, rows, seed)
+    partial[:, 0:64:2] = 0.0
+    partial[:, 1:64:2] = -0.0
+    partial[:, 64:128] = 0.0
+    partial[:, 128:192] = -0.0
+    return partial
+
+
+def check_zero_words_do_not_stall_the_exchange() -> None:
+    """A partial whose 32-bit word equals the empty-slot sentinel is sent as +0.0, so the receivers'
+    polling does not wait on it: the call completes and matches the reference."""
+    for cell in entry.CELLS:
+        rows, seed = cell.spec["rows"], 40
+        inputs = _boundary_inputs(rows, seed)
+        partial = _partial_with_zero_words(RANK, rows, seed)
+        assert (
+            partial[:, :64].view(torch.int32)
+            == torch.tensor(-(2**31), dtype=torch.int32, device="cuda")
+        ).all()
+        out = entry(partial, WORKSPACE, RANK, **inputs, **_scalars(cell))
+        ref = entry.reference(
+            [_partial_with_zero_words(r, rows, seed) for r in range(WORLD)],
+            WORKSPACE,
+            RANK,
+            **inputs,
+            **_scalars(cell),
+        )
+        _compare(out, ref)
+
+
+def check_tuned_fused_hc_tactic_is_shared() -> None:
+    """A cold tuning pass of the decode boundary's ``mhc_fused_hc`` lands every TP rank on one tactic, so
+    the ranks' replicated streams (and the router logits computed from them) stay bitwise equal."""
+    import zlib
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_fused_hc import (  # noqa: E501
+        fused_hc_scratch,
+        fused_hc_tactic,
+        mhc_fused_hc,
+    )
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+
+    for name in ("FORCE_DETERMINISTIC", "FORCE_MHC_KERNEL_DETERMINISTIC"):
+        os.environ.pop(name, None)
+    rows, seed = 4, 50
+    inputs = _boundary_inputs(rows, seed)
+    x = library_allreduce(_partial(RANK, rows, seed))
+    args = (
+        x,
+        inputs["residual"],
+        inputs["post"].unsqueeze(-1),
+        inputs["comb"],
+        inputs["fn"],
+        inputs["scale"],
+        inputs["base"],
+        inputs["norm_weight"],
+        entry.CELLS[0].spec["sinkhorn_iters"],
+        NORM_EPS,
+        HC_EPS,
+        SINKHORN_EPS,
+        POST_MULT,
+        LAYER_INPUT_EPS,
+    )
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(MAPPING, _TunerExchange())
+    try:
+        with autotune():
+            tactic = fused_hc_tactic(*args)
+        tactics = _HostExchange().tp_allgather(tuple(tactic))
+        assert all(t == tactics[0] for t in tactics), (
+            f"the ranks tuned different tactics: {tactics}"
+        )
+        out = mhc_fused_hc(*args, tactic, *fused_hc_scratch(rows, tactic, x.device))
+        torch.cuda.synchronize()
+        digest = zlib.crc32(
+            b"".join(t.contiguous().view(torch.uint8).cpu().numpy().tobytes() for t in out)
+        )
+        digests = _HostExchange().tp_allgather(digest)
+        assert len(set(digests)) == 1, f"the ranks' boundary outputs differ: {digests}"
+    finally:
+        tuner.clear_cache()
+        tuner.setup_distributed_state(MAPPING, None)
+
+
 def check_matches_the_unfused_boundary() -> None:
     """The decode target's wiring of the op against the path it replaces: the library one-shot all-reduce of
     the partials, then the mHC site's ``fused_hc``, on a real ``Mhc`` site.
@@ -295,6 +400,8 @@ CHECKS = (
     check_interleaves_with_the_library_allreduce,
     check_cuda_graph_replay,
     check_the_gate_discriminates_a_wrong_reduction,
+    check_zero_words_do_not_stall_the_exchange,
+    check_tuned_fused_hc_tactic_is_shared,
     check_matches_the_unfused_boundary,
     check_is_valid_rejects_what_the_kernel_cannot_take,
 )
@@ -303,7 +410,7 @@ CHECKS = (
 def _run_one_rank() -> int:
     """Body of one spawned rank: run every check; a failing rank exits nonzero and the launcher kills its
     siblings."""
-    global RANK, WORLD, HOST_GROUP, WORKSPACE, entry, library_allreduce, assert_within_ulp
+    global RANK, WORLD, HOST_GROUP, MAPPING, WORKSPACE, entry, library_allreduce, assert_within_ulp
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -331,6 +438,7 @@ def _run_one_rank() -> int:
     init_pg(dist.group.WORLD, local_group, torch_pybind11_abi())
     communicator.Distributed.get = staticmethod(lambda mapping: _HostExchange())
     mapping = Mapping(world_size=world, rank=rank, gpus_per_node=world, tp_size=world)
+    MAPPING = mapping
 
     entry = boundary_module.mhc_ar_boundary
     group_args = ar_entry.allreduce_group_args(mapping, strategy=int(AllReduceStrategy.ONESHOT))

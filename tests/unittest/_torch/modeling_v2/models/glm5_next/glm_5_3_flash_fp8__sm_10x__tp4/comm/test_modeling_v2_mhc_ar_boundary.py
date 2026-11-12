@@ -25,4 +25,7 @@ def test_mhc_ar_boundary_op_matrix() -> None:
         pytest.skip(
             f"the op runs on {_rank_job.WORLD_SIZE} ranks in one node; {devices} device(s) visible"
         )
+    claimed = [torch.cuda.get_device_capability(i) for i in range(_rank_job.WORLD_SIZE)]
+    if any(capability != (10, 0) for capability in claimed):
+        pytest.skip(f"the op is certified on sm_100; the claimed devices are {claimed}")
     _rank_job.run("mhc_ar_boundary", directory=Path(__file__).resolve().parent)

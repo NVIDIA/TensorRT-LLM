@@ -71,6 +71,9 @@ _FP8_SM = (10, 0)
 # number of mHC streams.
 _FP8_GEOMETRY = {"num_experts_per_tok": 8, "moe_intermediate_size": 2048, "hc_mult": 4}
 
+# The KDA head size and conv width the block-FP8 target's KDA kernels implement.
+_FP8_KDA = {"head_dim": 128, "short_conv_kernel_size": 4}
+
 #: The MoE routing the block-FP8 target's decode, prefill and runner kernels implement
 #: (DeepSeek-V3's noaux_tc): sigmoid scores, top-k over the scores plus the correction bias
 #: in a single group, the selected scores normalized, and one shared expert.
@@ -300,6 +303,7 @@ def fp8_model_refused(model_config: ModelConfig, compute_capability: Tuple[int, 
     routing = fields(FP8_MOE_ROUTING)
     linear = None if text_config is None else _field(text_config, "linear_attn_config")
     gate_lower_bound = None if linear is None else _field(linear, "gate_lower_bound")
+    kda = None if linear is None else {name: _field(linear, name) for name in _FP8_KDA}
     tied = text_config is not None and bool(_field(text_config, "tie_word_embeddings"))
     refused = {
         f"compute capability {compute_capability} (only sm_100)": compute_capability != _FP8_SM,
@@ -307,6 +311,7 @@ def fp8_model_refused(model_config: ModelConfig, compute_capability: Tuple[int, 
         f"text_config geometry {geometry} (only {_FP8_GEOMETRY})": geometry != _FP8_GEOMETRY,
         f"MoE routing {routing} (only {FP8_MOE_ROUTING})": routing != FP8_MOE_ROUTING,
         "a KDA gate without gate_lower_bound": gate_lower_bound is None,
+        f"KDA {kda} (only {_FP8_KDA})": kda != _FP8_KDA,
         "an LM head tied to the embedding": tied,
         f"world_size={mapping.world_size} tp={mapping.tp_size} (only tp4 over 4 ranks)": not (
             mapping.world_size == 4 and mapping.tp_size == 4
