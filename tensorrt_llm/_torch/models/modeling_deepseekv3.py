@@ -2098,11 +2098,15 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
 
     def setup_aliases(self) -> None:
         # `DeepseekV3WeightLoader` binds each MLA `v_b_proj` as a view of the V
-        # rows of `kv_b_proj.weight`; restore that alias for modules whose
-        # weights did not come through the loader (staged MX receivers).
-        for module in self.modules():
-            if isinstance(module, MLA):
-                module.alias_v_b_proj_to_kv_b_proj()
+        # rows of `kv_b_proj.weight`. A staged MX receiver of this exact root
+        # gets its weights without that loader, so restore the view here; after
+        # a loader run it is already bound and nothing changes. Subclasses can
+        # lay out `kv_b_proj` with their own loaders and are not MX-qualified,
+        # so they keep the binding their loader made.
+        if type(self) is DeepseekV3ForCausalLM:
+            for module in self.modules():
+                if isinstance(module, MLA):
+                    module.alias_v_b_proj_to_kv_b_proj()
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):

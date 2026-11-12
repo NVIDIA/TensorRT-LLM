@@ -714,6 +714,37 @@ def test_deepseek_v3_setup_aliases_leaves_a_loaded_producer_unchanged(
 
 @_requires_cutlass_bf16_moe
 @pytest.mark.parametrize(
+    "model_class",
+    [
+        pytest.param(modeling_deepseekv3_mod.GlmMoeDsaForCausalLM, id="glm-5"),
+        pytest.param(modeling_mistral_large3_mod.MistralLarge3ForCausalLM, id="mistral-large-3"),
+        pytest.param(_UnqualifiedDeepseekV3ForCausalLM, id="other-subclass"),
+    ],
+)
+def test_deepseek_v3_subclasses_keep_their_v_b_proj_binding(
+    monkeypatch: pytest.MonkeyPatch, model_class: type[nn.Module]
+) -> None:
+    """`setup_aliases()` restores the `v_b_proj` view only on the exact DeepSeek-V3 root.
+
+    A subclass can lay out `kv_b_proj` with its own loader, so even a
+    separately allocated `v_b_proj` stays the tensor the subclass built.
+    """
+    model = _tiny_model(monkeypatch, model_class=model_class, filled=False)
+    before = [layer.self_attn.v_b_proj for layer in model.model.layers]
+
+    ModelLoader._setup_aliases(model)
+
+    for layer, parameter in zip(model.model.layers, before):
+        attention = layer.self_attn
+        assert attention.v_b_proj is parameter
+        assert (
+            attention.v_b_proj.untyped_storage().data_ptr()
+            != attention.kv_b_proj.weight.untyped_storage().data_ptr()
+        )
+
+
+@_requires_cutlass_bf16_moe
+@pytest.mark.parametrize(
     "config_overrides, expected_layer_mlps, expected_dimension",
     [
         pytest.param(
