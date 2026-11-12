@@ -81,6 +81,17 @@ target_link_libraries(tllm_common_environment PUBLIC tllm::common_cuda)
 set_target_properties(tllm_common_environment
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+if(BUILD_PYT)
+  target_sources(tllm_common_profiler PRIVATE profiler.cpp)
+  # CPU-side Torch libraries keep dynamic NVRTC out of the provider.
+  target_link_libraries(tllm_common_profiler PUBLIC tllm::common_headers
+                                                    torch_cpu c10)
+  # The repository populates json headers without adding its CMake project.
+  target_include_directories(tllm_common_profiler SYSTEM
+                             PUBLIC "${json_SOURCE_DIR}/include")
+
+endif()
+
 add_library(
   common_src OBJECT
   cublasMMWrapper.cpp

@@ -128,3 +128,21 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;common;host")
+
+if(BUILD_PYT)
+  add_tllm_gtest(
+    profilerTest
+    OWNER
+    common
+    SOURCES
+    profilerTest.cpp
+    LINK_LIBRARIES
+    tllm::common_profiler
+    LABELS
+    "unit;common;host")
+  target_compile_definitions(
+    profilerTest
+    PRIVATE
+      TRTLLM_PROFILER_SELECTOR_CASES="${PROJECT_SOURCE_DIR}/../tests/unittest/profiler_selector_cases.json"
+  )
+endif()

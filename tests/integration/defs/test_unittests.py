@@ -17,9 +17,12 @@ import re
 import shlex
 import warnings
 from subprocess import CalledProcessError
-from typing import NoReturn, Optional
+from typing import TYPE_CHECKING, NoReturn, Optional
 
 from defs.conftest import tests_path
+
+if TYPE_CHECKING:
+    from defs.local_venv import PythonVenvRunnerImpl
 
 _MAX_CULPRITS = 20
 
@@ -521,3 +524,54 @@ def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):
         assert testcases, f"MPI rank {rank} collected no tests"
         assert all(case.find("skipped") is None for case in testcases), (
             f"MPI rank {rank} skipped a required TP case")
+
+
+def test_mpi_profiler(llm_root: str, llm_venv: "PythonVenvRunnerImpl",
+                      output_dir: str) -> None:
+    """Run the real MPI profiling contract on two ranks, rejecting skipped runs."""
+    import xml.etree.ElementTree as ET
+
+    from defs.common import venv_mpi_check_call
+
+    output_dir = os.path.abspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    for rank in range(2):
+        report_path = os.path.join(output_dir,
+                                   f"results-mpi-profiler-rank{rank}.xml")
+        if os.path.exists(report_path):
+            os.remove(report_path)
+    test_root = os.path.join(llm_root, "tests", "unittest")
+    case = os.path.join(test_root, "_torch", "distributed",
+                        "test_communicator_profiler.py"
+                        ) + "::test_two_rank_collective_p2p_profiler_smoke"
+    launcher = (
+        "import sys, pytest; from mpi4py import MPI; "
+        "rank = MPI.COMM_WORLD.Get_rank(); output = sys.argv[1]; "
+        "raise SystemExit(pytest.main(sys.argv[2:] + ['-v', '--tb=short', "
+        "f'--junitxml={output}/results-mpi-profiler-rank{rank}.xml']))")
+    venv_mpi_check_call(
+        llm_venv,
+        ["mpirun", "--allow-run-as-root", "-n", "2"],
+        ["-c", launcher, output_dir, case, "-m", "cpu_only"],
+        env={
+            "PYTHONPATH":
+            os.pathsep.join([test_root,
+                             os.environ.get("PYTHONPATH", "")]),
+            "TLLM_PROFILE_CUSTOM_REGIONS":
+            "mpi",
+        },
+        timeout=300,
+    )
+    for rank in range(2):
+        report = ET.parse(
+            os.path.join(output_dir, f"results-mpi-profiler-rank{rank}.xml"))
+        cases = report.findall(".//testcase")
+        assert len(
+            cases) == 1, f"MPI rank {rank} did not run exactly one smoke case"
+        case_result = cases[0]
+        assert case_result.find(
+            "skipped") is None, f"MPI rank {rank} skipped the smoke case"
+        assert case_result.find(
+            "failure") is None, f"MPI rank {rank} failed the smoke case"
+        assert case_result.find(
+            "error") is None, f"MPI rank {rank} errored in the smoke case"
