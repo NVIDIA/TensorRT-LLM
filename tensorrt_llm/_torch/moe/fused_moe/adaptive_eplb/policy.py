@@ -152,10 +152,7 @@ def plan_layout(
     num_experts = geometry.num_experts
     rows = np.asarray(load, dtype=np.float64).tolist()
     homes = np.asarray(home_layout).tolist()
-    home_slot = [-1] * num_experts
-    for slot, expert in enumerate(homes):
-        if expert >= 0:
-            home_slot[expert] = slot
+    home_slot = [slots[0] for slots in _expert_slots_of(homes, num_experts)]
     is_home = [expert >= 0 for expert in homes]
     proposed = _place_replicas(rows, homes, home_slot, geometry, int(total_active_slots))
     installed = _expert_slots_of(np.asarray(current_layout).tolist(), num_experts)
@@ -398,9 +395,8 @@ def evaluate_gains(
     ms per decode step, for ``load``; an install applies a layout and its shares together."""
     if not len(load):
         return np.zeros(0)
-    ep = geometry.ep_size
-    t_cur = model.layer_time_us(slot_rows(load, layout, shares), ep)
-    t_new = model.layer_time_us(slot_rows(load, new_layout, new_shares), ep)
+    t_cur = model.layer_time_us(slot_rows(load, layout, shares), geometry.ep_size)
+    t_new = model.layer_time_us(slot_rows(load, new_layout, new_shares), geometry.ep_size)
     return (t_cur - t_new) / 1e3
 
 
@@ -442,8 +438,7 @@ def copy_ms_per_layer(timings: Sequence[tuple[int, int, float]]) -> float | None
     ``None`` without one."""
     if not timings:
         return None
-    layers = sum(n for _, n, _ in timings)
-    return sum(ms for _, _, ms in timings) / layers
+    return sum(ms for _, _, ms in timings) / sum(n for _, n, _ in timings)
 
 
 def fixed_install_ms(timings: Sequence[tuple[int, int, float]]) -> float | None:
@@ -623,10 +618,7 @@ def build_route_tables(
     layout = [int(e) for e in (layout.tolist() if hasattr(layout, "tolist") else layout)]
     shares = [1.0] * num_slots if shares is None else shares
     shares = [float(s) for s in (shares.tolist() if hasattr(shares, "tolist") else shares)]
-    expert_slots: list[list[int]] = [[] for _ in range(num_experts)]
-    for slot, expert in enumerate(layout):
-        if expert >= 0:
-            expert_slots[expert].append(slot)
+    expert_slots = _expert_slots_of(layout, num_experts)
     counts = [len(copies) for copies in expert_slots]
     if 0 in counts:
         raise ValueError(f"expert {counts.index(0)} has no copy")

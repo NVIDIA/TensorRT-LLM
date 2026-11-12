@@ -257,9 +257,8 @@ class _Decider:
         model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
         self.evaluations.model = model
         gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
-        copy_ms = copy_ms_per_layer(_timings(self.copy_timings))
-        if copy_ms is None:
-            copy_ms = cfg.copy_ms
+        timed = copy_ms_per_layer(_timings(self.copy_timings))
+        copy_ms = cfg.copy_ms if timed is None else timed
         # The home layout is a candidate too: retiring the replicas copies nothing, so it replaces
         # the plan where it gains more than the plan does net of a layer's copy over the steps left.
         home = cfg.home_layouts[planned]
@@ -287,13 +286,12 @@ class _Decider:
             )
             gains = np.minimum(gains, previous_gains)
         gain = dict(zip(planned.tolist(), gains.tolist()))
-        retire = {layer: gain.pop(layer) for layer in planned[to_home].tolist()}
+        retire = [layer for layer in planned[to_home].tolist() if gain.pop(layer) * left > 0.0]
         chosen = choose_layers_to_install(gain, steps_left, copy_ms or 0.0)
         if copy_ms is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
-        # A retirement copies nothing: it pays as soon as it gains.
-        chosen += [layer for layer, g in retire.items() if g * (steps_left or 0.0) > 0.0]
+        chosen += retire  # a retirement copies nothing: it pays as soon as it gains
         growth = self.evaluations.read_cost(
             range(layers), rows, self.layout, self.shares, self.open_call
         )
@@ -728,13 +726,10 @@ class AdaptiveRuntime:
             end = torch.cuda.Event(enable_timing=True)
         begin.record()
         if update.tables:
-            first, end_layer = min(update.tables), max(update.tables) + 1
-            self.tables[first:end_layer].copy_(
-                self._host_tables[first:end_layer], non_blocking=True
-            )
-        end.record()
-        self._apply_events.append((update.window, len(update.tables), begin, end))
-        if update.tables:
+            first, stop = min(update.tables), max(update.tables) + 1
+            self.tables[first:stop].copy_(self._host_tables[first:stop], non_blocking=True)
             self.installs += 1
             self.installed_layers += len(update.tables)
+        end.record()
+        self._apply_events.append((update.window, len(update.tables), begin, end))
         self._event("applied", window=update.window, call=call, layers=sorted(update.tables))

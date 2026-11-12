@@ -526,24 +526,11 @@ def test_a_failed_worker_stops_adaptive_eplb_and_keeps_the_tables(host_cuda):
     assert not runtime.worker.inbox and torch.equal(runtime.tables, before)
 
 
-def test_windows_keep_their_numbers_across_installs(host_cuda, monkeypatch):
-    """A window gathered while an earlier update's tables are still on record is sent to the
-    decision process under its own number."""
-    _, clock, decisions, ranks = spied_ranks(monkeypatch, timed=True)
-    hot = np.tile([400.0, 400.0] + [1.0] * (E - 2), (L, 1)).astype(np.float32)
-    for _ in range(3):  # three more windows: the later ones gather after an install
-        for runtime in ranks:
-            set_statistics(runtime, hot, FORWARDS)
-        run(ranks, clock, 22)
-    sent = [m[1] for m in decisions[0].sent if m[0] == "window"]
-    assert sent == list(range(len(sent))) and len(sent) >= 3
-    assert [r["window"] for r in records(ranks[0])] == sent
-
-
 def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
     """Real deciders on both ranks: a window that replicates the two hot experts gives every rank
-    its own copy items, the same digest, and new tables on both."""
-    _, clock, _, ranks = spied_ranks(monkeypatch, timed=True)
+    its own copy items, the same digest, and new tables on both. A window gathered while an
+    earlier update's tables are still on record is sent under its own number."""
+    _, clock, decisions, ranks = spied_ranks(monkeypatch, timed=True)
     hot = np.tile([400.0, 400.0] + [1.0] * (E - 2), (L, 1)).astype(np.float32)
     for runtime in ranks:
         set_statistics(runtime, hot, FORWARDS)
@@ -566,6 +553,13 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
         counters = runtime.counters()  # what the executor reports in its iteration statistics
         assert counters["installs"] == 1 and counters["installedLayers"] == 2
         assert counters["windows"] >= 1
+    for _ in range(2):  # two more windows, gathered after the install
+        for runtime in ranks:
+            set_statistics(runtime, hot, FORWARDS)
+        run(ranks, clock, 22)
+    sent = [m[1] for m in decisions[0].sent if m[0] == "window"]
+    assert sent == list(range(len(sent))) and len(sent) >= 3
+    assert [r["window"] for r in records(ranks[0])] == sent
 
 
 def test_no_boundary_runs_while_a_graph_is_captured(monkeypatch):
@@ -634,17 +628,6 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
     assert sorted(window(2, 2).tables) == [0, 1]  # gains on both windows: installed
 
 
-def test_even_rows_keep_every_layer_home(monkeypatch):
-    monkeypatch.setattr(rt, "solve_shares", even_split)
-    decider = FakeDecision(0, copy_ms=0.5).decider
-    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
-    for w in range(3):  # a replica adds a weight stream to its GPU and offloads none: never planned
-        window_stats(decider.stats, range(E))
-        assert decider.decide(w).tables == {}
-        decider.schedule(w, np.array([[10 + 20 * w, 0, 0.0, 0]] * R))
-    assert (decider.layout == HOME).all()
-
-
 def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
     decider = FakeDecision(0, copy_ms=0.5).decider
@@ -652,10 +635,14 @@ def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
     window_stats(decider.stats)  # GPU 0's experts 0 and 1 are hot: both layers take replicas
     assert decider.decide(0).moved == [0, 1]
     decider.schedule(0, np.array([[10, 2, 1.0, 0]] * R))
-    window_stats(decider.stats, range(E))[:, L * (E + 1) : L * (E + 2)] = 0  # even rows, installs live
-    update = decider.decide(1)
-    assert sorted(update.tables) == [0, 1] and update.moved == [] and not update.copy_items
-    assert (decider.layout == HOME).all()
+    # Even rows, installs live: a replica adds a weight stream to its GPU and offloads none, so
+    # both layers retire theirs without a copy, and the next window plans none again.
+    for w in (1, 2):
+        window_stats(decider.stats, range(E))[:, L * (E + 1) : L * (E + 2)] = w - 1
+        update = decider.decide(w)
+        assert sorted(update.tables) == ([0, 1] if w == 1 else []) and update.moved == []
+        assert not update.copy_items and (decider.layout == HOME).all()
+        decider.schedule(w, np.array([[10 + 20 * w, 0, 0.0, 0]] * R))
 
 
 def test_decision_process_answers_and_reports_its_failure():

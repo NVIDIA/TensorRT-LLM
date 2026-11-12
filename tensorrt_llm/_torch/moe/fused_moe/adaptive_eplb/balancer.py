@@ -102,14 +102,7 @@ def nvlink_domain_error(comm: object) -> tuple[str | None, int]:
         pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
         if info.state == pynvml.NVML_GPU_FABRIC_STATE_COMPLETED:
             fabric = (bytes(info.clusterUuid).hex(), int(info.cliqueId))
-    except (
-        pynvml.NVMLError,
-        RuntimeError,
-        AttributeError,
-        TypeError,
-        ValueError,
-        ctypes.ArgumentError,
-    ):
+    except Exception:  # noqa: BLE001 - whatever fails, this rank still votes
         pass
     views = comm.allgather((up, socket.gethostname(), fabric))
     hosts = len({host for _, host, _ in views})
@@ -303,8 +296,7 @@ class AdaptiveMoeLayerLoadBalancer:
         graph capture, where the device flag gates every replay.
         """
         statistics = self.statistics
-        pending = self._pending
-        self._pending = None
+        pending, self._pending = self._pending, None
         if pending is not None:
             statistics.record(*pending, self._live_rows(pending[0]))
         if self.manager.recording or (
@@ -330,8 +322,7 @@ class AdaptiveMoeLayerLoadBalancer:
         into the backend's staging and returns a view of it, which the backend does not stage again.
         """
         ids = token_selected_experts
-        pending = self._pending
-        self._pending = None
+        pending, self._pending = self._pending, None
         if pending is not None and pending[0] is not ids:
             self.statistics.record(*pending, self._live_rows(pending[0]))
             pending = None
@@ -350,17 +341,14 @@ class AdaptiveMoeLayerLoadBalancer:
         else:
             out = staging.topk_idx
             weights = (token_final_scales, staging.topk_weights)
-        if pending is None:
-            statistics_args = (None, None, None, True)
-        else:
-            statistics_args = (*self.statistics, pending[1])
+        stats = (None, None, None, True) if pending is None else (*self.statistics, pending[1])
         self._route_into(
             ids,
             *self._tables,
             self.manager.ep_rank,
             out,
             *weights,
-            *statistics_args,
+            *stats,
             self._live_rows(ids),
         )
         if overlap_fn is not None:

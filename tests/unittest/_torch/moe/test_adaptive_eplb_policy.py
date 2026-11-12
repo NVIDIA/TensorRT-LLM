@@ -68,13 +68,10 @@ def test_the_policy_imports_with_numpy_alone():
     assert done.returncode == 0 and done.stdout.split() == ["plan_layout"], done.stderr
 
 
-def test_geometry_home_layout():
+def test_home_layout_and_slot_rows():
     home = [0, 1, 2, 3, -1, -1, 4, 5, 6, 7, -1, -1, 8, 9, 10, 11, -1, -1, 12, 13, 14, 15, -1, -1]
     assert GEOMETRY.home_layout().tolist() == home
     assert MODEL.slope_us == MODEL.scale * (MODEL.per_extra_tile_us / 256 + MODEL.per_row_us)
-
-
-def test_slot_rows():
     layout = np.array(
         [[0, 1, 2, 3, 0, -1, 4, 5, 6, 7, 0, 4, 8, 9, 10, 11, -1, -1, 12, 13, 14, 15, -1, -1]]
     )
@@ -209,21 +206,16 @@ def test_replica_goes_to_the_least_loaded_gpu_and_ties_to_the_lower_gpu():
     assert plan.layout.tolist() == _layout(SMALL, {2: 7}).tolist()
     plan = _plan([5.0, 5.0, 1.0, 1.0, 3.0, 3.0, 1.0, 10.0], total=9)
     assert plan.layout.tolist() == _layout(SMALL, {6: 7}).tolist()
-
-
-def test_second_copy_on_a_gpu_when_every_gpu_with_room_holds_the_expert():
+    # Every GPU with room holds the expert: a second copy on a GPU.
     plan = _plan([100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
     assert plan.expert_slots[0] == (0, 2, 6, 10, 14)
     assert plan.layout.tolist() == _layout(SMALL, {2: 0, 6: 0, 10: 0, 14: 0}).tolist()
 
 
-def test_installed_replica_keeps_its_slot_on_the_same_gpu():
+def test_installed_replicas_keep_their_slots():
     current = _layout(SMALL, {7: 7})
     plan = _plan([5.0, 5.0, 1.0, 1.0, 3.0, 3.0, 1.0, 10.0], current=current, total=9)
-    assert plan.layout.tolist() == current.tolist()
-
-
-def test_gpu_without_free_slots_keeps_an_installed_replica_instead_of_a_new_one():
+    assert plan.layout.tolist() == current.tolist()  # on the same GPU
     # GPU 1's free slots hold replicas of experts 0 and 4; the plan wants a replica of expert 6
     # there, so GPU 1 keeps expert 0's replica (rows per copy tie with expert 4's, smaller id).
     current = _layout(SMALL, {6: 0, 7: 4})
