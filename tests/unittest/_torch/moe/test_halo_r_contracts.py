@@ -790,6 +790,43 @@ def _function_body(source: str, signature: str) -> str:
     raise ValueError(f"unbalanced body of {signature}")
 
 
+_CXX_STRINGS_AND_COMMENTS = re.compile(
+    r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*[\s\S]*?\*/'
+)
+_CUDA_CALLEE = re.compile(r"(?:\w*::)*(cuda[A-Z]\w*|cu[A-Z]\w*|kernels::launch\w+)")
+
+
+def _cuda_call_wrappers(body: str) -> list[tuple[str, str]]:
+    """``(wrapper, call)`` for every CUDA runtime/driver call and kernel launch in ``body``.
+
+    ``wrapper`` names the call (or ``if``/``while``/``return (``) whose first
+    argument is the CUDA call, or is ``""`` when the CUDA call stands anywhere
+    else (a bare statement, an assignment, a later argument). A ``<<<`` launch
+    is listed as ``("", "<<<")``.
+    """
+    code = _CXX_STRINGS_AND_COMMENTS.sub(
+        lambda match: '""' if match.group(0)[0] in "\"'" else " ", body
+    )
+    calls = [("", "<<<")] * code.count("<<<")
+    open_calls = []  # (callee name, index of its "(") for every unclosed parenthesis
+    for index, char in enumerate(code):
+        if char == "(":
+            # The callee, with any template arguments: cudaX<K>(...) is a call of cudaX.
+            window = max(0, index - 256)
+            callee = re.search(r"([\w:]*)\s*(?:<[^<>;{}()]*>)?\s*$", code[window:index])
+            name = callee.group(1)
+            cuda = _CUDA_CALLEE.fullmatch(name)
+            if cuda is not None:
+                outer = open_calls[-1] if open_calls else None
+                start = window + callee.start()
+                direct = outer is not None and not code[outer[1] + 1 : start].strip()
+                calls.append((outer[0] if direct else "", cuda.group(1)))
+            open_calls.append((name, index))
+        elif char == ")" and open_calls:
+            open_calls.pop()
+    return calls
+
+
 def _assert_in_order(text: str, parts) -> None:
     positions = [text.index(part) for part in parts]
     assert positions == sorted(positions), parts
@@ -824,9 +861,28 @@ def test_native_submit_orders_copy_after_main_and_poisons_on_any_cuda_error() ->
     )
     # Capture is allowed: every value the launch hands the device is constant.
     assert "cudaStreamIsCapturing" not in submit and "kReadyGeneration," in source
-    # Every CUDA call of a launch goes through the sticky poison.
-    calls = re.findall(r"(\w*)\(\s*(cuda\w+|kernels::launch\w+)\(", submit)
-    assert calls and all(wrapper == "poisonOnError" for wrapper, _ in calls)
+    # Every CUDA call of a launch, nested or bare, goes through the sticky poison.
+    assert _cuda_call_wrappers(submit) == [
+        ("poisonOnError", "cudaEventRecord"),
+        ("poisonOnError", "cudaStreamWaitEvent"),
+        ("poisonOnError", "kernels::launchMoeRebalanceHaloR"),
+    ]
+    # The launch hands the launch error back to that poison.
+    launch = _function_body(
+        (_KERNELS / "moeRebalanceHaloR.cu").read_text(), "cudaError_t launchMoeRebalanceHaloR("
+    )
+    assert _cuda_call_wrappers(launch) == [("", "cudaLaunchKernelExC")]
+    assert "return cudaLaunchKernelExC(" in launch
+    # Outside the poison, the op makes only these CUDA calls: event creation, which the
+    # constructor checks; the route wait's driver call, which poisons by hand; the poison's
+    # message; and the best-effort event release.
+    unwrapped = [call for call in _cuda_call_wrappers(source) if call[0] != "poisonOnError"]
+    assert unwrapped == [
+        ("", "cudaEventCreateWithFlags"),
+        ("", "cuStreamBatchMemOp"),
+        ("", "cudaGetErrorString"),
+        ("static_cast", "cudaEventDestroy"),
+    ]
     poison = _function_body(source, "void poisonOnError(cudaError_t error")
     assert "mPoison = error;" in poison
     # The routes stay alive through the group's route hold, not an allocator stream.
@@ -1374,6 +1430,17 @@ def test_native_route_wait_and_join_are_constant_and_poisoned_together() -> None
             "mPoison = ",
         ),
     )
+    # The driver's batched wait reports a CUresult, which poisons by hand (above);
+    # every other CUDA call of the wait goes through the sticky poison.
+    assert _cuda_call_wrappers(wait) == [
+        ("poisonOnError", "cudaStreamWaitEvent"),
+        ("", "cuStreamBatchMemOp"),
+    ]
+    assert re.search(
+        r"CUresult const result = cuStreamBatchMemOp\([^;]*\);\s*"
+        r"if \(result != CUDA_SUCCESS\)\s*\{\s*mPoison = ",
+        wait,
+    )
     join = _function_body(source, "void join()")
     _assert_in_order(
         join,
@@ -1384,6 +1451,15 @@ def test_native_route_wait_and_join_are_constant_and_poisoned_together() -> None
             "poisonOnError(cudaStreamWaitEvent(execution, mCopyIdle, 0)",
         ),
     )
+    assert _cuda_call_wrappers(join) == [
+        ("poisonOnError", "cudaEventRecord"),
+        ("poisonOnError", "cudaStreamWaitEvent"),
+    ]
+    counts = _function_body(source, "std::vector<std::int64_t> relayCounts()")
+    assert _cuda_call_wrappers(counts) == [
+        ("poisonOnError", "cudaMemcpyAsync"),
+        ("poisonOnError", "cudaStreamSynchronize"),
+    ]
     operational = _function_body(source, "void requireOperational() const")
     assert "mPoison == cudaSuccess" in operational
 
