@@ -7,6 +7,22 @@ operand stages, the compact SFB chunk, the FC1 staging tile and the tagged hand-
 scale with it (``geometry``); everything below is written for the ``ntok = 8`` build,
 whose constants are the module's ``NTOK`` ones.
 
+Batch builds (``overlap``; ``ntok`` 16 or 32, windows of at most 64 experts): a CTA
+runs all its FC1 tiles before its first FC2 tile, so once the MMAs of its last FC1 tile
+have read activation k-block ``kb`` that B stage holds FC2 operand k-block ``kb``
+instead. The FC2 image is one buffer over the activation's 16 B stages (and their SFB
+stages), each k-block with its own empty barrier, which the MMA warp commits after the
+CTA's last FC1 tile and after each FC2 tile; the fetch warps write k-block ``kb`` of FC2
+tile ``j2`` once commit ``j2 + had_fc1`` there has completed (the stage's previous
+reader; the parity wait is exact because the commit before it was waited for by the
+previous tile's copy). The B operand then costs 16 stages, not 48, which leaves the
+weight ring its six stages at 32 token columns (the 16-column wide build keeps four).
+The activation is loaded by the epilogue warps as well (idle until the first
+accumulator) and lands in groups of ``X_GROUP_KB`` k-blocks, each with its own barrier,
+so the first FC1 MMAs wait for the first group only. Everything else -- the tile list,
+the arithmetic, the tagged hand-off, the row map -- is the ``ntok = 8`` kernel's, so a
+routed row is bitwise the same in every build.
+
 One launch per MoE layer replaces TRTLLM-gen's routing-indices kernel, FC1
 and FC2 for the rows of one expert-parallel window of ``L`` local experts
 (32 = this rank's own block, 64 = the ring-buddy stack, 96 = the
@@ -58,6 +74,30 @@ than 65 launches while the 32-bit counter repeats only every 2^32 - 1.
 Warp roles: 0-3 epilogue (TMEM lanes 0-127), 4 MMA, 5 weight TMA, 6-7 load
 the activation operand, then fetch the FC2 operand images (k-blocks 0-7 and
 8-15).
+
+Interleaved fetch (``fetch_kb != 0``, a batch build with the tagged hand-off only; compiled
+out otherwise). The two fetch warps take the FC2 k-blocks alternately (warp ``h`` serves
+``h, h + 2, ..., h + 14``, in the MMA's order) instead of halves, and a 32-column build polls
+``fetch_kb`` k-blocks per pass (one, as without it, at ``fetch_kb = 1``). The k-blocks an FC2
+tile waits for after the last FC1 round (its last ones) are then polled by both warps instead
+of one warp in series, and both warps deliver in the order the MMA consumes. The same words
+land in the same shared-memory bytes behind the same barriers: only which warp moves a
+k-block, and when, changes.
+
+In-kernel placement (``place_rank >= 0``, a batch build on the 64-expert ring-buddy window;
+compiled out otherwise). ``ids`` are the step's selected global expert ids (0..255) instead of
+``ring_buddy_assign``'s window ids, and every CTA derives the window ids itself: the balanced
+ring placement of ``ops/moe/ring_buddy_assign`` (8 ranks of 32-expert blocks, ``balance`` on)
+for rank ``place_rank``, statement for statement in integers (``_place_census``,
+``_place_flow``, ``_place_local``), so the expert call needs no placement launch before it.
+Ids outside 0..255 are treated as not local. The scratch (census, per-block maxima, moves) is
+the FC1 staging buffer, which nothing reads or writes before the first accumulator.
+
+Early start (``early_start != 0``, a batch build only; compiled out otherwise). The
+kernel's same-stream predecessor (``ops/moe/ring_buddy_assign`` with ``early_trigger``)
+triggers its dependents right after its own dependency wait, so this grid launches,
+allocates and initializes while the predecessor computes the ids, and reads its epoch
+(its own workspace word) before its wait; everything else is read after it.
 
 Early ids (``early_expert_ids``, ``early_ids != 0``; compiled out otherwise). The
 kernel's same-stream predecessor (``ops/comm/pool_gather_route``) publishes
@@ -136,9 +176,22 @@ HSTAGE_BYTES = HSTAGE_SF + NTOK * 4
 #: Workspace bytes per slot, enough for either hand-off.
 WS_SLOT_BYTES = max(IMG_BYTES, TAG_SLOT_BYTES)
 
+# mbarriers (besides the ring and accumulator pipelines)
+X_BAR = 0
+#: A batch build's activation lands in groups of this many k-blocks, each with its own
+#: barrier (``X_BAR + g``), so the first FC1 MMAs need only the first group.
+X_GROUP_KB = 4
+IMG_FULL_BAR = 1  # IMG_BUFS x FC2_KB, one per (buffer, k-block)
+IMG_EMPTY_BAR = IMG_FULL_BAR + IMG_BUFS * FC2_KB  # one per buffer
+NUM_BAR = IMG_EMPTY_BAR + IMG_BUFS
+
 #: Token columns a build is compiled for: the 8-row decode step, and the wide build of a
 #: TP4 decode step of two requests.
 NTOKS = (8, 16)
+#: Token columns of the batch builds (``overlap``): TP8 decode steps of two (16) and of
+#: three or four requests (32) at K = 7. 32 token rows fill each 128-row scale atom's
+#: 32-row group, so the compact SFB chunk is the whole 512-byte atom there.
+BATCH_NTOKS = (16, 32)
 
 
 class Geometry:
@@ -148,16 +201,29 @@ class Geometry:
     ``0 .. ntok - 1`` of each 128-row scale chunk (``16 ntok`` bytes apart); the FC1 tile's
     staged output is ``ntok`` rows x 32 code bytes then ``ntok`` x 4 scale bytes; a tagged
     tile is those ``9 ntok`` words.
+
+    ``overlap`` (a batch build): the FC2 operand image reuses the activation's B stages
+    (16 B stages, not 48) through one image buffer whose k-blocks each have an empty
+    barrier (``img_empty_bar + kb``); see the module docstring.
     """
 
-    def __init__(self, ntok: int):
-        assert ntok in NTOKS, ntok
+    def __init__(self, ntok: int, overlap: bool = False):
+        assert ntok in (BATCH_NTOKS if overlap else NTOKS), (ntok, overlap)
         self.ntok = ntok
+        self.overlap = bool(overlap)
+        self.b_stages = FC1_KB if overlap else B_STAGES
+        self.img_bufs = 1 if overlap else IMG_BUFS
+        self.img_stage0 = X_STAGE0 if overlap else IMG_STAGE0
+        # the activation's barriers: one, or one per X_GROUP_KB k-blocks in a batch build
+        self.x_bars = FC1_KB // X_GROUP_KB if overlap else 1
+        self.img_full_bar = X_BAR + self.x_bars
+        self.img_empty_bar = self.img_full_bar + self.img_bufs * FC2_KB
+        self.num_bar = self.img_empty_bar + (FC2_KB if overlap else self.img_bufs)
         self.route = ntok * TOP_K  # (token, k) routing lanes
         self.b_stage_bytes = ntok * KTILE // 2
         self.sfb_chunk = 16 * ntok
         self.sfb_stage = 4 * self.sfb_chunk
-        self.sfb_bytes = (B_STAGES - 1) * self.sfb_stage + 3 * self.sfb_chunk + 512
+        self.sfb_bytes = (self.b_stages - 1) * self.sfb_stage + 3 * self.sfb_chunk + 512
         self.img_b_bytes = FC2_KB * self.b_stage_bytes
         self.img_sf_bytes = FC2_KB * self.sfb_stage
         self.img_bytes = self.img_b_bytes + self.img_sf_bytes
@@ -186,6 +252,12 @@ assert (
     _G8.hstage_sf,
     _G8.hstage_bytes,
     _G8.ws_slot_bytes,
+    _G8.b_stages,
+    _G8.img_bufs,
+    _G8.img_stage0,
+    _G8.img_empty_bar,
+    _G8.num_bar,
+    _G8.img_full_bar,
 ) == (
     B_STAGE_BYTES,
     SFB_CHUNK_STRIDE,
@@ -198,6 +270,12 @@ assert (
     HSTAGE_SF,
     HSTAGE_BYTES,
     WS_SLOT_BYTES,
+    B_STAGES,
+    IMG_BUFS,
+    IMG_STAGE0,
+    IMG_EMPTY_BAR,
+    NUM_BAR,
+    IMG_FULL_BAR,
 )
 
 # Warp roles
@@ -211,12 +289,9 @@ NUM_THREADS = 32 * NUM_WARPS
 BAR_EPI = 1  # named barrier of the epilogue warps
 BAR_X = 2  # named barrier of the activation loaders
 BAR_ROUTE = 3  # named barrier of every warp but the weight TMA warp (routing)
-
-# mbarriers (besides the ring and accumulator pipelines)
-X_BAR = 0
-IMG_FULL_BAR = 1  # IMG_BUFS x FC2_KB, one per (buffer, k-block)
-IMG_EMPTY_BAR = IMG_FULL_BAR + IMG_BUFS * FC2_KB  # one per buffer
-NUM_BAR = IMG_EMPTY_BAR + IMG_BUFS
+#: Threads that load the activation in a batch build (``_load_x_batch``): the epilogue
+#: warps and warps 6-7.
+X_LOADERS = 32 * (EPI_WARPS + NUM_WARPS - X_WARP0)
 
 TMEM_COLS = 128
 TMEM_SFA_COL = 64
@@ -233,6 +308,15 @@ RCP6_F32 = 0.16666667163372039794921875
 
 # Workspace words per CTA (launch epochs)
 MAX_CTAS = 1024
+
+# In-kernel placement (``place_rank``): ``ring_buddy_assign``'s tep8 ring of 8 ranks of 32-expert
+# blocks, and its scratch words in the FC1 staging buffer (``hstage``): the per-block census,
+# each block's smallest feasible maximum, and each block's moves to its successor.
+RING = 8
+RING_BLOCK = 32
+PLACE_CENSUS = 0
+PLACE_NEED = RING
+PLACE_MOVED = 2 * RING
 
 # Stress-test delay sites (``delay`` bits; compiled out when 0). A
 # pseudo-random third of the CTAs, re-drawn every launch, spins 1..6 units of
@@ -284,16 +368,48 @@ class PersistentExpertsKernel:
         early_deadline_ns: int = 100_000,
         early_poll_ns: int = 32,
         ntok: int = NTOK,
+        overlap: int = 0,
+        early_start: int = 0,
+        fetch_kb: int = 0,
+        place_rank: int = -1,
     ):
         assert num_ctas <= MAX_CTAS
         assert num_local in (32, 64, 96)
         # fastroute's warp-local bit set is two words wide
         assert num_local <= 64 or fastroute == 0, "fastroute supports windows up to 64"
-        self.g = Geometry(ntok)
+        # Early start is built for the batch builds; the early-ids variant has its own entry.
+        assert early_start in (0, 1), early_start
+        assert early_start == 0 or (overlap != 0 and early_ids == 0), (
+            "the persistent kernel's early start is built for the batch builds without early ids"
+        )
+        # Interleaved fetch: k-blocks per polling pass of a 32-column build (a divisor of the
+        # eight k-blocks a fetch warp serves), on the batch builds' tagged hand-off.
+        assert fetch_kb in (0, 1, 2, 4), fetch_kb
+        assert fetch_kb == 0 or (overlap != 0 and handoff != 0), (
+            "the persistent kernel's interleaved fetch is built for the batch builds' tagged "
+            "hand-off"
+        )
+        # In-kernel placement: the batch builds on the two-window (64-expert) ring-buddy stack,
+        # with the routing through shared memory, the default entry and plain ids.
+        assert -1 <= place_rank < RING, place_rank
+        assert place_rank < 0 or (
+            overlap != 0
+            and num_local == 2 * RING_BLOCK
+            and early_ids == 0
+            and early_start == 0
+            and fastroute == 0
+        ), "the persistent kernel's in-kernel placement is built for the batch builds' 64-window"
+        self.g = Geometry(ntok, overlap != 0)
+        assert place_rank < 0 or (PLACE_MOVED + RING) * 4 <= self.g.hstage_bytes
         self.ntok = ntok
         assert acc_stages * ntok <= TMEM_SFA_COL
         # A wide build's slot table keeps 64 slots: at most 64 distinct local experts.
         assert ntok == NTOK or (num_local <= 64 and early_ids == 0)
+        # A batch build's fetch warps wait on per-k-block empty barriers (``_fetch_images``,
+        # ``_fetch_tagged``); the fast route (the TMA warp's own routing) is not built for it.
+        assert overlap == 0 or fastroute == 0, (
+            "the persistent kernel's batch builds take the routing through shared memory"
+        )
         if early_ids != 0 and (fastroute != 0 or early_fallbacks == 0):
             # The fast route reads the ids from global memory in the TMA warp,
             # which never waits in early mode.
@@ -321,6 +437,9 @@ class PersistentExpertsKernel:
         self.early_fallbacks = early_fallbacks
         self.early_deadline_ns = early_deadline_ns
         self.early_poll_ns = early_poll_ns
+        self.early_start = early_start
+        self.fetch_kb = fetch_kb
+        self.place_rank = place_rank
         self.sf_vec_size = 16
         self.cta_group = tcgen05.CtaGroup.ONE
         self.mma_inst_mn = (128, ntok)
@@ -355,12 +474,12 @@ class PersistentExpertsKernel:
             self.tiled_mma, self.mma_tiler, self.sf_vec_size, self.num_stages
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            self.tiled_mma, self.mma_tiler, cutlass.Float4E2M1FN, B_STAGES
+            self.tiled_mma, self.mma_tiler, cutlass.Float4E2M1FN, self.g.b_stages
         )
         # Standard SFB layout (defines the TMEM layout) and the compact SMEM
         # layout actually used for storage (see SFB_CHUNK_STRIDE and ``Geometry``).
         self.sfb_smem_layout_std = blockscaled_utils.make_smem_layout_sfb(
-            self.tiled_mma, self.mma_tiler, self.sf_vec_size, B_STAGES
+            self.tiled_mma, self.mma_tiler, self.sf_vec_size, self.g.b_stages
         )
         self.sfb_smem_layout_staged = cute.make_layout(
             self.sfb_smem_layout_std.shape,
@@ -435,7 +554,7 @@ class PersistentExpertsKernel:
         class SharedStorage:
             ring_mbar: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, 2 * self.acc_stages]
-            b_mbar: cute.struct.MemRange[cutlass.Int64, NUM_BAR]
+            b_mbar: cute.struct.MemRange[cutlass.Int64, self.g.num_bar]
             tmem_holding: cutlass.Int32
             hstage: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int64, self.g.hstage_bytes // 8], 16
@@ -578,7 +697,7 @@ class PersistentExpertsKernel:
         b_mbar = storage.b_mbar.data_ptr()
         if warp_idx == MMA_WARP:
             with cute.arch.elect_one():
-                for i in cutlass.range_constexpr(NUM_BAR):
+                for i in cutlass.range_constexpr(self.g.num_bar):
                     cute.arch.mbarrier_init(b_mbar + i, 1)
         cute.arch.mbarrier_init_fence()
         if warp_idx == 0:
@@ -601,51 +720,84 @@ class PersistentExpertsKernel:
             s_slot_k[tidx + i * NUM_THREADS] = Int32(TOP_K)  # above every slot index (atomic min)
         if tidx < self.bitmap_words:
             s_bitmap[tidx] = Uint32(0)
+        if cutlass.const_expr(self.place_rank >= 0):
+            if tidx < RING:
+                ptx.sts_u32(
+                    Int32(storage.hstage.data_ptr().toint()) + (PLACE_CENSUS + tidx) * 4, Uint32(0)
+                )
         cute.arch.sync_threads()
         if tidx == 0:
             self._stamp(trace_addr, cta, TR_ENTRY)
 
-        # Everything below reads tensors written by earlier kernels or touches
-        # the workspace shared with the previous launch. With early ids only the
-        # epoch (this grid's own workspace word; the previous launch completed
-        # before the predecessor's wait returned, and the predecessor triggers
-        # after that wait) and the tagged ids are read before the wait below.
-        if cutlass.const_expr(self.early_ids == 0):
-            cute.arch.griddepcontrol_wait()
-        # With ``fastroute`` the weight TMA warp routes on its own
-        # (``_tma_producer``) and skips the CTA's routing barriers, so its first
-        # loads go out one ids load after the wait.
-        epoch = Uint32(0)
-        if cutlass.const_expr(self.fastroute == 0):
+        if cutlass.const_expr(self.early_start != 0):
+            # Early start: the predecessor (``ring_buddy_assign``) released this grid right
+            # after its own dependency wait, so every grid before it has completed, the
+            # previous launch on this workspace included: the epoch word (this grid's own)
+            # is final and is read before the wait. The ids the predecessor writes, the
+            # activation and everything else are read after it.
             epoch = self._next_epoch(epoch_addr, cta)
-        else:
-            if warp_idx != TMA_WARP:
-                epoch = self._next_epoch(epoch_addr, cta)
-        if cutlass.const_expr(self.early_ids == 0):
+            cute.arch.griddepcontrol_wait()
             if tidx == 0:
                 self._stamp(trace_addr, cta, TR_WAITED)
+        else:
+            # Everything below reads tensors written by earlier kernels or touches
+            # the workspace shared with the previous launch. With early ids only the
+            # epoch (this grid's own workspace word; the previous launch completed
+            # before the predecessor's wait returned, and the predecessor triggers
+            # after that wait) and the tagged ids are read before the wait below.
+            if cutlass.const_expr(self.early_ids == 0):
+                cute.arch.griddepcontrol_wait()
+            # With ``fastroute`` the weight TMA warp routes on its own
+            # (``_tma_producer``) and skips the CTA's routing barriers, so its first
+            # loads go out one ids load after the wait.
+            epoch = Uint32(0)
+            if cutlass.const_expr(self.fastroute == 0):
+                epoch = self._next_epoch(epoch_addr, cta)
+            else:
+                if warp_idx != TMA_WARP:
+                    epoch = self._next_epoch(epoch_addr, cta)
+            if cutlass.const_expr(self.early_ids == 0):
+                if tidx == 0:
+                    self._stamp(trace_addr, cta, TR_WAITED)
         if cutlass.const_expr(self.delay & DELAY_ENTRY):
             self._delay_spin(DELAY_ENTRY * 53, cta)
 
         # -------- window ids -> sorted slots of the active local experts --------
         # Warps 0-1, one lane per (token, slot).
-        if tidx < self.g.route:
-            t = tidx // TOP_K
-            gid = Int32(-1)
-            if t < num_tokens:
-                if cutlass.const_expr(self.early_ids != 0):
-                    gid = self._early_id(tidx, ids_addr, epoch, trace_addr, cta)
-                else:
-                    gid = Int32(ptx.ld_u32(ids_addr + tidx * 4))
-            local = (gid >= 0) & (gid < self.num_local)
-            lid = Int32(-1)
-            if local:
-                lid = gid
-                ptx.atom_or_shared_u32(
-                    Int32(storage.bitmap.data_ptr().toint()) + (gid // 32) * 4,
-                    Uint32(1) << Uint32(gid % 32),
-                )
-            s_ids[tidx] = lid
+        if cutlass.const_expr(self.place_rank >= 0):
+            # In-kernel placement: the step's census, then the ring flow, then this lane's id.
+            hst = Int32(storage.hstage.data_ptr().toint())
+            gid = self._place_census(tidx, ids_addr, num_tokens, hst)
+            cute.arch.sync_threads()
+            if warp_idx == 0:
+                self._place_flow(lane, hst)
+            cute.arch.sync_threads()
+            if tidx < self.g.route:
+                lid = self._place_local(gid, hst)
+                if lid >= 0:
+                    ptx.atom_or_shared_u32(
+                        Int32(storage.bitmap.data_ptr().toint()) + (lid // 32) * 4,
+                        Uint32(1) << Uint32(lid % 32),
+                    )
+                s_ids[tidx] = lid
+        else:
+            if tidx < self.g.route:
+                t = tidx // TOP_K
+                gid = Int32(-1)
+                if t < num_tokens:
+                    if cutlass.const_expr(self.early_ids != 0):
+                        gid = self._early_id(tidx, ids_addr, epoch, trace_addr, cta)
+                    else:
+                        gid = Int32(ptx.ld_u32(ids_addr + tidx * 4))
+                local = (gid >= 0) & (gid < self.num_local)
+                lid = Int32(-1)
+                if local:
+                    lid = gid
+                    ptx.atom_or_shared_u32(
+                        Int32(storage.bitmap.data_ptr().toint()) + (gid // 32) * 4,
+                        Uint32(1) << Uint32(gid % 32),
+                    )
+                s_ids[tidx] = lid
         self._route_barrier(warp_idx)
         # Every thread has read its epoch word: advance it for the next launch.
         if tidx == 0:
@@ -750,7 +902,18 @@ class PersistentExpertsKernel:
                 trace_addr,
             )
         if warp_idx >= X_WARP0:
-            self._load_x(tidx - 32 * X_WARP0, x_addr, xsf_addr, num_tokens, storage, b_mbar)
+            if cutlass.const_expr(self.g.overlap):
+                # batch build: the epilogue warps load the activation too (threads 0..127)
+                self._load_x_batch(
+                    tidx - 32 * X_WARP0 + 32 * EPI_WARPS,
+                    x_addr,
+                    xsf_addr,
+                    num_tokens,
+                    storage,
+                    b_mbar,
+                )
+            else:
+                self._load_x(tidx - 32 * X_WARP0, x_addr, xsf_addr, num_tokens, storage, b_mbar)
             if tidx == 32 * X_WARP0:
                 self._stamp(trace_addr, cta, TR_X)
             if warp_idx >= FETCH_WARP0:
@@ -786,6 +949,8 @@ class PersistentExpertsKernel:
                         trace_addr,
                     )
         if warp_idx < EPI_WARPS:
+            if cutlass.const_expr(self.g.overlap):
+                self._load_x_batch(tidx, x_addr, xsf_addr, num_tokens, storage, b_mbar)
             # off the critical path and the tail: the epilogue warps are idle
             # until the first accumulator
             if cta == 0:
@@ -878,17 +1043,24 @@ class PersistentExpertsKernel:
         its token naming that expert, i.e. the ``k`` the slot table kept, so
         every valid entry names a row the FC2 epilogue writes. Runs after the
         routing barriers; the finalize reads the map only after this grid has
-        completed.
+        completed. The 128 epilogue threads take the ``8 ntok`` lanes in passes
+        (one up to 16 token columns, two at 32).
         """
-        if tidx < self.g.route:
-            t = tidx // TOP_K
-            if t < num_tokens:
-                out = Int32(-1)
-                lid = s_ids[tidx]
-                if lid >= 0:
-                    if s_slot_k[s_expert_slot[lid] * self.ntok + t] == tidx % TOP_K:
-                        out = tidx
-                ptx.st_u32(index_addr + tidx * 4, Uint32(out))
+        for part in cutlass.range_constexpr(
+            (self.g.route + 32 * EPI_WARPS - 1) // (32 * EPI_WARPS)
+        ):
+            lane = tidx
+            if cutlass.const_expr(part > 0):
+                lane = tidx + part * 32 * EPI_WARPS
+            if lane < self.g.route:
+                t = lane // TOP_K
+                if t < num_tokens:
+                    out = Int32(-1)
+                    lid = s_ids[lane]
+                    if lid >= 0:
+                        if s_slot_k[s_expert_slot[lid] * self.ntok + t] == lane % TOP_K:
+                            out = lane
+                    ptx.st_u32(index_addr + lane * 4, Uint32(out))
 
     @cute.jit
     def _retag_rotation_slot(self, tidx, flag_addr, img_addr, epoch, cta, grid0, num_slots):
@@ -993,6 +1165,75 @@ class PersistentExpertsKernel:
             cute.arch.sync_threads()
 
     @cute.jit
+    def _place_census(self, tidx, ids_addr, num_tokens, hst):
+        """In-kernel placement, step 1: this lane's selected global id (-1 past the last row or
+        outside 0..255), OR-ed into its block's presence word (``ring_buddy_assign``'s census:
+        a repeated expert sets the same bit)."""
+        gid = Int32(-1)
+        if tidx < self.g.route:
+            if tidx // TOP_K < num_tokens:
+                g = Int32(ptx.ld_u32(ids_addr + tidx * 4))
+                if (g >= 0) & (g < RING * RING_BLOCK):
+                    gid = g
+                    ptx.atom_or_shared_u32(
+                        hst + (PLACE_CENSUS + g // RING_BLOCK) * 4,
+                        Uint32(1) << Uint32(g % RING_BLOCK),
+                    )
+        return gid
+
+    @cute.jit
+    def _place_flow(self, lane, hst):
+        """In-kernel placement, step 2 (warp 0; lane ``r < 8`` is block ``r``): the smallest
+        feasible maximum ``T`` and the smallest flow ``x[r]`` (experts block ``r`` moves to rank
+        ``r + 1``), ``ring_buddy_assign``'s balanced placement in integers: ``arc`` is the load of
+        the ``n`` blocks ending at ``r``; ``T`` is the largest ``ceil(arc / (n + 1))`` for
+        ``n < 8`` and ``ceil(D / 8)`` for the whole ring; ``x[r] = max(0, max_n(arc - n T))``."""
+        if lane < RING:
+            arc = Int32(0)
+            need = Int32(0)
+            for n in cutlass.range_constexpr(1, RING + 1):
+                b = (lane + RING + 1 - n) % RING
+                arc = arc + ptx.popc_u32(ptx.lds_u32(hst + (PLACE_CENSUS + b) * 4))
+                if cutlass.const_expr(n == RING):
+                    need = cutlass.max(need, (arc + RING - 1) // RING)
+                else:
+                    need = cutlass.max(need, (arc + n) // (n + 1))
+            ptx.sts_u32(hst + (PLACE_NEED + lane) * 4, Uint32(need))
+        cute.arch.sync_warp()
+        if lane < RING:
+            t = Int32(0)
+            for r in cutlass.range_constexpr(RING):
+                t = cutlass.max(t, Int32(ptx.lds_u32(hst + (PLACE_NEED + r) * 4)))
+            arc = Int32(0)
+            moved = Int32(0)
+            for n in cutlass.range_constexpr(1, RING + 1):
+                b = (lane + RING + 1 - n) % RING
+                arc = arc + ptx.popc_u32(ptx.lds_u32(hst + (PLACE_CENSUS + b) * 4))
+                moved = cutlass.max(moved, arc - n * t)
+            ptx.sts_u32(hst + (PLACE_MOVED + lane) * 4, Uint32(moved))
+
+    @cute.jit
+    def _place_local(self, gid, hst):
+        """In-kernel placement, step 3: the window id of a lane's selected expert ``gid`` on
+        rank ``place_rank`` (own block ``i``, the predecessor's ``32 + i``), or -1 when another
+        rank runs it: the expert moves when fewer than ``x[block]`` present experts of its block
+        sit above it, as ``ring_buddy_assign`` decides."""
+        lid = Int32(-1)
+        if gid >= 0:
+            blk = gid // RING_BLOCK
+            i = gid % RING_BLOCK
+            word = ptx.lds_u32(hst + (PLACE_CENSUS + blk) * 4)
+            above = ptx.popc_u32((word >> Uint32(i)) >> Uint32(1))
+            runs_on = blk
+            if above < Int32(ptx.lds_u32(hst + (PLACE_MOVED + blk) * 4)):
+                runs_on = (blk + 1) % RING
+            if runs_on == self.place_rank:
+                lid = i
+                if blk != self.place_rank:
+                    lid = RING_BLOCK + i
+        return lid
+
+    @cute.jit
     def _nth_expert(self, lo, hi, slot):
         """The local expert of ``slot``: the ``slot``-th set bit of the 64-bit set."""
         c0 = ptx.popc_u32(lo)
@@ -1029,6 +1270,16 @@ class PersistentExpertsKernel:
                 if early > cap:
                     early = cap
         return early
+
+    @cute.jit
+    def _fc1_end(self, num_slots, total):
+        """One past the last FC1 position a CTA with tile-list length ``total`` runs:
+        ``min(num_slots * FC1_MT, total)`` (positions ``p`` with ``p + grid`` at or past it are
+        the CTA's last FC1 tile and its FC2 tiles)."""
+        fc1_end = num_slots * FC1_MT
+        if fc1_end > total:
+            fc1_end = total
+        return fc1_end
 
     @cute.jit
     def _decode(self, p, num_slots, n_early):
@@ -1267,25 +1518,36 @@ class PersistentExpertsKernel:
                 ring.consumer_wait(ring_state)
                 if lane == 0:
                     self._stamp(trace_addr, cta, TR_W0)
-        # the activation operand (FC1 B) is in shared memory
-        cute.arch.mbarrier_wait(b_mbar + X_BAR, 0)
+        # the activation operand (FC1 B) is in shared memory (a batch build waits per
+        # group of k-blocks, below)
+        if cutlass.const_expr(not self.g.overlap):
+            cute.arch.mbarrier_wait(b_mbar + X_BAR, 0)
+        if cutlass.const_expr(self.g.overlap):
+            fc1_end = self._fc1_end(num_slots, total)
         j2 = Int32(0)  # FC2 tiles of this CTA so far
         p = cta
         while p < total:
             is_fc2, slot, mt = self._decode(p, num_slots, n_early)
-            buf = j2 % IMG_BUFS
-            use_phase = (j2 // IMG_BUFS) % 2
+            buf = j2 % self.g.img_bufs
+            use_phase = (j2 // self.g.img_bufs) % 2
             b0 = Int32(X_STAGE0)
             if is_fc2 != 0:
-                b0 = Int32(IMG_STAGE0) + buf * FC2_KB
+                b0 = Int32(self.g.img_stage0) + buf * FC2_KB
             acc_pipe.producer_acquire(acc_state)
             tCtAcc = tCtAcc_base[(None, None, None, acc_state.index)]
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             kb = Int32(0)
             while kb < FC1_KB:
+                if cutlass.const_expr(self.g.overlap):
+                    if is_fc2 == 0:
+                        if kb % X_GROUP_KB == 0:
+                            # this group of activation k-blocks has landed
+                            cute.arch.mbarrier_wait(b_mbar + X_BAR + kb // X_GROUP_KB, 0)
                 if is_fc2 != 0:
                     # this k-block's intermediate columns have landed
-                    cute.arch.mbarrier_wait(b_mbar + IMG_FULL_BAR + buf * FC2_KB + kb, use_phase)
+                    cute.arch.mbarrier_wait(
+                        b_mbar + self.g.img_full_bar + buf * FC2_KB + kb, use_phase
+                    )
                 ring.consumer_wait(ring_state)
                 if cutlass.const_expr(self.trace != 0):
                     if (kb == 0) & (lane == 0):
@@ -1308,15 +1570,24 @@ class PersistentExpertsKernel:
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 ring.consumer_release(ring_state)
+                if cutlass.const_expr(self.g.overlap):
+                    # batch build: B stage kb (activation, then image) is free once
+                    # this tile's MMAs on it have completed; committed after the last
+                    # FC1 tile (which completes after every earlier one) and after
+                    # every FC2 tile, so the fetch waits on one known commit each
+                    if p + grid >= fc1_end:
+                        with cute.arch.elect_one():
+                            tcgen05.commit(b_mbar + self.g.img_empty_bar + kb)
                 ring_state.advance()
                 kb = kb + 1
             if cutlass.const_expr(self.trace != 0):
                 if lane == 0:
                     self._tile_stamp(trace_addr, cta, (p - cta) // grid, 2)
             if is_fc2 != 0:
-                # the image buffer is free once these MMAs have completed
-                with cute.arch.elect_one():
-                    tcgen05.commit(b_mbar + IMG_EMPTY_BAR + buf)
+                if cutlass.const_expr(not self.g.overlap):
+                    # the image buffer is free once these MMAs have completed
+                    with cute.arch.elect_one():
+                        tcgen05.commit(b_mbar + self.g.img_empty_bar + buf)
                 j2 = j2 + 1
             acc_pipe.producer_commit(acc_state)
             acc_state.advance()
@@ -1394,6 +1665,97 @@ class PersistentExpertsKernel:
         if q == 0:
             cute.arch.mbarrier_arrive(b_mbar + X_BAR)
 
+    @cute.jit
+    def _load_x_batch(self, q, x_addr, xsf_addr, num_tokens, storage, b_mbar):
+        """Batch builds: ``_load_x`` spread over the epilogue warps and warps 6-7, in groups.
+
+        Thread ``q`` (``0 .. X_LOADERS - 1``: the epilogue warps, then warps 6-7) loads,
+        group by group (k-blocks ``4 g .. 4 g + 3``), the 16-byte code chunks
+        ``q, q + X_LOADERS, ...`` of the group (k-block-major: k-block, row, 16-byte column)
+        and the group's scale words (row, then its 16 words). Every load goes out before
+        the first store, in group order, so the first group's bytes come back first (every
+        CTA reads the same activation lines). Then, group by group, the thread stores its
+        chunks and words; after a named barrier over the loaders one thread arrives on
+        ``X_BAR + g``, and the MMA starts on the first group while the others land. Same
+        placement as ``_load_x``, with zero codes and scales for rows at or beyond
+        ``num_tokens``; a thread's slot past the group's last chunk loads a valid word and
+        stores nothing.
+        """
+        sb = Int32(storage.sB.data_ptr().toint())
+        ssfb = Int32(storage.sSFB.data_ptr().toint())
+        last = num_tokens - 1
+        kb_chunks = self.ntok * (KTILE // 2 // 16)  # 16-byte chunks per k-block
+        g_chunks = X_GROUP_KB * kb_chunks  # code chunks per group
+        g_words = X_GROUP_KB * (KTILE // 64)  # scale words per row per group
+        n_words = self.ntok * g_words  # scale words per group
+        c_iters = (g_chunks + X_LOADERS - 1) // X_LOADERS
+        w_iters = (n_words + X_LOADERS - 1) // X_LOADERS
+        codes = []
+        scales = []
+        for g in cutlass.range_constexpr(self.g.x_bars):
+            for i in cutlass.range_constexpr(c_iters):
+                c = q + X_LOADERS * i
+                kb = g * X_GROUP_KB + c // kb_chunks
+                n = (c % kb_chunks) // 8
+                c16 = c % 8
+                nn = n
+                kk = kb
+                if (n > last) | (c >= g_chunks):
+                    nn = last
+                if c >= g_chunks:
+                    kk = g * X_GROUP_KB
+                codes.append(ptx.ld_v4_u32(x_addr + nn * X_ROW_BYTES + (kk * 8 + c16) * 16))
+            for i in cutlass.range_constexpr(w_iters):
+                w = q + X_LOADERS * i
+                n = w // g_words
+                j = g * g_words + w % g_words
+                nn = n
+                if n > last:
+                    nn = last
+                scales.append(ptx.ld_u32(xsf_addr + nn * X_SF_ROW_BYTES + j * 4))
+        for g in cutlass.range_constexpr(self.g.x_bars):
+            for i in cutlass.range_constexpr(c_iters):
+                c = q + X_LOADERS * i
+                if c < g_chunks:
+                    kb = g * X_GROUP_KB + c // kb_chunks
+                    n = (c % kb_chunks) // 8
+                    c16 = c % 8
+                    d = codes[g * c_iters + i]
+                    d0 = d[0]
+                    d1 = d[1]
+                    d2 = d[2]
+                    d3 = d[3]
+                    if n > last:
+                        d0 = Uint32(0)
+                        d1 = Uint32(0)
+                        d2 = Uint32(0)
+                        d3 = Uint32(0)
+                    ptx.sts_v4_u32(
+                        sb
+                        + (X_STAGE0 + kb) * self.g.b_stage_bytes
+                        + n * 128
+                        + ((c16 ^ self._sw(n)) * 16),
+                        d0,
+                        d1,
+                        d2,
+                        d3,
+                    )
+            for i in cutlass.range_constexpr(w_iters):
+                w = q + X_LOADERS * i
+                if w < n_words:
+                    n = w // g_words
+                    j = g * g_words + w % g_words
+                    v = scales[g * w_iters + i]
+                    if n > last:
+                        v = Uint32(0)
+                    ptx.sts_u32(
+                        ssfb + X_STAGE0 * self.g.sfb_stage + j * self.g.sfb_chunk + n * 16, v
+                    )
+            ptx.fence_proxy_async_shared()
+            ptx.bar_sync(BAR_X, X_LOADERS)
+            if q == 0:
+                cute.arch.mbarrier_arrive(b_mbar + X_BAR + g)
+
     # ------------------------------------------------------------------
     @cute.jit
     def _fetch_images(
@@ -1425,20 +1787,34 @@ class PersistentExpertsKernel:
         k-block is requested as soon as its own producers have published,
         independent of the others. A buffer is refilled only after the MMAs
         of its previous tile have completed.
+
+        Batch builds (``overlap``): one buffer over the activation's B stages. The MMA warp
+        commits a stage's empty barrier after the MMAs on it of this CTA's last FC1 tile
+        (if it has one: ``had_fc1``) and of each FC2 tile, so the lane that copies
+        k-block ``kb`` of FC2 tile ``j2`` waits for commit number ``j2 + had_fc1`` there,
+        the stage's previous reader. That parity wait is exact: the commit before it was
+        waited for by the copy of tile ``j2 - 1`` (or is the first), and the one after
+        needs this copy.
         """
         sb = Int32(storage.sB.data_ptr().toint())
         ssfb = Int32(storage.sSFB.data_ptr().toint())
-        full0 = Int32((b_mbar + IMG_FULL_BAR).toint())
+        full0 = Int32((b_mbar + self.g.img_full_bar).toint())
         kb_base = half * (FC2_KB // 2)
+        had_fc1 = Int32(0)
+        if cutlass.const_expr(self.g.overlap):
+            # this CTA's first position is an FC1 tile
+            if cta < self._fc1_end(num_slots, total):
+                had_fc1 = Int32(1)
         j2 = Int32(0)
         p = cta
         while p < total:
             is_fc2, slot, mt = self._decode(p, num_slots, n_early)
             if is_fc2 != 0:
-                buf = j2 % IMG_BUFS
-                use = j2 // IMG_BUFS
-                if use > 0:
-                    cute.arch.mbarrier_wait(b_mbar + IMG_EMPTY_BAR + buf, (use - 1) % 2)
+                buf = j2 % self.g.img_bufs
+                use = j2 // self.g.img_bufs
+                if cutlass.const_expr(not self.g.overlap):
+                    if use > 0:
+                        cute.arch.mbarrier_wait(b_mbar + self.g.img_empty_bar + buf, (use - 1) % 2)
                 if cutlass.const_expr(self.delay & DELAY_CONSUMER):
                     self._delay_spin(DELAY_CONSUMER * 53, cta)
                 fa = flag_addr + (slot * FC1_MT + 4 * kb_base + lane) * 4
@@ -1462,12 +1838,20 @@ class PersistentExpertsKernel:
                     if lane < FC2_KB // 2:
                         if ((new >> Uint32(lane)) & Uint32(1)) != Uint32(0):
                             kb = kb_base + lane
+                            if cutlass.const_expr(self.g.overlap):
+                                # B stage kb is free: the MMAs of this CTA's last
+                                # tile on it (FC1 or FC2) have completed
+                                commits = j2 + had_fc1
+                                if commits > 0:
+                                    cute.arch.mbarrier_wait(
+                                        b_mbar + self.g.img_empty_bar + kb, (commits - 1) % 2
+                                    )
                             # the image was written by generic stores of other
                             # CTAs; the bulk copy reads it through the async proxy
                             ptx.fence_proxy_async_global()
                             bar = full0 + (buf * FC2_KB + kb) * 8
                             ptx.mbar_arrive_expect_tx(bar, Int32(self.g.img_kb_tx))
-                            stage = IMG_STAGE0 + buf * FC2_KB + kb
+                            stage = self.g.img_stage0 + buf * FC2_KB + kb
                             src = img_addr + Int64(slot) * self.g.img_bytes
                             ptx.bulk_g2s(
                                 sb + stage * self.g.b_stage_bytes,
@@ -1521,9 +1905,26 @@ class PersistentExpertsKernel:
         shared stores, made visible to the tensor core
         (``fence.proxy.async.shared::cta``, warp barrier) and released to the
         MMA warp with one arrive on its (buffer, k-block) mbarrier.
+
+        Batch builds (``overlap``): one buffer over the activation's B stages; before
+        unpacking k-block ``kb`` of FC2 tile ``j2`` the warp waits for commit
+        ``j2 + had_fc1`` on that stage's empty barrier, as ``_fetch_images`` does, and a
+        32-column build polls one k-block per pass (36 words per lane).
+
+        Interleaved fetch (``fetch_kb``): warp ``half`` serves k-blocks ``half, half + 2, ...``
+        in passes of ``pass_kb`` (``fetch_kb`` at 32 columns), see the module docstring.
         """
         sb = Int32(storage.sB.data_ptr().toint())
         ssfb = Int32(storage.sSFB.data_ptr().toint())
+        pass_kb = TAG_PASS_KB
+        if cutlass.const_expr(self.g.overlap and self.ntok > 16):
+            pass_kb = 1
+            if cutlass.const_expr(self.fetch_kb != 0):
+                pass_kb = self.fetch_kb
+        had_fc1 = Int32(0)
+        if cutlass.const_expr(self.g.overlap):
+            if cta < self._fc1_end(num_slots, total):
+                had_fc1 = Int32(1)
         # this lane's 9 words of a k-block: source offset and destination
         src_off = []
         dst_off = []
@@ -1550,21 +1951,29 @@ class PersistentExpertsKernel:
         while p < total:
             is_fc2, slot, mt = self._decode(p, num_slots, n_early)
             if is_fc2 != 0:
-                buf = j2 % IMG_BUFS
-                use = j2 // IMG_BUFS
-                if use > 0:
-                    cute.arch.mbarrier_wait(b_mbar + IMG_EMPTY_BAR + buf, (use - 1) % 2)
+                buf = j2 % self.g.img_bufs
+                use = j2 // self.g.img_bufs
+                if cutlass.const_expr(not self.g.overlap):
+                    if use > 0:
+                        cute.arch.mbarrier_wait(b_mbar + self.g.img_empty_bar + buf, (use - 1) % 2)
                 if cutlass.const_expr(self.delay & DELAY_CONSUMER):
                     self._delay_spin(DELAY_CONSUMER * 53, cta)
                 slot_base = img_addr + Int64(slot) * self.g.tag_slot_bytes
-                for ps in cutlass.range_constexpr(FC2_KB // 2 // TAG_PASS_KB):
-                    kb0 = half * (FC2_KB // 2) + ps * TAG_PASS_KB
+                for ps in cutlass.range_constexpr(FC2_KB // 2 // pass_kb):
+                    kb0 = half * (FC2_KB // 2) + ps * pass_kb
+                    # the pass's k-blocks: a run of the warp's half, or every other one
+                    kbs = []
+                    for q in cutlass.range_constexpr(pass_kb):
+                        if cutlass.const_expr(self.fetch_kb != 0):
+                            kbs.append(2 * (ps * pass_kb + q) + half)
+                        else:
+                            kbs.append(kb0 + q)
                     delivered = Int32(0)
-                    while delivered != Int32((1 << TAG_PASS_KB) - 1):
+                    while delivered != Int32((1 << pass_kb) - 1):
                         payload = []
                         valid = []
-                        for q in cutlass.range_constexpr(TAG_PASS_KB):
-                            src = slot_base + Int64((kb0 + q) * self.g.tag_kb_bytes)
+                        for q in cutlass.range_constexpr(pass_kb):
+                            src = slot_base + Int64(kbs[q] * self.g.tag_kb_bytes)
                             ok = Int32(1)
                             pl = []
                             for i in cutlass.range_constexpr(self.g.tag_lane_words):
@@ -1574,10 +1983,19 @@ class PersistentExpertsKernel:
                                     ok = Int32(0)
                             payload.append(pl)
                             valid.append(ok)
-                        for q in cutlass.range_constexpr(TAG_PASS_KB):
+                        for q in cutlass.range_constexpr(pass_kb):
                             if ((delivered >> q) & 1) == 0:
                                 if ptx.ballot_u32(valid[q]) == Uint32(0xFFFFFFFF):
-                                    stage = IMG_STAGE0 + buf * FC2_KB + kb0 + q
+                                    if cutlass.const_expr(self.g.overlap):
+                                        # B stage kbs[q] is free: the MMAs of its previous
+                                        # reader (the last FC1 tile, or FC2 tile j2 - 1) are done
+                                        commits = j2 + had_fc1
+                                        if commits > 0:
+                                            cute.arch.mbarrier_wait(
+                                                b_mbar + self.g.img_empty_bar + kbs[q],
+                                                (commits - 1) % 2,
+                                            )
+                                    stage = self.g.img_stage0 + buf * FC2_KB + kbs[q]
                                     for i in cutlass.range_constexpr(self.g.tag_lane_words):
                                         if is_sf[i] != 0:
                                             ptx.sts_u32(
@@ -1593,7 +2011,7 @@ class PersistentExpertsKernel:
                                     cute.arch.sync_warp()
                                     if lane == 0:
                                         cute.arch.mbarrier_arrive(
-                                            b_mbar + IMG_FULL_BAR + buf * FC2_KB + kb0 + q
+                                            b_mbar + self.g.img_full_bar + buf * FC2_KB + kbs[q]
                                         )
                                     delivered = delivered | (1 << q)
                 if cutlass.const_expr(self.trace != 0):
@@ -1818,23 +2236,78 @@ class PersistentExpertsKernel:
         rcp6 = Float32(RCP6_F32)
         for p in cutlass.range_constexpr(self.ntok // 2):
             n0 = 2 * p
-            g0 = cute.arch.shuffle_sync_down(v[n0], 8)
-            g1 = cute.arch.shuffle_sync_down(v[n0 + 1], 8)
-            x = ptx.mul_rn_x2(g0, g1, t_neg, t_neg)
-            d = ptx.add_rn_x2(ptx.ex2_approx(x[0]), ptx.ex2_approx(x[1]), one, one)
-            gs = ptx.mul_rn_x2(g0, g1, ptx.rcp_approx_ftz(d[0]), ptx.rcp_approx_ftz(d[1]))
-            u = ptx.fma_rn_zero_x2(v[n0], v[n0 + 1], s_gate, s_gate)
-            hh = ptx.mul_rn_x2(u[0], u[1], gs[0], gs[1])
-            h0 = Float32(0.0)
-            h1 = Float32(0.0)
-            if is_up:
-                h0 = hh[0]
-                h1 = hh[1]
-            # (amax|h|) * sC == max(|h| * sC): rounding is monotone and sC > 0
-            a = ptx.mul_rn_x2(self._block_amax(h0), self._block_amax(h1), s_c, s_c)
-            q = ptx.mul_rn_x2(a[0], a[1], rcp6, rcp6)
-            self._quant_store(h0, q[0], s_c, n0, mask, num_tokens, warp_idx, lane, hst)
-            self._quant_store(h1, q[1], s_c, n0 + 1, mask, num_tokens, warp_idx, lane, hst)
+            if cutlass.const_expr(self.g.overlap):
+                # Batch builds: a pair with neither token routed to this expert (``mask``
+                # is the same in every thread) gets the zero bytes and scales
+                # ``_quant_store`` would give it, without the arithmetic.
+                if ((mask >> Uint32(n0)) & Uint32(3)) != Uint32(0):
+                    self._swiglu_pair(
+                        v,
+                        n0,
+                        is_up,
+                        t_neg,
+                        one,
+                        rcp6,
+                        s_gate,
+                        s_c,
+                        mask,
+                        num_tokens,
+                        warp_idx,
+                        lane,
+                        hst,
+                    )
+                else:
+                    self._zero_stage(n0, warp_idx, lane, hst)
+                    self._zero_stage(n0 + 1, warp_idx, lane, hst)
+            else:
+                self._swiglu_pair(
+                    v,
+                    n0,
+                    is_up,
+                    t_neg,
+                    one,
+                    rcp6,
+                    s_gate,
+                    s_c,
+                    mask,
+                    num_tokens,
+                    warp_idx,
+                    lane,
+                    hst,
+                )
+
+    @cute.jit
+    def _swiglu_pair(
+        self, v, n0, is_up, t_neg, one, rcp6, s_gate, s_c, mask, num_tokens, warp_idx, lane, hst
+    ):
+        """Tokens ``n0`` and ``n0 + 1`` of ``_swiglu_quant_to_stage``, through the packed
+        instructions (``*_x2``)."""
+        g0 = cute.arch.shuffle_sync_down(v[n0], 8)
+        g1 = cute.arch.shuffle_sync_down(v[n0 + 1], 8)
+        x = ptx.mul_rn_x2(g0, g1, t_neg, t_neg)
+        d = ptx.add_rn_x2(ptx.ex2_approx(x[0]), ptx.ex2_approx(x[1]), one, one)
+        gs = ptx.mul_rn_x2(g0, g1, ptx.rcp_approx_ftz(d[0]), ptx.rcp_approx_ftz(d[1]))
+        u = ptx.fma_rn_zero_x2(v[n0], v[n0 + 1], s_gate, s_gate)
+        hh = ptx.mul_rn_x2(u[0], u[1], gs[0], gs[1])
+        h0 = Float32(0.0)
+        h1 = Float32(0.0)
+        if is_up:
+            h0 = hh[0]
+            h1 = hh[1]
+        # (amax|h|) * sC == max(|h| * sC): rounding is monotone and sC > 0
+        a = ptx.mul_rn_x2(self._block_amax(h0), self._block_amax(h1), s_c, s_c)
+        q = ptx.mul_rn_x2(a[0], a[1], rcp6, rcp6)
+        self._quant_store(h0, q[0], s_c, n0, mask, num_tokens, warp_idx, lane, hst)
+        self._quant_store(h1, q[1], s_c, n0 + 1, mask, num_tokens, warp_idx, lane, hst)
+
+    @cute.jit
+    def _zero_stage(self, n, warp_idx, lane, hst):
+        """Token ``n``'s staged bytes as ``_quant_store`` leaves an unrouted token: zero codes
+        and a zero scale."""
+        if lane < 8:
+            ptx.sts_u8(hst + n * 32 + warp_idx * 8 + lane, Uint32(0))
+        if lane == 0:
+            ptx.sts_u8(hst + self.g.hstage_sf + n * 4 + warp_idx, Uint32(0))
 
     @cute.jit
     def _block_amax(self, h):

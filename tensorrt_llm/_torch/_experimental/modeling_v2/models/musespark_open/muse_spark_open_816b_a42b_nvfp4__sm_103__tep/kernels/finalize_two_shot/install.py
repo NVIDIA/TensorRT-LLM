@@ -28,17 +28,30 @@ stay on the unfused combine + all-reduce whatever
 ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED`` set. The switch is host state, a
 constant per CUDA-graph capture, and every rank arms it alike (the choice depends
 on the step's kind and row count only).
+
+At TP8 (sm103, two trays of four in one NVLink domain: ``dispatch.TWO_TRAYS_OF_4``) the
+workspace's receive memory is the trays' fabric, and the band is ``ROWS_BY_SM_TP[(103, 8)]``:
+there the built-in fused finalize is a one-shot over seven peers, ingress-bound from about
+three requests, and the unfused combine + cast + MNNVL two-shot above 128 rows is three
+launches. Measured per call in 62-layer chains on two GB300 trays (``mb-tep8-finalize-1``),
+built-in -> this kernel: 8.9 -> 8.4 us at 24 rows, 15.0 -> 8.9 at 80, 19.9 -> 9.8 at 128
+(the one-shot); 13.4 -> 10.0 at 136..152 (the unfused path). At 160 rows (more tokens than
+SMs) the two-register-bound build ties the unfused path, so the band ends at 152. Bitwise the
+built-in fused kernel at 24..128 rows on every rank in that run; above 128 rows the served
+unfused path rounds the per-expert norm's sum of squares in another order (within one BF16
+place of this kernel), so arming 129..152 rows changes bits there.
 """
 
 from __future__ import annotations
 
 import contextlib
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenModel
 
+from ... import dispatch as _dispatch
 from ...ops.moe import finalize_two_shot as _two
 
 #: The attribute the built-in MoE reads its fused finalize workspace from, and the
@@ -52,19 +65,73 @@ MAX_TOKENS_ATTRIBUTE = "_finalize_ar_max_tokens"
 MIN_ROWS_BY_SM = {103: 72}
 MIN_ROWS = MIN_ROWS_BY_SM[103]
 MAX_ROWS = _two.MAX_ROWS
+#: The band, per (SM, TP size): ``(fewest rows, most rows)`` of an armed decode forward. TP4
+#: keeps ``MIN_ROWS_BY_SM`` up to ``MAX_ROWS``. TP8 (sm103 only, two trays): from three
+#: requests (24 rows at K = 7; the kernel takes 17 and up, ``_two.MIN_ROWS_BY_RANKS``) to 19
+#: (152 rows, the device's SM count of tokens: see the module docstring).
+ROWS_BY_SM_TP = {
+    (103, 4): (MIN_ROWS_BY_SM[103], MAX_ROWS),
+    (103, 8): (24, 152),
+}
+#: ``finalize_two_shot__TP8_MAX_ROWS``: a lower last row count of the TP8 band; None keeps
+#: ``ROWS_BY_SM_TP[(103, 8)]``'s. ``128`` keeps the band to the rows whose served kernel is
+#: the built-in fused finalize, where this kernel returns its bits, so no step's values change.
+_TP8_MAX_ROWS: Optional[int] = None
+
+
+def configure(*, tep8_max_rows: Optional[int] = None) -> None:
+    """Set the last row of the TP8 band ``band`` reports.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; None, the
+    default, keeps the band ``ROWS_BY_SM_TP`` declares.
+
+    Args:
+        tep8_max_rows: the last armed row count at TP8 (``_TP8_MAX_ROWS``), inside
+            ``ROWS_BY_SM_TP[(103, 8)]``.
+
+    Raises:
+        ValueError: for a bound outside that band.
+    """
+    global _TP8_MAX_ROWS
+    if tep8_max_rows is None:
+        _TP8_MAX_ROWS = None
+        return
+    first, last = ROWS_BY_SM_TP[(103, 8)]
+    rows = int(tep8_max_rows)
+    if not first <= rows <= last:
+        raise ValueError(
+            f"[musespark_open] finalize_two_shot TP8 row bound {rows}: expected {first}..{last}"
+        )
+    _TP8_MAX_ROWS = rows
+
+
+def band(sm: int, tp_size: int) -> Tuple[int, int]:
+    """``(fewest rows, most rows)`` armed for ``(sm, tp_size)``; at TP8 ``configure`` may lower
+    the last."""
+    first, last = ROWS_BY_SM_TP[(sm, tp_size)]
+    if tp_size == 8 and _TP8_MAX_ROWS is not None:
+        last = min(last, _TP8_MAX_ROWS)
+    return first, last
 
 
 class FinalizeTwoShotSwitch:
     """What ``DecodeTarget`` arms: the workspace's ``active`` flag and the layers' chunk bound."""
 
-    def __init__(self, workspace, moes: List[torch.nn.Module], min_rows: int = MIN_ROWS) -> None:
+    def __init__(
+        self,
+        workspace,
+        moes: List[torch.nn.Module],
+        min_rows: int = MIN_ROWS,
+        max_rows: int = MAX_ROWS,
+    ) -> None:
         self.workspace = workspace
         self.moes = moes
         self.min_rows = int(min_rows)
+        self.max_rows = int(max_rows)
 
     def takes(self, rows: int) -> bool:
         """Whether a decode forward of ``rows`` rows is armed."""
-        return self.min_rows <= rows <= MAX_ROWS
+        return self.min_rows <= rows <= self.max_rows
 
     @contextlib.contextmanager
     def armed(self) -> Iterator[None]:
@@ -89,8 +156,20 @@ def refusal(model: MuseSparkOpenModel) -> Optional[str]:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         return "it is written for sm_103"
     mapping = model.layers[0].mapping
-    if mapping.tp_size not in _two.RANK_COUNTS or mapping.is_multi_node():
-        return f"it serves TP4 on one node, got TP{mapping.tp_size}"
+    one_tray = mapping.tp_size == 4 and not mapping.is_multi_node()
+    two_trays = mapping.tp_size == 8 and _dispatch.TWO_TRAYS_OF_4.holds(mapping)
+    if mapping.tp_size not in _two.RANK_COUNTS or not (one_tray or two_trays):
+        return (
+            f"it serves TP4 on one node or TP8 over {_dispatch.TWO_TRAYS_OF_4.description}, got "
+            f"TP{mapping.tp_size} ({_dispatch.describe_topology(mapping)})"
+        )
+    major, minor = torch.cuda.get_device_capability()
+    if (10 * major + minor, mapping.tp_size) not in ROWS_BY_SM_TP:
+        return f"it has no band for TP{mapping.tp_size} on sm_{major}{minor}"
+    try:
+        band(10 * major + minor, mapping.tp_size)
+    except ValueError as error:
+        return str(error)
     if mapping.enable_attention_dp or mapping.moe_tp_size != 1:
         return "the MoE output is not all-reduced over the TP group (attention DP or MoE TP)"
     workspace = getattr(model.layers[0].feed_forward, ATTRIBUTE, None)
@@ -147,6 +226,11 @@ def install(model: MuseSparkOpenModel) -> FinalizeTwoShotSwitch:
         moes.append(layer.feed_forward)
     bound_unarmed_calls(wrapped, moes)
     major, minor = torch.cuda.get_device_capability(workspace.device)
-    min_rows = MIN_ROWS_BY_SM[10 * major + minor]
-    _two.log_once_enabled(len(model.layers), workspace.max_rows, min_rows)
-    return FinalizeTwoShotSwitch(workspace, moes, min_rows)
+    min_rows, max_rows = band(10 * major + minor, mapping.tp_size)
+    # A finalize transport widened past 16 tokens (TP8:
+    # ``finalize_allreduce_transport.TP8_MAX_TOKENS_ENV``) is faster than this kernel up to
+    # its last token count, so the band starts above it.
+    min_rows = max(min_rows, int(getattr(wrapped, "max_tokens", 0)) + 1)
+    max_rows = min(max_rows, workspace.max_rows)
+    _two.log_once_enabled(len(model.layers), max_rows, min_rows)
+    return FinalizeTwoShotSwitch(workspace, moes, min_rows, max_rows)

@@ -25,6 +25,12 @@ row range:
   (buffer, ``t``, column vector) of every other rank, where that rank's CTA of the
   token reads it. Ingress per rank: ``(ranks - 1) / ranks * tokens * 8 KiB`` twice,
   behind two dependent exchanges.
+* **Rank counts** (``RANK_COUNTS``) -- four ranks on one tray (CUDA IPC), or eight over two
+  trays of four in one NVLink domain (the receive memory is a fabric allocation every rank
+  maps, as the TP8 built-in's). The built-in TP8 kernel runs the thread map above from 17
+  tokens on (below that it splits a token over a cluster of 8 CTAs), so at eight ranks a
+  call takes 17 or more tokens (``MIN_ROWS_BY_RANKS``) and stays bitwise the built-in's.
+  At eight ranks the built-in one-shot's ingress is ``7 * tokens * 8 KiB`` per rank.
 
 Lamport slots. Every slot starts as the sentinel word ``0x80000000``; a 32-bit word
 that still holds it has not arrived. No payload word is the sentinel: a partial has
@@ -122,8 +128,16 @@ MIN_ROWS = 64
 MAX_ROWS = 512
 #: The largest call the built-in fused finalize serves in one launch.
 BUILTIN_MAX_TOKENS = 128
-#: The tensor-parallel group sizes the transport is laid out for.
-RANK_COUNTS = (4,)
+#: The tensor-parallel group sizes the transport is laid out for: four ranks on one tray, or
+#: eight over two trays of four in one NVLink domain (fabric memory, as the TP8 built-in).
+RANK_COUNTS = (4, 8)
+#: The fewest tokens a call takes, by the group's rank count. Four ranks: ``MIN_ROWS``. Eight
+#: ranks: 17. The protocol needs at least ``ranks`` tokens per call (every rank owns one), and
+#: the built-in TP8 kernel runs this kernel's thread map (one 512-thread CTA per token) from 17
+#: tokens on (``musespark_open_finalize_ar._CLUSTER_TABLES[8]``); at 16 tokens and fewer it
+#: splits a token over a cluster of 8 CTAs and adds the per-CTA sums of squares in another order.
+#: So a call in the band is bitwise the built-in kernel's at either rank count.
+MIN_ROWS_BY_RANKS = {4: MIN_ROWS, 8: 17}
 MAX_RANKS = 8
 SENTINEL = 0x80000000
 BUFFERS = 2
@@ -577,21 +591,25 @@ def _pdl_enabled() -> bool:
     return _transport._pdl_enabled()
 
 
-def takes(num_tokens, max_rows: int = MAX_ROWS) -> bool:
+def takes(num_tokens, max_rows: int = MAX_ROWS, min_rows: int = MIN_ROWS) -> bool:
     """Whether a call of ``num_tokens`` is in this entry's band (the same on every rank)."""
     return (
         isinstance(num_tokens, int)
         and not isinstance(num_tokens, bool)
-        and MIN_ROWS <= num_tokens <= max_rows
+        and min_rows <= num_tokens <= max_rows
     )
 
 
 class FinalizeTwoShotWorkspace:
-    """This transport's memory and state for one TP4 group, in front of another finalize workspace.
+    """This transport's memory and state for one TP group, in front of another finalize workspace.
+
+    The group is four ranks on one tray, or eight over two trays of four in one NVLink domain
+    (``RANK_COUNTS``); across trays the receive memory is a fabric allocation every rank maps.
 
     ``finalize`` and ``finalize_chunked`` have the built-in ``FinalizeIpcWorkspace``
     signatures. While ``active`` (set by the fast path's switch around a decode forward,
-    identical on every rank), calls of ``MIN_ROWS..max_rows`` tokens run this module's
+    identical on every rank), calls of ``min_rows..max_rows`` tokens (``min_rows``:
+    ``MIN_ROWS_BY_RANKS`` of the group's size) run this module's
     kernel; every other call goes to ``wrapped`` (the ``finalize_transport`` workspace or
     the built-in one), whose protocol state is separate, so the two interleave freely.
     Construction is collective over the group (fabric allocation, sentinel fill, compilation
@@ -615,10 +633,14 @@ class FinalizeTwoShotWorkspace:
         )
 
         if mapping.tp_size not in RANK_COUNTS:
-            raise ValueError(f"the two-shot finalize serves TP4, got TP{mapping.tp_size}")
-        if not MIN_ROWS <= max_rows <= GRID_STEP or max_rows % mapping.tp_size:
             raise ValueError(
-                f"max_rows must be a multiple of the TP size in {MIN_ROWS}..{GRID_STEP}, "
+                f"the two-shot finalize serves TP{' or TP'.join(map(str, RANK_COUNTS))}, "
+                f"got TP{mapping.tp_size}"
+            )
+        self.min_rows = MIN_ROWS_BY_RANKS[mapping.tp_size]
+        if not self.min_rows <= max_rows <= GRID_STEP or max_rows % mapping.tp_size:
+            raise ValueError(
+                f"max_rows must be a multiple of the TP size in {self.min_rows}..{GRID_STEP}, "
                 f"got {max_rows}"
             )
         self.wrapped = wrapped
@@ -635,13 +657,16 @@ class FinalizeTwoShotWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("the CuTe DSL or the built-in finalize module is unavailable")
-            if mapping.is_multi_node():
-                raise RuntimeError("the two-shot finalize serves one tray")
+            # Four ranks: one tray (CUDA IPC). Eight: the two trays' fabric (the topology is
+            # the fast path's to check: ``kernels/finalize_two_shot.install.refusal``).
+            use_fabric = mapping.is_multi_node()
+            if use_fabric and self.ranks != 8:
+                raise RuntimeError("the two-shot finalize serves TP4 on one tray")
             if torch.cuda.get_device_capability(self.device) != (10, 3):
                 raise RuntimeError("the two-shot finalize runs on SM103 only")
             self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
             self._handle = _make_mnnvl_mcast_buffer(
-                self._comm, self.workspace_bytes, mapping, False
+                self._comm, self.workspace_bytes, mapping, use_fabric
             )
             words = self.workspace_bytes // 4
             self._uc = [
@@ -712,13 +737,13 @@ class FinalizeTwoShotWorkspace:
 
     def takes(self, num_tokens) -> bool:
         """Whether a call of ``num_tokens`` runs this kernel while active."""
-        return takes(num_tokens, self.max_rows)
+        return takes(num_tokens, self.max_rows, self.min_rows)
 
     def _validate(self, gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens):
-        """The built-in workspace's input contract, for ``MIN_ROWS..max_rows`` tokens."""
+        """The built-in workspace's input contract, for ``min_rows..max_rows`` tokens."""
         if not self.takes(num_tokens):
             raise ValueError(
-                f"num_tokens must be in [{MIN_ROWS}, {self.max_rows}], got {num_tokens!r}"
+                f"num_tokens must be in [{self.min_rows}, {self.max_rows}], got {num_tokens!r}"
             )
         if not (isinstance(eps, (int, float)) and math.isfinite(eps) and eps > 0):
             raise ValueError(f"eps must be positive and finite, got {eps!r}")
@@ -802,7 +827,7 @@ class FinalizeTwoShotWorkspace:
         eps: float,
         num_tokens: int,
     ) -> torch.Tensor:
-        """The wrapped ``finalize``, with ``MIN_ROWS..128`` tokens on this kernel while active."""
+        """The wrapped ``finalize``, with ``min_rows..128`` tokens on this kernel while active."""
         if self.active and self.takes(num_tokens) and num_tokens <= BUILTIN_MAX_TOKENS:
             return self.launch(gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens)
         return self.wrapped.finalize(
@@ -818,7 +843,7 @@ class FinalizeTwoShotWorkspace:
         eps: float,
         num_tokens: int,
     ) -> torch.Tensor:
-        """This kernel for ``MIN_ROWS..max_rows`` tokens while active, else the wrapped ``finalize_chunked``.
+        """This kernel for ``min_rows..max_rows`` tokens while active, else the wrapped ``finalize_chunked``.
 
         Raises:
             RuntimeError: for a call this kernel does not take when ``wrapped`` has no
@@ -859,8 +884,9 @@ class FinalizeTwoShot(OpWrapper):
     Certified bit for bit against the built-in kernel (``finalize`` up to 128 tokens,
     ``finalize_chunked`` above) by its own four-rank test (every cell, a delayed rank,
     back-to-back calls of changing token counts, CUDA-graph replays with changing
-    inputs) and against `reference` within a band. Not certified: TP8, more than 512
-    tokens.
+    inputs) and against `reference` within a band. At TP8 over two trays (17..512 tokens)
+    only by the bitwise comparison against the built-in TP8 fabric kernel of a multi-node
+    qualification run, not by a committed test. Not certified: more than 512 tokens.
     """
 
     def __call__(
@@ -874,7 +900,9 @@ class FinalizeTwoShot(OpWrapper):
         workspace: FinalizeTwoShotWorkspace,
     ) -> torch.Tensor:
         if not workspace.takes(num_tokens):
-            raise ValueError(f"finalize_two_shot serves {MIN_ROWS}..{workspace.max_rows} tokens")
+            raise ValueError(
+                f"finalize_two_shot serves {workspace.min_rows}..{workspace.max_rows} tokens"
+            )
         return workspace.launch(
             gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
         )

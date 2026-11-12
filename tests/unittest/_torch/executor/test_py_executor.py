@@ -1143,6 +1143,45 @@ class TestIdleDisaggLoopPacing:
         assert sleep.called is expect_sleep
 
 
+class TestDeferUnreadyGenReceivesGate:
+    """The coordinator defers unready receives only where the admission fence
+    can still be queued behind an in-flight forward and nothing else orders
+    the receive after it."""
+
+    @staticmethod
+    def _build(*, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = kv_manager_v2
+        executor.disable_overlap_scheduler = not overlap
+        executor.dist = Mock(rank=0, tp_size=1, world_size=pp_size, pp_size=pp_size)
+        executor.kv_connector_manager = Mock() if kv_connector else None
+        return executor._build_disagg_coordinator()
+
+    @pytest.mark.parametrize("kv_connector", [False, True], ids=["no_connector", "connector"])
+    @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
+    @pytest.mark.parametrize("overlap", [True, False], ids=["overlap", "no_overlap"])
+    @pytest.mark.parametrize("kv_manager_v2", [True, False], ids=["v2", "v1"])
+    def test_defers_only_with_v2_overlap_pp1_and_no_connector(
+        self, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool
+    ) -> None:
+        coordinator = self._build(
+            kv_manager_v2=kv_manager_v2, overlap=overlap, pp_size=pp_size, kv_connector=kv_connector
+        )
+
+        assert isinstance(coordinator, DisaggTransferCoordinator)
+        expected = kv_manager_v2 and overlap and pp_size == 1 and not kv_connector
+        assert coordinator._defer_unready_gen_receives is expected
+
+    def test_unset_executor_attributes_keep_the_blocking_fence(self) -> None:
+        """An executor assembled without the scheduler and cache-manager
+        attributes falls back to the blocking fence."""
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+
+        assert executor._build_disagg_coordinator()._defer_unready_gen_receives is False
+
+
 class TestDisaggTransferAdmissionPP:
     def test_pp_schedule_serializes_the_admission_decision(self) -> None:
         """Rank 0 admits right after scheduling; the admitted subset and the

@@ -38,6 +38,20 @@ TF32x3 kernel also rounds every weight to 22 bits, the TF32 ``Linear`` to 11.
 Programmatic dependent launch: the GEMM waits (``griddepcontrol.wait``) before its
 first load and releases its dependents after its last MMA; the sum kernel waits
 before reading the partials and releases its dependents.
+
+``router_staged_gemm`` (default off; set once, when the model is
+imported; ``set_staged`` for tests and benches): a call of ``STAGED_MIN_ROWS..STAGED_MAX_ROWS``
+rows -- two 128-row tiles, 38 K splits on GB300, a TEP8 decode step of 17..32 requests at
+K=7 -- runs its GEMM as ``ops/moe/router_gemm_staged.Sm100BF16x3RouterGemmStaged`` (the
+feature branch's sm107 kernel, #21754): the same tile, pipeline, K tiles per CTA, weight
+split, MMAs, accumulators and per-element add, with the finished partial tile written
+through shared memory (``bulk``: one 512-byte bulk copy per row; ``v4``: 16-byte vector
+stores) instead of one 4-byte store per element, and with ``-prewait`` every weight tile
+of the CTA (at most four here) loaded, and the first two split into tensor memory, before
+``griddepcontrol.wait``. The partials, hence the logits, the selected experts and their
+weights, are this entry's bits exactly; the sum kernel is unchanged. ``1`` selects
+``STAGED_DEFAULT``. Every other call, and every call while the switch is off, runs the
+tree's kernel as before.
 """
 
 from __future__ import annotations
@@ -93,6 +107,77 @@ def staged_epilogue() -> Optional[str]:
     return _staged_epilogue
 
 
+#: The staged GEMM's row band: the calls of two 128-row tiles.
+STAGED_MIN_ROWS = ROW_TILE + 1
+STAGED_MAX_ROWS = 2 * ROW_TILE
+#: The staged GEMM's builds: (epilogue, weight loads before the dependency wait). Every
+#: epilogue is a ``STAGED_MODES`` entry; the pre-wait builds are this target's (the sm_103
+#: ``bf16x3_router_gemm`` has no pre-wait build of its own).
+STAGED_BUILDS = {
+    "bulk": ("bulk", False),
+    "v4": ("v4", False),
+    "bulk-prewait": ("bulk", True),
+    "v4-prewait": ("v4", True),
+}
+#: The build the ``router_staged_gemm`` lever selects when its ``BUILD`` names none.
+STAGED_DEFAULT = "bulk-prewait"
+
+
+def staged_build(value: Optional[str]) -> Optional[str]:
+    """The ``STAGED_BUILDS`` entry a switch value names: None for unset, ``""`` or ``0``.
+
+    Raises:
+        ValueError: for any other value outside ``STAGED_BUILDS`` and ``1`` (on every rank alike).
+    """
+    value = "" if value is None else str(value).strip().lower()
+    if value in ("", "0"):
+        return None
+    if value == "1":
+        return STAGED_DEFAULT
+    if value not in STAGED_BUILDS:
+        raise ValueError(
+            f"[musespark_open] router staged build {value!r}: expected 0, 1 or one of "
+            f"{sorted(STAGED_BUILDS)}"
+        )
+    return value
+
+
+#: ``router_staged_gemm``: the build calls of the staged band run, None for the tree's kernel.
+_staged: Optional[str] = None
+
+
+def configure(*, staged: Optional[str] = None) -> None:
+    """Set the staged build calls of ``STAGED_MIN_ROWS..STAGED_MAX_ROWS`` rows run.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; None, the
+    default, keeps the tree's kernel at every row count.
+
+    Args:
+        staged: a ``STAGED_BUILDS`` name, or None (``_staged``).
+
+    Raises:
+        ValueError: as ``staged_build``.
+    """
+    set_staged(staged)
+
+
+def set_staged(value: Optional[str]) -> None:
+    """Run every later call of ``STAGED_MIN_ROWS..STAGED_MAX_ROWS`` rows with the staged build
+    ``value`` names (``staged_build``; None or ``0``: the tree's kernel). Before capture."""
+    global _staged
+    _staged = staged_build(value)
+
+
+def staged() -> Optional[str]:
+    """The staged build calls of ``STAGED_MIN_ROWS..STAGED_MAX_ROWS`` rows run, or None."""
+    return _staged
+
+
+def staged_takes(rows: int) -> bool:
+    """Whether a call of ``rows`` rows runs the staged GEMM."""
+    return _staged is not None and STAGED_MIN_ROWS <= rows <= STAGED_MAX_ROWS
+
+
 def row_tile(rows: int) -> int:
     """The GEMM's N tile for a call of ``rows`` rows: the next power of two, 8..128."""
     return min(max(triton.next_power_of_2(rows), 8), ROW_TILE)
@@ -116,7 +201,13 @@ def splits(rows: int, sms: Optional[int] = None) -> int:
     return sms // (EXPERT_TILES * triton.cdiv(rows, ROW_TILE))
 
 
-def _gemm(tile: int):
+def _gemm(tile: int, build: Optional[str] = None):
+    """The compiled GEMM for ``tile``-row tiles: the tree's kernel, or the staged ``build``."""
+    if build is not None:
+        from .router_gemm_staged import Sm100BF16x3RouterGemmStaged
+
+        epilogue, prewait = STAGED_BUILDS[build]
+        return Sm100BF16x3RouterGemmStaged.compile(tile, HIDDEN, epilogue, prewait)
     # Imported at the first compile, as before the move.
     from .bf16x3_router_gemm import Sm100BF16x3RouterGemm
 
@@ -176,7 +267,8 @@ class RouterGemm(OpWrapper):
         partials = torch.empty(
             (split_count, rows, EXPERTS), device=hidden_states.device, dtype=torch.float32
         )
-        _gemm(row_tile(rows))(hidden_states, weight, partials, split_count)
+        build = _staged if staged_takes(rows) else None
+        _gemm(row_tile(rows), build)(hidden_states, weight, partials, split_count)
         output = torch.empty((rows, EXPERTS), device=hidden_states.device, dtype=torch.float32)
         size = rows * EXPERTS
         splits_pow2 = triton.next_power_of_2(split_count)

@@ -48,7 +48,7 @@ are left out of the plan (``dispatch.WINDOWED_CONTEXT_ARENA_PATHS``); over a
 windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``) the paths that write the
 arena by column (``dispatch.FULL_CONTEXT_ARENA_PATHS``: the context-K/V fork and
 the verify fold) stay where the composition serves the window compaction too
-(sm103 tep4), and are left out otherwise. The installers
+(sm103 tep4 and tep8), and are left out otherwise. The installers
 ask the plan per fast path (``Plan.enabled``); each paragraph below names one
 fast path of ``dispatch.FAST_PATHS``. Their installers live under
 ``kernels/<fast path>/`` and their launches under ``ops/<category>/``.
@@ -135,6 +135,10 @@ Dense projections and prefetch:
   kernel per shape on every rank. The other fast paths' GEMM calls on those
   modules (the built-in attention's, the pool GEMM, the unpool GEMM handed to
   the boundary) go through the same dispatchers.
+* ``wide_dense_gemms`` (tep8) gives those dispatchers a kernel for their calls of
+  9..32 rows as well, at the sites the TP size's table names (``kernels/dense_gemms``'
+  ``WIDE_KERNELS_BY_SM_TP``): the QKV projection. Each is flashinfer's split-K with the
+  ``split_k`` of the site's 8-row kernel, so every row gets its one-request bits.
 * ``dense_gemm_prefetch`` has those dispatchers also prefetch the next
   projection's weight into L2 on a side stream, a fork that both targets join
   by the end of their forward.
@@ -178,12 +182,13 @@ Hops and boundaries:
   forks no prefetch of the pool weight. After the weights load,
   ``verify_direct_publish`` checks the kernel the published o_proj captures; a
   step that raises while armed resets the transport.
-* ``multi_request_post_attention_hop`` (sm103 tep4 only) arms the same joins on decode
+* ``multi_request_post_attention_hop`` (sm103 tep4 and tep8) arms the same joins on decode
   steps of 9..1024 rows (two to 128 requests at K = 7) with ``ops/allreduce/post_attn_hop_wide``:
   the o_proj partial skips the built-in MNNVL all-reduce and one kernel reduces it, joins
   it into the residual and applies the pre-FFN norm on the cluster boundary's 9..32-row
-  split, on its own transport sized for 512 rows (one-shot below ``TWO_SHOT_ROWS`` rows,
-  two-shot with a per-row owner from there, unicast publication) -- a step of 513..1024 rows
+  split, on its own transport sized for 512 rows (one-shot below the group's cut
+  ``TWO_SHOT_ROWS_BY_RANKS`` -- 32 rows at tep4, 16 at tep8 -- two-shot with a per-row
+  owner from there, the same bits either way, unicast publication) -- a step of 513..1024 rows
   (a generation worker's) on a second, two-shot transport of 1024 rows built on the first such
   step -- launched after the
   o_proj GEMM rather than as its programmatic dependent. Bitwise the built-in
@@ -210,19 +215,25 @@ Hops and boundaries:
   ``DecodeTarget`` pass ``capture_fold``: on the DFlash capture layers the fused
   post-FFN boundary also writes the layer's BF16 capture into the DFlash
   buffer, and the built-in capture copies of that layer are not launched.
-* ``wide_projection_gathers`` (tep4 on sm_103 only) widens ``projection_gathers`` to
+* ``wide_projection_gathers`` (sm_103, tep4 and tep8) widens ``projection_gathers`` to
   decode steps of 9..32 rows (two to four requests at K = 7), which ``DecodeTarget``
   arms (``WideProjections.armed``): the pool and unpool projections return the rank's
   slice, the post-FFN boundary and the pre-expert quantization gather it on the path's
-  32-row inboxes, and the dense GEMM plan runs its 9..32-row table, so the next QKV is
-  flashinfer's split-K, which the boundary's early release lets stream its weight.
-  Decode steps of 1..8 rows keep the 8-row inboxes and kernels.
-* ``projection_publish`` (tep4 on sm_103 only) takes the deferred pool and unpool
-  projections of decode steps of 33..512 rows (5 to 64 requests at K = 7), which
-  ``DecodeTarget`` arms (``PublishedProjections.armed``): each rank multiplies its column
-  slice with the slot of the site's multicast transport as the GEMM's output, and the
-  pre-expert NVFP4 quantization and the post-FFN join poll the published rows (the built-in
-  kernels' arithmetic on the gathered rows).
+  32-row inboxes, and the dense GEMM plan runs its 9..32-row table for the slices (and at
+  tep4 for QKV; at tep8 ``wide_dense_gemms`` has the QKV cells), so the next QKV is
+  flashinfer's split-K, which the boundary's early release lets stream its weight. At tep8
+  each boundary CTA of those rows covers two ranks' slices, and the unpooler's
+  ``dense_gemm_prefetch`` fork of the next QKV weight is dropped at those rows on the
+  converted edges (``boundary_early_release``). Decode steps of 1..8 rows keep the 8-row
+  inboxes and kernels.
+* ``projection_publish`` (tep4 and tep8 on sm_103) takes the deferred
+  pool and unpool projections of multi-request decode steps -- 33..448 rows at tep4 (5 to 56
+  requests at K = 7), the producer census's row counts of 40..512 at tep8 (5 to 64
+  requests; ``kernels/projection_publish``'s ``MAX_ROWS_BY_TP``) -- which ``DecodeTarget``
+  arms (``PublishedProjections.armed``): each rank multiplies its column slice with the slot
+  of the site's multicast transport as the GEMM's output (at tep8 over the two trays'
+  fabric), and the pre-expert NVFP4 quantization and the post-FFN join poll the published
+  rows (the built-in kernels' arithmetic on the gathered rows).
 
 MoE:
 
@@ -252,11 +263,12 @@ MoE:
   rows) and the TF32 ``Linear`` (above 128 rows). Steps with context rows and
   decode steps of at most 8 or more than 512 rows keep the class behind it. Not
   bitwise the built-in logits: its error is the FP32 accumulation's alone.
-* ``wide_moe_allreduce`` (tep4 on sm_103 only) puts a ``WideMoeAllReduce`` in
-  every MoE layer's ``all_reduce``: ``DecodeTarget`` arms them for a decode
-  forward of 129..1024 rows (above the fused finalize's 128), whose unfused MoE
-  output is then all-reduced on the MNNVL two-shot instead of the built-in NCCL
-  ring (``kernels/wide_moe_allreduce``); every other call, and every call of a
+* ``wide_moe_allreduce`` (tep4 and tep8 on sm_103) puts a
+  ``WideMoeAllReduce`` in every MoE layer's ``all_reduce``: ``DecodeTarget`` arms
+  them for a decode forward of 129..1024 rows (above the fused finalize's 128),
+  whose unfused MoE output is then all-reduced on the MNNVL two-shot (at tep8 over
+  the two trays' fabric) instead of the built-in NCCL ring
+  (``kernels/wide_moe_allreduce``); every other call, and every call of a
   prefill or mixed step, runs the built-in NCCL module.
 * ``finalize_two_shot`` (tep4 on sm_103 only) puts a ``FinalizeTwoShotWorkspace`` in
   front of the finalize transport in every MoE layer's fused finalize attribute:
@@ -299,7 +311,10 @@ installed by the shell's ``load_weights`` after the built-in loader
 
 * ``replicated_experts`` replicates each rank's ring predecessor's experts and
   patches every layer's experts module and routing method, whatever class the
-  MoE module itself has.
+  MoE module itself has. Its balanced placement takes the decode steps of up to 16
+  rows, and at tep8 up to 32 (three and four requests at K = 7;
+  ``ring_buddy.MAX_ROWS_BY_SM_TP``, keyed by the device's capability like the
+  composition).
 * ``persistent_experts`` routes the NVFP4 layers' stacked calls of at most 8
   rows to the persistent expert kernel. Without ``replicated_experts`` (tp 4)
   the stacked calls run over the rank's own expert block (the owner-only window,
@@ -386,9 +401,9 @@ decode steps' head logits stay BF16 and are sampled by
 ``ops/spec/head_sampler.py``; ``lm_head_inbox`` also lets the LM-head GEMM
 write into a multicast inbox that the sampler gathers from (and fires the
 context-K/V fork's head fork point right after that GEMM); ``wide_split_sampler``
-(tep4 on sm_103 only) widens the head to decode steps of 129..1024 rows, which the
+(tep4 and tep8) widens the head to decode steps of 129..1024 rows, which the
 sampler takes on the shipped sampler's 512-thread block (``target_head.widen``);
-``vocab_parallel_head`` (tep4) samples and argmaxes decode steps of
+``vocab_parallel_head`` (tep4 and tep8) samples and argmaxes decode steps of
 16 rows or more from each rank's own vocabulary shard, without the logits all-gather.
 """
 
@@ -414,6 +429,7 @@ from tensorrt_llm.logger import logger
 
 from . import dispatch as _dispatch
 from . import layers as _layers
+from . import lever_settings as _lever_settings
 from . import weights as _weights
 from .attention import DecodeAttentionPlan
 from .layers import _NO_ALLREDUCE, PostAttnHopCall
@@ -447,6 +463,8 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
     _finalize_two_shot: Optional[object]
     _wide_hop: Optional[object]
     _hot_replicas: Optional[object] = None
+    #: ``tep8_wide_direct_transports`` (``kernels/wide_direct_transports``), or None.
+    _wide_direct: Optional[object] = None
 
     @classmethod
     def adopt(
@@ -489,6 +507,7 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
         model._wide_hop = adopted.wide_hop
         model._wide_projections = adopted.wide_projections
         model._published_projections = adopted.published_projections
+        model._wide_direct = adopted.wide_direct
         model._batch_dense_gemms = adopted.batch_dense_gemms
         model._prefill = PrefillTarget(model, _dispatch.sm_of(compute_capability))
         model._decode = DecodeTarget(model)
@@ -687,9 +706,11 @@ class DecodeTarget:
     With ``wide_projection_gathers``, a forward of 9..32 rows (two to four requests) is
     armed (``WideProjections.armed``): the layers' pool and unpool projections return the
     rank's slice, their consumers gather it on the path's 32-row inboxes, and the dense
-    GEMM plan runs its 9..32-row table (the QKV projection on split-K).
+    GEMM plan runs its 9..32-row table (the slices on split-K; the QKV projection on split-K
+    from this table at tep4, from ``wide_dense_gemms``' at tep8).
 
-    With ``projection_publish``, a forward of 33..448 rows (5 to 56 requests) is armed
+    With ``projection_publish``, a forward of 33..448 rows (5 to 56 requests) at tep4, or of
+    one of the producer census's row counts of 40..512 (5 to 64 requests) at tep8, is armed
     (``PublishedProjections.armed``): the layers' pool and unpool slice GEMMs write into the
     sites' multicast transports and their consumers poll the published rows.
 
@@ -734,6 +755,7 @@ class DecodeTarget:
         self.wide_projections = getattr(core, "_wide_projections", None)
         self.published_projections = getattr(core, "_published_projections", None)
         self.batch_dense_gemms = getattr(core, "_batch_dense_gemms", None)
+        self.wide_direct = getattr(core, "_wide_direct", None)
 
     def forward(
         self,
@@ -798,6 +820,10 @@ class DecodeTarget:
         wide_ar_armed = wide_ar is not None and wide_ar.takes(rows)
         wide_proj = self.wide_projections
         wide_proj_armed = wide_proj is not None and wide_proj.takes(rows)
+        # tep8_wide_direct_transports: 16/24/32-row steps of the wide projection
+        # chain publish the pool / unpool slices from their GEMMs (kernels/wide_direct_transports).
+        wide_direct = self.wide_direct
+        wide_direct_armed = wide_proj_armed and wide_direct is not None and wide_direct.takes(rows)
         published = self.published_projections
         published_armed = published is not None and published.takes(rows)
         two_shot = self.finalize_two_shot
@@ -824,6 +850,7 @@ class DecodeTarget:
             kv_splits.armed() if kv_splits_armed else contextlib.nullcontext(),
             wide_ar.armed() if wide_ar_armed else contextlib.nullcontext(),
             wide_proj.armed() if wide_proj_armed else contextlib.nullcontext(),
+            wide_direct.armed(rows) if wide_direct_armed else contextlib.nullcontext(),
             published.armed(rows) if published_armed else contextlib.nullcontext(),
             two_shot.armed() if two_shot_armed else contextlib.nullcontext(),
             hot.armed() if hot_armed else contextlib.nullcontext(),
@@ -857,8 +884,8 @@ _TEP4_ONLY_PATHS = frozenset(
         "half_window_experts",
     }
 )
-#: The fast paths validated at a tep4 rank's shape on sm103, which no TEP8 composition
-#: serves: the multi-request
+#: The fast paths validated at a tep4 rank's shape, which ``_TEP8_PATHS`` leaves out
+#: (sm103 TEP8 adds ``_SM103_TEP8_MULTI_REQUEST_PATHS`` of them): the multi-request
 #: decode prep append, the windowed drafter arena compaction, the router GEMM of
 #: multi-request calls, the multi-request decode FMHA, the full-attention
 #: decode FMHA over an over-subscribed KV split, the MoE output all-reduce of 129..1024-row
@@ -875,31 +902,93 @@ _TEP4_ONLY_PATHS = frozenset(
 #: verify head of 16..1024-row decode steps on each rank's own vocabulary shard over the
 #: tray's multicast, and the drafter hops of 9..56-row block decodes on a wide one-shot
 #: transport.
+#: ``wide_drafter_hops`` and ``finalize_two_shot`` left this set when they became levers of
+#: both compositions (``levers._tep4_only``: on at tep4 as before, on its knob at tep8).
+#: The levers of the tep4 paths above are listed with them: the multi-request combine's
+#: norm-gate, the staged router GEMM and the wide direct transports of the sharded pool and
+#: unpool slices (whose ``wide_projection_gathers`` no tep8 composition serves).
 _SM103_TEP4_ONLY_PATHS = frozenset(
     {
         "hot_replicas",
         "multi_request_prep_append",
         "drafter_window_compact",
         "router_gemm",
+        "router_staged_gemm",
         "multi_request_split_kv",
+        "multi_request_combine_gate",
         "decode_kv_splits",
         "wide_moe_allreduce",
         "multi_request_post_attention_hop",
         "wide_projection_gathers",
+        "tep8_wide_direct_transports",
         "projection_publish",
         "context_sequence_parallel",
-        "finalize_two_shot",
         "batch_dense_gemms",
         "wide_drafter_window_attention",
         "wide_draft_topk",
         "wide_split_sampler",
         "context_prep",
         "vocab_parallel_head",
-        "wide_drafter_hops",
     }
 )
-#: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones.
+#: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones. Among
+#: them, ``wide_dense_gemms`` is TEP8's alone: its table (``dense_gemms.WIDE_KERNELS_BY_SM_TP``)
+#: has a TP8 row only, the QKV projection of 9..32-row decode steps on flashinfer's split-K 4
+#: (the 8-row cell's ``split_k``) in place of the built-in low-M dispatch's cuBLAS split-K and
+#: reduce; the attention output, pooler and unpooler projections keep the built-in dispatch.
 _TEP8_PATHS = _dispatch.BASE_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS
+#: The paths of ``_SM103_TEP4_ONLY_PATHS`` that sm103 TEP8 serves on top of ``_TEP8_PATHS``:
+#: those whose kernels take a TP8 rank -- any head count (the multi-request decode prep
+#: append), 2 KV heads of 8 query heads each (``multi_request_split_kv.RANK_KV_HEADS``), no
+#: rank shape (the router GEMM over the replicated router, the drafter arena compaction,
+#: the split sampler on the gathered row) or eight ranks over two trays' fabric
+#: (``post_attn_hop_wide``, ``head_sampler.VocabParallelWorkspace``, the MNNVL two-shot
+#: all-reduce ``wide_moe_allreduce`` arms). They act on decode steps of two or more
+#: requests (16 rows and up at K = 7), which every other TEP8 decode path leaves to the
+#: built-in modules: the decode prep append of every layer and the decode FMHA of the
+#: full-attention layers, the router logits of 9..512-row calls, the post-attention hop of
+#: 9..1024-row steps on its own transports, the verify head on each rank's vocabulary
+#: shard from 16 rows, the split verify sampler on 129..1024-row steps and the unfused MoE
+#: output all-reduce of 129..1024-row steps (above the fabric finalize's 128 rows; NCCL in
+#: the built-in). The windowed drafter arena's compaction keeps the context-K/V fork and
+#: the verify fold in the plan over the windowed arena (``dispatch.compose``). And
+#: ``projection_publish``, whose transports and consumers take the TP size from the mapping
+#: (``projection_publish.WORLDS``; the pool consumer reads one vector of each of the eight
+#: ranks' slots per thread, the unpool join's ``WORLD_SIZE`` is a constant of its build):
+#: the pool and unpool projections of the decode steps at the producer census's row counts
+#: of 40..512 (``CENSUS_ROWS_BY_TP[8]``, capped by ``MAX_ROWS_BY_TP[8]``) multiply the
+#: rank's 512 / 1024 columns and publish them from the GEMM, where the built-in multiplies
+#: the replicated weights on every rank above 8 rows. Its cuBLAS producer is certified per
+#: TP size and slice shape (``projection_publish.CERTIFIED_PRODUCERS``), so a TP4 census does
+#: not arm it; on another torch, cuBLASLt or device its build refuses and the built-in serves.
+#: And ``wide_projection_gathers`` on its TP8 table
+#: (``wide_projection_gathers.TP8_WIDE_KERNELS``, the slices only): the pool / unpool
+#: projections of 9..32-row decode steps as the rank's 512 / 1024 columns on split-K 4, in
+#: place of the replicated cuBLAS calls over the whole weights, their gathers fused into the
+#: pre-expert quantization and the post-FFN boundary on 32-row inboxes (each boundary CTA
+#: polling two peers), the boundary releasing the next QKV at entry.
+#: Left out: ``decode_kv_splits`` (its split acts only on the decode FMHA calls
+#: ``multi_request_split_kv`` declines and on mixed steps) and the paths written for one
+#: tray.
+_SM103_TEP8_MULTI_REQUEST_PATHS = frozenset(
+    {
+        "multi_request_prep_append",
+        "multi_request_split_kv",
+        "router_gemm",
+        "multi_request_post_attention_hop",
+        "vocab_parallel_head",
+        "wide_split_sampler",
+        "drafter_window_compact",
+        "wide_moe_allreduce",
+        "wide_projection_gathers",
+        "projection_publish",
+        # Levers over paths already in this set: the combine gate rides
+        # ``multi_request_split_kv``, the staged build rides ``router_gemm``. Both carry the
+        # rank through the path they build on, so TEP8 serving that path serves these too.
+        "multi_request_combine_gate",
+        "router_staged_gemm",
+    }
+)
 #: The fast paths written for any rank count whose output is bitwise the built-in
 #: model's.
 _TEP4_BITWISE_PATHS = frozenset(
@@ -973,6 +1062,13 @@ _SM103_TEP4_PATHS = (
             "capture_fold",
             "moe_prologue",
             "finalize_transport",
+            # The two paths this composition has always carried; the wider one serves them
+            # too now, on its knob (``levers._tep4_only``).
+            "wide_drafter_hops",
+            "finalize_two_shot",
+            # The levers both compositions serve, each off until its knob is set.
+            "finalize_entry_trigger",
+            "drafter_fused_prep",
         }
     )
 )
@@ -988,9 +1084,16 @@ _PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
 #: DFlash drafting a linear chain of ``dispatch.DRAFT_LEN`` tokens on an NVFP4
 #: checkpoint; every other deployment runs the built-in modules only. The lever table
 #: (``dispatch.compose``) decides which served levers a deployment is built with.
+#: At TEP8 ``finalize_two_shot`` is the expert finalize and all-reduce of decode steps of
+#: 24..``TP8_MAX_ROWS`` rows (3 to 19 requests) as one two-shot kernel over the two trays'
+#: fabric (``kernels/finalize_two_shot``), in place of the built-in one-shot fused kernel at
+#: 24..128 rows (bitwise its result) and of the unfused combine, BF16 cast and MNNVL two-shot
+#: above (the fused kernel's rounding there, within one BF16 place of the unfused path's). The
+#: composition serves it; its lever leaves it off there until its knob is set.
 TARGET_PATHS = {
     (103, 8): _dispatch.TargetPaths(
-        served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
+        served=_TEP8_PATHS | _SM103_TEP8_MULTI_REQUEST_PATHS | _PREFETCH_LEVERS,
+        topology=_dispatch.TWO_TRAYS_OF_4,
     ),
     (103, 4): _dispatch.TargetPaths(
         served=_SM103_TEP4_PATHS,
@@ -1091,6 +1194,8 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         )
         self._plan = plan
         self._mapping = getattr(model_config, "mapping", None)
+        # Before any installer: the kernel modules read these settings when they build.
+        _lever_settings.apply(plan)
         if plan and self._runtime_hooks is None:
             # Every composition serves both executor fast paths
             # (dispatch.TargetPaths); NO_PATHS declares no hooks.

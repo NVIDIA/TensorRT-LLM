@@ -53,7 +53,10 @@ def install_loaded_features(
     ``three_window_placement`` it stacks a third ring window on those
     layers (``windows=3``, likewise passed only then), and with
     ``bf16_routed_experts`` the BF16 layers' stacked calls take unpacked
-    routing (``bf16_unpacked=True``; likewise passed only then).
+    routing (``bf16_unpacked=True``; likewise passed only then). On a device and TP
+    size with a row cap of their own (``ring_buddy.max_rows_for`` of
+    ``compute_capability``: sm103 at tp 8) the stacked path also takes the decode calls
+    up to that cap (``max_rows``, passed only then); elsewhere up to ``ring_buddy.MAX_ROWS``.
 
     Without ``replicated_experts``, ``persistent_experts`` and ``bf16_routed_experts``
     are installed on the owner-only window (``_install_owner_window``: no
@@ -71,7 +74,7 @@ def install_loaded_features(
     whichever expert call the paths above installed).
     """
     if plan.enabled("replicated_experts"):
-        _install_ring_buddy(text_model, mapping, plan)
+        _install_ring_buddy(text_model, mapping, plan, compute_capability)
     elif plan.enabled("persistent_experts") or plan.enabled("bf16_routed_experts"):
         _install_owner_window(text_model, mapping, plan)
     if plan.enabled("hot_replicas"):
@@ -88,14 +91,19 @@ def install_loaded_features(
                 "[musespark_open] pool_into_route is planned but the model shell built no direct pool "
                 "transport"
             )
-        pool_direct.install_sites(text_model, mapping)
+        pool_direct.install_sites(text_model, mapping, wide=plan.enabled("tep8_wide_direct_pool"))
     if plan.enabled("next_qkv_prefetch"):
         from .kernels.next_qkv_prefetch import prefetch as _qkv_prefetch
 
         _qkv_prefetch.wrap_expert_forwards(text_model)
 
 
-def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:
+def _install_ring_buddy(
+    text_model,
+    mapping,
+    plan: "_dispatch.Plan",
+    compute_capability: Optional[Tuple[int, int]] = None,
+) -> None:
     """``install_loaded_features``'s ``replicated_experts`` install."""
     from .kernels.replicated_experts import ring_buddy as _ring_buddy
 
@@ -104,6 +112,36 @@ def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:
         extra["windows"] = 3
     if plan.enabled("bf16_routed_experts"):
         extra["bf16_unpacked"] = True
+    max_rows = _ring_buddy.max_rows_for(compute_capability, getattr(mapping, "tp_size", None))
+    if max_rows != _ring_buddy.MAX_ROWS:
+        # sm103 tep8: the balanced placement also takes the 17..32-row decode steps
+        # (three and four requests), one ring_buddy_assign program of 256 slots.
+        extra["max_rows"] = max_rows
+    batch_rows = _tep8_persistent_batch_rows(
+        compute_capability,
+        mapping,
+        plan.enabled("persistent_experts"),
+        max_rows,
+        plan.param("tep8_persistent_batch_experts", "MAX_ROWS")
+        if plan.enabled("tep8_persistent_batch_experts")
+        else 0,
+    )
+    if batch_rows:
+        extra["persistent_rows"] = batch_rows
+    if _tep8_experts_switch(
+        "tep8_experts_early_start",
+        plan.enabled("tep8_experts_early_start"),
+        batch_rows,
+        EARLY_START_WHAT,
+    ):
+        extra["persistent_early_start"] = True
+    if _tep8_experts_switch(
+        "tep8_experts_in_kernel_placement",
+        plan.enabled("tep8_experts_in_kernel_placement"),
+        batch_rows,
+        IN_KERNEL_PLACEMENT_WHAT,
+    ):
+        extra["persistent_in_kernel_placement"] = True
     _ring_buddy.install(
         text_model,
         mapping,
@@ -111,6 +149,126 @@ def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:
         static_from=_ring_buddy.BLOCK,
         **extra,
     )
+
+
+def _ring_buddy_row_cap(ring_buddy, compute_capability, mapping) -> int:
+    """The largest stacked call the balanced ring-buddy path takes on this device.
+
+    ``max_rows_for`` is the cap ``ring_buddy.install`` will itself apply, from
+    ``tep8_ring_buddy_wide`` (else the module constant ``MAX_ROWS``, 16, so the batch builds
+    are clamped to 16 rows here and only the 16-column build is reachable). It takes the ring
+    size, which is what ``install`` passes it, not the compute capability: a tep8 mapping
+    gives 8, a tep4 one 4, anything else None. Older trees carry neither function, and the cap
+    is then ``MAX_ROWS``.
+    """
+    resolve = getattr(ring_buddy, "max_rows_for", None)
+    ring_size = getattr(ring_buddy, "ring_size", None)
+    if resolve is None or ring_size is None:
+        return int(ring_buddy.MAX_ROWS)
+    return int(resolve(ring_size(mapping)))
+
+
+def _tep8_persistent_batch_rows(
+    compute_capability, mapping, persistent: bool, max_rows: int, rows: int
+) -> int:
+    """``tep8_persistent_batch_experts``' row bound for this install, or 0 (off).
+
+    ``rows`` is the lever's ``MAX_ROWS``: the largest stacked NVFP4 expert call (9..32 rows:
+    decode steps of two to four requests at K = 7) the persistent expert kernel serves, on its
+    batch builds (``ops/moe/persistent_experts.BATCH_NTOKS``), instead of TRTLLM-gen's
+    pre-routed call. Off (0), TRTLLM-gen serves every stacked call above 8 rows.
+
+    Resolved on every rank alike. It takes effect on sm103 at tp 8 with ``persistent_experts``
+    planned; elsewhere it warns and does nothing. Calls above the ring-buddy cap (``max_rows``)
+    never reach the stacked path, so the bound is clamped to it, with a warning.
+
+    Raises:
+        ValueError: a ``rows`` that is not in ``9 .. BATCH_MAX_ROWS``.
+    """
+    if not rows:
+        return 0
+    from tensorrt_llm.logger import logger
+
+    from .ops.moe import persistent_experts as _persistent
+
+    rows = int(rows)
+    if not _persistent.MAX_ROWS < rows <= _persistent.BATCH_MAX_ROWS:
+        raise ValueError(
+            f"[musespark_open] tep8_persistent_batch_experts MAX_ROWS {rows}: the persistent "
+            f"expert kernel's batch builds serve stacked calls of {_persistent.MAX_ROWS + 1}.."
+            f"{_persistent.BATCH_MAX_ROWS} rows; give the largest such call"
+        )
+    tp = getattr(mapping, "tp_size", None)
+    if _tp_agreement.sm_of(compute_capability) != 103 or tp != 8 or not persistent:
+        logger.warning(
+            "[musespark_open] tep8_persistent_batch_experts has no effect here: it serves "
+            "sm103 tep8 with persistent_experts planned (got sm "
+            f"{_tp_agreement.sm_of(compute_capability)}, tp {tp}, "
+            f"persistent_experts {persistent})"
+        )
+        return 0
+    if rows > max_rows:
+        logger.warning(
+            f"[musespark_open] tep8_persistent_batch_experts MAX_ROWS {rows}: the ring-buddy "
+            f"stacked path takes calls of at most {max_rows} rows; the batch builds serve "
+            f"9..{max_rows}"
+        )
+        rows = max_rows
+        if rows <= _persistent.MAX_ROWS:
+            return 0
+    builds = [n for n in _persistent.BATCH_NTOKS if n < rows] + [_persistent.batch_ntok(rows)]
+    logger.info(
+        f"[musespark_open] tep8_persistent_batch_experts: the NVFP4 "
+        f"layers' stacked calls of {_persistent.MAX_ROWS + 1}..{rows} rows on the 64-expert "
+        f"ring-buddy window run the persistent expert kernel's batch builds "
+        f"({', '.join(f'{n} columns' for n in sorted(set(builds)))}) instead of TRTLLM-gen"
+    )
+    return rows
+
+
+#: sm103 tep8, default off; acts only with ``tep8_persistent_batch_experts``: a 9..N-row
+#: stacked NVFP4 call launches its ``ring_buddy_assign`` with programmatic dependent launch and
+#: an early trigger (after its own dependency wait), and the persistent kernel's batch build
+#: behind it launches while the assignment runs and reads its epoch before its own wait.
+#: Same rows.
+EARLY_START_WHAT = (
+    "ring_buddy_assign triggers the persistent expert kernel's batch builds right after its own "
+    "dependency wait, and they read their epoch before theirs"
+)
+
+
+#: sm103 tep8, default off; acts only with ``tep8_persistent_batch_experts``, and never with
+#: ``tep8_experts_early_start`` (the batch build serves one or the other). The stacked call
+#: passes the step's global expert ids and the rank's own index, and each CTA derives the
+#: balanced ring placement of ``ops/moe/ring_buddy_assign`` itself.
+IN_KERNEL_PLACEMENT_WHAT = (
+    "the persistent expert kernel's batch builds derive the balanced ring placement themselves "
+    "from the step's global expert ids"
+)
+
+
+def _tep8_experts_switch(name: str, on: bool, batch_rows: int, what: str) -> bool:
+    """A lever of the persistent kernel's batch builds, as the plan resolved it.
+
+    Off: off. On where the batch builds serve (``batch_rows``, from
+    ``tep8_persistent_batch_experts``), with one INFO line; elsewhere a warning and off.
+    """
+    if not on:
+        return False
+    from tensorrt_llm.logger import logger
+
+    if not batch_rows:
+        logger.warning(
+            f"[musespark_open] {name} has no effect here: it acts on the persistent expert "
+            "kernel's batch builds, which serve only with tep8_persistent_batch_experts on "
+            "sm103 tep8 with persistent_experts planned"
+        )
+        return False
+    logger.info(
+        f"[musespark_open] {name}: on the NVFP4 layers' stacked calls of "
+        f"9..{batch_rows} rows, {what}"
+    )
+    return True
 
 
 def _install_owner_window(text_model, mapping, plan: "_dispatch.Plan") -> None:

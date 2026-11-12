@@ -61,8 +61,10 @@ Ownership and reuse (cuFlow):
   records, after its own dependency wait. A poll that has seen no arrival for
   ``guard_ns`` sets a guard word in host memory (and keeps polling).
 
-Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
-requests (16..32 rows) run the wide tagged kernel's statements, in
+Wide transport (``max_rows=WIDE_MAX_ROWS``; upstream b5ca973 / #21377 at TP4, here also TP8
+routing-only, ``tep8_wide_direct_pool`` beside the TEP8 router shard's wide
+route): the decode steps of two to four
+requests (16..32 rows, ``wide_prologue``) run the wide tagged kernel's statements, in
 which each CTA routes only its own two rows (no placement, no early ids). A record is
 then the source rank's ``[32, C]`` pool slot followed by one ``[32, L]`` FP32 logit
 block, the router's output as it is (``router_shard_rows`` with the block as its
@@ -150,11 +152,11 @@ def pool_row_words(world: int) -> int:
 
 
 def check_layout(world: int, max_rows: int) -> None:
-    """Raise unless ``(world, max_rows)`` is a served layout: 8 rows at TP8 or TP4, 32 rows at TP4."""
+    """Raise unless ``(world, max_rows)`` is a served layout: 8 rows at TP8 or TP4, 32 rows at TP4
+    or TP8 (at TP8 routing only, ``PLACE_NONE``: the tagged kernel's wide statements are the
+    TP-generic ones, each CTA's ``[2, L]`` logit words; the half window's census is TP4's)."""
     if world not in WORLDS or max_rows not in (MAX_ROWS, WIDE_MAX_ROWS):
         raise ValueError(f"no direct pool layout for TP{world} and {max_rows} rows")
-    if max_rows == WIDE_MAX_ROWS and world != 4:
-        raise ValueError("the wide direct pool layout is TP4 only")
 
 
 def pool_slot_words(world: int, max_rows: int = MAX_ROWS) -> int:
@@ -364,7 +366,9 @@ if _AVAILABLE:
             check_layout(world, max_rows)
             wide = max_rows > MAX_ROWS
             if wide and (
-                place not in (PLACE_NONE, PLACE_HALF) or (place == PLACE_HALF) != bool(census)
+                place not in (PLACE_NONE, PLACE_HALF)
+                or (place == PLACE_HALF) != bool(census)
+                or (place == PLACE_HALF and world != 4)
             ):
                 raise ValueError(
                     "the wide layout routes only, or places the half window with its census words"
@@ -1280,7 +1284,7 @@ class PoolDirectWorkspace:
     slot of ``buffer`` (512 columns at TP8, 1024 at TP4) and ``boxes(buffer, rows)``
     its ``[publish_copies(rows), box_words(world)]`` FP32 logit boxes (the 8-row
     layout) or ``block(buffer, rows)`` its ``[rows, L]`` FP32 logit block (the wide
-    layout, ``max_rows=WIDE_MAX_ROWS``, TP4), all on the multicast address: a producer
+    layout, ``max_rows=WIDE_MAX_ROWS``, TP4 or TP8), all on the multicast address: a producer
     given them as its output publishes into every rank's copy. ``kernel(variant)`` is the compiled routed
     kernel for a call's settings. Construction is collective over the group (fabric
     allocation and sentinel fill), and so is ``build_variants``; both succeed on
@@ -1848,7 +1852,11 @@ class PoolDirectRoute(OpWrapper):
         layout routes only (``PLACE_NONE``, no early ids)."""
         if not 1 <= rows <= workspace.max_rows:
             raise ValueError(f"rows must be in 1..{workspace.max_rows}, got {rows}")
-        if workspace.wide and (place not in (PLACE_NONE, PLACE_HALF) or early is not None):
+        if workspace.wide and (
+            place not in (PLACE_NONE, PLACE_HALF)
+            or early is not None
+            or (place == PLACE_HALF and workspace.world != 4)
+        ):
             raise ValueError(
                 "the wide layout routes only or places the half window (PLACE_NONE or PLACE_HALF), "
                 "without early ids"

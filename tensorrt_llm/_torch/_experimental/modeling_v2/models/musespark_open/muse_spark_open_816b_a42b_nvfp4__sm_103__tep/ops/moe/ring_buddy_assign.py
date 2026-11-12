@@ -46,6 +46,12 @@ its owner. Those ids address a one-window call as well: the rank's own block
 alone (``local_num_experts = BLOCK``), the owner-only window
 ``ring_buddy.install(windows=1)`` gives ``persistent_experts`` and
 ``bf16_routed_experts`` without replication.
+
+``early_trigger=True`` launches the program with programmatic dependent launch: it waits
+for the kernel that wrote ``selected``, then releases its own dependents at once, so the
+expert call behind it (the persistent kernel's early-start variant,
+``tep8_experts_early_start``) launches and initializes while this program
+still runs. The placement is the same.
 """
 
 from __future__ import annotations
@@ -81,9 +87,56 @@ def block_of(ranks: int) -> int:
     raise ValueError(f"ring_buddy_assign serves rings of {sorted(RING_SIZES)} ranks, got {ranks}")
 
 
-#: Largest ``M * TOP_K`` one program handles: 64 decode rows (eight requests' K = 7 verify
-#: steps): the same [SLOTS, RANKS] program at a 512-slot tile.
-MAX_SLOTS = 512
+#: Largest ``M * TOP_K`` one program handles: 256 decode rows (32 requests' K = 7 verify
+#: steps), the same [SLOTS, RANKS] program at a 2048-slot tile. The stacked path's own cap
+#: stays at ``ring_buddy.MAX_ROWS``; the tiles above 512 slots serve the tep8 decode steps
+#: ``tep8_ring_buddy_wide`` admits.
+MAX_SLOTS = 2048
+
+#: ``tep8_wide_balance``'s ``MAX_ROWS`` (default off): on tep8 the balanced placement of the
+#: NVFP4 layers also serves the decode calls above the stacked path's row cap, up to those rows
+#: (129..512, ``8 * B`` for B requests at K = 7), each call of more than 64 rows placed by the
+#: wide program.
+WIDE_BALANCE_MIN_ROWS = 129
+#: Largest ``M * TOP_K`` the wide program handles: 512 decode rows (64 requests at K = 7), a
+#: 4096-slot tile from 257 rows on. Its work is per expert (the census is a histogram of the
+#: ids, the move decision one per expert, one gather per slot), so the tile above ``MAX_SLOTS``
+#: costs no ``[SLOTS, RANKS]`` tensor; the narrow program keeps ``MAX_SLOTS``.
+WIDE_MAX_SLOTS = 4096
+_WIDE_BALANCE_ROWS: Optional[int] = None
+
+
+def configure(*, wide_balance_rows: Optional[int] = None) -> None:
+    """Set the band the balanced NVFP4 placement adds above the stacked path's cap.
+
+    ``lever_settings.apply`` sets it from the model's plan (through
+    ``ring_buddy.configure``) before any install; None, the default, adds no band.
+
+    Args:
+        wide_balance_rows: ``tep8_wide_balance``'s ``MAX_ROWS`` (``_WIDE_BALANCE_ROWS``),
+            in ``WIDE_BALANCE_MIN_ROWS``..``WIDE_MAX_SLOTS // TOP_K``.
+
+    Raises:
+        ValueError: for a row cap outside that range.
+    """
+    global _WIDE_BALANCE_ROWS
+    if wide_balance_rows is None:
+        _WIDE_BALANCE_ROWS = None
+        return
+    rows = int(wide_balance_rows)
+    if not WIDE_BALANCE_MIN_ROWS <= rows <= WIDE_MAX_SLOTS // TOP_K:
+        raise ValueError(
+            f"[musespark_open] tep8_wide_balance MAX_ROWS {rows}: expected the balanced "
+            f"placement's row cap for the NVFP4 layers' decode calls, a whole number in "
+            f"{WIDE_BALANCE_MIN_ROWS}..{WIDE_MAX_SLOTS // TOP_K}"
+        )
+    _WIDE_BALANCE_ROWS = rows
+
+
+def wide_balance_rows() -> Optional[int]:
+    """The row cap ``configure`` set, or None when the lever is off."""
+    return _WIDE_BALANCE_ROWS
+
 
 #: The half window (``half_window_experts``, tep4): a block's upper half starts at this
 #: local index, and the stack ``[own block | the predecessor's upper half]`` holds
@@ -99,6 +152,39 @@ HALF_SPAN = 96
 #: 1.52 / 1.52 / 1.52 / 1.60, 64 slots 2.21 / 1.86 / 1.65 / 1.72, 128 slots
 #: 3.08 / 2.37 / 1.73 / 2.15; a one-kernel BF16 cast of the weights is 0.8).
 NUM_WARPS = 4
+
+
+def num_warps_for(slots: int) -> int:
+    """Warps of the one program at a ``slots`` tile: ``NUM_WARPS`` up to 512 slots, then one
+    warp per 128 slots (8 at 1024, 16 at 2048), so every thread keeps the 32 elements of each
+    ``[SLOTS, RANKS]`` census tensor it holds at 512 slots instead of spilling them."""
+    return NUM_WARPS if slots <= 512 else min(16, slots // 128)
+
+
+#: Warps of the wide program (``wide=True``, ``_ring_buddy_assign_wide_kernel``) at every
+#: tile it serves (1024 and 2048 slots). GB300, CUDA graph of 62 back-to-back launches, us per
+#: launch at 4 / 8 / 16 warps: 1024 slots 1.95-1.98 / 1.89-1.95 / 2.12, 2048 slots
+#: 2.22-2.38 / 2.09-2.25 / 2.15-2.28; the narrow program takes 3.4-3.6 at 1024 slots and
+#: 5.8-5.9 at 2048, the BF16 cast it replaces 1.2-1.4.
+WIDE_NUM_WARPS = 8
+
+#: The wide program serves tiles above this many slots (more than 64 decode rows).
+WIDE_MIN_SLOTS = 512
+
+
+def wide_serves(
+    slots: int, ranks: int, balance: bool, static_from: Optional[int], half: bool
+) -> bool:
+    """Whether ``wide=True`` runs a call of a ``slots`` tile on the wide program: the
+    balanced tep8 placement (no half window, no static move) above ``WIDE_MIN_SLOTS``."""
+    return (
+        slots > WIDE_MIN_SLOTS
+        and ranks == 8
+        and bool(balance)
+        and not half
+        and (static_from is None or static_from == block_of(ranks))
+    )
+
 
 #: At TP8 a call with ``meta_tile`` also writes the routing
 #: tables TRTLLM-gen's expert op reads for the two-window ``[own block | predecessor's block]``
@@ -175,9 +261,16 @@ def _ring_buddy_assign_kernel(
     META: tl.constexpr,
     TILE: tl.constexpr,
     CTAS: tl.constexpr,
+    PDL: tl.constexpr,
 ):
     tl.static_assert(BLOCK == 32 or BLOCK == 64, "one 32- or 64-bit presence word per block")
     tl.static_assert(not HALF or (BLOCK == 64 and BALANCE), "the half window: tep4, balanced")
+    if PDL:
+        # ``early_trigger``: every grid before this one has completed once the wait returns
+        # (``selected`` is final); the dependents may launch from then on, and read this
+        # program's outputs only after their own wait.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     WIDE: tl.constexpr = BLOCK == 64
     UPPER: tl.constexpr = BLOCK // 2  # HALF_FROM
     SPAN: tl.constexpr = BLOCK + BLOCK // 2  # HALF_SPAN
@@ -292,6 +385,135 @@ def _ring_buddy_assign_kernel(
     tl.store(stats_ptr + RANKS + ranks, load - x + x_prev)
 
 
+@triton.jit
+def _ring_buddy_assign_wide_kernel(
+    selected_ptr,  # [num_slots] int32 global expert ids
+    weights_ptr,  # [num_slots] float32 routing weights
+    local_ids_ptr,  # [num_slots] int32 out
+    weights_bf16_ptr,  # [num_slots] bfloat16 out
+    stats_ptr,  # [2 * RANKS] int32 out: per-rank loads before, after
+    rank,
+    num_slots,
+    SLOTS: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    RANKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PDL: tl.constexpr,
+):
+    """``_ring_buddy_assign_kernel``'s balanced two-window placement (tep8) with per-expert
+    instead of ``[SLOTS, RANKS]`` work, for the wide tiles: the census is a histogram of the
+    step's ids, the move decision is made once per expert, and each slot gathers its expert's
+    local id. Every output is the same integer function of ``selected`` and ``rank``."""
+    tl.static_assert(BLOCK == 32 and RANKS * BLOCK == EXPERTS, "the tep8 ring of 32-expert blocks")
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    s = tl.arange(0, SLOTS)
+    smask = s < num_slots
+    g = tl.load(selected_ptr + s, mask=smask, other=0)
+    w = tl.load(weights_ptr + s, mask=smask, other=0.0)
+    experts = tl.arange(0, EXPERTS)
+    ranks = tl.arange(0, RANKS)
+
+    # Census: the per-expert slot counts (the SLOTS - num_slots masked-off slots load
+    # expert 0); a block's presence word sets bit i for each of its selected experts, so a
+    # repeated expert counts once.
+    counts = tl.histogram(g, EXPERTS) - tl.where(experts == 0, SLOTS - num_slots, 0)
+    i_e = experts % BLOCK
+    bit_e = tl.where(
+        counts > 0,
+        tl.full([EXPERTS], 1, tl.uint32) << i_e.to(tl.uint32),
+        tl.zeros([EXPERTS], dtype=tl.uint32),
+    )
+    word = tl.reduce(tl.reshape(bit_e, [RANKS, BLOCK]), 1, _bit_or)  # [RANKS] uint32
+    load = _popc(word, False)  # [RANKS]
+
+    # The balanced placement's smallest maximum T and smallest flow x (as the narrow program).
+    span = ranks + 1
+    back = (ranks[:, None] - ranks[None, :] + RANKS) % RANKS  # [r, k]
+    inarc = back[:, None, :] < span[None, :, None]  # [r, n, k]
+    arc = tl.sum(tl.where(inarc, load[None, None, :], 0), axis=2)  # [r, n]
+    need = tl.where(
+        span[None, :] == RANKS,
+        (arc + RANKS - 1) // RANKS,
+        (arc + span[None, :]) // (span[None, :] + 1),
+    )
+    t = tl.max(tl.max(need, axis=1), axis=0)
+    x = tl.max(tl.maximum(arc - span[None, :] * t, 0), axis=1)  # [RANKS]
+
+    # Per expert: it moves to its block's successor when fewer than x[b] selected experts of
+    # its block sit above it; its local id on this rank, or one outside the window.
+    word_e = tl.reshape(tl.broadcast_to(word[:, None], [RANKS, BLOCK]), [EXPERTS])
+    x_e = tl.reshape(tl.broadcast_to(x[:, None], [RANKS, BLOCK]), [EXPERTS])
+    blk_e = experts // BLOCK
+    above_e = _popc((word_e >> i_e.to(tl.uint32)) >> 1, False)
+    er_e = (blk_e + (above_e < x_e).to(tl.int32)) % RANKS
+    local_e = tl.where(
+        er_e == rank,
+        tl.where(blk_e == rank, i_e, BLOCK + i_e),
+        2 * BLOCK + experts % (EXPERTS - 2 * BLOCK),
+    )
+    local = tl.gather(local_e, g, 0)  # [SLOTS]
+    tl.store(local_ids_ptr + s, local, mask=smask)
+    tl.store(weights_bf16_ptr + s, w.to(tl.bfloat16), mask=smask)
+
+    from_prev = ((ranks[:, None] + RANKS - 1) % RANKS) == ranks[None, :]
+    x_prev = tl.sum(tl.where(from_prev, x[None, :], 0), axis=1)
+    tl.store(stats_ptr + ranks, load)
+    tl.store(stats_ptr + RANKS + ranks, load - x + x_prev)
+
+
+#: Fields of one band of ``accumulate_placement_stats``'s accumulator (int64 sums, in order):
+#: placements, their rows, the busiest rank's distinct experts under the owner-only
+#: placement and under the computed one, and the distinct experts of the whole ring; the
+#: last three are zero.
+PLACEMENT_STATS_FIELDS = 8
+
+
+@triton.jit
+def _placement_stats_kernel(
+    stats_ptr,  # [2 * RANKS] int32, ring_buddy_assign's per-rank loads before, after
+    acc_ptr,  # [8] int64 in/out, one band of the accumulator
+    rows,
+    RANKS: tl.constexpr,
+):
+    r = tl.arange(0, RANKS)
+    before = tl.load(stats_ptr + r).to(tl.int64)
+    after = tl.load(stats_ptr + RANKS + r).to(tl.int64)
+    f = tl.arange(0, 8)
+    add = tl.where(
+        f == 0,
+        1,
+        tl.where(
+            f == 1,
+            rows,
+            tl.where(
+                f == 2,
+                tl.max(before, axis=0),
+                tl.where(
+                    f == 3, tl.max(after, axis=0), tl.where(f == 4, tl.sum(before, axis=0), 0)
+                ),
+            ),
+        ),
+    ).to(tl.int64)
+    tl.store(acc_ptr + f, tl.load(acc_ptr + f) + add)
+
+
+def accumulate_placement_stats(
+    stats: torch.Tensor, acc: torch.Tensor, rows: int, ranks: int = RANKS
+) -> None:
+    """Add one placement's census (``stats``, the entry's third output) to ``acc``.
+
+    ``acc`` is ``PLACEMENT_STATS_FIELDS`` contiguous int64: device memory, or pinned host
+    memory that a host thread reads without a CUDA call (``ring_buddy``'s
+    ``ring_buddy_stats``). One program and a plain read-modify-write, so the
+    calls that share ``acc`` must be ordered by one stream, as every placement of a process
+    is (the routing method's call, on its main stream). Diagnostics only: the placement and
+    the expert call do not read ``acc``.
+    """
+    _placement_stats_kernel[(1,)](stats, acc, rows, RANKS=ranks, num_warps=1)
+
+
 def balance_ring(load: List[int]) -> Tuple[int, List[int]]:
     """The kernel's placement in plain Python: ``(max load, x)``.
 
@@ -330,13 +552,19 @@ class RingBuddyAssign(OpWrapper):
     (tep4, ``half_window_experts``) is the balanced placement onto the successor's
     copy of each block's upper half only (``ring_windows.place_half``): its ids
     address the 96-expert ``[own block | predecessor's experts 32..63]`` stack.
+    ``wide=True`` runs the balanced tep8 placement (``ranks=8``, ``balance``, no
+    ``half``, no static move) of a tile above ``WIDE_MIN_SLOTS`` on the wide program
+    (``_ring_buddy_assign_wide_kernel``): the same outputs, from per-expert work instead
+    of ``[SLOTS, RANKS]`` work; every other call ignores it. A call that also writes the
+    prerouted tables (``meta_tile``) keeps the ``[SLOTS, RANKS]`` program, which is where
+    they are built.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Pure function of ``selected`` and ``rank``; one program, so it is meant for
-    decode rows (``M * 8 <= 256``). Duplicate ids within a row are not expected
+    decode rows (``M * 8 <= MAX_SLOTS``). Duplicate ids within a row are not expected
     (top-k selection is distinct) and are counted once in the census.
 
     The rewritten ids are meaningful only for an expert call with
@@ -357,6 +585,8 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        wide: bool = False,
+        early_trigger: bool = False,
     ):
         block = block_of(ranks)
         static_from = block if static_from is None else static_from
@@ -380,6 +610,23 @@ class RingBuddyAssign(OpWrapper):
             meta["rows"] = rows
             meta["tile"] = meta_tile
             ctas = max(16, triton.next_power_of_2(sizes["c2b"]))
+        if wide and meta is None and wide_serves(slots, ranks, balance, static_from, half):
+            _ring_buddy_assign_wide_kernel[(1,)](
+                selected,
+                weights,
+                local_ids,
+                weights_bf16,
+                stats,
+                rank,
+                num_slots,
+                SLOTS=slots,
+                EXPERTS=EXPERTS,
+                RANKS=ranks,
+                BLOCK=block,
+                PDL=False,
+                num_warps=WIDE_NUM_WARPS,
+            )
+            return local_ids, weights_bf16, stats
         dummy = stats
         _ring_buddy_assign_kernel[(1,)](
             selected,
@@ -405,7 +652,9 @@ class RingBuddyAssign(OpWrapper):
             META=meta is not None,
             TILE=meta_tile if meta is not None else 8,
             CTAS=ctas,
-            num_warps=_META_WARPS if meta is not None else NUM_WARPS,
+            PDL=bool(early_trigger),
+            num_warps=_META_WARPS if meta is not None else num_warps_for(slots),
+            launch_pdl=bool(early_trigger),
         )
         if meta is not None:
             return local_ids, weights_bf16, stats, meta
@@ -421,9 +670,12 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        wide: bool = False,
+        early_trigger: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The placement in plain Python over the host copy of ``selected``
-        (``ring_windows.place_half`` with ``half``)."""
+        (``ring_windows.place_half`` with ``half``; ``wide`` changes only which program
+        computes it, and ``early_trigger`` only when the dependents launch)."""
         if half:
             from ...kernels.replicated_experts import windows as _windows
 
@@ -481,6 +733,8 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        wide: bool = False,
+        early_trigger: bool = False,
     ) -> None:
         """Inputs the kernel would read past or misplace without an error."""
         assert meta_tile is None or (not half and meta_tile in (8, 16, 32, 64)), (
@@ -496,8 +750,15 @@ class RingBuddyAssign(OpWrapper):
         assert selected.ndim == 2 and selected.shape[1] == TOP_K, (
             f"selected must be [M, {TOP_K}], got {tuple(selected.shape)}"
         )
-        assert 0 < selected.numel() <= MAX_SLOTS, (
-            f"one program covers at most {MAX_SLOTS} slots (M <= {MAX_SLOTS // TOP_K}), got {selected.numel()}"
+        slots = max(16, triton.next_power_of_2(max(1, selected.numel())))
+        most = (
+            WIDE_MAX_SLOTS
+            if wide and wide_serves(slots, ranks, balance, static_from, half)
+            else MAX_SLOTS
+        )
+        assert 0 < selected.numel() <= most, (
+            f"one program covers at most {most} slots (M <= {most // TOP_K}), "
+            f"got {selected.numel()}"
         )
         assert weights.dtype == torch.float32 and weights.is_contiguous(), (
             "weights must be contiguous float32"

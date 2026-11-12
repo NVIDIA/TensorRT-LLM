@@ -194,13 +194,13 @@ SERVED_AT = {
     "graph_start_qkv_prefetch": ({(103, 8)}, "composition", "upstream"),
     "half_window_experts": ({(103, 4)}, "composition", "upstream"),
     "hot_replicas": ({(103, 4)}, "composition", "upstream"),
-    "vocab_parallel_head": ({(103, 4)}, "composition", "upstream"),
-    "multi_request_prep_append": ({(103, 4)}, "composition", "upstream"),
-    "multi_request_split_kv": ({(103, 4)}, "composition", "upstream"),
-    "multi_request_post_attention_hop": ({(103, 4)}, "composition", "upstream"),
+    "vocab_parallel_head": ({(103, 4), (103, 8)}, "composition", "upstream"),
+    "multi_request_prep_append": ({(103, 4), (103, 8)}, "composition", "upstream"),
+    "multi_request_split_kv": ({(103, 4), (103, 8)}, "composition", "upstream"),
+    "multi_request_post_attention_hop": ({(103, 4), (103, 8)}, "composition", "upstream"),
     "wide_drafter_hops": ({(103, 4)}, "composition", "upstream"),
-    "router_gemm": ({(103, 4)}, "composition", "upstream"),
-    "projection_publish": ({(103, 4)}, "composition", "upstream"),
+    "router_gemm": ({(103, 4), (103, 8)}, "composition", "upstream"),
+    "projection_publish": ({(103, 4), (103, 8)}, "composition", "upstream"),
 }
 
 
@@ -217,7 +217,7 @@ def test_the_compositions_and_the_fast_paths():
     assert sorted(TARGET_PATHS) == [(103, 4), (103, 8)]
     served = TARGET_PATHS[(103, 4)].served | TARGET_PATHS[(103, 8)].served
     assert DISPATCH.FAST_PATH_NAMES == served
-    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (44, 55)
+    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (55, 55)
     with pytest.raises(KeyError):
         table((107, 4), 4, "agg", "windowed")
 
@@ -248,14 +248,22 @@ def test_the_lever_records_carry_no_field_of_another_target():
 VP = {"vocab_parallel_head"}
 #: The TP4 paths of the composition that are rule levers, on wherever served.
 TEP4_PATHS = set(LEVERS.TEP4_PATHS)
+#: The rule levers among the multi-request paths TEP8 serves (``SM103_TEP8_ADDED``).
+TEP8_MULTI_REQUEST = {
+    "multi_request_prep_append",
+    "multi_request_split_kv",
+    "multi_request_post_attention_hop",
+    "router_gemm",
+    "projection_publish",
+}
 
 REGIONS = [
     pytest.param(
         (103, 8),
         "agg",
         (1, 8),
-        "dense",
-        {"lm_head_inbox", "graph_start_qkv_prefetch"},
+        "windowed",
+        {"lm_head_inbox", "graph_start_qkv_prefetch"} | VP | TEP8_MULTI_REQUEST,
         id="tep8",
     ),
     pytest.param(
@@ -439,16 +447,38 @@ C55_SERVED = {
 }
 
 
+#: The paths TEP8 serves beyond ``C55_SERVED``: the multi-request decode paths of
+#: ``modeling._SM103_TEP8_MULTI_REQUEST_PATHS`` and ``wide_dense_gemms``, TEP8's alone. The
+#: baseline serves them like the rest of the composition.
+SM103_TEP8_ADDED = frozenset(
+    {
+        "drafter_window_compact",
+        "multi_request_post_attention_hop",
+        "multi_request_prep_append",
+        "multi_request_split_kv",
+        "projection_publish",
+        "router_gemm",
+        "vocab_parallel_head",
+        "wide_dense_gemms",
+        "wide_moe_allreduce",
+        "wide_projection_gathers",
+        "wide_split_sampler",
+    }
+)
+
+
 def c55_plan(key, max_batch_size, arena) -> set:
-    """``C55_SERVED[key]`` under that composition's rules: ``half_window_experts`` only up to
-    ``max_batch_size`` 8 (left out for an unknown one), ``hot_replicas`` left out of a plan
-    that carries the half window, and the drafter arena's: over a windowed arena,
-    ``context_kv_fork`` and ``verify_fold`` only with the window compaction; any other arena
-    leaves the compaction out. No served path builds on one of these names there, so each
-    rule removes the name alone. Then the base paths added since, each beside the path it
-    builds on: ``draft_head_sampled`` (``draft_head``), ``rejection_fold`` (``verify_fold``)
-    and ``paged_context_commit`` (``context_kv_fork``)."""
+    """``C55_SERVED[key]`` (with ``SM103_TEP8_ADDED`` at TEP8) under that composition's
+    rules: ``half_window_experts`` only up to ``max_batch_size`` 8 (left out for an unknown
+    one), ``hot_replicas`` left out of a plan that carries the half window, and the drafter
+    arena's: over a windowed arena, ``context_kv_fork`` and ``verify_fold`` only with the
+    window compaction; any other arena leaves the compaction out. No served path builds on
+    one of these names there, so each rule removes the name alone. Then the base paths added
+    since, each beside the path it builds on: ``draft_head_sampled`` (``draft_head``),
+    ``rejection_fold`` (``verify_fold``) and ``paged_context_commit`` (``context_kv_fork``)."""
     paths = set(C55_SERVED[key])
+    if key == (103, 8):
+        paths |= SM103_TEP8_ADDED
     if max_batch_size is None or max_batch_size > 8:
         paths.discard("half_window_experts")
     if "half_window_experts" in paths:
@@ -608,9 +638,21 @@ def test_the_window_compaction_needs_a_windowed_arena_and_the_full_context_paths
     assert table((103, 4), 1, "agg", "windowed").on("drafter_window_compact")
     dense = table((103, 4), 1, "agg", "dense")
     assert dense.decisions["drafter_window_compact"].source == "structural"
+    # TEP8 serves the compaction too, so its windowed arena keeps the arena-writing paths.
     tep8 = table((103, 8), 1, "agg", "windowed")
-    assert tep8.decisions["context_kv_fork"].source == "structural"
-    assert tep8.decisions["verify_fold"].source == "structural"
+    assert tep8.on("context_kv_fork") and tep8.on("verify_fold")
+    # A composition without the compaction leaves them out over a windowed arena.
+    no_compaction = {
+        **TARGET_PATHS,
+        (103, 8): DISPATCH.TargetPaths(
+            served=TARGET_PATHS[103, 8].served - {"drafter_window_compact"},
+            topology=TARGET_PATHS[103, 8].topology,
+            preconditions=TARGET_PATHS[103, 8].preconditions,
+        ),
+    }
+    windowed = DISPATCH.table_for(no_compaction, 103, 8, 1, "agg", "windowed", None, None)
+    assert windowed.decisions["context_kv_fork"].source == "structural"
+    assert windowed.decisions["verify_fold"].source == "structural"
     # With the compaction served, a knob that turns it off takes the arena-writing paths along.
     off = table((103, 4), 1, "agg", "windowed", knobs(drafter_window_compact="off"))
     assert off.decisions["context_kv_fork"].source == "dependency"

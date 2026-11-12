@@ -288,7 +288,46 @@ def weights_before_wait_rows(kernels: Sequence[str]) -> FrozenSet[int]:
     )
 
 
-def drop_converted_prefetches(model, plan, qkv: bool) -> Dict[str, Tuple[int, FrozenSet[int]]]:
+def wide_weights_before_wait_rows(
+    plan, kernels: Optional[Mapping[str, Sequence[str]]] = None
+) -> FrozenSet[int]:
+    """The 9..32-row counts whose QKV kernel loads its weight before its wait, as the plan
+    resolves a QKV call of those rows while ``wide_projection_gathers`` arms it
+    (``DenseGemmPlan.kernel_for``): the ``wide_dense_gemms`` cell (``plan.wide``) first, else the
+    armed table's (``kernels``; None reads the plan's ``wide_kernels``, which only
+    ``wide_projection_gathers.install`` sets, so a caller ahead of the install passes the table
+    the install will arm, as ``drop_converted_prefetches`` and ``check`` do). Empty when no cell
+    names QKV (the built-in dispatch, which loads nothing before its wait). Reads only the
+    plan's tables.
+    """
+    from ...ops.gemm.dense_gemm import MAX_ROWS, SPLITK, parse_kernel
+
+    armed = plan.wide_kernels if kernels is None else kernels
+    cells = plan.wide.get("qkv") or armed.get("qkv") or ()
+    return frozenset(
+        rows
+        for rows, kernel in enumerate(cells, start=MAX_ROWS + 1)
+        if parse_kernel(kernel)[0] == SPLITK
+    )
+
+
+def _armed_wide_kernels(model, plan) -> Optional[Dict[str, Tuple[str, ...]]]:
+    """The 9..32-row table ``wide_projection_gathers.install`` will arm for ``model``'s TP size on
+    ``plan``'s device -- the table its ``check`` reads -- or None when there is none (its
+    ``check`` then refuses the path). ``drop_converted_prefetches`` runs before that install,
+    while the plan's ``wide_kernels`` is still empty."""
+    from ..wide_projection_gathers.gathers import wide_kernel_steps, wide_kernels
+
+    try:
+        tp_size = int(model.layers[0].mapping.tp_size)
+        return wide_kernels(wide_kernel_steps(plan.capability, tp_size))
+    except ValueError:
+        return None
+
+
+def drop_converted_prefetches(
+    model, plan, qkv: bool, wide: bool = False
+) -> Dict[str, Tuple[int, FrozenSet[int]]]:
     """Drop the ``dense_gemm_prefetch`` prefetch of the weights whose GEMM edge this fast path converts.
 
     ``qkv``: the unpooler's prefetch of the next layer's QKV weight, on every
@@ -297,14 +336,33 @@ def drop_converted_prefetches(model, plan, qkv: bool) -> Dict[str, Tuple[int, Fr
     (``weights_before_wait_rows``; the unpooler's and QKV's calls of
     one step have the same rows), and only when the plan launches with
     programmatic dependent launch: without it the consumer cannot start early,
-    and the prefetch is the only thing that streams its weight.
-    Returns, per site, how many layers dropped it and at which row counts,
-    for the log line.
+    and the prefetch is the only thing that streams its weight. Returns, per
+    site, how many layers dropped it and at which row counts, for the log line.
+
+    The 1..8 rows come from the plan's 1..8-row table only, at this call and nowhere
+    else: ``weights_before_wait_rows`` also gives ``next_qkv_prefetch`` its fork rows,
+    which stay 1..8 (its "no prefetch kernel resident" argument is made for those kernels).
+    ``wide``: the plan also has ``wide_projection_gathers`` fuse the 9..32-row boundary
+    (served at tep8 with ``dense_gemm_prefetch``; tep4 serves no prefetch, so
+    there this drops nothing). Its unpool slice GEMM then runs on the unpooler's dispatcher and
+    would fork the prefetch at those rows too, whose join would gate the early-released QKV:
+    the 9..32-row counts whose QKV cell loads its weight before its wait
+    (``wide_weights_before_wait_rows`` on the table the path's install will arm,
+    ``_armed_wide_kernels``: ``wide_dense_gemms``' split-K cells at tep8, which take
+    precedence; the armed table's own QKV cells where it names them) are added to the converted
+    edges' exemptions here, so the path's ``check`` (``prefetch_conflicts``, same inputs) finds
+    no conflict left. Without ``wide`` the 9..32-row boundary
+    is the built-in one, released at exit, and the unpooler multiplies the whole replicated
+    weight there, which its dispatcher declines, so it forks no prefetch to drop. The QKV
+    dispatcher's own prefetch of the attention output weight is not this edge's and stays.
     """
     if plan is None or not plan.prefetch or not plan.enable_pdl:
         return {}
     none: FrozenSet[int] = frozenset()
     rows = {"qkv": weights_before_wait_rows(plan.kernels["qkv"]) if qkv else none}
+    if qkv and wide:
+        armed = _armed_wide_kernels(model, plan)
+        rows["qkv"] = rows["qkv"] | wide_weights_before_wait_rows(plan, armed)
     dropped = {site: 0 for site in rows}
     layers = list(model.layers)
     for index, layer in enumerate(layers):

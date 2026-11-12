@@ -34,7 +34,8 @@ kernel per shape runs it on every rank:
 
 The direct kernel holds every row in one CTA and serves at most ``MAX_ROWS``; the split-K
 kernel and cuBLAS also serve the 9..``WIDE_MAX_ROWS``-row steps of a tep4 rank
-(``wide_projection_gathers``).
+(``wide_projection_gathers``), of a tep8 rank's QKV projection (``wide_dense_gemms``) and of
+its pooler and unpooler slices (``wide_projection_gathers``).
 
 All accumulate in FP32 and round once; they differ from each other, and the
 split-K kernel's tactics with different ``split_k`` differ among themselves, only
@@ -67,8 +68,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 
 #: Rows this entry is certified for: one request's last accepted token and up to 7 drafts.
 MAX_ROWS = 8
-#: Rows the split-K and cuBLAS kernels are also certified for (the split-K kernel takes
-#: M <= 32): decode steps of up to four requests at K = 7, on the TP4 per-rank shapes.
+#: Rows the split-K and cuBLAS kernels are also certified for (flashinfer's split-K takes
+#: M <= 32): decode steps of up to four requests at K = 7, on the TP4 per-rank shapes and the
+#: TP8 QKV, pooler-slice and unpooler-slice shapes.
 WIDE_MAX_ROWS = 32
 #: The four per-rank projection shapes ``(K, N)`` of this checkpoint at tep8.
 QKV_SHAPE = (8192, 2304)

@@ -157,12 +157,17 @@ WIDE_MAX_TOKENS = 32
 LAYOUT_RANK_COUNTS = {MAX_TOKENS: (4, 8), WIDE_MAX_TOKENS: (4,)}
 #: The built-in TP8 kernel's cluster-8 range; above it the built-in runs one CTA per token.
 CLUSTER8_TOKENS = 16
+#: The most tokens the TP8 layout may be widened to: five requests at K = 7 (40 rows), whose
+#: 320 CTAs fit the ``grid_shift`` of 9 (512) the arrival counter then advances by.
+TP8_WIDE_MAX_TOKENS = 40
+
 #: The layout of a TP8 workspace, whose calls of 17..TP8_MAX_TOKENS tokens add their
 #: slot sums flat, in the built-in one-CTA-per-token order (``flat_sum``, as at TP4; the built-in
 #: runs one CTA per token up to 128). TP4 workspaces ignore it (their 17..32-token calls are
 #: ``serve_wide_calls``'). Kept out of ``LAYOUT_RANK_COUNTS`` (``has_layout``), so a 32-token TP8
-#: layout never makes the TP4 wide layout's entry admit TP8.
-TP8_MAX_TOKENS = 16
+#: layout never makes the TP4 wide layout's entry admit TP8. ``tep8_finalize_transport_wide``
+#: widens it to 17..``TP8_WIDE_MAX_TOKENS``; off, it stays ``MAX_TOKENS`` and nothing changes.
+TP8_MAX_TOKENS = MAX_TOKENS
 #: CTAs per token (one cluster), threads per CTA, BF16 values per thread.
 CLUSTER = 8
 VECTOR = 8
@@ -261,6 +266,34 @@ class Transport:
 DEFAULT = Transport()
 #: The same transport with the trigger at kernel entry.
 ENTRY_TRIGGER = Transport(trigger="entry")
+
+
+def configure(*, tep8_max_tokens: int = MAX_TOKENS, trigger: str = "late") -> None:
+    """Set the TP8 workspace layout and the trigger of the transport ``finalize_transport`` builds.
+
+    ``lever_settings.apply`` sets them from the model's plan before any install; a workspace
+    built afterwards takes them. The defaults are the built-in layout and trigger place.
+
+    Args:
+        tep8_max_tokens: the token layout of a TP8 workspace (``TP8_MAX_TOKENS``),
+            ``MAX_TOKENS``..``TP8_WIDE_MAX_TOKENS``. Above ``MAX_TOKENS`` its calls of
+            17..``tep8_max_tokens`` tokens run the flat build (``tep8_finalize_transport_wide``).
+        trigger: the dependent-launch trigger of ``DEFAULT``: ``"late"`` or ``"entry"``
+            (``finalize_entry_trigger``).
+
+    Raises:
+        ValueError: for a token count outside the range, or a trigger ``Transport`` refuses.
+    """
+    global TP8_MAX_TOKENS, DEFAULT
+    tokens = int(tep8_max_tokens)
+    if not MAX_TOKENS <= tokens <= TP8_WIDE_MAX_TOKENS:
+        raise ValueError(
+            f"[musespark_open] finalize transport token cap {tokens}: expected "
+            f"{MAX_TOKENS}..{TP8_WIDE_MAX_TOKENS}"
+        )
+    transport = Transport(trigger=str(trigger).strip() or "late")
+    TP8_MAX_TOKENS = tokens
+    DEFAULT = transport
 
 
 try:

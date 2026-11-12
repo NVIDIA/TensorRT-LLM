@@ -53,10 +53,9 @@ PROJECTION_WIDTHS = (4096, 8192)
 #: Rows (tokens) per call the inbox has room for: a decode step of one request with
 #: up to seven DFlash drafts. The built-in sharded projections stop at the same bound.
 MAX_ROWS = 8
-#: Rows per call of a wide inbox (``ProjectionInbox(max_rows=WIDE_MAX_ROWS)``): a TP4
-#: decode step of up to four requests with seven DFlash drafts each, where the fused
-#: consumers' per-CTA columns still fall inside one rank's slice at those rows. A wide
-#: inbox is a separate allocation with its own row layout; the 8-row inboxes are unchanged.
+#: Rows per call of a wide inbox (``ProjectionInbox(max_rows=WIDE_MAX_ROWS)``): a decode
+#: step of up to four requests with seven DFlash drafts each, at TP4 or TP8. A wide inbox is
+#: a separate allocation with its own row layout; the 8-row inboxes are unchanged.
 WIDE_MAX_ROWS = 32
 #: ``WIDE_MAX_ROWS`` under the name ``wide_projection_gathers`` reads.
 WIDE_ROWS = WIDE_MAX_ROWS
@@ -102,8 +101,9 @@ class ProjectionInbox:
     Construction is collective over the TP group.
 
     ``max_rows`` is the most rows one call may carry: ``MAX_ROWS`` (8), or
-    ``WIDE_MAX_ROWS`` (32) at TP4 for the wide sites and
-    ``wide_projection_gathers``, and at TP8 for ``projection_gathers``' 9..32-row sites.
+    ``WIDE_MAX_ROWS`` (32) at TP4 for the wide sites and ``wide_projection_gathers``,
+    and at TP8 for ``wide_projection_gathers``. The slot layout is the same at either world
+    size: ``world * max_rows`` rows of ``row_words`` tagged words per slot.
 
     Attributes read by the fused ops: ``base`` (address of rank 0's segment
     through the fabric mapping), ``stride`` (bytes between ranks' segments),
@@ -119,8 +119,8 @@ class ProjectionInbox:
             raise ValueError("ProjectionInbox needs TP4 or TP8 without attention DP or CP")
         world = mapping.tp_size
         if max_rows not in ROW_CAPACITIES:
-            # A wide inbox at TP8 too: the 9..32-row TP8 pool and unpool gathers of
-            # ``projection_gathers`` (``pool_gather_route`` takes one there as well, routing only).
+            # A wide inbox at TP8 too: ``wide_projection_gathers``' 9..32-row TP8 pool and
+            # unpool gathers.
             raise ValueError(
                 f"max_rows must be {MAX_ROWS} or {WIDE_MAX_ROWS}; got {max_rows} at TP{world}"
             )

@@ -197,7 +197,28 @@ class _MsgspecRoute(APIRoute):
         return route_handler
 
 
-TIMEOUT_KEEP_ALIVE = 5  # seconds.
+# Idle HTTP keep-alive timeout for the uvicorn listener, in seconds.
+#
+# Clients that hold a pool of idle connections and reuse the oldest one first do
+# not probe it before sending, so whenever the server closes an idle connection
+# first the next request goes out on a half-closed socket and fails with
+# "Connection reset by peer". Keeping the server's timeout well above the client's
+# idle window keeps that race shut -- the same rule the disaggregated coordinator
+# applies internally by holding its client timeout below the server's.
+#
+# 5 s was uvicorn's generic web-server default, inherited unexamined; it suits a
+# server facing many anonymous short-lived clients, which is the inverse of this
+# workload. It is also below common proxy and load-balancer idle timeouts, which
+# makes the server rather than the proxy the one that closes first. 3600 is the
+# value this project's own documentation gives operators and its benchmark
+# configurations set.
+#
+# The cost is one file descriptor and a timer per retained idle connection, bounded
+# by the client's pool rather than by this number. One caveat: with more than one
+# serve frontend, connections are load-balanced across frontends at accept time and
+# keep-alive pins each to the frontend that accepted it, so a long timeout freezes
+# that assignment for the connection's life instead of re-randomizing on re-dial.
+TIMEOUT_KEEP_ALIVE = 3600  # seconds.
 
 _warned_unresolvable_thinking = False
 

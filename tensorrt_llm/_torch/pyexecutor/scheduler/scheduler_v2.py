@@ -401,6 +401,32 @@ class ShortestPrefillFirstOrder:
     the context state, including passes in which the batch fills up before the
     scheduler reaches it.
 
+    ``max_age_passes`` N > 0 adds a bound the waiting clock cannot give: a
+    request that reached the context state N or more passes ago counts as aged
+    too, however much leftover budget it has been given since. A long cold
+    prompt that shorter requests keep to a trickle of tokens therefore reaches
+    its first token at most N passes plus its own prefill after it arrived.
+    With ``aged_lead_every`` K > 1 such a request goes ahead only on every K-th
+    pass and takes what is left of the budget on the others, so shorter
+    requests keep most passes while it finishes.
+
+    ``first_chunk_max_wait_passes`` M > 0 bounds how long a prompt that fits
+    one context step waits for it. Under a long queue (a prefill-decode
+    interval holds every context step back for N passes) shortest-first keeps
+    serving the newest short prompts, and a mid-size prompt can wait many
+    context steps. With M the aged requests split into three tiers, each in
+    arrival order: first those aged by ``max_age_passes``, which keeps that
+    bound on the oldest prompts; then requests that have not started
+    prefilling, have waited M passes and whose uncached prompt fits
+    ``first_chunk_max_tokens`` (the step's token budget); then those aged by
+    ``max_wait_passes``. Without M every aged request shares one tier, as
+    before. Started prompts and longer cold ones keep the ``max_wait_passes``
+    and ``max_age_passes`` clocks, so a long prompt is not promoted into
+    taking the whole budget pass after pass. The M tier applies on every pass;
+    ``aged_lead_every`` paces only the ``max_age_passes`` lead. An M at or
+    above ``max_wait_passes`` only orders such first chunks ahead of the other
+    requests aged by waiting.
+
     The reordering may try a request that has not started prefilling ahead of
     one that has. The scheduler therefore never lets the former preempt the
     latter for KV pages: arrival order would have scheduled, and protected,
@@ -410,11 +436,42 @@ class ShortestPrefillFirstOrder:
     per request and only when there is something to reorder.
     """
 
-    def __init__(self, max_wait_passes: int):
+    def __init__(
+        self,
+        max_wait_passes: int,
+        max_age_passes: int = 0,
+        aged_lead_every: int = 1,
+        first_chunk_max_wait_passes: int = 0,
+        first_chunk_max_tokens: Optional[int] = None,
+    ):
         self.max_wait_passes = max_wait_passes
+        self.max_age_passes = max_age_passes
+        self.aged_lead_every = max(aged_lead_every, 1)
+        self.first_chunk_max_wait_passes = first_chunk_max_wait_passes
+        self.first_chunk_max_tokens = first_chunk_max_tokens
         self._pass = 0
         self._waiting_since: dict[int, int] = {}
+        self._arrived_at: dict[int, int] = {}
         self._uncached_estimate: dict[int, int] = {}
+        # Requests in the first-chunk tier of the current pass's order; how many
+        # of them were admitted since take_first_chunk_aged_admissions().
+        self._first_chunk_aged: set[int] = set()
+        self._first_chunk_aged_admissions = 0
+        self._first_chunk_aged_logged = False
+
+    def describe(self) -> str:
+        """The settings, for the scheduler's startup log."""
+        text = (
+            f"max_wait_passes={self.max_wait_passes}, "
+            f"max_age_passes={self.max_age_passes}, "
+            f"aged_lead_every={self.aged_lead_every}"
+        )
+        if self.first_chunk_max_wait_passes > 0:
+            text += (
+                f", first_chunk_max_wait_passes={self.first_chunk_max_wait_passes}, "
+                f"first_chunk_max_tokens={self.first_chunk_max_tokens}"
+            )
+        return text
 
     def _uncached_tokens(self, req: LlmRequest, kv_cache_manager) -> int:
         if not req.is_first_context_chunk:
@@ -449,23 +506,44 @@ class ShortestPrefillFirstOrder:
         needs.
         """
         self._pass += 1
+        if self._first_chunk_aged:
+            self._first_chunk_aged.clear()
         waiting_ids = {
             r.py_request_id for r in active_requests if r.state_value == context_init_state_value
         }
         for request_id in [rid for rid in self._waiting_since if rid not in waiting_ids]:
             del self._waiting_since[request_id]
+            self._arrived_at.pop(request_id, None)
             self._uncached_estimate.pop(request_id, None)
         for request_id in waiting_ids:
             self._waiting_since.setdefault(request_id, self._pass)
+            self._arrived_at.setdefault(request_id, self._pass)
         context_reqs = [r for r in pending_ctx if r.state_value == context_init_state_value]
         if not reorder or len(context_reqs) < 2:
             return pending_ctx
+        age_leads = self.max_age_passes > 0 and self._pass % self.aged_lead_every == 0
+        first_chunk_wait = self.first_chunk_max_wait_passes
 
         def admission_key(item):
             arrival, req = item
-            waited = self._pass - self._waiting_since[req.py_request_id]
-            if waited >= self.max_wait_passes:
+            request_id = req.py_request_id
+            if age_leads and self._pass - self._arrived_at[request_id] >= self.max_age_passes:
                 return (0, 0, arrival)
+            waited = self._pass - self._waiting_since[request_id]
+            if (
+                first_chunk_wait > 0
+                and waited >= first_chunk_wait
+                and req.is_first_context_chunk
+                and (
+                    self.first_chunk_max_tokens is None
+                    or self._uncached_tokens(req, kv_cache_manager) <= self.first_chunk_max_tokens
+                )
+            ):
+                self._first_chunk_aged.add(request_id)
+                return (0, 1, arrival)
+            if waited >= self.max_wait_passes:
+                # Without the first-chunk tier, every aged request shares one.
+                return (0, 2 if first_chunk_wait > 0 else 0, arrival)
             return (1, self._uncached_tokens(req, kv_cache_manager), arrival)
 
         ordered = [req for _, req in sorted(enumerate(context_reqs), key=admission_key)]
@@ -476,6 +554,24 @@ class ShortestPrefillFirstOrder:
         """Restart the waiting clock of every request given context tokens this pass."""
         for req in scheduled_ctx:
             self._waiting_since[req.py_request_id] = self._pass
+        if self._first_chunk_aged:
+            admitted = [r for r in scheduled_ctx if r.py_request_id in self._first_chunk_aged]
+            if admitted and not self._first_chunk_aged_logged:
+                self._first_chunk_aged_logged = True
+                logger.info(
+                    "[V2Scheduler] shortest-prefill-first: first chunk of request "
+                    f"{admitted[0].py_request_id} admitted ahead of shorter prefills after "
+                    f"waiting {self.first_chunk_max_wait_passes} or more passes "
+                    f"(first_chunk_max_wait_passes={self.first_chunk_max_wait_passes}); later "
+                    "ones are counted in the prefill-decode interval summary, when that "
+                    "interval is set"
+                )
+            self._first_chunk_aged_admissions += len(admitted)
+
+    def take_first_chunk_aged_admissions(self) -> int:
+        """First chunks admitted from the first-chunk tier since the last call."""
+        count, self._first_chunk_aged_admissions = self._first_chunk_aged_admissions, 0
+        return count
 
 
 class KVCacheV2Scheduler(RequestScheduler):
@@ -608,9 +704,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         interval = _read_non_negative_int_env("TRTLLM_SCHED_PREFILL_DECODE_INTERVAL", 0)
         self._prefill_decode_interval = PrefillDecodeInterval(interval) if interval > 0 else None
         self._shortest_prefill_first = None
+        # Opt-in (default off): see ShortestPrefillFirstOrder's
+        # first_chunk_max_wait_passes. Acts only with shortest-prefill-first.
+        first_chunk_wait = _read_non_negative_int_env(
+            "TRTLLM_SCHED_SPF_FIRST_CHUNK_MAX_WAIT_PASSES", 0
+        )
         if os.environ.get("TRTLLM_SCHED_SHORTEST_PREFILL_FIRST", "0") == "1":
             self._shortest_prefill_first = ShortestPrefillFirstOrder(
-                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128)
+                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128),
+                max_age_passes=_read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_AGE_PASSES", 0),
+                aged_lead_every=_read_non_negative_int_env("TRTLLM_SCHED_SPF_AGED_LEAD_EVERY", 1),
+                first_chunk_max_wait_passes=first_chunk_wait,
+                first_chunk_max_tokens=max_num_tokens,
+            )
+        elif first_chunk_wait > 0:
+            logger.warning(
+                "TRTLLM_SCHED_SPF_FIRST_CHUNK_MAX_WAIT_PASSES has no effect without "
+                "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST=1"
             )
         self._context_admission_stats: Counter = Counter()
 
@@ -645,7 +755,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "shortest_prefill_first="
                 f"{self._shortest_prefill_first is not None}"
                 + (
-                    f" (max_wait_passes={self._shortest_prefill_first.max_wait_passes})"
+                    f" ({self._shortest_prefill_first.describe()})"
                     if self._shortest_prefill_first is not None
                     else ""
                 )
@@ -1071,13 +1181,20 @@ class KVCacheV2Scheduler(RequestScheduler):
         stats["deferred"] += int(deferred)
         stats["context"] += int(bool(scheduled_ctx))
         if stats["passes"] >= self._CONTEXT_ADMISSION_LOG_PASSES:
+            spf = self._shortest_prefill_first
+            first_chunk_aged = ""
+            if spf is not None and spf.first_chunk_max_wait_passes > 0:
+                first_chunk_aged = (
+                    f", {spf.take_first_chunk_aged_admissions()} first chunks admitted ahead after waiting "
+                    f"{spf.first_chunk_max_wait_passes} passes"
+                )
             logger.info(
                 f"[V2Scheduler] prefill-decode interval "
                 f"{self._prefill_decode_interval.interval}: over {stats['passes']} passes, "
                 f"{stats['context']} admitted context work, "
                 f"{stats['deferred']} held pending context back, "
                 f"{stats['withdrawn']} admissions withdrawn because the executor did not "
-                "run them"
+                "run them" + first_chunk_aged
             )
             stats.clear()
 

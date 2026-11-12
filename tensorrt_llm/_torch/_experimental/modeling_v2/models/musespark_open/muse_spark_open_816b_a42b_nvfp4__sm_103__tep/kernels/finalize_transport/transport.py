@@ -36,6 +36,16 @@ from ...ops.moe import finalize_allreduce_transport as _fin
 ATTRIBUTE = "_finalize_ar_workspace"
 
 
+#: ``finalize_entry_trigger`` (off by default) builds the transport with the ``entry`` trigger
+#: (``finalize_allreduce_transport.ENTRY_TRIGGER``), which lets the dependent grid launch right
+#: after this kernel's own ``griddepcontrol.wait`` instead of after its output store. The
+#: dependent (the unpool slice GEMM) then issues its weight loads while this kernel waits for its
+#: peers; it still reads the finalize's output only after its own wait, which returns once this
+#: grid has completed. Same statements, same bits; only the dependent's launch point moves. Off:
+#: the built-in place. The lever reaches this module through
+#: ``finalize_allreduce_transport.configure``, which rebuilds ``_fin.DEFAULT``.
+
+
 def refusal(model: MuseSparkOpenModel, wide: bool = False) -> Optional[str]:
     """Why ``install`` cannot replace this model's fused finalize, or None. Changes nothing."""
     legacy = getattr(model, ATTRIBUTE, None)
@@ -86,11 +96,11 @@ def install(model: MuseSparkOpenModel, wide: bool = False):
         RuntimeError: if the workspace could not be built on some rank (on every
             rank).
     """
+    transport = _fin.DEFAULT
     reason = agreed_refusal(model, wide)
     if reason is not None:
         raise ValueError(reason)
     legacy = getattr(model, ATTRIBUTE)
-    transport = _fin.DEFAULT
     workspace = _fin.FinalizeTransportWorkspace(legacy, legacy._mapping, transport)
     for layer in model.layers:
         setattr(layer.feed_forward, ATTRIBUTE, workspace)

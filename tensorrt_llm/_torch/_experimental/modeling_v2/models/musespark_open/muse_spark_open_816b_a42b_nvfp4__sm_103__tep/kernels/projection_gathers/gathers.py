@@ -130,11 +130,21 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
     _published = None
     _published_pool_buffer: Optional[int] = None
     _published_unpool_buffer: Optional[int] = None
+    #: ``wide_direct_transports`` (sm103 TEP8, ``tep8_wide_direct_transports``):
+    #: its arming (``WideDirectTransports``) and this layer's pool buffer; None without it.
+    _wide_direct = None
+    _wide_direct_pool_buffer: Optional[int] = None
 
     def _replicated_projection(self, module, hidden_states, workspace):
         defer = (self._defer_unpool and module is self.unpooler) or (
             self._defer_pool and module is self.pooler
         )
+        wide_direct = self._wide_direct
+        if defer and module is self.pooler and wide_direct is not None and wide_direct.is_armed:
+            # 16/24/32 rows: the pool slice GEMM publishes into the wide pool transport.
+            slot = wide_direct.project_pool(self, module, hidden_states)
+            if slot is not None:
+                return slot
         published = self._published
         if defer and published is not None and published.is_armed:
             # 33..512 rows: the slice GEMM publishes into the site's transport.
@@ -168,6 +178,11 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
         return projected
 
     def prepare_expert_input(self, pooled: torch.Tensor):
+        wide_direct = self._wide_direct
+        if wide_direct is not None and wide_direct.is_armed:
+            quantized = wide_direct.consume_pool(self, pooled)
+            if quantized is not None:
+                return quantized
         published = self._published
         if published is not None and published.is_armed:
             quantized = published.consume_pool(self, pooled)

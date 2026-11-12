@@ -736,6 +736,7 @@ def _build_wide_hop(
     )
     # The 8-row hop's call keeps every row count it takes.
     min_rows = _hop.MAX_ROWS + 1
+    # The line names the served cut (two_shot_rows=32 at TP4, 16 at TP8).
     _wide.log_once_enabled(
         len(model.layers),
         workspace.multicast,
@@ -745,6 +746,7 @@ def _build_wide_hop(
         r2=workspace.r2,
         r2_wide=workspace.r2_wide,
         smem_pad=workspace.smem_pad,
+        ranks=workspace.ranks,
     )
 
     def wide_factory() -> "_wide.WideHopWorkspace":
@@ -946,6 +948,7 @@ class AdoptedLayers:
     published_projections: Optional[object] = None
     finalize_two_shot: Optional[object] = None
     batch_dense_gemms: Optional[object] = None
+    wide_direct: Optional[object] = None
 
 
 def adopt_model(
@@ -986,6 +989,7 @@ def adopt_model(
         dense_gemm_plan = dense_gemms.install(
             model,
             prefetch=plan.enabled("dense_gemm_prefetch"),
+            wide=plan.enabled("wide_dense_gemms"),
         )
     norm_gate_trigger = None
     early_release_on = plan.enabled("boundary_early_release")
@@ -1181,8 +1185,14 @@ def adopt_model(
             model, pdl_triggers.capture_layers(model) - capture_folded
         )
         _refuse_unconverted_edges(converted, kept, len(model.layers))
+        # With wide_projection_gathers the unpool slice of a 9..32-row step runs on the unpooler's
+        # dispatcher too: its next-QKV prefetch is dropped at those rows on the converted edges
+        # (the path's check refuses a plan that still forks it there).
         dropped = pdl_triggers.drop_converted_prefetches(
-            model, dense_gemm_plan, qkv=bool(converted)
+            model,
+            dense_gemm_plan,
+            qkv=bool(converted),
+            wide=plan.enabled("wide_projection_gathers"),
         )
         pdl_triggers.log_installed(
             len(model.layers),
@@ -1278,6 +1288,22 @@ def adopt_model(
             model.layers[0].mapping, lambda: _wide_projections.check(model, dense_gemm_plan)
         )
         wide_projections = _wide_projections.install(model, dense_gemm_plan)
+    wide_direct = None
+    if wide_projections is not None and plan.enabled("tep8_wide_direct_transports"):
+        # Default off. After wide_projection_gathers (whose 9..32-row table and arming it rides)
+        # and unpool_into_boundary (whose joins, sites and producer policy its unpool site
+        # reuses). Collective: its refusal is agreed over the TP group first.
+        from .kernels.wide_direct_transports import transports as _wide_direct
+
+        wide_direct = _wide_direct.install(
+            model,
+            dense_gemm_plan,
+            wide_projections,
+            unpool_direct,
+            capture_folded,
+            compute_capability,
+            sites=plan.param("tep8_wide_direct_transports", "SITES"),
+        )
     published_projections = None
     if plan.enabled("projection_publish"):
         # After projection_gathers, whose MoE and join classes carry its hooks. Its refusal is
@@ -1289,6 +1315,19 @@ def adopt_model(
             model.layers[0].mapping, lambda: _projection_publish.check(model, layer_kwargs)
         )
         published_projections = _projection_publish.install(model)
+    if plan.enabled("tep8_router_shard"):
+        # Default off (TP8 sm103 gens): after moe_prologue, the router fork and
+        # wide_projection_gathers (whose deferred pool slices it routes), the 16..32-row prologue
+        # on a TP8 wide route inbox. Its refusal (another TP size or SM, a missing prerequisite)
+        # is agreed over the TP group and only warns. Off: nothing is imported or built.
+        # Placed after projection_publish -- which only adds hooks to the same MoE classes --
+        # rather than beside wide_projection_gathers, to leave that edit site free.
+        from .kernels.wide_prologue import prologue as _wide_prologue
+
+        _wide_prologue.install_tep8(
+            model,
+            _wide_prologue.tep8_router_shard_mode(plan.enabled("tep8_router_shard_wide")),
+        )
     batch_dense_gemms = None
     if plan.enabled("batch_dense_gemms"):
         # After dense_gemms (whose re-classed projections and plan it arms) and every
@@ -1315,4 +1354,5 @@ def adopt_model(
         published_projections=published_projections,
         finalize_two_shot=finalize_two_shot,
         batch_dense_gemms=batch_dense_gemms,
+        wide_direct=wide_direct,
     )

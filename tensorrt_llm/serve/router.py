@@ -62,6 +62,8 @@ PLACEMENT_HOLD_TIMEOUT_DEFAULT_S = 300.0
 # (and at most this many) so the late placement is refused instead of leaking.
 PLACEMENT_EARLY_RELEASE_TTL_S = 600.0
 PLACEMENT_EARLY_RELEASE_MAX = 16384
+# Held placement: log the placement counters every this many placements.
+PLACEMENT_STATS_INTERVAL = 500
 
 
 class HeldPlacementCancelled(ValueError):
@@ -830,6 +832,8 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         self._hold_started: dict[int, float] = {}
         self._early_releases: OrderedDict[int, float] = OrderedDict()
         self._hold_fallbacks = 0
+        self._hold_placements = 0
+        self._hold_held_placements = 0
         self._hold_wait_lat = None
         if max_inflight_per_server is not None:
             from tensorrt_llm.serve.responses_utils import PeriodicLatencyLogger
@@ -955,7 +959,9 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         # a server still has room after them.
         self._dispatch_held()
         if waiter.future.done():
+            self._count_placement(held=False)
             return waiter.future.result()
+        self._count_placement(held=True)
         try:
             server = await asyncio.wait_for(asyncio.shield(waiter.future),
                                             timeout=self._hold_timeout_s)
@@ -966,6 +972,24 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
             raise
         self._hold_wait_lat.record(time.monotonic() - waiter.enqueued_at)
         return server
+
+    def _count_placement(self, held: bool) -> None:
+        """Count a placement under the cap and log the counters periodically."""
+        self._hold_placements += 1
+        if held:
+            self._hold_held_placements += 1
+        if self._hold_placements % PLACEMENT_STATS_INTERVAL == 0:
+            in_flight = {
+                server: state._num_active_requests
+                for server, state in self._server_state.items()
+            }
+            below_cap = self._hold_placements - self._hold_held_placements
+            logger.info(f"LoadBalancingRouter[{self._server_role}]: "
+                        f"placements={self._hold_placements} "
+                        f"below_cap={below_cap} "
+                        f"held={self._hold_held_placements} "
+                        f"timeout_fallbacks={self._hold_fallbacks} "
+                        f"held_now={len(self._held)} in_flight={in_flight}")
 
     def _place_after_hold_timeout(self, key: int,
                                   waiter: _HeldPlacement) -> str:

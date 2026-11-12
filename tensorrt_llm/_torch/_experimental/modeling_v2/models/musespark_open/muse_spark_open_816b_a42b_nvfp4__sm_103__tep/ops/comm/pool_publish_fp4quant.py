@@ -3,13 +3,14 @@
 """The pre-expert RMSNorm + NVFP4 quantization reading its row from the pool's publish transport.
 
 On a 33..512-row decode step with ``projection_publish`` every rank's pool slice GEMM
-writes its ``[M, 1024]`` slice straight into its slot of the pool transport
+writes its ``[M, 4096 / TP]`` slice straight into its slot of the pool transport
 (``projection_publish.PublishTransport``). This kernel is flashinfer's
 ``RMSNormFP4QuantKernel`` (H = 4096: one CTA of 128 threads per two rows, 64 threads per
 row, each thread owning eight 8-element vectors spaced 512 columns apart -- the geometry
 ``pool_gather_fp4quant`` is written for) with its global-to-shared copy replaced by the
 gather: a thread's eight vectors are two vectors (256 words apart) of each of the four
-ranks' slots of its row in this rank's copy of the transport. It polls them (all eight
+ranks' 1024-column slots of its row in this rank's copy of the transport at TP4, one
+vector of each of the eight ranks' 512-column slots at TP8. It polls them (all eight
 loads in flight together, re-polled together) until no 16-bit half holds the sentinel,
 writes the sentinel back, and stores the eight vectors where the built-in copy would have
 put them. Phases 2 and 3 are ``pool_gather_fp4quant``'s (flashinfer's), statement for
@@ -390,9 +391,10 @@ class PoolPublishRmsnormFp4Quant(OpWrapper):
     kernel included) has completed. ``guard_ns`` / ``guard_break``: the poll guard
     (``guard_break`` for tests only).
 
-    A collective over the TP4 group: every rank calls it with the same row count and
-    buffer, in the same order relative to its other calls on ``transport``, no two
-    consecutive calls on one buffer (``projection_publish.buffer_sequence``).
+    A collective over the transport's TP group (four or eight ranks): every rank calls it
+    with the same row count and buffer, in the same order relative to its other calls on
+    ``transport``, no two consecutive calls on one buffer
+    (``projection_publish.buffer_sequence``).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -403,7 +405,10 @@ class PoolPublishRmsnormFp4Quant(OpWrapper):
     concatenated), through CUDA-graph replays with changing inputs, back-to-back
     60-layer chains on the model's buffer sequence with a delayed rank, and against
     `reference` within a band. The slots are published by the production producer
-    (cuBLAS into the multicast slot) and by an elementwise copy.
+    (cuBLAS into the multicast slot) and by an elementwise copy. At eight ranks over two
+    trays (one vector per rank per thread; the eight slots concatenated) the same
+    bit-for-bit comparison holds in 60-layer chains at 64..512 rows with a delayed rank
+    on the other tray, and in a graph replay.
     """
 
     def __call__(

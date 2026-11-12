@@ -85,6 +85,7 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
+from .scheduler.scheduler_v2 import _read_non_negative_int_env
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -4954,6 +4955,74 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
+# cuBLAS handles created before the cap when TRTLLM_TORCH_MEM_SAFETY_MARGIN_MB is
+# set; two covered every thread the executor started afterwards on GB300.
+_PREWARM_CUBLAS_HANDLES = 2
+
+
+def _prewarm_cublas_handles(count: int) -> None:
+    """Create ``count`` cuBLAS handles on the current device before PyTorch's cap is set.
+
+    PyTorch keeps one cuBLAS handle per (thread, device), created on the
+    thread's first BLAS call; ``cublasCreate`` allocates device memory outside
+    PyTorch's allocator. The executor loop runs on a thread started after
+    ``_adjust_torch_mem_fraction()``, which lets PyTorch grow into all but the
+    safety margin of the device, so the loop's first BLAS call can find no
+    device memory left (``CUBLAS_STATUS_ALLOC_FAILED``). Threads that exit
+    return their handles to PyTorch's pool, and a new thread takes a pooled
+    handle before it creates one. So ``count`` concurrent short-lived threads
+    leave ``count`` handles for later threads, already counted outside the cap.
+    """
+    import threading
+
+    device = torch.cuda.current_device()
+    barrier = threading.Barrier(count)
+    errors: List[BaseException] = []
+
+    def _create():
+        try:
+            torch.cuda.set_device(device)
+            # cuBLASLt calls use this same handle on CUDA.
+            torch.cuda.current_blas_handle()
+        except BaseException as e:  # reported by the caller
+            errors.append(e)
+        finally:
+            # Hold this thread's handle until every thread has its own.
+            try:
+                barrier.wait(timeout=120)
+            except threading.BrokenBarrierError:
+                pass
+
+    for attempt in range(2):
+        errors.clear()
+        barrier.reset()
+        free_before = torch.cuda.mem_get_info()[0]
+        reserved_before = torch.cuda.memory_reserved()
+        threads = [
+            threading.Thread(target=_create,
+                             name=f"trtllm_cublas_prewarm_{i}",
+                             daemon=True) for i in range(count)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if not errors:
+            outside = (free_before - torch.cuda.mem_get_info()[0]) - (
+                torch.cuda.memory_reserved() - reserved_before)
+            logger.info(
+                f"cuBLAS prewarm: {count} handle(s) "
+                f"ready in PyTorch's pool on device {device} before the "
+                f"PyTorch memory cap ({outside / 1024**2:.1f} MiB outside PyTorch)"
+            )
+            return
+        if attempt == 0:
+            # Room for the handles; the cap below is unchanged by this.
+            torch.cuda.empty_cache()
+    logger.warning(f"cuBLAS prewarm: could not create {count} cuBLAS "
+                   f"handle(s) on device {device}: {errors[0]!r}")
+
+
 def _adjust_torch_mem_fraction():
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
@@ -4990,14 +5059,26 @@ def _adjust_torch_mem_fraction():
     #       effectively resets the allocator cache.
     if not _limit_torch_cuda_mem_fraction:
         return
+    # Objects created lazily after this point outside PyTorch's allocator
+    # (cuBLAS handles of threads started later, KV cache manager stream pools,
+    # lazily loaded kernels) must fit in the device memory PyTorch leaves:
+    # TRTLLM_TORCH_MEM_SAFETY_MARGIN_MB (unset or 0: the built-in 32 MiB). Setting
+    # it also creates the cuBLAS handles of those threads first, outside the cap.
+    margin_mb = _read_non_negative_int_env("TRTLLM_TORCH_MEM_SAFETY_MARGIN_MB",
+                                           0)
+    if margin_mb > 0:
+        _prewarm_cublas_handles(_PREWARM_CUBLAS_HANDLES)
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
-    safety_margin = 32 * 1024**2
+    safety_margin = (margin_mb or 32) * 1024**2
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(
         f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
     )
+    if margin_mb > 0:
+        logger.info(f"TRTLLM_TORCH_MEM_SAFETY_MARGIN_MB: {margin_mb} MiB "
+                    f"of device memory left outside PyTorch's cap")
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
 
 

@@ -68,7 +68,9 @@ kernel), the fused context K/V projection (``F.linear``), and the TP-sharded
 ``qkv_proj`` / ``o_proj`` / ``gate_up_proj`` / ``down_proj`` (whose per-rank
 autotuner choices differ between ranks). Same tactic on every rank; drafter
 numerics only. The install reports every candidate call site it left
-built-in, and why.
+built-in, and why. On sm103 TP8 it first checks every row of the table with
+flashinfer's own validation and refuses the fast path if one fails
+(``fixed_low_m_gemm.INSTALL_CHECKED``).
 """
 
 from __future__ import annotations
@@ -88,7 +90,13 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
 from .dispatch import LAUNCH_PDL
-from .ops.gemm.fixed_low_m_gemm import fixed_low_m_gemm, splitk_tactics, tactic_for, takes
+from .ops.gemm.fixed_low_m_gemm import (
+    fixed_low_m_gemm,
+    refused_rows,
+    splitk_tactics,
+    tactic_for,
+    takes,
+)
 from .ops.spec.dflash_accept import (
     COUNTER_STRIDE,
     FORCE_FIXED,
@@ -103,6 +111,43 @@ from .ops.spec.dflash_accept import (
 #: gather serves decode steps at batch 1 (K + 1 <= 8 rows); larger calls
 #: (prefill chunks, batched decode) run the built-in. TP4 has no row bound.
 FC_SHARD_MAX_ROWS = 8
+
+#: Tokens the TP8 projection gather's workspace holds (``musespark_open_projection_gather``).
+FC_SHARD_TP8_ROW_CAPACITY = 128
+#: ``tep8_fc_shard_wide``: the TP8 row bound this module installs, ``FC_SHARD_MAX_ROWS``
+#: until ``configure`` raises it. Above the default, decode steps of two to five requests
+#: (16..40 rows at K = 7) shard ``fc`` too: per step the rank reads its 84 MB slice instead
+#: of the 671 MB weight.
+_FC_SHARD_TP8_MAX_ROWS = FC_SHARD_MAX_ROWS
+
+
+def configure(*, fc_shard_tp8_max_rows: int = FC_SHARD_MAX_ROWS) -> None:
+    """Set the TP8 row bound of the sharded ``fc``.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; the default
+    is the stock bound, where only the batch-1 decode step (K + 1 <= 8 rows) shards.
+
+    Args:
+        fc_shard_tp8_max_rows: the most rows a TP8 call may have and still shard
+            (``_FC_SHARD_TP8_MAX_ROWS``), ``FC_SHARD_MAX_ROWS``..``FC_SHARD_TP8_ROW_CAPACITY``.
+
+    Raises:
+        ValueError: for a bound outside that range.
+    """
+    global _FC_SHARD_TP8_MAX_ROWS
+    rows = int(fc_shard_tp8_max_rows)
+    if not FC_SHARD_MAX_ROWS <= rows <= FC_SHARD_TP8_ROW_CAPACITY:
+        raise ValueError(
+            f"[musespark_open] drafter_fc_shard TP8 row bound {rows}: expected "
+            f"{FC_SHARD_MAX_ROWS}..{FC_SHARD_TP8_ROW_CAPACITY}"
+        )
+    _FC_SHARD_TP8_MAX_ROWS = rows
+
+
+def fc_shard_tp8_max_rows() -> int:
+    """The TP8 row bound ``configure`` set, else ``FC_SHARD_MAX_ROWS``."""
+    return _FC_SHARD_TP8_MAX_ROWS
+
 
 #: The TP widths the sharded ``fc`` is written for: 8 gathers over the fabric
 #: projection-gather workspace, 4 with the built-in NCCL all-gather.
@@ -295,8 +340,15 @@ def install_sharded_fc(
         gather=gather,
         enable_pdl=enable_pdl,
         world=world,
-        max_rows=FC_SHARD_MAX_ROWS if world == 8 else None,
+        max_rows=fc_shard_tp8_max_rows() if world == 8 else None,
     )
+    if world == 8 and draft_model._fc_shard.max_rows > FC_SHARD_MAX_ROWS:
+        from tensorrt_llm.logger import logger
+
+        logger.info(
+            f"[musespark_open] tep8_fc_shard_wide: the TP8 sharded fc takes calls of up to "
+            f"{draft_model._fc_shard.max_rows} rows"
+        )
     draft_model.project_target_hidden = types.MethodType(sharded_project_target_hidden, draft_model)
     return None
 
@@ -677,9 +729,10 @@ def install(
         ValueError: if ``fc_shard`` or ``fused_accept`` is asked for and cannot be installed
             (no drafter / worker, or the reason its install declined), or
             ``fixed_gemms`` is asked for on a TP size without a tactic table
-            (``splitk_tactics``: 4 and 8) or some drafter GEMM call site takes no fixed
-            tactic -- running the built-in path under the fast path's name would
-            misreport what runs.
+            (``splitk_tactics``: 4 and 8), on a table with a row the split-K kernel refuses
+            (``refused_rows``; the tables of ``INSTALL_CHECKED``: sm103 TP8), or some drafter
+            GEMM call site takes no fixed tactic -- running the built-in path under the fast
+            path's name would misreport what runs.
     """
     enable_pdl = LAUNCH_PDL
     if fc_shard:
@@ -716,10 +769,18 @@ def install(
         tp_size = getattr(mapping, "tp_size", None)
         try:
             tactics = splitk_tactics(tp_size)
+            refused = refused_rows(tp_size)
         except ValueError as error:
             raise ValueError(
                 f"[musespark_open] drafter_fixed_gemms cannot run here: {error}"
             ) from error
+        if refused:
+            # Before any module changes, as dense_gemms.install refuses a cell it cannot serve:
+            # otherwise the first call at that row count raises inside the engine's warmup.
+            raise ValueError(
+                "[musespark_open] drafter_fixed_gemms cannot run here: the split-K kernel refuses "
+                f"{len(refused)} row(s) of the TP{tp_size} tactic table ({'; '.join(refused)})"
+            )
         sites = install_fixed_tactic_gemms(draft_model, enable_pdl, tactics)
         total = sites.installed + len(sites.declined)
         if not sites.installed or sites.declined:

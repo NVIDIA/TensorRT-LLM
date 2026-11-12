@@ -22,7 +22,14 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
     if block_conv or block_decode:
         from .kernels.drafter_block_decode import block_decode as _draft
 
-        _draft.install(shell.llm.draft_model, block_conv, block_decode)
+        _draft.install(
+            shell.llm.draft_model,
+            block_conv,
+            block_decode,
+            conv_epilogue=plan.enabled("drafter_conv_epilogue"),
+            finish_norm=plan.enabled("drafter_finish_norm"),
+            silu_epilogue=plan.enabled("drafter_silu_epilogue"),
+        )
     if plan.enabled("wide_drafter_window_attention"):
         # On the block decode drafter_block_decode just bound.
         from .kernels.wide_drafter_window_attention import attention as _wide_window
@@ -66,6 +73,8 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             shell.llm.model,
             declined=plan.declined,
             paged_commit=plan.enabled("paged_context_commit"),
+            fused_prep=plan.enabled("drafter_fused_prep"),
+            fused_prep_min_requests=plan.param("drafter_fused_prep", "MIN_REQUESTS"),
         )
     verify_fold = plan.enabled("verify_fold")
     path_walk_tail = plan.enabled("path_walk_tail")

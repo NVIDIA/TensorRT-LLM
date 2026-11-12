@@ -32,6 +32,33 @@ stack or a tep4 rank's own 64-expert block (the owner-only window of
 three-window stack ``[own | b-1 | b-2]``. The kernel's active-expert bit set
 is over window ids (two 32-bit words up to 64), so the ring's block size does
 not enter it. An expert's rows do not depend on the window it is read from.
+
+Wider calls on a window of at most 64 experts: the wide build (9..16 rows,
+``wide_persistent_experts``), or with ``batch=True`` the batch builds (9..32
+rows: 16 or 32 token columns, ``BATCH_OPTIONS``), which keep the 8-row build's
+six weight stages by reusing the activation's shared-memory stages for the FC2
+operand. Every build computes a routed row with the same instructions in the
+same order, so the rows are bitwise the same whichever build serves a call.
+
+Early start (``early_start=True`` on a batch call; ``tep8_experts_early_start``):
+the batch build variant that reads its epoch before its dependency wait, for a launch
+whose same-stream predecessor released it right after its own dependency wait
+(``ring_buddy_assign(early_trigger=True)``, the call that wrote ``topk_ids``), so the grid
+launches and initializes while that predecessor runs; ``ring_buddy`` pairs the two calls.
+Same workspace, same rows.
+
+Interleaved fetch (``tep8_experts_interleaved_fetch``, or ``fetch_kb`` on a
+call): the batch builds' two fetch warps move the FC2 operand's k-blocks alternately instead of
+in halves (a 32-column build ``BATCH_FETCH_KB`` per polling pass), so the k-blocks an FC2 tile
+still waits for are polled by both warps in the MMA's order instead of by one warp in series
+(``kernel.py``'s module docstring). Every build and variant of a batch call (early start
+included) takes it; same workspace, same rows.
+
+In-kernel placement (``place_rank`` on a batch call on the 64-expert window; the call site is
+``ring_buddy``'s ``tep8_experts_in_kernel_placement``): ``topk_ids`` are the
+step's selected global ids and the kernel computes ``ring_buddy_assign``'s balanced tep8
+placement for rank ``place_rank`` itself, so no placement launch precedes it. The default
+entry (its epoch after the wait, so any predecessor will do); same workspace, same rows.
 """
 
 from __future__ import annotations
@@ -57,6 +84,27 @@ WIDE_MAX_ROWS = 16
 #: What the wide build changes in the device's ``OPTIONS``: its B operand and compact scale
 #: stages are twice the 8-row build's, so four weight stages fit in shared memory.
 WIDE_OPTIONS: Dict[str, int] = {"num_stages": 4}
+#: Rows the batch builds serve (``batch=True``; windows of at most 64 experts): sm103 TP8
+#: decode steps of two to four requests at K = 7 on the ring-buddy stack
+#: (``tep8_persistent_batch_experts``).
+BATCH_MAX_ROWS = 32
+#: The batch builds' token columns: the smallest that holds a call's rows above 8.
+BATCH_NTOKS = (16, 32)
+#: What a batch build changes in the device's ``OPTIONS`` (``kernel.py``'s ``overlap``): the
+#: FC2 operand image reuses the activation's 16 B stages, which keeps the six weight
+#: stages at 32 token columns, and the activation lands in groups of k-blocks; the image
+#: moves by the tagged hand-off (``OPTIONS``' ``handoff``) on per-k-block barriers; the
+#: accumulator stages fit 64 TMEM columns.
+BATCH_OPTIONS: Dict[int, Dict[str, int]] = {
+    16: {"overlap": 1},
+    32: {"overlap": 1, "acc_stages": 2},
+}
+#: Interleaved fetch (``tep8_experts_interleaved_fetch``): k-blocks one fetch warp of a
+#: 32-column batch build polls
+#: per pass (``kernel.py``'s ``fetch_kb``; the 16-column build keeps its four). One, as before:
+#: the interleave alone carries the gain, and two per pass measured no better (four, slower).
+BATCH_FETCH_KB = 1
+#: The switch of the batch builds' interleaved fetch: unset, empty or ``0`` is off, ``1`` on.
 #: Expert windows the kernel is compiled for.
 WINDOWS = (32, 64, 96)
 SF_VEC = 16
@@ -180,6 +228,55 @@ def _refuse_under_capture(what: str) -> None:
         )
 
 
+_FETCH_LOGGED: list = []
+#: ``tep8_experts_interleaved_fetch``: the batch builds' ``fetch_kb``, 0 while it is off.
+_FETCH_KB = 0
+
+
+def configure(*, interleaved_fetch: bool = False) -> None:
+    """Set the batch builds' interleaved fetch.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; off, the
+    default, leaves ``fetch_kb`` at 0 and the builds fetch as before.
+
+    Args:
+        interleaved_fetch: the ``tep8_experts_interleaved_fetch`` lever; on, the builds take
+            ``BATCH_FETCH_KB`` (``_FETCH_KB``).
+    """
+    global _FETCH_KB
+    _FETCH_KB = BATCH_FETCH_KB if interleaved_fetch else 0
+
+
+def batch_fetch_kb() -> int:
+    """The batch builds' ``fetch_kb``: ``BATCH_FETCH_KB`` under
+    ``tep8_experts_interleaved_fetch``, else 0."""
+    return _FETCH_KB
+
+
+def _log_fetch_once(fetch_kb: int) -> None:
+    """One INFO line per process, when the batch builds are prepared with the interleaved fetch."""
+    if _FETCH_LOGGED:
+        return
+    _FETCH_LOGGED.append(True)
+    from tensorrt_llm.logger import logger
+
+    logger.info(
+        "[musespark_open] tep8_experts_interleaved_fetch: the batch builds' two fetch warps "
+        f"move the FC2 operand's k-blocks alternately ({fetch_kb} per polling pass at 32 columns, "
+        "4 at 16 columns); logged once per process"
+    )
+
+
+def batch_ntok(rows: int) -> int:
+    """The batch build that serves a call of ``rows`` (9..``BATCH_MAX_ROWS``) rows."""
+    for ntok in BATCH_NTOKS:
+        if rows <= ntok:
+            return ntok
+    raise ValueError(
+        f"persistent_experts: the batch builds serve at most {BATCH_MAX_ROWS} rows, got {rows}"
+    )
+
+
 class _Workspace:
     """Graph-stable per-(device, grid) scratch shared by every launch on a stream.
 
@@ -195,7 +292,9 @@ class _Workspace:
     once, outside graph capture, and never re-initialized.
     """
 
-    def __init__(self, device: torch.device, num_ctas: int, ntok: int = MAX_ROWS):
+    def __init__(
+        self, device: torch.device, num_ctas: int, ntok: int = MAX_ROWS, batch: bool = False
+    ):
         from ._persistent_experts.kernel import FC1_MT, MAX_CTAS, MAX_SLOTS, TRACE_WORDS, Geometry
 
         assert num_ctas <= MAX_CTAS
@@ -203,25 +302,32 @@ class _Workspace:
         self.epoch = torch.zeros(MAX_CTAS, dtype=torch.int32, device=device)
         self.flags = torch.zeros(MAX_SLOTS * FC1_MT, dtype=torch.int32, device=device)
         self.images = torch.zeros(
-            MAX_SLOTS * Geometry(ntok).ws_slot_bytes, dtype=torch.uint8, device=device
+            MAX_SLOTS * Geometry(ntok, batch).ws_slot_bytes, dtype=torch.uint8, device=device
         )
         self.trace = torch.zeros(num_ctas, TRACE_WORDS, dtype=torch.int64, device=device)
 
 
 def _workspace(
-    device: torch.device, num_ctas: int, handoff: Optional[int] = None, ntok: int = MAX_ROWS
+    device: torch.device,
+    num_ctas: int,
+    handoff: Optional[int] = None,
+    ntok: int = MAX_ROWS,
+    batch: bool = False,
 ) -> _Workspace:
-    """The workspace of this device, grid, hand-off protocol and build width (its own epochs)."""
+    """The workspace of this device, grid, hand-off protocol and build width (its own epochs);
+    a batch build has its own."""
     if handoff is None:
         handoff = _config(device)[1]["handoff"]
     key = (_device_index(device), num_ctas, int(handoff))
     if ntok != MAX_ROWS:
         key = key + (int(ntok),)
+    if batch:
+        key = key + ("batch",)
     with _LOCK:
         ws = _WORKSPACES.get(key)
         if ws is None:
             _refuse_under_capture("workspace")
-            ws = _Workspace(device, num_ctas, ntok)
+            ws = _Workspace(device, num_ctas, ntok, batch)
             _WORKSPACES[key] = ws
     return ws
 
@@ -300,16 +406,40 @@ def _compiled(
     w2_sf,
     early=None,
     ntok: int = MAX_ROWS,
+    batch: bool = False,
+    early_start: bool = False,
+    fetch_kb: int = 0,
+    place_rank: int = -1,
 ):
     """(compiled launcher, grid size, options) for this device's configuration and window.
 
     With ``early`` (an ``EarlyExpertIds``), the variant that takes its ids from
     that buffer's tagged words before its dependency wait (``early_expert_ids``).
     With ``ntok = WIDE_MAX_ROWS``, the wide build (``WIDE_OPTIONS`` applied; no early ids).
+    With ``batch``, the batch build of ``ntok`` (``BATCH_NTOKS``) columns
+    (``BATCH_OPTIONS[ntok]`` applied; no early ids); with ``early_start`` as well, its
+    early-start variant (see the module docstring); with ``fetch_kb`` (non-zero), its
+    interleaved fetch; with ``place_rank`` (0..7), its in-kernel placement for that rank.
     """
     num_ctas, options = _config(device)
     extra = _early_options(early)
-    if ntok != MAX_ROWS:
+    assert batch or not early_start, "early start is a batch build variant"
+    assert batch or not fetch_kb, "the interleaved fetch is a batch build variant"
+    assert place_rank < 0 or (batch and not early_start and num_local == 64), (
+        "the in-kernel placement is a batch build variant on the 64-expert window, default entry"
+    )
+    if batch:
+        assert early is None, "the batch builds have no early-ids variant"
+        assert num_local <= 64, "the batch builds serve windows of at most 64 experts"
+        options = dict(options, **BATCH_OPTIONS[ntok])
+        if early_start:
+            options["early_start"] = 1
+        if fetch_kb:
+            options["fetch_kb"] = int(fetch_kb)
+        if place_rank >= 0:
+            options["place_rank"] = int(place_rank)
+        extra = {"ntok": int(ntok)}
+    elif ntok != MAX_ROWS:
         assert early is None, "the wide build has no early-ids variant"
         options = dict(options, **WIDE_OPTIONS)
         extra = {"ntok": int(ntok)}
@@ -397,7 +527,10 @@ class PersistentExperts(OpWrapper):
     """NVFP4 experts of one window for <= 8 pre-routed rows, one persistent launch.
 
     Calls of 9..16 rows on a window of at most 64 experts run the wide build (MMA N = 16,
-    its own workspace), with the same contract and the same per-row arithmetic.
+    its own workspace), with the same contract and the same per-row arithmetic. With
+    ``batch=True``, calls of 9..``BATCH_MAX_ROWS`` rows on such a window run the batch
+    builds instead (MMA N = 16 or 32, ``BATCH_OPTIONS``, a workspace each), again with the
+    same contract and per-row arithmetic.
 
     Arguments mirror the pre-routed ``fp4_block_scale_moe_runner`` call the
     MuseSpark layer makes: NVFP4 rows ``hidden_states`` ``[M, 2048]`` uint8 with
@@ -459,6 +592,10 @@ class PersistentExperts(OpWrapper):
         output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor,
+        batch: bool = False,
+        early_start: bool = False,
+        fetch_kb: Optional[int] = None,
+        place_rank: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         import cutlass
         from cuda.bindings import driver as cuda
@@ -466,7 +603,23 @@ class PersistentExperts(OpWrapper):
         device = hidden_states.device
         rows_in = hidden_states.shape[0]
         num_local = gemm1_weights.shape[0]
-        ntok = MAX_ROWS if rows_in <= MAX_ROWS else WIDE_MAX_ROWS
+        batch = bool(batch) and rows_in > MAX_ROWS
+        early_start = bool(early_start) and batch
+        place = -1
+        if place_rank is not None:
+            # topk_ids are global: only the batch build's in-kernel placement may read them
+            assert batch and num_local == 64 and 0 <= int(place_rank) < 8, (
+                "persistent_experts: place_rank needs a batch call of 9..32 rows on the "
+                "64-expert window"
+            )
+            place = int(place_rank)
+            early_start = False
+        fetch = 0
+        if batch:
+            ntok = batch_ntok(rows_in)
+            fetch = batch_fetch_kb() if fetch_kb is None else int(fetch_kb)
+        else:
+            ntok = MAX_ROWS if rows_in <= MAX_ROWS else WIDE_MAX_ROWS
         fn, num_ctas, options = _compiled(
             device,
             num_local,
@@ -475,8 +628,12 @@ class PersistentExperts(OpWrapper):
             gemm2_weights,
             gemm2_weights_scale,
             ntok=ntok,
+            batch=batch,
+            early_start=early_start,
+            fetch_kb=fetch,
+            place_rank=place,
         )
-        ws = _workspace(device, num_ctas, options["handoff"], ntok)
+        ws = _workspace(device, num_ctas, options["handoff"], ntok, batch)
         if _EARLY and ntok == MAX_ROWS:
             from . import early_expert_ids as _early_ids
 
@@ -523,15 +680,57 @@ class PersistentExperts(OpWrapper):
         gemm2_weights_scale: torch.Tensor,
         early=None,
         wide: bool = False,
+        batch_rows: int = 0,
+        early_start: bool = False,
+        fetch_kb: Optional[int] = None,
+        place_rank: Optional[int] = None,
     ) -> None:
         """Compile the kernel for this window and create its workspace, now.
 
         Call it eagerly (at install time, before any graph capture): a call
         under capture that would have to do either refuses. With ``early`` (the
         workspace's ``EarlyExpertIds``) the early-ids variant
-        is compiled too; with ``wide``, the wide build and its workspace as well.
+        is compiled too; with ``wide``, the wide build and its workspace as well;
+        with ``batch_rows`` above ``MAX_ROWS``, every batch build that serves 9..``batch_rows``
+        rows and its workspace, and with ``early_start`` their early-start variants too, all
+        with the batch calls' fetch (``fetch_kb``, by default ``batch_fetch_kb()``); with
+        ``place_rank`` (0..7, the 64-expert window) their in-kernel placement variants as well.
         """
         device = gemm1_weights.device
+        if batch_rows > MAX_ROWS:
+            fetch = batch_fetch_kb() if fetch_kb is None else int(fetch_kb)
+            if fetch and fetch_kb is None:
+                _log_fetch_once(fetch)
+            for ntok in BATCH_NTOKS:
+                if ntok > batch_ntok(batch_rows):
+                    break
+                for early_variant in (False, True) if early_start else (False,):
+                    _, num_ctas, options = _compiled(
+                        device,
+                        gemm1_weights.shape[0],
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        ntok=ntok,
+                        batch=True,
+                        early_start=early_variant,
+                        fetch_kb=fetch,
+                    )
+                if place_rank is not None:
+                    _compiled(
+                        device,
+                        gemm1_weights.shape[0],
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        ntok=ntok,
+                        batch=True,
+                        fetch_kb=fetch,
+                        place_rank=int(place_rank),
+                    )
+                _workspace(device, num_ctas, options["handoff"], ntok, True)
         if wide:
             _, num_ctas, options = _compiled(
                 device,
@@ -577,8 +776,17 @@ class PersistentExperts(OpWrapper):
         output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor,
+        batch: bool = False,
+        early_start: bool = False,
+        fetch_kb: Optional[int] = None,
+        place_rank: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The layer in plain torch, FP64, over the prepared (shuffled) operands.
+
+        ``batch``, ``early_start`` and ``fetch_kb`` (which build serves the call, when it loads
+        its activation, and how it moves the FC2 operand) do not change the result and are
+        ignored. With ``place_rank``, ``topk_ids`` are global and are placed first by
+        ``ring_buddy_assign``'s reference (balanced, tep8) for that rank.
 
         Undoes the 32-row shuffle and the gate/up interleave by index, decodes
         the swizzled scales, and requantizes the SwiGLU output to NVFP4 with
@@ -586,6 +794,10 @@ class PersistentExperts(OpWrapper):
         non-local slots are zero here (the op leaves them unwritten); a local
         expert a token repeats is routed through its first slot only.
         """
+        if place_rank is not None:
+            from .ring_buddy_assign import ring_buddy_assign as _assign
+
+            topk_ids = _assign.reference(topk_ids, topk_weights.float(), int(place_rank))[0]
         m = hidden_states.shape[0]
         num_local = gemm1_weights.shape[0]
         device = hidden_states.device
@@ -633,11 +845,22 @@ class PersistentExperts(OpWrapper):
         output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor,
+        batch: bool = False,
+        early_start: bool = False,
+        fetch_kb: Optional[int] = None,
+        place_rank: Optional[int] = None,
     ) -> None:
         """Inputs the kernel would read past or misread without an error."""
         m = hidden_states.shape[0]
         num_local = gemm1_weights.shape[0]
-        limit = WIDE_MAX_ROWS if num_local <= 64 else MAX_ROWS
+        if place_rank is not None:
+            assert batch and m > MAX_ROWS and num_local == 64 and 0 <= place_rank < 8, (
+                "place_rank: a batch call of 9..32 rows on the 64-expert window, rank 0..7"
+            )
+        if num_local > 64:
+            limit = MAX_ROWS
+        else:
+            limit = BATCH_MAX_ROWS if batch else WIDE_MAX_ROWS
         assert 1 <= m <= limit, f"one launch serves 1..{limit} rows on this window, got {m}"
         assert hidden_states.dtype == torch.uint8 and hidden_states.is_contiguous(), (
             "hidden_states must be contiguous packed NVFP4 bytes"

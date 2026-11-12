@@ -263,5 +263,15 @@ def test_a_paged_context_plans_every_fast_path_but_the_window_compaction(monkeyp
     assert structural == {"drafter_window_compact"}
     off = {name for name, d in decisions.items() if not d.on}
     # The half expert window's rule keeps it to max_batch_size 8; nothing builds on it.
-    assert off == {"drafter_window_compact", "half_window_experts"}
+    # The ported decode-stack levers are default off, and the ones that do carry a
+    # default carry it at TP8 only, so on this TP4 context deployment none is armed.
+    assert off == {
+        "drafter_window_compact",
+        "half_window_experts",
+        "drafter_fused_prep",
+        "finalize_entry_trigger",
+        "multi_request_combine_gate",
+        "router_staged_gemm",
+        "tep8_wide_direct_transports",
+    }
     assert plan.paths == modeling.TARGET_PATHS[103, 4].served - off

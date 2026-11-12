@@ -1,16 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fast path ``projection_publish``: decode steps of 33..448 rows (5 to 56 requests at K = 7)
-on column-sharded pool / unpool projections that publish from the GEMM, sm103 TEP4.
+"""Fast path ``projection_publish``: multi-request decode steps on column-sharded pool / unpool
+projections that publish from the GEMM -- TEP4 at 33..448 rows (5 to 56 requests at K = 7),
+TEP8 at the census row counts of 40..512 rows (5 to 64 requests).
 
 From 33 rows the built-in MoE multiplies the whole replicated pool (8192 -> 4096) and
 unpool (4096 -> 8192) weights on every rank (67 MB each per rank), and ``projection_gathers``
 / ``wide_projection_gathers`` stop at 8 / 32 rows. While ``DecodeTarget`` arms this path for
-a decode forward of 33..448 rows (``PublishedProjections.armed``):
+a decode forward of the TP size's rows (``PublishedProjections.takes``, ``served_rows``):
 
 * the pool and unpool projections of every publishing layer multiply the rank's column
-  slice (16.8 MB) with the slot of the site's multicast transport as the GEMM's output
-  (``ops/comm/projection_publish``): the GEMM's epilogue stores are the publication;
+  slice (16.8 MB at TP4, 8.4 MB at TP8) with the slot of the site's multicast transport as
+  the GEMM's output (``ops/comm/projection_publish``): the GEMM's epilogue stores are the
+  publication;
 * the pre-expert RMSNorm + NVFP4 quantization (``ops/comm/pool_publish_fp4quant``, on the
   MoE preparation stream where the built-in runs it) and the post-FFN join
   (``projection_publish.unpool_publish_join``) poll their rows of the transport, reset
@@ -22,17 +24,26 @@ keep the built-in path), the unpool site of every layer whose post-FFN join feed
 layer's norm (every layer but the last). Each site's calls of a step form one cycle on its
 transport's buffers (``buffer_sequence``).
 
-The transports (11.0 MB pool + 22.0 MB unpool per rank at 448 rows; the build logs the
-device memory they take, which the multicast allocation rounds up) are built at the first
-armed forward, which the engine runs eagerly (its CUDA-graph warm-up): a deployment whose
-decode steps never reach 33 rows never allocates them. A forward captured before they
-exist runs unarmed, on every rank alike. The build refuses, on every rank alike, and the
-steps run the built-in projections when the cuBLAS producer is not the one the census
-certified (``projection_publish.producer_refusal``) or a transport cannot be allocated.
+The row cap is per TP size (``MAX_ROWS_BY_TP``): above it the published join costs more than
+the slice GEMMs save, so those steps keep the built-in projections, and the transports are
+sized to it. TP4: 448 (generation-worker decode steps of 57..64 requests keep the built-in).
+TP8: 512, the decode step of 64 requests. At TP8 the path also publishes only at the row
+counts the producer census ran at (``projection_publish.CENSUS_ROWS_BY_TP``).
 
-``dense_gemm_prefetch`` composes: no dispatcher has a kernel at 33..448 rows, so none
-forks a prefetch on these steps, and the slice GEMM first joins the plan's outstanding
-forks as the site's dispatcher would (``_join_named_forks``).
+The transports (11.0 MB pool + 22.0 MB unpool per rank at TP4 and 448 rows, 12.6 MB +
+25.2 MB at TP8 and 512 rows; the build logs the device memory they take, which the
+multicast allocation rounds up) are built at the first armed forward, which the engine
+runs eagerly (its CUDA-graph warm-up): a deployment whose decode steps never reach 33 rows
+never allocates them. A forward captured before they exist runs unarmed, on every rank
+alike. The build refuses, on every rank alike, and the steps run the built-in projections
+when the cuBLAS producer is not one the census certified at the TP size's slice shapes
+(``projection_publish.producer_refusal``) or a transport cannot be allocated.
+
+``dense_gemm_prefetch`` and ``next_qkv_prefetch`` compose: no dispatcher has a kernel above
+32 rows, so none forks a prefetch on these steps, and the slice GEMM first joins the plan's
+outstanding forks as the site's dispatcher would (``_join_named_forks``). At sm103 TEP8
+``wide_moe_allreduce`` arms on the same steps from 129 rows; it reduces the MoE output
+between the two sites and touches neither transport.
 
 Numerics: the consumers are the built-in kernels' bits on the gathered rows. The slice
 GEMMs are another cuBLAS kernel than the replicated GEMM's (FP32 accumulation, rounded
@@ -47,7 +58,7 @@ does not fit the armed shape raises on every rank alike instead of falling back.
 from __future__ import annotations
 
 import contextlib
-from typing import Iterator, List, Optional, Tuple
+from typing import FrozenSet, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -60,18 +71,54 @@ from ...ops.comm import pool_publish_fp4quant as _pool
 from ...ops.comm import projection_publish as _publish
 from ..projection_gathers.gathers import MuseSparkOpenTepGatedResidual, MuseSparkOpenTepGatherMoE
 
-#: The rows of the decode steps this path arms. Above 448 rows the published join costs more
-#: than the slice GEMMs save (generation-worker decode steps of 57..64 requests), so those
-#: steps keep the built-in projections; the transports are sized to this bound.
-MIN_ROWS, MAX_ROWS = _publish.MIN_ROWS, 448
+#: The fewest rows of a decode step this path arms.
+MIN_ROWS = _publish.MIN_ROWS
+#: The most rows of a decode step this path arms, per TP size; the transports are sized to it.
+#: TP4: above 448 rows the published join costs more than the slice GEMMs save
+#: (generation-worker decode steps of 57..64 requests). TP8: 512, the decode step of 64
+#: requests (the TP8 census covers every row count it serves up to 512).
+MAX_ROWS_BY_TP = {4: 448, 8: 512}
 
 
-def _pool_args(moe) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+def max_rows_for(tp_size: int) -> int:
+    """The row cap of a TP group of ``tp_size`` ranks.
+
+    Raises:
+        ValueError: if the path does not serve that TP size.
+    """
+    if tp_size not in MAX_ROWS_BY_TP:
+        served = " or ".join(f"TP{tp}" for tp in sorted(MAX_ROWS_BY_TP))
+        raise ValueError(f"[musespark_open] projection_publish serves {served}, got TP{tp_size}")
+    return MAX_ROWS_BY_TP[tp_size]
+
+
+def served_rows(tp_size: int) -> Optional[FrozenSet[int]]:
+    """The decode row counts a TP group of ``tp_size`` ranks publishes at, or None for every
+    count of ``MIN_ROWS..max_rows_for(tp_size)``: the census's row counts up to the cap where
+    the census names them (``CENSUS_ROWS_BY_TP``, TP8)."""
+    cap = max_rows_for(tp_size)
+    census = _publish.CENSUS_ROWS_BY_TP.get(tp_size)
+    if census is None:
+        return None
+    return frozenset(rows for rows in census if MIN_ROWS <= rows <= cap)
+
+
+def describe_rows(tp_size: int) -> str:
+    """The served rows in words, for the log lines."""
+    cap = max_rows_for(tp_size)
+    rows = served_rows(tp_size)
+    if rows is None:
+        return f"{MIN_ROWS}..{cap} rows"
+    return f"{min(rows)}..{max(rows)} rows (the {len(rows)} row counts of the producer census)"
+
+
+def _pool_args(moe, max_rows: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """(gain, global scale) exactly when the built-in ``prepare_expert_input`` would quantize a
-    BF16 ``[33..448, 4096]`` pool output with flashinfer's fused ``rmsnorm_fp4quant``; else None.
+    BF16 ``[33..max_rows, 4096]`` pool output with flashinfer's fused ``rmsnorm_fp4quant``;
+    else None.
 
     The built-in's conditions that do not depend on the call's tensor (which is a fresh,
-    contiguous BF16 CUDA tensor of 33..448 rows on the armed path). Reads nothing that
+    contiguous BF16 CUDA tensor of 33..max_rows rows on the armed path). Reads nothing that
     differs between ranks.
     """
     from tensorrt_llm._torch.modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant_available
@@ -84,7 +131,7 @@ def _pool_args(moe) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         or not isinstance(getattr(backend, "op_backend", None), TRTLLMOpBackend)
         or not getattr(backend, "has_nvfp4", False)
         or getattr(backend, "fc31_act_scale", None) is not None
-        or MAX_ROWS > getattr(moe.experts, "moe_max_num_tokens", MAX_ROWS)
+        or max_rows > getattr(moe.experts, "moe_max_num_tokens", max_rows)
         or moe.expert_hidden_size != _pool.HIDDEN
         or not rmsnorm_fp4_quant_available()
     ):
@@ -106,7 +153,7 @@ def _pool_args(moe) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
 
 
 def _join_fits(join, next_norm, gain) -> bool:
-    """Whether the built-in join of 33..448 rows runs its Triton kernel (``_fused_enabled`` and
+    """Whether the built-in join of 33..512 rows runs its Triton kernel (``_fused_enabled`` and
     the operands' dtypes); the call's residual is checked per call."""
     return (
         bool(getattr(join, "_fused_enabled", False))
@@ -155,16 +202,21 @@ class _ForkStream(torch.cuda.ExternalStream):
 
 
 class PublishedProjections:
-    """The decode steps of 33..448 rows on the published projections: armed per forward by
-    ``DecodeTarget``.
+    """The decode steps of the TP size's served rows on the published projections: armed per
+    forward by ``DecodeTarget``.
 
-    Logs once per row count and site that an armed call published, so a served log shows
-    what the captured decode steps run.
+    ``max_rows`` is the TP size's cap (``MAX_ROWS_BY_TP``), ``rows`` the row counts it
+    publishes at (``served_rows``; None: every count of ``MIN_ROWS..max_rows``). Logs once
+    per row count and site that an armed call published, so a served log shows what the
+    captured decode steps run.
     """
 
     def __init__(self, model, comm) -> None:
         self._layers = list(model.layers)
         self.mapping = self._layers[0].mapping
+        self.tp_size = int(self.mapping.tp_size)
+        self.max_rows = max_rows_for(self.tp_size)
+        self.rows: Optional[FrozenSet[int]] = served_rows(self.tp_size)
         self._comm = comm
         self.pool: Optional[_publish.PublishTransport] = None
         self.unpool: Optional[_publish.PublishTransport] = None
@@ -185,17 +237,20 @@ class PublishedProjections:
     def takes(self, rows: int) -> bool:
         """Whether a decode forward of ``rows`` rows runs on the published projections.
 
-        33..448 rows, unless the build refused, or the forward is captured before the first
-        eager armed forward built the transports (every rank captures the same graphs, so
-        every rank answers alike).
+        ``MIN_ROWS..max_rows`` rows (at TP8 only the census's row counts, ``rows``), unless
+        the build refused, or the forward is captured before the first eager armed forward
+        built the transports (every rank captures the same graphs, so every rank answers
+        alike).
         """
-        if not MIN_ROWS <= rows <= MAX_ROWS or self._refused is not None:
+        if not MIN_ROWS <= rows <= self.max_rows or self._refused is not None:
+            return False
+        if self.rows is not None and rows not in self.rows:
             return False
         if not self._built and (
             torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling()
         ):
             logger.warning_once(
-                "[musespark_open] projection_publish: a decode forward of 33..448 rows was captured "
+                f"[musespark_open] projection_publish: a decode forward of {rows} rows was captured "
                 "before an eager one built the transports; it runs the built-in projections",
                 key="musespark_open.projection_publish.unbuilt",
             )
@@ -245,7 +300,10 @@ class PublishedProjections:
         unpool_layers: List[int] = []
         for index, layer in enumerate(layers):
             moe = layer.feed_forward
-            if isinstance(moe, MuseSparkOpenTepGatherMoE) and _pool_args(moe) is not None:
+            if (
+                isinstance(moe, MuseSparkOpenTepGatherMoE)
+                and _pool_args(moe, self.max_rows) is not None
+            ):
                 pool_layers.append(index)
             if index + 1 < len(layers) and isinstance(layer.add_ffn, MuseSparkOpenTepGatedResidual):
                 gain = (
@@ -267,21 +325,21 @@ class PublishedProjections:
             )
         else:
             reason = _publish.producer_refusal(
-                torch.device("cuda", torch.cuda.current_device()), self.mapping.tp_size
+                torch.device("cuda", torch.cuda.current_device()), self.tp_size
             )
         reason = _tp_agreement.agreed_refusal(self.mapping, reason)
         if reason is None:
             try:
                 self.pool = _publish.PublishTransport(
                     self.mapping,
-                    _publish.local_columns(_publish.POOL_HIDDEN, self.mapping.tp_size),
-                    MAX_ROWS,
+                    _publish.local_columns(_publish.POOL_HIDDEN, self.tp_size),
+                    self.max_rows,
                     comm=self._comm,
                 )
                 self.unpool = _publish.PublishTransport(
                     self.mapping,
-                    _publish.local_columns(_publish.UNPOOL_HIDDEN, self.mapping.tp_size),
-                    MAX_ROWS,
+                    _publish.local_columns(_publish.UNPOOL_HIDDEN, self.tp_size),
+                    self.max_rows,
                     comm=self._comm,
                 )
             except RuntimeError as error:
@@ -292,8 +350,8 @@ class PublishedProjections:
         if reason is not None:
             self._refused = reason
             logger.warning(
-                f"[musespark_open] projection_publish: not armed ({reason}); 33..448-row decode "
-                "steps run the built-in projections"
+                f"[musespark_open] projection_publish: not armed at TP{self.tp_size} ({reason}); "
+                f"decode steps of {describe_rows(self.tp_size)} run the built-in projections"
             )
             return
         for index, buffer in zip(pool_layers, _publish.buffer_sequence(len(pool_layers))):
@@ -306,8 +364,9 @@ class PublishedProjections:
         self.pool.start_guard_watch("pool")
         self.unpool.start_guard_watch("unpool")
         logger.info(
-            f"[musespark_open] projection_publish: decode steps of {MIN_ROWS}..{MAX_ROWS} rows publish "
-            f"the pool slice from {len(pool_layers)} layers and the unpool slice from "
+            f"[musespark_open] projection_publish at TP{self.tp_size}: decode steps of "
+            f"{describe_rows(self.tp_size)} publish the pool slice ({self.pool.columns} columns) "
+            f"from {len(pool_layers)} layers and the unpool slice ({self.unpool.columns} columns) from "
             f"{len(unpool_layers)} layers into multicast transports "
             f"({(self.pool.nbytes + self.unpool.nbytes) / 2**20:.1f} MiB per rank, "
             f"{(self.pool.allocated + self.unpool.allocated) / 2**20:.1f} MiB of device memory)"
@@ -352,7 +411,13 @@ class PublishedProjections:
         weight = module.weight[begin : begin + columns]
         if site == "pool" and getattr(_publish, "TEP8_POOL_PROGRAMMATIC", False):
             self._programmatic_pool_fork(moe, hidden_states, weight, slot)
-        _publish.publish_projection(hidden_states, weight, slot)
+        # ``batch_splitk`` (dense_gemms, tep8_batch_splitk): its kernel stores
+        # each element of the slot once, after its reduction, as the cuBLAS producer does; every
+        # rank takes the same branch (the switch and the plan's table are the same on every rank).
+        dispatcher = module.__dict__.get("_low_m_dispatcher")
+        batch = getattr(dispatcher, "batch_splitk_apply", None)
+        if batch is None or batch(hidden_states, weight, None, out=slot) is None:
+            _publish.publish_projection(hidden_states, weight, slot)
         self._unconsumed += 1
         self._report(site, rows)
         return slot
@@ -395,7 +460,7 @@ class PublishedProjections:
         buffer = getattr(moe, "_published_pool_buffer", None)
         if buffer is None or not self.pool.is_slot(pooled, buffer, self._rows):
             return None
-        args = _pool_args(moe)
+        args = _pool_args(moe, self.max_rows)
         if args is None:
             raise RuntimeError(
                 f"[musespark_open] projection_publish: layer {moe.layer_idx}'s pool slice was "
@@ -457,17 +522,13 @@ def check(model, layer_kwargs: dict) -> None:
     """Whether ``install`` may run on ``model``; changes nothing.
 
     Raises:
-        ValueError: if the model is not TP4 or TP8 (two trays, with the TP8 census's
-            producer), the kernels cannot be built here, or the
-            projection gathers did not fuse both sites (this path rides their classes).
+        ValueError: if the model is not TP4 or TP8 (``MAX_ROWS_BY_TP``), the kernels cannot be
+            built here, or the projection gathers did not fuse both sites (this path rides
+            their classes).
     """
     layers = list(model.layers)
     mapping = layers[0].mapping
-    if mapping.tp_size not in _publish.WORLDS:
-        raise ValueError(
-            f"[musespark_open] projection_publish serves TP{'/TP'.join(map(str, _publish.WORLDS))}, "
-            f"got TP{mapping.tp_size}"
-        )
+    max_rows_for(mapping.tp_size)
     if not (_pool.available() and _publish.available()):
         raise ValueError(
             "[musespark_open] projection_publish needs CuTe DSL, flashinfer's RMSNormFP4QuantKernel "
@@ -516,8 +577,8 @@ def install(model) -> PublishedProjections:
             "preparation streams record their fork for a programmatic pool GEMM edge"
         )
     logger.info(
-        f"[musespark_open] projection_publish: decode steps of {MIN_ROWS}..{MAX_ROWS} rows in "
-        f"{len(layers)} layers will publish the pool / unpool slices from their GEMMs (transports "
-        "built at the first armed forward)"
+        f"[musespark_open] projection_publish at TP{published.tp_size}: decode steps of "
+        f"{describe_rows(published.tp_size)} in {len(layers)} layers will publish the pool / unpool "
+        "slices from their GEMMs (transports built at the first armed forward)"
     )
     return published

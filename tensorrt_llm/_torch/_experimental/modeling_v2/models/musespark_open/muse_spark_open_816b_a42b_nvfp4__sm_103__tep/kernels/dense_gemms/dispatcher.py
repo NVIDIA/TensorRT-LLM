@@ -16,7 +16,9 @@ yields a ``DenseGemmDispatcher`` and keeps whatever the engine assigns to it as
 that dispatcher's fallback. A call that fits -- BF16, no bias, at most 8 rows,
 the site's shape -- runs ``dense_gemm`` with the kernel this fast path names for
 the site and row count, the same on every rank; any other call goes to the built-in dispatcher
-unchanged. A fast path may also give the plan a table for 9..32 rows
+unchanged. ``wide_dense_gemms`` gives the sites its table names (``WIDE_KERNELS_BY_SM_TP``:
+QKV at tep8) a kernel for the 9..32-row calls as well, on every call of those rows. A
+fast path may also give the plan a table for 9..32 rows
 (``DenseGemmPlan.set_wide_kernels``, ``wide_projection_gathers``): while it arms
 the plan (``wide_armed``, one decode forward), a call of those rows at a site the
 table names runs that table's kernel. Nothing else in the layer changes, so the other fast paths
@@ -27,6 +29,26 @@ Above 32 rows the built-in ``Linear`` never asks a low-M dispatcher, so a fast p
 that acts on larger decode steps arms the plan instead (``DenseGemmPlan.batch``, set
 for one decode forward by ``batch_dense_gemms``): while it is set, a re-classed
 projection's ``apply_linear`` hands the call to it with the built-in GEMM as a callable.
+With ``tep8_batch_splitk`` (``batch_splitk``, sm103 TEP8 only) and no such
+path armed, ``apply_linear`` runs a 33..160-row call of a site ``SM103_TP8_BATCH_KERNELS``
+names on ``ops/gemm/batch_splitk_gemm`` instead of the built-in cuBLAS call; the pooler and
+unpooler slices of those rows run it through ``projection_publish`` (``batch_splitk_apply``).
+
+With ``tep8_attn_block_splitk`` (sm103 TEP8 only) the
+attention block's two projections of a 9..32-row decode call run on ``ops/gemm/batch_splitk_gemm``
+(this target's copy of flashinfer's split-K kernel, launched with programmatic dependent launch)
+at the cells ``SM103_TP8_ATTN_BLOCK_KERNELS`` names: the attention output projection at split_k 1
+(one K slice, cuBLAS's summation order) instead of the built-in cuBLAS call, so its weight k-tiles
+are loaded into shared memory before its ``griddepcontrol.wait``, under the attention that
+launches it early (the sliding-window cluster block, the full layers' combine); and QKV at split_k
+4 (flashinfer's K slices and order) with a deeper ring where the copy's reduce-scatter mailbox
+leaves room. The forks and joins are the served ones.
+
+Bits: the o_proj cells reproduce the built-in cuBLAS call. **The QKV cells do not, wherever the
+served 9..32-row call is that same cuBLAS call** -- they sum K in four slices instead of one. They
+keep the served bits only where a wide table is armed at those rows with a split_k 4 cell, and on
+sm103 the path that arms one (``wide_projection_gathers``) is TEP4-only, so at TEP8 this lever
+changes the decoded text. Its lever is lossless-numeric for that reason, not bitwise.
 
 With ``dense_gemm_prefetch`` a projection that ran also forks a side stream that asks the L2 to
 fetch the next projection's weight (QKV -> the same layer's attention output ->
@@ -75,6 +97,8 @@ from ...ops.gemm.dense_gemm import (
     CUBLAS,
     DIRECT,
     MAX_ROWS,
+    O_PROJ_SHAPE,
+    QKV_SHAPE,
     SPLITK,
     WIDE_MAX_ROWS,
     dense_gemm,
@@ -129,6 +153,99 @@ TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "unpool": ((2, "direct:128,2"), (MAX_ROWS, CUBLAS)),
 }
 
+#: ``wide_dense_gemms`` on sm103 at tep8 (two trays): the QKV projection ``[2304, 8192]`` of the
+#: 9..32-row calls of a decode step of 2..4 requests, as ``(last row count, kernel)`` steps from 9
+#: rows. flashinfer's split-K with the ``split_k`` 4 of QKV's 8-row cell in ``DEFAULT_KERNELS`` --
+#: required, not preferred: ``install``'s split-K check refuses any other, and with it every row of a
+#: wide call gets the bits it gets in a one-request step. ``mma_m`` 64 gives 36 column tiles, 144
+#: CTAs in clusters of 4 (one wave, the grid of the cuBLAS split-K these calls ran); ``mma_n`` 16 /
+#: 32 holds the rows of two / three or four requests in one tile, at the deepest pipeline the shared
+#: memory takes at ``split_k`` 4 (10 / 8 stages; the owner CTA also holds its three peers' partials,
+#: which is why the tep4 sweeps' deepest split-K-4 pick is 10 at ``mma_n`` 16 where split-K 2 reaches
+#: 11). It replaces the built-in low-M dispatch's cache-miss pick, cuBLAS's split-K 4 plus its
+#: reduce kernel. Served here, QKV also forks the
+#: attention output projection's L2 prefetch (``dense_gemm_prefetch``) at these rows, as at 1..8;
+#: o_proj's dispatcher joins it before the built-in GEMM it keeps. The attention output projection
+#: is not named: its 8-row cell is cuBLAS, which no split-K cell reproduces bit for bit. Nor are the
+#: pooler and unpooler: above 8 rows the built-in tep8 model multiplies their whole replicated
+#: weights, a shape these sites do not take; ``wide_projection_gathers`` names their slices in its
+#: own TP8 table, armed per decode forward (``set_wide_kernels``), and leaves QKV to this one.
+#: Chosen from the shapes, not from a per-call sweep; ``install``'s split-K check refuses a cell
+#: that would change the bits.
+SM103_TP8_WIDE_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((16, "splitk:64,16,4,10"), (WIDE_MAX_ROWS, "splitk:64,32,4,8")),
+}
+
+#: The ``wide_dense_gemms`` table of each ``(compute capability, TP size)`` it is measured for.
+WIDE_KERNELS_BY_SM_TP: Mapping[
+    Tuple[Tuple[int, int], int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {
+    ((10, 3), 8): SM103_TP8_WIDE_KERNELS,
+}
+
+#: The sites whose wide cells are measured on the rank's slices (``sharded_projections``).
+_SLICE_SITES = frozenset({"pool", "unpool"})
+
+
+def wide_kernels(table: Mapping[str, Tuple[Tuple[int, str], ...]]) -> Dict[str, Tuple[str, ...]]:
+    """The kernel of each site of a ``wide_dense_gemms`` table (``WIDE_KERNELS_BY_SM_TP``) for rows
+    9..32 (index ``rows - 9``)."""
+    out = {}
+    for site, steps in table.items():
+        kernels, first = [], MAX_ROWS + 1
+        for last, kernel in steps:
+            kernels += [kernel] * (last - first + 1)
+            first = last + 1
+        assert len(kernels) == WIDE_MAX_ROWS - MAX_ROWS, steps
+        out[site] = tuple(kernels)
+    return out
+
+
+def wide_kernel_table(
+    capability: Tuple[int, int],
+    tp_size: int,
+    sharded: bool,
+    kernels: Mapping[str, Tuple[str, ...]],
+) -> Dict[str, Tuple[str, ...]]:
+    """``wide_dense_gemms``' kernel per row count 9..32 of each site its table names on
+    ``capability`` at ``tp_size`` (``WIDE_KERNELS_BY_SM_TP``), checked against ``kernels``, the
+    plan's 1..8-row table.
+
+    Every wide cell must be flashinfer's split-K with the ``split_k`` of its site's 8-row cell:
+    split-K tactics of one ``split_k`` sum the same K slices in the same order, so every row of a
+    wide call gets the bits that row gets in a one-request step. Reads only the tables.
+
+    Raises:
+        ValueError: if ``WIDE_KERNELS_BY_SM_TP`` has no table for ``(capability, tp_size)``; if the
+            table names the pooler or unpooler (cells measured on the rank's slices) and the
+            projections are not ``sharded``; or if a wide cell does not sum the K slices of its
+            site's 8-row cell.
+    """
+    key = (tuple(capability), int(tp_size))
+    steps = WIDE_KERNELS_BY_SM_TP.get(key)
+    if steps is None or (not sharded and _SLICE_SITES & set(steps)):
+        measured = ", ".join(
+            f"SM {sm} at TP{tp}"
+            + (" with the sharded pooler and unpooler" if _SLICE_SITES & set(cells) else "")
+            for (sm, tp), cells in sorted(WIDE_KERNELS_BY_SM_TP.items())
+        )
+        raise ValueError(
+            f"[musespark_open] wide_dense_gemms is measured for {measured}; got SM {key[0]} at "
+            f"TP{key[1]}, {'sharded' if sharded else 'replicated'} projections"
+        )
+    table = wide_kernels(steps)
+    for role, wide_cells in table.items():
+        family, fields = parse_kernel(kernels[role][MAX_ROWS - 1])
+        for kernel in wide_cells:
+            wide_family, wide_fields = parse_kernel(kernel)
+            if family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]:
+                raise ValueError(
+                    f"[musespark_open] wide_dense_gemms: {role} kernel {kernel} does not sum "
+                    f"the K slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"
+                )
+    return table
+
+
 #: The measured table of each ``(compute capability, TP size)``, with the pooler and
 #: unpooler on the rank's slices (``kernel_steps`` swaps in the replicated tep4 cells).
 KERNELS_BY_SM_TP: Mapping[
@@ -144,6 +261,245 @@ TP4_REPLICATED_PROJECTION_KERNELS_BY_SM: Mapping[
 ] = {
     (10, 3): TP4_REPLICATED_PROJECTION_KERNELS,
 }
+
+
+#: ``batch_splitk``: the switch (read once, at ``install``). Off by default; on sm103 at TP8 with
+#: the sharded pooler and unpooler, ``1`` runs the 33..160-row decode calls (5..20 requests at
+#: K = 7) of the sites ``SM103_TP8_BATCH_KERNELS`` names on ``ops/gemm/batch_splitk_gemm`` (a
+#: cluster split-K kernel whose kernel-N tile holds up to 256 rows, reducing in DSMEM) instead
+#: of the built-in cuBLAS call (a split-K ``nvjet`` kernel plus ``cublasLt::splitKreduce`` for
+#: most of these shapes and rows). Anywhere else it changes nothing but a warning.
+#: The row band of ``batch_splitk``: above the 9..32-row wide band, up to the 20-request step.
+BATCH_MIN_ROWS = WIDE_MAX_ROWS + 1
+BATCH_MAX_ROWS = 160
+#: ``tep8_batch_splitk``: whether ``install`` builds that table. Off keeps the built-in calls.
+_BATCH_SPLITK = False
+
+
+def configure(*, batch_splitk: bool = False, attn_block_splitk: bool = False) -> None:
+    """Set whether ``install`` arms the batched split-K tables.
+
+    ``lever_settings.apply`` sets them from the model's plan before any install; the defaults
+    keep the built-in cuBLAS calls above the wide band and the served calls inside it.
+
+    Args:
+        batch_splitk: the ``tep8_batch_splitk`` lever (``_BATCH_SPLITK``).
+        attn_block_splitk: the ``tep8_attn_block_splitk`` lever (``_ATTN_BLOCK_SPLITK``).
+    """
+    global _BATCH_SPLITK, _ATTN_BLOCK_SPLITK
+    _BATCH_SPLITK = bool(batch_splitk)
+    _ATTN_BLOCK_SPLITK = bool(attn_block_splitk)
+
+
+#: ``batch_splitk`` on sm103 at TP8 (per-rank QKV ``[2304, 8192]``, pooler slice ``[512, 8192]``,
+#: unpooler slice ``[1024, 4096]``), as ``(last row count, kernel)`` steps from 33 rows; rows past
+#: a site's last step keep the built-in call. ``bsplitk:<mma_m>,<mma_n>,<split_k>,<stages>``:
+#: ``mma_n`` public rows per CTA (a call takes ``ceil(rows / mma_n)`` row tiles). Every cell is
+#: split_k 4, the split_k of each site's 8-row cell in ``DEFAULT_KERNELS`` and of the 9..32-row
+#: kernels: K is summed in the same four slices in the same order, so every row gets the bits it
+#: gets in a one-request step (``install`` checks the split_k). Chosen in 62-layer chains of cold
+#: weights against the served cuBLAS call on one GB300 (microbench ``mb-h58-bsk-2``, each cell
+#: the fastest split_k-4 tactic launched without PDL; checked through the overlay in
+#: ``mb-h58-bsk-verify``): QKV one row tile (144 CTAs, the most clusters of 4 that fit) up to 128
+#: rows, -0.1..+2.2 us against cuBLAS without PDL and +1.1..+3.4 us with it (from 136 rows
+#: cuBLAS's two-CTA tiles tie or win); the pooler slice four row tiles (128 CTAs) and the
+#: unpooler slice two (128 CTAs), +0.2..+2.6 us without PDL at every row count. The attention
+#: output projection is not named: its split_k 1 cells (cuBLAS's bits) are slower than cuBLAS
+#: without PDL at every row count.
+SM103_TP8_BATCH_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": (
+        (40, "bsplitk:64,40,4,8"),
+        (48, "bsplitk:64,48,4,7"),
+        (56, "bsplitk:64,56,4,7"),
+        (64, "bsplitk:64,64,4,6"),
+        (72, "bsplitk:64,72,4,6"),
+        (80, "bsplitk:64,80,4,5"),
+        (88, "bsplitk:64,88,4,5"),
+        (96, "bsplitk:64,96,4,5"),
+        (104, "bsplitk:64,104,4,4"),
+        (112, "bsplitk:64,112,4,4"),
+        (120, "bsplitk:64,120,4,4"),
+        (128, "bsplitk:64,128,4,4"),
+    ),
+    "pool": (
+        (48, "bsplitk:64,24,4,10"),
+        (64, "bsplitk:64,16,4,11"),
+        (96, "bsplitk:64,24,4,10"),
+        (128, "bsplitk:64,32,4,9"),
+        (160, "bsplitk:64,40,4,8"),
+    ),
+    "unpool": (
+        (48, "bsplitk:64,24,4,8"),
+        (64, "bsplitk:64,32,4,8"),
+        (80, "bsplitk:64,40,4,8"),
+        (96, "bsplitk:64,48,4,7"),
+        (112, "bsplitk:64,56,4,7"),
+        (128, "bsplitk:64,64,4,6"),
+        (144, "bsplitk:64,72,4,6"),
+        (160, "bsplitk:64,80,4,5"),
+    ),
+}
+
+#: The ``batch_splitk`` table of each ``(compute capability, TP size)`` it is measured for.
+BATCH_KERNELS_BY_SM_TP: Mapping[
+    Tuple[Tuple[int, int], int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {((10, 3), 8): SM103_TP8_BATCH_KERNELS}
+
+
+#: ``tep8_attn_block_splitk``, pushed here by ``lever_settings.apply`` (default off). On sm103 at
+#: TP8 with the sharded pooler and unpooler it runs the 9..32-row calls of the sites and rows
+#: ``SM103_TP8_ATTN_BLOCK_KERNELS`` names on ``ops/gemm/batch_splitk_gemm``; anywhere else it
+#: changes nothing but a warning.
+_ATTN_BLOCK_SPLITK = False
+
+#: ``attn_block_splitk`` on sm103 at TP8, as ``(last row count, kernel)`` steps from 9 rows (``None``:
+#: the served call at those rows). ``bsplitk:<mma_m>,<mma_n>,<split_k>,<stages>`` with one row tile
+#: per call (``mma_n`` covers the rows), so each weight byte is streamed once.
+#:
+#: * o_proj ``[8192, 1024]``: split_k 1, the bits of the built-in cuBLAS call (which does not split
+#:   K = 1024 at these rows); ``mma_m`` 64, 128 CTAs. Launched with PDL right behind the attention's
+#:   early trigger, it loads its weight k-tiles before its wait.
+#: * QKV ``[2304, 8192]``: split_k 4, the served cell's K slices and order (the reduce-scatter
+#:   copy is bitwise with flashinfer's kernel at equal split_k), one more stage than flashinfer's
+#:   cell and ``mma_n`` 24 at 17..24 rows; 9..16 rows keep flashinfer's cell (the copy was slower there).
+#:
+#: Measured on the E-MK chain of kernel stack 3 (62 layers, 8 ranks, two tray pairs; mb-emk-h217-1..4).
+SM103_TP8_ATTN_BLOCK_KERNELS: Mapping[str, Tuple[Tuple[int, Optional[str]], ...]] = {
+    "qkv": ((16, None), (24, "bsplitk:64,24,4,10"), (WIDE_MAX_ROWS, "bsplitk:64,32,4,9")),
+    "o_proj": (
+        (16, "bsplitk:64,16,1,8"),
+        (24, "bsplitk:64,24,1,8"),
+        (WIDE_MAX_ROWS, "bsplitk:64,32,1,8"),
+    ),
+}
+
+#: The ``attn_block_splitk`` table of each ``(compute capability, TP size)`` it is measured for.
+ATTN_BLOCK_KERNELS_BY_SM_TP: Mapping[
+    Tuple[Tuple[int, int], int], Mapping[str, Tuple[Tuple[int, Optional[str]], ...]]
+] = {((10, 3), 8): SM103_TP8_ATTN_BLOCK_KERNELS}
+
+#: The ``split_k`` an ``attn_block_splitk`` cell of each site must have: QKV's 8-row cell's (flashinfer
+#: split-K 4), and 1 for o_proj, whose 8-row cell is cuBLAS, which sums K = 1024 in one slice.
+_ATTN_BLOCK_SPLIT_K = {"qkv": 4, "o_proj": 1}
+
+
+def attn_block_kernels(
+    table: Mapping[str, Tuple[Tuple[int, Optional[str]], ...]] = SM103_TP8_ATTN_BLOCK_KERNELS,
+) -> Dict[str, Tuple[Optional[str], ...]]:
+    """The ``attn_block_splitk`` kernel of each site per row count 9..32 (index ``rows - WIDE_MIN_ROWS``),
+    ``None`` where the site keeps its served call."""
+    out = {}
+    for site, steps in table.items():
+        kernels: List[Optional[str]] = []
+        first = WIDE_MIN_ROWS
+        for last, kernel in steps:
+            assert first <= last <= WIDE_MAX_ROWS, steps
+            kernels += [kernel] * (last - first + 1)
+            first = last + 1
+        assert first == WIDE_MAX_ROWS + 1, steps
+        out[site] = tuple(kernels)
+    return out
+
+
+def attn_block_kernel_table(
+    capability: Tuple[int, int], tp_size: int, sharded: bool
+) -> Dict[str, Tuple[Optional[str], ...]]:
+    """``attn_block_splitk``'s kernel per row count 9..32 of each site its table names on ``capability``
+    at ``tp_size``, each cell checked: its ``split_k`` (``_ATTN_BLOCK_SPLIT_K``), one row tile at every
+    row count it serves, and the site's shape (``batch_splitk_gemm.validate``). Reads only the tables.
+
+    Raises:
+        ValueError: if ``ATTN_BLOCK_KERNELS_BY_SM_TP`` has no table for ``(capability, tp_size)``, the
+            projections are not ``sharded``, or a cell fails a check.
+    """
+    from ...ops.gemm import batch_splitk_gemm as _bsk
+
+    key = (tuple(capability), int(tp_size))
+    steps = ATTN_BLOCK_KERNELS_BY_SM_TP.get(key)
+    if steps is None or not sharded:
+        raise ValueError(
+            f"[musespark_open] tep8_attn_block_splitk is measured for SM {(10, 3)} at TP8 with the "
+            f"sharded "
+            f"pooler and unpooler; got SM {key[0]} at TP{key[1]}, "
+            f"{'sharded' if sharded else 'replicated'} projections"
+        )
+    shapes = {"qkv": QKV_SHAPE, "o_proj": O_PROJ_SHAPE}
+    table = attn_block_kernels(steps)
+    for role, cells in table.items():
+        k, n = shapes[role]
+        for rows, kernel in enumerate(cells, start=WIDE_MIN_ROWS):
+            if kernel is None:
+                continue
+            tactic = _bsk.parse(kernel)
+            if tactic.split_k != _ATTN_BLOCK_SPLIT_K[role]:
+                raise ValueError(
+                    f"[musespark_open] tep8_attn_block_splitk: {role} kernel {kernel} has split_k "
+                    f"{tactic.split_k}; the site's bits need {_ATTN_BLOCK_SPLIT_K[role]}"
+                )
+            if rows > tactic.mma_n:
+                raise ValueError(
+                    f"[musespark_open] tep8_attn_block_splitk: {role} kernel {kernel} takes {rows} rows in "
+                    f"more than one row tile"
+                )
+            _bsk.validate(tactic, rows, n, k)
+    return table
+
+
+def batch_kernels(
+    table: Mapping[str, Tuple[Tuple[int, str], ...]] = SM103_TP8_BATCH_KERNELS,
+) -> Dict[str, Tuple[Optional[str], ...]]:
+    """The kernel of each site of a ``batch_splitk`` table per row count ``BATCH_MIN_ROWS..
+    BATCH_MAX_ROWS`` (index ``rows - BATCH_MIN_ROWS``); ``None`` past the site's last step."""
+    out = {}
+    for site, steps in table.items():
+        kernels: List[Optional[str]] = []
+        first = BATCH_MIN_ROWS
+        for last, kernel in steps:
+            assert first <= last <= BATCH_MAX_ROWS, steps
+            kernels += [kernel] * (last - first + 1)
+            first = last + 1
+        kernels += [None] * (BATCH_MAX_ROWS - first + 1)
+        out[site] = tuple(kernels)
+    return out
+
+
+def batch_kernel_table(
+    capability: Tuple[int, int],
+    tp_size: int,
+    sharded: bool,
+    kernels: Mapping[str, Tuple[str, ...]],
+) -> Dict[str, Tuple[Optional[str], ...]]:
+    """``batch_splitk``'s kernel per row count 33..160 of each site its table names on ``capability``
+    at ``tp_size``, checked against ``kernels`` (the plan's 1..8-row table): every cell must be a
+    split-K tactic with the ``split_k`` of its site's 8-row cell. Reads only the tables.
+
+    Raises:
+        ValueError: if ``BATCH_KERNELS_BY_SM_TP`` has no table for ``(capability, tp_size)``, the
+            projections are not ``sharded``, or a cell does not sum the K slices of its site's
+            8-row cell.
+    """
+    from ...ops.gemm import batch_splitk_gemm as _bsk
+
+    key = (tuple(capability), int(tp_size))
+    steps = BATCH_KERNELS_BY_SM_TP.get(key)
+    if steps is None or not sharded:
+        raise ValueError(
+            f"[musespark_open] batch_splitk is measured for SM {(10, 3)} at TP8 with the sharded "
+            f"pooler and unpooler; got SM {key[0]} at TP{key[1]}, "
+            f"{'sharded' if sharded else 'replicated'} projections"
+        )
+    table = batch_kernels(steps)
+    for role, cells in table.items():
+        family, fields = parse_kernel(kernels[role][MAX_ROWS - 1])
+        for kernel in cells:
+            if kernel is None:
+                continue
+            if family != SPLITK or _bsk.parse(kernel).split_k != fields[2]:
+                raise ValueError(
+                    f"[musespark_open] batch_splitk: {role} kernel {kernel} does not sum the K "
+                    f"slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"
+                )
+    return table
 
 
 def _by_rows(steps: Tuple[Tuple[int, str], ...]) -> List[str]:
@@ -365,8 +721,17 @@ class DenseGemmPlan:
         prefetch: bool,
         enable_pdl: bool,
         capability: Optional[Tuple[int, int]] = None,
+        wide: Optional[Mapping[str, Tuple[str, ...]]] = None,
+        attn_block: Optional[Mapping[str, Tuple[Optional[str], ...]]] = None,
     ) -> None:
         self.kernels = dict(kernels)
+        #: ``wide_dense_gemms``: the kernel of a site's 9..32-row calls (``wide[site][rows - 9]``);
+        #: a site it does not name keeps the built-in dispatch at those rows.
+        self.wide = dict(wide or {})
+        #: ``attn_block_splitk``: the batch split-K cell of a site's 9..32-row calls
+        #: (``attn_block[site][rows - WIDE_MIN_ROWS]``, ``None`` where the served call runs).
+        #: Empty when the lever is off, which is what ``attn_block_kernel_for`` reads.
+        self.attn_block = dict(attn_block or {})
         #: The 9..32-row table (``set_wide_kernels``) and whether the current forward arms it.
         self.wide_kernels: Dict[str, Tuple[str, ...]] = {}
         self.wide_armed = False
@@ -374,6 +739,10 @@ class DenseGemmPlan:
         #: ``BatchDenseGemms``), whose ``projection`` every re-classed projection's
         #: ``apply_linear`` calls; ``None`` otherwise.
         self.batch = None
+        #: ``batch_splitk``: the kernel of a site's 33..160-row calls
+        #: (``batch_splitk[site][rows - BATCH_MIN_ROWS]``, ``None`` past its last step); empty
+        #: when off (``set_batch_splitk_kernels``).
+        self.batch_splitk: Dict[str, Tuple[Optional[str], ...]] = {}
         self.prefetch = prefetch
         self.enable_pdl = enable_pdl
         #: The compute capability of the device the plan serves (``install`` reads it once);
@@ -395,12 +764,16 @@ class DenseGemmPlan:
 
     def kernel_for(self, role: str, rows: int) -> Optional[str]:
         """The kernel of a ``rows``-row call at site ``role``, or None where the plan has none
-        (the built-in dispatch): ``kernels`` at 1..8 rows; at 9..32 rows ``wide_kernels``
-        while ``wide_armed`` (``wide_projection_gathers``)."""
+        (the built-in dispatch): ``kernels`` at 1..8 rows; at 9..32 rows the ``wide`` table
+        (``wide_dense_gemms``) for the sites it names, else ``wide_kernels`` while ``wide_armed``
+        (``wide_projection_gathers``)."""
         if 1 <= rows <= MAX_ROWS:
             return self.kernels[role][rows - 1]
         if not WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
             return None
+        wide = self.wide.get(role)
+        if wide is not None:
+            return wide[rows - WIDE_MIN_ROWS]
         if self.wide_armed:
             wide = self.wide_kernels.get(role)
             return None if wide is None else wide[rows - WIDE_MIN_ROWS]
@@ -409,6 +782,35 @@ class DenseGemmPlan:
     def kernel(self, role: str, rows: int) -> Optional[str]:
         """``kernel_for``: the kernel of a ``role`` call of ``rows`` rows, or ``None``."""
         return self.kernel_for(role, rows)
+
+    def attn_block_kernel_for(self, role: str, rows: int) -> Optional[str]:
+        """``attn_block_splitk``'s cell of a 9..32-row ``role`` call, or ``None`` (the served call)."""
+        cells = self.attn_block.get(role)
+        if cells is None or not WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
+            return None
+        return cells[rows - WIDE_MIN_ROWS]
+
+    def batch_kernel_for(self, role: str, rows: int) -> Optional[str]:
+        """``batch_splitk``'s kernel of a 33..160-row ``role`` call, or ``None`` (the built-in call)."""
+        cells = self.batch_splitk.get(role)
+        if cells is None or not BATCH_MIN_ROWS <= rows <= BATCH_MAX_ROWS:
+            return None
+        return cells[rows - BATCH_MIN_ROWS]
+
+    def set_batch_splitk_kernels(self, kernels: Mapping[str, Tuple[Optional[str], ...]]) -> None:
+        """Give sites a ``batch_splitk`` kernel per row count 33..160 (``batch_kernel_table``).
+
+        Raises:
+            ValueError: for an unknown site or a table that does not cover 33..160 rows.
+        """
+        rows = BATCH_MAX_ROWS - BATCH_MIN_ROWS + 1
+        for role, table in kernels.items():
+            if role not in SITES or len(table) != rows:
+                raise ValueError(
+                    f"[musespark_open] dense_gemms: a batch_splitk table names {rows} kernels per "
+                    f"site of {SITES}, got {role!r} with {len(table)}"
+                )
+        self.batch_splitk = {role: tuple(table) for role, table in kernels.items()}
 
     def set_wide_kernels(self, kernels: Mapping[str, Tuple[str, ...]]) -> None:
         """Give sites a kernel per row count 9..32 (``kernels[site][rows - WIDE_MIN_ROWS]``).
@@ -647,6 +1049,10 @@ class DenseGemmDispatcher:
             return self._apply_substitute(input_tensor, weight)
         if self.publish is not None:
             return self._apply_publish(module, input_tensor, weight, bias, force_active)
+        if plan.attn_block:
+            out = self._attn_block_apply(input_tensor, weight, bias)
+            if out is not None:
+                return out
         if not self.fits(input_tensor, weight, bias):
             if input_tensor.dim() >= 1 and self.is_decode_call(input_tensor):
                 # The built-in dispatch picks its kernel per rank: say so once.
@@ -686,6 +1092,106 @@ class DenseGemmDispatcher:
         if _keeps_prefetch(self.site, rows):
             self.site.plan.fork_prefetch(self.site.next_weight())
         return product.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
+    def _attn_block_apply(
+        self, input_tensor: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """``attn_block_splitk``: a 9..32-row QKV or o_proj call on the plan's batch split-K cell for its
+        rows, or ``None`` (the served call): BF16, no bias, the site's shape, contiguous, 32-byte aligned,
+        not compiled or differentiated. Joins happened in ``apply``. Forks what the served call forks:
+        QKV (``fits``' path) the next weight's prefetch; o_proj (the built-in call's path) nothing."""
+        plan = self.site.plan
+        if bias is not None or torch.is_grad_enabled() or torch.compiler.is_compiling():
+            return None
+        if not (
+            input_tensor.is_cuda
+            and input_tensor.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and weight.dim() == 2
+            and input_tensor.dim() >= 1
+            and (int(weight.shape[1]), int(weight.shape[0])) == self.site.shape
+            and int(input_tensor.shape[-1]) == int(weight.shape[1])
+            and input_tensor.is_contiguous()
+            and weight.is_contiguous()
+            and input_tensor.data_ptr() % 32 == 0
+            and weight.data_ptr() % 32 == 0
+        ):
+            return None
+        k = int(weight.shape[1])
+        rows = input_tensor.numel() // k
+        kernel = plan.attn_block_kernel_for(self.site.role, rows)
+        if kernel is None:
+            return None
+        from ...ops.gemm import batch_splitk_gemm as _bsk
+
+        x = input_tensor.view(-1, k)
+        out = torch.empty((rows, int(weight.shape[0])), dtype=x.dtype, device=x.device)
+        _bsk.run(x, weight, out, _bsk.parse(kernel), plan.enable_pdl)
+        if (
+            self.site.role != "o_proj"
+            and plan.prefetch
+            and self.site.next_weight is not None
+            and rows not in self.site.skip_prefetch_rows
+        ):
+            plan.fork_prefetch(self.site.next_weight())
+        logger.info_once(
+            f"[musespark_open] tep8_attn_block_splitk: a {rows}-row {self.site.role} call (layer "
+            f"{self.site.layer_idx}) ran {kernel}",
+            key=f"musespark_open.attn_block_splitk.{self.site.role}.{rows}",
+        )
+        return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
+    def batch_splitk_apply(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        out: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """A 33..160-row call on the plan's ``batch_splitk`` kernel for its rows, or ``None`` (the caller
+        runs the built-in call): BF16, no bias, the site's shape, contiguous, 32-byte aligned, not
+        compiled or differentiated. ``out`` (``projection_publish``'s transport slot) receives the
+        product; the kernel stores each element of it once, after the reduction. Joins the plan's
+        forks the site's dispatcher would have joined before its GEMM."""
+        plan = self.site.plan
+        if not plan.batch_splitk or bias is not None:
+            return None
+        if torch.is_grad_enabled() or torch.compiler.is_compiling():
+            return None
+        if not (
+            input_tensor.is_cuda
+            and input_tensor.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and weight.dim() == 2
+            and input_tensor.dim() >= 1
+            and (int(weight.shape[1]), int(weight.shape[0])) == self.site.shape
+            and int(input_tensor.shape[-1]) == int(weight.shape[1])
+            and input_tensor.is_contiguous()
+            and weight.is_contiguous()
+            and input_tensor.data_ptr() % 32 == 0
+            and weight.data_ptr() % 32 == 0
+        ):
+            return None
+        k = int(weight.shape[1])
+        rows = input_tensor.numel() // k
+        kernel = plan.batch_kernel_for(self.site.role, rows)
+        if kernel is None:
+            return None
+        from ...ops.gemm import batch_splitk_gemm as _bsk
+
+        plan.join()
+        if plan.named_forks:
+            plan.join_role(self.site.role)
+        x = input_tensor.view(-1, k)
+        if out is None:
+            out = torch.empty((rows, int(weight.shape[0])), dtype=x.dtype, device=x.device)
+        _bsk.run(x, weight, out, _bsk.parse(kernel), plan.enable_pdl)
+        logger.info_once(
+            f"[musespark_open] batch_splitk: a {rows}-row {self.site.role} call (layer "
+            f"{self.site.layer_idx}) ran {kernel}",
+            key=f"musespark_open.batch_splitk.{self.site.role}",
+        )
+        return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
     def _apply_publish(
         self,
@@ -775,6 +1281,10 @@ class MuseSparkOpenTepDenseLinear(Linear):
         batch = dispatcher.site.plan.batch
         lora = getattr(self, "lora", None) is not None and bool(lora_params)
         if batch is None or lora:
+            if dispatcher.site.plan.batch_splitk and not lora and _builtin_is_cublas(self):
+                out = dispatcher.batch_splitk_apply(input, self.weight, bias)
+                if out is not None:
+                    return out
             return Linear.apply_linear(self, input, bias, lora_params, layer_idx)
         return batch.projection(
             dispatcher.site,
@@ -812,6 +1322,18 @@ class MuseSparkOpenTepDenseLinear(Linear):
         return linear
 
 
+def _builtin_is_cublas(linear: Linear) -> bool:
+    """Whether the built-in call of ``linear`` above 32 rows is ``F.linear`` on its BF16 weight
+    (``UnquantizedLinearMethod.apply``): no custom cuBLAS GEMM, no CuTe DSL BF16 GEMM."""
+    from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
+
+    return (
+        isinstance(getattr(linear, "quant_method", None), UnquantizedLinearMethod)
+        and not getattr(linear, "use_custom_cublas_mm", False)
+        and not getattr(linear, "use_cute_dsl_bf16_gemm", False)
+    )
+
+
 def _projection_weight(moe, linear: Linear, sharded: bool) -> Callable[[], torch.Tensor]:
     """The weight a pooler / unpooler GEMM is handed: the rank's row slice when sharded."""
     if not sharded:
@@ -835,17 +1357,20 @@ def install(
 
     ``kernels`` is the kernel of each site per row count; when None, the table of the
     device's compute capability (``device_capability``, read once here), the model's TP
-    size and its projection layout (``default_kernels``); ``wide`` is ignored. Every module is checked
-    before any is re-classed, so a refusal
-    leaves the model as it was. Only the weights' shapes are read, so this runs
-    on a model whose weights are still on the meta device.
+    size and its projection layout (``default_kernels``). ``wide`` (``wide_dense_gemms``, tep8's
+    QKV) adds the TP size's 9..32-row table (``wide_kernel_table``) for the sites it names.
+    Every module is checked before any is re-classed, so a refusal leaves the model as it was.
+    Only the weights' shapes are read, so this runs on a model whose weights are still on the
+    meta device.
 
     Raises:
         ValueError: if the low-M dispatch is off (``TRTLLM_LOW_M_GEMM_BACKEND``), so
             the built-in ``Linear`` never asks a dispatcher; if no ``kernels`` are given
             and the device and TP size have no table (``kernel_steps``); if ``prefetch`` is asked
             without the sharded projections (``sharded_projections``), whose
-            pooler GEMM would read the whole replicated weight; if a
+            pooler GEMM would read the whole replicated weight; if ``wide`` is asked where
+            ``wide_kernel_table`` refuses (no table for the device and TP size, slices
+            without the sharded projections, a cell off its 8-row ``split_k``); if a
             projection cannot be re-classed (see
             ``MuseSparkOpenTepDenseLinear.check``); or if a named kernel cannot
             serve its site's shape.
@@ -865,8 +1390,38 @@ def install(
             "(MUSESPARK_OPEN_SHARDED_PROJECTIONS=1); without them the pooler GEMM reads the "
             "whole replicated weight"
         )
-    plan = DenseGemmPlan(kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability)
+    wide_table = wide_kernel_table(capability, tp_size, sharded, kernels) if wide else {}
+    batch_table: Mapping[str, Tuple[Optional[str], ...]] = {}
+    if _BATCH_SPLITK:
+        if (tuple(capability), tp_size) in BATCH_KERNELS_BY_SM_TP and sharded:
+            batch_table = batch_kernel_table(capability, tp_size, sharded, kernels)
+        else:
+            logger.warning(
+                "[musespark_open] tep8_batch_splitk is measured for SM (10, 3) at "
+                f"TP8 with the sharded pooler and unpooler; SM {tuple(capability)} at TP{tp_size} "
+                f"({'sharded' if sharded else 'replicated'}) keeps the built-in calls"
+            )
+    attn_table: Mapping[str, Tuple[Optional[str], ...]] = {}
+    if _ATTN_BLOCK_SPLITK:
+        if (tuple(capability), tp_size) in ATTN_BLOCK_KERNELS_BY_SM_TP and sharded:
+            attn_table = attn_block_kernel_table(capability, tp_size, sharded)
+        else:
+            logger.warning(
+                "[musespark_open] tep8_attn_block_splitk has no table for SM "
+                f"{tuple(capability)} at TP{tp_size} "
+                f"({'sharded' if sharded else 'replicated'}); the served calls run"
+            )
+    plan = DenseGemmPlan(
+        kernels,
+        prefetch=prefetch,
+        enable_pdl=LAUNCH_PDL,
+        capability=capability,
+        wide=wide_table,
+        attn_block=attn_table,
+    )
     plan.tp_size = tp_size
+    if batch_table:
+        plan.set_batch_splitk_kernels(batch_table)
 
     layers = list(model.layers)
     planned = []
@@ -899,6 +1454,12 @@ def install(
                     raise ValueError(
                         f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
                     )
+            for rows, kernel in enumerate(wide_table.get(role, ()), start=MAX_ROWS + 1):
+                error = kernel_error(kernel, rows, *shape)
+                if error is not None:
+                    raise ValueError(
+                        f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
+                    )
             planned.append((index, role, modules[role], shape, weights))
 
     next_of = {"qkv": "o_proj", "o_proj": "pool"}
@@ -920,4 +1481,15 @@ def install(
         f"{MAX_ROWS} rows by {describe(kernels)}; "
         f"L2 prefetch of the next weight {'on' if prefetch else 'off'}"
     )
+    if wide_table:
+        table = WIDE_KERNELS_BY_SM_TP[(tuple(capability), tp_size)]
+        steps = "; ".join(
+            f"{site}=" + ", ".join(f"{k}@..{last}" for last, k in table[site]) for site in table
+        )
+        builtin = ", ".join(site for site in SITES if site not in table)
+        logger.info(
+            f"[musespark_open] wide_dense_gemms: calls of {MAX_ROWS + 1}..{WIDE_MAX_ROWS} rows by "
+            f"{steps}; each row gets the bits of its {MAX_ROWS}-row kernel"
+            + (f"; {builtin} keep the built-in dispatch at these rows" if builtin else "")
+        )
     return plan

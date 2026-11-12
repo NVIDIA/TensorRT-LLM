@@ -17,6 +17,7 @@ import hashlib
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -388,14 +389,28 @@ def _coalescing_group_kwargs(group: int) -> dict[str, int]:
     return {"coalescing_group": group}
 
 
+class _SwaBranchCell:
+    """Branch point of one request, set after its reuse match (see _SwaEndpointRetirer)."""
+
+    __slots__ = ("point",)
+
+    def __init__(self) -> None:
+        self.point: Optional[int] = None
+
+
 def _swa_endpoint_priority(
-    prompt_length: int, tokens_per_block: int, rewind_tokens: int
+    prompt_length: int,
+    tokens_per_block: int,
+    rewind_tokens: int,
+    branch: Optional[_SwaBranchCell] = None,
 ) -> Callable[[int, object], int]:
     """Assign page priorities around a fixed reusable prompt endpoint.
 
     ``prompt_length`` excludes the final prompt token that is recomputed.
     The callback applies to newly created pages; reused pages keep their priority.
-    Intermediate pages remain reusable until evicted.
+    Intermediate pages remain reusable until evicted. ``branch``, once its point
+    is set, also gives endpoint priority to the window ending where the request
+    left the reuse tree, so a sibling leaving at the same point reuses up to it.
     """
 
     def priority(ordinal: int, life_cycle: object) -> int:
@@ -409,7 +424,23 @@ def _swa_endpoint_priority(
             return 70
         return 0
 
-    return priority
+    if branch is None:
+        return priority
+
+    def priority_with_branch(ordinal: int, life_cycle: object) -> int:
+        value = priority(ordinal, life_cycle)
+        point = branch.point
+        # 0: a sliding-window page outside the prompt endpoint's range.
+        if value == 0 and point is not None:
+            block_start = ordinal * tokens_per_block
+            if (
+                block_start < point
+                and block_start + tokens_per_block > point - life_cycle.window_size
+            ):
+                return 70
+        return value
+
+    return priority_with_branch
 
 
 def _request_conversation_id(request: LlmRequest) -> Optional[str]:
@@ -493,6 +524,233 @@ class ConversationManager:
     def clear(self) -> None:
         """Clear state after reusable KV-cache blocks have been cleared."""
         self._conversation_states.clear()
+
+
+# Default 0 (off). N >= 1: under block_reuse_config.policy=all_reusable, keep each
+# conversation's newest N sliding-window endpoints and free older ones as turns commit.
+_SWA_ENDPOINT_RETIRE_ENV = "TRTLLM_KV_SWA_ENDPOINT_RETIRE"
+
+
+def _swa_endpoint_retire_turns() -> int:
+    """Endpoints kept per conversation under TRTLLM_KV_SWA_ENDPOINT_RETIRE; 0 is off."""
+    turns = int(os.environ.get(_SWA_ENDPOINT_RETIRE_ENV, "").strip() or 0)
+    if turns < 0:
+        raise ValueError(f"{_SWA_ENDPOINT_RETIRE_ENV} must be 0 (off) or a turn count >= 1")
+    return turns
+
+
+@dataclass(slots=True)
+class _SwaRetireState:
+    current_request_id: Optional[int] = None
+    # (committed endpoint, its drop plan), oldest first: the newest max_num_turns
+    # are kept; older ones wait until retiring them is safe (_SwaEndpointRetirer).
+    endpoint_plans: deque[Tuple[int, PlannedDropHandle]] = field(default_factory=deque)
+    # Whether a turn of this conversation committed an endpoint.
+    committed: bool = False
+    last_request_id: Optional[int] = None
+
+
+class _SwaEndpointRetirer(ConversationManager):
+    """Retire superseded sliding-window endpoints while every prefix stays reusable.
+
+    ``all_reusable`` commits every block, so shared prefixes (subagents, aux
+    chains) stay reusable, but each turn leaves its endpoint pages at endpoint
+    priority after the conversation moves on, where they compete with live
+    endpoints. This keeps the newest ``max_num_turns`` endpoint plans per
+    conversation (``per_conversation``'s drop plan: the windowed pages at the
+    committed endpoint; full attention is never planned) and applies the oldest
+    when a newer turn commits, so its unheld pages are freed at once.
+
+    A superseded plan is applied only once it lies outside every kept endpoint's
+    endpoint-priority range: the window plus ``swa_endpoint_rewind_tokens``
+    before it, as ``_swa_endpoint_priority`` assigns. A next turn that resumes
+    up to the rewind before an endpoint needs the window ending there, whose
+    leading blocks precede that endpoint's own plan; while the endpoints are
+    closer than the window plus the rewind, only the older plan covers those
+    blocks, and applying it would free them at once. Until then the plan waits.
+
+    Branch snapshots port Mamba's ``enable_branch_snapshot`` to SWA pools: a new
+    conversation whose lookup leaves the radix tree mid-path records the point;
+    the pages it creates in the window ending there get endpoint priority, and
+    if its own endpoint plan overlaps that window the plan is kept apart and
+    never retired by the conversation, so later siblings leaving the tree at
+    the same point still reuse up to it. ``all_reusable`` already commits that
+    window, so unlike Mamba no chunk boundary is needed there.
+    """
+
+    # Bounds for ids that never return (finished and recycled conversations);
+    # an evicted entry's handles apply their plans when released.
+    _MAX_CONVERSATIONS = 16384
+    _MAX_BRANCH_PLANS = 4096
+    # Waiting plans per conversation; past this the oldest is applied anyway.
+    _MAX_WAITING_PLANS = 32
+    _LOG_INTERVAL_S = 60.0
+
+    def __init__(
+        self,
+        max_num_turns: int,
+        windows: Sequence[int],
+        tokens_per_block: int,
+        rewind_tokens: int,
+    ) -> None:
+        super().__init__(max_num_turns)
+        self._conversation_states: OrderedDict[str, _SwaRetireState] = OrderedDict()
+        self._windows = sorted(set(windows))
+        self._max_window = self._windows[-1]
+        self._tokens_per_block = tokens_per_block
+        self._rewind_tokens = rewind_tokens
+        self._branch_points: Dict[int, int] = {}
+        self._branch_plans: OrderedDict[int, PlannedDropHandle] = OrderedDict()
+        self.counters: Dict[str, int] = defaultdict(int)
+        self._next_log = time.monotonic() + self._LOG_INTERVAL_S
+
+    def is_new_conversation(self, request: LlmRequest) -> bool:
+        """False only for a turn whose conversation already committed an endpoint."""
+        conversation_id = _request_conversation_id(request)
+        state = self._conversation_states.get(conversation_id) if conversation_id else None
+        return state is None or not state.committed
+
+    def record_branch_point(self, request_id: int, point: int) -> None:
+        self._branch_points[request_id] = point
+
+    def prepare_request(self, request: LlmRequest) -> None:
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        if conversation_id in self._conversation_states:
+            self._conversation_states.move_to_end(conversation_id)
+        else:
+            self._conversation_states[conversation_id] = _SwaRetireState()
+            while len(self._conversation_states) > self._MAX_CONVERSATIONS:
+                self._conversation_states.popitem(last=False)
+                self.counters["conversations_evicted"] += 1
+        super().prepare_request(request)
+
+    def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
+        request_id = request.py_request_id
+        branch_point = self._branch_points.pop(request_id, None)
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        # get(): an overlapping same-id request can outlive its owner's state.
+        state = self._conversation_states.get(conversation_id)
+        if state is None or state.current_request_id != request_id:
+            return
+        try:
+            drop_handle = kv_cache.plan_committed_block_drop()
+        except RuntimeError as error:
+            logger.warning(f"SWA endpoint retire: no drop plan for request {request_id}: {error}")
+            drop_handle = None
+        if drop_handle is None:
+            self.counters["plans_missing"] += 1
+        else:
+            endpoint = kv_cache.num_committed_tokens
+            state.committed = True
+            self.counters["endpoints_planned"] += 1
+            if (
+                branch_point is not None
+                and endpoint - branch_point < self._max_window + self._tokens_per_block
+            ):
+                self._branch_plans[request_id] = drop_handle
+                self.counters["branch_plans_kept"] += 1
+                while len(self._branch_plans) > self._MAX_BRANCH_PLANS:
+                    self._branch_plans.popitem(last=False)[1].drop()
+                    self.counters["branch_plans_retired"] += 1
+            else:
+                state.endpoint_plans.append((endpoint, drop_handle))
+                # A recomputed (preempted) request commits again past its prompt;
+                # its prompt endpoint may still be what the next turn matches, so
+                # both retire at the next turn.
+                if state.last_request_id != request_id:
+                    self._retire_superseded(state)
+                state.last_request_id = request_id
+        self._release(conversation_id, state)
+        self._maybe_log()
+
+    def _block_span(self, first_token: int, endpoint: int) -> Tuple[int, int]:
+        """[begin, end) of the blocks holding tokens first_token..endpoint."""
+        block = self._tokens_per_block
+        return max(0, first_token) // block, -(-endpoint // block)
+
+    def _may_retire(self, endpoint: int, kept: Sequence[int]) -> bool:
+        """True when the plan at ``endpoint`` reaches no kept endpoint's protected blocks.
+
+        Per window, plan_committed_block_drop plans the live window ending at the
+        endpoint (at least as wide), and _swa_endpoint_priority protects the
+        window plus the rewind before each kept endpoint, since a next turn may
+        resume anywhere in that rewind.
+        """
+        for window in self._windows:
+            plan_begin, plan_end = self._block_span(endpoint + 1 - window, endpoint)
+            for kept_endpoint in kept:
+                begin, end = self._block_span(
+                    kept_endpoint - self._rewind_tokens - window, kept_endpoint
+                )
+                if plan_begin < end and begin < plan_end:
+                    return False
+        return True
+
+    def _retire_superseded(self, state: _SwaRetireState) -> None:
+        """Apply the plans older than the newest max_num_turns that are safe to apply."""
+        num_superseded = len(state.endpoint_plans) - self._max_num_turns
+        if num_superseded <= 0:
+            return
+        superseded = [state.endpoint_plans.popleft() for _ in range(num_superseded)]
+        kept = [endpoint for endpoint, _ in state.endpoint_plans]
+        waiting = deque()
+        for endpoint, handle in superseded:
+            if self._may_retire(endpoint, kept):
+                handle.drop()
+                self.counters["endpoints_retired"] += 1
+            else:
+                waiting.append((endpoint, handle))
+        while len(waiting) > self._MAX_WAITING_PLANS:
+            waiting.popleft()[1].drop()
+            self.counters["endpoints_retired_forced"] += 1
+        waiting.extend(state.endpoint_plans)
+        state.endpoint_plans = waiting
+
+    def finish_request(self, request: LlmRequest) -> None:
+        self._branch_points.pop(request.py_request_id, None)
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        state = self._conversation_states.get(conversation_id)
+        if state is None or state.current_request_id != request.py_request_id:
+            return
+        self._release(conversation_id, state)
+
+    def _release(self, conversation_id: str, state: _SwaRetireState) -> None:
+        state.current_request_id = None
+        # A conversation that committed stays known (bounded above), so its next
+        # turn is a continuation rather than a branch.
+        if not state.endpoint_plans and not state.committed:
+            self._conversation_states.pop(conversation_id)
+
+    def clear(self) -> None:
+        self._branch_points.clear()
+        self._branch_plans.clear()
+        super().clear()
+
+    def format_counters(self) -> str:
+        counters = dict(sorted(self.counters.items()))
+        plans = sum(len(state.endpoint_plans) for state in self._conversation_states.values())
+        waiting = sum(
+            max(0, len(state.endpoint_plans) - self._max_num_turns)
+            for state in self._conversation_states.values()
+        )
+        return (
+            f"conversations={len(self._conversation_states)} "
+            f"branch_plans={len(self._branch_plans)} "
+            f"endpoint_plans={plans} endpoints_waiting={waiting} "
+            + " ".join(f"{name}={value}" for name, value in counters.items())
+        )
+
+    def _maybe_log(self) -> None:
+        now = time.monotonic()
+        if now >= self._next_log:
+            self._next_log = now + self._LOG_INTERVAL_S
+            logger.info(f"KVCacheManagerV2 SWA endpoint retire: {self.format_counters()}")
 
 
 def _estimate_full_attn_size_per_token(
@@ -1498,6 +1756,10 @@ class KVCacheManagerV2(BaseResourceManager):
     _defer_close_armed: bool = False
     _defer_close_scope: bool = False
     _deferred_closes: Tuple[Tuple[int, _KVCache], ...] = ()
+    # Under TRTLLM_KV_SWA_ENDPOINT_RETIRE: the conversation manager, which also
+    # takes SWA branch snapshots (see _SwaEndpointRetirer).
+    _swa_retirer: Optional["_SwaEndpointRetirer"] = None
+    _swa_pending_branch: Optional[Tuple[int, _SwaBranchCell]] = None
 
     def __init__(
         self,
@@ -2211,6 +2473,45 @@ class KVCacheManagerV2(BaseResourceManager):
             if enable_conversation_manager
             else None
         )
+        swa_retire_turns = _swa_endpoint_retire_turns()
+        if swa_retire_turns:
+            swa_windows = [w for w in self.max_attention_window_vec if w is not None]
+            inactive = [
+                reason
+                for reason, failed in (
+                    ("block reuse is off", not self.enable_block_reuse),
+                    (
+                        f"policy is {self.block_reuse_policy}",
+                        self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE,
+                    ),
+                    ("the manager does not publish reuse", not self._can_publish_block_reuse),
+                    ("recurrent-state manager", self._has_recurrent_state),
+                    ("no sliding-window layer", not swa_windows),
+                )
+                if failed
+            ]
+            if inactive:
+                logger.warning(
+                    f"{_SWA_ENDPOINT_RETIRE_ENV}={swa_retire_turns} is inactive: "
+                    + "; ".join(inactive)
+                )
+            else:
+                retirer = _SwaEndpointRetirer(
+                    swa_retire_turns,
+                    swa_windows,
+                    self.tokens_per_block,
+                    self._swa_endpoint_rewind,
+                )
+                self.conversation_manager = self._swa_retirer = retirer
+                logger.info(
+                    f"KVCacheManagerV2 SWA endpoint retire on ({_SWA_ENDPOINT_RETIRE_ENV}="
+                    f"{swa_retire_turns}): all_reusable, keep {swa_retire_turns} newest "
+                    f"endpoint(s) per conversation, older plans wait while they reach a kept "
+                    f"endpoint's window+rewind, windows {retirer._windows}, "
+                    f"rewind {self._swa_endpoint_rewind}, branch snapshot priority "
+                    f"{'on' if self._swa_endpoint_rewind > 0 else 'off: rewind 0'}, "
+                    f"is_draft={self.is_draft}"
+                )
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -4362,7 +4663,43 @@ class KVCacheManagerV2(BaseResourceManager):
     def _record_branch_snapshot_point(
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
-        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+        """Hook for recurrent-state managers; attention-only caches have no snapshots.
+
+        Under TRTLLM_KV_SWA_ENDPOINT_RETIRE it takes SWA branch snapshots with the
+        Mamba manager's branch-point rules (see _SwaEndpointRetirer).
+        """
+        retirer = self._swa_retirer
+        if retirer is None:
+            return
+        pending, self._swa_pending_branch = self._swa_pending_branch, None
+        counters = retirer.counters
+        if num_lookup_tokens is None or req.is_dummy_request:
+            counters["branch_skip_no_fresh_match"] += 1
+            return
+        if not retirer.is_new_conversation(req):
+            counters["branch_skip_continuing_turn"] += 1
+            return
+        divergence = kv_cache._get_num_reusable_tokens_before_pruning()
+        if divergence >= num_lookup_tokens:
+            counters["branch_skip_no_divergence"] += 1
+            return
+        # Align down: past a block boundary the match is a partial-match child.
+        point = (divergence // self.tokens_per_block) * self.tokens_per_block
+        if point == 0:
+            counters["branch_skip_aligned_to_zero"] += 1
+            return
+        if point >= req.prompt_len:
+            counters["branch_skip_at_prompt_end"] += 1
+            return
+        retirer.record_branch_point(req.py_request_id, point)
+        if point <= kv_cache.num_committed_tokens:
+            # Reuse reached the fork, so its window exists; only keep it from retiring.
+            counters["branch_snapshots_existing"] += 1
+        elif pending is not None and pending[0] == req.py_request_id:
+            pending[1].point = point
+            counters["branch_snapshots_taken"] += 1
+        else:
+            counters["branch_skip_no_priority_callback"] += 1
 
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
@@ -4607,6 +4944,15 @@ class KVCacheManagerV2(BaseResourceManager):
         ready.record(self._stream)
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
+
+    def take_disagg_receive_ready(self, req: LlmRequest) -> torch.cuda.Event | None:
+        """Hand over the readiness event recorded at ``req``'s disagg admission.
+
+        The caller then owns the ordering guarantee: the receive destination
+        may be published only after the event completes. ``prepare_resources``
+        does not wait on a taken event.
+        """
+        return self._disagg_receive_ready.pop(req.py_request_id, None)
 
     def get_history_length(self, req: LlmRequest) -> int | None:
         """Return the cache's current history_length, or None if no cache.
@@ -7367,8 +7713,13 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self.is_draft
             and expected_prompt_length is not None
         ):
+            branch = None
+            if self._swa_retirer is not None:
+                # Set by _record_branch_snapshot_point after the match, before any page exists.
+                branch = _SwaBranchCell()
+                self._swa_pending_branch = (request_id, branch)
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
-                expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
+                expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind, branch
             )
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),

@@ -90,6 +90,7 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
+from ...ops.spec import drafter_step_prep as _step_prep
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
 from ...ops.spec.context_kv_commit_paged import context_kv_commit_paged
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
@@ -196,6 +197,9 @@ class Launched:
     point: str
     #: The captured rows the side chain projected (a view of the shared capture buffer).
     gen_hs: torch.Tensor
+    #: Whether the side chain and the commit run the fused bookkeeping
+    #: (``drafter_fused_prep``, ``ops/spec/drafter_step_prep.py``).
+    fused: bool = False
 
 
 class ContextKvFork:
@@ -207,7 +211,13 @@ class ContextKvFork:
     ``prepare_1st_drafter_inputs`` takes it, joins and commits.
     """
 
-    def __init__(self, worker: DFlashWorker, draft_model: nn.Module, point: str):
+    def __init__(
+        self,
+        worker: DFlashWorker,
+        draft_model: nn.Module,
+        point: str,
+        prep: Optional["_step_prep.DrafterStepPrep"] = None,
+    ):
         self.worker = worker
         self.draft_model = draft_model
         self.point = point
@@ -218,6 +228,8 @@ class ContextKvFork:
         self._armed: Optional[tuple] = None
         self._launched: Optional[Launched] = None
         self._fallback_logged = False
+        #: The fused decode-step bookkeeping (``drafter_fused_prep``), or None.
+        self.prep = prep
         #: ``paged_context_commit``: a paged context's commit runs ``context_kv_commit_paged``.
         self.paged_commit_on = False
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
@@ -264,10 +276,11 @@ class ContextKvFork:
                 "the side chain cannot be forked from it"
             )
         capture = current_capture_id()
+        fused = self.prep is not None and self.prep.takes(self.worker, num_gens, k + 1)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            gen_hs = self.side_chain(spec_metadata, attn_metadata, num_gens, k)
-        self._launched = Launched(main, capture, num_gens, k, point, gen_hs)
+            gen_hs = self.side_chain(spec_metadata, attn_metadata, num_gens, k, fused)
+        self._launched = Launched(main, capture, num_gens, k, point, gen_hs, fused)
         self.launches[point] += 1
 
     # -- the worker side ---------------------------------------------------
@@ -314,7 +327,12 @@ class ContextKvFork:
         base, last = arena_columns(worker)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            if worker._ctx_paged and self._commits_paged(worker, slots, num_accepted):
+            if worker._ctx_paged and launched.fused:
+                # drafter_fused_prep: the same context_kv_commit_paged op
+                # #21535's paged_context_commit branch below calls, reached through the
+                # fused bookkeeping's own gate (drafter_step_prep.takes).
+                self.prep.commit_context(worker, slots, num_accepted, rows, num_ctx)
+            elif worker._ctx_paged and self._commits_paged(worker, slots, num_accepted):
                 context_kv_commit_paged(
                     worker._ctx_len,
                     worker._ctx_base,
@@ -450,20 +468,32 @@ class ContextKvFork:
             return None
         return num_gens, k
 
-    def side_chain(self, spec_metadata, attn_metadata, num_gens: int, k: int) -> torch.Tensor:
+    def side_chain(
+        self, spec_metadata, attn_metadata, num_gens: int, k: int, fused: bool = False
+    ) -> torch.Tensor:
         """The built-in store of the step's context K/V, unmasked; runs on the side stream.
 
         The worker's ``_store_step_context`` without its mask, after this step's page
         table decode over the KV cache manager's pages. Its first launch is a torch
         kernel, so the fork is a plain dependency on the main stream's last kernel.
+        With ``fused`` (``drafter_fused_prep``) the decode and the store
+        are ``drafter_step_prep``'s launches, the same bytes.
         """
         worker = self.worker
-        DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_gens)
+        if fused:
+            self.prep.refresh_block_tables(worker, attn_metadata, num_gens)
+        else:
+            DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_gens)
         slots = worker._batch_to_slot[:num_gens]
         # The built-in's get_hidden_states(num_tokens)[0 : rows]: the same view.
         gen_hs = spec_metadata.captured_hidden_states[
             : num_gens * (k + 1), : spec_metadata.hidden_size * spec_metadata.num_capture_layers
         ]
+        if fused:
+            self.prep.store_step_context(
+                worker, self.draft_model, gen_hs, slots, self.rows[:num_gens], k + 1
+            )
+            return gen_hs
         worker._store_step_context(
             self.draft_model, gen_hs, slots, self.rows[:num_gens], worker._ctx_len[slots]
         )
@@ -771,6 +801,8 @@ def install(
     late_join: bool = False,
     declined: Optional[Callable[..., None]] = None,
     paged_commit: bool = False,
+    fused_prep: bool = False,
+    fused_prep_min_requests: int = _step_prep.DEFAULT_MIN_REQUESTS,
 ) -> None:
     """Install the fork on the DFlash worker, the target core and the LM head (``POINT``).
 
@@ -803,7 +835,12 @@ def install(
     fork: Optional[ContextKvFork] = worker.__dict__.get("_kv_fork")
     fresh = fork is None
     if fresh:
-        fork = ContextKvFork(worker, drafter, point)
+        fork = ContextKvFork(
+            worker,
+            drafter,
+            point,
+            _step_prep.from_plan(fused_prep, fused_prep_min_requests),
+        )
         worker._kv_fork = fork
     fork.draft_model = drafter
     fork.declined = declined

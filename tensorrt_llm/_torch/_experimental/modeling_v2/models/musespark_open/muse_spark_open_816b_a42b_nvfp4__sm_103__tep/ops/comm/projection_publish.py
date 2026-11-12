@@ -1,14 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
-"""Transports the column-sharded pool and unpool GEMMs publish into on 33..512-row decode steps (TP4).
+"""Transports the column-sharded pool and unpool GEMMs publish into on 33..512-row decode steps.
 
 From 33 rows the built-in MoE multiplies the whole replicated pool (8192 -> 4096) and
 unpool (4096 -> 8192) weights on every rank: 67 MB per projection per rank. Here each
-rank multiplies only its column slice (16.8 MB: pool ``[R, 8192] x [1024, 8192]^T``,
-unpool ``[R, 4096] x [2048, 4096]^T``) and the GEMM's output tensor *is* this rank's slot
+rank multiplies only its column slice and the GEMM's output tensor *is* this rank's slot
 of a multicast transport, so the GEMM's own epilogue stores publish the slice to every
-rank. The consumers -- the pre-expert RMSNorm + NVFP4 quantization
+rank. The TP group is the mapping's (``WORLDS``): four ranks of one tray (16.8 MB per
+projection: pool ``[R, 8192] x [1024, 8192]^T``, unpool ``[R, 4096] x [2048, 4096]^T``)
+or eight over two trays of one NVLink domain (8.4 MB: pool ``[R, 8192] x [512, 8192]^T``,
+unpool ``[R, 4096] x [1024, 4096]^T``; the multicast allocation takes fabric handles once
+the group spans nodes). The consumers -- the pre-expert RMSNorm + NVFP4 quantization
 (``pool_publish_fp4quant``) and the post-FFN join (``unpool_publish_join`` below) --
 poll their rows of their own copy, reset them and compute the built-in kernels'
 arithmetic on the gathered row.
@@ -30,9 +33,13 @@ Ownership and reuse (cuFlow):
   ``r`` once, from its epilogue, with its final value. cuBLAS picks a beta-zero kernel
   (no read-back of the output); where it splits K it reduces the partial products from
   its workspace in a separate reduction kernel, whose single store is the publication.
-  The census test drives this with a concurrent poller at every served row count;
-  the census holds for the cuBLAS it ran on, so the path publishes only with that
-  cuBLAS, torch and device (``producer_refusal``).
+  The census test drives this with a concurrent poller at every served row count of a
+  site's slice shape; the census holds for the cuBLAS it ran on and the slice shapes it
+  ran at, so the path publishes only with that cuBLAS, torch and device, and at a TP size
+  whose census certified it (``CERTIFIED_PRODUCERS``, ``CERTIFIED_PRODUCERS_TP8``,
+  ``producer_refusal``): a TP4 census does not let TP8 publish. TP8's census also fixes the
+  row counts it ran at (``CENSUS_ROWS_BY_TP``); a TP8 step of another row count runs the
+  built-in projections.
 * One reader and resetter per element per call: the consumer thread of each rank that
   owns that element of its row, on its own copy.
 * Reuse: no two consecutive calls on a transport use the same buffer, the last call of a
@@ -77,6 +84,7 @@ from .unpool_direct_boundary import buffer_sequence, check_buffer_sequence
 
 __all__ = [
     "BUFFERS",
+    "CENSUS_ROWS_BY_TP",
     "MAX_ROWS",
     "MIN_ROWS",
     "POOL_HIDDEN",
@@ -94,12 +102,17 @@ __all__ = [
 
 #: The TP size the transports connect: one GB300 tray.
 WORLD = 4
-#: The TP sizes a transport serves: one tray, or two trays over MNNVL (TP8), whose 33..64-row
-#: decode steps (5..8 requests) multiply the whole replicated pool and unpool weights on every
-#: rank too.
+#: The TP sizes a transport serves, taken from the mapping: one tray, or two trays over MNNVL
+#: (TP8), whose decode steps above 8 rows multiply the whole replicated pool and unpool
+#: weights on every rank too.
 WORLDS = (4, 8)
 #: The decode rows the transports serve: five to 64 requests at K = 7 (and the counts between).
 MIN_ROWS, MAX_ROWS = 33, 512
+#: The row capacity of a wide transport: the decode steps of two to four requests at K = 7
+#: (16..32 rows), whose slice GEMMs are flashinfer's split-K cells of ``wide_projection_gathers``
+#: (``wide_direct_transports``, sm103 TEP8, behind ``tep8_wide_direct_transports``).
+#: Its own allocation: the 33..512-row transports are unchanged.
+WIDE_TRANSPORT_ROWS = 32
 #: Width of the pooled (expert) activation and of the residual stream.
 POOL_HIDDEN, UNPOOL_HIDDEN = 4096, 8192
 #: Buffers of a transport (``buffer_sequence``).
@@ -132,8 +145,20 @@ CERTIFIED_PRODUCERS = frozenset(
 )
 #: The TP8 slice shapes (pool ``[R, 8192] x [512, 8192]^T``, unpool ``[R, 4096] x [1024, 4096]^T``)
 #: are other GEMMs than the TP4 census drove, so TP8 publishes only with a producer the TP8 census
-#: (33..448 rows, both sites) certified. Same key as above.
-CERTIFIED_PRODUCERS_TP8 = frozenset()
+#: (both sites, at the row counts of ``CENSUS_ROWS_BY_TP[8]``) certified. Same key as above.
+CERTIFIED_PRODUCERS_TP8 = frozenset(
+    {
+        ("2.14.0a0+b2c75dd062.nv26.09", 130800, 152),
+    }
+)
+#: The decode row counts a census ran at, per TP size, where the path publishes at those
+#: counts only. TP8: the rows of the served generation workers' CUDA-graph batch sizes of
+#: five or more requests at K = 7 (batch sizes 1..32, then every 8 from 40 to the max batch
+#: of 64: 40..256 rows by 8, then 320, 384, 448, 512), 32 row counts; a TP8 decode step of
+#: another row count (an eager step past the captured sizes) runs the built-in projections.
+#: TP4 has no entry: it publishes at every row count of its band, 33..448 (its census ran at
+#: the row counts that band serves).
+CENSUS_ROWS_BY_TP = {8: tuple(range(40, 257, 8)) + (320, 384, 448, 512)}
 #: Environment variables that resize torch's cuBLAS workspaces, which changes cuBLAS's choice
 #: of split-K kernels; the census ran with none set.
 CUBLAS_WORKSPACE_ENV = ("CUBLAS_WORKSPACE_CONFIG", "CUBLASLT_WORKSPACE_SIZE")
@@ -212,14 +237,14 @@ def local_columns(width: int, world: int = WORLD) -> int:
 
 
 class PublishTransport:
-    """One site's multicast transport on every rank of a TP4 group, for up to ``max_rows`` rows.
+    """One site's multicast transport on every rank of a TP4 or TP8 group, for up to ``max_rows`` rows.
 
-    ``slot(buffer, rows)`` is this rank's ``[rows, columns]`` BF16 slot of ``buffer`` on the
-    multicast address: a GEMM given it as its output publishes into every rank's copy;
-    nothing may read it. ``receive()`` is this rank's copy (``int16``,
-    ``[BUFFERS, WORLD, max_rows, columns]``), which the consumers poll and reset.
-    Construction is collective over the group (fabric allocation, sentinel fill) and
-    succeeds on every rank or raises on every rank.
+    ``world`` is the mapping's TP size (``WORLDS``). ``slot(buffer, rows)`` is this rank's
+    ``[rows, columns]`` BF16 slot of ``buffer`` on the multicast address: a GEMM given it
+    as its output publishes into every rank's copy; nothing may read it. ``receive()`` is
+    this rank's copy (``int16``, ``[BUFFERS, world, max_rows, columns]``), which the
+    consumers poll and reset. Construction is collective over the group (fabric
+    allocation, sentinel fill) and succeeds on every rank or raises on every rank.
 
     The guard word lives in pinned host memory, so the host reads it while the device still
     polls (``guard_fired(sync=False)``, ``start_guard_watch``).
@@ -240,8 +265,10 @@ class PublishTransport:
         world = mapping.tp_size
         if columns not in (local_columns(POOL_HIDDEN, world), local_columns(UNPOOL_HIDDEN, world)):
             raise ValueError(f"no projection site has {columns} columns per rank at TP{world}")
-        if not MIN_ROWS <= max_rows <= MAX_ROWS:
-            raise ValueError(f"max_rows must be in {MIN_ROWS}..{MAX_ROWS}, got {max_rows}")
+        if not (max_rows == WIDE_TRANSPORT_ROWS or MIN_ROWS <= max_rows <= MAX_ROWS):
+            raise ValueError(
+                f"max_rows must be {WIDE_TRANSPORT_ROWS} or in {MIN_ROWS}..{MAX_ROWS}, got {max_rows}"
+            )
         self.rank = mapping.tp_rank
         self.world = mapping.tp_size
         self.columns = int(columns)
@@ -316,7 +343,7 @@ class PublishTransport:
         )
 
     def receive(self) -> torch.Tensor:
-        """This rank's copy of the transport, ``int16 [BUFFERS, WORLD, max_rows, columns]``."""
+        """This rank's copy of the transport, ``int16 [BUFFERS, world, max_rows, columns]``."""
         return self._receive
 
     def control_ptr(self) -> int:
@@ -496,7 +523,7 @@ if triton is not None:
     def _unpool_publish_join_kernel(
         out_ptr,  # [T, HIDDEN] fp32, the new residual stream
         residual_ptr,  # [T, HIDDEN] fp32, the old one
-        receive_ptr,  # int16 [BUFFERS, WORLD, CAPACITY, COLUMNS], this rank's copy
+        receive_ptr,  # int16 [BUFFERS, WORLD_SIZE, CAPACITY, COLUMNS], this rank's copy
         gain_ptr,  # [HIDDEN] (1 + w) when HAS_GAIN, else unread
         alpha_ptr,  # [HIDDEN] fp32
         beta_ptr,  # [HIDDEN] fp32
@@ -592,10 +619,11 @@ class UnpoolPublishJoin(OpWrapper):
     ``MuseSparkOpenGatedResidual._add_after_rmsnorm_and_norm``'s. Returns its
     ``(updated, next_input)`` for the gathered branch.
 
-    A collective over the TP4 group: every rank calls it with the same row count and
-    buffer, in the same order relative to its other calls on ``transport``, and no two
-    consecutive calls on one buffer (``buffer_sequence``). ``guard`` (polling rounds, 0:
-    none) and ``guard_break`` select the poll guard (``guard_break`` for tests only).
+    A collective over the transport's TP group (four or eight ranks): every rank calls it
+    with the same row count and buffer, in the same order relative to its other calls on
+    ``transport``, and no two consecutive calls on one buffer (``buffer_sequence``).
+    ``guard`` (polling rounds, 0: none) and ``guard_break`` select the poll guard
+    (``guard_break`` for tests only).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -605,7 +633,10 @@ class UnpoolPublishJoin(OpWrapper):
     (the four ranks' slots concatenated), through CUDA-graph replays with changing inputs,
     back-to-back 61-layer chains on the model's buffer sequence with a delayed rank, and
     against `reference` within its band. The slots are published by the production
-    producer (cuBLAS into the multicast slot) and by an elementwise copy.
+    producer (cuBLAS into the multicast slot) and by an elementwise copy. At eight ranks
+    over two trays (the eight slots concatenated) the same bit-for-bit comparison holds in
+    61-layer chains at 64..512 rows with a delayed rank on the other tray, and in a graph
+    replay.
     """
 
     def __call__(

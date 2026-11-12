@@ -35,11 +35,14 @@ to it as well.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm.logger import logger
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
 EXPERTS = 256
@@ -543,3 +546,525 @@ class RouterShardPublish(OpWrapper):
 
 
 router_shard_publish = RouterShardPublish()
+
+
+#: ``router_shard_wide`` (``wide_prologue``): the rows a call may carry, and the fewest. The
+#: built-in router takes its tensor-core launch from 16 rows up to 128; the wide prologue
+#: serves TP4 decode steps of two to four requests (16..32 rows at K=7).
+WIDE_MIN_ROWS = 16
+WIDE_MAX_ROWS = 32
+#: The built-in tensor-core launch's tiles: 16 tokens x 32 experts per program, the
+#: 8192-wide dot split into 16 programs of 512, 4 warps (``_router_tensorcore_kernel``).
+WIDE_TOKENS_PER_TILE = 16
+WIDE_EXPERTS_PER_TILE = 32
+WIDE_SPLITS = 16
+
+
+#: ``router_shard_wide`` launches the built-in ``_router_tensorcore_kernel``'s statements over
+#: the rank's ``L`` experts: the same tile, loads and ``tl.dot`` (TF32x3) per program, so
+#: each program's partial is the built-in program's for the same 32 experts; only the
+#: weight rows it is given and the partials' row stride (``L`` instead of 256) differ.
+@triton.jit
+def _router_shard_wide_kernel(
+    hidden_states,
+    weight,
+    partials,
+    TOKENS: tl.constexpr,
+    EXPERTS: tl.constexpr,
+):
+    tokens = tl.program_id(0) * 16 + tl.arange(0, 16)
+    experts = tl.program_id(1) * 32 + tl.arange(0, 32)
+    split = tl.program_id(2)
+    acc = tl.zeros((16, 32), tl.float32)
+    for block in range(4):
+        hidden = split * 512 + block * 128 + tl.arange(0, 128)
+        x = tl.load(
+            hidden_states + tokens[:, None] * 8192 + hidden[None, :],
+            tokens[:, None] < TOKENS,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(weight + experts[None, :] * 8192 + hidden[:, None])
+        acc = tl.dot(x, w, acc, input_precision="tf32x3")
+    tl.store(
+        partials + split * TOKENS * EXPERTS + tokens[:, None] * EXPERTS + experts[None, :],
+        acc,
+        tokens[:, None] < TOKENS,
+    )
+
+
+#: The built-in ``_router_tensorcore_reduce_kernel``'s statements: the 16 partials of an
+#: element summed by one ``tl.sum`` over a ``[16, 128]`` tile at 4 warps, then scaled.
+@triton.jit
+def _router_shard_wide_reduce_kernel(partials, output, scale, SIZE: tl.constexpr):
+    offsets = tl.program_id(0) * 128 + tl.arange(0, 128)
+    splits = tl.arange(0, 16)
+    values = tl.load(
+        partials + splits[:, None] * SIZE + offsets[None, :],
+        offsets[None, :] < SIZE,
+        other=0.0,
+    )
+    tl.store(output + offsets, tl.sum(values, axis=0) * scale, offsets < SIZE)
+
+
+class RouterShardWide(OpWrapper):
+    """The rank's ``L`` router logit columns of a 16..32-row step, the built-in tensor-core bits.
+
+    At 16..128 rows the built-in ``MuseSparkOpenMoE.router_logits`` runs
+    ``_router_tensorcore_kernel`` (TF32x3, ``(cdiv(M, 16), 8, 16)`` programs of 16
+    tokens x 32 experts x 512 hidden) and a reduce of its 16 partials, reading the
+    whole 8 MiB weight on every rank. This entry launches the same two kernels'
+    statements over this rank's ``L`` experts only (``(cdiv(M, 16), L / 32, 16)``
+    programs on ``weight[L r : L r + L]``): every program is the built-in program of
+    those 32 experts, and every logit's 16 partials are summed by the same reduction,
+    so each logit is the built-in one bit for bit, from a quarter of the weight at EP4.
+
+    A plain launch (no programmatic dependent launch) into the caller's ``out``,
+    for a side stream forked from the producer of ``hidden_states`` (``router_fork``).
+
+    Args:
+        hidden_states: ``[M, 8192]`` BF16, contiguous, ``16 <= M <= 32``.
+        weight: the full router weight ``[256, 8192]`` FP32, contiguous.
+        rank: the expert-parallel rank ``r``; columns ``[L r, L r + L)`` are computed.
+        scale: the metap multiplier, a Python float (applied in FP32 after the sum).
+        out: ``[M, L]`` FP32, contiguous, on the input's device; overwritten.
+        ranks: the expert-parallel group size (4 or 8); ``L = local_experts(ranks)``.
+
+    Returns:
+        ``out``.
+    """
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="tep4: two requests' K=7 verify, 16 rows, 64 columns per rank",
+            spec=dict(rows=16, ranks=4),
+        ),
+        Cell(why="tep4: three requests, 24 rows (two token tiles)", spec=dict(rows=24, ranks=4)),
+        Cell(why="tep4: four requests, 32 rows (the wide capacity)", spec=dict(rows=32, ranks=4)),
+        Cell(why="a row count off the K=7 grid (19 rows)", spec=dict(rows=19, ranks=4)),
+        Cell(why="tep8 layout: 16 rows, 32 columns per rank", spec=dict(rows=16, ranks=8)),
+    )
+
+    note = """
+    The claim the test proves is equality with the built-in router's columns
+    ``L r .. L r + L - 1`` at every row count 16..32, for every rank, at EP4 and EP8,
+    eagerly and through a CUDA-graph replay on a forked side stream; the cells
+    additionally gate the op against the float64 reference.
+    """
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> torch.Tensor:
+        tokens = hidden_states.shape[0]
+        local = local_experts(ranks)
+        first = rank * local
+        partials = torch.empty(
+            (WIDE_SPLITS, tokens, local), device=hidden_states.device, dtype=torch.float32
+        )
+        _router_shard_wide_kernel[
+            (triton.cdiv(tokens, WIDE_TOKENS_PER_TILE), local // WIDE_EXPERTS_PER_TILE, WIDE_SPLITS)
+        ](
+            hidden_states,
+            weight[first : first + local],
+            partials,
+            TOKENS=tokens,
+            EXPERTS=local,
+            num_warps=4,
+        )
+        _router_shard_wide_reduce_kernel[(triton.cdiv(tokens * local, 128),)](
+            partials,
+            out,
+            scale,
+            SIZE=tokens * local,
+            num_warps=4,
+        )
+        return out
+
+    def reference(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> torch.Tensor:
+        """``RouterShard.reference``: the float64 product, the multiplier on the FP32 sum.
+
+        ``out`` does not change the values."""
+        del out
+        return router_shard.reference(hidden_states, weight, rank, scale, 16, ranks=ranks)
+
+    def is_valid(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> None:
+        """Dense row-major operands; 16..32 rows (the built-in's tensor-core launch range)."""
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
+            raise ValueError(f"hidden_states must be 2-D BF16, got {hidden_states.dtype}")
+        if not hidden_states.is_contiguous() or hidden_states.shape[1] != HIDDEN:
+            raise ValueError(f"hidden_states must be contiguous [M, {HIDDEN}]")
+        rows = hidden_states.shape[0]
+        if not WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
+            raise ValueError(f"{WIDE_MIN_ROWS}..{WIDE_MAX_ROWS} rows, got {rows}")
+        if weight.dtype != torch.float32 or tuple(weight.shape) != (EXPERTS, HIDDEN):
+            raise ValueError(f"weight must be FP32 [{EXPERTS}, {HIDDEN}]")
+        if not weight.is_contiguous():
+            raise ValueError("weight must be contiguous")
+        if ranks not in RANK_COUNTS:
+            raise ValueError(f"ranks must be one of {RANK_COUNTS}, got {ranks}")
+        if not 0 <= rank < ranks:
+            raise ValueError(f"rank must be in [0, {ranks}), got {rank}")
+        local = local_experts(ranks)
+        if out.dtype != torch.float32 or tuple(out.shape) != (rows, local):
+            raise ValueError(f"out must be FP32 [{rows}, {local}]")
+        if not out.is_contiguous() or out.device != hidden_states.device:
+            raise ValueError("out must be contiguous, on the input's device")
+
+
+router_shard_wide = RouterShardWide()
+
+
+#: ``router_shard_rows`` (``wide_prologue``) launches ``_router_shard_side_kernel``'s statements
+#: with each program looping over ``PER`` consecutive rows of one expert: the weight row is
+#: loaded once per program, and every row's logit is the same ``tl.sum`` over the same
+#: ``[1, 8192]`` tile layout (the warp count alone fixes it), so each row's bits are those
+#: of ``router_shard`` on that row. Placed after every other kernel of this file.
+@triton.jit
+def _router_shard_rows_kernel(
+    hidden_states,
+    weight,
+    output,
+    scale,
+    TOKENS: tl.constexpr,
+    PER: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    first = tl.program_id(0) * PER
+    expert = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    offsets = tl.arange(0, HIDDEN)
+    w = tl.load(
+        weight + expert[:, None] * HIDDEN + offsets[None, :],
+        expert[:, None] < EXPERTS,
+        other=0.0,
+    )
+    for k in tl.static_range(PER):
+        token = first + k
+        if token < TOKENS:
+            x = tl.load(hidden_states + token * HIDDEN + offsets).to(tl.float32)
+            logits = tl.sum(w * x[None, :], axis=1) * scale
+            tl.store(output + token * EXPERTS + expert, logits, expert < EXPERTS)
+
+
+#: Rows a ``router_shard_rows`` call may carry: two to four requests' K=7 verify steps.
+ROWS_MAX_ROWS = 32
+#: Rows per program by row count: the fastest of the bitwise-equal launches on one R200 at
+#: 16 warps (every entry writes the same bits).
+ROWS_PER_PROGRAM = {16: 1, 24: 4, 32: 2}
+
+
+#: ``configure(rows_tiling=...)`` = ``rows:per:experts,...`` (e.g. ``16:2:2,24:4:2,32:4:2``;
+#: sm_107 sets ``16:1:2,24:2:2,32:2:2``) sets ``router_shard_rows``' rows per program and experts
+#: per program at those row counts; None (or a row count not listed) keeps ``ROWS_PER_PROGRAM``
+#: with one expert per program. In the engine the router runs beside the pool GEMM, whose CTAs
+#: hold 128 of the 212 SMs, so fewer, larger programs can finish sooner there than in the
+#: isolated launch ``ROWS_PER_PROGRAM`` was chosen on. Neither count is part of a logit's
+#: summation order (the ``[experts, 8192]`` tile is a register repetition of the ``[1, 8192]``
+#: row layout, which the warp count alone fixes), so every logit keeps its bits.
+ROWS_TILING: dict[int, tuple[int, int]] = {}
+
+
+def _rows_tiling(raw: Optional[str]) -> dict[int, tuple[int, int]]:
+    """``rows:per:experts,...`` as ``{rows: (per, experts)}``; None or empty: no entry.
+
+    Raises:
+        ValueError: for a cell outside 1..32 rows, below one row per program, or with an
+            expert count other than 1, 2, 4 or 8.
+    """
+    out = {}
+    for cell in (c for c in (raw or "").strip().split(",") if c.strip()):
+        rows, per, experts = (int(v) for v in cell.split(":"))
+        if not (1 <= rows <= 32 and per >= 1 and experts in (1, 2, 4, 8)):
+            raise ValueError(f"[musespark_open] router_shard rows_tiling: bad cell {cell!r}")
+        out[rows] = (per, experts)
+    return out
+
+
+def configure(*, rows_tiling: Optional[str] = None) -> None:
+    """Set the tiling ``router_shard_rows`` launches with (``ROWS_TILING``).
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; the default is
+    the built-in tiling (``ROWS_PER_PROGRAM``, one expert per program).
+
+    Args:
+        rows_tiling: ``rows:per:experts,...`` cells (rows per program and experts per program
+            at a row count), or None for none.
+
+    Raises:
+        ValueError: for a malformed cell (``_rows_tiling``); the tiling is then unchanged.
+    """
+    global ROWS_TILING
+    ROWS_TILING = _rows_tiling(rows_tiling)
+    if ROWS_TILING:
+        cells = sorted(ROWS_TILING.items())
+        logger.info(
+            "[musespark_open] router_shard_rows: rows per program / experts per program "
+            + ", ".join(f"{rows} rows {per}/{experts}" for rows, (per, experts) in cells)
+        )
+
+
+def rows_per_program(tokens: int) -> int:
+    """Rows each ``router_shard_rows`` program loops over at ``tokens`` rows (2 off the K=7 grid)."""
+    if tokens in ROWS_TILING:
+        return ROWS_TILING[tokens][0]
+    return ROWS_PER_PROGRAM.get(tokens, 2)
+
+
+def experts_per_program(tokens: int) -> int:
+    """Expert rows of the weight tile each ``router_shard_rows`` program holds at ``tokens`` rows."""
+    return ROWS_TILING[tokens][1] if tokens in ROWS_TILING else TILE_ROWS
+
+
+class RouterShardRows(OpWrapper):
+    """The rank's ``L`` router logit columns of up to 32 rows, each row's one-request bits.
+
+    ``router_shard_side``'s statements -- the built-in small-batch router's -- over every row
+    of a 2..4-request decode step: each logit is the one ``router_shard`` computes for that row
+    at the same warp count, i.e. the bits the built-in router gives the row when its request
+    decodes alone (``num_warps = builtin_warps(MAX_ROWS, overlaps)``). The built-in router of a
+    16..32-row step instead takes its TF32x3 tensor-core launch, which ``router_shard_wide``
+    reproduces; this entry trades those bits for the one-request ones in one launch and no
+    reduce. A plain launch (no programmatic dependent launch) into the caller's ``out``, for
+    the router fork's side stream.
+
+    With ``enable_pdl`` the same statements run as ``_router_shard_rows_pdl_kernel``, launched
+    with programmatic dependent launch: the immutable weight tile is loaded before
+    ``griddepcontrol.wait``, the rows and the stores only after it. On a side stream forked
+    from the producer of ``hidden_states`` inside a CUDA graph capture, the fork is captured as
+    a programmatic edge, so the program becomes resident and streams its weight while the
+    producer finishes (as the pool GEMM beside it does). ``early_trigger`` (with
+    ``enable_pdl``) also releases this kernel's own dependents at entry; their
+    ``griddepcontrol.wait`` still returns only after this grid completed. Same bits.
+
+    Args:
+        hidden_states: ``[M, 8192]`` BF16, contiguous, ``1 <= M <= 32``.
+        weight: the full router weight ``[256, 8192]`` FP32, contiguous.
+        rank: the expert-parallel rank ``r``; columns ``[L r, L r + L)`` are computed.
+        scale: the metap multiplier, a Python float (applied in FP32 after the sum).
+        num_warps: the warp count of the built-in launch at one request's rows (4 or 16).
+        out: ``[M, L]`` FP32, contiguous, on the input's device; overwritten.
+        ranks: the expert-parallel group size (4 or 8); ``L = local_experts(ranks)``.
+        tiling: ``(rows per program, experts per program)``; None: ``ROWS_TILING`` /
+            ``ROWS_PER_PROGRAM``. Not part of any logit's summation order.
+        enable_pdl: launch ``_router_shard_rows_pdl_kernel`` with programmatic dependent launch.
+        early_trigger: with ``enable_pdl``, trigger the dependents at entry.
+
+    Returns:
+        ``out``.
+    """
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="tep4: two requests' K=7 verify, 16 rows, 64 columns, the served 16 warps",
+            spec=dict(rows=16, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="tep4: three requests, 24 rows (4 rows per program)",
+            spec=dict(rows=24, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="tep4: four requests, 32 rows (the wide capacity, 2 rows per program)",
+            spec=dict(rows=32, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="a row count off the K=7 grid (19 rows, a partial last program)",
+            spec=dict(rows=19, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="without the prepare stream: the 4-warp summation order",
+            spec=dict(rows=24, num_warps=4, ranks=4),
+        ),
+        Cell(why="tep8 layout: 16 rows, 32 columns", spec=dict(rows=16, num_warps=16, ranks=8)),
+    )
+
+    note = """
+    The claim the test proves is that every row of every rank's output is ``router_shard``'s
+    logit for that row bit for bit -- the built-in small-batch router's columns
+    ``L r .. L r + L - 1`` of that row in a one-request (8-row) call -- at every row count
+    1..32, both warp counts, EP4 and EP8, eagerly and through a CUDA-graph replay on a forked
+    side stream; the cells additionally gate the op against the float64 reference.
+    """
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        num_warps: int,
+        out: torch.Tensor,
+        ranks: int = 4,
+        tiling: Optional[tuple[int, int]] = None,
+        enable_pdl: bool = False,
+        early_trigger: bool = False,
+    ) -> torch.Tensor:
+        tokens = hidden_states.shape[0]
+        local = local_experts(ranks)
+        first = rank * local
+        if tiling is None:
+            per, tile = rows_per_program(tokens), experts_per_program(tokens)
+        else:
+            per, tile = (int(v) for v in tiling)
+        grid = (triton.cdiv(tokens, per), triton.cdiv(local, tile))
+        if enable_pdl:
+            _router_shard_rows_pdl_kernel[grid](
+                hidden_states,
+                weight[first : first + local],
+                out,
+                scale,
+                TOKENS=tokens,
+                PER=per,
+                EXPERTS=local,
+                HIDDEN=HIDDEN,
+                ROWS=tile,
+                EARLY_TRIGGER=bool(early_trigger),
+                num_warps=num_warps,
+                enable_fp_fusion=False,
+                launch_pdl=True,
+            )
+            return out
+        _router_shard_rows_kernel[grid](
+            hidden_states,
+            weight[first : first + local],
+            out,
+            scale,
+            TOKENS=tokens,
+            PER=per,
+            EXPERTS=local,
+            HIDDEN=HIDDEN,
+            ROWS=tile,
+            num_warps=num_warps,
+            enable_fp_fusion=False,
+            launch_pdl=False,
+        )
+        return out
+
+    def reference(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        num_warps: int,
+        out: torch.Tensor,
+        ranks: int = 4,
+        tiling: Optional[tuple[int, int]] = None,
+        enable_pdl: bool = False,
+        early_trigger: bool = False,
+    ) -> torch.Tensor:
+        """``RouterShard.reference``; ``num_warps``, ``out``, ``tiling`` and the launch do not change
+        the values."""
+        del out, tiling, enable_pdl, early_trigger
+        return router_shard.reference(hidden_states, weight, rank, scale, num_warps, ranks=ranks)
+
+    def is_valid(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        num_warps: int,
+        out: torch.Tensor,
+        ranks: int = 4,
+        tiling: Optional[tuple[int, int]] = None,
+        enable_pdl: bool = False,
+        early_trigger: bool = False,
+    ) -> None:
+        """Dense row-major operands; 1..32 rows; a built-in warp count; a tiling ``_rows_tiling``
+        accepts; ``early_trigger`` only with ``enable_pdl``."""
+        if tiling is not None:
+            per, experts = tiling
+            if not (per >= 1 and experts in (1, 2, 4, 8)):
+                raise ValueError(f"tiling must be (rows >= 1, experts in 1/2/4/8), got {tiling}")
+        if early_trigger and not enable_pdl:
+            raise ValueError("early_trigger needs enable_pdl")
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
+            raise ValueError(f"hidden_states must be 2-D BF16, got {hidden_states.dtype}")
+        if not hidden_states.is_contiguous() or hidden_states.shape[1] != HIDDEN:
+            raise ValueError(f"hidden_states must be contiguous [M, {HIDDEN}]")
+        rows = hidden_states.shape[0]
+        if not 1 <= rows <= ROWS_MAX_ROWS:
+            raise ValueError(f"1..{ROWS_MAX_ROWS} rows, got {rows}")
+        if weight.dtype != torch.float32 or tuple(weight.shape) != (EXPERTS, HIDDEN):
+            raise ValueError(f"weight must be FP32 [{EXPERTS}, {HIDDEN}]")
+        if not weight.is_contiguous():
+            raise ValueError("weight must be contiguous")
+        if ranks not in RANK_COUNTS:
+            raise ValueError(f"ranks must be one of {RANK_COUNTS}, got {ranks}")
+        if not 0 <= rank < ranks:
+            raise ValueError(f"rank must be in [0, {ranks}), got {rank}")
+        if num_warps not in WARP_COUNTS:
+            raise ValueError(f"num_warps must be one of {WARP_COUNTS}, got {num_warps}")
+        local = local_experts(ranks)
+        if out.dtype != torch.float32 or tuple(out.shape) != (rows, local):
+            raise ValueError(f"out must be FP32 [{rows}, {local}]")
+        if not out.is_contiguous() or out.device != hidden_states.device:
+            raise ValueError("out must be contiguous, on the input's device")
+
+
+router_shard_rows = RouterShardRows()
+
+
+#: ``router_shard_rows(..., enable_pdl=True)`` launches ``_router_shard_rows_kernel``'s statements
+#: under a symbol of its own, with programmatic dependent launch: the immutable weight tile before
+#: ``griddepcontrol.wait`` (as ``_router_shard_kernel`` with ``PDL``), every row load and every store
+#: after it, so each program waits before it exits and every logit is the same ``tl.sum`` over the
+#: same tile as ``_router_shard_rows_kernel``'s. With ``EARLY_TRIGGER`` the program first releases
+#: its dependents (``griddepcontrol.launch_dependents``). Placed after every other kernel of this
+#: file, so their source lines and line info are unchanged.
+@triton.jit
+def _router_shard_rows_pdl_kernel(
+    hidden_states,
+    weight,
+    output,
+    scale,
+    TOKENS: tl.constexpr,
+    PER: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    ROWS: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
+):
+    if EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
+    first = tl.program_id(0) * PER
+    expert = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    offsets = tl.arange(0, HIDDEN)
+    w = tl.load(
+        weight + expert[:, None] * HIDDEN + offsets[None, :],
+        expert[:, None] < EXPERTS,
+        other=0.0,
+    )
+    tl.extra.cuda.gdc_wait()
+    for k in tl.static_range(PER):
+        token = first + k
+        if token < TOKENS:
+            x = tl.load(hidden_states + token * HIDDEN + offsets).to(tl.float32)
+            logits = tl.sum(w * x[None, :], axis=1) * scale
+            tl.store(output + token * EXPERTS + expert, logits, expert < EXPERTS)

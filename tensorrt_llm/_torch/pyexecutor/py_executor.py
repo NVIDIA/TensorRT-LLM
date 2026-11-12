@@ -140,6 +140,25 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
 
+# Iteration stats record device memory use. Each torch.cuda.mem_get_info() is
+# an RM ioctl that takes the driver lock; made every iteration it stalls ~1 % of
+# multi-node TEP8 decode steps by 10-100 ms on OCI JHB. Reading it once a second
+# instead leaves stats.gpu_mem_usage at most that stale. One reading per
+# process: an executor process drives one device.
+_MEMINFO_INTERVAL_S = 1.0
+_meminfo_cached: Optional[Tuple[float, Tuple[int, int]]] = None
+
+
+def _iter_stats_mem_get_info() -> Tuple[int, int]:
+    """torch.cuda.mem_get_info() for the iteration stats record, at most once a second."""
+    global _meminfo_cached
+    now = time.monotonic()
+    cached = _meminfo_cached
+    if cached is None or now - cached[0] >= _MEMINFO_INTERVAL_S:
+        cached = _meminfo_cached = (now, torch.cuda.mem_get_info())
+    return cached[1]
+
+
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
@@ -2344,7 +2363,7 @@ class PyExecutor:
         stats.num_completed_requests = num_completed_requests
         stats.max_num_active_requests = self.max_num_active_requests
 
-        end, total_gpu_memory = torch.cuda.mem_get_info()
+        end, total_gpu_memory = _iter_stats_mem_get_info()
         stats.gpu_mem_usage = total_gpu_memory - end
         stats.cpu_mem_usage = 0
         stats.pinned_mem_usage = 0
@@ -3927,6 +3946,15 @@ class PyExecutor:
         transceiver = getattr(self, "kv_cache_transceiver", None)
         if transceiver is None:
             return NoopDisaggCoordinator()
+        is_kv_manager_v2 = getattr(self, "_is_kv_manager_v2", False)
+        # Only the overlap loop admits while the previous forward is still
+        # queued on the execution stream that records the admission fence. A
+        # KV connector is reported after that fence, so it keeps the wait.
+        defer_unready_gen_receives = (
+            is_kv_manager_v2
+            and not getattr(self, "disable_overlap_scheduler", True)
+            and self._dist_size(getattr(self, "dist", None), "pp_size") == 1
+            and getattr(self, "kv_connector_manager", None) is None)
         return DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=getattr(self, "async_transfer_manager", None),
@@ -3941,7 +3969,8 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
-            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False))
+            is_kv_manager_v2=is_kv_manager_v2,
+            defer_unready_gen_receives=defer_unready_gen_receives)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:
@@ -5702,6 +5731,12 @@ class PyExecutor:
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
+
+                    # The previous forward is done, so a receive admitted
+                    # this iteration (its fence recorded behind that forward)
+                    # can start now rather than at the next iteration's poll.
+                    # Rank-local; a no-op unless receive fences are polled.
+                    self.disagg.publish_ready_gen_receives()
 
                 if self.enable_early_first_token_response:
                     if self.previous_batch is not None and should_process_previous_batch:

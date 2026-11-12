@@ -50,6 +50,8 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   prefill work across single-node BF16 TP4/EP4 ranks;
   ``MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS`` (default 4096) sets the smallest step split.
 - ``MUSESPARK_OPEN_BF16X3_ROUTER`` (default off): BF16x3 projection for large routers.
+- ``MUSESPARK_OPEN_FINALIZE_BF16_OUT`` (default off): the model's own unfused expert
+  finalize stores BF16 instead of FP32, bitwise the following cast.
 - ``MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES`` (default off): fuse large-batch routing;
   ``MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER`` preserves Torch's large-batch order.
 - ``MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS`` (default off): use four warps for large
@@ -225,7 +227,7 @@ def post_expert_norm_rows(
 
 @triton.jit
 def _post_expert_norm_combine_kernel(
-    out_ptr,  # [num_tokens, HIDDEN] fp32
+    out_ptr,  # [num_tokens, HIDDEN] fp32, or bf16/fp16 (rounded once at the store)
     gemm2_ptr,  # [num_permuted, >= HIDDEN], any float dtype
     index_ptr,  # [num_tokens * TOP_K] integer, -1 for a non-local slot
     weights_ptr,  # [num_tokens * TOP_K] any float dtype
@@ -292,7 +294,10 @@ def _post_expert_norm_combine_kernel(
     # zeros even if ``eps`` were ever zero, where ``rsqrt(0)`` would otherwise
     # turn the zeroed row into a NaN.
     acc = tl.sum(tl.where(local[:, None], normed * weights[:, None], 0.0), axis=0)
-    tl.store(out_ptr + token * HIDDEN + hoff, acc, mask=in_row)
+    # FP32 accumulation either way. A narrower output is rounded here, once, to
+    # nearest-even -- the same single rounding the caller's ``.to()`` applies to
+    # an FP32 output -- and a same-dtype ``.to`` emits nothing.
+    tl.store(out_ptr + token * HIDDEN + hoff, acc.to(out_ptr.dtype.element_ty), mask=in_row)
 
 
 # Threads per program. Measured, not reasoned: at the checkpoint's width eight
@@ -343,8 +348,9 @@ def _fused_post_expert_norm_combine(
     top_k: int,
     hidden_size: int,
     num_warps: int = _FINALIZE_NUM_WARPS,
+    out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    out = torch.empty((num_tokens, hidden_size), dtype=torch.float32, device=gemm2_output.device)
+    out = torch.empty((num_tokens, hidden_size), dtype=out_dtype, device=gemm2_output.device)
     _post_expert_norm_combine_kernel[(num_tokens,)](
         out,
         gemm2_output,
@@ -365,7 +371,7 @@ def _fused_post_expert_norm_combine(
 
 @triton.jit
 def _post_expert_norm_combine_sparse_kernel(
-    out_ptr,  # [num_tokens, HIDDEN] fp32
+    out_ptr,  # [num_tokens, HIDDEN] fp32, or bf16/fp16 (rounded once at the store)
     gemm2_ptr,  # [num_permuted, >= HIDDEN], any float dtype
     index_ptr,  # [num_tokens * TOP_K] integer, -1 for a non-local slot
     weights_ptr,  # [num_tokens * TOP_K] any float dtype
@@ -410,7 +416,9 @@ def _post_expert_norm_combine_sparse_kernel(
             normed = scaled * tl.rsqrt(variance + eps)
             weight = tl.load(weights_ptr + token * TOP_K + slot).to(tl.float32)
             acc += normed * weight
-    tl.store(out_ptr + token * HIDDEN + hoff, acc, mask=in_row)
+    # As in the tile kernel: one round-to-nearest-even at the store when the
+    # output is narrower than FP32, nothing when it is FP32.
+    tl.store(out_ptr + token * HIDDEN + hoff, acc.to(out_ptr.dtype.element_ty), mask=in_row)
 
 
 _SPARSE_FINALIZE_NUM_WARPS = 4
@@ -433,8 +441,9 @@ def _sparse_post_expert_norm_combine(
     num_tokens: int,
     top_k: int,
     hidden_size: int,
+    out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    out = torch.empty((num_tokens, hidden_size), dtype=torch.float32, device=gemm2_output.device)
+    out = torch.empty((num_tokens, hidden_size), dtype=out_dtype, device=gemm2_output.device)
     _post_expert_norm_combine_sparse_kernel[(num_tokens,)](
         out,
         gemm2_output,
@@ -464,6 +473,7 @@ def post_expert_norm_combine(
     hidden_size: int,
     num_warps: int = _FINALIZE_NUM_WARPS,
     sparse_slots: bool = False,
+    out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Weight-first RMSNorm each selected expert output, then combine, in FP32.
 
@@ -483,7 +493,23 @@ def post_expert_norm_combine(
     reads only the local slots of each token instead of the whole top-k tile.
     ``num_warps`` sets the tile kernel's width only; the sparse kernel always
     runs ``_SPARSE_FINALIZE_NUM_WARPS`` warps.
+
+    ``out_dtype`` is the dtype of the returned tensor; the accumulation is FP32
+    either way. FP32 (the default) is the unchanged function. BF16 or FP16 is
+    the FP32 result rounded once to nearest-even -- in the kernel's store, or by
+    ``.to`` on the reference composition -- so it is bitwise
+    ``post_expert_norm_combine(...).to(out_dtype)`` without the FP32 tensor's
+    write, read and second launch. ``MuseSparkOpenMoE.forward`` asks for BF16
+    only under ``MUSESPARK_OPEN_FINALIZE_BF16_OUT``; every other caller,
+    including the attention-DP combine hook, keeps FP32.
     """
+    if out_dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise ValueError(f"post_expert_norm_combine cannot return {out_dtype}")
+    # Passed on to the launch wrappers only when it is not the default, so the
+    # FP32 call is exactly today's: modeling_v2's context-SP path swaps
+    # ``_sparse_post_expert_norm_combine`` for a launch of the same pre-out_dtype
+    # signature (``context_sequence_parallel/moe.py: _SparseFinalizeTo``).
+    narrow_out = {} if out_dtype == torch.float32 else {"out_dtype": out_dtype}
     # ``num_tokens == 0`` happens on the zero-token DP pad and would launch an
     # empty grid; a row-major ``gemm2_output`` is what the kernel's single row
     # stride assumes. Both fall back rather than assert, because both are
@@ -508,6 +534,7 @@ def post_expert_norm_combine(
             num_tokens=num_tokens,
             top_k=top_k,
             hidden_size=hidden_size,
+            **narrow_out,
         )
     if on_cuda and num_tokens > 0 and row_major:
         return _fused_post_expert_norm_combine(
@@ -520,6 +547,7 @@ def post_expert_norm_combine(
             top_k=top_k,
             hidden_size=hidden_size,
             num_warps=num_warps,
+            **narrow_out,
         )
     normed, _ = post_expert_norm_rows(
         gemm2_output,
@@ -531,7 +559,8 @@ def post_expert_norm_combine(
         hidden_size=hidden_size,
     )
     weights = routing_weights.reshape(num_tokens, top_k, 1).to(torch.float32)
-    return (normed * weights).sum(dim=1)
+    # ``.to`` of an FP32 tensor to FP32 returns it unchanged.
+    return (normed * weights).sum(dim=1).to(out_dtype)
 
 
 def _version_or_none(tensor: torch.Tensor) -> Optional[int]:
@@ -819,6 +848,25 @@ def _large_finalize_sparse_enabled() -> bool:
     Resolved at module construction, before warmup and any graph capture.
     """
     return os.environ.get("MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _finalize_bf16_out_enabled() -> bool:
+    """Whether ``MuseSparkOpenMoE.forward``'s own finalize stores BF16 instead of FP32.
+
+    Off unless MUSESPARK_OPEN_FINALIZE_BF16_OUT names a truthy value. The
+    finalize's FP32 output is cast to the BF16 activation dtype on the very next
+    line of ``forward``, so the kernel can round at its store instead: the same
+    single round-to-nearest-even, so BITWISE the same tensor, with half the
+    finalize write and no separate cast kernel. Only that call site asks for it;
+    the attention-DP ``unfinalized_combine_fn`` hook keeps FP32. Resolved at
+    module construction, before warmup and any graph capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_FINALIZE_BF16_OUT", "0").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -2066,6 +2114,7 @@ class MuseSparkOpenMoE(nn.Module):
         self.mapping = model_config.mapping
         self._large_finalize_4warps = os.getenv("MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS", "0") == "1"
         self._large_finalize_sparse = _large_finalize_sparse_enabled()
+        self._finalize_bf16_out = _finalize_bf16_out_enabled()
         self._finalize_ar_max_tokens = (
             _FINALIZE_AR_CHUNKED_MAX_TOKENS if _fused_finalize_ar_chunked_enabled() else 128
         )
@@ -2440,10 +2489,15 @@ class MuseSparkOpenMoE(nn.Module):
         routing_weights: torch.Tensor,
         num_tokens: int,
         token_selected_slots: Optional[torch.Tensor] = None,
+        *,
+        out_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
         # ``token_selected_slots`` is part of the ``unfinalized_combine_fn``
         # contract for per-expert transforms; the post-expert norm is the same
         # for every expert, so this finalize does not consult it.
+        # ``out_dtype`` is NOT part of that contract: the scheduler never passes
+        # it, so the attention-DP combine reduces FP32 partials as before. Only
+        # ``forward``'s own call asks for BF16 (MUSESPARK_OPEN_FINALIZE_BF16_OUT).
         del token_selected_slots
         if self.mapping.moe_tp_size > 1:
             # Backend row permutations are rank-local. Reduce in canonical
@@ -2481,6 +2535,8 @@ class MuseSparkOpenMoE(nn.Module):
                 getattr(self, "_large_finalize_sparse", False)
                 and num_tokens >= _SPARSE_FINALIZE_MIN_TOKENS
             ),
+            # Only when narrowed, so the default call is exactly today's.
+            **({} if out_dtype == torch.float32 else {"out_dtype": out_dtype}),
         )
 
     def forward(
@@ -2603,6 +2659,20 @@ class MuseSparkOpenMoE(nn.Module):
                         num_tokens,
                     )
                     finalize_ar_used = True
+                elif (
+                    getattr(self, "_finalize_bf16_out", False)
+                    and hidden_states.dtype == torch.bfloat16
+                ):
+                    # MUSESPARK_OPEN_FINALIZE_BF16_OUT: the kernel rounds at its
+                    # store, so the cast below is a no-op and the result is
+                    # bitwise what that cast produced from the FP32 output.
+                    combined = self.finalize(
+                        gemm2_output,
+                        expanded_idx_to_permuted_idx,
+                        token_final_scales,
+                        num_tokens,
+                        out_dtype=torch.bfloat16,
+                    )
                 else:
                     combined = self.finalize(
                         gemm2_output, expanded_idx_to_permuted_idx, token_final_scales, num_tokens
@@ -2623,6 +2693,8 @@ class MuseSparkOpenMoE(nn.Module):
         # anyway -- but it is a real numerics change and the parity gates
         # decide it, not this argument. For pure MoE TP, finalize has already
         # reduced each expert before normalization; only the cast remains.
+        # Under MUSESPARK_OPEN_FINALIZE_BF16_OUT the finalize above already
+        # rounded to BF16 at its store and this returns ``combined`` itself.
         combined = combined.to(hidden_states.dtype)
         # ``has_tp()`` is only ``tp_size > 1``; it knows nothing about attention
         # DP. Under attention DP the ranks of the TP group hold DIFFERENT

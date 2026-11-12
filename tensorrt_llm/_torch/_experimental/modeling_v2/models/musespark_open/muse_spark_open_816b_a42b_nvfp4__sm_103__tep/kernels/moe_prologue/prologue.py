@@ -90,12 +90,60 @@ from ...ops.comm import pool_gather_route as _route
 from ...ops.comm.projection_inbox import MAX_ROWS, ProjectionInbox
 from ...ops.moe import router_shard as _shard
 from ..context_kv_fork.fork import dedicated_stream
-from ..projection_gathers.gathers import MuseSparkOpenTepGatherMoE, _require_aligned
+from ..projection_gathers.gathers import MuseSparkOpenTepGatherMoE, _require_aligned, fused_rows
 
 #: The built-in code the routed prologue reproduces: the router kernel and its
 #: launch choice (``_router_projection_kernel``, ``MuseSparkOpenMoE.router_logits``),
 #: the routing kernel (``_full_routing_kernel``) and the memo the experts and the
 #: finalize read (``MuseSparkOpenRoutingMethod.apply``); its ``reference`` runs them.
+
+#: ``_report_tep8``'s (rows, reason) pairs already logged in this process.
+_TEP8_REPORTED = set()
+
+
+def _report_tep8(
+    world: int,
+    rows: int,
+    layer: int,
+    declined: Optional[str],
+    router_rows: bool = False,
+    direct: bool = False,
+) -> None:
+    """Log, once per process and row count (and reason), what a TP8 wide prologue call did.
+
+    TP8 only (``wide_prologue.install_tep8``, ``tep8_router_shard``): the first
+    served call at a row count names the router shard and the routed pool kernel; a declined
+    call names why it keeps the built-in prepare (the BF16-expert layers decline by design).
+    TP4 logs nothing, as before.
+    """
+    if world != 8 or (rows, declined, direct) in _TEP8_REPORTED:
+        return
+    _TEP8_REPORTED.add((rows, declined, direct))
+    if declined is None and direct:
+        router = "router_shard_rows (one-request bits)" if router_rows else "router_shard_wide"
+        logger.info(
+            f"[musespark_open] tep8 router shard: a captured {rows}-row decode step runs {router} into "
+            "the wide direct pool transport's logit block, the pool slice GEMM into its slot, and "
+            "pool_direct_route's wide routing (tep8_wide_direct_pool; first at layer "
+            f"{layer}; logged once per row count)"
+        )
+    elif declined is None:
+        router = "router_shard_rows (one-request bits)" if router_rows else "router_shard_wide"
+        logger.info(
+            f"[musespark_open] tep8 router shard: a {rows}-row decode step runs {router} on the "
+            "router fork and the logit exchange + routing in pool_gather_route on the TP8 wide "
+            f"inbox (first at layer {layer}; logged once per row count)"
+        )
+    elif declined.startswith("no fused"):
+        logger.info(
+            f"[musespark_open] tep8 router shard: a {rows}-row call of layer {layer} keeps the "
+            f"built-in prepare ({declined}; expected on the BF16-expert layers)"
+        )
+    else:
+        logger.warning(
+            f"[musespark_open] tep8 router shard: a {rows}-row call of layer {layer} keeps the "
+            f"built-in prepare ({declined})"
+        )
 
 
 def _placement(moe, world: Optional[int] = None):
@@ -131,8 +179,35 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
     #: ``pool_direct.DirectPoolSite`` (its producers publish into the routed kernel's
     #: transport); None otherwise.
     _pool_direct_armed = None
+    #: ``wide_prologue``: the TP4 wide inbox (``WIDE_MAX_ROWS`` rows) of the 16..32-row
+    #: prologue, or None (those steps keep the built-in prepare). At TP8 the inbox
+    #: ``wide_prologue.install_tep8`` builds (``tep8_router_shard``).
+    _wide_inbox: Optional[ProjectionInbox] = None
+    #: ``wide_prologue``: whether the 16..32-row router shard gives each row its
+    #: one-request bits (``router_shard_rows``) instead of the built-in tensor-core
+    #: router's (``router_shard_wide``); the ``wide_router_per_row`` lever at TP4,
+    #: ``tep8_router_shard`` without ``tep8_router_shard_wide`` under ``install_tep8``.
+    _wide_router_rows: bool = False
+    #: ``wide_prologue.install_tep8`` with ``TRTLLM_MUSESPARK_TEP8_ROUTER_SHARD_EARLY``: on the
+    #: router fork's side stream, ``router_shard_rows`` is a programmatic launch (its weight tile
+    #: before its dependency wait; ``"entry"`` also releases the routed pool kernel at entry)
+    #: instead of a plain one. None keeps the plain launch.
+    _wide_router_early: Optional[str] = None
+    #: ``wide_prologue``: whether ``pool_into_route`` and ``unpool_into_boundary`` also
+    #: build their 16..32-row direct transports; the ``wide_direct_transports`` lever.
+    #:
+    #: NOT ``_wide_direct``: this mixin is re-classed in front of the MoE, and
+    #: projection_gathers.MuseSparkOpenTepGatherMoE uses ``_wide_direct`` for the wide direct
+    #: transport OBJECT (default None), read as ``.is_armed``. A bool here shadows that None
+    #: through the MRO, so ``wide_direct is not None`` passed and every 8-row decode step
+    #: raised AttributeError("'bool' object has no attribute 'is_armed'") at warmup.
+    _wide_direct_built: bool = False
 
     def prepare_moe_inputs(self, hidden_states: torch.Tensor):
+        if self._wide_inbox is not None:
+            wide = self._wide_prepare(hidden_states)
+            if wide is not None:
+                return wide
         warps = self._prologue_router_warps(hidden_states)
         if warps is None:
             self._pool_direct_refuse_declined(hidden_states)
@@ -212,6 +287,125 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
                 **({} if early is None else {"early": early}),
             )
         self._prologue_record_routing(out, place, state, world)
+        return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
+
+    def _wide_router_shard(
+        self, hidden_states: torch.Tensor, rank: int, warps: int, out: torch.Tensor, world: int
+    ) -> None:
+        """This rank's router logit columns of a 16..32-row call into ``out`` (``[rows, L]`` FP32).
+
+        By default ``router_shard_wide``: the built-in 16..32-row router's bits (its TF32x3
+        tensor-core split-K and reduce). With ``_wide_router_rows``, ``router_shard_rows`` at
+        ``warps``: each row's logits are the built-in small-batch router's for that row in a
+        one-request call, one launch and no reduce, but other bits than the built-in
+        16..32-row launch's. With ``_wide_router_early`` and on the router fork's stream, the
+        launch is programmatic (``router_shard_rows(enable_pdl=True)``): the same bits, the
+        weight tile streamed while the producer of ``hidden_states`` finishes.
+        """
+        if self._wide_router_rows:
+            early = self._wide_router_early
+            side = self._router_stream
+            if early is not None and (
+                side is None or torch.cuda.current_stream().cuda_stream != side.cuda_stream
+            ):
+                early = None
+            _shard.router_shard_rows(
+                hidden_states,
+                self.router.weight,
+                rank,
+                self.metap_multiplier,
+                warps,
+                out,
+                ranks=world,
+                enable_pdl=early is not None,
+                early_trigger=early == "entry",
+            )
+        else:
+            _shard.router_shard_wide(
+                hidden_states, self.router.weight, rank, self.metap_multiplier, out, ranks=world
+            )
+
+    def _wide_prepare(self, hidden_states: torch.Tensor):
+        """``wide_prologue``: the prologue of a 16..32-row decode step, or None (nothing launched).
+
+        Where the built-in decode would run its tensor-core router and the fused routing on
+        a pool-deferring call of 16..32 rows: this rank's router columns
+        (``_wide_router_shard``) on the router fork's side stream, the pool slice GEMM on the
+        current one, and ``pool_gather_route`` on the
+        wide inbox -- the pool gather + quantization, the logit exchange and the routing
+        (no placement: above 8 rows the experts are the built-in ones and read only the
+        routing memo). The pool slice is this rank's columns of the built-in replicated
+        pool projection, by a GEMM of its own shape.
+        """
+        rows = hidden_states.shape[0] if hidden_states.dim() == 2 else 0
+        if not _shard.WIDE_MIN_ROWS <= rows <= _shard.WIDE_MAX_ROWS:
+            return None
+        if self._prologue_router_conditions(hidden_states, _shard.WIDE_MAX_ROWS) is None:
+            # pool_into_route's wide site (tep8_wide_direct_pool) armed this layer:
+            # its peers poll the transport for its record, so a decline raises instead.
+            self._pool_direct_refuse_declined(hidden_states)
+            return None
+        inbox = self._wide_inbox
+        world = inbox.world
+        # The pool slice reaches the routed kernel only where the pool projection defers its
+        # gather at this row count: always under wide_prologue's TP4 install (_defer_max_rows
+        # 32); at TP8 (install_tep8) while wide_projection_gathers is armed (fused_rows 32).
+        if rows > max(self._defer_max_rows, fused_rows(self)):
+            self._pool_direct_refuse_declined(hidden_states)
+            _report_tep8(world, rows, self.layer_idx, "the pool slice is not deferred")
+            return None
+        columns = _route.local_columns(world)
+        probe = hidden_states.view(-1)[: rows * columns].view(rows, columns)
+        args = self._pool_quant_args(probe, max_rows=inbox.max_rows)
+        if args is None:
+            self._pool_direct_refuse_declined(hidden_states)
+            _report_tep8(world, rows, self.layer_idx, "no fused NVFP4 pre-expert quantization")
+            return None
+        gain, global_scale = args
+        # One request's warp count (the built-in launch's at 8 rows), for router_shard_rows.
+        warps = _shard.builtin_warps(
+            _shard.MAX_ROWS, getattr(self, "_prepare_stream", None) is not None
+        )
+        if self._pool_direct_armed is not None:
+            # pool_into_route's wide site: the same chain with the producers publishing.
+            return self._pool_direct_armed.prepare(self, hidden_states, warps, gain, global_scale)
+        routing = self.experts.routing_method
+        side = self._router_stream
+        local = _shard.local_experts(world)
+        with self.nvtx("router"):
+            main = torch.cuda.current_stream()
+            logits_local = torch.empty(
+                (rows, local), device=hidden_states.device, dtype=torch.float32
+            )
+            if side is None:
+                self._wide_router_shard(hidden_states, inbox.rank, warps, logits_local, world)
+            else:
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    self._wide_router_shard(hidden_states, inbox.rank, warps, logits_local, world)
+        with self.nvtx("pool"):
+            projected = self._replicated_projection(
+                self.pooler, hidden_states, self._pool_gather_workspace
+            )
+            if side is not None:
+                main.wait_stream(side)
+            bias = routing.e_score_correction_bias
+            _require_aligned(pooled=projected, gain=gain, bias=bias, logits=logits_local)
+            out = _route.pool_gather_route(
+                projected,
+                logits_local,
+                inbox,
+                gain,
+                global_scale,
+                self.pre_expert_norm.variance_epsilon,
+                bias,
+                routing.renorm_eps,
+                _route.PLACE_NONE,
+                enable_pdl=self._prologue_enable_pdl,
+                return_gathered=False,
+            )
+        self._prologue_record_routing(out, _route.PLACE_NONE, None, world)
+        _report_tep8(world, rows, self.layer_idx, None, self._wide_router_rows)
         return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
 
     def _prologue_record_routing(self, out, place: int, state, world: int = 8) -> None:

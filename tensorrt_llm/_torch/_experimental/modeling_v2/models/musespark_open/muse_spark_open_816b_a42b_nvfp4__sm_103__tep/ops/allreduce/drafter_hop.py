@@ -143,6 +143,42 @@ WIDE_MAX_ROWS = 256
 WIDE_SERVED_ROWS_BY_SM: dict[tuple[int, int], int] = {(10, 3): 56}
 
 
+#: The widest TP8 bound the lever may name: the blocks of 8 requests at K = 7.
+TP8_WIDE_MAX_ROWS = 64
+#: ``wide_drafter_hops__TP8_MAX_ROWS``: the rows of the wide workspace at TP8 (two trays),
+#: which only the lever names (no ``WIDE_SERVED_ROWS_BY_SM`` entry covers that layout).
+_TP8_WIDE_ROWS = TP8_WIDE_MAX_ROWS
+
+
+def configure(*, tep8_wide_rows: int = TP8_WIDE_MAX_ROWS) -> None:
+    """Set the rows of the TP8 wide drafter-hop workspace.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install. It is read only
+    where that workspace is built (``kernels/drafter_hops.install_wide`` at TP8), so the
+    default changes nothing on a plan without ``wide_drafter_hops``.
+
+    Args:
+        tep8_wide_rows: the workspace's rows (``_TP8_WIDE_ROWS``),
+            ``MAX_ROWS + 1``..``TP8_WIDE_MAX_ROWS``.
+
+    Raises:
+        ValueError: for a row count outside that range.
+    """
+    global _TP8_WIDE_ROWS
+    rows = int(tep8_wide_rows)
+    if not MAX_ROWS < rows <= TP8_WIDE_MAX_ROWS:
+        raise ValueError(
+            f"[musespark_open] wide_drafter_hops TP8 rows {rows}: expected "
+            f"{MAX_ROWS + 1}..{TP8_WIDE_MAX_ROWS}"
+        )
+    _TP8_WIDE_ROWS = rows
+
+
+def tp8_wide_rows() -> int:
+    """The TP8 wide workspace's rows, as ``configure`` set them."""
+    return _TP8_WIDE_ROWS
+
+
 def wide_served_rows(capability: Optional[Tuple[int, int]] = None) -> int:
     """The served wide workspace's rows on ``capability`` (this process's device when None).
 
