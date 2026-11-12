@@ -393,7 +393,8 @@ class TestRankState:
             1,
             7,
             321,
-            2,  # Rank state prefix.
+            2,
+            0,  # Rank state prefix.
             -2,
             1,
             1,
