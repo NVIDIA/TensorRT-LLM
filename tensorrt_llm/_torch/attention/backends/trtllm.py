@@ -2240,9 +2240,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return (self.is_mla_enable and self.has_fp8_kv_cache
                 and _has_fp8_context_mla_fmha(get_sm_version()))
     def has_fmha_library(self, fmha_cls: type) -> bool:
-        """Whether this layer may dispatch to the given FMHA library."""
-        return any(
-            isinstance(fmha, fmha_cls) for fmha in self._fmha_manager.fmha_libs)
+        """Whether this layer has the library configured; request support is checked later."""
+        manager = getattr(self, "_fmha_manager", None)
+        if manager is None:
+            return False
+        return any(isinstance(fmha, fmha_cls) for fmha in manager.fmha_libs)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()

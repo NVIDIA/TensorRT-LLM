@@ -756,8 +756,21 @@ class DecoderWarmup:
                 and isinstance(module.attn, TrtllmAttention)
                 and module.attn.has_fmha_library(FlashInferTrtllmGenFmha)
             ):
-                FlashInferTrtllmGenFmha.prewarm()
-                return
+                try:
+                    FlashInferTrtllmGenFmha.prewarm()
+                except Exception as e:
+                    # This optional build may cover kernels the layer never selects.
+                    # Defer failures to the first forward that actually needs them.
+                    logger.warning(
+                        "FlashInfer TRTLLM-Gen FMHA prewarm failed; retrying lazily on first use. "
+                        f"{type(e).__name__}: {e}"
+                    )
+                break
+
+        # Eligibility and build success may differ across TP peers. Every peer
+        # meets here before a forward can start a collective's timeout clock.
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
 
     def _prewarm_cute_dsl_indexer_q(self) -> None:
         """Pre-compile the DSv4 indexer-Q CuTe DSL kernels, then barrier.

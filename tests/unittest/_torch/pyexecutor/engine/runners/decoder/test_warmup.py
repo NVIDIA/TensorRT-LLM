@@ -1918,10 +1918,11 @@ def test_decode_only_warmup_requests_generation_shapes_only(decode_only: bool) -
             assert context_shapes, shapes
 
 
-def _fmha_prewarm_owner(modules: list, pp_size: int) -> SimpleNamespace:
+def _fmha_prewarm_owner(modules: list, pp_size: int, tp_size: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         model=SimpleNamespace(modules=lambda: iter(modules)),
-        mapping=SimpleNamespace(pp_size=pp_size),
+        mapping=SimpleNamespace(pp_size=pp_size, tp_size=tp_size),
+        dist=Mock(),
     )
 
 
@@ -2000,8 +2001,58 @@ def test_trtllm_attention_reports_its_fmha_libraries() -> None:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
     attn = object.__new__(TrtllmAttention)
+    assert not attn.has_fmha_library(FlashInferTrtllmGenFmha)
+    attn._fmha_manager = None
+    assert not attn.has_fmha_library(FlashInferTrtllmGenFmha)
     attn._fmha_manager = SimpleNamespace(fmha_libs=[object.__new__(FallbackFmha)])
     assert not attn.has_fmha_library(FlashInferTrtllmGenFmha)
 
     attn._fmha_manager.fmha_libs.insert(0, object.__new__(FlashInferTrtllmGenFmha))
     assert attn.has_fmha_library(FlashInferTrtllmGenFmha)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("eligible", [False, True])
+@pytest.mark.parametrize("build_fails", [False, True])
+def test_flashinfer_fmha_prewarm_meets_tp_peers_after_build(
+    eligible: bool, build_fails: bool
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+
+    owner = _fmha_prewarm_owner(
+        [_attention_layer(uses_flashinfer_fmha=eligible)], pp_size=4, tp_size=2
+    )
+    events = []
+
+    def build() -> None:
+        events.append("build")
+        if build_fails:
+            raise RuntimeError("JIT module unavailable")
+
+    owner.dist.tp_allgather.side_effect = lambda _: events.append("barrier")
+    with (
+        patch.object(FlashInferTrtllmGenFmha, "serves_only_extra_page_sizes", return_value=False),
+        patch.object(FlashInferTrtllmGenFmha, "prewarm", side_effect=build),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+    ):
+        DecoderWarmup._prewarm_flashinfer_trtllm_gen_fmha(owner)
+
+    assert events == (["build"] if eligible else []) + ["barrier"]
+    owner.dist.tp_allgather.assert_called_once_with(1)
+    assert warning.call_count == int(eligible and build_fails)
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_fmha_prewarm_initializes_decode_and_prefill_modules() -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
+
+    decode, prefill = Mock(), Mock()
+    flashinfer = SimpleNamespace(
+        decode=SimpleNamespace(get_trtllm_gen_fmha_module=decode),
+        prefill=SimpleNamespace(get_trtllm_gen_fmha_module=prefill),
+    )
+    with patch.object(flashinfer_trtllm_gen, "flashinfer", flashinfer, create=True):
+        flashinfer_trtllm_gen.FlashInferTrtllmGenFmha.prewarm()
+
+    decode.assert_called_once_with()
+    prefill.assert_called_once_with()
