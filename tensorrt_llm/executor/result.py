@@ -617,12 +617,10 @@ class GenerationResultBase:
                 # count prompt tokens. It reports cached tokens only for a
                 # request's finished first candidate, which is where
                 # `record_stats` counts the prompt too.
-                prompt_token_ids = getattr(self, "prompt_token_ids", None)
                 if (MetricNames.PROMPT_CACHE_CACHED_TOKENS in response.metrics
                         and MetricNames.PROMPT_TOKENS not in self.metrics_dict
-                        and prompt_token_ids):
-                    self.metrics_dict[MetricNames.PROMPT_TOKENS] = len(
-                        prompt_token_ids)
+                        and (prompt_len := self._prompt_len())):
+                    self.metrics_dict[MetricNames.PROMPT_TOKENS] = prompt_len
 
             if self._done:
                 req_perf_metrics_dict = _build_perf_metrics_dict(
@@ -789,6 +787,19 @@ class GenerationResultBase:
         else:
             raise ValueError(f"Unknown response type: {response}")
 
+    def _prompt_len(self) -> int:
+        """Number of prompt tokens, for metrics and tracing.
+
+        Reads ``GenerationRequest.prompt_len`` when this result has a request:
+        ``len(self.prompt_token_ids)`` would materialize an int32-buffered
+        prompt as a Python list (O(ISL)) on every finished request.
+        """
+        request = getattr(self, "_generation_request", None)
+        if request is not None:
+            return request.prompt_len
+        prompt_token_ids = getattr(self, "prompt_token_ids", None)
+        return len(prompt_token_ids) if prompt_token_ids is not None else 0
+
     def record_stats(self,
                      output: CompletionOutput,
                      stats: Optional[dict[str, float]] = None,
@@ -819,10 +830,9 @@ class GenerationResultBase:
             metrics_stats.update(processed_metrics_stat)
         # Record prompt tokens only for the first candidate to avoid
         # double-counting the shared prompt across n candidates.
-        prompt_token_ids = getattr(self, "prompt_token_ids", None)
         if output.finish_reason and sequence_index == 0:
-            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
-                metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+            if (prompt_len := self._prompt_len()) > 0:
+                metrics_stats[MetricNames.PROMPT_TOKENS] = prompt_len
 
         # Request-scoped metrics: only record for the first candidate to avoid
         # double-counting across n candidates.
@@ -846,6 +856,9 @@ class GenerationResultBase:
                     metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
                         [spec_dec.total_draft_tokens]
 
+            # Only prefill perplexity needs the prompt ids themselves.
+            prompt_token_ids = getattr(self, "prompt_token_ids",
+                                       None) if output.prompt_logprobs else None
             if output.prompt_logprobs and prompt_token_ids:
                 try:
                     prompt_lps = []
@@ -959,10 +972,10 @@ class GenerationResultBase:
                           sampling_params.n)
             safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_ID,
                           self.id)
-            if prompt_token_ids := getattr(self, "prompt_token_ids", None):
+            if prompt_len := self._prompt_len():
                 safe_set_attr(span,
                               tracing.SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
-                              len(prompt_token_ids))
+                              prompt_len)
             safe_set_attr(span,
                           tracing.SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS,
                           output.length)
