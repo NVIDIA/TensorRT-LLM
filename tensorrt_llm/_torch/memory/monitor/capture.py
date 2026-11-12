@@ -31,12 +31,12 @@ from .capability import NVML_UNAVAILABLE, Capability, nvml_process_usage, probe_
 from .checks import CheckResult, check_kv_pool_conservation, check_tag_coverage
 from .frame import DeviceReading, Frame, TorchReading, build_frame
 from .names import CUDA_GRAPHS, UNTAGGED, WEIGHTS
-from .pools import pool_usage
+from .pools import pool_usage, released_tags_pinned
 from .providers import collect_all
 from .report import render
 from .schema import Basis, Category, Entry, Group, Placement, Source
 from .summary import group_totals
-from .tagging import get_frozen_map, live_attribution, live_bytes_by_tag
+from .tagging import get_frozen_map, live_attribution
 
 __all__ = ["MonitorCapture", "capture", "read_device", "read_torch", "render_capture"]
 
@@ -146,7 +146,7 @@ _TAG_CATEGORIES: dict[str, Category] = {
 }
 
 
-def _tag_entries(by_tag: dict[str, int] | None = None) -> list[Entry]:
+def _tag_entries(by_tag: dict[str, int]) -> list[Entry]:
     """Monitor entries for the startup tags and claimed modules.
 
     Returns nothing when nothing was attributed, so the torch-side rows stay
@@ -156,8 +156,6 @@ def _tag_entries(by_tag: dict[str, int] | None = None) -> list[Entry]:
     an ``unattributed_live`` row from ``torch_live`` minus the tagged total,
     and emitting both would double count.
     """
-    if by_tag is None:
-        by_tag = live_bytes_by_tag(get_frozen_map())
     entries: list[Entry] = []
     for label, size in sorted(by_tag.items()):
         if label == UNTAGGED or not size:
@@ -246,14 +244,17 @@ def capture(
         device_index = torch.cuda.current_device()
 
     # One allocator snapshot serves the torch reading, the pool split and the
-    # tags: a snapshot costs milliseconds, and two would disagree.
+    # tags: a snapshot costs milliseconds, and two would disagree. The sleep
+    # release state is pinned for the same reason: sleep or wakeup on another
+    # thread must not change it between the readings below.
     segments = _segments(device_index)
-    torch_reading = read_torch(device_index, segments)
-    # One tag reading feeds the entries, check B and the stack breakdown;
-    # reading twice would let the allocator move between them.
-    by_tag, sites = live_attribution(get_frozen_map(), segments)
-    pool_rows: dict[str, list[dict]] = {}
-    entries = collect_all(pool_rows=pool_rows) + _tag_entries(by_tag)
+    with released_tags_pinned():
+        torch_reading = read_torch(device_index, segments)
+        # One tag reading feeds the entries, check B and the stack breakdown;
+        # reading twice would let the allocator move between them.
+        by_tag, sites = live_attribution(get_frozen_map(), segments)
+        pool_rows: dict[str, list[dict]] = {}
+        entries = collect_all(pool_rows=pool_rows) + _tag_entries(by_tag)
     checks = _run_checks(by_tag, torch_reading.live, pool_rows)
 
     frame = build_frame(read_device(device_index), torch_reading, entries)

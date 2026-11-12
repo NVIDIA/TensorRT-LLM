@@ -17,7 +17,7 @@
 Three rules the renderer enforces, because each corresponds to a way these
 reports mislead in practice:
 
-* An unmeasurable quantity renders as ``unsupported`` or ``unavailable``,
+* An unmeasurable quantity renders as ``unknown`` or ``unavailable``,
   never as ``0.00 GiB``.
 * ``reserved - allocated`` is labelled "reserved, not handed out", not
   "fragmentation": it also holds blocks awaiting release on other streams.
@@ -32,7 +32,7 @@ from .frame import Frame, derived_entries
 from .schema import GIB, Category, Entry, Group, Placement
 from .summary import group_totals, render_summary
 
-__all__ = ["UNAVAILABLE", "render"]
+__all__ = ["render"]
 
 UNKNOWN = "       unknown"
 UNAVAILABLE = "   unavailable"

@@ -223,7 +223,11 @@ def test_creation_steps_tag_their_allocations():
     try:
         assert tagging.live_bytes_by_tag(frozen).get("guided_decoder", 0) >= 16 << 20
         # Reported under the executor's own name for the step.
-        entries = [e for e in _tag_entries() if e.category is Category.SAMPLER]
+        entries = [
+            e
+            for e in _tag_entries(tagging.live_bytes_by_tag(tagging.get_frozen_map()))
+            if e.category is Category.SAMPLER
+        ]
         assert entries and entries[0].owner == "Sampler"
         assert entries[0].size_bytes >= 32 << 20
     finally:

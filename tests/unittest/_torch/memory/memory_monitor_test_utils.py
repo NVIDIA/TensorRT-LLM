@@ -43,6 +43,21 @@ def capability(**overrides: object) -> Capability:
     return Capability(**fields)
 
 
+def capture_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Warnings logged from now on, each once-only warning included again."""
+    from tensorrt_llm.logger import logger
+
+    warnings: list[str] = []
+    monkeypatch.setattr(logger, "_appeared_keys", set())
+
+    def log(severity, *msg):
+        if severity == logger.WARNING:
+            warnings.append(" ".join(str(m) for m in msg))
+
+    monkeypatch.setattr(logger, "log", log)
+    return warnings
+
+
 def kv_stats(
     total: int, free: int, evictable: int, slot_sizes: tuple[int, ...] = (MB,)
 ) -> types.SimpleNamespace:

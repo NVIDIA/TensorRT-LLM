@@ -33,7 +33,7 @@ from dataclasses import dataclass
 
 from . import startup
 from .frame import DeviceReading, Frame, derived_entries
-from .schema import GIB, GROUP_OF, Category, Group, Source
+from .schema import GIB, GROUP_OF, Category, Group, Source, signed_gib
 
 __all__ = ["GROUP_OF", "Group", "GroupTotals", "group_totals", "render_summary"]
 
@@ -50,7 +50,7 @@ _NOTES = {
     Group.CUDA_GRAPHS: "held by captured CUDA graphs for replay; not reusable",
     Group.COMMUNICATION: "multi-GPU communication buffers",
     Group.OVERHEAD: "CUDA context, cuBLAS, NCCL internals and other driver memory",
-    Group.OTHER: "tagged with a name the report does not group",
+    Group.OTHER: "tagged with a name the report does not group, or free in a private pool",
 }
 
 
@@ -104,7 +104,11 @@ def group_totals(frame: Frame) -> GroupTotals:
             if kind == "default" or not free or pool.released:
                 continue
             group = Group.CUDA_GRAPHS if kind == "graph" else Group.OTHER
-            name = "free in graph pools" if kind == "graph" else f"{label} pool, free"
+            name = (
+                "free in graph pools"
+                if kind == "graph"
+                else f"free in pool '{label}', reusable only by that pool"
+            )
             sizes[group] = (sizes.get(group) or 0) + free
             by_owner = members.setdefault(group, {})
             by_owner[name] = by_owner.get(name, 0) + free
@@ -187,8 +191,7 @@ def _size(value: int | None) -> str:
 def _delta(now: int | None, before: int | None) -> str:
     if now is None or before is None:
         return ""
-    change = (now - before) / GIB
-    return f"{change:+9.2f} GiB"
+    return f"{signed_gib(now - before, 9)} GiB"
 
 
 def render_summary(
@@ -276,8 +279,10 @@ def render_summary(
         out.append(f"{line}   {note}")
         parts = [(n, b) for n, b in (totals.members or {}).get(group, []) if abs(b) >= _SHOWN]
         # A single owner usually just restates the row, but for the two
-        # residual rows the name of the only part is the information.
-        if len(parts) > 1 or (parts and group in (Group.TORCH_UNATTRIBUTED, Group.OVERHEAD)):
+        # residual rows and the catch-all row the name of the only part is
+        # the information.
+        named_alone = (Group.TORCH_UNATTRIBUTED, Group.OVERHEAD, Group.OTHER)
+        if len(parts) > 1 or (parts and group in named_alone):
             listed = ", ".join(f"{n} {b / GIB:.2f}" for n, b in parts[:5])
             more = f", +{len(parts) - 5} more" if len(parts) > 5 else ""
             out.append(f"  {'':<28s}  of which (GiB): {listed}{more}")
@@ -355,7 +360,7 @@ def _conclusion(
             grew = grown[focus]
             lines.append(
                 f"  Conclusion: since warmup, {focus.value} grew the most "
-                f"({grown[focus] / GIB:+.2f} GiB)."
+                f"({signed_gib(grown[focus])} GiB)."
             )
         else:
             lines.append("  Conclusion: nothing has grown since warmup.")
@@ -386,7 +391,14 @@ def _conclusion(
     # specific evidence a report has; when it is large or memory ran out it
     # outranks the generic advice for the row.
     activation = _profiled_activation()
-    explained = _growth_suggestion(focus, grew, advice.get(focus), sites, activation)
+    explained = _growth_suggestion(
+        focus,
+        grew,
+        advice.get(focus),
+        sites,
+        activation,
+        includes_other_processes=totals.process_total_is_upper_bound,
+    )
     unexplained = grew
     if focus is Group.TORCH_UNATTRIBUTED and activation:
         unexplained = grew - activation
@@ -416,6 +428,7 @@ def _growth_suggestion(
     advice: str | None,
     sites: dict[str, int] | None,
     activation: int | None = None,
+    includes_other_processes: bool = False,
 ) -> str:
     """What to do about a row that grew since warmup, or ``""``.
 
@@ -444,15 +457,29 @@ def _growth_suggestion(
             beyond = "and no forward pass was profiled to tell activations apart"
         if sites:
             site, size = max(sites.items(), key=lambda kv: kv[1])
+            if 2 * size > grew:
+                where = (
+                    f"most of it was allocated by {site} ({size / GIB:.2f} GiB) and is still held"
+                )
+            else:
+                where = (
+                    f"the largest site still holding memory is {site} "
+                    f"({size / GIB:.2f} of {amount})"
+                )
             return (
-                f"PyTorch memory with no known owner grew {amount} after warmup, {beyond}; most "
-                f"of it was allocated by {site} ({size / GIB:.2f} GiB) and is still held"
-                f"{to_reduce}"
+                f"PyTorch memory with no known owner grew {amount} after warmup, {beyond}; "
+                f"{where}{to_reduce}"
             )
         return (
             f"PyTorch memory with no known owner grew {amount} after warmup, {beyond}, so "
             "something may be holding on to memory (a cache, a callback, a leak); rerun with "
             f"TLLM_MEM_MONITOR_STACKS=1 to name the code that allocated it{to_reduce}"
+        )
+    if focus is Group.OVERHEAD and includes_other_processes:
+        return (
+            f"the overhead row grew {amount} after warmup, but NVML does not list this process, "
+            "so that row also holds other processes' memory and its growth may not be this "
+            "process's"
         )
     if focus is Group.OVERHEAD:
         return (

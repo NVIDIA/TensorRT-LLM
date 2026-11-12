@@ -86,6 +86,12 @@ LABELS: dict[str, _Label] = {
         "GPU memory mapped as a host NUMA node, kept until exit; may not be in per-process device usage",
         counts=False,
     ),
+    "userbuffers": _Label(
+        Category.COMM_NVLS,
+        "userbuffers",
+        Basis.PHYSICAL_BACKING,
+        "registered allreduce buffers, at the multicast-rounded size; kept until exit",
+    ),
     "eplb_managed": _Label(
         Category.EPLB,
         "MoE load balancer, managed memory",
@@ -96,6 +102,15 @@ LABELS: dict[str, _Label] = {
 }
 
 
+def optional_trtllm_op(name: str) -> Callable | None:
+    """``torch.ops.trtllm.<name>``, or ``None`` when this build does not register it."""
+    # Imported here: the compilation package loads the custom ops, which load this package during
+    # ``import tensorrt_llm``.
+    from ....compilation.utils import get_optional_trtllm_op
+
+    return get_optional_trtllm_op(name)
+
+
 class NativeMemoryProvider:
     """One entry per label with memory held on the current device."""
 
@@ -104,11 +119,7 @@ class NativeMemoryProvider:
 
     @staticmethod
     def _op() -> Callable | None:
-        # Imported here: the compilation package loads the custom ops, which load this package during
-        # ``import tensorrt_llm``.
-        from ....compilation.utils import get_optional_trtllm_op
-
-        return get_optional_trtllm_op("get_native_memory_usage")
+        return optional_trtllm_op("get_native_memory_usage")
 
     def available(self) -> bool:
         return self._op() is not None

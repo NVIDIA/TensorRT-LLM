@@ -110,6 +110,18 @@ def test_mcast_allreduce_counts_active_and_retired_workspaces(monkeypatch):
     ws["buffer_size_bytes"] = 4 * MB
     assert workspaces({"tp0": ws}, {})[0].size_bytes == 12 * MB
 
+    # The executor thread retires another mapping's workspace while a report
+    # reads the dict; the report must not see the dict change size under it.
+    retired = {}
+
+    class _RetiredWhileRead(list):
+        def __iter__(self):
+            retired.setdefault("tp1", []).append(_workspace(MB))
+            return super().__iter__()
+
+    retired["tp0"] = _RetiredWhileRead([_workspace(6 * MB)])
+    assert workspaces({}, retired)[0].size_bytes == 6 * MB
+
 
 @pytest.mark.cpu_only
 def test_nccl_window_counts_pooled_buffers_whether_or_not_checked_out(monkeypatch):

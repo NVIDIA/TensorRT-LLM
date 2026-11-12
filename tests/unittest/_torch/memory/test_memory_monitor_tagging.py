@@ -32,6 +32,7 @@ from tensorrt_llm._torch.memory.monitor.tagging import (
     UNTAGGED,
     TagSnapshot,
     freeze_tag_map,
+    get_frozen_map,
     live_bytes_by_tag,
     start_tagging_window,
     stop_tagging_window,
@@ -113,7 +114,6 @@ def test_unsupported_is_not_zero(monkeypatch):
 
     empty = TagSnapshot(supported=False)
     assert live_bytes_by_tag(empty) == {}, "a dict of zeros would read as a measurement"
-    assert not empty
 
     with monkeypatch.context() as m:
         m.setattr(mod, "tagging_supported", lambda: False)
@@ -244,6 +244,9 @@ def test_freed_weights_do_not_label_their_successor(window):
 def test_frozen_label_does_not_follow_a_reused_address(window):
     if not window:
         pytest.skip("tagging unsupported here")
+    # With no cached segments, the freed block's segment is the only one the
+    # successor can be carved from, so it starts at the same address.
+    torch.cuda.empty_cache()
     with tag("SAMPLER"):
         freed = torch.empty(64 * MB, dtype=torch.uint8, device="cuda")
     address = freed.untyped_storage().data_ptr()
@@ -253,8 +256,7 @@ def test_frozen_label_does_not_follow_a_reused_address(window):
     torch.cuda.synchronize()
     successor = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")
     try:
-        if successor.untyped_storage().data_ptr() != address:
-            pytest.skip("the allocator placed the new block elsewhere")
+        assert successor.untyped_storage().data_ptr() == address, "the address is reused"
         totals = live_bytes_by_tag(frozen)
         assert totals.get("SAMPLER", 0) == 0, "a block at a freed owner's address is not its owner"
         assert totals[UNTAGGED] >= 32 * MB
@@ -313,10 +315,8 @@ def test_nothing_happens_when_off(monkeypatch):
 def test_capture_builds_tag_entries(window, monkeypatch):
     """``capture()`` with tags present, which is the shipped path.
 
-    Earlier tests all passed ``entries`` explicitly and so never ran
-    ``_tag_entries``. That left a reference to a non-existent enum member
-    unexercised until a real serving run hit it, so this goes through
-    ``capture()`` itself.
+    Goes through ``capture()`` itself, so the tag entries it builds -- their
+    categories included -- are the ones a real report shows.
     """
     if not window:
         pytest.skip("tagging unsupported here")
@@ -335,7 +335,7 @@ def test_capture_builds_tag_entries(window, monkeypatch):
         assert result is not None
         # Rendering exercises every field each entry declares.
         assert "weights" in render_capture(result)
-        entries = _tag_entries()
+        entries = _tag_entries(live_bytes_by_tag(get_frozen_map()))
         assert entries, "a tagged allocation must produce an entry"
         for entry in entries:
             assert isinstance(entry.placement, Placement)

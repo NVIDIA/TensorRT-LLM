@@ -118,6 +118,40 @@ def test_capacity_is_physical_and_in_use_is_logical():
 
 
 @pytest.mark.cpu_only
+def test_host_backed_pools_are_not_counted_as_device_memory():
+    """Sparse KV offload puts pinned host pools in a GPU-level pool group.
+
+    The statistics give a slot size for every pool of the group, whatever its
+    medium; only the device-backed pools hold device memory.
+    """
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+    def pool(nbytes, medium):
+        return types.SimpleNamespace(slot_bytes=nbytes, storage_medium=medium)
+
+    manager = FakeKvManager(kv_stats(10, 2, 3, slot_sizes=(MB, 4 * MB)))
+    manager.impl = types.SimpleNamespace(
+        pool_group_descs=[
+            types.SimpleNamespace(
+                pool_group_index=0,
+                pools=[pool(MB, CacheTier.GPU_MEM), pool(4 * MB, CacheTier.HOST_MEM)],
+            )
+        ]
+    )
+    rows = kv_pool_group_stats(manager)
+    assert rows[0]["capacity_bytes"] == 10 * MB
+    assert rows[0]["in_use_bytes"] == 5 * MB
+    assert rows[0]["host_capacity_bytes"] == 40 * MB
+
+    entries = KvCacheProvider(manager).collect()
+    counted = [e for e in entries if e.counts_toward_total]
+    assert [e.size_bytes for e in counted] == [10 * MB], "only the device pool is device memory"
+    host = [e for e in entries if "host-backed" in e.owner]
+    assert len(host) == 1 and host[0].size_bytes == 40 * MB
+    assert host[0].counts_toward_total is False
+
+
+@pytest.mark.cpu_only
 def test_managers_without_storage_statistics():
     from tensorrt_llm._torch.memory.monitor.providers import default_providers
 
@@ -182,6 +216,10 @@ def test_main_draft_and_cross_pools_are_registered_once_each():
         reg.clear_registered_providers()
         _register_kv_cache_monitor_providers(main, main, None)
         assert physical() == [100 * MB], "a draft sharing the main manager is counted once"
+
+        rebuilt = FakeKvManager(kv_stats(200, 0, 0))
+        _register_kv_cache_monitor_providers(rebuilt, None, None)
+        assert physical() == [200 * MB], "a rebuilt manager supersedes the one it replaced"
     finally:
         reg.clear_registered_providers()
 

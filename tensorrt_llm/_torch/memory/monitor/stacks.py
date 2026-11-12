@@ -124,11 +124,16 @@ def site_of(frames: list[dict]) -> str | None:
     allocation. Given as ``path:function``, the path trimmed to something
     readable.
     """
-    if not frames:
-        return None
-    outside = [f for f in frames if not any(s in f.get("filename", "") for s in _SKIP)]
-    own = [f for f in outside if not _is_library(f.get("filename", ""))]
-    frame = (own or outside or [None])[0]
+    frame = None
+    for candidate in frames:
+        filename = candidate.get("filename", "")
+        if any(s in filename for s in _SKIP):
+            continue
+        if not _is_library(filename):
+            frame = candidate
+            break
+        if frame is None:
+            frame = candidate
     if frame is None:
         return None
     path = frame.get("filename", "?")

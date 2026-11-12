@@ -98,17 +98,17 @@ def test_held_pages_follow_release_and_num_pages_does_not(pool):
 def test_release_failures_are_counted_per_pool_and_per_process(monkeypatch, pool, unreleased):
     clean = PagePool.create(slot_sizes=[16 * MB], device_id=0)
     clean.release()
-    assert clean.num_release_failures == 0 and unreleased() == 0, "a clean release counts nothing"
+    assert clean._num_release_failures == 0 and unreleased() == 0, "a clean release counts nothing"
 
     _fail_every(monkeypatch, 2)
     total = sum(pool.num_pages(s) for s in range(pool.num_slots))
     pool.release()
-    assert pool.num_release_failures == total // 2
+    assert pool._num_release_failures == total // 2
     assert unreleased() == total // 2 * pool.page_size
     assert sum(pool.held_pages(s) for s in range(pool.num_slots)) == 0
 
     pool.release()  # idempotent: the handles are not walked again
-    assert pool.num_release_failures == total // 2
+    assert pool._num_release_failures == total // 2
     assert unreleased() == total // 2 * pool.page_size
 
 

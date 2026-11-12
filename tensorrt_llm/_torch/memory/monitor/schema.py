@@ -21,8 +21,8 @@ Three orthogonal axes describe every entry, and they must stay orthogonal:
     mechanism.
 ``placement``
     Which pool physically holds it. Kept separate from ``category`` because
-    CUDA-graph pools hold captured activations -- modelling "CUDA graph" as a
-    category would double count against ``ACTIVATION``.
+    the pool does not say what the memory is for: a CUDA graph's pool holds
+    buffers that belong to the step that captured it.
 ``basis``
     What the number actually measures. Being able to read a number does not
     make it a physical-occupancy number: a page pool can report its
@@ -55,10 +55,20 @@ __all__ = [
     "Group",
     "Placement",
     "Source",
+    "signed_gib",
 ]
 
 
 GIB = 1 << 30
+
+
+def signed_gib(nbytes: float, width: int = 0) -> str:
+    """``nbytes`` as a signed GiB amount with two decimals, e.g. ``+1.25``.
+
+    A change that rounds to zero prints as ``+0.00``, never ``-0.00``.
+    """
+    value = round(nbytes / GIB, 2)
+    return f"{value + 0.0:+{width}.2f}"
 
 
 class Category(StrEnum):

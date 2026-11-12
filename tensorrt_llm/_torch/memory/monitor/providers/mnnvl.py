@@ -65,7 +65,7 @@ class MnnvlProvider:
         self._memory_cls: type | None = None
         self._state_cls: type | None = None
 
-    def _resolve(self) -> bool:
+    def _resolve(self) -> None:
         if self._memory_cls is None:
             # Imported on first use: the ``distributed`` package brings in
             # the communication stack, which importing the monitor must not.
@@ -76,11 +76,10 @@ class MnnvlProvider:
 
             self._memory_cls = MnnvlMemory
             self._state_cls = MnnvlAllocationState
-        return True
 
     def available(self) -> bool:
         """Always: a process with no MNNVL allocations reports zero."""
-        return self._resolve()
+        return True
 
     def _maps(self) -> list[dict]:
         maps = []
@@ -94,8 +93,7 @@ class MnnvlProvider:
         return maps
 
     def collect(self) -> list[Entry]:
-        if not self._resolve():
-            return []
+        self._resolve()
         states = self._state_cls
 
         # Holds physical backing right now.

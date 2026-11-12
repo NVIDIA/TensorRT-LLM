@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV cache v2 provider.
+"""KV cache pool provider (manager V2 statistics, with a V1 fallback).
 
 The pool is allocated once and held for the process's life, so its physical
 footprint is the *configured* capacity -- ``total`` slots -- and does not
@@ -32,7 +32,7 @@ import weakref
 from typing import Any
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL, CacheTier
 
 from ..pools import is_tag_released
 from ..schema import Basis, Category, Entry, Placement, Source
@@ -40,9 +40,24 @@ from ..schema import Basis, Category, Entry, Placement, Source
 __all__ = ["KvCacheProvider", "kv_pool_group_stats"]
 
 
-def _slot_bytes(stats: Any) -> int:
-    """Bytes per block: every pool in the group contributes one slot."""
-    return sum(int(size) for size in stats.slot_sizes)
+def _host_backed_slot_bytes(manager: Any) -> dict[int, int]:
+    """Per GPU-level pool group, the slot bytes of its host-backed pools.
+
+    With sparse KV cache offload a GPU-level pool group also holds pools whose
+    pages are pinned host memory mapped into the device (``PoolDesc.storage_medium``
+    is not ``GPU_MEM``). The storage statistics give one slot size per pool of
+    the group whatever its medium, so these bytes are taken out of the device
+    row. A manager without pool descriptors has no such pools.
+    """
+    impl = getattr(manager, "impl", None)
+    host: dict[int, int] = {}
+    for group in getattr(impl, "pool_group_descs", ()) or ():
+        nbytes = sum(
+            int(pool.slot_bytes) for pool in group.pools if pool.storage_medium != CacheTier.GPU_MEM
+        )
+        if nbytes:
+            host[int(group.pool_group_index)] = nbytes
+    return host
 
 
 def kv_pool_group_stats(manager: Any) -> list[dict]:
@@ -50,13 +65,17 @@ def kv_pool_group_stats(manager: Any) -> list[dict]:
 
     Returned rather than logged so the conservation checks and the monitor
     entries work from one reading; sampling twice would let the pool change
-    underneath a comparison.
+    underneath a comparison. ``slot_bytes`` and the byte figures cover the
+    device-backed pools only; ``host_slot_bytes`` is the group's host-backed
+    share, which KV sizing does not take from the device budget.
     """
     per_group = manager.get_storage_statistics(GPU_LEVEL)
+    host_slot_bytes = _host_backed_slot_bytes(manager)
 
     rows = []
     for pool_id, stats in enumerate(per_group):
-        slot_bytes = _slot_bytes(stats)
+        host = host_slot_bytes.get(pool_id, 0)
+        slot_bytes = sum(int(size) for size in stats.slot_sizes) - host
         total = int(stats.total)
         free = int(stats.free)
         evictable = int(stats.evictable)
@@ -64,11 +83,13 @@ def kv_pool_group_stats(manager: Any) -> list[dict]:
             {
                 "pool_group_id": pool_id,
                 "slot_bytes": slot_bytes,
+                "host_slot_bytes": host,
                 "total_slots": total,
                 "free_slots": free,
                 "evictable_slots": evictable,
                 # Physical: the whole pool is resident whether or not it is in use.
                 "capacity_bytes": total * slot_bytes,
+                "host_capacity_bytes": total * host,
                 # Logical: how that resident capacity is currently divided.
                 "free_bytes": free * slot_bytes,
                 "evictable_bytes": evictable * slot_bytes,
@@ -241,6 +262,19 @@ class KvCacheProvider:
                     note=f"{row['total_slots']} slots resident; {split}",
                 )
             )
+            if row["host_capacity_bytes"]:
+                entries.append(
+                    Entry(
+                        category=Category.KV_CACHE_POOL,
+                        size_bytes=row["host_capacity_bytes"],
+                        source=Source.COMPONENT,
+                        placement=Placement.NON_TORCH,
+                        basis=Basis.PHYSICAL_BACKING,
+                        owner=f"{owner} host-backed",
+                        note="pinned host memory mapped into the device; not device memory",
+                        counts_toward_total=False,
+                    )
+                )
             # The split is reported for diagnosis but never summed: these
             # bytes are already inside capacity_bytes above.
             entries.append(

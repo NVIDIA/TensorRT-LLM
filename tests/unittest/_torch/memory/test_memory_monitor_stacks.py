@@ -141,7 +141,8 @@ def test_switching_after_the_startup_ring_wrapped_is_safe(monkeypatch):
         pytest.skip("tagging unsupported here")
     warnings = []
     monkeypatch.setattr(logger, "warning", warnings.append)
-    assert tagging.start_tagging_window(max_entries=100)
+    monkeypatch.setattr(tagging, "_DEFAULT_MAX_ENTRIES", 100)
+    assert tagging.start_tagging_window()
     with tagging.tag("STEP"):
         blocks = [torch.empty(1024, device="cuda") for _ in range(137)]
     del blocks

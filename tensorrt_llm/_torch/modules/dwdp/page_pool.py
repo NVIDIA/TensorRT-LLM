@@ -260,15 +260,6 @@ class PagePool:
             raise IndexError(f"Invalid slot {slot}, must be in [0, {len(self._page_handles)})")
         return len(self._page_handles[slot])
 
-    @property
-    def num_release_failures(self) -> int:
-        """Page handles of this pool whose release raised, over every slot.
-
-        ``release()`` logs and continues so that teardown cannot be derailed
-        by one bad handle.
-        """
-        return self._num_release_failures
-
     def slot_size(self, slot: int) -> int:
         """Get the size of a slot in bytes.
 

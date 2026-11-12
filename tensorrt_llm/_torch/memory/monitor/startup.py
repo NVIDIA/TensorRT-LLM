@@ -36,7 +36,7 @@ with device-wide usage.
 A startup that sizes the KV cache builds a temporary executor first and
 releases it before building the final one. Regions for resources each
 executor owns (KV transfer buffers, the LoRA device cache) are recorded for
-the final executor only (:func:`sizing_pass`); what the temporary one
+the final executor only (:func:`set_sizing_pass`); what the temporary one
 allocates and frees shows in the steps that allocate and free it. Regions
 for resources that outlive it, such as communicators, are recorded either
 way.
@@ -61,7 +61,7 @@ from tensorrt_llm.logger import logger
 
 from .capability import nvml_process_usage
 from .providers import collect_all
-from .schema import GIB, Group, Placement
+from .schema import GIB, Group, Placement, signed_gib
 from .settings import full_mode
 
 __all__ = [
@@ -370,10 +370,10 @@ def render_stage_lines() -> list[str]:
     for sample in _stages:
         taken = sample.process_taken if per_process else sample.device_taken
         # Value first: step names vary too much in length to align after them.
-        out.append(f"    {taken / GIB:+8.2f} GiB  {sample.name}")
+        out.append(f"    {signed_gib(taken, 8)} GiB  {sample.name}")
     if _failed is not None:
         taken = (
-            f"; this process took {_failed.process_taken / GIB:+.2f} GiB in it before failing"
+            f"; this process took {signed_gib(_failed.process_taken)} GiB in it before failing"
             if _failed.process_taken is not None
             else ""
         )
@@ -408,7 +408,7 @@ def render_plan_lines(
     cache = f", excluding {reusable / GIB:.2f} GiB of free PyTorch cache" if reusable else ""
     out.append(
         f"  Startup plan: peak outside the KV cache {_plan.non_kv_peak / GIB:.2f} GiB{kv} "
-        f"= {planned / GIB:.2f} GiB; device now {in_use / GIB:.2f} GiB{cache} ({over / GIB:+.2f})."
+        f"= {planned / GIB:.2f} GiB; device now {in_use / GIB:.2f} GiB{cache} ({signed_gib(over)})."
     )
     if _plan.activation is not None:
         out.append(

@@ -24,7 +24,6 @@ __all__ = [
     "REGION_KV_TRANSFER_BUFFERS",
     "REGION_LORA_DEVICE_CACHE",
     "REGION_TORCH_DISTRIBUTED_NCCL",
-    "REGION_USERBUFFERS",
     "UNTAGGED",
     "WEIGHTS",
 ]
@@ -44,5 +43,3 @@ REGION_TORCH_DISTRIBUTED_NCCL = "NCCL communicators (torch.distributed)"
 REGION_KV_TRANSFER_BUFFERS = "KV cache transfer buffers"
 #: The LoRA adapters' device cache.
 REGION_LORA_DEVICE_CACHE = "LoRA device cache"
-#: The userbuffers allreduce workspace.
-REGION_USERBUFFERS = "userbuffers"

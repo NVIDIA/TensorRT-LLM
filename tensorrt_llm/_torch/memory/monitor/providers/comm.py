@@ -36,6 +36,7 @@ from tensorrt_llm._ipc_utils import IpcMemory
 
 from ..claims import claimed_modules
 from ..schema import Basis, Category, Entry, Placement, Source
+from .native import optional_trtllm_op
 
 __all__ = ["IpcMemoryProvider", "McastAllReduceProvider", "NcclWindowProvider", "SymmMemProvider"]
 
@@ -100,9 +101,10 @@ class McastAllReduceProvider:
         # Imported here: ``distributed.ops`` imports this package for its regions.
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
+        # Snapshots: the executor thread adds workspaces while a report reads them.
         workspaces = list(MNNVLAllReduce.allreduce_mnnvl_workspaces.values())
-        for retired in MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.values():
-            workspaces.extend(retired)
+        for retired in list(MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.values()):
+            workspaces.extend(list(retired))
 
         total = 0
         counted = 0
@@ -141,11 +143,7 @@ class NcclWindowProvider:
 
     @staticmethod
     def _op() -> Callable | None:
-        # Imported here: the compilation package loads the custom ops, which load this package during
-        # ``import tensorrt_llm``.
-        from ....compilation.utils import get_optional_trtllm_op
-
-        return get_optional_trtllm_op("get_nccl_window_usage")
+        return optional_trtllm_op("get_nccl_window_usage")
 
     def available(self) -> bool:
         return self._op() is not None

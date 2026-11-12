@@ -57,10 +57,6 @@ def log_mem_snapshot(tag: str) -> None:
       ``cuMemCreate``, NCCL buffers, cuBLAS workspace, CUDA driver context,
       lazily loaded module code, etc.). CUDA-graph pools are **not** in here:
       they use the native allocator and are already inside ``reserved``.
-
-    In the memory monitor's full mode an additional memory monitor report is
-    emitted that decomposes ``non_torch`` rather than leaving it as one
-    opaque number.
     """
     if os.environ.get("TLLM_LOG_MEM_PROFILE", "") != "1":
         return
@@ -77,30 +73,6 @@ def log_mem_snapshot(tag: str) -> None:
         f"torch_reserved_peak={reserved_peak / _GIB:.2f}GiB "
         f"free={free / _GIB:.2f}GiB total={total / _GIB:.2f}GiB"
     )
-    _maybe_log_monitor_report(tag)
-
-
-def _maybe_log_monitor_report(tag: str) -> None:
-    """Emit the memory monitor report when the monitor is in full mode.
-
-    Imported inside the function so that this leaf module stays free of
-    import cycles. The import is not guarded: the package is part of this
-    tree, so failing to import it is a bug to surface. Building the report
-    is guarded by ``report_now``: these calls sit inside warmup, which a
-    diagnostic must not break.
-
-    Skipped while the startup tagging window is recording. Its tags are not
-    frozen yet, so every PyTorch byte would read as untagged, and each
-    snapshot would also copy the whole event history being recorded.
-    """
-    from tensorrt_llm._torch.memory.monitor.tagging import tagging_window_active
-    from tensorrt_llm._torch.memory.monitor.triggers import report_now
-
-    if tagging_window_active():
-        return
-    report = report_now(tag=tag)
-    if report is not None:
-        logger.info("\n" + report)
 
 
 def log_tensor_size(tag: str, tensor: torch.Tensor, **extra) -> None:

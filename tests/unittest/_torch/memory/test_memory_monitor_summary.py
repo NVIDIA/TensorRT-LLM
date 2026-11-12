@@ -110,7 +110,7 @@ def test_summary_is_readable_without_allocator_terms():
     order = [g.value for g in Group if g.value in summary]
     assert sorted(order, key=summary.index)[0] == "KV cache", "largest first"
 
-    # advice=None with a headline once raised TypeError on the OOM path.
+    # A headline without advice renders: the OOM path passes no advice.
     text = render(_typical(), capability(), headline="OUT OF MEMORY: example")
     assert text.index("OUT OF MEMORY") < text.index("KV cache"), "headline above the table"
 
@@ -145,7 +145,7 @@ def test_conclusion_names_what_grew_since_warmup():
     text = render(_typical(), capability(), baseline=_baseline())
     assert "nothing has grown since warmup" in text
 
-    # Seen on a real run: "grew the most (+0.00 GiB)".
+    # Growth below the printed precision would read "grew the most (+0.00 GiB)".
     baseline = _baseline()
     for group in baseline:
         if baseline[group] is not None and group is not Group.TORCH_CACHE:
@@ -203,6 +203,59 @@ def test_suggestions():
 
     text = summary(_typical(process=23 * GIB), headline="OUT OF MEMORY")
     assert "memory outside PyTorch grew 3.00 GiB after warmup" in text
+
+    # "Most of it" only when the site holds more than half of the growth.
+    sites = {"my_app/cache.py:put": 2 * GIB, "modules/linear.py:forward": GIB}
+    text = summary(grown(8 * GIB), headline="OUT OF MEMORY", unattributed_sites=sites)
+    assert "most of it" not in text
+    assert "the largest site still holding memory is my_app/cache.py:put (2.00 of 8.00 GiB)" in text
+
+
+def test_overhead_growth_is_not_blamed_on_this_process_without_its_own_reading():
+    """Without NVML's per-process figure the overhead row includes other processes."""
+    from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+    def summary(frame):
+        return "\n".join(
+            render_summary(
+                frame, group_totals(frame), baseline=_baseline(), headline="OUT OF MEMORY"
+            )
+        )
+
+    frame = build_frame(
+        DeviceReading(total=180 * GIB, free=157 * GIB, process_used=None),
+        TorchReading(reserved=2 * GIB, live=GIB),
+        _typical().entries,
+    )
+    text = summary(frame)
+    assert "memory outside PyTorch grew" not in text
+    assert "also holds other processes' memory" in text
+
+
+def test_free_space_of_a_private_pool_is_named_even_alone():
+    from tensorrt_llm._torch.memory.monitor.pools import PoolUsage
+
+    frame = build_frame(
+        DeviceReading(total=180 * GIB, free=150 * GIB, process_used=20 * GIB),
+        TorchReading(
+            reserved=5 * GIB,
+            live=GIB,
+            pools=(
+                PoolUsage((0, 0), "default", "default", 2 * GIB, GIB),
+                PoolUsage(
+                    (1, 1),
+                    "mempool",
+                    "sleep: executor_extra",
+                    3 * GIB,
+                    0,
+                    sleep_tag="executor_extra",
+                ),
+            ),
+        ),
+        [_entry(Category.KV_CACHE_POOL, 10 * GIB)],
+    )
+    summary = render(frame, capability()).partition("--- details")[0]
+    assert "free in pool 'sleep: executor_extra', reusable only by that pool 3.00" in summary
 
 
 def test_activations_of_the_failing_step_are_not_called_held_memory(monkeypatch):
@@ -271,3 +324,11 @@ def test_a_group_absent_at_warmup_counts_as_grown_from_zero():
     baseline[Group.TORCH_UNATTRIBUTED] = None
     text = "\n".join(render_summary(frame, group_totals(frame), baseline=baseline))
     assert "PyTorch, unattributed grew" not in text
+
+
+def test_a_change_that_rounds_to_zero_has_no_sign():
+    from tensorrt_llm._torch.memory.monitor.schema import signed_gib
+
+    assert signed_gib(-1 << 20) == "+0.00", "-1 MiB is -0.00 GiB, printed unsigned"
+    assert signed_gib(-(1 << 30), 6) == " -1.00"
+    assert signed_gib(3 << 29) == "+1.50"
