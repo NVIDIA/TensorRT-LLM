@@ -742,13 +742,18 @@ async def server_uses_speculative_decoding(base_url: str) -> Optional[bool]:
 
     Returns True or False when the first model card carries the TensorRT-LLM
     ``metadata.speculative_config`` entry, and None when the server does not
-    report it (another server, an older TensorRT-LLM, or no answer).
+    report it (another server, an older TensorRT-LLM, or no answer within five
+    seconds).
     """
     models_url = f"{base_url}/v1/models"
-    async with aiohttp.ClientSession(trust_env=True,
-                                     timeout=AIOHTTP_TIMEOUT) as session:
+    headers = {}
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    async with aiohttp.ClientSession(
+            trust_env=True, timeout=aiohttp.ClientTimeout(total=5)) as session:
         try:
-            async with session.get(models_url) as response:
+            async with session.get(models_url, headers=headers) as response:
                 if response.status != 200:
                     return None
                 payload = await response.json()
