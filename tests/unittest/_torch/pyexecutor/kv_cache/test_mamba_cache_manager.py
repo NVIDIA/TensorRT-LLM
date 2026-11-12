@@ -3351,9 +3351,9 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
     assert "pp_size=1" in message
     # The stub's floor still fits a smaller batch; the error should name it.
     feasible = mgr._largest_max_batch_size_for_gpu_quota(minimum_quota - 1)
-    assert feasible >= 1
-    assert feasible < 2 or "Reduce max_batch_size" in message
-    assert f"a value of {feasible} would fit this quota" in message
+    assert feasible == 1
+    assert "Reduce max_batch_size" in message
+    assert "a value of 1 would fit this quota" in message
     # The search must not leave the configured batch size mutated.
     assert mgr.max_batch_size == 2
 
