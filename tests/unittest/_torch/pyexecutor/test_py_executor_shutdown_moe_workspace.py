@@ -63,6 +63,7 @@ def _executor(events: list) -> PyExecutor:
     executor.virtual_memory_pools = None
     executor.sampler = object()
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     executor.pending_encoder_steps = []
     executor.active_requests = []
     executor.responses = {}
