@@ -338,12 +338,15 @@ def _write_safetensors_header(
     ],
 )
 def test_deepseek_v4_base_checkpoint_detection(
-    tmp_path, tensor_dtype, tensor_shape, expected_layout, expected_is_base
+    tmp_path, monkeypatch, tensor_dtype, tensor_shape, expected_layout, expected_is_base
 ):
     _write_safetensors_header(tmp_path, tensor_dtype, tensor_shape)
 
     assert ModelConfig._detect_deepseek_v4_routed_moe_layout(str(tmp_path)) == expected_layout
+    # The base-checkpoint check reads the index and the layers.0 shard header once.
+    reads = _record_header_reads(monkeypatch)
     assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
+    assert reads == ["model-00001-of-00001.safetensors"]
 
 
 def test_nvfp4_plus_override_selects_only_the_cutedsl_moe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,6 +419,35 @@ def test_deepseek_v4_mtp_layers_take_the_routed_moe_layout_of_the_mtp_block(
         experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
         assert experts.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
         assert experts.group_size == 32
+
+
+def test_deepseek_v4_mtp_blocks_take_their_own_routed_moe_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With two checkpoint MTP blocks of different formats, MTP layer j is
+    configured from block mtp.{j}."""
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    num_hidden_layers = 3
+    _write_routed_expert_blocks(
+        tmp_path,
+        {**{f"layers.{i}": "U8" for i in range(num_hidden_layers)}, "mtp.0": "I8", "mtp.1": "U8"},
+    )
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        types.SimpleNamespace(num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=2),
+        str(tmp_path),
+        "MEGAMOE_CUTEDSL",
+        None,
+        _mtp_one_model_spec_config(2),
+    )
+
+    mtp0 = layer_quant_config[f"model.layers.{num_hidden_layers}.mlp.experts"]
+    mtp1 = layer_quant_config[f"model.layers.{num_hidden_layers + 1}.mlp.experts"]
+    assert (mtp0.quant_algo, mtp0.group_size) == (QuantAlgo.W4A8_MXFP4_MXFP8, 32)
+    assert (mtp1.quant_algo, mtp1.group_size) == (QuantAlgo.NVFP4, 16)
 
 
 def test_deepseek_v4_mtp_layer_without_its_own_block_keeps_the_layers0_layout(

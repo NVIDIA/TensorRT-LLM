@@ -994,8 +994,8 @@ class ModelConfig(Generic[TConfig]):
         if tensor_info is None:
             return False
 
-        return ModelConfig._detect_deepseek_v4_routed_moe_layout(
-            checkpoint_dir) not in ("mxfp4", "nvfp4")
+        return ModelConfig._deepseek_v4_routed_moe_layout_of(
+            tensor_info) not in ("mxfp4", "nvfp4")
 
     @staticmethod
     def _build_deepseek_v41_quant_config(hf_quant_config: dict) -> QuantConfig:

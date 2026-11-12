@@ -584,6 +584,50 @@ def test_internal_mtp_without_override_reuses_target_model_config() -> None:
 
 
 @pytest.mark.cpu_only
+def test_mtp_moe_backend_auto_puts_the_deepseek_v4_mxfp4_mtp_layer_on_trtllm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``MTPDecodingConfig(moe_backend="AUTO")`` on an NVFP4 DeepSeek-V4 export whose MTP
+    block is MXFP4: the drafter gets a config copy resolved from that block's quantization
+    to TRTLLM, while the target keeps MEGAMOE_CUTEDSL."""
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 103)
+    num_hidden_layers = 61
+    body = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    mtp = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8, group_size=32)
+    target_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+            model_type="deepseek_v4",
+            num_hidden_layers=num_hidden_layers,
+        ),
+        quant_config=body,
+        quant_config_dict={
+            "model.layers.0.mlp.experts": body,
+            f"model.layers.{num_hidden_layers}.mlp.experts": mtp,
+        },
+        moe_backend="MEGAMOE_CUTEDSL",
+    )
+    target_config.spec_config = MTPDecodingConfig(max_draft_len=3, moe_backend="AUTO")
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+        return_value=sentinel.draft_model,
+    ) as mtp_cls:
+        draft_model = _build_mtp_one_model_draft(
+            target_config, None, sentinel.lm_head, target_model
+        )
+
+    assert draft_model is sentinel.draft_model
+    assert mtp_cls.call_args.args[0].moe_backend == "TRTLLM"
+    assert target_config.moe_backend == "MEGAMOE_CUTEDSL"
+    assert "experts" in target_model.preload_weight_modules
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "model_type,replacement,head_algo",
     [
