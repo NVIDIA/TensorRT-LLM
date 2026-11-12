@@ -2385,10 +2385,7 @@ class KvCacheCreator:
         Hybrid managers describe their own target layers and append the
         drafter's after them when they opt in.
         """
-        cls = self._kv_cache_manager_cls
-        return cls is KVCacheManagerV2 or (
-            issubclass(cls, MambaHybridCacheManagerV2)
-            and cls.accepts_appended_draft_layers)
+        return self._kv_cache_manager_cls.accepts_appended_draft_layers()
 
     def _unified_drafter_block_width(self) -> int:
         """Use the loaded checkpoint's slot convention for sizing and allocation."""

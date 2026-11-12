@@ -53,7 +53,9 @@ _NUM_DRAFT_LAYERS = 2
 
 
 class _K3LikeManager(MambaHybridCacheManagerV2):
-    accepts_appended_draft_layers = True
+    @classmethod
+    def accepts_appended_draft_layers(cls) -> bool:
+        return True
 
 
 def _mla_config(*, num_layers, kv_quant_algo=None):

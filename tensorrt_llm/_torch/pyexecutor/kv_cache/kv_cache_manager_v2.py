@@ -2031,6 +2031,18 @@ class KVCacheManagerV2(BaseResourceManager):
     # Empty when ``layer_specs`` describes every layer.
     _appended_draft_layer_specs: dict[int, KVCacheLayerSpec] = {}
 
+    @classmethod
+    def accepts_appended_draft_layers(cls) -> bool:
+        """Whether the KV cache creator may append a standalone drafter's
+        layers (``layer_specs``) after this manager's target layers.
+
+        This plain manager takes its target layers through ``layer_specs``
+        and accepts the drafter's right after them; subclasses that lay out
+        layers themselves (sparse attention, hybrid models) stay refused
+        until they override this to hold the drafter's on their terms.
+        """
+        return cls is KVCacheManagerV2
+
     @property
     def _kv_alloc_extra_tokens(self) -> int:
         """Tokens a request is allocated beyond its history for spec decoding.
