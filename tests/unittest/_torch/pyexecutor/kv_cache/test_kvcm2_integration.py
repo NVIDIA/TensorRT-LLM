@@ -3723,7 +3723,7 @@ def test_adp_dummy_holds_paired_draft_kv(path: str, draft_len: int) -> None:
             assert scheduled.paused_requests == []
             assert_dummy_in_both_pools(dummy)
             if path == "transactional" and attempt == 0:
-                executor._revert_gen_alloc(scheduled)
+                executor._revert_unexecuted_alloc(scheduled)
                 executor._finalize_adp_dummy_allocation(False)
                 assert_dummy_released(dummy)
             else:
