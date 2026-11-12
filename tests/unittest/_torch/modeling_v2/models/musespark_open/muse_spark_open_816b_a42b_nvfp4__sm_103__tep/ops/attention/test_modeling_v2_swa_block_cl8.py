@@ -6,11 +6,15 @@ A TEP4 decode step of one request (4 KV heads, 32 query heads, 32-key FP8 pages,
 prep, norm-gate, FP8 Q) is run twice on identical inputs: through the CL8 cluster kernel and through
 the split + combine pair it replaces. The CL8 kernel is not bit-identical to the pair (another softmax
 partition, P in f16), so the gated output is compared within a BF16 tolerance; the step's K/V append
-into the FP8 cache is the stock one and must match byte for byte.
+into the FP8 cache is the stock one, compared to one FP8 ulp (CL8 redoes norm + RoPE in CUDA, the pair in Triton).
 """
 
 import pytest
 import torch
+
+pytest.importorskip(
+    "cuda.bindings"
+)  # the CL8 kernel is NVRTC-compiled and launched via the driver API
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.attention import (  # noqa: E501
     paged_decode_attention as paged_mod,
@@ -98,9 +102,17 @@ def test_swa_cl8_matches_split_combine_pair(rows, length, pos_dtype, monkeypatch
     out_pair, pool_pair = _run(False, monkeypatch, inputs, rows)
     out_cl8, pool_cl8 = _run(True, monkeypatch, inputs, rows)
 
-    # The step's K/V append is the stock write: the same FP8 bytes, and it did change the cache.
-    assert torch.equal(pool_cl8.view(torch.uint8), pool_pair.view(torch.uint8))
-    assert not torch.equal(pool_cl8.view(torch.uint8), inputs[0].view(torch.uint8))
+    # The step's K/V append is the stock write, and it did change the cache. The two paths round the
+    # normed + RoPE'd K in different kernels, so a BF16 ulp can flip an FP8 byte: compare the written
+    # elements dequantized to one e4m3 ulp (3 mantissa bits: 2^-3 relative, 2^-9 absolute floor) with
+    # a small flipped fraction. Everything else in the pool must be untouched.
+    orig = inputs[0].view(torch.uint8)
+    b_cl8, b_pair = pool_cl8.view(torch.uint8), pool_pair.view(torch.uint8)
+    written = (b_pair != orig) | (b_cl8 != orig)
+    assert written.any(), "the K/V append did not change the cache"
+    f_cl8, f_pair = pool_cl8.float()[written], pool_pair.float()[written]
+    torch.testing.assert_close(f_cl8, f_pair, atol=2**-9, rtol=2**-3)
+    assert (b_cl8[written] != b_pair[written]).float().mean().item() < 0.1
 
     assert out_cl8.shape == (rows, HQ * D) and out_cl8.dtype == torch.bfloat16
     assert torch.isfinite(out_cl8.float()).all()
