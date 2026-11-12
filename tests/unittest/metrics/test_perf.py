@@ -153,7 +153,16 @@ def test_request_candidates_keep_enum_keys_and_diagnostic_requests_are_not_compl
     prom.emit(diagnostic)
     assert prom.counter_request_success.collect()[0].samples == []
     prom.emit(request)
-    assert prom.histogram_queue_time_request.labels(**prom.labels)._sum.get() == 0
+    histogram = prom.histogram_queue_time_request.labels(**prom.labels)
+    assert histogram._sum.get() == 0
+    assert (
+        next(
+            sample.value
+            for sample in histogram.collect()[0].samples
+            if sample.name.endswith("_count")
+        )
+        == 1
+    )
     assert (
         prom.counter_request_success.labels(**prom.labels, finished_reason="stop")._value.get() == 1
     )

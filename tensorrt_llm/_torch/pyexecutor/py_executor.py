@@ -1765,6 +1765,7 @@ class PyExecutor:
             raise RuntimeError(
                 "Cannot rebind an executor after an execution failure")
         self._resources_released = False
+        self._perf_metrics.reset()
         try:
             # The step counter restarts at 0, and so does the placement schedule.
             moe_warmup_placement_restart()

@@ -172,6 +172,10 @@ class PerfMetricsCollector:
     """
 
     def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Begin a resource phase without invalidating exposure references."""
         self.latest_loop: PerfMetricsRecord | None = None
         self.latest_rank: Mapping[MetricKey, MetricValue] = _empty_fields()
         self._previous_fetched = 0
