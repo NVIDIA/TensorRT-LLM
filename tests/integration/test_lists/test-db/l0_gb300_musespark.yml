@@ -50,6 +50,7 @@ l0_gb300_musespark:
   - unittest/_torch/speculative/hw_agnostic/test_dflash_trtllm_window.py
   - unittest/_torch/speculative/hw_agnostic/test_dflash_dummy_slot.py
   - unittest/_torch/speculative/hw_agnostic/test_dflash_worker.py
+  - unittest/_torch/speculative/hw_agnostic/test_padding_onehot_draft_probs.py
   - unittest/_torch/speculative/hw_agnostic/test_dflash2_semantics.py
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_attention_op_tables.py
   - unittest/disaggregated/test_kv_transfer.py
