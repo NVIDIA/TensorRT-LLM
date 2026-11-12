@@ -13,7 +13,6 @@ from tensorrt_llm._utils import get_sm_version
 from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
 from .gated_mlp import GatedMLP
-from .linear import Linear
 from .situ import SituAndMul
 
 # Fused FC12 only pays off from this local intermediate size up.
@@ -21,14 +20,12 @@ _MIN_INTERMEDIATE_SIZE = 3072
 
 
 class Mxfp8SharedExpertMLP(nn.Module):
-    """Run a SiTU GatedMLP on one packed set of SM107 MXFP8 weights.
+    """Run a replicated SiTU GatedMLP on one packed set of SM107 MXFP8 weights.
 
     Large eager batches run the fused FC12 kernel; everything else runs two
-    MXFP8 GEMMs (see ``cute_dsl_mxfp8_gated_mlp_rubin``). A replicated MLP
-    (``tp_size == 1``) needs nothing else, so the caller may free its BF16
-    weights. A tensor-parallel MLP keeps its BF16 GatedMLP as
-    ``bf16_fallback``: MXFP8 runs only where fused FC12 runs, and ``down_proj``
-    exposes the BF16 projection whose ``all_reduce`` reduces the partials.
+    MXFP8 GEMMs (see ``cute_dsl_mxfp8_gated_mlp_rubin``). Only replicated MLPs
+    (``tp_size == 1``, e.g. Kimi K3 shared experts under attention DP) convert,
+    so nothing needs the BF16 weights afterwards and the caller may free them.
 
     Weight reloading is not supported.
     """
@@ -39,6 +36,12 @@ class Mxfp8SharedExpertMLP(nn.Module):
         if mlp.split_gate_up:
             return "gate and up are separate projections"
         gate_up, down, activation = mlp.gate_up_proj, mlp.down_proj, mlp.activation
+        if down.tp_size > 1:
+            # Kimi K3 shards its shared expert only without attention DP: TEP8 and
+            # TEP16 leave a local intermediate size of 768 and 384, where SM107
+            # MXFP8 measured up to ~34% slower than BF16 in decode and no faster
+            # in prefill. Other TP widths are not Kimi K3 deployments.
+            return "tensor-parallel MLP"
         if not (IS_CUTLASS_DSL_RUBIN_AVAILABLE and get_sm_version() == 107):
             return "needs SM107 with the CuTe DSL Rubin package"
         if not (
@@ -63,19 +66,19 @@ class Mxfp8SharedExpertMLP(nn.Module):
         return None
 
     def __init__(self, mlp: GatedMLP) -> None:
-        """Pack ``mlp``'s loaded BF16 weights; ``unsupported_reason(mlp)`` must be None."""
+        """Pack ``mlp``'s loaded BF16 weights; raise ValueError if ``unsupported_reason(mlp)`` is set."""
         super().__init__()
+        reason = self.unsupported_reason(mlp)
+        if reason is not None:
+            raise ValueError(f"Mxfp8SharedExpertMLP cannot take this MLP: {reason}.")
         from ..custom_ops.cute_dsl_mxfp8_shared_expert_custom_op import (
             GATE_UP_INTERLEAVE,
             cute_dsl_mxfp8_gated_mlp_rubin,
-            use_fused_fc12,
         )
 
         self._op = cute_dsl_mxfp8_gated_mlp_rubin
-        self._use_fused_fc12 = use_fused_fc12
         self._beta = float(mlp.activation.beta)
         self._linear_beta = float(mlp.activation.linear_beta)
-        self._local_intermediate = mlp.down_proj.weight.shape[1]
 
         gate, up = mlp.gate_up_proj.weight.detach().chunk(2, dim=0)
         hidden_size = gate.shape[1]
@@ -95,14 +98,6 @@ class Mxfp8SharedExpertMLP(nn.Module):
         self.register_buffer("fc1_scale", fc1_scale, persistent=False)
         self.register_buffer("fc2_weight", fc2, persistent=False)
         self.register_buffer("fc2_scale", fc2_scale, persistent=False)
-        self.bf16_fallback: Optional[GatedMLP] = mlp if mlp.down_proj.tp_size > 1 else None
-
-    @property
-    def down_proj(self) -> Linear:
-        """The tensor-parallel BF16 down projection, for callers that defer its all-reduce."""
-        if self.bf16_fallback is None:
-            raise AttributeError("a replicated Mxfp8SharedExpertMLP has no down_proj")
-        return self.bf16_fallback.down_proj
 
     def pre_reload_weights(self) -> None:
         raise NotImplementedError("Mxfp8SharedExpertMLP does not support weight reloading.")
@@ -110,16 +105,12 @@ class Mxfp8SharedExpertMLP(nn.Module):
     def forward(
         self, x: torch.Tensor, *, final_all_reduce_params: Optional[AllReduceParams] = None
     ) -> torch.Tensor:
+        """Return the MLP output; ``final_all_reduce_params`` is accepted for the
+        GatedMLP call signature and ignored, since a replicated MLP reduces nothing."""
         # The fused kernel needs every CTA resident, which compiled graphs
         # cannot promise once they schedule ops on several streams.
         allow_fused = not torch.compiler.is_compiling()
-        fallback = self.bf16_fallback
-        if fallback is not None and not (
-            allow_fused and self._use_fused_fc12(x.numel() // x.shape[-1], self._local_intermediate)
-        ):
-            # With BF16 kept, MXFP8 only pays off where fused FC12 runs.
-            return fallback(x, final_all_reduce_params=final_all_reduce_params)
-        output = self._op(
+        return self._op(
             x,
             self.fc1_weight,
             self.fc1_scale,
@@ -129,8 +120,3 @@ class Mxfp8SharedExpertMLP(nn.Module):
             self._linear_beta,
             allow_fused,
         )
-        if fallback is not None and fallback.down_proj.reduce_output:
-            output = fallback.down_proj.all_reduce(
-                output, all_reduce_params=final_all_reduce_params
-            )
-        return output

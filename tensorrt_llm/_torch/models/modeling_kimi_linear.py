@@ -181,9 +181,9 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # BF16 shared/latent MLP weights are optionally quantized once after loading.
 # Checkpoint-native attention FP8 is independent of this lossy conversion.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
-# On SM107 with the CuTe DSL Rubin package, runs the shared experts on packed
-# MXFP8 weights (fused FC12 for large eager batches, two MXFP8 GEMMs otherwise).
-# Experts it cannot take keep the path the variable above selects.
+# On SM107 with the CuTe DSL Rubin package, runs the replicated (attention-DP)
+# shared experts on packed MXFP8 weights (fused FC12 for large eager batches,
+# two MXFP8 GEMMs otherwise). Experts it cannot take keep their previous path.
 _KIMI_K3_MXFP8_SHARED_EXPERT_ENV = "KIMI_K3_MXFP8_SHARED_EXPERT"
 
 # The two token-count bounds of the MoE front's issue order (``KimiK3MoERuntime._front_plan``).
@@ -1439,10 +1439,11 @@ def _has_weights(module: nn.Module) -> bool:
 
 
 def _convert_shared_experts_to_mxfp8(model: nn.Module) -> Tuple[int, Dict[str, int]]:
-    """Swap each loaded shared-expert GatedMLP for its SM107 MXFP8 module.
+    """Swap each loaded shared-expert GatedMLP for its SM107 MXFP8 module and
+    free its BF16 weights.
 
-    A replicated expert also frees its BF16 weights. Returns the number of
-    experts converted and, for the rest, how many each unmet condition kept.
+    Returns the number of experts converted and, for the rest, how many each
+    unmet condition kept.
     """
     converted = 0
     kept: Dict[str, int] = {}
@@ -1458,9 +1459,8 @@ def _convert_shared_experts_to_mxfp8(model: nn.Module) -> Tuple[int, Dict[str, i
             kept[reason] = kept.get(reason, 0) + 1
             continue
         moe.shared_experts = Mxfp8SharedExpertMLP(shared)
-        if moe.shared_experts.bf16_fallback is None:
-            for projection in (shared.gate_up_proj, shared.down_proj):
-                projection.weight.data = projection.weight.data.new_empty(0)
+        for projection in (shared.gate_up_proj, shared.down_proj):
+            projection.weight.data = projection.weight.data.new_empty(0)
         converted += 1
     if converted:
         gc.collect()
@@ -2186,7 +2186,7 @@ class KimiK3MoERuntime(nn.Module):
         if not (do_multi_stream() or AutoTuner.get().is_tuning_mode):
             return 0
         shared = self.shared_experts
-        if isinstance(shared, Mxfp8SharedExpertMLP) and shared.bf16_fallback is None:
+        if isinstance(shared, Mxfp8SharedExpertMLP):
             return 0
         down = shared.down_proj
         if (
@@ -3493,6 +3493,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     architecture is registered by that wrapper, not here."""
 
     mamba_metadata_cls = KimiK3MambaMetadata
+    # Set from the environment in __init__; loaders that build the model without
+    # it (modeling_v2 targets, checkpoint tests) inherit the defaults.
+    _mxfp8_shared_expert: bool = False
 
     def __init__(self, model_config: ModelConfig):
         mlp_fp8 = os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV, "0")
@@ -4585,9 +4588,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         if self._mxfp8_shared_expert:
             if _rubin_mxfp8_is_available():
                 converted, kept = _convert_shared_experts_to_mxfp8(self.model)
-                fallback = "FP8 weight read" if self._fp8_weight_read_moe_mlp else "BF16"
-                kept_note = f"; {sum(kept.values())} kept on {fallback}: {kept}" if kept else ""
-                logger.info(f"Kimi K3: {converted} shared experts run SM107 MXFP8{kept_note}")
+                kept_note = (
+                    f"; {sum(kept.values())} kept their previous path: {kept}" if kept else ""
+                )
+                if converted:
+                    logger.info(f"Kimi K3: {converted} shared experts run SM107 MXFP8{kept_note}")
+                else:
+                    logger.warning(
+                        f"{_KIMI_K3_MXFP8_SHARED_EXPERT_ENV}=1 converted no shared expert"
+                        f"{kept_note}"
+                    )
             else:
                 logger.warning(
                     f"{_KIMI_K3_MXFP8_SHARED_EXPERT_ENV}=1 needs SM107 with the CuTe DSL "

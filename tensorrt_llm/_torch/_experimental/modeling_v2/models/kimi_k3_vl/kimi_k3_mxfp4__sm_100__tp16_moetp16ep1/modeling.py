@@ -3217,8 +3217,9 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         text = _text_model_config(model_config)
         # _check_construction rejects speculative decoding, so the one-engine shell below builds no drafter.
         # The inherited loader reads these: this target has neither helix context parallelism nor the fp8
-        # weight-read conversion of the shared / latent MLPs.
+        # weight-read or MXFP8 conversion of the shared / latent MLPs.
         self._fp8_weight_read_moe_mlp = False
+        self._mxfp8_shared_expert = False
         self.mapping_with_cp = None
         self._repurposed_tp_mapping = None
         cfg = text.pretrained_config

@@ -1,5 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
+"""Device helpers of the Rubin MXFP8 FC12 kernel.
+
+TensorRT-LLM-local file, not part of the upstream cutedsl_megamoe export; it serves the
+kernel adapted from the upstream training forward GLU kernel
+(``sources/kernel_src/rubin/training/mega/fwd_glu/``). A re-export must carry it forward.
+"""
 
 from typing import Optional
 

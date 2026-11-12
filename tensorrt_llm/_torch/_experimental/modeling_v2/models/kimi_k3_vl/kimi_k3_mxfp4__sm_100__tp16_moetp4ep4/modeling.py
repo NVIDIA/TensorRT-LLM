@@ -3323,8 +3323,9 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             or spec_config.spec_dec_mode.is_dspark()
         ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
         # The inherited loader reads these: this target has neither helix context parallelism nor the fp8
-        # weight-read conversion of the shared / latent MLPs.
+        # weight-read or MXFP8 conversion of the shared / latent MLPs.
         self._fp8_weight_read_moe_mlp = False
+        self._mxfp8_shared_expert = False
         self.mapping_with_cp = None
         self._repurposed_tp_mapping = None
         cfg = text.pretrained_config

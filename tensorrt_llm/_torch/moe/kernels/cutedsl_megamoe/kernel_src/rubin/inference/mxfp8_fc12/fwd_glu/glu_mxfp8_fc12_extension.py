@@ -1,6 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Scheduling adapter for the MXFP8 GLU FC12 kernel."""
+"""Scheduling adapter for the MXFP8 GLU FC12 kernel.
+
+TensorRT-LLM-local file, not part of the upstream cutedsl_megamoe export: adapted
+from the upstream training forward GLU kernel
+(``sources/kernel_src/rubin/training/mega/fwd_glu/``). A re-export must carry it forward.
+"""
 
 import dataclasses
 from typing import ClassVar, List, Literal, Optional, Tuple

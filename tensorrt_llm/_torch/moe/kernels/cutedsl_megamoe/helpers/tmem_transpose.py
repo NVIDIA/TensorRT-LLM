@@ -3,6 +3,10 @@
 """tcgen05 TMEM transpose used by the Rubin MXFP8 FC12 epilogue.
 
 Accumulator layouts and pipeline synchronization are managed by the callers.
+
+TensorRT-LLM-local file, not part of the upstream cutedsl_megamoe export: adapted
+from the upstream training TMEM transpose helper (``sources/helpers/tmem_transpose.py``).
+A re-export must carry it forward.
 """
 
 from typing import Optional, Tuple
@@ -176,7 +180,7 @@ class _TmemTranspose16x32Core:
         # skip-R1.Load mode: ``reg_tensor`` must already be in the transpose
         # input distribution produced by ``load_subtile_raw_acc``;
         # we copy it in lieu of the R1 LDTM.
-        # Weak entry guard (replaces the removed input contract): the transpose
+        # Weak entry guard: the transpose
         # atoms are 32-bit element atoms over exactly 16 regs/lane, so the fed
         # tensor must be a 32-bit element type of size 16.
         self._reg_tensor = reg_tensor

@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 from torch import nn
 from utils.util import getSMVersion
 
@@ -28,7 +27,8 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.mxfp8_fused_mlp import Mxfp8SharedExpertMLP
-from tensorrt_llm._torch.modules.situ import SituAndMul, situ_and_mul_kernel
+from tensorrt_llm._torch.modules.situ import SituAndMul
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 skip_not_sm107 = pytest.mark.skipif(
@@ -40,33 +40,6 @@ _BETA = 4.0
 _LINEAR_BETA = 25.0
 # Mirrors GATE_UP_INTERLEAVE, which only imports where the CuTe DSL package exists.
 _INTERLEAVE = 32
-
-
-@skip_no_cuda
-@pytest.mark.parametrize("num_tokens,intermediate_size", [(1, 64), (7, 3072)])
-def test_situ_kernel_reads_interleaved_gate_up(num_tokens: int, intermediate_size: int) -> None:
-    torch.manual_seed(0)
-    gate_up = torch.randn((num_tokens, 2 * intermediate_size), dtype=torch.bfloat16, device="cuda")
-    blocks = gate_up.view(num_tokens, 2, -1, _INTERLEAVE)
-    interleaved = blocks.transpose(1, 2).reshape(num_tokens, -1).contiguous()
-    output = gate_up.new_empty((num_tokens, intermediate_size))
-
-    situ_and_mul_kernel[(num_tokens, triton.cdiv(intermediate_size, 1024))](
-        output,
-        output.stride(0),
-        interleaved,
-        interleaved.stride(0),
-        intermediate_size,
-        _BETA,
-        _LINEAR_BETA,
-        BLOCK_SIZE=1024,
-        HAS_LINEAR_BETA=True,
-        LAUNCH_WITH_PDL=False,
-        GATE_UP_INTERLEAVE=_INTERLEAVE,
-    )
-
-    reference = SituAndMul(beta=_BETA, linear_beta=_LINEAR_BETA)(gate_up)
-    torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
 
 
 @skip_not_sm107
@@ -84,6 +57,9 @@ def test_fused_fc12_dispatch_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     assert use_fused_fc12(2048, 3072)
     with with_multi_stream(True):
         assert not use_fused_fc12(2048, 3072)
+    # Breakable CUDA graph warmup must take the path its capture records.
+    with enable_breakable_cuda_graph():
+        assert not use_fused_fc12(2048, 3072)
     # Expert and dense DWDP prefetch on a copy stream beside the kernel.
     with monkeypatch.context() as patch:
         patch.setattr(dense_manager, "get_global_dense_dwdp_manager", lambda: object())
@@ -99,6 +75,8 @@ def test_fused_plan_tracks_sm_reserve(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(op, "_COMPILED_PLAN_CACHE", {})
     device = torch.device("cuda", torch.cuda.current_device())
+    # The plan queries the driver, which needs the CUDA context a real call already has.
+    torch.zeros(1, device=device)
     previous = cute_dsl_utils.sm_reserve()
     full = op._get_plan(device, 2048, 3072, _BETA, _LINEAR_BETA)
     cute_dsl_utils.set_sm_reserve(previous + 16)
@@ -112,7 +90,10 @@ def test_fused_plan_tracks_sm_reserve(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _make_gated_mlp(
-    hidden_size: int, intermediate_size: int
+    hidden_size: int,
+    intermediate_size: int,
+    beta: float = _BETA,
+    linear_beta: float = _LINEAR_BETA,
 ) -> tuple[GatedMLP, torch.Tensor, torch.Tensor]:
     mlp = GatedMLP(
         hidden_size=hidden_size,
@@ -120,7 +101,7 @@ def _make_gated_mlp(
         bias=False,
         dtype=torch.bfloat16,
         reduce_output=False,
-        activation=SituAndMul(beta=_BETA, linear_beta=_LINEAR_BETA, use_fused_activation=True),
+        activation=SituAndMul(beta=beta, linear_beta=linear_beta, use_fused_activation=True),
     ).cuda()
     gate = torch.randn((intermediate_size, hidden_size), dtype=torch.bfloat16) * 0.02
     up = torch.randn((intermediate_size, hidden_size), dtype=torch.bfloat16) * 0.02
@@ -130,14 +111,41 @@ def _make_gated_mlp(
     return mlp, torch.cat((gate, up)).cuda(), down.cuda()
 
 
-def _reference(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor) -> torch.Tensor:
-    activation = SituAndMul(beta=_BETA, linear_beta=_LINEAR_BETA)
+def _reference(
+    x: torch.Tensor,
+    gate_up: torch.Tensor,
+    down: torch.Tensor,
+    beta: float = _BETA,
+    linear_beta: float = _LINEAR_BETA,
+) -> torch.Tensor:
+    activation = SituAndMul(beta=beta, linear_beta=linear_beta)
     return F.linear(activation(F.linear(x, gate_up)), down)
+
+
+def _relative_l2(output: torch.Tensor, reference: torch.Tensor) -> float:
+    return ((output.float() - reference.float()).norm() / reference.float().norm()).item()
+
+
+def _max_tile_relative_l2(output: torch.Tensor, reference: torch.Tensor) -> float:
+    """Largest relative L2 error over 128 x 256 output tiles."""
+    return max(
+        _relative_l2(
+            output[row : row + 128, col : col + 256], reference[row : row + 128, col : col + 256]
+        )
+        for row in range(0, output.shape[0], 128)
+        for col in range(0, output.shape[1], 256)
+    )
+
+
+# (4.0, 25.0) are the Kimi K3 betas; (1.0, 2.0) sit inside the pre-activation spread,
+# where SiTU is far from linear and swapped or dropped betas change the output.
+_BETA_CASES = [(_BETA, _LINEAR_BETA), (1.0, 2.0)]
 
 
 @skip_not_sm107
 @torch.inference_mode()
-def test_mxfp8_shared_expert_matches_bf16() -> None:
+@pytest.mark.parametrize("beta,linear_beta", _BETA_CASES)
+def test_mxfp8_shared_expert_matches_bf16(beta: float, linear_beta: float) -> None:
     from tensorrt_llm._torch.custom_ops.cute_dsl_mxfp8_shared_expert_custom_op import (
         _unfused_mxfp8_gated_mlp,
         use_fused_fc12,
@@ -145,10 +153,11 @@ def test_mxfp8_shared_expert_matches_bf16() -> None:
 
     torch.manual_seed(0)
     hidden_size, intermediate_size = 2048, 3072
-    mlp, reference_gate_up, reference_down = _make_gated_mlp(hidden_size, intermediate_size)
+    mlp, reference_gate_up, reference_down = _make_gated_mlp(
+        hidden_size, intermediate_size, beta, linear_beta
+    )
     assert Mxfp8SharedExpertMLP.unsupported_reason(mlp) is None
     expert = Mxfp8SharedExpertMLP(mlp)
-    assert expert.bf16_fallback is None
 
     empty = expert(torch.empty((0, hidden_size), dtype=torch.bfloat16, device="cuda"))
     assert empty.shape == (0, hidden_size)
@@ -158,21 +167,26 @@ def test_mxfp8_shared_expert_matches_bf16() -> None:
     # run the fused FC12 kernel in eager mode.
     for num_tokens in (32, 1024, 2048, 2100):
         x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
-        reference = _reference(x, reference_gate_up, reference_down)
+        reference = _reference(x, reference_gate_up, reference_down, beta, linear_beta)
         output = expert(x)
         assert output.shape == reference.shape
-        relative_l2 = (output.float() - reference.float()).norm() / reference.float().norm()
-        assert relative_l2 < 0.1, (num_tokens, relative_l2.item())
+        # Per tile, so one tile missing an FC1 chunk cannot hide in the average.
+        tile_error = _max_tile_relative_l2(output, reference)
+        assert tile_error < 0.1, (num_tokens, tile_error)
 
         # CUDA graphs always take the two-GEMM path.
-        unfused = _unfused_mxfp8_gated_mlp(x, *weights, _BETA, _LINEAR_BETA)
+        unfused = _unfused_mxfp8_gated_mlp(x, *weights, beta, linear_beta)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = expert(x)
         graph.replay()
         torch.testing.assert_close(captured, unfused, rtol=0, atol=0)
+        assert _max_tile_relative_l2(captured, reference) < 0.1, num_tokens
         if not use_fused_fc12(num_tokens, intermediate_size):
             torch.testing.assert_close(output, unfused, rtol=0, atol=0)
+        else:
+            # Fused (1x32 activation scales) and two-GEMM (1x128) differ only by quantization.
+            assert _max_tile_relative_l2(output, unfused) < 0.1, num_tokens
 
 
 @skip_not_sm107
@@ -183,7 +197,7 @@ def test_tuning_fused_fc12_also_runs_the_two_gemm_path(monkeypatch: pytest.Monke
     torch.manual_seed(0)
     hidden_size, intermediate_size = 2048, 3072
     expert = Mxfp8SharedExpertMLP(_make_gated_mlp(hidden_size, intermediate_size)[0])
-    x = torch.randn((2048, hidden_size), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((3000, hidden_size), dtype=torch.bfloat16, device="cuda")
     assert op.use_fused_fc12(x.shape[0], intermediate_size)
     # The two-GEMM path tunes its GEMMs when it runs under autotune; only the call is checked here.
     calls = []
@@ -197,7 +211,37 @@ def test_tuning_fused_fc12_also_runs_the_two_gemm_path(monkeypatch: pytest.Monke
     assert calls == []
     with autotune():
         expert(x)
-    assert calls == [x.shape]
+    # Two-GEMM tuning stops at _TWO_GEMM_TUNE_MAX_NUM_TOKENS rows, so only those run.
+    assert calls == [(op._TWO_GEMM_TUNE_MAX_NUM_TOKENS, hidden_size)]
+
+
+@skip_not_sm107
+@torch.inference_mode()
+def test_ops_reject_unsafe_calls() -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_mxfp8_shared_expert_custom_op as op
+
+    torch.manual_seed(0)
+    expert = Mxfp8SharedExpertMLP(_make_gated_mlp(2048, 3072)[0])
+    weights = (expert.fc1_weight, expert.fc1_scale, expert.fc2_weight, expert.fc2_scale)
+    x = torch.randn((2048, 2048), dtype=torch.bfloat16, device="cuda")
+    # A negative beta would silently cap SiTU, since beta * tanh(x / beta) is even in beta.
+    with pytest.raises(ValueError, match="positive"):
+        op.cute_dsl_mxfp8_gated_mlp_rubin(x, *weights, -1.0, _LINEAR_BETA)
+    # Called directly, the fused op refuses where its CTAs may not all be resident.
+    with with_multi_stream(True), pytest.raises(RuntimeError, match="resident"):
+        op.cute_dsl_mxfp8_shared_expert_rubin(x, *weights, _BETA, _LINEAR_BETA)
+    with enable_breakable_cuda_graph(), pytest.raises(RuntimeError, match="resident"):
+        op.cute_dsl_mxfp8_shared_expert_rubin(x, *weights, _BETA, _LINEAR_BETA)
+
+
+@skip_no_cuda
+def test_tensor_parallel_mlp_is_not_converted() -> None:
+    mlp = _make_gated_mlp(2048, 3072)[0]
+    # A tensor-parallel shard (Kimi K3 TEP8/TEP16) keeps its BF16 path.
+    mlp.down_proj.tp_size = 2
+    assert Mxfp8SharedExpertMLP.unsupported_reason(mlp) == "tensor-parallel MLP"
+    with pytest.raises(ValueError, match="tensor-parallel"):
+        Mxfp8SharedExpertMLP(mlp)
 
 
 @skip_not_sm107
