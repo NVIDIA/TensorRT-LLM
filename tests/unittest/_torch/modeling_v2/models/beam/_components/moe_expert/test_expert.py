@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+from collections.abc import Iterator
 
 import pytest
 import torch
@@ -48,7 +49,7 @@ _WEIGHT_BYTES = sum(2 * rows * cols for rows, cols in WEIGHT_SHAPES.values())
 
 
 @pytest.fixture(scope="module", autouse=True)
-def controls():
+def controls() -> Iterator[None]:
     """IEEE fp32, no reduced-precision bf16 reduction and no autocast for the whole module."""
     with cases.numerical_controls():
         yield
@@ -58,17 +59,19 @@ def controls():
 
 
 @contextlib.contextmanager
-def observed_calls():
+def observed_calls() -> Iterator[
+    dict[str, list[tuple[tuple[torch.Tensor, ...], torch.Tensor | dict[str, torch.Tensor]]]]
+]:
     """Every cublas_mm result and activation mapping made inside the block, unchanged."""
     seen = {"mm": [], "act": []}
     mm_call, act_call = CublasMm.__call__, SwigluFp32.__call__
 
-    def mm(self, *args, **kwargs):
+    def mm(self, *args: torch.Tensor, **kwargs: object) -> torch.Tensor:
         out = mm_call(self, *args, **kwargs)
         seen["mm"].append((args, out))
         return out
 
-    def act(self, *args, **kwargs):
+    def act(self, *args: torch.Tensor, **kwargs: object) -> dict[str, torch.Tensor]:
         out = act_call(self, *args, **kwargs)
         seen["act"].append((args, out))
         return out
@@ -122,7 +125,7 @@ def _requested_cuda_bytes() -> int:
     return torch.cuda.memory_stats()["requested_bytes.all.current"]
 
 
-def test_construction_holds_one_expert_and_nothing_else():
+def test_construction_holds_one_expert_and_nothing_else() -> None:
     gc.collect()
     torch.cuda.synchronize()
     before = _requested_cuda_bytes()
@@ -143,13 +146,13 @@ def test_construction_holds_one_expert_and_nothing_else():
     assert list(expert.checkpoint_tensors()) == list(WEIGHT_SHAPES)
 
 
-def test_construction_rejects_a_host_device():
+def test_construction_rejects_a_host_device() -> None:
     with pytest.raises(ValueError, match="sm_103 CUDA devices"):
         BeamMoeExpertBf16Sm103Tp1(device="cpu")
 
 
 @pytest.mark.parametrize("source_device", ["cpu", "cuda"])
-def test_load_copies_exact_values(source_device):
+def test_load_copies_exact_values(source_device: str) -> None:
     weights = {k: v.to(source_device) for k, v in cases.matrix_case(17)[0].items()}
     expert = loaded(weights)
     for name, tensor in expert.checkpoint_tensors().items():
@@ -173,7 +176,9 @@ def test_load_copies_exact_values(source_device):
         ("not_a_tensor", TypeError, "must be a torch.Tensor"),
     ],
 )
-def test_rejects_unsupported_inputs_before_any_kernel(case, error, match):
+def test_rejects_unsupported_inputs_before_any_kernel(
+    case: str, error: type[Exception], match: str
+) -> None:
     weights, x_all = cases.matrix_case(17)
     expert = BeamMoeExpertBf16Sm103Tp1(device="cuda")
     if case != "not_loaded":
@@ -209,7 +214,9 @@ def test_rejects_unsupported_inputs_before_any_kernel(case, error, match):
         ("not_a_mapping", TypeError, "weights must be a mapping"),
     ],
 )
-def test_rejected_load_leaves_the_expert_unchanged(case, error, match):
+def test_rejected_load_leaves_the_expert_unchanged(
+    case: str, error: type[Exception], match: str
+) -> None:
     """Every other tensor is a valid replacement; a bad down tensor is the last one checked."""
     weights, x_all = cases.matrix_case(17)
     expert = loaded(weights)
@@ -236,7 +243,7 @@ def test_rejected_load_leaves_the_expert_unchanged(case, error, match):
     assert bitwise_equal(expert(x), y_before)
 
 
-def test_rejected_first_load_leaves_the_expert_unloaded():
+def test_rejected_first_load_leaves_the_expert_unloaded() -> None:
     weights = dict(cases.matrix_case(17)[0])
     weights["down_proj.weight"] = weights["down_proj.weight"].float()
     expert = BeamMoeExpertBf16Sm103Tp1(device="cuda")
@@ -251,7 +258,7 @@ def test_rejected_first_load_leaves_the_expert_unloaded():
 
 @pytest.mark.parametrize("tokens", cases.TOKENS)
 @pytest.mark.parametrize("seed", cases.SEEDS)
-def test_matrix_every_step_matches_the_source_expert(seed, tokens):
+def test_matrix_every_step_matches_the_source_expert(seed: int, tokens: int) -> None:
     weights, x_all = cases.matrix_case(seed)
     expert = loaded(weights)
     x = x_all[:tokens].cuda()
@@ -275,7 +282,7 @@ def test_matrix_every_step_matches_the_source_expert(seed, tokens):
 # ----------------------------------------------------------------------------- fixtures
 
 
-def test_zero_input_gives_exact_zero():
+def test_zero_input_gives_exact_zero() -> None:
     expert = loaded(cases.matrix_case(17)[0])
     steps = run(expert, torch.zeros(17, 5120, dtype=BF16, device="cuda"))
     for stage, tensor in steps.items():
@@ -283,7 +290,7 @@ def test_zero_input_gives_exact_zero():
         assert bool((tensor == 0).all()), stage
 
 
-def test_signed_gates_exercise_silu_exactly():
+def test_signed_gates_exercise_silu_exactly() -> None:
     weights, x, expected = cases.signed_gate_fixture()
     gates = expected["gate"].double()
     assert int((gates < 0).sum()) >= 2000 and int((gates > 0).sum()) >= 2000
@@ -295,7 +302,7 @@ def test_signed_gates_exercise_silu_exactly():
     assert not torch.equal(silu, gates) and not torch.equal(silu, gates / 2)
 
 
-def test_precision_fixture_tells_fp32_activation_from_bf16_steps():
+def test_precision_fixture_tells_fp32_activation_from_bf16_steps() -> None:
     weights, x, expected, premature_act = cases.precision_fixture()
     steps = run(loaded(weights), x.cuda())
     cases.assert_stages(steps, expected, cases.EXACT_RULES, "precision fixture")
@@ -303,7 +310,7 @@ def test_precision_fixture_tells_fp32_activation_from_bf16_steps():
     assert bool((steps["act"].cpu().double() != premature_act.double()).all())
 
 
-def test_sparse_mapping_fixes_orientation_and_feature_maps():
+def test_sparse_mapping_fixes_orientation_and_feature_maps() -> None:
     weights, x, expected = cases.sparse_mapping_fixture()
     steps = run(loaded(weights), x.cuda())
     cases.assert_stages(steps, expected, cases.EXACT_RULES, "sparse mapping")
@@ -319,7 +326,7 @@ def test_sparse_mapping_fixes_orientation_and_feature_maps():
         assert not torch.equal(gold["y"].cpu(), expected["y"]), name
 
 
-def test_row_permutation_keeps_tokens_apart():
+def test_row_permutation_keeps_tokens_apart() -> None:
     weights, x_all = cases.matrix_case(17)
     expert = loaded(weights)
     x = x_all.cuda()
@@ -334,7 +341,7 @@ def test_row_permutation_keeps_tokens_apart():
     assert cases.violations(mixed, base["y"], *cases.MATRIX_RULES["y"])["failing"] > 0
 
 
-def test_no_residual_weighting_or_collective():
+def test_no_residual_weighting_or_collective() -> None:
     """Zero down weights with a nonzero input: an added residual, bias or any other term
     would leave the output nonzero. Exact outputs on the fixtures above rule out a mixing
     weight or the routed scaling factor."""
@@ -350,7 +357,7 @@ def test_no_residual_weighting_or_collective():
     assert not any("reduce" in n or "all_gather" in n or "distributed" in n for n in names), names
 
 
-def test_forward_runs_on_the_gpu():
+def test_forward_runs_on_the_gpu() -> None:
     weights, x_all = cases.matrix_case(41)
     expert = loaded(weights)
     x = x_all[:129].cuda()

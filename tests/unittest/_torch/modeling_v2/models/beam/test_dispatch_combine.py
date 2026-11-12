@@ -46,18 +46,22 @@ BF16, FP32, I64 = torch.bfloat16, torch.float32, torch.int64
 
 
 @pytest.fixture(scope="module")
-def experts():
+def experts() -> cases.AffineExperts:
     return cases.affine_experts()
 
 
-def call(x, ids, w, experts):
+def call(
+    x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor, experts: cases.AffineExperts
+) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, torch.Tensor]]]:
     """One public call on fresh copies of the experts' log; returns (output, calls)."""
     provider = experts.fresh()
     out = dispatch_and_combine(x, ids, w, provider)
     return out, provider.calls
 
 
-def check_calls(calls, x, ids):
+def check_calls(
+    calls: list[tuple[int, torch.Tensor, torch.Tensor]], x: torch.Tensor, ids: torch.Tensor
+) -> None:
     """Exactly the selected experts, ascending, once each, each with its tokens' rows in
     ascending token order: every one of the T*8 assignments once and nothing else."""
     selected = sorted(set(ids.reshape(-1).tolist()))
@@ -71,7 +75,13 @@ def check_calls(calls, x, ids):
     assert assignments == ids.numel()
 
 
-def run_checked(x, ids, w, experts, zero=False):
+def run_checked(
+    x: torch.Tensor,
+    ids: torch.Tensor,
+    w: torch.Tensor,
+    experts: cases.AffineExperts,
+    zero: bool = False,
+) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, torch.Tensor]], dict]:
     """Public call on the GPU with every output and immutability check; returns
     (output, calls, golden)."""
     x, ids, w = x.cuda(), ids.cuda(), w.cuda()
@@ -92,7 +102,7 @@ def run_checked(x, ids, w, experts, zero=False):
 # ----------------------------------------------------------------------------- the interface
 
 
-def test_public_callable_and_provider_interface():
+def test_public_callable_and_provider_interface() -> None:
     params = list(inspect.signature(dispatch_and_combine).parameters)
     assert params == ["hidden_states", "expert_ids", "mixing_weights", "expert_provider"]
     doc = " ".join(inspect.getdoc(dispatch_combine).split())
@@ -111,7 +121,9 @@ def test_public_callable_and_provider_interface():
     ) == (5120, 256, 8, 2.5)
 
 
-def test_component_holds_no_parameters_and_allocates_nothing_persistent(experts):
+def test_component_holds_no_parameters_and_allocates_nothing_persistent(
+    experts: cases.AffineExperts,
+) -> None:
     """No router parameter, expert matrix, module or configuration object exists to build:
     the component is a function, its entry holds no state, and after a call only the
     returned tensor remains allocated."""
@@ -159,7 +171,9 @@ _T = 17
         ("provider_not_callable", TypeError, "expert_provider must be callable"),
     ],
 )
-def test_rejects_malformed_inputs_before_any_device_work(case, error, match, experts):
+def test_rejects_malformed_inputs_before_any_device_work(
+    case: str, error: type[Exception], match: str, experts: cases.AffineExperts
+) -> None:
     """Each argument is named in its error, nothing is computed and no provider is called;
     the checks read metadata only, so they never synchronize with the device."""
     x, ids, w = (t.cuda() for t in cases.matrix_case(41, _T))
@@ -209,7 +223,9 @@ def test_rejects_malformed_inputs_before_any_device_work(case, error, match, exp
         ("not_a_tensor", TypeError, r"expert_provider\(\d+\) must return a torch.Tensor"),
     ],
 )
-def test_rejects_provider_outputs_outside_the_contract(case, error, match, experts):
+def test_rejects_provider_outputs_outside_the_contract(
+    case: str, error: type[Exception], match: str, experts: cases.AffineExperts
+) -> None:
     x, ids, w = (t.cuda() for t in cases.matrix_case(17, _T))
     good = experts.fresh()
     bad = {
@@ -229,7 +245,9 @@ def test_rejects_provider_outputs_outside_the_contract(case, error, match, exper
 
 @pytest.mark.parametrize("tokens", cases.TOKENS)
 @pytest.mark.parametrize("seed", cases.SEEDS)
-def test_matrix_matches_the_source_combination(seed, tokens, experts):
+def test_matrix_matches_the_source_combination(
+    seed: int, tokens: int, experts: cases.AffineExperts
+) -> None:
     out, calls, gold = run_checked(*cases.matrix_case(seed, tokens), experts)
     assert cases.bitwise_equal(out, gold["output"]), f"seed {seed}, {tokens} tokens"
     # Each expert's output went back to its own tokens: the scattered golden is different.
@@ -245,7 +263,7 @@ def test_matrix_matches_the_source_combination(seed, tokens, experts):
 # ----------------------------------------------------------------------------- fixtures
 
 
-def test_shared_extreme_experts_keep_tokens_and_experts_apart(experts):
+def test_shared_extreme_experts_keep_tokens_and_experts_apart(experts: cases.AffineExperts) -> None:
     x, ids, w, _ = cases.fixtures()["shared_extremes"]
     out, calls, gold = run_checked(x, ids, w, experts)
     assert cases.bitwise_equal(out, gold["output"])
@@ -259,7 +277,9 @@ def test_shared_extreme_experts_keep_tokens_and_experts_apart(experts):
         assert not torch.equal(wrong["output"], out), fault
 
 
-def test_cancellation_witness_needs_every_rounding_step_in_place(experts):
+def test_cancellation_witness_needs_every_rounding_step_in_place(
+    experts: cases.AffineExperts,
+) -> None:
     """Signed routes of unequal size: the rounded route, the fp32 accumulation and the single
     final scale are each visible in the output."""
     x, ids, w, _ = cases.fixtures()["cancellation_witness"]
@@ -275,7 +295,7 @@ def test_cancellation_witness_needs_every_rounding_step_in_place(experts):
         assert not torch.equal(wrong["output"], out), fault
 
 
-def test_zero_weight_routes_contribute_exactly_zero(experts):
+def test_zero_weight_routes_contribute_exactly_zero(experts: cases.AffineExperts) -> None:
     x, ids, w, _ = cases.fixtures()["zero_weight_route"]
     out, calls, gold = run_checked(x, ids, w, experts)
     assert cases.bitwise_equal(out, gold["output"])
@@ -291,7 +311,9 @@ def test_zero_weight_routes_contribute_exactly_zero(experts):
 
 
 @pytest.mark.parametrize("name", ["all_zero_weights", "all_zero_outputs"])
-def test_all_zero_weights_or_outputs_give_exact_zero(name, experts):
+def test_all_zero_weights_or_outputs_give_exact_zero(
+    name: str, experts: cases.AffineExperts
+) -> None:
     x, ids, w, zero = cases.fixtures()[name]
     provider = cases.affine_experts(zero=True) if zero else experts
     out, _, _ = run_checked(x, ids, w, provider)
@@ -302,7 +324,9 @@ def test_all_zero_weights_or_outputs_give_exact_zero(name, experts):
 
 @pytest.mark.parametrize("seed", cases.SEEDS)
 @pytest.mark.parametrize("tokens", [t for t in cases.TOKENS if t > 1])
-def test_row_permutation_keeps_each_token_its_output(seed, tokens, experts):
+def test_row_permutation_keeps_each_token_its_output(
+    seed: int, tokens: int, experts: cases.AffineExperts
+) -> None:
     x, ids, w = (t.cuda() for t in cases.matrix_case(seed, tokens))
     perm = cases.permutation(seed, tokens).cuda()
     base, _ = call(x, ids, w, experts)
@@ -313,7 +337,7 @@ def test_row_permutation_keeps_each_token_its_output(seed, tokens, experts):
 # ----------------------------------------------------------------------------- execution
 
 
-def test_token_arithmetic_runs_on_the_gpu(experts):
+def test_token_arithmetic_runs_on_the_gpu(experts: cases.AffineExperts) -> None:
     """Gathers, products, roundings, the accumulation and the scale all produce tensors on
     the input's device; only the expert list itself comes to the host (``tolist``)."""
     x, ids, w = (t.cuda() for t in cases.matrix_case(41, 129))
