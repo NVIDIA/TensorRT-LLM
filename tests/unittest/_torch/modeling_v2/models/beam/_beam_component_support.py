@@ -92,8 +92,8 @@ def ieee_fp32_session(write_evidence):
     finally:
         # Legacy setters can also change the newer precision controls.
         precision, allow_matmul, allow_cudnn, matmul_precision, cudnn_precision = saved
-        torch.set_float32_matmul_precision(precision)
         matmul.allow_tf32 = allow_matmul
+        torch.set_float32_matmul_precision(precision)
         torch.backends.cudnn.allow_tf32 = allow_cudnn
         matmul.fp32_precision = matmul_precision
         torch.backends.cudnn.fp32_precision = cudnn_precision
