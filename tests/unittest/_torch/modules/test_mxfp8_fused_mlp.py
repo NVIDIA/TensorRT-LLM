@@ -128,6 +128,8 @@ def _relative_l2(output: torch.Tensor, reference: torch.Tensor) -> float:
 
 def _max_tile_relative_l2(output: torch.Tensor, reference: torch.Tensor) -> float:
     """Largest relative L2 error over 128 x 256 output tiles."""
+    # ``max`` keeps a finite value over a later NaN, so reject non-finite outputs first.
+    assert torch.isfinite(output).all(), "non-finite output"
     return max(
         _relative_l2(
             output[row : row + 128, col : col + 256], reference[row : row + 128, col : col + 256]
