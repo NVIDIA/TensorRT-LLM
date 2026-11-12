@@ -36,6 +36,7 @@ l0_h100:
   - unittest/others/test_import_cuda_context.py
   - unittest/others/test_lora_manager.py
   - unittest/_torch/misc
+  - unittest/_torch/models/test_deepseekv3_fp8_block_scale_dequant_load.py
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_rms_norm_fp8_per_token.py
