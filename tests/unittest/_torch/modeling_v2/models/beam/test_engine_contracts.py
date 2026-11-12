@@ -177,6 +177,14 @@ def test_pretrained_quantization_takes_precedence_over_fallback(
     "field,value,message",
     [
         ("cuda_graph_config", object(), "CUDA graphs are not supported by this eager Beam target"),
+        ("torch_compile_config", object(), "torch_compile_config must be None"),
+        ("prefill_cuda_graph_backend", "piecewise", "prefill_cuda_graph_backend must be disabled"),
+        ("prefill_cuda_graph_backend", "breakable", "prefill_cuda_graph_backend must be disabled"),
+        (
+            "prefill_cuda_graph_backend",
+            Enum("PrefillBackend", {"BREAKABLE": "breakable"}).BREAKABLE,
+            "prefill_cuda_graph_backend must be disabled",
+        ),
         (
             "disable_overlap_scheduler",
             False,
@@ -196,6 +204,17 @@ def test_eager_target_route_refuses_unsupported_engine_options(
     with pytest.raises(NoTarget, match=message):
         routing.route(model_config, llm_args, (10, 3))
     assert reads == []
+
+
+@pytest.mark.parametrize(
+    "backend", ["disabled", Enum("PrefillBackend", {"DISABLED": "disabled"}).DISABLED]
+)
+def test_eager_route_accepts_disabled_prefill_graphs(route_setup, backend) -> None:
+    config, args, reads = route_setup
+    args.prefill_cuda_graph_backend = backend
+    args.torch_compile_config = None
+    assert routing.route(config, args, (10, 3)) is Target
+    assert reads == [None]
 
 
 @pytest.mark.parametrize("builtin", [None, object])
