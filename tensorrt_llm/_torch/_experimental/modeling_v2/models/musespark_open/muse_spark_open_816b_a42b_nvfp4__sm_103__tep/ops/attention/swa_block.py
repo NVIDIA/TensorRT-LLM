@@ -825,7 +825,6 @@ def _cl8_launch(
     return out
 
 
-
 @triton.jit
 def _prep_rows(
     ptr,
