@@ -205,6 +205,19 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"num_workers": 2, "server_keep_alive_timeout": 20}, True),
         (generator.DISAGG_SCHEMA, {"checkpoint_io_policy": "native"}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"checkpoint_io_policy": "unknown"}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64 - 1}}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"watermark_config": {"key": 0, "algorithm": "gumbel_dual_key", "context_width": 64}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": -1}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "context_width": 0}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "context_width": 65}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "algorithm": "synthid"}}, False),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": 7}}}, True),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": -1}}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
@@ -405,6 +418,33 @@ def test_runtime_rejects_untagged_union_values(owner: str, field: str, value: di
     with pytest.raises(ValidationError) as excinfo:
         TypeAdapter(model.model_fields[field].annotation).validate_python(value)
     assert "union_tag_not_found" in {error["type"] for error in excinfo.value.errors()}
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("preemption", "valid"),
+    [
+        ({}, True),
+        ({"tpot_budget": 0.1}, True),
+        ({"target_output_tps": 40}, True),
+        ({"tpot_budget": None, "target_output_tps": 40}, True),
+        ({"tpot_budget": 0.1, "target_output_tps": None}, True),
+        ({"tpot_budget": None, "target_output_tps": None}, True),
+        ({"tpot_budget": 0}, False),
+        ({"tpot_budget": -0.1}, False),
+        ({"tpot_budget": 1}, False),
+        ({"target_output_tps": 0}, False),
+        ({"target_output_tps": -1}, False),
+        ({"tpot_budget": 0.1, "target_output_tps": 40}, False),
+        ({"policy": "wait"}, False),
+    ],
+)
+def test_gen_preemption_fields(
+    schemas: dict[str, dict], filename: str, preemption: dict, valid: bool
+) -> None:
+    config = {"scheduler_config": {"gen_preemption": preemption}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
@@ -704,6 +744,44 @@ def test_llm_model_fields_have_schema(schemas: dict[str, dict]) -> None:
         disagg["$defs"]["DisaggServerBlock"],
     ):
         _assert_model_fields_in_schema(TorchLlmArgs, schema["properties"])
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("config_name", "algorithm"),
+    [("DeepSeekSparseAttentionConfig", "dsa"), ("DeepSeekV4SparseAttentionConfig", "deepseek_v4")],
+)
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_sparse_offload_indexer_default(
+    schemas: dict[str, dict], filename: str, config_name: str, algorithm: str, enabled: bool | None
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import (
+        DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
+    )
+
+    config_cls = {
+        "dsa": DeepSeekSparseAttentionConfig,
+        "deepseek_v4": DeepSeekV4SparseAttentionConfig,
+    }[algorithm]
+    sparse_config: dict[str, str | bool] = {"algorithm": algorithm}
+    if enabled is not None:
+        sparse_config["enable_kv_cache_offload"] = enabled
+    schema = schemas[filename]
+    definition = schema["$defs"][config_name]
+    field = "use_cute_dsl_paged_mqa_logits"
+    assert definition["properties"][field]["default"] is True
+    assert config_cls.model_validate(sparse_config).use_cute_dsl_paged_mqa_logits is True
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"sparse_attention_config": sparse_config})
+    for value in (False, True):
+        explicit = {**sparse_config, field: value}
+        assert validator.is_valid({"sparse_attention_config": explicit})
+        assert config_cls.model_validate(explicit).use_cute_dsl_paged_mqa_logits is value
+    for invalid in (None, "invalid", 2):
+        assert not validator.is_valid(
+            {"sparse_attention_config": {**sparse_config, field: invalid}}
+        )
 
 
 def test_model_field_guard_detects_missing_fields_and_aliases() -> None:

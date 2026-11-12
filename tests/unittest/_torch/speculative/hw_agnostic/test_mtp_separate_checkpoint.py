@@ -619,6 +619,7 @@ def test_qwen4_replacement_loads_mtp_and_hyper_connection(
     }
     loader = ModelLoader.__new__(ModelLoader)
     loader._metrics = {}
+    loader._startup_metadata = {}
     loader.spec_config = model.spec_config
     loader.mapping = config.mapping
     loader.weight_mapper = object()
@@ -968,6 +969,7 @@ def test_replacement_loader_initializes_independent_architecture_mapper(monkeypa
     model.draft_model.owns_lm_head = False
     loader = ModelLoader.__new__(ModelLoader)
     loader._metrics = {}
+    loader._startup_metadata = {}
     loader.spec_config = model.spec_config
     loader.mapping = config.mapping
     loader.weight_mapper = object()
