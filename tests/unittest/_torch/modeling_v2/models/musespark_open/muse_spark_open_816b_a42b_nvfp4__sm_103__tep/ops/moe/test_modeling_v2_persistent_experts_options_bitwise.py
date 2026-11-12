@@ -88,6 +88,11 @@ def test_override_rows_are_bitwise_equal_to_default(monkeypatch, override):
     for key, value in changed.items():
         assert options[key] == int(value) != default_options[key], key
 
+    # The kernel was compiled with the override: a cached launcher is keyed by the options
+    # tuple (key[3]) that `_compiled` passes to the kernel constructor.
+    wanted = {(k, int(v)) for k, v in changed.items()}
+    assert any(wanted <= set(key[3]) for key in PE._COMPILED), (wanted, list(PE._COMPILED))
+
     assert torch.isfinite(default_rows.float()).all()
     assert default_rows.float().abs().max() > 0  # a zero or unwritten output would pass equal
     assert torch.equal(index, default_index)
