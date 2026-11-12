@@ -1961,9 +1961,21 @@ class TestTierStoragePressure:
         snapshot.pop("restoredBlocks")
         snapshot.pop("evictedBlocks")
         log()
-        assert not _has_series(
-            collector.kv_cache_tier_moved_blocks, {**labels, "operation": "drop_capacity"}
+        assert (
+            collector.kv_cache_tier_moved_blocks.labels(**labels, operation="restore")._value.get()
+            == 8
         )
+        assert (
+            collector.kv_cache_tier_moved_blocks.labels(**labels, operation="evict")._value.get()
+            == 9
+        )
+        snapshot["poolGroupId"] = 1
+        log()
+        for operation in ("restore", "evict"):
+            assert not _has_series(
+                collector.kv_cache_tier_moved_blocks,
+                {**labels, "pool_group": "1", "operation": operation},
+            )
 
     @pytest.mark.parametrize(
         "changes",

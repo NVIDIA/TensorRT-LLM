@@ -138,7 +138,7 @@
                       "name": "@@LOKI_UID@@"
                     },
                     "spec": {
-                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"@@ENGINE_PODS@@\",pod=~\".*\",container=~\"${container:regex}\"} |~ \"$search\"",
+                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"(${worker:regex})|(@@FRONTEND_PODS@@)\",container=~\"${container:regex}\"} |~ \"$search\"",
                       "legendFormat": ""
                     }
                   },
@@ -363,7 +363,7 @@
                     },
                     "spec": {
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_ctx_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}} context"
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} context"
                     }
                   },
                   "refId": "A",
@@ -382,7 +382,7 @@
                     },
                     "spec": {
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_gen_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}} generation"
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} generation"
                     }
                   },
                   "refId": "B",
@@ -452,7 +452,7 @@
                     },
                     "spec": {
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_fetched = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}"
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}"
                     }
                   },
                   "refId": "A",
@@ -523,7 +523,7 @@
                     "spec": {
                       "editorMode": "code",
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_active = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
                       "queryType": "range"
                     }
                   },
@@ -596,7 +596,7 @@
                     "spec": {
                       "editorMode": "code",
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_unscheduled = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
                       "queryType": "range"
                     }
                   },
@@ -669,7 +669,7 @@
                     "spec": {
                       "editorMode": "code",
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_dummy = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
                       "queryType": "range"
                     }
                   },
@@ -741,7 +741,7 @@
                     },
                     "spec": {
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_ctx_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}} context"
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} context"
                     }
                   },
                   "refId": "A",
@@ -760,7 +760,7 @@
                     },
                     "spec": {
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_gen_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}} generation"
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} generation"
                     }
                   },
                   "refId": "B",
@@ -830,7 +830,7 @@
                     },
                     "spec": {
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_fetched = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}"
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}"
                     }
                   },
                   "refId": "A",
@@ -901,7 +901,7 @@
                     "spec": {
                       "editorMode": "code",
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_active = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
                       "queryType": "range"
                     }
                   },
@@ -974,7 +974,7 @@
                     "spec": {
                       "editorMode": "code",
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_unscheduled = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
                       "queryType": "range"
                     }
                   },
@@ -1047,7 +1047,7 @@
                     "spec": {
                       "editorMode": "code",
                       "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_dummy = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
-                      "legendFormat": "{{pod}} / {{role}} / rank {{rank}}",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
                       "queryType": "range"
                     }
                   },
