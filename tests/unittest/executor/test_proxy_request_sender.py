@@ -7,18 +7,25 @@ submitting thread and send bursts of payloads as one list; the worker unpickles
 each payload.
 """
 
+import asyncio
 import pickle
 import queue
+import socket
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
+import zmq
 
+from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import (
     GenerationExecutorProxy,
     _create_request_sender,
     _RequestSender,
 )
+from tensorrt_llm.executor.request import CancellingRequest
+from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError
 from tensorrt_llm.executor.worker import _incoming_requests
 
 pytestmark = pytest.mark.cpu_only
@@ -28,11 +35,23 @@ class _RecordingQueue:
     """Request-queue stand-in that records each message; the first put can block.
 
     Like ``ZeroMqQueue`` with ``TLLM_LLMAPI_ZMQ_DEBUG=1``, it rejects a write from
-    any thread other than the first one that wrote.
+    any thread other than the first one that wrote, so the production factory
+    keeps every write on the sender thread.
     """
+
+    _zmq_debug_enabled = True
 
     def __init__(self, block_first_put: bool = False):
         self.messages = []
+        self.socket = SimpleNamespace(
+            setsockopt=lambda *args: self._check_writer(),
+            get_monitor_socket=lambda **kwargs: SimpleNamespace(
+                poll=lambda timeout: False,
+                getsockopt=lambda option: 0,
+                close=lambda **kwargs: self._check_writer(),
+            ),
+            disable_monitor=lambda: self._check_writer(),
+        )
         self.writer = None
         self.first_put_started = threading.Event()
         self.release_first_put = threading.Event()
@@ -45,7 +64,10 @@ class _RecordingQueue:
         elif self.writer != threading.get_ident():
             raise RuntimeError("request queue written from a second thread")
 
-    def put(self, msg):
+    def setup_lazily(self):
+        self._check_writer()
+
+    def put(self, msg, *, timeout=None):
         self._check_writer()
         if not self.messages:
             self.first_put_started.set()
@@ -55,6 +77,9 @@ class _RecordingQueue:
     def put_noblock(self, msg, *, retry=1, wait_time=0.001):
         self._check_writer()
         self.messages.append(msg)
+
+    def close(self):
+        self._check_writer()
 
 
 def _payloads(*items):
@@ -80,11 +105,28 @@ def _pre_shutdown(proxy):
     return shutdown
 
 
-def test_batching_is_opt_in(monkeypatch):
-    monkeypatch.delenv("TRTLLM_PROXY_BATCH_REQUESTS", raising=False)
-    assert _create_request_sender(_RecordingQueue(), queue.Queue()) is None
-    monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", "1")
-    assert isinstance(_create_request_sender(_RecordingQueue(), queue.Queue()), _RequestSender)
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+def test_batching_is_opt_in(monkeypatch, setting):
+    if setting is None:
+        monkeypatch.delenv("TRTLLM_PROXY_BATCH_REQUESTS", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", setting)
+    batching = setting == "1"
+    q = _RecordingQueue(block_first_put=True)
+    sender = _create_request_sender(q, queue.Queue())
+    sender.send(pickle.dumps("a"))
+    assert not q.messages, "submission waited for its command to be written"
+    assert q.first_put_started.wait(10)
+    sender.send(pickle.dumps("b"))
+    sender.send(pickle.dumps("c"))
+    q.release_first_put.set()
+    sender.close(timeout=10)
+    expected = (
+        [_payloads("a"), _payloads("b", "c")]
+        if batching
+        else [_payloads("a"), _payloads("b"), _payloads("c")]
+    )
+    assert q.messages == expected
 
 
 def test_lone_request_is_sent_as_one_payload_list():
@@ -120,7 +162,8 @@ def test_close_flushes_queued_requests_and_drops_later_ones():
     closer.join(timeout=10)
     assert not closer.is_alive()
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
-    sender.send(pickle.dumps("late"))
+    with pytest.raises(EngineUnavailableError):
+        sender.send(pickle.dumps("late"))
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
 
 
@@ -129,7 +172,7 @@ def test_close_is_idempotent():
     sender = _RequestSender(request_queue, queue.Queue())
     sender.send(pickle.dumps("a"))
     sender.close(timeout=10)
-    assert sender._thread is None
+    assert not sender._thread.is_alive()
     sender.close(timeout=10)
     assert request_queue.messages == [_payloads("a")]
 
@@ -147,19 +190,17 @@ def test_sender_thread_sends_the_sentinel_after_the_queued_requests():
     closer.start()
     request_queue.release_first_put.set()
     closer.join(timeout=10)
-    assert result == [False]
+    assert result == [None]
     # A bare None after the payload lists, written by the sender thread.
     assert request_queue.messages == [_payloads("first"), _payloads("queued"), None]
 
 
-def test_caller_sends_the_sentinel_when_the_sender_thread_did_not():
-    # The thread never started, so nothing has written the queue yet.
-    assert _RequestSender(_RecordingQueue(), queue.Queue()).close(send_sentinel=True)
-    # The thread stopped before the sentinel was asked for.
-    sender = _RequestSender(_RecordingQueue(), queue.Queue())
-    sender.send(pickle.dumps("a"))
-    sender.close(timeout=10)
-    assert sender.close(timeout=10, send_sentinel=True)
+def test_shutdown_without_requests_still_uses_the_socket_owner():
+    q = _RecordingQueue()
+    sender = _RequestSender(q, queue.Queue())
+    assert sender.close(timeout=10, send_sentinel=True) is None
+    assert q.messages == [None]
+    assert q.writer != threading.get_ident()
 
 
 def test_close_during_interpreter_finalization_does_not_join():
@@ -171,13 +212,13 @@ def test_close_during_interpreter_finalization_does_not_join():
     # Joining would wait for the blocked send; at teardown close() must return at
     # once, and must not ask anyone to send the sentinel.
     sender._is_finalizing = lambda: True
-    assert sender.close(send_sentinel=True) is False
+    assert sender.close(send_sentinel=True) is None
     assert sender._thread is not None
     # Outside finalization the same sender still flushes and stops.
     sender._is_finalizing = lambda: False
     request_queue.release_first_put.set()
     sender.close(timeout=10)
-    assert sender._thread is None
+    assert not sender._thread.is_alive()
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
 
 
@@ -205,35 +246,88 @@ def test_pre_shutdown_sends_the_sentinel_itself_if_nothing_else_wrote(batching):
     request_queue = _RecordingQueue()
     proxy = _bare_proxy()
     proxy.request_queue = request_queue
-    if batching:
-        proxy._request_sender = _RequestSender(request_queue, queue.Queue())
+    proxy._request_sender = _RequestSender(request_queue, queue.Queue(), batching=batching)
 
     shutdown = _pre_shutdown(proxy)
     shutdown.join(timeout=10)
     assert not shutdown.is_alive()
     proxy.workers_started = False
     assert request_queue.messages == [None]
-    assert request_queue.writer == shutdown.ident
+    assert request_queue.writer != shutdown.ident
 
 
-def test_transport_error_reaches_error_queue():
-    class _FailingQueue:
-        def put(self, msg):
+@pytest.mark.timeout(20, method="thread")
+@pytest.mark.parametrize("late_close", [False, True])
+def test_transport_error_reaches_error_queue(monkeypatch, late_close):
+    monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", "1")
+    published = threading.Event()
+    finish_failure = threading.Event()
+
+    class _ErrorQueue(queue.Queue):
+        def put_nowait(self, error):
+            super().put_nowait(error)
+            published.set()
+            if not late_close:
+                assert finish_failure.wait(timeout=10)
+
+    class _FailingQueue(_RecordingQueue):
+        attempts = 0
+
+        def put(self, msg, *, timeout=None):
+            if msg is None:
+                return super().put(msg, timeout=timeout)
+            self._check_writer()
+            self.attempts += 1
+            self.first_put_started.set()
+            assert self.release_first_put.wait(timeout=10)
             raise RuntimeError("socket closed")
 
-    error_queue = queue.Queue()
-    sender = _RequestSender(_FailingQueue(), error_queue)
-    sender.send(pickle.dumps("a"))
-    sender.close(timeout=10)
-    error = error_queue.get_nowait()
-    assert isinstance(error, RuntimeError)
-    assert str(error) == "socket closed"
+    request_queue = _FailingQueue(block_first_put=True)
+    error_queue = _ErrorQueue()
+    sender = _create_request_sender(request_queue, error_queue)
+    closer = None
+    try:
+        sender.send(pickle.dumps("a"))
+        assert request_queue.first_put_started.wait(timeout=10)
+        sender.send(pickle.dumps("queued"))
+        request_queue.release_first_put.set()
+        assert published.wait(timeout=10)
+        if late_close:
+            # The failure owner must already know how to stop its workers;
+            # cleanup can arrive after that owner has closed its socket.
+            sender._thread.join(timeout=3)
+            assert not sender._thread.is_alive()
+        responsibility = []
+        closer = threading.Thread(
+            target=lambda: responsibility.append(sender.close(timeout=10, send_sentinel=True))
+        )
+        closer.start()
+        if not late_close:
+            with sender._cond:
+                assert sender._cond.wait_for(lambda: sender._send_sentinel, timeout=10)
+        finish_failure.set()
+        closer.join(timeout=10)
+        assert not closer.is_alive()
+        assert responsibility == [None]
+        assert request_queue.attempts == 1
+        assert request_queue.messages == [None]
+        error = error_queue.get_nowait()
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "socket closed"
+    finally:
+        request_queue.release_first_put.set()
+        finish_failure.set()
+        if closer is not None:
+            closer.join(timeout=10)
+        sender.close(timeout=10)
 
 
 def test_batched_request_is_captured_when_sent():
     proxy = _bare_proxy()
     sent = []
-    proxy._request_sender = SimpleNamespace(send=sent.append)
+    proxy._request_sender = SimpleNamespace(
+        send=lambda payload, **kwargs: sent.append(payload), close=lambda **kwargs: None
+    )
 
     request = {"max_tokens": 1}
     proxy._send_request(request)
@@ -247,14 +341,6 @@ def test_batched_request_is_captured_when_sent():
     assert len(sent) == 1
 
 
-def test_unbatched_request_is_put_directly():
-    proxy = _bare_proxy()
-    request_queue = _RecordingQueue()
-    proxy.request_queue = request_queue
-    proxy._send_request("a")
-    assert request_queue.messages == ["a"]
-
-
 def test_worker_unpacks_batched_requests_in_order():
     class _ListQueue:
         def __init__(self, messages):
@@ -265,3 +351,774 @@ def test_worker_unpacks_batched_requests_in_order():
 
     request_queue = _ListQueue(["a", _payloads("b", "c"), "d", None, "after sentinel"])
     assert list(_incoming_requests(request_queue)) == ["a", "b", "c", "d"]
+
+
+@pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
+@pytest.mark.parametrize("push", [False, True])
+def test_initial_connection_timeout_fails_accepted_work(tmp_path, push, direct_send):
+    if push:
+        commands = IpcQueue(
+            (f"ipc://{tmp_path}/absent", b"k" * 32),
+            is_server=False,
+            socket_type=zmq.PUSH,
+        )
+    else:
+        commands = IpcQueue(is_server=True)
+    errors = queue.Queue()
+    sender = _RequestSender(
+        commands, errors, batching=not direct_send, connect_timeout=0.15, direct_send=direct_send
+    )
+    try:
+        sender.send(pickle.dumps("accepted"))
+        assert isinstance(errors.get(timeout=2), TimeoutError)
+        with pytest.raises(EngineDeadError):
+            sender.send(pickle.dumps("late"))
+    finally:
+        sender.close(timeout=2)
+    assert not sender._thread.is_alive()
+
+
+@pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
+@pytest.mark.parametrize("transport", ["tcp", "ipc"])
+def test_established_disconnect_fails_while_idle_without_replay(tmp_path, transport, direct_send):
+    address = (f"ipc://{tmp_path}/commands", b"k" * 32) if transport == "ipc" else None
+    peer = IpcQueue(address, is_server=True, socket_type=zmq.PULL)
+    address = peer.address
+    commands = IpcQueue(address, is_server=False, socket_type=zmq.PUSH)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
+    replacement = None
+    try:
+        sender.send(pickle.dumps("accepted"))
+        assert peer.get(timeout=2) == _payloads("accepted")
+        # No subsequent send or Again may be needed to discover missing tail data.
+        peer.close()
+        assert isinstance(errors.get(timeout=2), ConnectionError)
+        sender._thread.join(timeout=2)
+        assert not sender._thread.is_alive()
+        replacement = IpcQueue(address, is_server=True, socket_type=zmq.PULL)
+        with pytest.raises(EngineDeadError):
+            sender.send(pickle.dumps("after-disconnect"))
+        assert not replacement.poll(0.1)
+    finally:
+        sender.close(timeout=2)
+        peer.close()
+        if replacement is not None:
+            replacement.close()
+
+
+@pytest.mark.timeout(12, method="thread")
+def test_control_capacity_is_reserved_when_admission_is_full():
+    q = _RecordingQueue(block_first_put=True)
+    sender = _RequestSender(q, queue.Queue())
+    sender.MAX_BATCH_SIZE = 1
+    sender.MAX_PENDING_REQUESTS = 1
+    sender.MAX_PENDING_CONTROLS = 1
+    try:
+        sender.send(pickle.dumps("in-flight"))
+        assert q.first_put_started.wait(3)
+        sender.send(pickle.dumps("queued"))
+        with pytest.raises(EngineUnavailableError):
+            sender.send(pickle.dumps("overload"))
+        sender.send(pickle.dumps("cancel"), control=True)
+        with pytest.raises(EngineUnavailableError):
+            sender.send(pickle.dumps("extra-cancel"), control=True)
+    finally:
+        q.release_first_put.set()
+        sender.close(timeout=3, send_sentinel=True)
+    assert q.messages == [_payloads("in-flight"), _payloads("queued"), _payloads("cancel"), None]
+
+
+@pytest.mark.timeout(12, method="thread")
+@pytest.mark.parametrize("local_final", [False, True])
+def test_proxy_retains_cancellations_when_control_queue_is_full(local_final):
+    q = _RecordingQueue(block_first_put=True)
+    proxy = _bare_proxy()
+    proxy._engine_dead = False
+    proxy._fatal_error = None
+    proxy.doing_shutdown = False
+    proxy._error_queue = queue.Queue()
+    unrelated = SimpleNamespace(queue=queue.Queue())
+    proxy._results = {
+        42: SimpleNamespace(queue=queue.Queue()),
+        43: SimpleNamespace(queue=queue.Queue()),
+        44: unrelated,
+    }
+    sender = _RequestSender(q, proxy._error_queue)
+    sender.MAX_PENDING_CONTROLS = 1
+    sender.MAX_BATCH_SIZE = 1
+    proxy._request_sender = sender
+    try:
+        sender.send(pickle.dumps("in-flight"))
+        assert q.first_put_started.wait(3)
+        sender.send(pickle.dumps("queued-control"), control=True)
+        if local_final:
+            from tensorrt_llm.executor.postproc_worker import PostprocWorker
+
+            response = PostprocWorker.Output(42, None, True, should_abort=True)
+            proxy.result_queue = SimpleNamespace(get=lambda: response)
+            assert proxy.dispatch_result_task()
+            assert 42 not in proxy._results
+        else:
+            proxy.abort_request(42)
+        proxy.abort_request(42)
+        proxy.abort_request(43)
+        assert not proxy._engine_dead
+        assert unrelated.queue.empty()
+        assert proxy._error_queue.empty()
+    finally:
+        q.release_first_put.set()
+        sender.close(timeout=3)
+    delivered = [pickle.loads(message[0]) for message in q.messages[2:]]
+    assert [request.id for request in delivered] == [42, 43]
+    assert all(isinstance(request, CancellingRequest) for request in delivered)
+
+
+@pytest.mark.timeout(12, method="thread")
+def test_shutdown_cancels_survive_full_control_queue():
+    q = _RecordingQueue(block_first_put=True)
+    sender = _RequestSender(q, queue.Queue())
+    sender.MAX_PENDING_CONTROLS = 1
+    sender.MAX_BATCH_SIZE = 1
+    sender.send(pickle.dumps("in-flight"))
+    assert q.first_put_started.wait(3)
+    sender.send(pickle.dumps("queued-control"), control=True)
+    closed = threading.Thread(target=lambda: sender.close(timeout=3, cancel_ids=(7, 8)))
+    closed.start()
+    q.release_first_put.set()
+    closed.join(timeout=4)
+    assert not closed.is_alive()
+    assert q.messages[:2] == [_payloads("in-flight"), _payloads("queued-control")]
+    cancels = [pickle.loads(message[0]) for message in q.messages[2:]]
+    assert all(isinstance(request, CancellingRequest) for request in cancels)
+    assert [request.id for request in cancels] == [7, 8]
+    assert None not in q.messages
+
+
+@pytest.mark.timeout(20, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
+def test_connected_backpressure_preserves_queued_requests_beyond_old_timeout(direct_send):
+    blocked = threading.Event()
+
+    class ObservedQueue(IpcQueue):
+        def put(self, message, **kwargs):
+            try:
+                return super().put(message, **kwargs)
+            except zmq.Again:
+                blocked.set()
+                raise
+
+    peer = IpcQueue(is_server=True, socket_type=zmq.PULL, receive_hwm=1)
+    peer.socket.setsockopt(zmq.RCVBUF, 256 * 1024)
+    commands = ObservedQueue(peer.address, is_server=False, socket_type=zmq.PUSH, send_hwm=1)
+    commands.socket.setsockopt(zmq.SNDBUF, 256 * 1024)
+    errors = queue.Queue()
+    sender = _RequestSender(
+        commands, errors, batching=False, connect_timeout=0.15, direct_send=direct_send
+    )
+    count = 16
+    data = b"x" * (1024 * 1024)
+    try:
+        for i in range(count):
+            sender.send(pickle.dumps((i, data)))
+        assert blocked.wait(3), "real transport did not reach backpressure"
+        # A connected worker can legitimately stop consuming for longer than
+        # the old five-second recovery deadline. It must retain accepted work.
+        time.sleep(5.2)
+        assert sender.available
+        assert errors.empty()
+        sender.send(pickle.dumps((count, data)))
+        received = []
+        for _ in range(count + 1):
+            message = peer.get(timeout=3)
+            assert len(message) == 1
+            request_id, contents = pickle.loads(message[0])
+            assert contents == data
+            received.append(request_id)
+        assert received == list(range(count + 1))
+        assert errors.empty()
+    finally:
+        sender.close(timeout=2)
+        peer.socket.setsockopt(zmq.LINGER, 0)
+        peer.close()
+    assert not sender._thread.is_alive()
+
+
+@pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("stop", ["capacity", "close", "failure"])
+def test_capacity_wait_unblocks_on_progress_or_shutdown(stop):
+    commands = _RecordingQueue(block_first_put=True)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False)
+    sender.MAX_PENDING_REQUESTS = 1
+    outcomes = queue.Queue()
+    entered = threading.Event()
+
+    def wait_for_capacity():
+        entered.set()
+        try:
+            sender.send(pickle.dumps("waiting"), wait_for_capacity=True)
+            outcomes.put(None)
+        except (EngineDeadError, EngineUnavailableError) as error:
+            outcomes.put(error)
+
+    waiter = threading.Thread(target=wait_for_capacity)
+    closer = None
+    try:
+        sender.send(pickle.dumps("in-flight"))
+        assert commands.first_put_started.wait(2)
+        sender.send(pickle.dumps("queued"))
+        waiter.start()
+        assert entered.wait(2)
+        assert outcomes.empty()
+        if stop == "failure":
+            sender.fail(RuntimeError("worker died"))
+        elif stop == "close":
+            closer = threading.Thread(target=sender.close, kwargs={"timeout": 2})
+            closer.start()
+        else:
+            commands.release_first_put.set()
+        outcome = outcomes.get(timeout=2)
+        if stop == "capacity":
+            assert outcome is None
+        elif stop == "failure":
+            assert isinstance(outcome, EngineDeadError)
+        else:
+            assert isinstance(outcome, EngineUnavailableError)
+    finally:
+        commands.release_first_put.set()
+        waiter.join(timeout=2)
+        if closer is not None:
+            closer.join(timeout=2)
+        sender.close(timeout=2)
+    assert not waiter.is_alive()
+    if stop == "capacity":
+        assert commands.messages == [
+            _payloads("in-flight"),
+            _payloads("queued"),
+            _payloads("waiting"),
+        ]
+
+
+@pytest.mark.parametrize(
+    ("batching", "debug", "direct"),
+    [
+        ("0", False, True),
+        (None, False, True),
+        ("1", False, True),
+        ("0", True, False),
+        ("1", True, False),
+    ],
+)
+def test_production_sender_writes_on_the_submitting_thread_unless_zmq_debug(
+    monkeypatch, batching, debug, direct
+):
+    if batching is None:
+        monkeypatch.delenv("TRTLLM_PROXY_BATCH_REQUESTS", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", batching)
+    commands = IpcQueue(is_server=True)
+    commands._zmq_debug_enabled = debug
+    sender = _create_request_sender(commands, queue.Queue())
+    try:
+        assert sender._direct_send is direct
+    finally:
+        sender.close(timeout=2)
+        commands.close()
+
+
+class _ObservedQueue(IpcQueue):
+    """Real command socket that records writers and the sender thread's waits."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writers = set()
+        self.owner_blocked = threading.Event()
+
+    def put(self, message, **kwargs):
+        try:
+            super().put(message, **kwargs)
+        except zmq.Again:
+            if threading.current_thread().name == "proxy_request_sender":
+                self.owner_blocked.set()
+            raise
+        self.writers.add(threading.current_thread().name)
+
+
+def _deschedule_owner(sender):
+    """Stop the sender thread's progress, like a thread that is denied the GIL.
+
+    The thread is held where it waits for work, outside the condition lock, so
+    callers still run. Setting the returned event lets it continue.
+    """
+    resume = threading.Event()
+    wake = sender._owner_wake
+
+    class _HeldWake:
+        def wait(self, timeout=None):
+            if threading.current_thread() is sender._thread:
+                resume.wait()
+            return wake.wait(timeout)
+
+        def __getattr__(self, name):
+            return getattr(wake, name)
+
+    sender._owner_wake = _HeldWake()
+    # Let a wait already in progress reach the replacement.
+    time.sleep(0.2)
+    return resume
+
+
+def _command_peer(commands):
+    """Connect a worker-side PAIR peer and wait until commands can reach it."""
+    peer = IpcQueue(commands.address, is_server=False)
+    peer.setup_lazily()
+    deadline = time.monotonic() + 5
+    while not commands.socket.poll(0, zmq.POLLOUT):
+        assert time.monotonic() < deadline, "command peer did not connect"
+        time.sleep(0.01)
+    return peer
+
+
+def _close_quietly(*queues):
+    for ipc_queue in queues:
+        if ipc_queue.socket is not None:
+            ipc_queue.socket.setsockopt(zmq.LINGER, 0)
+        ipc_queue.close()
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_unbatched_admission_does_not_wait_for_the_sender_thread():
+    # Regression: unbatched commands could only be written by the sender
+    # thread. A busy event loop starved it of the GIL, so a connected and idle
+    # worker received nothing while admission filled and rejected requests.
+    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    sender.MAX_PENDING_REQUESTS = 4
+    peer = _command_peer(commands)
+    resume = _deschedule_owner(sender)
+    count = 4 * sender.MAX_PENDING_REQUESTS
+    try:
+        for item in range(count):
+            sender.send(pickle.dumps(item))
+        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        assert commands.writers == {threading.current_thread().name}
+        assert sender._pending_requests == 0
+        assert errors.empty()
+    finally:
+        resume.set()
+        sender.close(timeout=2)
+        _close_quietly(peer)
+    assert not sender._thread.is_alive()
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_admission_after_an_unwritable_socket_does_not_wait_for_the_sender_thread():
+    # Regression: after one write found the socket unwritable, the sender
+    # thread kept the queue across its retry wait. Callers then only queued
+    # commands, so a descheduled sender thread starved a connected worker.
+    # The socket holds every command, so a slow libzmq I/O thread on a loaded
+    # host cannot leave commands that only the held-back sender would retry.
+    commands = _ObservedQueue(is_server=True, send_hwm=256)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    sender.MAX_PENDING_REQUESTS = 16
+    peer = None
+    resume = None
+    try:
+        # The worker has not connected yet, so the sender thread must retry.
+        sender.send(pickle.dumps(0))
+        assert commands.owner_blocked.wait(5)
+        resume = _deschedule_owner(sender)
+        peer = _command_peer(commands)
+        count = 4 * sender.MAX_PENDING_REQUESTS
+        for item in range(1, count):
+            sender.send(pickle.dumps(item))
+        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        assert errors.empty()
+    finally:
+        if resume is not None:
+            resume.set()
+        sender.close(timeout=2)
+        if peer is not None:
+            _close_quietly(peer)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_peer_loss_seen_by_a_caller_stops_admission_without_the_sender_thread():
+    # Regression: a caller that observed the command peer's loss kept
+    # admitting requests, and health stayed green, until the possibly
+    # descheduled sender thread recorded the failure.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    peer = _command_peer(commands)
+    resume = None
+    try:
+        sender.send(pickle.dumps("before"))
+        assert peer.get(timeout=2) == _payloads("before")
+        resume = _deschedule_owner(sender)
+        _close_quietly(peer)
+        accepted = 0
+        deadline = time.monotonic() + 5
+        with pytest.raises(EngineDeadError):
+            while time.monotonic() < deadline:
+                sender.send(pickle.dumps("after-loss"))
+                accepted += 1
+                time.sleep(0.01)
+        assert accepted < 50, "admission continued long after the loss was observed"
+        assert not sender.available
+        assert errors.empty(), "the descheduled sender thread recorded the loss"
+        resume.set()
+        assert isinstance(errors.get(timeout=2), ConnectionError)
+    finally:
+        if resume is not None:
+            resume.set()
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(10, method="thread")
+def test_direct_transport_error_is_recorded_by_the_sender_thread():
+    class _FailingQueue(IpcQueue):
+        def put(self, message, **kwargs):
+            if message is not None:
+                raise RuntimeError("socket closed")
+            return super().put(message, **kwargs)
+
+    commands = _FailingQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    peer = _command_peer(commands)
+    try:
+        # The caller's failed write is retried and reported by the sender thread.
+        sender.send(pickle.dumps("rejected"))
+        error = errors.get(timeout=2)
+        assert isinstance(error, RuntimeError) and str(error) == "socket closed"
+        with pytest.raises(EngineDeadError):
+            sender.send(pickle.dumps("after-failure"))
+    finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(30, method="thread")
+def test_busy_event_loop_does_not_fill_unbatched_admission():
+    # Regression: the exact serving shape. A coroutine that keeps the loop busy
+    # and yields between submissions starved the sender thread of the GIL.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    sender.MAX_PENDING_REQUESTS = 64
+    peer = _command_peer(commands)
+    count = 1000
+
+    async def submit():
+        rejected = 0
+        for item in range(count):
+            deadline = time.perf_counter() + 300e-6
+            while time.perf_counter() < deadline:
+                pass
+            try:
+                sender.send(pickle.dumps(item))
+            except EngineUnavailableError:
+                rejected += 1
+            await asyncio.sleep(0)
+        return rejected
+
+    try:
+        assert asyncio.run(submit()) == 0
+        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        assert errors.empty()
+    finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_full_batched_admission_writes_the_backlog_without_the_sender_thread():
+    # Regression: with TRTLLM_PROXY_BATCH_REQUESTS=1 only the sender thread
+    # wrote commands. A busy event loop starved it of the GIL, so a connected
+    # and idle worker received nothing while admission filled and rejected
+    # requests (about 2000 of 3000 asyncio submits at 150 us each).
+    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=True, direct_send=True)
+    sender.MAX_PENDING_REQUESTS = 4
+    peer = _command_peer(commands)
+    resume = _deschedule_owner(sender)
+    limit = sender.MAX_PENDING_REQUESTS
+    count = 4 * limit
+    try:
+        for item in range(count):
+            sender.send(pickle.dumps(item))
+        # Each full backlog is written by the caller as one message, in order.
+        for first in range(0, count - limit, limit):
+            assert peer.get(timeout=2) == _payloads(*range(first, first + limit))
+        assert commands.writers == {threading.current_thread().name}
+        assert sender._pending_requests == limit
+        # The last backlog waits for the sender thread, which coalesces it.
+        resume.set()
+        assert peer.get(timeout=2) == _payloads(*range(count - limit, count))
+        assert errors.empty()
+    finally:
+        resume.set()
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_a_written_command_does_not_wake_the_sender_thread():
+    # Regression: every send woke the sender thread even after the caller had
+    # written the command. With another CPU-bound thread, each needless wake
+    # made the next callers wait for the lock through GIL handoffs, which
+    # doubled median delivery latency compared with a direct put.
+    # The socket holds every command, so a slow libzmq I/O thread on a loaded
+    # host cannot cause real backpressure, which does need the sender thread.
+    commands = IpcQueue(is_server=True, send_hwm=256)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    peer = _command_peer(commands)
+    notified = []
+    notify_all = sender._cond.notify_all
+
+    def recording_notify_all():
+        notified.append(threading.current_thread().name)
+        notify_all()
+
+    try:
+        sender.send(pickle.dumps("connect"))
+        assert peer.get(timeout=2) == _payloads("connect")
+        sender._cond.notify_all = recording_notify_all
+        for item in range(32):
+            sender.send(pickle.dumps(item))
+        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(32)] == list(range(32))
+        assert notified == []
+        assert errors.empty()
+    finally:
+        sender._cond.notify_all = notify_all
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+class _PollRecordingSocket:
+    """Forward to a ZMQ socket, recording each poll made under a held lock."""
+
+    def __init__(self, socket, lock_holder, polls):
+        self._socket = socket
+        self._lock_holder = lock_holder
+        self._polls = polls
+
+    def __getattr__(self, name):
+        return getattr(self._socket, name)
+
+    def poll(self, *args, **kwargs):
+        sender = self._lock_holder.get("sender")
+        if sender is not None and sender._cond._is_owned():
+            self._polls.append(threading.current_thread().name)
+        return self._socket.poll(*args, **kwargs)
+
+    def get_monitor_socket(self, **kwargs):
+        monitor = self._socket.get_monitor_socket(**kwargs)
+        return _PollRecordingSocket(monitor, self._lock_holder, self._polls)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_sends_and_idle_checks_do_not_poll_under_the_sender_lock():
+    # Regression: zmq_poll releases the GIL even with a zero timeout. Polling
+    # the monitor and command sockets while holding the sender lock made every
+    # caller wait for that thread to get the GIL back; with another CPU-bound
+    # thread, p99 submission latency was 46 ms against 10 ms for a direct put.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    holder = {}
+    polls = []
+    commands.socket = _PollRecordingSocket(commands.socket, holder, polls)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    holder["sender"] = sender
+    peer = _command_peer(commands)
+    try:
+        for item in range(32):
+            sender.send(pickle.dumps(item))
+        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(32)] == list(range(32))
+        # Let the idle sender thread check the connection a few times.
+        time.sleep(3.5 * sender.IDLE_CHECK_INTERVAL)
+        assert polls == []
+        assert sender.available
+        assert errors.empty()
+    finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_sender_thread_stays_off_the_lock_while_callers_check_the_connection():
+    # Regression: the sender thread took the lock every 50 ms to check the
+    # connection even while every send already checked it. With another
+    # CPU-bound thread, a caller that arrived during that check waited for GIL
+    # handoffs, so p99 submission latency stayed 2.5 times a direct put's.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    peer = _command_peer(commands)
+    owner_checks = []
+    check_terminal = sender._check_terminal
+
+    def recording_check_terminal():
+        if threading.current_thread() is sender._thread:
+            owner_checks.append(time.monotonic())
+        return check_terminal()
+
+    try:
+        sender.send(pickle.dumps("connect"))
+        assert peer.get(timeout=2) == _payloads("connect")
+        sender._check_terminal = recording_check_terminal
+        count = 0
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            sender.send(pickle.dumps(count))
+            count += 1
+            time.sleep(0.002)
+        active = len(owner_checks)
+        time.sleep(3.5 * sender.IDLE_CHECK_INTERVAL)
+        idle = len(owner_checks) - active
+        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        # A 50 ms period would give about ten checks while callers were active.
+        assert active <= 3
+        # An idle connection is still checked, so its loss is still detected.
+        assert idle >= 2
+        assert errors.empty()
+    finally:
+        sender._check_terminal = check_terminal
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+def _probe(port, kind):
+    if kind in ("tcp", "garbage"):
+        with socket.create_connection(("127.0.0.1", port)) as probe:
+            if kind == "garbage":
+                probe.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                time.sleep(0.05)
+        return
+    socket_type = zmq.PAIR if kind == "zmtp" else zmq.DEALER
+    with zmq.Context() as context, context.socket(socket_type) as probe:
+        probe.setsockopt(zmq.LINGER, 0)
+        probe.connect(f"tcp://127.0.0.1:{port}")
+        time.sleep(0.2)
+
+
+@pytest.mark.timeout(15, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
+@pytest.mark.parametrize("kind", ["tcp", "garbage", "zmtp", "incompatible"])
+def test_unrelated_connection_to_command_port_does_not_fail_the_engine(kind, direct_send):
+    # Regression: any local connect/close on the loopback command port
+    # produced a socket-monitor disconnect, which declared a healthy engine dead.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
+    peer = _command_peer(commands)
+    try:
+        sender.send(pickle.dumps("before"))
+        assert peer.get(timeout=2) == _payloads("before")
+        _probe(int(commands.address[0].rsplit(":", 1)[1]), kind)
+        # Let the idle sender thread process the probe's connection events.
+        time.sleep(3 * sender.IDLE_CHECK_INTERVAL)
+        assert errors.empty()
+        assert sender.available
+        sender.send(pickle.dumps("after"))
+        assert peer.get(timeout=2) == _payloads("after")
+        # Losing the command peer itself remains terminal.
+        _close_quietly(peer)
+        assert isinstance(errors.get(timeout=2), ConnectionError)
+        with pytest.raises(EngineDeadError):
+            sender.send(pickle.dumps("after-disconnect"))
+    finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(15, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
+def test_probe_overlapping_the_worker_handshake_does_not_fail_the_engine(direct_send):
+    # Regression: a TLS probe produces no handshake failure event. If it was
+    # still open when the worker's handshake completed, its close was taken
+    # for the command peer's loss.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
+    port = int(commands.address[0].rsplit(":", 1)[1])
+    probe = socket.create_connection(("127.0.0.1", port))
+    peer = None
+    try:
+        time.sleep(0.2)
+        peer = _command_peer(commands)
+        sender.send(pickle.dumps("before"))
+        assert peer.get(timeout=2) == _payloads("before")
+        probe.sendall(bytes.fromhex("16030100c4010000c00303") + b"\x00" * 190)
+        time.sleep(0.05)
+        probe.close()
+        time.sleep(0.5)
+        assert errors.empty()
+        assert sender.available
+        sender.send(pickle.dumps("after"))
+        assert peer.get(timeout=2) == _payloads("after")
+        _close_quietly(peer)
+        assert isinstance(errors.get(timeout=2), ConnectionError)
+    finally:
+        probe.close()
+        sender.close(timeout=2)
+        if peer is not None:
+            _close_quietly(peer)
+
+
+def test_command_connection_identifies_the_command_peer():
+    from tensorrt_llm.executor.request_sender import _CommandConnection
+
+    accepted, connected = zmq.EVENT_ACCEPTED, zmq.EVENT_CONNECTED
+    succeeded, disconnected = zmq.EVENT_HANDSHAKE_SUCCEEDED, zmq.EVENT_DISCONNECTED
+    failed = zmq.EVENT_HANDSHAKE_FAILED_NO_DETAIL
+
+    def lost(*events):
+        connection = _CommandConnection()
+        return [connection.observe(event, value) for event, value in events]
+
+    # A rejected connection, then the established peer's own loss.
+    assert lost(
+        (accepted, 7), (succeeded, 0), (accepted, 8), (disconnected, 8), (disconnected, 7)
+    ) == [
+        False,
+        False,
+        False,
+        False,
+        True,
+    ]
+    # A second completed handshake is not the command peer.
+    assert (
+        lost((accepted, 7), (succeeded, 0), (accepted, 8), (succeeded, 0), (disconnected, 8))[-1]
+        is False
+    )
+    # Concurrent handshakes: the failed one is removed and the other remains the peer.
+    assert lost(
+        (accepted, 7),
+        (accepted, 8),
+        (succeeded, 0),
+        (failed, 104),
+        (disconnected, 8),
+        (disconnected, 7),
+    ) == [False, False, False, False, False, True]
+    # Without a failure event, either concurrent candidate may be the peer.
+    assert lost((accepted, 7), (accepted, 8), (succeeded, 0), (disconnected, 8))[-1] is True
+    # A peer that is still attached shows the disconnected candidate was not the peer.
+    connection = _CommandConnection()
+    for event, value in ((accepted, 7), (accepted, 8), (succeeded, 0)):
+        assert connection.observe(event, value) is False
+    assert connection.observe(disconnected, 8, lambda: True) is False
+    assert connection.observe(disconnected, 7, lambda: True) is True
+    # A connection that disconnects before any handshake carried no commands.
+    assert lost((connected, 9), (disconnected, 9)) == [False, False]
+    # A completed handshake for an unobserved connection keeps every loss terminal.
+    assert lost((succeeded, 0), (disconnected, 5)) == [False, True]

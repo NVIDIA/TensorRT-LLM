@@ -325,6 +325,20 @@ of at most six digits. A process-guard registration timeout also returns 124.
 If registration of the stop helper fails after the task has exited, an existing
 nonzero task status still takes precedence.
 
+### Remote MPI process supervision
+
+Executor sessions backed by `MpiCommSession` or `RemoteMpiCommSessionClient`, including `trtllm-llmapi-launch` and disaggregated MPI serving, start a separate process-watch helper for every worker. Helpers report process liveness to an authenticated TCP listener owned by the proxy, independently of MPI, CUDA, and the worker's Python thread. Startup requires reports from every rank. After the first rank reports, a rank without a report for 30 seconds fails startup, so a rank that exits before reporting does not leave its peers waiting. A worker exit, helper exit, or five seconds without a heartbeat makes the engine failure terminal. When a worker call returns or raises in a live process, the result or error that MPI delivers takes precedence; without one, the failure is terminal after two seconds. This detects process loss, not a live worker stuck in a collective. Local `MpiPoolSession` workers continue to use local process handles instead.
+
+Every worker must reach its proxy's listener, including across container network namespaces. The default advertised IPv4 address uses the same local-address discovery as native disaggregated serving: the default route, then available interfaces, then hostname resolution, with loopback as a final fallback. Discovery cannot guarantee the correct interface on a multihomed host. Explicit loopback is valid only when all workers share the proxy's network namespace.
+
+| Environment variable | Default | Purpose |
+|----------------------|---------|---------|
+| `TRTLLM_WORKER_WATCH_HOST` | Discovered local IPv4 address | Advertise this proxy's worker-reachable hostname or IPv4/IPv6 address. Supply IPv6 literals without brackets. |
+| `TRTLLM_WORKER_WATCH_PORT` | OS-assigned ephemeral port | Select a TCP port from 1 through 65535 for firewall allowlisting. Co-located proxies require distinct ports. |
+| `TRTLLM_WORKER_WATCH` | Enabled | Set to `0` to disable independent remote process supervision explicitly. Existing MPI future/error checks remain, but abrupt remote rank loss may then remain undetected while MPI is stuck. Startup logs this reduced coverage. |
+
+Set these variables in the proxy's environment before constructing the LLM. Each disaggregated instance has its own proxy: a shared `MASTER_ADDR` or one global host override need not identify every instance's listener. Allow worker-to-proxy TCP traffic on the selected port; working MPI connectivity alone does not prove this separate listener is reachable. Restrict listener ingress to MPI workers. HMAC authenticates reports; it does not encrypt traffic or prevent connection exhaustion. Unreachable helpers report the rank, advertised endpoint, and configuration guidance. Readiness timeouts also list ranks whose reports are missing. Network errors fail startup; they never disable supervision automatically.
+
 ### Remote MPI batch ordering
 
 The remote MPI server dispatches the next batch only after every future in the

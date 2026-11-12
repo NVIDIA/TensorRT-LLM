@@ -55,7 +55,10 @@ class ZeroMqQueue:
                  is_server: bool,
                  is_async: bool = False,
                  name: Optional[str] = None,
-                 use_hmac_encryption: bool = True):
+                 use_hmac_encryption: bool = True,
+                 send_hwm: Optional[int] = None,
+                 receive_hwm: Optional[int] = None,
+                 ipv6: bool = False):
         '''
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
@@ -64,6 +67,7 @@ class ZeroMqQueue:
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+            ipv6 (bool): Enable IPv6 before binding or connecting. Defaults to False.
         '''
 
         if not use_hmac_encryption:
@@ -82,7 +86,13 @@ class ZeroMqQueue:
         self._setup_done = False
         self.name = name
         self.socket = self.context.socket(socket_type)
+        if ipv6:
+            self.socket.setsockopt(zmq.IPV6, 1)
         self.socket.set_hwm(0)
+        if send_hwm is not None:
+            self.socket.setsockopt(zmq.SNDHWM, send_hwm)
+        if receive_hwm is not None:
+            self.socket.setsockopt(zmq.RCVHWM, receive_hwm)
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None
@@ -202,17 +212,48 @@ class ZeroMqQueue:
         else:
             return False
 
-    def put(self, obj: Any, routing_id: Optional[bytes] = None):
+    def put(self,
+            obj: Any,
+            routing_id: Optional[bytes] = None,
+            *,
+            timeout: Optional[float] = None) -> None:
+        """Send an object, optionally bounding the wait for a writable peer.
+
+        Args:
+            obj: Object to send.
+            routing_id: Destination identity for a ROUTER socket.
+            timeout: Maximum wait in seconds, or None to wait indefinitely.
+
+        Raises:
+            ValueError: If timeout is negative.
+            zmq.Again: If the message cannot be sent within timeout.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be nonnegative")
         self.setup_lazily()
         self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
+            flags = 0
+            if timeout is not None:
+                if timeout == 0:
+                    # ZMQ_EVENTS processes pending pipe updates like a
+                    # zero-timeout zmq_poll but does not release the GIL, so
+                    # callers holding a lock do not make others wait for it.
+                    writable = self.socket.getsockopt(zmq.EVENTS) & zmq.POLLOUT
+                else:
+                    writable = self.socket.poll(int(timeout * 1000),
+                                                zmq.POLLOUT)
+                if not writable:
+                    raise zmq.Again()
+                # A peer can disappear after poll reports writability.
+                flags = zmq.NOBLOCK
             if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
                 # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
-                self._send_data(data, routing_id=routing_id)
+                self._send_data(data, flags=flags, routing_id=routing_id)
             else:
                 # Standard socket without encryption - use pyobj directly
-                self.socket.send_pyobj(obj)
+                self.socket.send_pyobj(obj, flags=flags)
 
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.

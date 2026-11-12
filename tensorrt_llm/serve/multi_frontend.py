@@ -166,12 +166,12 @@ class LauncherForwarder:
                 },
             )
 
-    async def get_status(self, path: str, timeout_s: float = 5.0) -> Optional[int]:
-        """HTTP status of ``GET path`` on the launcher, ``None`` if unreachable."""
+    async def get_status(self, timeout_s: float = 5.0) -> Optional[int]:
+        """Read launcher health, or return None if the request cannot complete."""
         try:
             session = await self._get_session()
             async with session.get(
-                f"http://launcher{path}", timeout=aiohttp.ClientTimeout(total=timeout_s)
+                "http://launcher/health", timeout=aiohttp.ClientTimeout(total=timeout_s)
             ) as resp:
                 await resp.read()
                 return resp.status
@@ -259,8 +259,9 @@ class AttachedFrontendWatchdog:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         failures = 0
-        # The launcher starts listening only after its attached frontends are
-        # ready, so failures count once it has answered.
+        # The launcher starts listening after worker admission and attached
+        # frontend readiness. Any HTTP response ends the connection grace;
+        # worker loss may make its very first response unhealthy.
         launcher_answered = False
         next_health = loop.time() + self._health_interval
         while True:
@@ -271,13 +272,14 @@ class AttachedFrontendWatchdog:
             if loop.time() < next_health:
                 continue
             next_health = loop.time() + self._health_interval
-            status = await self._forwarder.get_status("/health")
+            status = await self._forwarder.get_status()
             if status == 200:
                 launcher_answered = True
                 failures = 0
                 continue
-            if not launcher_answered:
+            if not launcher_answered and status is None:
                 continue
+            launcher_answered = True
             failures += 1
             if failures >= self._health_failures:
                 self._die(
