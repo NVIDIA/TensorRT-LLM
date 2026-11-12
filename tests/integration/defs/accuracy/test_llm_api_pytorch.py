@@ -318,9 +318,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                     acceptance_length,
                 )
 
-    @skip_no_rubin
     @pytest.mark.skip_less_device_memory(60000)
     def test_nvfp4_mla(self, monkeypatch):
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            _fp4_mla_attention_backend, fp4_mla_generation_backend_supported)
+        if not fp4_mla_generation_backend_supported(
+                get_sm_version(), _fp4_mla_attention_backend()):
+            pytest.skip("requires a supported FP4 MLA generation backend")
         from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import \
             Fp4MlaFmha
         from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import \
@@ -340,6 +344,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 attn_backend="TRTLLM",
                 kv_cache_config=kv_cache_config,
                 enable_chunked_prefill=False,
+                cuda_graph_config=CudaGraphConfig(),
                 max_num_tokens=8192,
                 max_batch_size=1350,
         ) as llm:

@@ -189,6 +189,7 @@ class KimiK3MLAAttention(MLA):
         # replace it with its projection's config, and exclude_modules with the
         # global kv_cache_quant_algo (apply_quant_config_exclude_modules).
         self._skip_layerwise_quant_config = True
+        self._preserve_kv_cache_quant_algo = True
         # Keep the base MLA registration enabled so breakable CUDA graphs use
         # the shared custom op. The output gate is a base hook and runs on both
         # the registered and eager paths before the row-parallel o_proj.

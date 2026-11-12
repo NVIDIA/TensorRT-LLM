@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA tensor layout validation, scale views, and workspace allocation."""
 
+from math import prod
 from typing import Any
 
 import torch
@@ -227,6 +228,17 @@ def _validate_fp4_mla_attention_q_shape(head_dim: int, q_residual_dim: int) -> N
         )
 
 
+def _workspace_has_capacity(metadata: Any, attr_name: str, shape: tuple[int, ...]) -> bool:
+    tensor = metadata.fp4_mla_state.workspaces.get(attr_name)
+    if tensor is None:
+        return False
+    if metadata.is_cuda_graph and metadata.forward_scratch_buffers is not None:
+        return tensor.numel() >= prod(shape)
+    return tensor.ndim == len(shape) and all(
+        tensor.shape[index] >= dimension for index, dimension in enumerate(shape)
+    )
+
+
 def _ensure_workspace_tensor(
     metadata: Any,
     attr_name: str,
@@ -234,20 +246,23 @@ def _ensure_workspace_tensor(
     *,
     dtype: torch.dtype,
     device: torch.device,
-    shared: bool = False,
+    shared: bool,
 ) -> torch.Tensor:
     workspaces = metadata.fp4_mla_state.workspaces
     # Only per-forward scratch may be shared; persistent caches keep metadata ownership.
-    if (
-        shared
-        and metadata.is_cuda_graph
-        and metadata.fp4_mla_state.decode_scratch_buffers is not None
-    ):
-        buffers = metadata.fp4_mla_state.decode_scratch_buffers
+    if shared and metadata.is_cuda_graph and metadata.forward_scratch_buffers is not None:
+        buffers = metadata.forward_scratch_buffers
         tensor = metadata.get_empty(
             buffers, list(shape), dtype, f"fp4_mla_decode{attr_name}", capture_graph=True
         )
-        workspaces[attr_name] = tensor  # Capture readiness probes use this same registry.
+        registered = workspaces.get(attr_name)
+        if (
+            registered is None
+            or registered.dtype != dtype
+            or registered.device != tensor.device
+            or registered.numel() < tensor.numel()
+        ):
+            workspaces[attr_name] = tensor
         return tensor
     tensor = workspaces.get(attr_name)
     needs_alloc = (

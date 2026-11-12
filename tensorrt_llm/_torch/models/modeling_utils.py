@@ -522,7 +522,7 @@ def apply_quant_config_exclude_modules(
     kv_cache_quant_algo, if not None, is set for non-Attention
     modules too, which is the same practice as when there's no
     exclude_modules. An excluded module that sets
-    _skip_layerwise_quant_config keeps its own kv_cache_quant_algo
+    _preserve_kv_cache_quant_algo keeps its own kv_cache_quant_algo
     instead of the global one.
     """
     quant_config = model_config.quant_config
@@ -567,7 +567,7 @@ def apply_quant_config_exclude_modules(
                     for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
-                    if getattr(module, '_skip_layerwise_quant_config', False):
+                    if getattr(module, '_preserve_kv_cache_quant_algo', False):
                         module.quant_config = QuantConfig(
                             kv_cache_quant_algo=module.quant_config.
                             kv_cache_quant_algo)

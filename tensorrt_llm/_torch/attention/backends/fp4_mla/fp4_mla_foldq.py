@@ -168,7 +168,12 @@ def run_fp4_mla_foldq(
 
     def workspace(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         return _ensure_workspace_tensor(
-            metadata, "_fp4_mla_foldq_" + name, shape, dtype=dtype, device=output.device
+            metadata,
+            "_fp4_mla_foldq_" + name,
+            shape,
+            dtype=dtype,
+            device=output.device,
+            shared=False,
         )
 
     folded_q = workspace("q", (tasks, 128, 320), torch.uint8)

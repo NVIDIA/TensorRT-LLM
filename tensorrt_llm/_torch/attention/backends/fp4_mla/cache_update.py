@@ -28,11 +28,11 @@ from .config import (
     _ceil_div,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
-    _fp4_mla_generation_backend_supported,
     _fp4_mla_packed_rows_per_seq,
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
     _HPUpdatePhase,
+    fp4_mla_generation_backend_supported,
 )
 from .fp4_mla_kernels import (
     _fp4_mla_context_cache_update_kernel,
@@ -105,7 +105,7 @@ def can_fuse_fp4_mla_q_quant(
     backend = _fp4_mla_attention_backend()
     sm_version = get_sm_version()
     return bool(
-        _fp4_mla_generation_backend_supported(sm_version, backend)
+        fp4_mla_generation_backend_supported(sm_version, backend)
         and num_gen > 0
         and getattr(metadata, "kv_cache_manager", None) is not None
         and q.shape[0] > 0

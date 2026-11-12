@@ -8,6 +8,7 @@ import inspect
 import os
 from typing import Any, Literal, Optional
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 
 HP_BLOCK_SIZE: int = 16
@@ -181,11 +182,34 @@ def _fp4_mla_attention_backend() -> str:
     return "triton"
 
 
-def _fp4_mla_generation_backend_supported(sm_version: int, backend: str) -> bool:
+def fp4_mla_generation_backend_supported(sm_version: int, backend: str) -> bool:
     """Static hardware/backend eligibility shared by validation and generation."""
     return backend in _FP4_MLA_K_RESIDUAL_BACKENDS and (
         sm_version == 107 or (backend == "triton" and is_blackwell_datacenter(sm_version))
     )
+
+
+def validate_fp4_mla_backend(
+    sm_version: int, backend: str | None = None, *, context_only: bool, helix: bool
+) -> None:
+    """Validate the attention path used by this worker's NVFP4 KV cache."""
+    if context_only:
+        from .fp4_mla_context import _FP8_CONTEXT_SUPPORTED_SMS
+
+        if sm_version in _FP8_CONTEXT_SUPPORTED_SMS:
+            return
+        raise UnsupportedError(f"NVFP4 MLA context does not support SM{sm_version}.")
+    backend = _fp4_mla_attention_backend() if backend is None else backend
+    if not fp4_mla_generation_backend_supported(sm_version, backend):
+        override = os.getenv(FP4_MLA_ATTENTION_BACKEND_ENV)
+        selected = f" ({FP4_MLA_ATTENTION_BACKEND_ENV}={override})" if override else ""
+        raise UnsupportedError(
+            f"NVFP4 KV cache selects FP4 MLA generation, which does not support "
+            f"SM{sm_version} with {backend}{selected}. Use Triton on SM100/SM103, "
+            "or Triton/CuTe DSL on SM107."
+        )
+    if helix and backend != _FP4_MLA_CUTEDSL_BACKEND:
+        raise UnsupportedError("FP4 MLA Helix generation requires the CuTe DSL backend.")
 
 
 # Modules the FP4 MLA CuTe DSL kernels import.

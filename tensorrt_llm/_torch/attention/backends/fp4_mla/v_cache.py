@@ -11,6 +11,7 @@ import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.logger import logger
 
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
@@ -190,7 +191,17 @@ def _triton_prepack_v_enabled() -> bool:
     # metadata (eager and every CUDA graph) holds its own copy, and the KV-cache
     # budget does not count it, so the triton backend uses it only when opted in.
     default = _env_enabled_default(FP4_MLA_PREPACK_V_ENV, False)
-    return _env_enabled_default(FP4_MLA_TRITON_PREPACK_V_ENV, default)
+    enabled = _env_enabled_default(FP4_MLA_TRITON_PREPACK_V_ENV, default)
+    if enabled:
+        logger.warning_once(
+            "Triton FP4 MLA V prepacking allocates a full-pool copy for eager metadata "
+            "and each CUDA graph outside the KV cache budget. This opt-in can exhaust "
+            "GPU memory; leave both TRTLLM_FP4_MLA_TRITON_PREPACK_V and "
+            "TRTLLM_FP4_MLA_PREPACK_V unset unless that "
+            "additional memory has been accounted for.",
+            key="fp4_mla_triton_prepack_v_unbudgeted",
+        )
+    return enabled
 
 
 def _triton_can_prepack_v(v_head_dim: int, page_size: int, block_v: int) -> bool:
@@ -371,6 +382,7 @@ def _update_triton_v_packed_cache(
         _v_packed_shape(kv_cache, v_head_dim, page_size, block_v),
         dtype=torch.uint8,
         device=kv_cache.device,
+        shared=False,
     )
     fp4_mla_repack_v_cache(
         v_packed,

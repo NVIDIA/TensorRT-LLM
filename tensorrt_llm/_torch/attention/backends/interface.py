@@ -198,6 +198,7 @@ class AttentionMetadata:
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
     cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
+    forward_scratch_buffers: Optional[Buffers] = None
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
@@ -508,12 +509,15 @@ class AttentionMetadata:
 
         self.mamba_metadata.prepare(self)
 
-    def create_cuda_graph_metadata(self,
-                                   max_batch_size: int,
-                                   sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None,
-                                   encode_only: bool = False) -> Self:
+    def create_cuda_graph_metadata(
+            self,
+            max_batch_size: int,
+            sub_cross_metadata: bool = False,
+            max_draft_tokens: int = 0,
+            buffers=None,
+            encode_only: bool = False,
+            *,
+            forward_scratch_buffers: Optional[Buffers] = None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
@@ -529,9 +533,15 @@ class AttentionMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.cuda_graph_buffers = buffers
+        cuda_graph_metadata.forward_scratch_buffers = forward_scratch_buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True, max_draft_tokens, buffers, encode_only)
+                max_batch_size,
+                True,
+                max_draft_tokens,
+                buffers,
+                encode_only,
+                forward_scratch_buffers=forward_scratch_buffers)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
@@ -1297,10 +1307,12 @@ class AttentionBackend(Generic[TMetadata]):
         max_num_tokens: int,
         runtime_features: AttentionRuntimeFeatures,
     ) -> int:
-        """Minimum staging capacity in per-token workspace units; default zero.
+        """Minimum tokens priced at ``runtime_workspace_bytes_per_token``.
 
-        The estimator subtracts staging already covered by the profiling peak
-        before reserving additional memory for this backend-specific floor.
+        The estimator calls this only for a nonzero per-token workspace rate
+        with an admission cap. It subtracts staging actually covered by the
+        profiling peak before reserving additional memory. Backends whose
+        workspace is not chunk-bounded return zero, as does the default.
         """
         return 0
 

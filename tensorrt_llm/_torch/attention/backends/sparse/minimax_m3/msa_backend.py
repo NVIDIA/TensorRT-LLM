@@ -907,7 +907,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """Whether kv_lens can change after prepare(): only with speculative decoding.
 
         max_total_draft_tokens is set by the engine's update_spec_dec_param; the
-        other checks mirror TrtllmAttentionMetadata's spec_active.
+        other checks mirror TrtllmAttentionMetadata's generation block-offset capacity predicate.
         """
         params = self.kv_cache_params
         runtime_features = self.runtime_features

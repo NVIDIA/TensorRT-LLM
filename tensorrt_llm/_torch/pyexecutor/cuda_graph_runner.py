@@ -294,9 +294,9 @@ class CUDAGraphRunner:
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
+        self.forward_scratch_buffers = Buffers()
         if self.enabled:
             self._create_shared_static_tensors()
-        self.fp4_mla_decode_buffers = Buffers()
         self.cuda_graph_meta_buffers = (Buffers()
                                         if config.private_metadata_buffers else
                                         get_memory_buffers())
@@ -766,8 +766,11 @@ class CUDAGraphRunner:
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, key.draft_len,
-            self.cuda_graph_meta_buffers)
+            num_sequences_in_batch,
+            False,
+            key.draft_len,
+            self.cuda_graph_meta_buffers,
+            forward_scratch_buffers=self.forward_scratch_buffers)
         if is_mixed_encoder_decoder:
             generation_query_len = key.draft_len + 1
             graph_attn_metadata.seq_lens = torch.tensor(
@@ -778,9 +781,6 @@ class CUDAGraphRunner:
             )
             graph_attn_metadata.num_contexts = key.num_contexts
         assert graph_attn_metadata.is_cuda_graph
-        fp4_state = getattr(graph_attn_metadata, "fp4_mla_state", None)
-        if fp4_state is not None:
-            fp4_state.decode_scratch_buffers = self.fp4_mla_decode_buffers
 
         if enable_spec_decode:
             graph_spec_metadata = spec_metadata.create_cuda_graph_metadata(
@@ -1600,7 +1600,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
-        self.fp4_mla_decode_buffers.buffers.clear()
+        self.forward_scratch_buffers.buffers.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()

@@ -1199,7 +1199,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # its kernels dereference block columns a host-derived cap would
             # leave unstaged (uninitialized in this buffer).
             max_blocks = None
-            if (not self.kv_lens_advance_on_device()
+            if (not self._generation_block_offsets_need_capacity()
                     and self.kv_cache_manager.tokens_per_block):
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
@@ -1472,12 +1472,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:num_seqs],
         )
 
-    def kv_lens_advance_on_device(self) -> bool:
-        """Whether kv_lens_cuda can advance on the device past the host lengths of prepare().
-
-        Speculative decoding does that: draft and tree sub-steps and the overlap
-        scheduler's accepted-token correction rewrite the device lengths.
-        """
+    def _generation_block_offsets_need_capacity(self) -> bool:
+        """Whether generation block-offset rows need their configured capacity."""
         return (self.draft_kv_cache_manager is not None
                 or self.is_spec_decoding_enabled
                 or bool(self.kv_cache_params.num_extra_kv_tokens)
@@ -2395,8 +2391,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return 0
         # Mirrors MLA::contextWorkspaceLayout's buffer_batch_size * query_tokens floor
         # and the cached-partition capacity prepared by this backend's metadata.
-        return runtime_features.chunked_prefill_buffer_batch_size * max(
-            runtime_features.chunk_size, max_num_tokens)
+        return runtime_features.chunked_prefill_buffer_batch_size * max_num_tokens
 
     @classmethod
     def runtime_workspace_fixed_bytes(cls, model_config: "ModelConfig",

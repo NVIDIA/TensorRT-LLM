@@ -22,9 +22,11 @@ if TYPE_CHECKING:
 class Fp4MlaState:
     """State shared by RoPE/cache append and all FP4 FMHAs in one batch.
 
-    Allocate through the metadata buffer allocator so eager forwards and each
-    CUDA graph retain their existing storage/aliasing rules. This state is not
-    layer-local: MTP and metadata preparation update it before any FMHA runs.
+    Allocate through the metadata buffer allocator. CUDA graphs of one runner
+    share per-forward decode scratch through metadata.forward_scratch_buffers;
+    CUDAGraphRunner.clear() releases it. Persistent caches remain metadata-local.
+    This state is not layer-local: MTP and metadata preparation update it before
+    any FMHA runs.
     """
 
     hp_pool: torch.Tensor | None = None
@@ -61,11 +63,8 @@ class Fp4MlaState:
     paged_kv_indptr_decode: torch.Tensor | None = None
     _paged_kv_indices: torch.Tensor | None = None
     num_sequences: int = 0
-    num_blocks: list[int] | None = None
     num_context_blocks: int = 0
     num_generation_blocks: int = 0
-    # Per-forward scratch shared only by graphs of the owning runner; clear() releases it.
-    decode_scratch_buffers: Buffers | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
     v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
 

@@ -39,6 +39,7 @@ from .layout import (
     _validate_fp4_mla_attention_q_shape,
     _validate_fp4_mla_cache_shape,
     _validate_fp4_mla_kv_storage_shape,
+    _workspace_has_capacity,
     get_fp4_mla_v_scale_pool_view,
 )
 from .metadata import (
@@ -239,13 +240,7 @@ def _run_triton_attention_decode(
     # ("nvt") backend, which launches page-stats at num_warps=8. Both are
     # overridable for tuning.
     sm_count = _get_sm_count(q_fp4.device)
-    # page-stats num_warps: the full-pages fast path (uniform q_len==1 decode)
-    # benefits from num_warps=8 (more warps hide the QK load latency); the
-    # masked path (q_len>1 / ragged lengths) carries extra per-thread state and
-    # measured markedly faster at num_warps=4 (e.g. bs256 q_len4: 131->95ms).
-    page_stats_num_warps = _env_int("TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS")
-    if page_stats_num_warps is None:
-        page_stats_num_warps = 4
+    page_stats_num_warps = _env_int("TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS") or 4
     page_stats_launch_meta = {"occupancy": 2, "num_warps": page_stats_num_warps}
     # PV benefits from num_warps=8 across shapes measured.
     pv_num_warps = _env_int("TRTLLM_FP4_MLA_PV_NUM_WARPS") or 8
@@ -354,25 +349,16 @@ def _run_triton_attention_decode(
     target_l1_ctas = 3 * sm_count
     num_reduce_groups = _ceil_div(target_l1_ctas, max(seqhead_ctas, 1))
     num_reduce_groups = max(1, min(num_reduce_groups, max_pages, 64))
-    # The grouped (two-level) reduce needs an auxiliary workspace, and
-    # _ensure_workspace_tensor can only (re)allocate it outside CUDA graph
-    # capture. If a warmup forward did not already size that workspace (e.g. the
-    # warmup batch took the single-level path), fall back to the single-level
-    # reduce during capture so we never allocate mid-capture. The single-level
-    # reduce is numerically identical (it just launches fewer CTAs).
+    group_pages = triton.next_power_of_2(_ceil_div(max_pages, num_reduce_groups))
+    num_reduce_groups = _ceil_div(max_pages, group_pages)
+    # Use the grouped reduce during capture only when warmup registered enough
+    # scratch. Otherwise the numerically equivalent single-level reduce avoids
+    # growing the shared pool while capturing.
     if num_reduce_groups > 1 and torch.cuda.is_current_stream_capturing():
-        gmax = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_max_buf")
-        gsum = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_sum_buf")
-        groups_ready = (
-            gmax is not None
-            and gsum is not None
-            and gmax.shape[0] >= num_queries
-            and gmax.shape[1] >= num_reduce_groups
-            and gmax.shape[2] >= num_heads
-            and gsum.shape[0] >= num_queries
-            and gsum.shape[1] >= num_reduce_groups
-            and gsum.shape[2] >= num_heads
-        )
+        group_shape = (num_queries, num_reduce_groups, num_heads)
+        groups_ready = _workspace_has_capacity(
+            metadata, "_fp4_mla_attention_group_max_buf", group_shape
+        ) and _workspace_has_capacity(metadata, "_fp4_mla_attention_group_sum_buf", group_shape)
         if not groups_ready:
             num_reduce_groups = 1
     if num_reduce_groups <= 1:
@@ -391,8 +377,6 @@ def _run_triton_attention_decode(
             **launch_meta,
         )
     else:
-        group_pages = _ceil_div(max_pages, num_reduce_groups)
-        num_reduce_groups = _ceil_div(max_pages, group_pages)
         group_max = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_group_max_buf",
@@ -509,18 +493,13 @@ def _run_triton_attention_decode(
             if max_pages % p == 0 and max_pages // p >= 16 and base_grid * p <= 148 * 4:
                 page_split = p
                 break
-    # The page-split PV path needs a partial-output workspace, which
-    # _ensure_workspace_tensor can only (re)allocate outside CUDA graph capture.
-    # Fall back to the unsplit PV (numerically identical) during capture unless a
-    # warmup forward already sized that workspace, so capture never allocates.
+    # Use split PV during capture only when warmup registered enough partial
+    # output scratch; unsplit PV is numerically equivalent and needs no pool growth.
     if page_split > 1 and torch.cuda.is_current_stream_capturing():
-        pbuf = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_pv_partial_buf")
-        partial_ready = (
-            pbuf is not None
-            and pbuf.shape[0] >= num_queries
-            and pbuf.shape[1] >= page_split
-            and pbuf.shape[2] >= num_heads
-            and pbuf.shape[3] >= kv_lora_rank
+        partial_ready = _workspace_has_capacity(
+            metadata,
+            "_fp4_mla_attention_pv_partial_buf",
+            (num_queries, page_split, num_heads, kv_lora_rank),
         )
         if not partial_ready:
             page_split = 1
@@ -849,6 +828,7 @@ def _run_cutedsl_packed_decode(
         (task_capacity, physical_m, 512),
         dtype=torch.float32,
         device=device,
+        shared=False,
     )[:tasks]
     maxima = _ensure_workspace_tensor(
         metadata,
@@ -856,6 +836,7 @@ def _run_cutedsl_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
+        shared=False,
     )[:tasks]
     sums = _ensure_workspace_tensor(
         metadata,
@@ -863,6 +844,7 @@ def _run_cutedsl_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
+        shared=False,
     )[:tasks]
     module.run_trtllm_fp4_mla_decode_packed(
         q_fp4,
@@ -1328,6 +1310,7 @@ def run_fp4_mla_attention_decode(
                 (2, num_queries, physical_heads),
                 dtype=torch.float32,
                 device=output.device,
+                shared=False,
             )
         if num_heads < physical_heads and not direct_split_output:
             kernel_output = _ensure_workspace_tensor(
@@ -1336,6 +1319,7 @@ def run_fp4_mla_attention_decode(
                 (q_batch_capacity, physical_heads, kv_lora_rank),
                 dtype=output.dtype,
                 device=output.device,
+                shared=False,
             )[:num_queries]
 
         if splits > 1:

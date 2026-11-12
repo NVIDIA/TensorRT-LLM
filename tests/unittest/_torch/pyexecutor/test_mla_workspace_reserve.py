@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     get_mla_context_workspace_reserve,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm.mapping import Mapping
 
 
 def _ctx_req(
@@ -428,8 +429,70 @@ def test_workspace_reserve_honors_staging_floor(
     assert cap == expected_cap
 
 
+@pytest.mark.cpu_only
+def test_workspace_reserve_reports_fixed_cost_without_a_staging_floor() -> None:
+    with pytest.raises(ResourceError, match="fixed KV cache cost") as raised:
+        get_mla_context_workspace_reserve(512, 3, 1, 128, fixed_bytes=512, min_workspace_tokens=0)
+    assert "lower max_num_tokens" not in str(raised.value)
+
+
 def test_workspace_reserve_rejects_unaffordable_floor() -> None:
     with pytest.raises(ResourceError, match="workspace floor"):
         get_mla_context_workspace_reserve(
             1024, 3, 2, 4096, fixed_bytes=512, min_workspace_tokens=256
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sparse_algorithm,has_fp4,expected",
+    [
+        (None, True, 64),
+        ("dsa", True, 0),
+        ("deepseek_v4", True, 0),
+        ("csa2", False, 0),
+        ("dsa", False, 64),
+        ("skip_softmax", True, 64),
+    ],
+)
+def test_context_mla_staging_floor_is_backend_owned(
+    monkeypatch: pytest.MonkeyPatch, sparse_algorithm: str | None, has_fp4: bool, expected: int
+) -> None:
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 103)
+    config = SimpleNamespace(
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: has_fp4)),
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        sparse_attention_config=None
+        if sparse_algorithm is None
+        else SimpleNamespace(algorithm=sparse_algorithm),
+    )
+    features = trtllm_backend.AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=16)
+    assert (
+        trtllm_backend.TrtllmAttention.runtime_workspace_min_tokens(
+            config,
+            Mapping(),
+            max_num_tokens=16,
+            runtime_features=features,
+        )
+        == expected
+    )
+
+
+@pytest.mark.cpu_only
+def test_context_mla_staging_floor_reuses_bounded_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = trtllm_backend.TrtllmAttention
+    monkeypatch.setattr(
+        backend,
+        "runtime_workspace_is_chunked_prefill_bounded",
+        classmethod(lambda cls, config: False),
+    )
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+    )
+    features = trtllm_backend.AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=16)
+    assert (
+        backend.runtime_workspace_min_tokens(
+            config, Mapping(), max_num_tokens=16, runtime_features=features
+        )
+        == 0
+    )

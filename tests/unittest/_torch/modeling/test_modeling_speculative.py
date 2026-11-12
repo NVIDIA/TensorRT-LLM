@@ -23,6 +23,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import tensorrt_llm._torch.models.modeling_speculative as speculative_modeling
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
@@ -37,8 +39,96 @@ from tensorrt_llm._torch.models.modeling_speculative import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_config
+from tensorrt_llm.llmapi.llm_args import (
+    DraftTargetDecodingConfig,
+    Eagle3DecodingConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("draft_kind", ["eagle3", "external_model", "external_drafter"])
+@pytest.mark.parametrize("override", [None, QuantAlgo.FP8], ids=["inherit", "explicit_fp8"])
+def test_draft_construction_preserves_kv_override_through_exclusion(
+    monkeypatch, draft_kind: str, override: QuantAlgo | None
+) -> None:
+    pretrained = PretrainedConfig(
+        hidden_size=128,
+        vocab_size=32,
+        num_hidden_layers=1,
+        torch_dtype=torch.bfloat16,
+        tie_word_embeddings=False,
+        architectures=["LlamaForCausalLM"],
+    )
+    spec_kwargs = dict(max_draft_len=3, speculative_model="draft-checkpoint")
+    if draft_kind == "eagle3":
+        spec_config = Eagle3DecodingConfig(**spec_kwargs)
+    elif draft_kind == "external_model":
+        spec_config = MTPDecodingConfig(**spec_kwargs)
+        update_spec_config_from_model_config(
+            spec_config,
+            pretrained,
+            target_model_cls=SimpleNamespace(build_mtp_draft_model_from_config=True),
+        )
+    else:
+        spec_config = DraftTargetDecodingConfig(**spec_kwargs)
+    target_config = ModelConfig(
+        pretrained_config=pretrained,
+        spec_config=spec_config,
+        quant_config=QuantConfig(
+            kv_cache_quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=["*self_attn*"],
+        ),
+        skip_create_weights_in_init=True,
+    )
+    if override is not None:
+        target_config.extra_attrs["draft_kv_cache_quant_algo_override"] = override
+    draft_config = ModelConfig(
+        pretrained_config=pretrained,
+        skip_create_weights_in_init=True,
+    )
+    monkeypatch.setattr(
+        ModelConfig, "from_pretrained", classmethod(lambda *args, **kwargs: draft_config)
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.modules.linear.get_sm_version", lambda: 100)
+    monkeypatch.setattr("tensorrt_llm._torch.attention.backends.trtllm.get_sm_version", lambda: 100)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.attention.create_attention",
+        lambda *args, **kwargs: SimpleNamespace(
+            support_fused_qkv=lambda: False,
+            update_quant_config=lambda quant_config: None,
+        ),
+    )
+    monkeypatch.setattr(speculative_modeling, "get_spec_worker", lambda *args, **kwargs: None)
+
+    def build_draft(_target_config, loaded_config, _target_head, _target_model):
+        layer = nn.Module()
+        layer.self_attn = Attention(
+            hidden_size=128,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            max_position_embeddings=128,
+            bias=False,
+            layer_idx=0,
+            dtype=torch.bfloat16,
+            config=loaded_config,
+        )
+        draft_model = nn.Module()
+        draft_model.layers = nn.ModuleList([layer])
+        return draft_model
+
+    monkeypatch.setattr(speculative_modeling, "get_draft_model", build_draft)
+    with torch.device("cpu"):
+        model = SpecDecOneEngineForCausalLM(nn.Identity(), target_config)
+        model.apply_quant_config_exclude_modules()
+
+    attention = model.draft_model.layers[0].self_attn
+    assert attention.quant_config.quant_algo is None
+    assert attention.quant_config.kv_cache_quant_algo == (override or QuantAlgo.NVFP4)
+    assert "preserve_kv_cache_quant_algo" not in target_config.extra_attrs
 
 
 @pytest.mark.cpu_only
@@ -51,6 +141,7 @@ def test_draft_kv_cache_quant_algo_override_updates_all_layers() -> None:
     layer_quant_1 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
     draft = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={},
         quant_config_dict={
             "model.layers.0": layer_quant_0,
             "model.layers.1": layer_quant_1,
@@ -60,6 +151,7 @@ def test_draft_kv_cache_quant_algo_override_updates_all_layers() -> None:
     _set_draft_kv_cache_quant_algo(draft, target)
 
     assert draft.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert draft.extra_attrs["preserve_kv_cache_quant_algo"] is True
     assert layer_quant_0.kv_cache_quant_algo == QuantAlgo.FP8
     assert layer_quant_1.kv_cache_quant_algo == QuantAlgo.FP8
     assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
@@ -82,6 +174,7 @@ def test_draft_kv_cache_quant_algo_inheritance_preserves_layer_settings(
     }
     draft = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.FP8),
+        extra_attrs={},
         quant_config_dict=layer_configs,
     )
 
@@ -103,6 +196,7 @@ def test_draft_kv_cache_quant_algo_without_layer_settings(override: QuantAlgo | 
     )
     draft = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        extra_attrs={},
         quant_config_dict=None,
     )
 

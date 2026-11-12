@@ -12,8 +12,8 @@ or any private-Triton extension):
 * ``USE_TMA_DATA_LOAD`` path through ``_fp4_mla_qk_scores_tile`` -- builds
   device-side TMA descriptors via ``tl.make_tensor_descriptor`` for the
   full-K window, then gathers the virtual ``[Q, Q_r, Q] x [K, K, K_r]`` tail.
-* ``ASSUME_FULL_HEADS`` / ``ASSUME_FULL_PAGES`` / ``ASSUME_VALID_PAGES``
-  constexpr branches that drop ``tl.where`` masks on the hot decode path.
+* ``ASSUME_FULL_HEADS`` constexpr branches for complete head tiles. Production
+  decode retains the KV-length and page-validity masks.
 * ``PACK_PROBS`` fused page-stats kernel that quantizes P to FP4 in registers
   before the page-max correction, eliminating the ``p_probs`` HBM round-trip.
 * ``_fp4_mla_swizzled_sf_offset_row_block`` faster offset helper for the
@@ -767,7 +767,7 @@ def _fp4_mla_qk_scores_tile(
     return scores, safe_physical_page
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PAGES"])
 def _fp4_mla_attention_page_stats_kernel(
     page_max_ptr,
     page_sum_ptr,
@@ -810,7 +810,7 @@ def _fp4_mla_attention_page_stats_kernel(
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
+    MAX_PAGES,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1014,7 +1014,7 @@ def _fp4_mla_attention_page_stats_kernel(
         tl.store(page_sum_ptr + out_offsets, page_sum, mask=mask_h)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PAGES"])
 def _fp4_mla_attention_page_stats_grouped_kernel(
     page_max_ptr,
     page_sum_ptr,
@@ -1055,7 +1055,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
+    MAX_PAGES,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1306,7 +1306,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
             tl.store(page_sum_ptr + out_offsets, page_sum)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PAGES"])
 def _fp4_mla_attention_page_stats_mtp_kernel(
     page_max_ptr,
     page_sum_ptr,
@@ -1347,7 +1347,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
+    MAX_PAGES,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1541,7 +1541,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
         tl.store(page_sum_ptr + out_offsets, page_sum)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PAGES"])
 def _fp4_mla_attention_reduce_stats_kernel(
     max_ptr,
     denom_ptr,
@@ -1552,7 +1552,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
     page_stats_s0,
     page_stats_s1,
     NUM_HEADS: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
+    MAX_PAGES,
     BLOCK_H: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
@@ -1657,7 +1657,7 @@ def _fp4_mla_attention_group_reduce_stats_kernel(
     tl.store(group_sum_ptr + out_offsets, group_sum, mask=mask_h)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PAGES"])
 def _fp4_mla_attention_prob_scale_kernel(
     p_sf_ptr,
     max_ptr,
@@ -1673,7 +1673,7 @@ def _fp4_mla_attention_prob_scale_kernel(
     PAGE_SIZE: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
+    MAX_PAGES,
     BLOCK_H: tl.constexpr,
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_PAGES: tl.constexpr,
@@ -1736,7 +1736,7 @@ def _fp4_mla_attention_prob_scale_kernel(
     tl.store(p_sf_ptr + sf_offsets, scales * factor[:, None], mask=mask_h[:, None])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PAGES", "PAGES_PER_SPLIT"])
 def _fp4_mla_attention_pv_kernel(
     out_ptr,
     p_fp4_ptr,
@@ -1767,7 +1767,7 @@ def _fp4_mla_attention_pv_kernel(
     FP4_BLOCK: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
+    MAX_PAGES,
     P_GLOBAL_SCALE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -1780,7 +1780,7 @@ def _fp4_mla_attention_pv_kernel(
     ASSUME_FULL_V: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
     PAGE_SPLIT: tl.constexpr = 1,
-    PAGES_PER_SPLIT: tl.constexpr = 0,
+    PAGES_PER_SPLIT=0,
     PARTIAL_OUT: tl.constexpr = False,
     partial_out_ptr=None,
     partial_s0: tl.constexpr = 0,
@@ -2039,7 +2039,7 @@ def _fp4_mla_attention_pv_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PAGES", "PAGES_PER_SPLIT"])
 def _fp4_mla_attention_pv_prepacked_v_kernel(
     out_ptr,
     p_fp4_ptr,
@@ -2066,7 +2066,7 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
     FP4_BLOCK: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
+    MAX_PAGES,
     P_GLOBAL_SCALE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -2078,7 +2078,7 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
     ASSUME_FULL_V: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
     PAGE_SPLIT: tl.constexpr = 1,
-    PAGES_PER_SPLIT: tl.constexpr = 0,
+    PAGES_PER_SPLIT=0,
     PARTIAL_OUT: tl.constexpr = False,
     partial_out_ptr=None,
     partial_s0: tl.constexpr = 0,

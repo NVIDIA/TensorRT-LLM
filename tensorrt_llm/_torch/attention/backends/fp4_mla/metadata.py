@@ -575,8 +575,6 @@ def configure_fp4_mla_device_page_table(
             max_page_capacity,
             max(1, _ceil_div(max_kv_len, FP4_MLA_TOKENS_PER_BLOCK)),
         )
-        # Bound eager Triton specializations to logarithmically many page strides.
-        max_pages = min(max_page_capacity, 1 << (max_pages - 1).bit_length())
         if num_contexts > 0:
             max_context_len = int(kv_lens[:num_contexts].max().item())
             max_context_pages = _ceil_div(
@@ -614,7 +612,6 @@ def configure_fp4_mla_device_page_table(
     metadata.fp4_mla_state.device_page_table = True
     metadata.fp4_mla_state.num_sequences = num_sequences
     metadata.fp4_mla_state.page_table_stride = max_pages
-    metadata.fp4_mla_state.num_blocks = None
     metadata.fp4_mla_state.num_context_blocks = num_contexts * max_pages
     metadata.fp4_mla_state.num_generation_blocks = num_generation_sequences * max_pages
     return True

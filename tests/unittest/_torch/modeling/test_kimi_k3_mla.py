@@ -15,11 +15,12 @@ from _torch.modeling.test_kimi_k3_checkpoint import load_mla_checkpoint
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention.backends.fp4_mla import (
-    FP4_MLA_TOKENS_PER_BLOCK,
-    _cutedsl_backend_available,
-)
+from tensorrt_llm._torch.attention.backends.fp4_mla import FP4_MLA_TOKENS_PER_BLOCK
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+    _fp4_mla_attention_backend,
+    fp4_mla_generation_backend_supported,
+)
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures, KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
@@ -310,12 +311,11 @@ def _load_mla_checkpoint_every_layer(
 
 
 def _fp4_mla_unavailable() -> bool:
-    """FP4 MLA runs the triton backend on SM100/SM103 and the CuTe DSL one on SM107."""
+    """Whether the selected generation backend can execute FP4 MLA."""
     if not torch.cuda.is_available():
         return True
-    capability = torch.cuda.get_device_capability()
-    return not (
-        capability in ((10, 0), (10, 3)) or (capability == (10, 7) and _cutedsl_backend_available())
+    return not fp4_mla_generation_backend_supported(
+        tensorrt_llm._utils.get_sm_version(), _fp4_mla_attention_backend()
     )
 
 

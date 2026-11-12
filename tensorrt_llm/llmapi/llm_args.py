@@ -5538,12 +5538,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that "
-        "the fp8 context-MLA attention workspace is reserved and scheduled for. Only affects fp8 "
-        "context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the "
-        "never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves "
-        "less workspace (freeing KV cache) and defers context requests whose summed attended KV would "
-        "exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the "
-        "scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
+        "the context-MLA attention workspace is reserved and scheduled for. Applies to backends "
+        "that declare attended-KV workspace, including dense FP8-KV and NVFP4-KV MLA and sparse "
+        "MLA gathers. None (default) requests the never-stall worst case "
+        "min(max_batch_size, max_num_tokens) * max_seq_len; the memory budget may reduce the "
+        "admitted capacity. The override is floored at max_seq_len and capped at that worst case. "
+        "Smaller values may leave more memory for KV cache, but the reserve cannot drop below the backend's "
+        "staging floor after crediting staging actually measured during profiling. An override "
+        "below that floor still limits admission without necessarily freeing more memory. "
+        "The scheduler defers context requests whose summed attended KV exceeds the admitted cap."
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
