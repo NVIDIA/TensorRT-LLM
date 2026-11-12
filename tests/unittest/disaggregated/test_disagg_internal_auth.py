@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.conversation_id import SUBAGENT_AFFINITY_HEADER
@@ -255,6 +256,24 @@ def test_worker_affinity_survives_wire_roundtrip(
 
     assert scheduling.subagent_affinity_id == "parent"
     assert wire_request.conversation_params.conversation_id == "child"
+
+
+def test_completion_handler_passes_affinity_to_generate(tmp_path) -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT, completion=True)
+    headers = build_subagent_affinity_headers("secret", request, ServerRole.CONTEXT)
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(
+            AggConfig(role=ServerRole.CONTEXT, model_name="test-model")
+        )
+        server._internal_disagg_auth_key = "secret"
+        response = env.client(server.app).post(
+            "/v1/completions",
+            content=request.model_dump_json(exclude_unset=True),
+            headers={"content-type": "application/json", **headers},
+        )
+        assert response.status_code == 200, response.text
+        (call,) = server.generator.generate_calls
+        assert call.kwargs["scheduling_params"].subagent_affinity_id == "parent"
 
 
 @pytest.mark.parametrize("key", [None, "secret"])
