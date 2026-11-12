@@ -8315,9 +8315,10 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_per_layer_dynamic_eplb_cuda_graph(self) -> 'TorchLlmArgs':
         """Restrict CUDA graphs with per-layer dynamic EPLB.
 
-        Only a planner that hands the device constant values in every layer
-        call (HALO-R) can be captured, and only in breakable prefill graphs,
-        whose eager breaks leave the MoE layers in captured segments.
+        Only a planner whose layer calls hand the device a constant READY
+        value and route target (HALO-R) can be captured, and only in breakable
+        prefill graphs, whose eager breaks leave the MoE layers in captured
+        segments.
         """
         load_balancer = self.moe_config.load_balancer
         if getattr(load_balancer, "mode", None) != "per_layer_dynamic":

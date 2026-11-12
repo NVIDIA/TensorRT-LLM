@@ -23,10 +23,14 @@ The last CTA publishes READY into this rank's cell on every rank, which
 MegaMoE's gate waits for. A failing CTA traps before it adds to the route
 counter, so MegaMoE never reads routes of a failed launch.
 
-Every value a layer call hands the device is constant: READY is always 1,
-because the next launch of the layer waits for every rank's READY and zeroes
-its row before its count exchange; the route wait targets ``auxiliary_sms``
-and MAIN resets the counter once it passes. A breakable prefill CUDA graph can
+The READY value and the route target a layer call hands the device are
+constant: READY is always 1, because the next launch of the layer waits for
+every rank's READY and zeroes its row before its count exchange; the route
+wait targets ``auxiliary_sms`` and MAIN resets the counter once it passes.
+The spin bound is ``SchedulerSpinBound``'s (the MoE communication timeout
+guard's value, or the warmup bound while kernels are tuned), except that each breakable bucket's first eager launch
+waits at least the warmup bound (see ``submit_fused``); a captured launch
+keeps the bound current at capture. A breakable prefill CUDA graph can
 therefore capture whole layer calls and replay them in any interleaving with
 eager calls: MAIN may change between layer calls (the eager warmup and the
 capture of the breakable runner run on its capture stream), and a change

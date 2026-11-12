@@ -859,7 +859,7 @@ def test_native_submit_orders_copy_after_main_and_poisons_on_any_cuda_error() ->
             "kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream, mLaunched)",
         ),
     )
-    # Capture is allowed: every value the launch hands the device is constant.
+    # Capture is allowed: the READY value and the route target the launch hands the device are constant.
     assert "cudaStreamIsCapturing" not in submit and "kReadyGeneration," in source
     # Every CUDA call of a launch, nested or bare, goes through the sticky poison.
     assert _cuda_call_wrappers(submit) == [
