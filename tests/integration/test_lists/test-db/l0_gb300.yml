@@ -151,7 +151,8 @@ l0_gb300:
   # run post-merge (l0_gb300_multi_gpus).
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
 
-# K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
+# K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
+# NVLink domain.
 - condition:
     ranges:
       system_gpu_count:
@@ -167,6 +168,7 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16/test_k3_megamoe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_latent_reduce.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_markov/test_k3_markov.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_k3_mnnvl_comm.py

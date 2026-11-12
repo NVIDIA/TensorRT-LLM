@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SiTU-gated multiply (Kimi K3's MLP activation) via the fused Triton situ_and_mul kernel."""
+"""SiTU-gated multiply (Kimi K3's MLP activation) via the family's fused Triton situ_and_mul kernel."""
 
 from typing import Optional
 
 import torch
 
-import tensorrt_llm._torch.modules.situ  # noqa: F401 — registers torch.ops.trtllm.situ_and_mul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ...kernels.k3r_situ import op as _situ_op  # noqa: F401 — registers the op
 
 
 class SituAndMul(OpWrapper):
@@ -73,14 +74,14 @@ class SituAndMul(OpWrapper):
     up cap is None, and divisibility of widths, strides and pointers. Warm each
     specialization outside CUDA-graph capture; replay with rewritten inputs is
     bit-identical to eager. libdevice tanh differs from torch in the last fp32
-    bits. SituAndMul's use_fused_activation=True CUDA path calls this op; its
-    other path evaluates the same formula eagerly.
+    bits. The kernel is the family's copy of trtllm::situ_and_mul's
+    (kernels/k3r_situ), bit-identical to it.
     """
 
     def __call__(
         self, x: torch.Tensor, beta: float, linear_beta: Optional[float] = None
     ) -> torch.Tensor:
-        return torch.ops.trtllm.situ_and_mul(x, beta, linear_beta)
+        return torch.ops.mv2_kimi_k3_vl.situ_and_mul(x, beta, linear_beta)
 
     def reference(
         self, x: torch.Tensor, beta: float, linear_beta: Optional[float] = None

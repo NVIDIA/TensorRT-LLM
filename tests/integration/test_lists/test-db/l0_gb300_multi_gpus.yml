@@ -33,6 +33,9 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
   - accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_gsm8k
   - accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_eagle3_gsm8k_and_acceptance
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_comm
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_fp8w_gemm_push_cells.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_core_allreduce.py
   # qwen4_exp target, post-merge: three drafts over quantized KV -- NVFP4 KV at tp4 with the
   # breakable prefill graph, FP8 KV at dep4 (MTP under attention DP), FP8 KV at tep4 on
   # FlashInfer's ring replay, NVFP4 KV at tep4 without block reuse -- and dep2 context and

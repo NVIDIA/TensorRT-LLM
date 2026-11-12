@@ -137,6 +137,7 @@ l0_cpu:
   # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_step.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_fp4_mla_copies.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_k3_decode_worker.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_capture_view.py
@@ -149,6 +150,33 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
+  # The Kimi K3 SM107 targets' cpu_only cases: CuTe DSL hint tables, the FP4 MLA
+  # decode plan geometry, each target's constants and model defaults, the routing
+  # of the recipes' mappings, the context MLA split-K dispatch gates, the
+  # drafter's binding to the unified draft KV layers and the targets' cache
+  # manager (KDA mid-chunk snapshots, on stubs).
+  # Its GPU tests are in l0_gr100.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_common
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_fp4_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_fp4_mla_plan_splits.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_mxfp8_gemm_fp8_out_source.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sm107_routing.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark/test_k3_unified_draft_binding.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/cache/test_k3_sm107_cache_manager.py
+  # Kimi K3 family glue and kernels: V1 import scan, the FC12 counter layout and die-claim
+  # gating, source parity with V1 / the reference, and the KDA mid-chunk snapshot plan
+  # (their GPU cases are in l0_b300).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_v1_imports.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_moe/test_k3r_fc12_layout.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_no_env_switches.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_common.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated/test_k3r_rms_norm_gated.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
