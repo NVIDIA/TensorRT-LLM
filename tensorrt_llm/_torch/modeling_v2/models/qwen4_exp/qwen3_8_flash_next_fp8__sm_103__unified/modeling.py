@@ -3495,6 +3495,68 @@ def _selection(
     )
 
 
+def _score_chunk_rows(core, block_table, tokens_per_block: int) -> int:
+    """Rows one `_score_and_select` call scores: fewer than `_SCORE_TABLE_ELEMENTS / columns`,
+    in whole query tiles."""
+    columns = block_table.shape[1] * tokens_per_block // core.compress_ratio
+    chunk = max(1, (_SCORE_TABLE_ELEMENTS - 1) // columns)
+    if chunk >= _SELECTION_CUT_ALIGN:
+        chunk -= chunk % _SELECTION_CUT_ALIGN
+    return chunk
+
+
+def _score_and_select(
+    core,
+    index_cache,
+    q_index,
+    block_table,
+    logical,
+    req_idx,
+    tokens_per_block: int,
+    visible_blocks,
+    seq_lens_q,
+    topk_indices,
+    row_starts,
+    lo: int,
+    hi: int,
+    context_rows: bool,
+    out,
+) -> None:
+    """Score rows `[lo, hi)` against `index_cache` and select them into `out` (`_selection`),
+    in equal chunks of at most `_score_chunk_rows` (whole query tiles): a row's scores and
+    selection read only its query, position and request, so the chunks select what one call
+    would; below the bound the rows are one call. Equal chunks keep the last one past the
+    index scores' decode-row limit, whose launch rounds the scores differently."""
+    bound = _score_chunk_rows(core, block_table, tokens_per_block)
+    pieces = max(1, -(-(hi - lo) // bound))
+    chunk = -(-(hi - lo) // pieces)
+    if bound >= _SELECTION_CUT_ALIGN:
+        chunk = -(-chunk // _SELECTION_CUT_ALIGN) * _SELECTION_CUT_ALIGN
+    for a in range(lo, hi, max(1, chunk)):
+        b = min(a + chunk, hi)
+        scores = _context_index_scores(
+            q_index[a:b],
+            index_cache,
+            block_table,
+            logical[a:b],
+            req_idx[a:b],
+            tokens_per_block,
+            core.compress_ratio,
+            context_rows,
+        )
+        _selection(
+            core,
+            scores,
+            visible_blocks[a:b],
+            logical[a:b],
+            seq_lens_q[a:b],
+            topk_indices[a:b],
+            row_starts[a:b],
+            out[a - lo : b - lo],
+            context=context_rows,
+        )
+
+
 def _prefill_split_enabled(attn_tp_size: int, dp_size: int) -> bool:
     """Whether a prefill step splits its selection and row-wise work over the attention-TP group."""
     return dp_size == 1 and attn_tp_size in _PREFILL_SPLIT_DEFAULT_TP
@@ -4456,38 +4518,24 @@ class PrefillTarget:
                 device=proj.device,
             )
 
-            # A call scores fewer than `_SCORE_TABLE_ELEMENTS / columns` rows (whole query
-            # tiles): a row's scores and selection read only its query, position and request,
-            # so the chunks select what one call would; below the bound a part is one call.
-            columns = block_table.shape[1] * tokens_per_block // core.compress_ratio
-            chunk = max(1, (_SCORE_TABLE_ELEMENTS - 1) // columns)
-            if chunk >= _SELECTION_CUT_ALIGN:
-                chunk -= chunk % _SELECTION_CUT_ALIGN
-
             def score_and_select(lo, hi, context_rows, out):
-                for a in range(lo, hi, chunk):
-                    b = min(a + chunk, hi)
-                    scores = _context_index_scores(
-                        q_index[a:b],
-                        core._bound.pools.index_cache[i],
-                        block_table,
-                        logical[a:b],
-                        req_idx[a:b],
-                        tokens_per_block,
-                        core.compress_ratio,
-                        context_rows,
-                    )
-                    _selection(
-                        core,
-                        scores,
-                        visible_blocks[a:b],
-                        logical[a:b],
-                        seq_lens_q[a:b],
-                        topk_indices[a:b],
-                        topk_row_starts[a:b],
-                        out[a - lo : b - lo],
-                        context=context_rows,
-                    )
+                _score_and_select(
+                    core,
+                    core._bound.pools.index_cache[i],
+                    q_index,
+                    block_table,
+                    logical,
+                    req_idx,
+                    tokens_per_block,
+                    visible_blocks,
+                    seq_lens_q,
+                    topk_indices,
+                    topk_row_starts,
+                    lo,
+                    hi,
+                    context_rows,
+                    out,
+                )
 
             for lo, hi, context_rows in parts:
                 if context_rows and self._split_context_rows(hi - lo):
@@ -5572,25 +5620,23 @@ class PrefillTarget:
                 dtype=torch.int32,
                 device=qkv.device,
             )
+            # Every context row is scored, so they go in the trunk prefill's chunks.
             for lo, hi, context_rows in parts:
-                scores = _context_index_scores(
-                    q_index[lo:hi],
-                    draft.index_cache,
-                    block_table,
-                    logical[lo:hi],
-                    req_idx[lo:hi],
-                    tokens_per_block,
-                    core.compress_ratio,
-                    context_rows,
-                )
-                _selection(
+                _score_and_select(
                     core,
-                    scores,
-                    visible_blocks[lo:hi],
-                    logical[lo:hi],
-                    seq_lens_q[lo:hi],
-                    topk_indices[lo:hi],
-                    row_starts[lo:hi],
+                    draft.index_cache,
+                    q_index,
+                    block_table,
+                    logical,
+                    req_idx,
+                    tokens_per_block,
+                    visible_blocks,
+                    seq_lens_q,
+                    topk_indices,
+                    row_starts,
+                    lo,
+                    hi,
+                    context_rows,
                     selected[lo:hi],
                 )
             if share:
