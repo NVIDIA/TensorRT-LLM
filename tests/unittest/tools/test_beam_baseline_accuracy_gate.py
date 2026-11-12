@@ -19,7 +19,10 @@ spec.loader.exec_module(gate)
 
 
 @pytest.mark.parametrize("passed", [True, False])
-def test_gate_uses_baseline_and_propagates_public_verdict(tmp_path, monkeypatch, passed):
+@pytest.mark.parametrize("timeout,budget", [(3600, 2400), (2700, 2400), (600, 300)])
+def test_gate_uses_baseline_and_propagates_public_verdict(
+    tmp_path, monkeypatch, passed, timeout, budget
+):
     root = tmp_path / "models"
     (root / "target").mkdir(parents=True)
     monkeypatch.setenv("TRTLLM_TEST_TARGET_RELATIVE_PATH", "target")
@@ -31,17 +34,17 @@ def test_gate_uses_baseline_and_propagates_public_verdict(tmp_path, monkeypatch,
 
     monkeypatch.setattr(gate.runner, "run", run)
     if passed:
-        gate._run_first100(root, tmp_path / "results", 3600)
+        gate._run_first100(root, tmp_path / "results", timeout)
     else:
         with pytest.raises(AssertionError, match="accuracy"):
-            gate._run_first100(root, tmp_path / "results", 3600)
+            gate._run_first100(root, tmp_path / "results", timeout)
     (call,) = calls
     assert (
         call["num_questions"],
         call["min_correct"],
         call["concurrency"],
         call["time_budget_s"],
-    ) == (100, 95, 1, 2700)
+    ) == (100, 95, 1, budget)
     managed = call["managed"]
     assert managed.argv[:3] == ("trtllm-serve", str(root / "target"), "--config")
     config = yaml.safe_load(Path(managed.argv[-1]).read_text())
@@ -51,6 +54,13 @@ def test_gate_uses_baseline_and_propagates_public_verdict(tmp_path, monkeypatch,
     assert config["tensor_parallel_size"] == 4
     assert config["cuda_graph_config"] is None and config["disable_overlap_scheduler"]
     assert "speculative_config" not in config
+
+
+@pytest.mark.parametrize("timeout", [0, 300])
+def test_timeout_must_allow_cleanup(tmp_path, monkeypatch, timeout):
+    monkeypatch.setattr(gate.runner, "run", lambda **kwargs: pytest.fail("unexpected launch"))
+    with pytest.raises(ValueError, match="cleanup reserve"):
+        gate._run_first100(tmp_path, tmp_path / "results", timeout)
 
 
 @pytest.mark.parametrize("relative", ["../outside", "/outside", "missing"])
