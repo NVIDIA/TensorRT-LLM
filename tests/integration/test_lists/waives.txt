@@ -11,7 +11,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_sched
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False] SKIP (https://nvbugs/7044394)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy[dp4] SKIP (https://nvbugs/6939213)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy[dp8] SKIP (https://nvbugs/6939213)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl SKIP (https://nvbugs/6997728)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp8] SKIP (https://nvbugs/7010731)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency] SKIP (https://nvbugs/6177390)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency] SKIP (https://nvbugs/6177390)
