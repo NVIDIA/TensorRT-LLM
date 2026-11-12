@@ -294,7 +294,7 @@ def test_linear_quant_ignore_keeps_activation_bf16(
         for parameter in mlp.parameters():
             parameter.normal_(0, 0.02)
     down = mlp.down_proj
-    projections = [down] + ([mlp.gate_proj, mlp.up_proj] if split_gate_up else [])
+    projections = [down] + ([mlp.gate_proj, mlp.up_proj] if split_gate_up else [mlp.gate_up_proj])
     for projection in projections:
         projection.quant_config = QuantConfig(quant_algo="FP8")
         projection.input_scale = torch.ones(())

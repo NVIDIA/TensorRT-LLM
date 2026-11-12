@@ -443,7 +443,7 @@ def test_visual_gen_ignored_steps_schema(schemas, steps, valid, attention):
     assert (not errors) == valid, [error.message for error in errors]
 
 
-@pytest.mark.parametrize("linear_ignore", [[], ["blocks.0.ffn.*"]])
+@pytest.mark.parametrize("linear_ignore", [[], ["blocks.0.ffn.*"], "blocks.0"])
 @pytest.mark.parametrize("attention_ignore", [[], ["blocks.0.attn1"]])
 @pytest.mark.parametrize("linear_steps", [[], [0]])
 @pytest.mark.parametrize("attention_steps", [[], [1]])
@@ -511,6 +511,21 @@ def test_visual_gen_quant_ignore_cache_combinations(schemas, steps, valid, atten
         ({"quant_algo": "NVFP4", "ignored_steps": []}, True, True),
         ({"quant_algo": "NVFP4", "ignored_steps": [0]}, True, False),
         ({"quant_algo": "NVFP4", "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "NVFP4", "dynamic": False, "ignored_steps": [0]}, False, False),
+        ({"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "W4A16_AWQ", "ignored_steps": [0]}, False, False),
+        ({"quant_algo": "FP8_BLOCK_SCALES", "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "ignored_steps": [0]}, False, True),
+        (
+            {
+                "quant_algo": "FP8",
+                "dynamic": False,
+                "config_groups": {"group_0": {"weights": {"dynamic": True}}},
+                "ignored_steps": [0],
+            },
+            False,
+            True,
+        ),
         ({"ignored_steps": [0]}, False, False),
         ({"quant_algo": None, "ignored_steps": [0]}, False, False),
     ],

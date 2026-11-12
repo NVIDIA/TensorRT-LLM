@@ -178,10 +178,6 @@ class DynamicLinearWeightLoader:
         if quant_algo is None or self.dynamic_weight_quant:
             return
 
-        if self.quant_config is not None:
-            if self.quant_config.is_module_excluded_from_quantization(name):
-                return
-
         # Ask the destination buffer, not the module's name. ``quant_algo``
         # above falls back to the *global* recipe for any module that carries
         # no ``quant_config`` of its own, which includes modules that cannot be
@@ -229,11 +225,6 @@ class DynamicLinearWeightLoader:
         """Decide if weight should be dynamically quantized at load time."""
         if not self.dynamic_weight_quant or quant_algo is None:
             return False
-
-        # Check if module is excluded
-        if self.quant_config is not None:
-            if self.quant_config.is_module_excluded_from_quantization(name):
-                return False
 
         weight = weight_dict.get("weight")
         if weight is None:
@@ -365,6 +356,11 @@ class DynamicLinearWeightLoader:
             quant_algo = module_quant_config.quant_algo
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
+            if (
+                self.quant_config is not None
+                and self.quant_config.is_module_excluded_from_quantization(name)
+            ):
+                quant_algo = None
 
         if getattr(self.quant_config, "ignored_steps", []) and quant_algo is not None:
             self._retain_unquantized_weight(module, name, weight_dicts)

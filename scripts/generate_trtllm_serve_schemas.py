@@ -358,7 +358,7 @@ def generate_disagg_schema() -> dict:
 
 def generate_visual_gen_schema() -> dict:
     """Describe the separate VisualGen engine-args YAML file."""
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm.visual_gen.args import _LOAD_TIME_QUANT_ALGOS, VisualGenArgs
 
     schema = _schema_for(VisualGenArgs)
     # ModelOpt dictionaries remain extensible, but their diffusion step selector
@@ -397,13 +397,15 @@ def generate_visual_gen_schema() -> dict:
                     "cache_config": {"type": "null"},
                     "quant_config": {
                         "properties": {
-                            "ignore": {"maxItems": 0},
-                            "exclude_modules": {"maxItems": 0},
+                            "ignore": {"type": ["array", "null"], "maxItems": 0},
+                            "exclude_modules": {"type": ["array", "null"], "maxItems": 0},
                         },
                     },
                     "attention_config": {
                         "properties": {
-                            "quant_attention_config": {"properties": {"ignore": {"maxItems": 0}}}
+                            "quant_attention_config": {
+                                "properties": {"ignore": {"type": "array", "maxItems": 0}}
+                            }
                         }
                     },
                 }
@@ -418,7 +420,15 @@ def generate_visual_gen_schema() -> dict:
                     "runtime_lora_config": {"type": "null"},
                     "quant_config": {
                         "required": ["quant_algo"],
-                        "properties": {"quant_algo": {"not": {"type": "null"}}},
+                        "properties": {
+                            "quant_algo": {"enum": [algo.value for algo in _LOAD_TIME_QUANT_ALGOS]}
+                        },
+                        "allOf": [
+                            {
+                                "if": {"properties": {"config_groups": {"maxProperties": 0}}},
+                                "then": {"properties": {"dynamic": {"const": True}}},
+                            }
+                        ],
                     },
                 }
             },

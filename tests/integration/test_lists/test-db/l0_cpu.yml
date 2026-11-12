@@ -271,6 +271,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_wan_transformer.py::test_linear_ignored_steps_keep_fused_norm_output_bf16
   - unittest/_torch/visual_gen/test_ltx2_attention.py::test_linear_ignored_steps_keep_norm_output_bf16
   - unittest/_torch/visual_gen/test_ltx2_attention.py::test_linear_ignored_steps_bypass_async_qkv_quantization
+  - unittest/_torch/visual_gen/test_ltx2_attention.py::test_attention_ignore_survives_stage2_topology
   - unittest/_torch/visual_gen/test_sleep.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_tensor_payload.py

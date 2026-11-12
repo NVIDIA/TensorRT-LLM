@@ -41,6 +41,16 @@ REQUEST = dict(
     guidance_scale=1.0,
 )
 
+# Quality bounds for this fixed B200 fixture, with headroom for backend rounding.
+LPIPS_LIMITS = {
+    "linear_fp8_block_layer": 0.01,
+    "linear_nvfp4_step": 0.03,
+    "attention_flashinfer_step": 0.03,
+    "attention_trtllm_sage_layer": 0.005,
+    "attention_cutedsl_step": 0.02,
+    "attention_cudnn_layer": 0.005,
+}
+
 
 @dataclass(frozen=True)
 class QuantIgnoreCase:
@@ -292,5 +302,10 @@ def test_flux2_klein_quant_ignore(case: QuantIgnoreCase, bf16_reference: Generat
     report_path = result.directory / "report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     report["lpips_against_bf16"] = score
+    report["lpips_limit"] = LPIPS_LIMITS[case.name]
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps({"case": case.name, "lpips_against_bf16": score}), flush=True)
+    assert score <= LPIPS_LIMITS[case.name], (
+        f"{case.name}: LPIPS {score:.6f} exceeds {LPIPS_LIMITS[case.name]:.6f} "
+        "against the BF16 reference"
+    )

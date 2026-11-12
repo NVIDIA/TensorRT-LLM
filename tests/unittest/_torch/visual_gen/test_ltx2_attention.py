@@ -41,6 +41,73 @@ def _create_config(backend: str = "VANILLA") -> DiffusionModelConfig:
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("excluded", [False, True])
+def test_attention_ignore_survives_stage2_topology(
+    monkeypatch: pytest.MonkeyPatch, excluded: bool
+) -> None:
+    """Keep layer exclusions on both native LTX2 topology stacks without GPU collectives."""
+    from unittest.mock import patch
+
+    from test_common.visual_gen_quantization import ToyAttentionBackend
+
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+        LTXModel,
+        LTXModelType,
+        Stage2Groups,
+    )
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    stage2_group = object()
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group=None: 2 if group is stage2_group else 1
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    config = _create_config("CUTEDSL")
+    config.visual_gen_mapping = VisualGenMapping(world_size=1, rank=0)
+    config.attention = AttentionConfig(
+        backend="CUTEDSL",
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="nvfp4",
+            v_dtype="fp8",
+            ignore=[f"transformer_blocks.{0 if excluded else 9}.attn1"],
+        ),
+    )
+    with (
+        torch.device("meta"),
+        patch(
+            "tensorrt_llm._torch.visual_gen.attention.backends.utils.get_visual_gen_attention_backend",
+            return_value=ToyAttentionBackend,
+        ),
+    ):
+        model = LTXModel(
+            model_type=LTXModelType.VideoOnly,
+            num_attention_heads=2,
+            attention_head_dim=128,
+            in_channels=4,
+            out_channels=4,
+            caption_channels=128,
+            cross_attention_dim=128,
+            num_layers=1,
+            model_config=config,
+            stage2_groups=Stage2Groups(stage2_group, stage2_group, seq_rank=0, seq_size=2),
+        )
+    attention = model.transformer_blocks[0].attn1
+    default = attention.attn
+    assert (default.quant_attention_config is None) == excluded
+    assert default.num_heads == 2
+    model.set_ulysses_topology(is_stage2=True)
+    assert model.active_topology == "stage2"
+    assert isinstance(attention.attn, UlyssesAttention)
+    stage2 = attention.attn.inner_backend
+    assert stage2 is not default and stage2.num_heads == 1
+    assert (stage2.quant_attention_config is None) == excluded
+    model.set_ulysses_topology(is_stage2=False)
+    assert model.active_topology == "default" and attention.attn is default
+
+
 def _init_weights(module: torch.nn.Module, std: float = 0.02):
     """Initialize all parameters with small random values.
 
