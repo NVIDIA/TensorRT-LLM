@@ -7046,6 +7046,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._after_shrink(req.py_request_id, kv_cache)
 
             for req in scheduled_batch.generation_requests:
+                # A paired pool's generation dummy has a fixed shape, and
+                # add_dummy_requests reserves its full forward capacity in both
+                # pools, even when it joins the batch after scheduler admission.
+                # An unpaired pool is not handed to add_dummy_requests: the
+                # mirror the scheduler admits for its dummy is empty and grows
+                # below like any other.
+                preallocated_dummy = (
+                    self.enable_joint_kv_cache_reuse
+                    and req.is_dummy_request
+                    and req.py_request_id in self.kv_cache_map
+                )
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     raise RuntimeError(
@@ -7062,7 +7073,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 # A paired scheduler already grew both pools atomically; the
                 # recorded width says so, so do not charge this step twice.
-                if req.py_request_id in self._allocated_draft_lens:
+                if preallocated_dummy or req.py_request_id in self._allocated_draft_lens:
                     continue
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
                 if not kv_cache.resize(new_cap):
