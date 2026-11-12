@@ -489,6 +489,7 @@ exclude = [
     "tensorrt_llm/scaffolding/worker.py",
     "tensorrt_llm/scheduling_params.py",
     "tensorrt_llm/serve/__init__.py",
+    "tensorrt_llm/serve/_base/msgspec_route.py",
     "tensorrt_llm/serve/chat_utils.py",
     "tensorrt_llm/serve/cluster_storage.py",
     "tensorrt_llm/serve/disagg_auto_scaling.py",
