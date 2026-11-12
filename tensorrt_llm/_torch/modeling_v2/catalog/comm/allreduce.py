@@ -32,6 +32,16 @@ _NO_WORKSPACE = frozenset(
     }
 )
 
+#: Strategies of the `AllReduce` module's own kernels, which this op has no branch for: the
+#: module runs the MNNVL or symmetric-memory kernel where it can and calls this op at AUTO
+#: otherwise (`_torch/distributed/ops.py`), and so does a call built by `allreduce_group_args`.
+_MODULE_ONLY = frozenset(
+    {
+        int(AllReduceStrategy.MNNVL),
+        int(AllReduceStrategy.SYMM_MEM),
+    }
+)
+
 
 def allreduce_group_args(mapping, strategy: int = AUTO) -> dict:
     """The communicator side of the call for this rank's TP group.
@@ -41,7 +51,8 @@ def allreduce_group_args(mapping, strategy: int = AUTO) -> dict:
 
     The IPC workspace is this op's own fixture: one per mapping, shared with
     every other user of that mapping in the process, allocated on first use.
-    It exists only for strategies that read it.
+    It exists only for strategies that read it. MNNVL and SYMM_MEM reach the
+    op as AUTO (`_MODULE_ONLY`); running the MNNVL kernel is the caller's part.
 
     Mirrors the router in `_torch/distributed/ops.py`: under MPI the plain
     symbol is called and `process_group` stays None; with MPI disabled the
@@ -50,6 +61,8 @@ def allreduce_group_args(mapping, strategy: int = AUTO) -> dict:
     from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
     from tensorrt_llm._utils import mpi_disabled
 
+    if strategy in _MODULE_ONLY:
+        strategy = AUTO
     workspace = None if strategy in _NO_WORKSPACE else get_allreduce_workspace(mapping)
     process_group, rank = None, None
     if mpi_disabled():

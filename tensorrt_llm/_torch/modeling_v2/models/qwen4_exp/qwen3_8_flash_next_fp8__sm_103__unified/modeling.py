@@ -685,14 +685,16 @@ _FP8_ROWTILE_MAX_SCRATCH = 1 << 30  # capacity: fixed: bounds a per-call scratch
 #: Opt-in switch (`weights.switch`): a context step over an fp8 pool whose pages would widen
 #: past `_FP8_ROWTILE_MAX_SCRATCH` runs one row-tile launch per group of requests that fits
 #: (`_rowtile_scratch_groups`) instead of the per-row kernel. Off by default because such steps'
-#: outputs then move by rounding. Read once, when the target is built.
+#: outputs then move by rounding. Read once, when the target is built; `check_deployment`
+#: declines it without an FP8 KV cache, where it does nothing.
 ROWTILE_SCRATCH_GROUPS_ENV = "TRTLLM_MODELING_V2_ROWTILE_SCRATCH_GROUPS"
 #: The stock MoE communication override (`communication_factory`), compared upper-cased like the
-#: stock factory. Under attention DP, `NVLINK_ONE_SIDED` runs the MoE round trip as an all-to-all
-#: dispatch / combine (`moe_a2a__dp_dispatch_combine`): a reference path, not a faster one; it
-#: needs MPI, attention DP and MNNVL. Unset or `ALLGATHER` keeps the all-gather / reduce-scatter
-#: round trip. `check_deployment` declines any other value, and the all-to-all where it cannot
-#: run. Read once, when the target is built.
+#: stock factory and, like it, read only under attention DP with `dp_size > 1`: other layouts
+#: have no MoE round trip and ignore it. There `NVLINK_ONE_SIDED` runs the round trip as an
+#: all-to-all dispatch / combine (`moe_a2a__dp_dispatch_combine`): a reference path, not a faster
+#: one; it needs MPI and MNNVL. Unset or `ALLGATHER` keeps the all-gather / reduce-scatter round
+#: trip. `check_deployment` declines any other value, and the all-to-all where it cannot run.
+#: Read once, when the target is built.
 MOE_COMM_METHOD_ENV = "TRTLLM_FORCE_COMM_METHOD"
 
 
@@ -721,6 +723,22 @@ _INFORWARD_MIN_MAIN = _GDN_INPLACE_MAX_TOKENS + 1
 #: (`ops/comm/mnnvl_allreduce__tp_sum`) instead of the IPC one, where the platform supports MNNVL
 #: (`MNNVLAllReduce.is_mnnvl`); the two return the same bits.
 _TP_SUM_MNNVL_MAX_ROWS = 32
+#: The engine `allreduce_strategy` values under which the target runs its own communication: the
+#: MNNVL `tp_sum` and the IPC buffers `_own_ipc` admits. Under another strategy every TP sum is
+#: the raw all-reduce at that strategy and the gathers run NCCL; `check_deployment` declines UB
+#: and LOWPRECISION, whose setup only the stock `AllReduce` module does.
+_OWN_COMM_STRATEGIES = frozenset({int(AllReduceStrategy.AUTO), int(AllReduceStrategy.MNNVL)})
+#: The stock IPC fusion all-reduce's accumulation switch (`use_fp32_acc` in
+#: `allReduceFusionKernels.cu`): fp32 unless the value starts with `0`. `hc_allreduce_inject_norm`
+#: always sums in fp32, so with the opt-out the decode sites sum apart (`_hc_ar_inject`).
+AR_FP32_ACC_ENV = "ALL_REDUCE_FUSION_KERNEL_ACC_FP32"
+
+
+def _own_ipc(core) -> bool:
+    """Whether the target opens its own IPC buffers over the attention-TP group: the split index
+    gather's Lamport buffers, the two-rank copy-engine exchange and (at AUTO only) the fused TP sum
+    + inject. Needs an `_OWN_COMM_STRATEGIES` strategy and peer access between the group's ranks."""
+    return core.allreduce_strategy in _OWN_COMM_STRATEGIES and can_access_peer(core.mapping)
 
 
 def _runtime_hooks() -> RuntimeHooks:
@@ -906,7 +924,8 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self.mapping = mapping
         # Ranks the attention and recurrent heads are split over (1 under attention DP).
         self.attn_tp_size = _pool.attention_tp_size(mapping)
-        # The engine's all-reduce strategy for the TP sums; the fused IPC paths need AUTO.
+        # The engine's all-reduce strategy for the TP sums; `_OWN_COMM_STRATEGIES` gates the
+        # target's own MNNVL and IPC paths.
         self.allreduce_strategy = int(model_config.allreduce_strategy)
         # Under attention DP each rank serves its own requests; MoE runs over the TP group's rows.
         self.dp_size = mapping.tp_size if mapping.enable_attention_dp else 1
@@ -1281,7 +1300,11 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self._decode = DecodeTarget(self)
 
     def _tp_sum_op(self):
-        """Return the attention-TP sum of block partials, bit-identical on every rank."""
+        """Return the attention-TP sum of block partials, bit-identical on every rank.
+
+        At AUTO or MNNVL, where the platform supports MNNVL, rows up to `_TP_SUM_MNNVL_MAX_ROWS`
+        take the MNNVL kernel; every other sum is the raw all-reduce, which `allreduce_group_args`
+        hands MNNVL as AUTO."""
         if self.attn_tp_size == 1:
             return lambda x: x
         group = allreduce_group_args(self.mapping, self.allreduce_strategy)
@@ -1299,7 +1322,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
                 **group,
             )
 
-        if self.allreduce_strategy != int(AllReduceStrategy.AUTO) or not MNNVLAllReduce.is_mnnvl(
+        if self.allreduce_strategy not in _OWN_COMM_STRATEGIES or not MNNVLAllReduce.is_mnnvl(
             self.mapping, torch.bfloat16, explicitly_requested=True
         ):
             return tp_sum
@@ -1317,7 +1340,10 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         return tp_sum
 
     def _hc_ar_inject(self):
-        """Return the decode sites' fused TP-sum + injection state, or None where unsupported."""
+        """Return the decode sites' fused TP-sum + injection state, or None where unsupported.
+
+        The kernel sums in fp32, the stock IPC all-reduce's default; under that all-reduce's
+        opt-out (`AR_FP32_ACC_ENV`) the sites sum through `tp_sum`, which follows it."""
         if not (
             self.attn_tp_size in (2, 4)
             and self.dp_size == 1
@@ -1325,7 +1351,8 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             and self.hidden == 2560
             and self.hc_count == 4
             and self.allreduce_strategy == int(AllReduceStrategy.AUTO)
-            and can_access_peer(self.mapping)
+            and not os.environ.get(AR_FP32_ACC_ENV, "").startswith("0")
+            and _own_ipc(self)
         ):
             return None
         group = allreduce_group_args(self.mapping, self.allreduce_strategy)
@@ -3232,7 +3259,8 @@ def _index_split_group(core) -> tuple | None:
 def _index_split_lamport(core):
     """The split gather's Lamport IPC buffers, or None where the Lamport exchange does not apply.
 
-    Needs 2-4 attention-TP ranks with peer access, PDL and captured batches that reach the split.
+    Needs 2-4 attention-TP ranks, `_own_ipc`, PDL and captured batches that reach the split;
+    without it the split gathers over NCCL.
     A collective: every rank builds the buffers here, before any capture."""
     graph_batches = tuple(
         getattr(getattr(core, "model_config", None), "cuda_graph_batch_sizes", ()) or ()
@@ -3242,7 +3270,7 @@ def _index_split_lamport(core):
         and get_env_enable_pdl()
         and _INDEX_SPLIT_LAMPORT_ROWS > 0
         and (not graph_batches or max(graph_batches) >= _INDEX_SPLIT_MIN_REQUESTS)
-        and can_access_peer(core.mapping)
+        and _own_ipc(core)
     ):
         return None
     width = core.token_topk + core.compress_ratio - 1
@@ -4167,11 +4195,13 @@ class PrefillTarget:
             self._comm_fork = torch.cuda.Event()
             self._comm_join = torch.cuda.Event()
         # Two-rank sequence parallelism only: sized for half a max_num_tokens step's bf16 rows.
+        # Without `_own_ipc` the pair exchanges over NCCL.
         self._ce_exchange = None
         if (
             self._comm_stream is not None
             and self._sequence_parallel is not None
             and self._sequence_parallel[1] == 2
+            and _own_ipc(core)
         ):
             from .ops.comm.ce_exchange__sp_pair import CopyEngineExchange
 
@@ -6871,30 +6901,42 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
                 f"the checkpoint has Qwen3.8-Flash-Next's shape but declares {differs}; the "
                 f"target implements { ({k: _TEXT_SETTINGS[k] for k in differs}) }"
             )
-        # The opt-in switches, read here so a misspelled value fails before the build.
+        # The opt-in switches, read here so a misspelled value fails before the build; one that
+        # would do nothing at this deployment declines rather than being ignored.
         mapping = model_config.mapping
-        _weights.moe_tpb_requested()
-        _weights.switch(ROWTILE_SCRATCH_GROUPS_ENV)
-        comm_method = _moe_comm_method()
-        if comm_method not in ("ALLGATHER", "NVLINK_ONE_SIDED"):
+        if _weights.moe_tpb_requested() and not _weights.moe_tpb_enabled(mapping):
             raise NoTarget(
-                f"{MOE_COMM_METHOD_ENV}={comm_method} at {layout}: the target runs the MoE round "
-                "trip as ALLGATHER (the default) or NVLINK_ONE_SIDED"
+                f"{_weights.MOE_TPB_ENV}=rr at {layout}: the block-major MoE decode copy runs at "
+                "tp4 and tep4 only; unset it"
             )
-        if comm_method == "NVLINK_ONE_SIDED":
-            from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-                NVLinkOneSided,
+        rowtile_groups = _weights.switch(ROWTILE_SCRATCH_GROUPS_ENV)
+        strategy = AllReduceStrategy(int(model_config.allreduce_strategy))
+        if _pool.attention_tp_size(mapping) > 1 and strategy in (
+            AllReduceStrategy.UB,
+            AllReduceStrategy.LOWPRECISION,
+        ):
+            raise NoTarget(
+                f"allreduce_strategy={strategy.name} at {layout}: the target calls the all-reduce "
+                "op directly, without the buffers the stock AllReduce module sets up for it"
             )
-
-            if (
-                mpi_disabled()
-                or not mapping.enable_attention_dp
-                or not NVLinkOneSided.is_platform_supported()
-            ):
+        # As the stock factory: only an attention-DP group has a MoE round trip to override.
+        if mapping.enable_attention_dp and mapping.dp_size > 1:
+            comm_method = _moe_comm_method()
+            if comm_method not in ("ALLGATHER", "NVLINK_ONE_SIDED"):
                 raise NoTarget(
-                    f"{MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED at {layout}: the all-to-all MoE "
-                    "round trip needs MPI, attention DP and MNNVL on this node"
+                    f"{MOE_COMM_METHOD_ENV}={comm_method} at {layout}: the target runs the "
+                    "attention-DP MoE round trip as ALLGATHER (the default) or NVLINK_ONE_SIDED"
                 )
+            if comm_method == "NVLINK_ONE_SIDED":
+                from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+                    NVLinkOneSided,
+                )
+
+                if mpi_disabled() or not NVLinkOneSided.is_platform_supported():
+                    raise NoTarget(
+                        f"{MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED at {layout}: the all-to-all MoE "
+                        "round trip needs MPI and MNNVL on this node"
+                    )
         spec = model_config.spec_config
         if spec is not None:
             # One linear MTP chain, verified at `max_draft_len + 1` rows on the GDN cached replay.
@@ -6965,6 +7007,12 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
             raise NoTarget(
                 f"a {kv_cache_quant_algo} KV cache; the target stores K/V as the checkpoint's "
                 "bf16, as FP8 or as NVFP4"
+            )
+        if rowtile_groups and kv_cache_quant_algo != QuantAlgo.FP8:
+            stored = "bf16" if kv_cache_quant_algo is None else kv_cache_quant_algo
+            raise NoTarget(
+                f"{ROWTILE_SCRATCH_GROUPS_ENV} with a {stored} KV cache: the grouped row-tile "
+                "context launches run over an FP8 KV cache only; unset it"
             )
         if model_config.torch_dtype != torch.bfloat16:
             raise NoTarget(

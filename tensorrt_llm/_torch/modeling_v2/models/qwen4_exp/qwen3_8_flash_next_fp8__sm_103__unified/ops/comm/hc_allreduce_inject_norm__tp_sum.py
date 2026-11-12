@@ -8,6 +8,10 @@ interleaves with the plain all-reduce's calls), then `_hc_inject_norm_launch`'s 
 norm from the summed row, its sum of squares in the Triton program's reduction tree at
 `program_warps` warps. Both outputs are bitwise the all-reduce followed by the Triton kernel.
 
+The sum accumulates in fp32 only, the all-reduce's default. Under
+`ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0` the all-reduce sums in bf16 and this kernel does not
+match it, so the target does not call it then (`modeling._hc_ar_inject`).
+
 Only the norm weights are read before the grid-dependency wait; the residual, injection weights
 and shared-expert operands are read after it.
 """
