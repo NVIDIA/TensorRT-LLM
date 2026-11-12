@@ -86,6 +86,16 @@ Set environment variable `TLLM_NVTX_DEBUG=1`.
 Set environment variable `TLLM_PROFILE_RECORD_GC=1`.
 
 
+### Select custom PyTorch profiler regions
+
+Set `TLLM_PROFILE_CUSTOM_REGIONS` before process startup. Unset, empty or
+whitespace-only values select `workflow,mpi,nccl,nanobind`; `kv` and `moe` are
+opt-in. Set `none` to disable all custom scopes, or list categories separated by
+commas. Invalid nonempty selections warn and use the defaults. Selection is
+cached for the process lifetime. Native NCCL and nanobind scopes also require
+their build options. See the [shared profiler contract](profiler-metadata.md)
+for the capture prerequisites and execution-trace metadata format.
+
 ### Enable GIL information in NVTX markers
 
 Append “python-gil” to Nsys “-t” option.
@@ -96,7 +106,17 @@ Append “python-gil” to Nsys “-t” option.
 ### Collect PyTorch profiler results
 
 1. Set environment variable `TLLM_PROFILE_START_STOP=A-B` to specify the range of the iterations to be collected.
-2. Set environment variable `TLLM_TORCH_PROFILE_TRACE=<path>`, and the results will be saved to `<path>`.
+2. Set `TLLM_TORCH_PROFILE_TRACE=<path>` as the output filename base. Each rank writes its own Chrome trace, and the actual exported path is logged.
+
+A single environment range keeps the filename `<base>-rank-<rank><extension>`.
+For multiple environment ranges, each output also includes its start and stop
+iterations to prevent later windows from overwriting earlier ones. For example,
+`TLLM_PROFILE_START_STOP=1-100,400-500` with
+`TLLM_TORCH_PROFILE_TRACE=chrome.json` writes
+`chrome-rank-0-iterations-1-100.json` and
+`chrome-rank-0-iterations-400-500.json` on rank 0. An early exit uses the current
+iteration as the end of the filename range. Runtime profiling requests keep
+their existing per-request filenames.
 
 For VisualGen, use `TLLM_PROFILE_VISUAL_GEN_START_STOP` instead. Numeric ranges select
 per-request denoise steps, while `predenoise`, `postdenoise`, and `all` select the

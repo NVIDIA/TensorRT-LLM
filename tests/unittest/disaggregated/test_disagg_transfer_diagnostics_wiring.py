@@ -65,6 +65,8 @@ def _disagg_request(
 
 def _diagnostic_transceiver() -> KvCacheTransceiverV2:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
     transceiver._mapping = SimpleNamespace(rank=4, tp_rank=1, pp_rank=0, cp_rank=0, cp_size=1)
     transceiver._instance_name = "diagnostic-test"
     transceiver._dp_rank = 2
@@ -1244,6 +1246,8 @@ def test_ctx_settlement_continues_when_diagnostic_emission_fails(
     )
     request = _disagg_request(4, request_id)
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = False
@@ -1303,6 +1307,8 @@ def test_ctx_settlement_continues_when_diagnostic_session_snapshot_is_stale(
     )
     request = _disagg_request(6, request_id)
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = False
@@ -1356,6 +1362,8 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     request = _disagg_request(5, request_id)
     request.set_kv_cache_size = Mock()
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
     transceiver._ever_had_recv_session = True
     transceiver._gen_idle_agreed = False
     transceiver._gen_need_sync = False

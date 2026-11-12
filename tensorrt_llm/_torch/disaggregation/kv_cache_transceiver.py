@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, NamedTuple, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -124,6 +124,20 @@ def create_kv_cache_transceiver(
     cache_transceiver_config: CacheTransceiverConfig,
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None
 ) -> Optional["KvCacheTransceiver"]:
+    """Construct the configured KV resource owner and optional profiling
+    wrapper.
+
+    Args:
+        mapping: Rank and parallelism layout for the transceiver.
+        dist: Distributed operations used during setup and transfers.
+        kv_cache_manager: KV cache pools whose blocks are transferred.
+        attention_type: Attention implementation used by the cache manager.
+        cache_transceiver_config: Runtime, transport, and transfer settings.
+        mamba_cache_manager: Optional state-cache manager for hybrid models.
+
+    Returns:
+        The selected transceiver, or None when transfers are disabled.
+    """
     resolve_cache_transceiver_config(cache_transceiver_config)
     lifecycle_policy = getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
     bypasses_python = (cache_transceiver_config is None
@@ -224,13 +238,37 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        transceiver = KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                           cache_transceiver_config)
 
-    # Explicit legacy runtime: transceiver_runtime is None or "CPP".
-    return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
-                                  attention_type, cache_transceiver_config,
-                                  mamba_cache_manager)
+    else:
+        # Explicit legacy runtime: transceiver_runtime is None or "CPP".
+        transceiver = BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
+                                             attention_type,
+                                             cache_transceiver_config,
+                                             mamba_cache_manager)
+
+    return _maybe_profile_kv_cache_transceiver(transceiver,
+                                               cache_transceiver_config.backend,
+                                               mapping)
+
+
+def _maybe_profile_kv_cache_transceiver(
+        transceiver: "KvCacheTransceiver", backend: str,
+        mapping: Mapping) -> "KvCacheTransceiver":
+    """Wrap the resource owner only when KV profiling was selected at
+    startup.
+    """
+    from tensorrt_llm._profiler import custom_region_enabled
+
+    if not custom_region_enabled("kv"):
+        return transceiver
+    from .profiler import _ProfiledKvCacheTransceiver
+
+    return _ProfiledKvCacheTransceiver(transceiver, backend, mapping.rank)
+
+
+SendTerminalOutcome = Literal["complete", "failed", "cancelled"]
 
 
 class CtxTransferStatus(NamedTuple):
@@ -280,9 +318,9 @@ class KvCacheTransceiver(ABC):
     of an instance must call them the same number of times with the same
     arguments per iteration; divergence can deadlock the instance.
 
-    Request ids in results are the ids the transceiver tracks: the request's
-    disaggregated unique id when its disaggregated params carry one,
-    otherwise ``request_id``.
+    Request ids in results use the local domain returned by
+    ``status_request_id``: C++ tracks ``request_id`` and V2 tracks the local
+    disaggregated unique id.
     """
 
     # KV-transfer timeout budget in milliseconds, taken from
@@ -308,6 +346,47 @@ class KvCacheTransceiver(ABC):
 
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether the send session closed before its final slice."""
+        return False
+
+    def status_request_id(self, req: LlmRequest) -> int:
+        """Return the request ID this runtime includes in status results."""
+        return req.request_id
+
+    def transfer_resource_ownership(self, req: LlmRequest) -> bool | None:
+        """Observe admission without changing resource ownership.
+
+        Returns True/False only when the implementation can authoritatively
+        determine whether it owns resources for req. None means unknown,
+        unlike the compatibility default of ``has_inflight_transfer``.
+        """
+        return None
+
+    def start_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        """Observe one pending send's safely retired outcome without polling.
+
+        Implementations without precise terminal evidence leave this a no-op.
+        Observers stop observation after terminal or rejected admission.
+        """
+
+    def stop_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        """Discard outcome observation without changing transfer ownership."""
+
+    def get_send_terminal_outcome(
+            self, req: LlmRequest) -> SendTerminalOutcome | None:
+        """Return a precisely observed, safely retired send outcome, if any."""
+        return None
+
+    def get_send_terminal_outcomes(self) -> Dict[int, SendTerminalOutcome]:
+        """Return ready, opt-in send outcomes keyed by local status id.
+
+        Pending observations are omitted. Reading does not poll or consume
+        the outcomes; disabling each observation retires its entry.
+        """
+        return {}
+
+    @property
+    def receive_completion_uses_request_state(self) -> bool:
+        """Whether receive outcomes require observing request-state mutation."""
         return False
 
     @property
@@ -426,9 +505,10 @@ class KvCacheTransceiver(ABC):
     def cancel_request(self, req: LlmRequest) -> bool:
         """Best-effort cancellation of ``req``'s in-flight transfers.
 
-        Returns True when the transfers are cancelled and it is safe to
-        release the request's KV resources; False when a task is mid-write
-        and the caller must retry on a later iteration.
+        The Python runtime and legacy C++ mode return True only after safe
+        cancellation. With C++ in-flight cancellation enabled, True accepts
+        the cancellation request; later status polling determines the final
+        outcome and safe resource release. False requires a later retry.
         """
         raise NotImplementedError
 
@@ -533,6 +613,10 @@ class KvCacheTransceiver(ABC):
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
+
+    @property
+    def receive_completion_uses_request_state(self) -> bool:
+        return True
 
     def __init__(self,
                  mapping: Mapping,

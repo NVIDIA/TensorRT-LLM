@@ -2,6 +2,8 @@
 
 # MoE Performance Guide
 
+To inspect materialized routing choices, see [MoE routing profiling](moe-routing-profiler.md) and its synchronization and backend limits.
+
 ## MoE Architecture
 
 An MoE module contains `num_experts` experts and a router that selects `top_k` of them for each token. To accelerate LLM execution, a multi-GPU deployment usually partitions these experts across ranks, which makes each rank hold only part of them. The module therefore additionally pays for a **dispatch** (send each token to the rank that owns its target expert) and a **combine** (bring the results back).

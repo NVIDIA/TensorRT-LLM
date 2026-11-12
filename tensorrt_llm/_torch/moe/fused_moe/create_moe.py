@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional
 
 import torch
 
+from tensorrt_llm._profiler import warn_unsupported_moe_routing
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -89,6 +90,9 @@ def create_moe_backend(
         A ``MoEImplBase`` execution unit, a self-contained ``MoE`` layer, or
         ``VanillaMoE``.
     """
+    if issubclass(moe_cls, (TritonFusedMoE, VanillaMoE)):
+        warn_unsupported_moe_routing(moe_cls.__name__)
+
     shapes = derive_moe_layer_shapes(
         model_config,
         num_experts=num_experts,
