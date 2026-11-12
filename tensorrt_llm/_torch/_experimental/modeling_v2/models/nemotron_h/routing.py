@@ -60,7 +60,8 @@ _BF16_DEP16 = (16, True, 1, 16)
 # 32 ranks (eight trays): the same attention data parallel, the routed experts in thirty-two
 # 16-expert windows. Every non-expert shape a rank runs is dep16's; only the expert window
 # differs, which is a weight layout, hence its own target. The disaggregated context tier's
-# layout when it runs at DEP32 beside generation tiers at dep16. Not yet gated (GSM8K pending).
+# layout when it runs at DEP32 beside generation tiers at dep16. Gated on eight trays in one
+# NVLink domain.
 _BF16_DEP32 = (32, True, 1, 32)
 
 # Block reuse on dep16, opt-in and not gated yet: the disaggregated context tier reuses each
@@ -256,8 +257,8 @@ def route(
             "moe_ep 32)"
         )
     # Only GB200 trays (4 GPUs each, in one NVLink domain) were measured: two for tp8, four
-    # for dep16 (eight for dep32, not gated yet). An 8-GPU node runs the intra-node collectives
-    # nobody has gated.
+    # for dep16, eight for dep32. An 8-GPU node runs the intra-node collectives nobody has
+    # gated.
     if not nvfp4 and not mapping.is_multi_node():
         raise NoTarget(
             f"parallel layout {split} inside one node of {mapping.gpus_per_node} GPUs; the "
