@@ -17,7 +17,6 @@ checks and end-to-end media quality tests.
 - Generate representative inputs at runtime. The Wan tests use the pipeline's
   default first denoising step: seeded Gaussian latents and checkpoint UMT5
   embeddings of existing repository prompts and the default negative prompt.
-  No input or output safetensors fixture is required.
 - Choose a reference for the behavior being checked. For example, compare the
   BF16 component with HF diffusers in FP32, a runtime feature with eager
   execution, and parallel execution with a single GPU. Quantized variants
