@@ -486,15 +486,16 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     MAIN-to-MAIN fence, and ``finish`` joins COPY into MAIN. All five are
     hooks the base group declares; its owner checks (``_check_owner``) are
     shared. Every other method is HALO-Q's.
-    It adds ``forget_helper_residency`` for weight reloads.
+    It adds ``forget_helper_residency``, which the layer handle calls on every rebind.
     """
 
     planner_name = "HALO-R"
 
     def forget_helper_residency(self) -> None:
-        """Forget which expert each helper slot holds after the expert weights were rewritten.
+        """Forget which expert each helper slot holds; the layer handle calls this on every rebind.
 
-        The helper slots may still hold copies of the old weights, which the
+        That includes the second bind of each standard load. After a rewrite of the
+        expert weights the helper slots may still hold copies of the old weights, which the
         next launch would otherwise skip. Every rank's launches derive the
         same need sets from their own tables, so a reset on some ranks only
         would leave helper slices that no rank copies. This is therefore an

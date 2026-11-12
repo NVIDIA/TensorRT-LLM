@@ -253,7 +253,7 @@ def test_halo_r_planner_builds_the_halo_r_group(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_rebinding_the_backend_forgets_helper_residency(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Loaders bind the layer again after they rewrite its weights."""
+    """A second bind of the same backend, as a standard load makes, forgets what the helper slots hold."""
     group = SimpleNamespace(home_experts=4, helper_slots=2, forget_helper_residency=MagicMock())
     _patch_group_builders(monkeypatch, halo_r=MagicMock(return_value=group))
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_r"))

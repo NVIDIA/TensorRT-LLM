@@ -234,9 +234,14 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                     f"per-layer dynamic EPLB layer {self.layer_idx} is already "
                     "bound to a different backend"
                 )
-            # Loaders bind again after they rewrite the weights. Helper slots
-            # may still hold copies of the old ones, so a producer that tracks
-            # what they hold must forget it.
+            # A standard load binds every layer twice, as ConfigurableMoE and
+            # its backend each run ``post_load_weights`` and both end here;
+            # the second call finds the producer built. This backend has no
+            # weight reload (``pre_reload_weights`` raises), so the reset
+            # below, for a producer that has one, runs on that second bind
+            # and covers a reload path added later: helper slots may then
+            # still hold copies of the old weights, and a producer that
+            # tracks what they hold must forget it.
             forget_helper_residency = getattr(
                 self._scheduler_group, "forget_helper_residency", None
             )

@@ -585,7 +585,7 @@ class _Layers:
         self.weights[layer] += 1000
         self.load_weights(layer)
         torch.cuda.synchronize()
-        # What the layer handle's rebind calls on every rank once a loader has rewritten the weights.
+        # What the layer handle's rebind calls on every rank, which is where a weight reload would end.
         self.groups[layer].forget_helper_residency()
         if self.tables[layer] is not None:
             self.tables[layer] = [[-1] * self.helper_slots for _ in range(self.ep)]
