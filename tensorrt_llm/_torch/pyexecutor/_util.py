@@ -54,6 +54,8 @@ from ..memory.monitor import startup as _monitor_startup
 from ..memory.monitor.names import REGION_KV_TRANSFER_BUFFERS
 from ..memory.monitor.providers import \
     register_provider as _monitor_register_provider
+from ..memory.monitor.providers import \
+    unregister_providers_of as _monitor_unregister_providers_of
 from ..memory.monitor.providers.kv_cache import \
     KvCacheProvider as _MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
@@ -87,9 +89,9 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import ModelEngine
 from .py_executor import PyExecutor, PyExecutorResources
-from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import (BaseResourceManager, KVCacheCompressionManager,
+                               KVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
 from .runtime_hooks import runtime_hooks_of
 from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
 from .sampler.penalties import PenaltyStore
@@ -151,20 +153,17 @@ def _has_variable_kv_cache_geometry(model_config: ModelConfig) -> bool:
                                       for spec in layer_specs}) > 1
 
 
-def _register_kv_cache_monitor_providers(main, draft, cross) -> None:
+def _register_kv_cache_monitor_providers(
+        main: Optional[BaseResourceManager],
+        draft: Optional[BaseResourceManager],
+        cross: Optional[BaseResourceManager]) -> None:
     """Hand each distinct KV cache pool to the memory monitor."""
     seen = []
     for role, manager in (("main", main), ("draft", draft), ("cross", cross)):
         if manager is None or any(manager is other for other in seen):
             continue
         seen.append(manager)
-        try:
-            _monitor_register_provider(_MonitorKvCacheProvider(manager, role))
-        except Exception as exc:  # noqa: BLE001
-            # A diagnostic must never be the reason an executor fails to
-            # come up.
-            logger.debug(f"memory monitor: could not register the {role} KV "
-                         f"cache provider ({type(exc).__name__}: {exc})")
+        _monitor_register_provider(_MonitorKvCacheProvider(manager, role))
 
 
 def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
@@ -2077,11 +2076,6 @@ class KvCacheCreator:
                 "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
-        # The memory monitor compares later usage against this plan. The
-        # profiled peak still holds the temporary sizing KV pool, which the
-        # final KV cache replaces, so it is taken out of the non-KV peak.
-        _monitor_startup.record_memory_plan(peak_memory - allocated_bytes,
-                                            activation_bytes)
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
@@ -2091,6 +2085,9 @@ class KvCacheCreator:
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
+        # Memory taken out of the KV cache budget for workspaces the
+        # profiling run does not allocate.
+        kv_budget_reserves = 0
         if getattr(self._sparse_attention_config, "algorithm",
                    None) == "deepseek_v4":
             workspace_memory = get_indexer_mqa_logits_workspace_bytes(
@@ -2100,6 +2097,7 @@ class KvCacheCreator:
                 budget_before, workspace_memory)
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
+                kv_budget_reserves += workspace_reserve
                 logger.info(
                     f"Reserving {workspace_reserve / (GB):.2f} GiB for the DeepSeek-V4 Indexer MQA "
                     f"logits workspace (workspace cap {workspace_memory / (GB):.2f} GiB): KV cache "
@@ -2157,12 +2155,22 @@ class KvCacheCreator:
                     kv_len_cap))
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
+                kv_budget_reserves += workspace_reserve
                 logger.info(
                     f"Reserving {workspace_reserve / (GB):.2f} GiB for the context-MLA attention "
                     f"workspace (w={w_bytes_per_token} B/token, admitting up to "
                     f"{self._fp8_ctx_mla_kv_len_cap} tokens of summed attended KV): KV cache budget "
                     f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
                 )
+
+        # The memory monitor compares later usage against this plan, which
+        # needs a measured peak. The profiled peak still holds the temporary
+        # sizing KV pool, which the final KV cache replaces, so it is taken
+        # out of the non-KV peak; the workspace reserves are added to it.
+        if py_executor is not None and not self._skip_est:
+            _monitor_startup.record_memory_plan(
+                peak_memory - allocated_bytes + kv_budget_reserves,
+                activation_bytes)
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -3704,6 +3712,13 @@ class KvCacheCreator:
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
+        # The memory monitor stops reporting the pools being released. A
+        # manager may outlive its shutdown, and V1 keeps reporting the bytes
+        # it allocated.
+        for manager_type in (ResourceManagerType.KV_CACHE_MANAGER,
+                             ResourceManagerType.DRAFT_KV_CACHE_MANAGER,
+                             ResourceManagerType.CROSS_KV_CACHE_MANAGER):
+            _monitor_unregister_providers_of(resources.get(manager_type))
         compression_manager = resources.pop(
             ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, None)
         if compression_manager is not None:

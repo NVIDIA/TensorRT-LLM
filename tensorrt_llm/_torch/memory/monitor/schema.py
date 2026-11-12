@@ -179,7 +179,6 @@ class Entry:
     placement: Placement
     basis: Basis
     owner: str | None = None
-    executor_stage: str | None = None
     note: str | None = None
 
     #: ``False`` for virtual-address reservations and remote imported
@@ -200,10 +199,6 @@ class Entry:
             raise ValueError(
                 f"Entry {self.category} has negative size {self.size_bytes}; use None for unknown."
             )
-
-    @property
-    def is_unknown(self) -> bool:
-        return self.size_bytes is None
 
 
 class Group(Enum):

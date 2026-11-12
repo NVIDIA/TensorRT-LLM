@@ -14,11 +14,9 @@
 # limitations under the License.
 """Report cost, exact sums, and state that must not leak between startups."""
 
-import contextlib
+import gc
 import os
-import sys
 import types
-import weakref
 
 import pytest
 import torch
@@ -116,7 +114,10 @@ def test_released_kv_cache_is_listed_not_counted():
         assert sum(e.size_bytes for e in provider.collect()) == 512 * MB
     finally:
         pools.clear_registered_pools()
-    assert weakref.ref(manager)() is manager
+    # The provider holds the manager weakly: once it is gone, so is the row.
+    del manager
+    gc.collect()
+    assert not provider.available()
 
 
 @needs_gpu
@@ -226,16 +227,22 @@ def test_startup_state_does_not_leak(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_nvml_lookup_says_why_the_process_is_missing(monkeypatch):
-    from tensorrt_llm import profiler
+    from tensorrt_llm._torch.memory.monitor import capability
     from tensorrt_llm._torch.memory.monitor.capability import nvml_process_usage
+
+    class NVMLError(Exception):
+        pass
 
     proc = types.SimpleNamespace(pid=os.getpid(), usedGpuMemory=7 * MB)
     fake = types.SimpleNamespace(
+        NVMLError=NVMLError,
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
         nvmlDeviceGetHandleByUUID=lambda u: "handle",
         nvmlDeviceGetComputeRunningProcesses_v3=lambda h: [proc],
     )
-    monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
+    monkeypatch.setattr(capability, "pynvml", fake)
+    monkeypatch.setattr(capability, "_nvml", capability._NvmlSession())
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(uuid="x")
     )

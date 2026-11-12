@@ -136,7 +136,7 @@ def test_sleep_mode_pools_are_named_and_released_memory_leaves_the_footprint():
         assert torch.cuda.memory_reserved() >= awake.torch.reserved
         # ... but the reading leaves the released pool out, so the
         # residual stays put instead of dropping by the released size.
-        assert asleep.torch.released >= 256 * MB
+        assert sum(p.reserved for p in asleep.torch.pools if p.released) >= 256 * MB
         assert asleep.torch.reserved <= awake.torch.reserved - 256 * MB
         assert abs(asleep.nontorch_residual - awake.nontorch_residual) < 64 * MB
         assert group_totals(awake).sizes.get(Group.WEIGHTS, 0) >= 256 * MB
@@ -152,7 +152,7 @@ def test_sleep_mode_pools_are_named_and_released_memory_leaves_the_footprint():
         assert "Released by sleep mode" in note and "Unit sleep 0.25 GiB" in note
         materialize_with_tag("unit_sleep")
         torch.cuda.synchronize()
-        assert _capture().frame.torch.released == 0
+        assert not any(p.released for p in _capture().frame.torch.pools)
     finally:
         tagging.clear_claims()
         del module, held, proxy

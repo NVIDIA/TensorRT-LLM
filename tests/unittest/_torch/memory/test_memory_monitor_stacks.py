@@ -31,8 +31,8 @@ def _clean(monkeypatch):
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
     tagging.clear_claims()
     yield
-    torch.cuda.memory._record_memory_history(None) if torch.cuda.is_available() else None
-    monkeypatch.setattr(stacks, "_recording", False)
+    stacks.stop_stack_recording()
+    tagging.stop_tagging_window()
     tagging.clear_claims()
     tagging.set_frozen_map(tagging.TagSnapshot(supported=False))
 
@@ -108,14 +108,14 @@ def test_off_by_default_and_handed_over_when_asked(monkeypatch):
         torch.cuda.memory, "_record_memory_history", lambda *a, **k: calls.append((a, k))
     )
 
-    monkeypatch.delenv(stacks.ENV_VAR, raising=False)
+    monkeypatch.delenv(stacks.STACKS_ENV_VAR, raising=False)
     assert stacks.stacks_enabled() is False
     with tagging.startup_window():
         pass
     # The last call ends recording; serving pays nothing.
     assert calls[-1][0] == (None,), "recording must stop after startup by default"
 
-    monkeypatch.setenv(stacks.ENV_VAR, "1")
+    monkeypatch.setenv(stacks.STACKS_ENV_VAR, "1")
     calls.clear()
     with tagging.startup_window():
         pass
@@ -130,7 +130,7 @@ def test_off_by_default_and_handed_over_when_asked(monkeypatch):
     stacks.stop_stack_recording()
     stacks.stop_stack_recording()
     assert calls == [((None,), {})], "stopped exactly once"
-    assert stacks.stack_recording_active() is False
+    assert stacks._recording is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -169,7 +169,7 @@ def test_unattributed_memory_is_named_by_its_allocating_code(monkeypatch):
     from tensorrt_llm._torch.memory.monitor.summary import Group, group_totals, render_summary
 
     # Without recording there are no sites at all.
-    monkeypatch.delenv(stacks.ENV_VAR, raising=False)
+    monkeypatch.delenv(stacks.STACKS_ENV_VAR, raising=False)
     torch.cuda.memory._record_memory_history(None)
     held = _allocate_in_moe_forward()
     try:
@@ -177,7 +177,7 @@ def test_unattributed_memory_is_named_by_its_allocating_code(monkeypatch):
     finally:
         del held
 
-    monkeypatch.setenv(stacks.ENV_VAR, "1")
+    monkeypatch.setenv(stacks.STACKS_ENV_VAR, "1")
     if not stacks.stacks_enabled():
         pytest.skip("stack recording unsupported here")
     earlier = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")

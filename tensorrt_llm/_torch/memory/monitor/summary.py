@@ -33,11 +33,9 @@ from dataclasses import dataclass
 
 from . import startup
 from .frame import DeviceReading, Frame, derived_entries
-from .schema import GIB, GROUP_OF, Group, Source
+from .schema import GIB, GROUP_OF, Category, Group, Source
 
 __all__ = ["GROUP_OF", "Group", "GroupTotals", "group_totals", "render_summary"]
-
-_GIB = float(GIB)
 
 #: Rows smaller than this print as 0.00 GiB and are left out.
 _SHOWN = 5 << 20
@@ -156,8 +154,25 @@ def _released_line(frame: Frame) -> str:
     )
     if not parts:
         return ""
-    listed = ", ".join(f"{name} {size / _GIB:.2f} GiB" for name, size in parts)
+    listed = ", ".join(f"{name} {size / GIB:.2f} GiB" for name, size in parts)
     return f"  Released by sleep mode, returns on wakeup (not in the rows above): {listed}."
+
+
+def _kv_pool_bytes(frame: Frame) -> int | None:
+    """Resident bytes of the KV cache pools, or ``None`` if none was measured.
+
+    The startup plan sized only the pools: everything else in the KV cache
+    group -- buffers its creation step allocated in PyTorch -- is part of
+    the plan's non-KV peak, so counting it here would count it twice.
+    """
+    sizes = [
+        e.size_bytes
+        for e in frame.entries
+        if e.category is Category.KV_CACHE_POOL
+        and e.counts_toward_total
+        and e.size_bytes is not None
+    ]
+    return sum(sizes) if sizes else None
 
 
 def _baseline_of(baseline: dict[Group, int | None], group: Group) -> int | None:
@@ -166,13 +181,13 @@ def _baseline_of(baseline: dict[Group, int | None], group: Group) -> int | None:
 
 
 def _size(value: int | None) -> str:
-    return "     unknown" if value is None else f"{value / _GIB:8.2f} GiB"
+    return "     unknown" if value is None else f"{value / GIB:8.2f} GiB"
 
 
 def _delta(now: int | None, before: int | None) -> str:
     if now is None or before is None:
         return ""
-    change = (now - before) / _GIB
+    change = (now - before) / GIB
     return f"{change:+9.2f} GiB"
 
 
@@ -263,7 +278,7 @@ def render_summary(
         # A single owner usually just restates the row, but for the two
         # residual rows the name of the only part is the information.
         if len(parts) > 1 or (parts and group in (Group.TORCH_UNATTRIBUTED, Group.OVERHEAD)):
-            listed = ", ".join(f"{n} {b / _GIB:.2f}" for n, b in parts[:5])
+            listed = ", ".join(f"{n} {b / GIB:.2f}" for n, b in parts[:5])
             more = f", +{len(parts) - 5} more" if len(parts) > 5 else ""
             out.append(f"  {'':<28s}  of which (GiB): {listed}{more}")
 
@@ -278,7 +293,7 @@ def render_summary(
         if asleep
         else startup.render_plan_lines(
             device.device_used,
-            totals.sizes.get(Group.KV_CACHE),
+            _kv_pool_bytes(frame),
             totals.sizes.get(Group.TORCH_CACHE),
         )
     )
@@ -340,7 +355,7 @@ def _conclusion(
             grew = grown[focus]
             lines.append(
                 f"  Conclusion: since warmup, {focus.value} grew the most "
-                f"({grown[focus] / _GIB:+.2f} GiB)."
+                f"({grown[focus] / GIB:+.2f} GiB)."
             )
         else:
             lines.append("  Conclusion: nothing has grown since warmup.")
@@ -355,15 +370,15 @@ def _conclusion(
     other = device.other_process if device is not None else None
     if other is not None and other > totals.process_total and device.free < 0.05 * device.total:
         lines.append(
-            f"  Note: other processes on this GPU hold {other / _GIB:.2f} GiB, more than this "
-            f"process ({totals.process_total / _GIB:.2f} GiB), leaving {device.free / _GIB:.2f} GiB "
+            f"  Note: other processes on this GPU hold {other / GIB:.2f} GiB, more than this "
+            f"process ({totals.process_total / GIB:.2f} GiB), leaving {device.free / GIB:.2f} GiB "
             "free; check what else is running on it."
         )
 
     cache = known.get(Group.TORCH_CACHE, 0)
     if totals.process_total and cache > 0.1 * totals.process_total:
         lines.append(
-            f"  Note: PyTorch holds {cache / _GIB:.2f} GiB it is not using; an allocation "
+            f"  Note: PyTorch holds {cache / GIB:.2f} GiB it is not using; an allocation "
             "can still fail if that space is fragmented."
         )
 
@@ -386,7 +401,7 @@ def _conclusion(
 
 #: Growth since warmup large enough to explain even when nothing failed, so
 #: a periodic report can point at a leak before it runs out.
-_GROWTH_WORTH_NAMING = 1 << 30
+_GROWTH_WORTH_NAMING = GIB
 
 
 def _profiled_activation() -> int | None:
@@ -411,19 +426,19 @@ def _growth_suggestion(
     """
     if not grew:
         return ""
-    amount = f"{grew / _GIB:.2f} GiB"
+    amount = f"{grew / GIB:.2f} GiB"
     if focus is Group.TORCH_UNATTRIBUTED:
         to_reduce = f"; to reduce activation memory, {advice}" if advice else ""
         if activation and grew - activation < _SHOWN:
             return (
                 f"PyTorch memory with no known owner grew {amount} after warmup, within the "
-                f"{activation / _GIB:.2f} GiB the profiled forward pass allocated, so it is most "
+                f"{activation / GIB:.2f} GiB the profiled forward pass allocated, so it is most "
                 f"likely activations of the step in flight{to_reduce}"
             )
         if activation:
             beyond = (
-                f"{(grew - activation) / _GIB:.2f} GiB more than the profiled forward pass "
-                f"allocated ({activation / _GIB:.2f} GiB)"
+                f"{(grew - activation) / GIB:.2f} GiB more than the profiled forward pass "
+                f"allocated ({activation / GIB:.2f} GiB)"
             )
         else:
             beyond = "and no forward pass was profiled to tell activations apart"
@@ -431,7 +446,7 @@ def _growth_suggestion(
             site, size = max(sites.items(), key=lambda kv: kv[1])
             return (
                 f"PyTorch memory with no known owner grew {amount} after warmup, {beyond}; most "
-                f"of it was allocated by {site} ({size / _GIB:.2f} GiB) and is still held"
+                f"of it was allocated by {site} ({size / GIB:.2f} GiB) and is still held"
                 f"{to_reduce}"
             )
         return (

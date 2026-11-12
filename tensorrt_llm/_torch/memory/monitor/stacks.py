@@ -17,7 +17,8 @@
 Tags and claims cover what exists when startup ends. What an op allocates
 while serving -- activations, scratch buffers, a library's lazily created
 workspace -- carries no tag and is reported as "PyTorch, unattributed".
-With ``TLLM_MEM_MONITOR_STACKS=1`` the allocator keeps, for every live
+With ``memory_monitor_config.record_stacks`` (or
+``TLLM_MEM_MONITOR_STACKS=1``) in full mode, the allocator keeps, for every live
 block, the Python stack that allocated it, and that part of the report is
 broken down by allocating code. Memory a C++ op allocates through
 ``torch::empty`` is named by the Python call site of the op.
@@ -50,15 +51,12 @@ from .capability import tagging_supported
 from .settings import STACKS_ENV_VAR, full_mode, stacks_requested
 
 __all__ = [
-    "ENV_VAR",
+    "STACKS_ENV_VAR",
     "site_of",
     "start_stack_recording",
-    "stack_recording_active",
     "stacks_enabled",
     "stop_stack_recording",
 ]
-
-ENV_VAR = STACKS_ENV_VAR
 
 #: Frames from these paths say how memory was allocated, not who wanted it.
 _SKIP = ("/torch/", "/memory/monitor/", "<frozen", "/contextlib.py", "/functools.py")
@@ -76,11 +74,6 @@ def stacks_enabled() -> bool:
 _recording = False
 
 
-def stack_recording_active() -> bool:
-    """Whether stack recording started here is still on."""
-    return _recording
-
-
 def start_stack_recording() -> bool:
     """Keep each live block's Python allocation stack from now on.
 
@@ -96,7 +89,7 @@ def start_stack_recording() -> bool:
         return False
     _recording = True
     logger.info(
-        "memory monitor: recording allocation stacks (TLLM_MEM_MONITOR_STACKS=1); "
+        "memory monitor: recording allocation stacks (record_stacks); "
         "PyTorch allocations are slower while this is on"
     )
     return True

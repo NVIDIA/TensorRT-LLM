@@ -52,7 +52,6 @@ from .settings import (
     setting,
     stacks_requested,
 )
-from .startup import clear_baseline
 
 __all__ = [
     "ENV_VAR",
@@ -67,7 +66,6 @@ __all__ = [
     "Placement",
     "Source",
     "capture",
-    "clear_baseline",
     "configure",
     "current_rank",
     "full_mode",

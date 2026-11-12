@@ -32,19 +32,16 @@ from .frame import Frame, derived_entries
 from .schema import GIB, Category, Entry, Group, Placement
 from .summary import group_totals, render_summary
 
-__all__ = ["UNAVAILABLE", "UNSUPPORTED", "render"]
-
-_GIB = float(GIB)
+__all__ = ["UNAVAILABLE", "render"]
 
 UNKNOWN = "       unknown"
 UNAVAILABLE = "   unavailable"
-UNSUPPORTED = "   unsupported"
 
 
 def _gib(value: int | None) -> str:
     if value is None:
         return UNKNOWN
-    return f"{value / _GIB:10.2f} GiB"
+    return f"{value / GIB:10.2f} GiB"
 
 
 def _line(label: str, value: int | None, suffix: str = "") -> str:
@@ -160,7 +157,7 @@ def render(
         for pool in torch_r.pools:
             add(
                 f"      {pool.label:<26s}{_gib(pool.reserved)} reserved, "
-                f"{pool.allocated / _GIB:.2f} GiB allocated"
+                f"{pool.allocated / GIB:.2f} GiB allocated"
                 + ("   <- released by sleep mode, not counted" if pool.released else "")
             )
     add(_line("component counters", frame.nontorch_known))

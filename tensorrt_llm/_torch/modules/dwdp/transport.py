@@ -754,7 +754,7 @@ class DWDPTransport:
         return self._granularity
 
     @property
-    def local_bytes(self) -> int:
+    def local_bytes_outside_torch(self) -> int:
         """Device memory of this rank's own expert chunks, held in local fabric handles.
 
         Handles imported from peers are not counted. 0 once released.

@@ -169,10 +169,6 @@ def test_mnnvl_reads_local_backing_and_address_space_without_double_counting(mon
     )
     assert _by_basis(entries, Basis.PHYSICAL_BACKING)[0].size_bytes == 3 * MB, "subclass maps"
 
-    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.distributed.mnnvl_memory", None)
-    provider = MnnvlProvider()
-    assert provider.available() is False and provider.collect() == [], "module missing"
-
 
 class _DwdpPool:
     page_size = 16 * MB
@@ -216,9 +212,9 @@ def test_dwdp_local_weight_shards_are_weights(monkeypatch):
     assert not provider.available() and provider.collect() == [], "no DWDP, no row"
 
     experts = types.SimpleNamespace(
-        weight_manager=types.SimpleNamespace(local_weight_bytes=96 * MB)
+        weight_manager=types.SimpleNamespace(local_bytes_outside_torch=96 * MB)
     )
-    dense = types.SimpleNamespace(dense=types.SimpleNamespace(local_store_bytes=32 * MB))
+    dense = types.SimpleNamespace(dense=types.SimpleNamespace(local_bytes_outside_torch=32 * MB))
     monkeypatch.setattr(misc, "_dwdp_manager", lambda: experts)
     monkeypatch.setattr(dense_manager, "get_global_dense_dwdp_manager", lambda: dense)
     entries = {e.owner: e for e in provider.collect()}
@@ -237,9 +233,9 @@ def test_dwdp_local_bytes_exclude_imported_peer_handles():
     # Only this rank's chunks are in the handle set; imported handles are not.
     transport._handle_set = types.SimpleNamespace(sizes={(0, "w1"): 64 * MB, (1, "w1"): 32 * MB})
     transport._imported_handles = [11, 12, 13]
-    assert transport.local_bytes == 96 * MB
+    assert transport.local_bytes_outside_torch == 96 * MB
     transport._released = True
-    assert transport.local_bytes == 0, "released"
+    assert transport.local_bytes_outside_torch == 0, "released"
 
 
 class TestMemoryCountersIsDiagnosticOnly:
@@ -249,14 +245,17 @@ class TestMemoryCountersIsDiagnosticOnly:
         # consumes it once, so summing the two would double it.
         provider = MemoryCountersProvider()
         monkeypatch.setattr(provider, "available", lambda: True)
+        from tensorrt_llm._torch.memory.monitor.providers import misc
+
         fake = types.SimpleNamespace(
             instance=staticmethod(lambda: types.SimpleNamespace(gpu=512 * MB))
         )
-        module = types.ModuleType("tensorrt_llm.bindings")
-        module.MemoryCounters = fake
-        monkeypatch.setitem(sys.modules, "tensorrt_llm.bindings", module)
+        # The provider holds the binding it imported, so that is the one to
+        # replace; a fake ``tensorrt_llm.bindings`` module would go unread.
+        monkeypatch.setattr(misc, "MemoryCounters", fake)
 
         entry = provider.collect()[0]
+        assert entry.size_bytes == 512 * MB, "the fake counter was read"
         assert entry.counts_toward_total is False
         assert entry.source is Source.COMPONENT
         assert entry.category is Category.CPP_BUFFERS

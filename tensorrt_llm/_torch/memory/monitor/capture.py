@@ -32,8 +32,7 @@ from .checks import CheckResult, check_kv_pool_conservation, check_tag_coverage
 from .frame import DeviceReading, Frame, TorchReading, build_frame
 from .names import CUDA_GRAPHS, UNTAGGED, WEIGHTS
 from .pools import pool_usage
-from .providers import collect_all, default_providers
-from .providers.kv_cache import KvCacheProvider
+from .providers import collect_all
 from .report import render
 from .schema import Basis, Category, Entry, Group, Placement, Source
 from .summary import group_totals
@@ -60,6 +59,9 @@ class MonitorCapture:
     baseline: dict[Group, int | None] | None = None
     #: Advice that overrides the summary's own, when the cause is known.
     suggestion: str = ""
+    #: Whether the summary may give tuning advice; off for a failure that
+    #: is not about memory.
+    advise: bool = True
     #: Whether to list memory taken by each startup step.
     startup_steps: bool = False
     #: Untagged PyTorch memory by allocating code; empty unless stack
@@ -184,14 +186,18 @@ def _check_failed(name: str, exc: Exception) -> CheckResult:
     )
 
 
-def _run_checks(by_tag: dict[str, int], torch_live: int) -> tuple[CheckResult, ...]:
+def _run_checks(
+    by_tag: dict[str, int],
+    torch_live: int,
+    pool_rows: dict[str, list[dict]] | None = None,
+) -> tuple[CheckResult, ...]:
     """Conservation checks over this reading; a check that cannot run is listed, not raised.
 
     Each compares figures that come from independent sources, so a failure
     means the sources disagree -- which is worth more than any single number
-    in the report. Check C reads the pool statistics the KV cache provider
-    collected for this same report, so the check and the KV row describe
-    one reading.
+    in the report. Check C runs on ``pool_rows``, the pool statistics each
+    KV cache provider read for this same report, so the check and the KV
+    row describe one reading even when two reports run at once.
     """
     results: list[CheckResult] = []
     try:
@@ -199,16 +205,11 @@ def _run_checks(by_tag: dict[str, int], torch_live: int) -> tuple[CheckResult, .
     except (KeyError, TypeError, ValueError) as exc:
         results.append(_check_failed("B:tag_coverage", exc))
 
-    for provider in default_providers():
-        if not isinstance(provider, KvCacheProvider):
-            continue
+    for name, rows in (pool_rows or {}).items():
         try:
-            rows = provider.last_pool_group_rows
-            if rows is None:
-                continue
-            results.extend(check_kv_pool_conservation(rows, name=provider.name))
-        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-            results.append(_check_failed(f"C:{provider.name}", exc))
+            results.extend(check_kv_pool_conservation(rows, name=name))
+        except (KeyError, TypeError, ValueError) as exc:
+            results.append(_check_failed(f"C:{name}", exc))
     return tuple(results)
 
 
@@ -220,6 +221,7 @@ def capture(
     headline: str = "",
     record_baseline: bool = False,
     suggestion: str = "",
+    advise: bool = True,
     startup_steps: bool = False,
     force: bool = False,
 ) -> MonitorCapture | None:
@@ -250,8 +252,9 @@ def capture(
     # One tag reading feeds the entries, check B and the stack breakdown;
     # reading twice would let the allocator move between them.
     by_tag, sites = live_attribution(get_frozen_map(), segments)
-    entries = collect_all() + _tag_entries(by_tag)
-    checks = _run_checks(by_tag, torch_reading.live)
+    pool_rows: dict[str, list[dict]] = {}
+    entries = collect_all(pool_rows=pool_rows) + _tag_entries(by_tag)
+    checks = _run_checks(by_tag, torch_reading.live, pool_rows)
 
     frame = build_frame(read_device(device_index), torch_reading, entries)
     baseline = None if record_baseline else startup.baseline()
@@ -271,6 +274,7 @@ def capture(
         headline=headline,
         baseline=baseline,
         suggestion=suggestion,
+        advise=advise,
         startup_steps=startup_steps,
         unattributed_sites=sites or None,
     )
@@ -288,7 +292,7 @@ def render_capture(snapshot: MonitorCapture) -> str:
         checks=list(snapshot.checks),
         headline=snapshot.headline,
         baseline=snapshot.baseline,
-        advice=_advice(),
+        advice=_advice() if snapshot.advise else {},
         suggestion=snapshot.suggestion,
         startup_steps=snapshot.startup_steps,
         unattributed_sites=snapshot.unattributed_sites,

@@ -260,7 +260,7 @@ class DenseDWDP:
         return self._layers
 
     @property
-    def local_store_bytes(self) -> int:
+    def local_bytes_outside_torch(self) -> int:
         """Device memory this rank's dense shards hold outside PyTorch; 0 once released."""
         store = self._store
         return store.local_bytes_outside_torch if store is not None else 0

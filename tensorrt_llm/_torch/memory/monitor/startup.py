@@ -43,7 +43,7 @@ way.
 
 Only the executor that owns the record writes to it: while another executor
 is built alongside a running one, every writer is a no-op
-(:func:`suspended`).
+(:func:`recording_paused`).
 
 The module holds one startup's record. ``startup_window`` clears it when an
 executor's startup begins; :func:`clear` is the reset.
@@ -76,7 +76,6 @@ __all__ = [
     "advice_for_stage",
     "baseline",
     "clear",
-    "clear_baseline",
     "failed_stage",
     "memory_plan",
     "record_baseline",
@@ -85,7 +84,7 @@ __all__ = [
     "record_stage",
     "set_stage_advice",
     "stages",
-    "suspended",
+    "recording_paused",
     "step_name",
 ]
 
@@ -159,25 +158,25 @@ _plan: MemoryPlan | None = None
 _baseline: dict[Group, int | None] | None = None
 
 
-#: Nesting depth of :func:`suspended`; writers are no-ops while positive.
-_suspended: int = 0
+#: Nesting depth of :func:`recording_paused`; writers are no-ops while positive.
+_paused: int = 0
 #: Whether the temporary executor that sizes the KV cache is being built.
 _sizing: bool = False
 
 
 def _on() -> bool:
-    return full_mode() and _suspended == 0
+    return full_mode() and _paused == 0
 
 
 @contextlib.contextmanager
-def suspended() -> Iterator[None]:
+def recording_paused() -> Iterator[None]:
     """Make every writer a no-op, for an executor that does not own the record."""
-    global _suspended
-    _suspended += 1
+    global _paused
+    _paused += 1
     try:
         yield
     finally:
-        _suspended -= 1
+        _paused -= 1
 
 
 def set_sizing_pass(active: bool) -> None:
@@ -267,22 +266,27 @@ def set_stage_advice(names: dict[str, str], advice: dict[str, str]) -> None:
     _advice.update(advice)
 
 
+def _sample(
+    stage: str, free_before: int, free_after: int | None, process_before: Reading | None
+) -> StageSample:
+    """The step ``stage``, with what this process took since ``process_before``."""
+    after = _reading() if process_before is not None else None
+    process_taken = residual_taken = None
+    if after is not None:
+        process_taken = after.process - process_before.process
+        residual_taken = after.residual - process_before.residual
+    return StageSample(
+        stage, _names.get(stage, stage), free_before, free_after, process_taken, residual_taken
+    )
+
+
 def record_stage(
     stage: str, free_before: int, free_after: int, process_before: Reading | None = None
 ) -> None:
     global _active_stage
     if not _on():
         return
-    after = _reading() if process_before is not None else None
-    process_taken = residual_taken = None
-    if after is not None:
-        process_taken = after.process - process_before.process
-        residual_taken = after.residual - process_before.residual
-    _stages.append(
-        StageSample(
-            stage, _names.get(stage, stage), free_before, free_after, process_taken, residual_taken
-        )
-    )
+    _stages.append(_sample(stage, free_before, free_after, process_before))
     _active_stage = None
 
 
@@ -293,14 +297,7 @@ def record_failed_stage(
     global _failed, _active_stage
     if not _on():
         return
-    after = _reading() if process_before is not None else None
-    process_taken = residual_taken = None
-    if after is not None:
-        process_taken = after.process - process_before.process
-        residual_taken = after.residual - process_before.residual
-    _failed = StageSample(
-        stage, _names.get(stage, stage), free_before, None, process_taken, residual_taken
-    )
+    _failed = _sample(stage, free_before, None, process_before)
     _active_stage = None
 
 
@@ -313,12 +310,6 @@ def record_baseline(sizes: dict[Group, int | None]) -> None:
 def baseline() -> dict[Group, int | None] | None:
     """Group totals when startup completed, or ``None`` before that."""
     return _baseline
-
-
-def clear_baseline() -> None:
-    """Forget the post-warmup baseline."""
-    global _baseline
-    _baseline = None
 
 
 def record_memory_plan(non_kv_peak: int, activation: int | None) -> None:

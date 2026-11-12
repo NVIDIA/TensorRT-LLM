@@ -92,7 +92,6 @@ def test_frame_balances_and_keeps_a_negative_residual():
         ]
     )
     assert frame.nontorch_known == local, "a remote mapping is not summed"
-    assert frame.excluded_total == peers
 
     # A negative residual is a signal, not an error to be smoothed away:
     # torch claims more than the process is measured to hold.
@@ -115,7 +114,6 @@ def test_unknown_is_not_zero(monkeypatch):
         entries=[_entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.COMPONENT)]
     )
     assert frame.nontorch_known == 0, "an unknown entry is excluded from sums"
-    assert Category.DWDP_PAGES in frame.unknown_categories
     assert group_totals(frame).unmeasured, "survives aggregation as unmeasured"
     text = render(frame, capability())
     assert UNAVAILABLE.strip() in text
@@ -242,30 +240,33 @@ def test_schema_guards():
 
 def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monkeypatch):
     """torch and NVML number devices differently under CUDA_VISIBLE_DEVICES."""
-    import contextlib
     import os
-    import sys
     import types
 
-    from tensorrt_llm import profiler
     from tensorrt_llm._torch.memory.monitor import capability
     from tensorrt_llm._torch.memory.monitor.capability import _nvml_available, nvml_process_usage
-
-    monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
 
     class NVMLError(Exception):
         pass
 
-    def broken():
+    def broken(*_args):
         raise NVMLError("NVML_ERROR_UNINITIALIZED")
 
-    def nvml(**functions):
-        return types.SimpleNamespace(NVMLError=NVMLError, **functions)
+    def use(**functions):
+        fake = types.SimpleNamespace(
+            NVMLError=NVMLError, nvmlInit=lambda: None, nvmlShutdown=lambda: None
+        )
+        vars(fake).update(functions)
+        monkeypatch.setattr(capability, "pynvml", fake)
+        monkeypatch.setattr(capability, "_nvml", capability._NvmlSession())
+        return fake
 
-    # Importable is not enough: the library has to answer.
-    monkeypatch.setitem(sys.modules, "pynvml", nvml(nvmlDeviceGetCount=broken))
+    # Initialising is not enough: the library has to answer.
+    use(nvmlDeviceGetCount=broken)
     assert _nvml_available() is False
-    monkeypatch.setitem(sys.modules, "pynvml", nvml(nvmlDeviceGetCount=lambda: 1))
+    use(nvmlInit=broken, nvmlDeviceGetCount=lambda: 1)
+    assert _nvml_available() is False
+    use(nvmlDeviceGetCount=lambda: 1)
     assert _nvml_available() is True
 
     looked_up = []
@@ -274,13 +275,12 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
     def by_index(i):
         raise AssertionError("looked up by index; that is the wrong GPU when remapped")
 
-    fake = nvml(
+    fake = use(
         nvmlDeviceGetHandleByIndex=by_index,
         nvmlDeviceGetHandleByUUID=lambda u: looked_up.append(u) or "handle",
         nvmlDeviceGetComputeRunningProcesses_v3=lambda h: [proc],
         nvmlDeviceGetCount=lambda: 3,
     )
-    monkeypatch.setitem(sys.modules, "pynvml", fake)
     monkeypatch.setattr(
         capability.torch.cuda,
         "get_device_properties",
@@ -294,7 +294,7 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
     used, reason = nvml_process_usage(0)
     assert used is None and "not in NVML's process list" in reason
     # So is NVML failing outright.
-    fake.nvmlDeviceGetComputeRunningProcesses_v3 = lambda h: broken()
+    fake.nvmlDeviceGetComputeRunningProcesses_v3 = broken
     assert nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
 
 
@@ -315,7 +315,7 @@ def test_an_unknown_diagnostic_entry_is_not_an_unmeasured_provider():
         TorchReading(reserved=2 * GIB, live=GIB),
         entries,
     )
-    assert frame.unknown_categories == []
+    assert not group_totals(frame).unmeasured
     text = render(frame, capability())
     assert "[unmeasured]" not in text
 

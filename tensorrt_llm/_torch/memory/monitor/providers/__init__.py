@@ -64,8 +64,9 @@ __all__ = [
     "collect_all",
     "default_providers",
     "end_executor",
-    "other_live_executors",
+    "has_other_live_executors",
     "register_provider",
+    "unregister_providers_of",
 ]
 
 
@@ -110,9 +111,9 @@ def current_executor() -> object | None:
     return _current_executor
 
 
-def other_live_executors() -> int:
-    """How many executors other than the one being built are alive."""
-    return sum(1 for token in _live_executors if token is not _current_executor)
+def has_other_live_executors() -> bool:
+    """Whether an executor other than the one being built is alive."""
+    return any(token is not _current_executor for token in _live_executors)
 
 
 def end_executor(token: object) -> None:
@@ -144,6 +145,20 @@ def register_provider(provider: MonitorProvider) -> None:
         (o, p) for o, p in _registered if not (o is owner and p.name == provider.name)
     ]
     _registered.append((owner, provider))
+
+
+def unregister_providers_of(component: object) -> None:
+    """Drop every provider that reads ``component``, at its release.
+
+    For a component released while its executor lives on, such as the KV
+    cache the sizing pass builds and tears down. A provider says what it
+    reads through ``describes(component)``; one without it is kept.
+    """
+    _registered[:] = [
+        (o, p)
+        for o, p in _registered
+        if not (callable(getattr(p, "describes", None)) and p.describes(component))
+    ]
 
 
 def clear_registered_providers() -> None:
@@ -191,16 +206,30 @@ def _failed_entry(provider: MonitorProvider, exc: Exception) -> Entry:
     )
 
 
-def collect_all(providers: list[MonitorProvider] | None = None) -> list[Entry]:
+def collect_all(
+    providers: list[MonitorProvider] | None = None,
+    pool_rows: dict[str, list[dict]] | None = None,
+) -> list[Entry]:
     """Collect from every available provider, tolerating individual failures.
 
     A provider that raises is reported as unmeasured, so its memory shows up
     as a named gap in the overhead row instead of silently disappearing.
+
+    ``pool_rows``, when given, receives the KV pool-group rows each KV cache
+    provider read for its entries, keyed by provider name, so a check on
+    them describes this collection and no other.
     """
     entries: list[Entry] = []
     for provider in default_providers() if providers is None else providers:
         try:
             if not provider.available():
+                continue
+            read_pool_rows = getattr(provider, "collect_with_pool_rows", None)
+            if pool_rows is not None and read_pool_rows is not None:
+                collected, rows = read_pool_rows()
+                if rows is not None:
+                    pool_rows[provider.name] = rows
+                entries.extend(collected)
                 continue
             entries.extend(provider.collect())
         except Exception as exc:  # one provider must not break the report

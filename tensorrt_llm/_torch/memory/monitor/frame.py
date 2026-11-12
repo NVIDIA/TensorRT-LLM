@@ -34,8 +34,8 @@ The two subtractions mean different things and are never merged:
 1. ``torch_live - sum(tagged)`` is memory we hold and could in principle name,
    but have not tagged -- untagged weights and workspaces, logits, and
    allocations whose tag was evicted from the trace ring. Calling it
-   "activation" would be a systematic misattribution, especially before
-   tagging lands.
+   "activation" would be a systematic misattribution, especially outside
+   full mode, where nothing is tagged.
 2. ``process_used - torch_reserved - nontorch_known`` is memory nothing can
    attribute: CUDA context, NCCL internals, cuBLAS handles, lazily loaded
    module code.
@@ -112,15 +112,6 @@ class TorchReading:
     pools: tuple | None = None
 
     @property
-    def released(self) -> int:
-        """Reserved bytes of sleep-mode pools whose memory is released.
-
-        Not part of ``reserved`` or ``live``: torch still counts those pools,
-        but the GPU no longer backs them, so the reading leaves them out.
-        """
-        return sum(p.reserved for p in self.pools or () if p.released)
-
-    @property
     def footprint(self) -> int:
         """What torch holds from the driver, or ``live`` as a lower bound."""
         return self.live if self.reserved is None else self.reserved
@@ -154,15 +145,6 @@ class Frame:
     nontorch_known: int = 0
     nontorch_residual: int = 0
 
-    #: Entries whose size is unknown, by category. These are excluded from
-    #: every sum; they exist so the report can say "we could not measure
-    #: this" instead of silently contributing zero.
-    unknown_categories: list[Category] = field(default_factory=list)
-
-    #: Entries excluded from totals by construction (VA reservations, remote
-    #: mappings). Shown, never summed.
-    excluded_total: int = 0
-
     @property
     def residual_is_negative(self) -> bool:
         return self.nontorch_residual < 0
@@ -188,13 +170,9 @@ def build_frame(
     frame = Frame(device=device, torch=torch, entries=list(entries))
 
     for entry in entries:
-        if not entry.counts_toward_total:
-            # Diagnostic entries never reach a sum, so an unknown one is not
-            # memory missing from the total.
-            frame.excluded_total += entry.size_bytes or 0
-            continue
-        if entry.size_bytes is None:
-            frame.unknown_categories.append(entry.category)
+        # Diagnostic entries never reach a sum, and an unknown size is
+        # reported as unmeasured rather than counted as zero.
+        if not entry.counts_toward_total or entry.size_bytes is None:
             continue
         if entry.placement is Placement.NON_TORCH:
             frame.nontorch_known += entry.size_bytes

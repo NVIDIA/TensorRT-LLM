@@ -366,6 +366,7 @@ def test_startup_window(monkeypatch):
         m.setattr(torch.cuda.memory, "_record_memory_history", lambda *a, **k: calls.append((a, k)))
         assert tagging.start_tagging_window()
         assert calls[0][1].get("context", "all") is None, "recorded without stacks"
+        tagging.stop_tagging_window()
 
     # Recording stops before the report is built.
     with monkeypatch.context() as m:

@@ -180,14 +180,14 @@ class DwdpLocalWeightsProvider:
         manager = _dwdp_manager()
         weight_manager = manager.weight_manager if manager is not None else None
         if weight_manager is not None:
-            parts.append(("DWDP expert shards", weight_manager.local_weight_bytes))
+            parts.append(("DWDP expert shards", weight_manager.local_bytes_outside_torch))
         # Imported on use, like the DWDP manager above.
         from tensorrt_llm._torch.modules.dwdp.dense.manager import get_global_dense_dwdp_manager
 
         dense_manager = get_global_dense_dwdp_manager()
         dense = dense_manager.dense if dense_manager is not None else None
         if dense is not None:
-            parts.append(("DWDP dense shards", dense.local_store_bytes))
+            parts.append(("DWDP dense shards", dense.local_bytes_outside_torch))
         return parts
 
     def available(self) -> bool:

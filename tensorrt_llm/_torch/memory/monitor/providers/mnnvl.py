@@ -66,29 +66,20 @@ class MnnvlProvider:
         self._state_cls: type | None = None
 
     def _resolve(self) -> bool:
-        if self._memory_cls is not None:
-            return True
-        try:
-            # Resolved on first use: the module needs the CUDA driver bindings,
-            # and a process without them simply has no MNNVL memory.
+        if self._memory_cls is None:
+            # Imported on first use: the ``distributed`` package brings in
+            # the communication stack, which importing the monitor must not.
             from tensorrt_llm._torch.distributed.mnnvl_memory import (
                 MnnvlAllocationState,
                 MnnvlMemory,
             )
-        except ImportError:
-            return False
-        self._memory_cls = MnnvlMemory
-        self._state_cls = MnnvlAllocationState
+
+            self._memory_cls = MnnvlMemory
+            self._state_cls = MnnvlAllocationState
         return True
 
     def available(self) -> bool:
-        """Whether MNNVL state can be read at all.
-
-        A process with MNNVL present but no allocations is *available* and
-        reports zero; a process where the module cannot be imported is
-        unavailable and reports nothing. Collapsing the two would make
-        "no MNNVL here" indistinguishable from "we failed to look".
-        """
+        """Always: a process with no MNNVL allocations reports zero."""
         return self._resolve()
 
     def _maps(self) -> list[dict]:

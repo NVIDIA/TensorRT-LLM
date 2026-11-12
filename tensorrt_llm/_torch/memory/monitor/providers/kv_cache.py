@@ -112,10 +112,6 @@ class KvCacheProvider:
         self.role = role
         self.name = f"kv_cache.{role}"
         self._ref = None
-        #: Pool-group rows the last ``collect`` read; check C runs on these so
-        #: the check and the KV row describe one reading. ``None`` when the
-        #: last collect had no storage statistics to read.
-        self.last_pool_group_rows: list[dict] | None = None
         if manager is None:
             return
         try:
@@ -167,12 +163,25 @@ class KvCacheProvider:
     def available(self) -> bool:
         return self._manager is not None
 
+    def describes(self, component: object) -> bool:
+        """Whether ``component`` is the manager this provider reads."""
+        return component is not None and self._manager is component
+
     def collect(self) -> list[Entry]:
-        self.last_pool_group_rows = None
+        return self.collect_with_pool_rows()[0]
+
+    def collect_with_pool_rows(self) -> tuple[list[Entry], list[dict] | None]:
+        """The entries, and the pool-group rows they were built from.
+
+        Returned together so the conservation check runs on the reading the
+        KV row shows. The rows are ``None`` when the manager has no storage
+        statistics (KV cache manager V1).
+        """
         manager = self._manager
         if manager is None:
-            return []
-        return self._with_sleep_release(self._collect(manager))
+            return [], None
+        entries, rows = self._collect(manager)
+        return self._with_sleep_release(entries), rows
 
     @staticmethod
     def _with_sleep_release(entries: list[Entry]) -> list[Entry]:
@@ -196,13 +205,12 @@ class KvCacheProvider:
             for e in entries
         ]
 
-    def _collect(self, manager: Any) -> list[Entry]:
+    def _collect(self, manager: Any) -> tuple[list[Entry], list[dict] | None]:
         if not hasattr(manager, "get_storage_statistics"):
-            return [self._v1_entry(manager)]
+            return [self._v1_entry(manager)], None
 
         entries = []
         rows = kv_pool_group_stats(manager)
-        self.last_pool_group_rows = rows
         for row in rows:
             owner = f"kv_cache.{self.role}.pool_group[{row['pool_group_id']}]"
             in_use = row["in_use_bytes"]
@@ -248,4 +256,4 @@ class KvCacheProvider:
                 )
             )
 
-        return entries
+        return entries, rows

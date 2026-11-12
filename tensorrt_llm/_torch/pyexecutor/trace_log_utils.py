@@ -48,7 +48,8 @@ def log_mem_snapshot(tag: str) -> None:
       this process's usage: TensorRT-LLM supports colocated processes (Ray
       fractional GPUs, GMS weight sharing, RLHF alongside a trainer,
       disaggregated ctx+gen on one device), whose memory is included here.
-      Set ``TLLM_MEM_MONITOR=1`` to get the NVML per-process split.
+      The memory monitor's full mode (``memory_monitor_config.mode='full'``
+      or ``TLLM_MEM_MONITOR=1``) adds the NVML per-process split.
     - ``slack     = reserved - alloc`` — reserved but not handed out. Besides
       fragmented space this covers blocks already requested for release that
       are waiting on other streams, so it is not all immediately reusable.
@@ -57,7 +58,7 @@ def log_mem_snapshot(tag: str) -> None:
       lazily loaded module code, etc.). CUDA-graph pools are **not** in here:
       they use the native allocator and are already inside ``reserved``.
 
-    With ``TLLM_MEM_MONITOR=1`` an additional memory monitor report is
+    In the memory monitor's full mode an additional memory monitor report is
     emitted that decomposes ``non_torch`` rather than leaving it as one
     opaque number.
     """
@@ -80,16 +81,23 @@ def log_mem_snapshot(tag: str) -> None:
 
 
 def _maybe_log_monitor_report(tag: str) -> None:
-    """Emit the full memory monitor report when ``TLLM_MEM_MONITOR=1``.
+    """Emit the memory monitor report when the monitor is in full mode.
 
     Imported inside the function so that this leaf module stays free of
     import cycles. The import is not guarded: the package is part of this
     tree, so failing to import it is a bug to surface. Building the report
     is guarded by ``report_now``: these calls sit inside warmup, which a
     diagnostic must not break.
+
+    Skipped while the startup tagging window is recording. Its tags are not
+    frozen yet, so every PyTorch byte would read as untagged, and each
+    snapshot would also copy the whole event history being recorded.
     """
+    from tensorrt_llm._torch.memory.monitor.tagging import tagging_window_active
     from tensorrt_llm._torch.memory.monitor.triggers import report_now
 
+    if tagging_window_active():
+        return
     report = report_now(tag=tag)
     if report is not None:
         logger.info("\n" + report)

@@ -83,8 +83,9 @@ from .capability import tagging_supported
 from .claims import claim_module_memory, claimed_modules, claimed_storages, clear_claims
 from .names import CUDA_GRAPHS, UNTAGGED
 from .pools import classify_all, is_released
+from .schema import GIB
 from .settings import full_mode
-from .stacks import site_of, stacks_enabled, start_stack_recording
+from .stacks import site_of, stacks_enabled, start_stack_recording, stop_stack_recording
 
 __all__ = [
     "CUDA_GRAPHS",
@@ -105,6 +106,7 @@ __all__ = [
     "stop_tagging_window",
     "tag",
     "tagging_supported",
+    "tagging_window_active",
 ]
 
 _FREE_ACTIONS = ("free_completed", "segment_free")
@@ -116,6 +118,11 @@ _DEFAULT_MAX_ENTRIES = 1_000_000
 
 #: Ring size of the recording in progress, so a wrap is judged against it.
 _max_entries: int = _DEFAULT_MAX_ENTRIES
+
+#: Whether the tagging window this module started is recording. Tags are
+#: written only then: outside it the metadata lands on nobody's trace, or on
+#: a trace someone else is recording.
+_recording = False
 
 
 def history_recording_active() -> bool:
@@ -138,10 +145,11 @@ def tag(name: str) -> Iterator[None]:
     narrower tag inside a broader one leaves the outer one in effect
     afterwards.
 
-    A no-op when the monitor is off or tagging is unsupported, so call
-    sites need no guard.
+    A no-op unless this module's tagging window is recording, so call sites
+    need no guard, and a recording someone else started -- or the stack
+    recording that follows startup -- never carries these labels.
     """
-    if not full_mode() or not tagging_supported():
+    if not _recording:
         yield
         return
 
@@ -217,7 +225,7 @@ def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
     Does nothing, and returns False, while a recording someone else started
     is active: replacing it would discard their trace.
     """
-    global _max_entries
+    global _max_entries, _recording
     if not tagging_supported():
         return False
     if history_recording_active():
@@ -233,11 +241,19 @@ def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
         return False
     _windows.clear()
     _max_entries = max_entries
+    _recording = True
     return True
+
+
+def tagging_window_active() -> bool:
+    """Whether the startup tagging window is recording right now."""
+    return _recording
 
 
 def stop_tagging_window() -> None:
     """Stop recording and discard the trace. Safe to call when it was never started."""
+    global _recording
+    _recording = False
     try:
         torch.cuda.memory._record_memory_history(None)
     except RuntimeError as exc:
@@ -337,14 +353,18 @@ def _live_blocks(
     ``None`` if the allocator could not be read. ``frames`` is the allocating
     stack when stack recording is on, else empty. ``requested`` is the size
     the allocation asked for, which is what trace events record.
-    ``segments`` is an allocator snapshot already taken; one is taken if not.
+    ``segments`` is an allocator snapshot already taken; if not, one is
+    taken and limited to the current device, since the snapshot covers every
+    device the process has touched.
     """
     if segments is None:
         try:
             segments = torch.cuda.memory._snapshot()["segments"]
+            device = torch.cuda.current_device()
         except RuntimeError as exc:
             logger.debug(f"memory monitor: snapshot failed while reading tags ({exc})")
             return None
+        segments = [s for s in segments if s.get("device", device) == device]
     kinds = classify_all(segment.get("segment_pool_id", (0, 0)) for segment in segments)
     blocks = []
     for segment in segments:
@@ -447,12 +467,15 @@ def forget_startup_of(token: object) -> None:
     """Drop the startup records if they describe the executor ``token``.
 
     Called when that executor shuts down, so a later report does not
-    describe the startup of an executor that no longer exists.
+    describe the startup of an executor that no longer exists. Stack
+    recording, which only that executor's startup can have started, stops
+    with it.
     """
     global _startup_executor
     if token is None or token is not _startup_executor:
         return
     _startup_executor = None
+    stop_stack_recording()
     startup.clear()
     set_frozen_map(TagSnapshot(supported=False))
 
@@ -471,11 +494,11 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
     startup that raises part way through still publishes what it managed to
     tag and still reports, which is exactly when a breakdown is worth having.
     """
-    global _startup_executor
+    global _startup_executor, _recording
     if not full_mode(rank):
         yield False
         return
-    if providers.other_live_executors():
+    if providers.has_other_live_executors():
         # Startup records -- steps, regions, the warmup baseline and the
         # frozen tags -- are per process. Recording this executor's startup
         # would overwrite those of the executor still serving, whose reports
@@ -488,7 +511,7 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
         )
         # Steps, regions and the KV sizing plan of this startup must not be
         # written into the running executor's record either.
-        with startup.suspended():
+        with startup.recording_paused():
             yield False
         return
 
@@ -519,31 +542,36 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
             )
         finally:
             if recording:
-                # Either way the event history ends here; stack mode keeps
-                # only each live block's allocating stack from now on.
-                if not (stacks_enabled() and start_stack_recording()):
+                # Either way the event history ends here. Stack mode keeps
+                # only each live block's allocating stack from now on, and
+                # only after a completed startup: a failed one has no
+                # executor left to stop it.
+                if failed or interrupted or not (stacks_enabled() and start_stack_recording()):
                     stop_tagging_window()
+                else:
+                    _recording = False
         set_frozen_map(snapshot)
         if not interrupted:
             _log_window_result(snapshot, rank, failed=failed, out_of_memory=out_of_memory)
 
 
-#: Messages of failures that mean the device ran out of memory: CUDA's and
-#: PyTorch's, the executor's own explanation of a failed creation step, and
-#: the NCCL form a failed communicator allocation takes.
-_OOM_MESSAGES = ("out of memory", "insufficient gpu memory", "unhandled cuda error")
-
-
 def _is_out_of_memory(exc: BaseException) -> bool:
-    """Whether ``exc``, or an exception it was raised from, is a device OOM."""
+    """Whether ``exc``, or an exception it was raised from, is a device OOM.
+
+    Uses the same predicate as the runtime OOM report, so startup and
+    serving agree on what counts as running out of device memory.
+    """
+    # Imported here: ``triggers`` builds reports through ``capture``, which
+    # reads this module's tags.
+    from .triggers import is_device_oom_message
+
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, torch.OutOfMemoryError):
             return True
-        message = str(current).lower()
-        if any(text in message for text in _OOM_MESSAGES):
+        if is_device_oom_message(str(current)):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -589,7 +617,7 @@ def _log_window_result(
     if step is not None:
         headline = (
             f"STARTUP FAILED while creating: {step.name} "
-            f"(free device memory before it: {step.free_before / (1 << 30):.2f} GiB)."
+            f"(free device memory before it: {step.free_before / GIB:.2f} GiB)."
         )
         # A step's tuning advice is about its memory; any other failure
         # (a missing checkpoint key, say) gets none.
@@ -605,6 +633,7 @@ def _log_window_result(
         record_baseline=not failed,
         headline=headline,
         suggestion=suggestion,
+        advise=out_of_memory or not failed,
         startup_steps=True,
     )
     if report is not None:

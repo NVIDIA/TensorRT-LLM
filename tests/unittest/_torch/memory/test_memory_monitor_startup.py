@@ -98,7 +98,10 @@ def test_executor_memory_monitor_feeds_the_report(monkeypatch):
             # failing step recorded, inside the window.
             startup.set_stage_advice({"kv_cache": "KV cache"}, {"kv_cache": "reduce the fraction"})
             startup.record_failed_stage("kv_cache", 3 * GIB)
-            raise RuntimeError("Executor creation failed due to insufficient GPU memory.")
+            # The executor's explanation, raised from the allocator's error.
+            raise RuntimeError(
+                "Executor creation failed due to insufficient GPU memory."
+            ) from torch.OutOfMemoryError("CUDA out of memory")
     text = texts[0]
     assert "STARTUP FAILED while creating: KV cache" in text
     assert "Suggestion: reduce the fraction." in text
@@ -179,6 +182,22 @@ def test_every_scoped_step_has_a_category():
         if step.value not in _TAG_CATEGORIES
     ]
     assert not missing, f"creation steps without a category: {missing}"
+
+
+@pytest.mark.cpu_only
+def test_step_names_the_monitor_spells_out_are_executor_steps():
+    # The monitor cannot import the executor's step enum, so it spells the
+    # values out; a renamed step would otherwise silently lose its category,
+    # its advice or its sleep state.
+    from tensorrt_llm._torch.memory.monitor.capture import _ADVICE_STEP, _TAG_CATEGORIES
+    from tensorrt_llm._torch.memory.monitor.names import CUDA_GRAPHS, WEIGHTS
+    from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KV_CACHE_SLEEP_TAG
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+    steps = {step.value for step in ExecutorMemoryType}
+    spelled = set(_TAG_CATEGORIES) - {WEIGHTS, CUDA_GRAPHS}
+    spelled |= set(_ADVICE_STEP.values()) | {KV_CACHE_SLEEP_TAG}
+    assert spelled <= steps, f"not executor steps: {sorted(spelled - steps)}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="reads a real allocator snapshot")
@@ -314,26 +333,37 @@ def test_failed_step_gets_its_advice_only_for_an_out_of_memory_failure(monkeypat
             tagging.TagSnapshot(supported=False), failed=True, out_of_memory=out_of_memory
         )
         assert calls[0]["suggestion"] == expected, f"out_of_memory={out_of_memory}"
+        # A failure that is not about memory gets no advice at all, not the
+        # largest group's generic advice in place of the step's.
+        assert calls[0]["advise"] is out_of_memory, f"out_of_memory={out_of_memory}"
 
     oom = torch.OutOfMemoryError("CUDA out of memory")
     try:
         raise RuntimeError("Executor creation failed") from oom
     except RuntimeError as wrapped:
         chained = wrapped
+    nccl = RuntimeError("Failed, NCCL error: 'unhandled cuda error (run with NCCL_DEBUG)'")
     cases = [
         (oom, True),
         (chained, True),
-        (RuntimeError("Executor creation failed due to insufficient GPU memory."), True),
-        (RuntimeError("Failed, NCCL error: 'unhandled cuda error (run with NCCL_DEBUG)'"), True),
         (KeyError("model.layers.0.weight"), False),
+        # The runtime OOM report's predicate: host memory is not device OOM.
+        (RuntimeError("cudaHostAlloc failed: out of memory"), False),
     ]
     for exc, expected in cases:
         assert tagging._is_out_of_memory(exc) is expected, repr(exc)
+    # NCCL reports a failed cudaMalloc as a generic CUDA error: an OOM only
+    # when the device is nearly full, as for the runtime report.
+    for full in (True, False):
+        monkeypatch.setattr(triggers, "_device_nearly_full", lambda full=full: full)
+        assert tagging._is_out_of_memory(nccl) is full, f"device nearly full={full}"
 
 
 @pytest.mark.cpu_only
 def test_memory_plan_leaves_out_the_temporary_sizing_pool():
-    """The non-KV peak excludes the sizing KV pool the final cache replaces."""
+    """The non-KV peak excludes the sizing KV pool the final cache replaces,
+    includes the workspace reserves taken out of the KV budget, and is
+    recorded only when a forward pass was profiled."""
     from contextlib import nullcontext
     from types import SimpleNamespace
     from unittest.mock import Mock, patch
@@ -343,64 +373,80 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
-    model_engine = Mock()
-    model_engine.model.model_config.attn_backend = "TRTLLM"
-    model_engine.model.model_config.is_encoder_decoder = False
-    model_engine.mm_encoder_output_budget_bytes = None
-    model_engine.mm_encoder_cache = None
-    with patch.object(
-        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
-    ):
-        creator = KvCacheCreator(
-            model_engine=model_engine,
-            mapping=Mapping(),
-            net_max_seq_len=4096,
-            kv_connector_manager=None,
-            max_num_tokens=256,
-            max_beam_width=1,
-            tokens_per_block=128,
-            max_seq_len=4096,
-            max_batch_size=8,
-            kv_cache_config=KvCacheConfig(max_tokens=1024),
-            llm_args=Mock(cache_transceiver_config=None, enable_chunked_prefill=False),
-            speculative_config=None,
-            sparse_attention_config=None,
-            profiling_stage_data=None,
-            is_disagg=False,
-        )
-    py_executor = Mock()
-    py_executor.warmup_scope.return_value = nullcontext()
-    py_executor.dist.mapping.rank = 0
-    py_executor.dist.broadcast.side_effect = lambda value, root: value
-    py_executor.await_responses.return_value = []
-    kv_manager = Mock()
-    sizing_pool = 300
-    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=sizing_pool)
-    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
-    with (
-        # Sizing proper starts here; the plan has been recorded by then.
-        patch.object(creator, "_cal_max_memory", side_effect=RuntimeError("stop here")) as cal,
-        patch.object(torch.cuda, "mem_get_info", return_value=(400, 1024)),
-        patch.object(
-            torch.cuda,
-            "memory_stats",
-            return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 500},
-        ),
-        patch.object(creator, "_encode_dummy_inputs", return_value=None),
-        patch.object(creator, "_get_multimodal_encoder_memory_reserve", return_value=0),
-        patch.object(creator, "_get_penalty_workspace_reserve", return_value=0),
-        patch.object(torch.cuda, "empty_cache"),
-        patch.object(torch.cuda, "reset_peak_memory_stats"),
-        patch(
-            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_fixed_bytes",
-            return_value=0,
-        ),
-        pytest.raises(RuntimeError, match="stop here"),
-    ):
-        creator.configure_kv_cache_capacity(py_executor)
-    peak, allocated = cal.call_args.args[0], cal.call_args.args[3]
+    def size(skip_est: bool):
+        model_engine = Mock()
+        model_engine.model.model_config.attn_backend = "TRTLLM"
+        model_engine.model.model_config.is_encoder_decoder = False
+        model_engine.mm_encoder_output_budget_bytes = None
+        model_engine.mm_encoder_cache = None
+        with patch.object(
+            KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
+        ):
+            creator = KvCacheCreator(
+                model_engine=model_engine,
+                mapping=Mapping(),
+                net_max_seq_len=4096,
+                kv_connector_manager=None,
+                max_num_tokens=256,
+                max_beam_width=1,
+                tokens_per_block=128,
+                max_seq_len=4096,
+                max_batch_size=8,
+                kv_cache_config=KvCacheConfig(max_tokens=1024),
+                llm_args=Mock(cache_transceiver_config=None, enable_chunked_prefill=False),
+                speculative_config=None,
+                sparse_attention_config=None,
+                profiling_stage_data=None,
+                is_disagg=False,
+            )
+        creator._skip_est = skip_est
+        creator._sparse_attention_config = SimpleNamespace(algorithm="deepseek_v4")
+        py_executor = Mock()
+        py_executor.warmup_scope.return_value = nullcontext()
+        py_executor.dist.mapping.rank = 0
+        py_executor.dist.broadcast.side_effect = lambda value, root: value
+        py_executor.await_responses.return_value = []
+        kv_manager = Mock()
+        kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=sizing_pool)
+        py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+        util = "tensorrt_llm._torch.pyexecutor._util"
+        with (
+            patch.object(creator, "_cal_max_memory", return_value=budget) as cal,
+            patch.object(torch.cuda, "mem_get_info", return_value=(400, 1024)),
+            patch.object(
+                torch.cuda,
+                "memory_stats",
+                return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 500},
+            ),
+            patch.object(creator, "_encode_dummy_inputs", return_value=None),
+            patch.object(creator, "_get_multimodal_encoder_memory_reserve", return_value=0),
+            patch.object(creator, "_get_penalty_workspace_reserve", return_value=0),
+            patch.object(torch.cuda, "empty_cache"),
+            patch.object(torch.cuda, "reset_peak_memory_stats"),
+            patch(f"{util}.get_attention_workspace_fixed_bytes", return_value=0),
+            # The DeepSeek-V4 indexer workspace is taken out of the KV budget.
+            patch(f"{util}.get_indexer_mqa_logits_workspace_bytes", return_value=indexer),
+            patch(f"{util}.get_indexer_mqa_logits_workspace_reserve", return_value=indexer),
+            patch(f"{util}.is_decode_only", return_value=True),
+            patch(f"{util}.get_mla_context_workspace_kv_len_cap", return_value=None),
+        ):
+            creator.configure_kv_cache_capacity(py_executor)
+        assert creator._kv_cache_config.max_gpu_total_bytes == budget - indexer
+        return cal.call_args
+
+    sizing_pool, budget, indexer = 300, 200, 50
+    startup.clear()
+    call = size(skip_est=False)
+    peak, allocated = call.args[0], call.args[3]
     assert allocated == sizing_pool
-    assert startup.memory_plan().non_kv_peak == peak - sizing_pool
+    assert startup.memory_plan().non_kv_peak == peak - sizing_pool + indexer, (
+        "the indexer reserve is outside the KV cache, so it is part of the non-KV peak"
+    )
+
+    # Without a profiled forward pass the "peak" is only current usage: no plan.
+    startup.clear()
+    size(skip_est=True)
+    assert startup.memory_plan() is None
 
 
 @pytest.mark.cpu_only
