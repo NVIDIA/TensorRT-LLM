@@ -275,6 +275,14 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     attn_metadata.swap_for_draft(
         'host_kv_cache_block_offsets',
         draft_kv_cache_manager.host_kv_cache_block_offsets)
+    # The mixed-precision high page table and the dense block-offset copy are
+    # the draft manager's own too (None when its layers take no mixed precision).
+    attn_metadata.swap_for_draft(
+        'mixed_precision_high_block_table',
+        attn_metadata.draft_mixed_precision_high_block_table)
+    attn_metadata.swap_for_draft(
+        'mixed_precision_low_block_offsets',
+        attn_metadata.draft_mixed_precision_low_block_offsets)
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 
@@ -1284,16 +1292,14 @@ class SpecMetadata:
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
-        bad = [
-            s for s in padding_slot_ids
-            if s is None or s < 0 or s >= self.draft_probs.shape[0]
-        ]
+        # The last draft_probs row is the shared scratch row (dummy_slot_row).
+        bad = [s for s in padding_slot_ids if s < 0 or s >= self.dummy_slot_row]
         if bad:
             # Writing a different row would leave the real slot's distribution
             # stale and break lossless acceptance, so fail loudly instead.
             raise RuntimeError(
                 f"rejection sampling: padding slot ids {bad[:8]} outside "
-                f"draft_probs rows [0, {self.draft_probs.shape[0]}) "
+                f"slot rows [0, {self.dummy_slot_row}) "
                 f"(num_seq_slots={self.num_seq_slots}, "
                 f"max_num_requests={self.max_num_requests}, "
                 f"is_cuda_graph={self.is_cuda_graph})")
