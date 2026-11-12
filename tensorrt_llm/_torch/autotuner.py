@@ -17,10 +17,12 @@ import concurrent.futures
 import contextlib
 import copy
 import enum
+import errno
 import fcntl
 import inspect
 import itertools
 import json
+import math
 import os
 import time
 import zlib
@@ -28,7 +30,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Set, Tuple,
+                    Union)
 
 import torch
 from cuda.bindings import driver
@@ -302,7 +305,9 @@ def autotune(tune_mode: bool = True,
 
     Args:
         tune_mode: Whether to enable tuning mode
-        cache_path: Path to save/load cache files
+        cache_path: Path to save/load cache files. A save waits at most
+            TLLM_AUTOTUNER_CACHE_LOCK_TIMEOUT seconds (default 120) for other
+            processes' saves to the file and is skipped after that.
         skip_dynamic_tuning_buckets: When True, suppress bucket generation in
             _optimization_profiles() and profile the encountered shapes and
             their mapped buckets, subject to tune_max_num_tokens. Inputs with
@@ -376,7 +381,10 @@ def autotune(tune_mode: bool = True,
             # save cache
             if cache_path is not None:
                 logger.info(f"[Autotuner] Saving cache to {cache_path}")
-                autotuner.profiling_cache.save_cache(cache_path, rank)
+                autotuner.profiling_cache.save_cache(
+                    cache_path,
+                    rank,
+                    write_shared=autotuner._writes_shared_cache())
         finally:
             # Restore the singleton's prior distributed state (see enter) so the
             # temporary full-world state does not persist past this context.
@@ -439,30 +447,74 @@ class AutoTunerStatistics:
         return stats_str
 
 
+_CACHE_LOCK_TIMEOUT_ENV = "TLLM_AUTOTUNER_CACHE_LOCK_TIMEOUT"
+# Covers a healthy cold-start queue of ~100 rank saves; caps a hung filesystem.
+_CACHE_LOCK_TIMEOUT_SECONDS = 120.0
+
+
+def _cache_lock_timeout() -> float:
+    """Seconds a cache save waits for the lock before it is skipped."""
+    value = os.environ.get(_CACHE_LOCK_TIMEOUT_ENV)
+    if value is None:
+        return _CACHE_LOCK_TIMEOUT_SECONDS
+    try:
+        timeout = float(value)
+    except ValueError:
+        timeout = math.nan
+    if math.isnan(timeout):
+        logger.warning_once(
+            f"[AutoTuner] Ignoring {_CACHE_LOCK_TIMEOUT_ENV}={value!r}, "
+            f"not a number of seconds",
+            key=_CACHE_LOCK_TIMEOUT_ENV)
+        return _CACHE_LOCK_TIMEOUT_SECONDS
+    return timeout
+
+
 @contextlib.contextmanager
-def _exclusive_cache_lock(lock_path: Path):
-    """Cross-node-correct exclusive lock used by save_cache/load_cache.
+def _exclusive_cache_lock(lock_path: Path, timeout: float) -> Iterator[bool]:
+    """Hold the POSIX lock on `lock_path` that serializes cache writers.
 
-    POSIX byte-range lock (`fcntl.lockf`) held on a SEPARATE lockfile
-    (not the data file), which avoids the truncate / rename complications
-    of locking the file you're also rewriting. The lockfile is persistent;
-    the kernel releases the lock when the holding fd is closed — including
-    on process death, so there is no stale-lock cleanup path to maintain.
-
-    Both readers and writers use LOCK_EX: read/write frequencies on the
-    autotuner cache are similar and the simpler "always exclusive" model
-    avoids reader/writer-priority pitfalls on networked filesystems.
+    Yields False, without the lock, if another process holds it for `timeout`
+    seconds.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.lockf(fd, fcntl.LOCK_EX)
-        yield
-    finally:
+        deadline = time.monotonic() + timeout
+        delay = 0.05
+        while True:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                # A lock held elsewhere fails with EACCES or EAGAIN.
+                if e.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                yield False
+                return
+            time.sleep(min(delay, remaining))
+            delay = min(2 * delay, 1.0)
         try:
-            fcntl.lockf(fd, fcntl.LOCK_UN)
+            yield True
         finally:
-            os.close(fd)
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _read_cache_text(file_path: Path, attempts: int = 5) -> str:
+    """Read the cache file, retrying reads that raced a replacement (ESTALE)."""
+    for _ in range(attempts - 1):
+        try:
+            with open(file_path, "r") as f:
+                return f.read()
+        except OSError as e:
+            if e.errno != errno.ESTALE:
+                raise
+    with open(file_path, "r") as f:
+        return f.read()
 
 
 class AutoTunerProfilingCache:
@@ -633,75 +685,54 @@ class AutoTunerProfilingCache:
 
         return shared_cache, rank_cache
 
-    def save_cache(self, file_path: Union[str, Path], rank: int) -> None:
-        """Save the profiling cache to disk in JSON format.
+    def save_cache(self,
+                   file_path: Union[str, Path],
+                   rank: int,
+                   write_shared: bool = True) -> None:
+        """Merge this cache into the JSON file at `file_path`.
 
-        Cache entries are organized based on distributed strategy:
-        - INDEPENDENT ops are saved per-rank (rank_0, rank_1, ...)
-        - Non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL) are saved in a shared dict
-        - Ops marked `exclude_from_cache=True` are dropped entirely.
+        INDEPENDENT ops go to the `rank_{rank}` section, other ops to the shared
+        section, and excluded ops are dropped. Writers serialize on a lock file
+        and merge rather than replace, so entries another process saved since
+        this one loaded are kept. A save that adds nothing takes no lock and
+        writes nothing; one that cannot take the lock within
+        TLLM_AUTOTUNER_CACHE_LOCK_TIMEOUT seconds is skipped with a warning.
 
         Args:
-            file_path: Path where to save the cache
-            rank: The rank of the current process
-
-        Raises:
-            IOError: If file cannot be written
-
-        Note:
-            The cache is saved in JSON format which provides human-readable output.
-            Some type information may be lost for complex tactic objects.
-
-            Concurrency model:
-            * Cross-process mutual exclusion uses POSIX byte-range locks
-              (`fcntl.lockf`) on a SEPARATE lockfile next to the data
-              file. The lockfile is persistent (never unlinked); the
-              kernel auto-releases the lock when the holding fd is
-              closed, including on crash, so no stale-lock cleanup is
-              needed. Both readers and writers take LOCK_EX — read/write
-              frequencies are similar here and the simpler logic is
-              worth more than read parallelism.
-            * The data file itself is replaced atomically via
-              (write-to-tmp + fsync + rename). A writer killed at any
-              point leaves a discardable .tmp file; `file_path` is never
-              partially written, so concurrent readers always see a
-              fully-formed JSON document.
-            * The on-disk rank-specific dict is MERGED (not replaced)
-              with this writer's contribution so a concurrent writer
-              that loaded earlier does not get its entries clobbered.
+            write_shared: Whether to save the shared section. Ranks that hold
+                the same shared entries leave it to one of them.
         """
         file_path = Path(file_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = self._lock_path_for(file_path)
-
         try:
-            # Partition cache into shared (non-INDEPENDENT) and rank-specific (INDEPENDENT)
             shared_cache, rank_cache = self._partition_cache_by_strategy()
+            sections = {f"rank_{rank}": self._serialize_cache_data(rank_cache)}
+            if write_shared:
+                sections[self.SHARED_CACHE_KEY] = self._serialize_cache_data(
+                    shared_cache)
+            try:
+                on_disk = self._read_cache_file(file_path) or {}
+            except OSError:
+                # An unlocked read can race a rename; the locked read decides.
+                on_disk = {}
+            if not any(sections.values()) or not self._merge_sections(
+                    on_disk, sections):
+                logger.info(f"[AutoTuner] Nothing new to save to {file_path}")
+                return
 
-            serialized_shared_cache = self._serialize_cache_data(shared_cache)
-            serialized_rank_cache = self._serialize_cache_data(rank_cache)
-
-            with _exclusive_cache_lock(lock_path):
-                current_cache = self._read_existing_cache(file_path)
-
-                # Merge shared cache entries (non-INDEPENDENT ops)
-                if self.SHARED_CACHE_KEY not in current_cache:
-                    current_cache[self.SHARED_CACHE_KEY] = {}
-                current_cache[self.SHARED_CACHE_KEY].update(
-                    serialized_shared_cache)
-
-                # Merge rank-specific cache entries (INDEPENDENT ops).
-                # MUST be a merge (not assignment): a concurrent writer
-                # that committed its rank_{rank} contribution between
-                # this writer's load_cache and save_cache would otherwise
-                # be silently dropped by an `=` assignment that re-writes
-                # the slot with only this writer's in-memory cache.
-                rank_key = f"rank_{rank}"
-                if rank_key not in current_cache:
-                    current_cache[rank_key] = {}
-                current_cache[rank_key].update(serialized_rank_cache)
-
-                self._atomic_write_json(file_path, current_cache)
+            timeout = _cache_lock_timeout()
+            with _exclusive_cache_lock(self._lock_path_for(file_path),
+                                       timeout) as locked:
+                if not locked:
+                    logger.warning(
+                        f"[AutoTuner] Skipped saving the cache to {file_path}: "
+                        f"another process held its lock for {timeout:g} s "
+                        f"({_CACHE_LOCK_TIMEOUT_ENV})")
+                    return
+                current_cache = self._read_cache_file(file_path) or {
+                    "metadata": self._serialize_metadata()
+                }
+                if self._merge_sections(current_cache, sections):
+                    self._atomic_write_json(file_path, current_cache)
             logger.info(
                 f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
             )
@@ -714,68 +745,77 @@ class AutoTunerProfilingCache:
         """Return the lockfile path that pairs with `file_path`."""
         return file_path.with_name(file_path.name + ".lock")
 
-    def _read_existing_cache(self, file_path: Path) -> Dict[str, Any]:
-        """Read the data file (best-effort) under the caller's lock."""
-        if not file_path.exists():
-            return {"metadata": self._serialize_metadata()}
+    @staticmethod
+    def _merge_sections(cache_file: Dict[str, Any],
+                        sections: Dict[str, Dict[str, Any]]) -> bool:
+        """Merge `sections` into `cache_file`; return whether it changed."""
+        changed = False
+        for name, entries in sections.items():
+            on_disk = cache_file.setdefault(name, {})
+            for key, value in entries.items():
+                if on_disk.get(key) != value:
+                    on_disk[key] = value
+                    changed = True
+        return changed
+
+    @staticmethod
+    def _read_cache_file(file_path: Path) -> Optional[Dict[str, Any]]:
+        """Parse the cache file; None if it is missing, empty or unparsable.
+
+        Writers replace the file by rename, so reading needs no lock. A file
+        torn by a crash or by an older in-place writer is ignored.
+        """
         try:
-            with open(file_path, "r") as f:
-                content = f.read()
-            if not content.strip():
-                return {"metadata": self._serialize_metadata()}
+            content = _read_cache_text(file_path)
+        except FileNotFoundError:
+            return None
+        if not content.strip():
+            return None
+        try:
             return json.loads(content)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            # An earlier writer from a pre-fix version may have left a
-            # corrupted file behind. Don't fail the current save — start
-            # from a fresh dict and overwrite atomically.
-            logger.warning(f"[AutoTuner] Could not parse existing cache at "
-                           f"{file_path}: {e!r}; starting from a fresh dict.")
-            return {"metadata": self._serialize_metadata()}
+        except json.JSONDecodeError as e:
+            logger.warning(f"[AutoTuner] Ignoring unparsable cache file "
+                           f"{file_path}: {e!r}")
+            return None
 
     @staticmethod
     def _atomic_write_json(file_path: Path, payload: Dict[str, Any]) -> None:
-        """Write `payload` to `file_path` atomically (tmp + fsync + rename)."""
+        """Replace `file_path` by rename, so readers never see a partial file.
+
+        No fsync: a cache needs an atomic replacement, not durability.
+        """
         tmp_path = file_path.with_name(
             f".{file_path.name}.tmp.{os.getpid()}.{time.time_ns()}")
         with open(tmp_path, "w") as f:
             json.dump(payload, f, indent=2, default=str)
-            f.flush()
-            os.fsync(f.fileno())
         os.rename(tmp_path, file_path)
 
     def load_cache(self, file_path: Union[str, Path], rank: int) -> None:
-        """Load the profiling cache from disk in JSON format.
+        """Merge the file's shared and `rank_{rank}` entries into this cache.
 
-        Loads both shared cache entries (non-INDEPENDENT ops) and rank-specific
-        entries (INDEPENDENT ops) and merges them into the current cache.
-
-        Args:
-            file_path: Path to the cache file
-            rank: The rank of the current process
+        Takes no lock, as writers replace the file by rename. The file wins on a
+        key both hold; entries the file lacks, e.g. after a skipped save, are
+        kept. An empty, unreadable or unparsable file is ignored.
 
         Raises:
             FileNotFoundError: If cache file doesn't exist
-            IOError: If file cannot be read
-
-        Note:
-            Loading will replace the current cache contents. The cache is loaded
-            from JSON format.
         """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"Cache file not found: {file_path}")
 
-        lock_path = self._lock_path_for(file_path)
         try:
-            with _exclusive_cache_lock(lock_path):
-                with open(file_path, "r") as f:
-                    current_cache_contents = json.load(f)
+            current_cache_contents = self._read_cache_file(file_path)
+        except OSError as e:
+            # An unlocked read can race a rename (NFS ESTALE) or fail on I/O.
+            logger.warning(
+                f"[AutoTuner] Not loading the cache at {file_path}: {e!r}")
+            return
+        if current_cache_contents is None:
+            return
+        try:
             self._deserialize_metadata(
                 current_cache_contents.get("metadata", {}))
-
-            # Start with empty cache and independent ops set
-            self.cache = {}
-            self.independent_op = set()
 
             # Load shared cache entries (non-INDEPENDENT ops)
             if self.SHARED_CACHE_KEY in current_cache_contents:
@@ -2337,6 +2377,13 @@ class AutoTuner:
     def _is_distributed(self) -> bool:
         """Check if we're in a distributed environment."""
         return self._dist is not None and self._tuning_group()[0] > 1
+
+    def _writes_shared_cache(self) -> bool:
+        """Whether this rank saves the shared cache section.
+
+        Ranks of one tuning group hold the same shared entries.
+        """
+        return not self._is_distributed() or self._tuning_group()[1] == 0
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:
