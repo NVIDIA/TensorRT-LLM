@@ -299,10 +299,11 @@ and online benchmarks. PackageSanityCheck and PerfSanity remain enabled.
 
 The CPU suite must contain runnable API stability, serve-schema, lazy-server
 import, and lazy-model-zoo validation. The serving chat/completions examples and
-config-override precedence test must also resolve to stages scheduled in the trigger mode;
-OnDemand stages and optional
-pre-merge multi-GPU stages cannot satisfy this requirement. Missing or filtered
-required validation keeps `scope=None`. Public changes therefore get a wider
+config-override precedence test must also resolve to candidate stages, including
+Post-Merge, OnDemand and multi-GPU stages. The selector checks that validation
+exists and adds it to the candidate set; Groovy applies the user's execution
+scope downstream. Missing, unmapped or filtered required validation keeps
+`scope=None`. Public changes therefore get a wider
 test set than internal VG changes without requiring all unrelated GPU tests.
 
 Outcomes:

@@ -399,7 +399,6 @@ def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,
-        post_merge=bool(data.get("post_merge", False)),
         raw_diffs=raw_diffs,
         docstring_files=docstring_files,
         docstring_only_files=docstring_only_files,
