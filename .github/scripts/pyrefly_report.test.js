@@ -13,7 +13,7 @@ function harness({resolved = false, existing = true, diagnostics = [finding], er
   const report = {pr_number: 42, base_ref: 'release/test', base_sha: 'b'.repeat(40),
     head_sha: head, diagnostics, error};
   const run = {id: 123, run_attempt: 1, event: 'pull_request',
-    path: '.github/workflows/pyrefly-diff.yml', head_sha: head, head_branch: 'feature',
+    path: '.github/workflows/pyrefly-check.yml', head_sha: head, head_branch: 'feature',
     repository: {full_name: 'NVIDIA/TensorRT-LLM'},
     head_repository: {full_name: 'contributor/TensorRT-LLM'}, pull_requests: []};
   const pr = {state: 'open', base: {ref: report.base_ref},
@@ -55,9 +55,12 @@ test('fork run with an empty pull_requests list can create one file-level thread
   assert.equal(args.subject_type, 'file');
   assert.equal(args.commit_id, head);
   assert.equal(args.path, 'tensorrt_llm/module.py');
-  assert.ok(args.body.includes('release/test'));
+  assert.ok(args.body.includes('Found after merging this PR (aaaaaaaaaaaa) into the latest ' +
+    '<code>release/test</code> (bbbbbbbbbbbb). Line numbers refer to the merged code.'));
+  assert.ok(args.body.includes('⚠️ Pyrefly: 1 diagnostic from your changes'));
   assert.ok(args.body.includes('unknown-name'));
-  assert.ok(args.body.includes('resolve this conversation'));
+  assert.ok(args.body.includes('may come from a semantic conflict with the latest <code>release/test</code>,'));
+  assert.ok(args.body.includes('Resolve this conversation before merging the PR.'));
 });
 
 test('each check with findings reopens a manually resolved thread', async () => {
@@ -83,8 +86,9 @@ test('clean comparison updates and resolves an existing thread', async () => {
   const state = harness({diagnostics: []});
   await state.publish();
   assert.deepEqual(state.writes.map(item => item[0]), ['update', 'resolve']);
-  assert.ok(state.writes[0][1].body.includes('no new diagnostics'));
-  assert.ok(!state.writes[0][1].body.includes('resolve this conversation'));
+  assert.ok(state.writes[0][1].body.includes('✅ Pyrefly: no diagnostics from your changes'));
+  assert.ok(state.writes[0][1].body.includes('Checked after merging this PR (aaaaaaaaaaaa) into the latest'));
+  assert.ok(!state.writes[0][1].body.includes('Resolve this conversation'));
 });
 
 test('clean comparison does not create a thread', async () => {
@@ -181,6 +185,16 @@ test('incomplete report may lack the target branch SHA', () => {
   assert.ok(bodyFor(state.report, state.run, 'https://github.com').includes('(unavailable)'));
 });
 
+test('diagnostics are listed in one code block, location first and message indented', () => {
+  const state = harness();
+  state.report.diagnostics = [finding, {...finding, line: 30, name: 'parse-error',
+    message: 'Parse error\nExpected an expression'}];
+  const body = bodyFor(state.report, state.run, 'https://github.com');
+  assert.equal(body.split('<pre>').length, 2);
+  assert.ok(body.includes('<pre>tensorrt_llm/module.py:12\n    [unknown-name] Unknown name `example`\n' +
+    'tensorrt_llm/module.py:30\n    [parse-error] Parse error\n    Expected an expression</pre>'));
+});
+
 test('rendered diagnostics escape markup and keep long reports within the comment limit', () => {
   const state = harness();
   state.report.diagnostics = Array.from({length: 200}, () => ({...finding,
@@ -188,6 +202,7 @@ test('rendered diagnostics escape markup and keep long reports within the commen
   const body = bodyFor(state.report, state.run, 'https://github.com');
   assert.ok(body.includes('&lt;script&gt;'));
   assert.ok(!body.includes('<script>'));
+  assert.ok(body.includes('⚠️ Pyrefly: 200 diagnostics from your changes'));
   assert.ok(body.includes('of 200 diagnostics'));
   assert.ok(body.length < 65536);
 });
