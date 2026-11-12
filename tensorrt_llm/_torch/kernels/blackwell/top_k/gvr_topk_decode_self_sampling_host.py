@@ -2579,6 +2579,7 @@ def _varlen_launcher(
     wide_cta_rows: bool = False,
     pdl: bool = False,
     r_cap: int = 0,
+    use_rubin_tuning: bool = True,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher for one logits dtype.
 
@@ -2603,6 +2604,8 @@ def _varlen_launcher(
         key = (num_rows, npad, k, n_env, next_n, cr, profile) + _varlen_key_flags(
             det, wide_cta_rows, pdl, r_cap
         )
+        if not use_rubin_tuning:
+            key += ("original_route",)
     cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
     if hit is not None:
@@ -2636,7 +2639,8 @@ def _varlen_launcher(
     if low:
         plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
-        plan_free = _route_fp32_varlen(
+        router = _route_fp32_varlen if use_rubin_tuning else route
+        plan_free = router(
             num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap
         )
         # Select host options without changing the compilation target.
