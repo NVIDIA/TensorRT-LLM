@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
 
-from ._compile_cache import build_and_load_attention_kernel
+from ._compile_cache import build_and_load_attention_kernel, cache_compiled
 from ._hardware import get_max_active_clusters
 from ._scales import (
     GlobalScale,
@@ -1995,7 +1995,7 @@ def _paged_context_compile_spec(
     )
 
 
-@functools.cache
+@cache_compiled
 def _get_compiled_context(
     compile_spec: _ContextCompileSpec,
 ):
@@ -2389,7 +2389,7 @@ def _get_compiled_context(
     return compiled, policy
 
 
-@functools.cache
+@cache_compiled
 def _get_compiled_paged_context(
     compile_spec: _PagedContextCompileSpec,
 ):
