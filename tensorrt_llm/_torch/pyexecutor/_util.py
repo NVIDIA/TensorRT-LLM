@@ -2482,9 +2482,12 @@ class KvCacheCreator:
                 "target and draft KV cache; keeping a separate draft KV cache.",
                 key="dflash_per_layer_kv_heads_fallback")
             return "the target or drafter has variable per-layer KV geometry"
-        # Draft layers live in the target manager's storage: a K-only target
-        # cannot hold a drafter's K and V, or the other way around.
-        if target_layout[3] != draft_layout[3]:
+        # Only the hybrid managers' appended draft layers take the target's
+        # kv_factor: the plain manager pages each layer through that layer's
+        # own factor, so a K-only target there also holds a drafter's K and V.
+        # A hybrid target cannot, so the mismatch keeps a separate pool.
+        if target_layout[3] != draft_layout[3] and issubclass(
+                self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
             reason = ("the target stores a "
                       f"{'K-only' if target_layout[3] else 'K and V'} KV cache "
                       "while the drafter stores a "

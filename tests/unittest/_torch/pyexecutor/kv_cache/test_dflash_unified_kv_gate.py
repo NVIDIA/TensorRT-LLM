@@ -27,6 +27,9 @@ import yaml
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+    MambaHybridCacheManagerV2,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -61,6 +64,14 @@ def _model_config(*, kv_heads, head_dim, kv_quant_algo=None):
 
 class _V1LikeManager:
     """A non-V2 manager: predates the appended-draft layer specs."""
+
+
+class _MambaAppendsManager(MambaHybridCacheManagerV2):
+    """A hybrid manager: its appended draft layers must match its cache type."""
+
+    @classmethod
+    def accepts_appended_draft_layers(cls) -> bool:
+        return True
 
 
 def _mla_model_config(*, kv_quant_algo=None):
@@ -221,16 +232,23 @@ def test_non_v2_target_manager_keeps_separate_cache(is_disagg: bool) -> None:
     assert not creator._should_unify_dflash_kv_cache()
 
 
+@pytest.mark.parametrize(
+    "manager_cls", [KVCacheManagerV2, _MambaAppendsManager], ids=["plain_v2", "mamba_hybrid"]
+)
 @pytest.mark.parametrize("target_is_mla", [True, False])
 @pytest.mark.parametrize("is_disagg", [False, True])
-def test_mismatched_draft_k_only_keeps_separate_cache(is_disagg: bool, target_is_mla: bool) -> None:
-    """A drafter's K-only flag never unifies, aggregated or disaggregated.
+def test_mismatched_draft_k_only_keeps_separate_cache(
+    is_disagg: bool, target_is_mla: bool, manager_cls: type
+) -> None:
+    """A k_only mismatch shares only where the storage can hold both shapes.
 
-    Unlike the head-count and dtype mismatches, aggregated serving has no
-    transfer step: the drafter's layers would land in the target's pool, whose
-    storage holds one of the two shapes (a K-only Kimi K3 target with its GQA
-    DSpark drafter), so both the mismatch directions keep a separate draft KV
-    cache instead of failing the appended-layer validation at construction.
+    The plain manager pages each layer through that layer's kv_factor, so an
+    aggregated shared pool holds a K-only target and a drafter's K and V, or
+    the other way around; disaggregated serving still keeps separate pools, as
+    the transceiver registers one k_only per side. The hybrid manager's
+    appended draft layers must match its target cache type, so both mismatch
+    directions keep a separate draft KV cache instead of failing the
+    appended-layer validation at construction.
     """
     gqa = _model_config(kv_heads=1, head_dim=128)
     if target_is_mla:
@@ -239,8 +257,11 @@ def test_mismatched_draft_k_only_keeps_separate_cache(is_disagg: bool, target_is
         target, draft = gqa, _mla_model_config()
 
     creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+    creator._kv_cache_manager_cls = manager_cls
 
-    assert not creator._should_unify_dflash_kv_cache()
+    assert creator._should_unify_dflash_kv_cache() is (
+        manager_cls is KVCacheManagerV2 and not is_disagg
+    )
 
 
 def test_layout_compares_rank_local_heads():
