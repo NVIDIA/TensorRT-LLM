@@ -295,7 +295,7 @@ def triton_qsa_generation_token_mapping(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_paged_kv_store_kernel(
     k,
     v,
@@ -1883,7 +1883,7 @@ def _qsa_paged_sparse_gqa_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_paged_sparse_gqa_splitk_kernel(
     q,
     k_cache,
@@ -2056,7 +2056,7 @@ def _qsa_paged_sparse_gqa_splitk_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_merge_splitk_kernel(
     partial_output,
     partial_lse,

@@ -23,8 +23,11 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     _qsa_decode_token_mapping_kernel,
     _qsa_generation_token_mapping_kernel,
     _qsa_index_scores_query_tile,
+    _qsa_merge_splitk_kernel,
     _qsa_paged_index_scores_kernel,
     _qsa_paged_index_scores_qtile_kernel,
+    _qsa_paged_kv_store_kernel,
+    _qsa_paged_sparse_gqa_splitk_kernel,
     _qsa_unscale_block_table_kernel,
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
@@ -32,6 +35,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_mtp_reuse_topk,
     triton_qsa_paged_index_scores,
     triton_qsa_paged_kv_store,
+    triton_qsa_paged_sparse_gqa,
     triton_qsa_prefill_compress,
     triton_qsa_unscale_block_table,
 )
@@ -699,6 +703,55 @@ def test_qsa_row_metadata_kernels_compile_once() -> None:
             for a, e in zip(actual, run(rows, 0)):
                 torch.testing.assert_close(a, e, rtol=0, atol=0, equal_nan=True)
     assert [len(k.device_caches[device][0]) for k in kernels] == compiled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_kv_store_and_splitk_compile_once_per_launch_class() -> None:
+    """K/V store, split-K sparse GQA and its merge: one compiled kernel per launch class for every
+    row count in the class (the split count and PDL follow the row bucket)."""
+    torch.manual_seed(5)
+    device = torch.cuda.current_device()
+    kernels = (
+        _qsa_paged_kv_store_kernel,
+        _qsa_paged_sparse_gqa_splitk_kernel,
+        _qsa_merge_splitk_kernel,
+    )
+    pages, tokens_per_block, head_dim, q_heads = 16, 8, 64, 4
+    k_cache = torch.zeros(pages, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.arange(pages, dtype=torch.int32, device="cuda").view(2, pages // 2)
+
+    def run(rows: int) -> None:
+        requests = torch.randint(0, 2, (rows,), dtype=torch.int32, device="cuda")
+        positions = torch.randint(0, pages // 2 * tokens_per_block, (rows,), device="cuda")
+        kv = torch.randn(rows, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+        triton_qsa_paged_kv_store(
+            k=kv,
+            v=kv,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            request_indices=requests,
+            logical_positions=positions,
+            block_table=block_table,
+            tokens_per_block=tokens_per_block,
+        )
+        triton_qsa_paged_sparse_gqa(
+            q=torch.randn(rows, q_heads, head_dim, dtype=torch.bfloat16, device="cuda"),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=block_table,
+            selected_tokens=torch.randint(0, 64, (rows, 512), dtype=torch.int32, device="cuda"),
+            request_indices=requests,
+            tokens_per_block=tokens_per_block,
+            softmax_scale=head_dim**-0.5,
+        )
+
+    for first, others in ((2, (1, 3, 4)), (33, (32, 48, 100))):
+        run(first)
+        compiled = [len(k.device_caches[device][0]) for k in kernels]
+        for rows in others:
+            run(rows)
+        assert [len(k.device_caches[device][0]) for k in kernels] == compiled, first
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
