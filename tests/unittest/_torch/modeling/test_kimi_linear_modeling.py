@@ -24,6 +24,7 @@ def test_kimi_linear_model_builds_shared_aux_stream_registry(
     class _FakeDecoderLayer(nn.Module):
         def __init__(self, _model_config, _config, _layer_idx, aux_stream_dict) -> None:
             super().__init__()
+            self.token_sliced = False
             layer_aux_stream_dicts.append(aux_stream_dict)
 
     monkeypatch.setattr(torch.cuda, "Stream", lambda: next(stream_iter))

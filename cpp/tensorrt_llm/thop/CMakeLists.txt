@@ -29,19 +29,15 @@ else() # Windows
 endif()
 
 add_library(th_utils STATIC thUtils.cpp)
+# Shared-library consumers must explicitly link ${SHARED_TARGET} before the
+# transitive static components of tllm::torch_utils to share its logger and
+# driver-wrapper singletons (see cmake/modules/modeling_v2.cmake).
+add_library(tllm::torch_utils ALIAS th_utils)
+# Torch headers require C++20 reversed operator== synthesis.
+target_compile_features(th_utils PUBLIC cxx_std_20)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
-# Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
-# OptionalArrayRef in the reverse order, relying on C++20's automatic generation
-# of the reversed comparison operator. th_utils/th_common only contain host .cpp
-# sources, so scope the bump to these targets instead of the repo-wide C++17
-# standard.
-set_target_properties(th_utils PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
-                                                          ON)
-# Declare the dependency on the main shared library explicitly so consumers
-# (e.g. thUtilsTest) place it after th_utils on the link line; this was
-# previously satisfied transitively via the removed TensorRT plugin target.
-target_link_libraries(th_utils PUBLIC ${SHARED_TARGET} ${TORCH_LIBRARIES}
-                                      ${CUBLAS_LIB} ${CURAND_LIB})
+target_link_libraries(th_utils PUBLIC tllm::runtime_buffers ${TORCH_LIBRARIES}
+                                      Python3::Python)
 
 function(add_th_common_family target)
   add_library(${target} OBJECT ${ARGN})
@@ -67,14 +63,18 @@ add_th_common_family(
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   sparseKvCacheCompactOp.cpp
-  minimaxM3Fp8IndexerOp.cpp
-  minimaxM3SelectBlocksOp.cpp
   mlaRopeInplaceOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
+target_include_directories(th_common_attention
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+
+# MiniMax-M3 torch ops live in minimaxM3/; that directory adds them to
+# th_common_attention with target_sources() so the list stays next to the files.
+add_subdirectory(minimaxM3)
 
 add_th_common_family(
   th_common_gemm_quant
@@ -142,8 +142,9 @@ add_th_common_family(
   fusedGemmAllreduceOp.cpp
   dwdpFabricGatherOp.cpp)
 
-add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
-                     mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
+add_th_common_family(
+  th_common_sequence causalConv1dOp.cpp gdnVerifyOp.cpp mambaConv1dOp.cpp
+  mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
 
 add_th_common_family(
   th_common_visual_gen
@@ -152,7 +153,16 @@ add_th_common_family(
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
-  sageQuantizeOp.cpp)
+  sageQuantizeOp.cpp
+  blockCausalLayoutOp.cpp
+  rotateRowsOp.cpp
+  scatterKvSlotsOp.cpp
+  denseFp8FmhaOp.cpp
+  fusedDiTQKNormRopeFp8Op.cpp)
+# denseFp8FmhaOp.cpp includes the trtllm-gen FMHA runner headers; the interface
+# target carries the compile definitions those headers need to match the
+# library's struct layouts.
+target_link_libraries(th_common_visual_gen PRIVATE trtllm_gen_fmha_interface)
 
 add_th_common_family(
   th_common_decoding
@@ -166,10 +176,6 @@ add_th_common_family(
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
-
-# GLM bindings keep their existing family targets; source lists live with the
-# model.
-add_subdirectory(glmMoeDsa)
 
 add_library(
   th_common SHARED

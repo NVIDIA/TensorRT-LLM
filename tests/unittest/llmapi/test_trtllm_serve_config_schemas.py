@@ -19,6 +19,7 @@ import copy
 import importlib.util
 import json
 import runpy
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),
+        (generator.SERVE_SCHEMA, {"moe_config": {"load_balancer": "eplb.yaml"}}, True),
         (generator.SERVE_SCHEMA, {"backend": "pytorch"}, True),
         (generator.SERVE_SCHEMA, {"backend": "_autodeploy"}, False),
         (
@@ -80,6 +82,31 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": True}},
+            True,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": False}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": "invalid"}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": 1}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": None}},
+            False,
+        ),
         (
             generator.SERVE_SCHEMA,
             {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
@@ -144,6 +171,15 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
+        (generator.SERVE_SCHEMA, {"checkpoint_io_policy": "rank_striped_read_ahead"}, True),
+        (generator.SERVE_SCHEMA, {"checkpoint_io_policy": "unknown"}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {"dwdp_config": {"num_experts_per_worker": 0, "num_prefetch_experts": 0}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_experts_per_worker": -1}}, False),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_prefetch_experts": -1}}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
@@ -157,15 +193,158 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
         (
             generator.DISAGG_SCHEMA,
+            {"context_servers": {"dwdp_config": {"dwdp_size": 12, "num_experts_per_worker": -1}}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
             {"context_servers": {"moe_config": {"backend_typo": "CUTLASS"}}},
             False,
         ),
         (generator.DISAGG_SCHEMA, {"schedule_style": "invalid"}, False),
         (generator.DISAGG_SCHEMA, {"num_workers": 2, "server_keep_alive_timeout": 20}, True),
+        (generator.DISAGG_SCHEMA, {"checkpoint_io_policy": "native"}, True),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"checkpoint_io_policy": "unknown"}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64 - 1}}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"watermark_config": {"key": 0, "algorithm": "gumbel_dual_key", "context_width": 64}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": -1}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "context_width": 0}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "context_width": 65}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "algorithm": "synthid"}}, False),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": 7}}}, True),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": -1}}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 1}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "native",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "morton",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "hilbert",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "peano",
+                    }
+                }
+            },
+            False,
+        ),
+        # Tagged unions: the tag is required even where the branch model defaults it.
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "speculative_config": {
+                    "decoding_type": "NGram",
+                    "max_draft_len": 3,
+                    "max_matching_ngram_size": 4,
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"speculative_config": {"max_matching_ngram_size": 4, "is_keep_all": True}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"sparse_attention_config": {"algorithm": "rocket", "kt_cache_dtype": "float8_e5m2"}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"sparse_attention_config": {"kt_cache_dtype": "float8_e5m2"}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_compression_config": {
+                    "algorithm": "quantization_for_cold_page",
+                    "skip_rope_quantization": True,
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_compression_config": {"skip_rope_quantization": True}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "teacache", "teacache_thresh": 0.1}},
+            True,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"teacache_thresh": 0.1}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "backend": "TRTLLM",
+                    "sparse_attention_config": {"algorithm": "vsa", "vsa_sparsity": 0.5},
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "backend": "TRTLLM",
+                    "sparse_attention_config": {"vsa_sparsity": 0.5},
+                }
+            },
+            False,
+        ),
     ],
 )
 def test_config_validation(
@@ -173,6 +352,283 @@ def test_config_validation(
 ) -> None:
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+def _tagged_unions(node: object):
+    if isinstance(node, dict):
+        if "discriminator" in node:
+            yield node
+        for value in node.values():
+            yield from _tagged_unions(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _tagged_unions(value)
+
+
+def test_tagged_union_branches_require_their_tag(schemas: dict[str, dict]) -> None:
+    unions = [union for schema in schemas.values() for union in _tagged_unions(schema)]
+    assert unions, "No tagged unions found; update this test."
+    for union in unions:
+        tag = union["discriminator"]["propertyName"]
+        for branch in union["oneOf"]:
+            assert tag in branch.get("required", []), (tag, branch)
+
+
+def test_aliased_union_tag_is_required() -> None:
+    from typing import Annotated, Literal, Union
+
+    class First(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        kind: Literal["first"] = Field("first", alias="type")
+        size: int = 1
+
+    class Second(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        kind: Literal["second"] = Field("second", alias="type")
+        rate: float = 1.0
+
+    schema = generator._schema_for(Annotated[Union[First, Second], Field(discriminator="kind")])
+    assert all(branch["required"] == ["type"] for branch in schema["oneOf"])
+    validator = Draft202012Validator(schema)
+    assert not list(validator.iter_errors({"type": "first", "size": 2}))
+    assert list(validator.iter_errors({"size": 2}))
+
+
+@pytest.mark.parametrize(
+    ("owner", "field", "value"),
+    [
+        ("TorchLlmArgs", "speculative_config", {"max_matching_ngram_size": 4, "is_keep_all": True}),
+        ("TorchLlmArgs", "sparse_attention_config", {"kt_cache_dtype": "float8_e5m2"}),
+        ("TorchLlmArgs", "kv_cache_compression_config", {"skip_rope_quantization": True}),
+        ("VisualGenArgs", "cache_config", {"teacache_thresh": 0.1}),
+        ("AttentionConfig", "sparse_attention_config", {"vsa_sparsity": 0.5}),
+    ],
+)
+def test_runtime_rejects_untagged_union_values(owner: str, field: str, value: dict) -> None:
+    from pydantic import TypeAdapter, ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.visual_gen.args import AttentionConfig, VisualGenArgs
+
+    model = {
+        "TorchLlmArgs": TorchLlmArgs,
+        "VisualGenArgs": VisualGenArgs,
+        "AttentionConfig": AttentionConfig,
+    }[owner]
+    with pytest.raises(ValidationError) as excinfo:
+        TypeAdapter(model.model_fields[field].annotation).validate_python(value)
+    assert "union_tag_not_found" in {error["type"] for error in excinfo.value.errors()}
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("preemption", "valid"),
+    [
+        ({}, True),
+        ({"tpot_budget": 0.1}, True),
+        ({"target_output_tps": 40}, True),
+        ({"tpot_budget": None, "target_output_tps": 40}, True),
+        ({"tpot_budget": 0.1, "target_output_tps": None}, True),
+        ({"tpot_budget": None, "target_output_tps": None}, True),
+        ({"tpot_budget": 0}, False),
+        ({"tpot_budget": -0.1}, False),
+        ({"tpot_budget": 1}, False),
+        ({"target_output_tps": 0}, False),
+        ({"target_output_tps": -1}, False),
+        ({"tpot_budget": 0.1, "target_output_tps": 40}, False),
+        ({"policy": "wait"}, False),
+    ],
+)
+def test_gen_preemption_fields(
+    schemas: dict[str, dict], filename: str, preemption: dict, valid: bool
+) -> None:
+    config = {"scheduler_config": {"gen_preemption": preemption}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("field", ["transfer_timeout_sec", "control_grace_sec"])
+@pytest.mark.parametrize(("value", "valid"), [(0.5, True), (0.0, False), (-1.0, False)])
+def test_connector_timeout_constraints(
+    schemas: dict[str, dict], filename: str, field: str, value: float, valid: bool
+) -> None:
+    config = {"kv_connector_config": {"connector": "lmcache", field: value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
+def test_branch_snapshot_field_types(
+    schemas: dict[str, dict], filename: str, section: str, value: bool | str, valid: bool
+) -> None:
+    config = {"kv_cache_config": {section: {"enable_branch_snapshot": value}}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
+def test_dspark_device_reranking_field(
+    schemas: dict[str, dict], filename: str, value: bool | str, valid: bool
+) -> None:
+    field = schemas[filename]["$defs"]["DSparkDecodingConfig"]["properties"][
+        "enable_fused_confidence_scheduler"
+    ]
+    assert field["default"] is True
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 5,
+            "enable_fused_confidence_scheduler": value,
+        }
+    }
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(
+    ("load_balancer", "valid"),
+    [
+        ({"num_slots": 288}, True),
+        ({"mode": "standard", "num_slots": 288, "layer_updates_per_iter": 1}, True),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 4}, True),
+        (
+            {"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "shared_banks"},
+            True,
+        ),
+        # A mapping without mode is standard EPLB, which has no auxiliary_sms.
+        ({"num_slots": 320, "auxiliary_sms": 4}, False),
+        ({"mode": "per_layer_dynamic"}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "layer_updates_per_iter": 1}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
+        ({"mode": "dynamic", "num_slots": 320}, False),
+    ],
+)
+def test_load_balancer_schema_matches_runtime(
+    schemas: dict[str, dict], load_balancer: dict, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import MoeConfig
+
+    config = {"moe_config": {"load_balancer": load_balancer}}
+    errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        MoeConfig(load_balancer=load_balancer)
+    else:
+        with pytest.raises(ValueError):
+            MoeConfig(load_balancer=load_balancer)
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("settings", "valid"),
+    [
+        ({"serve_graceful_shutdown_timeout_s": 30}, True),
+        ({"serve_graceful_shutdown_timeout_s": None}, True),
+        ({"serve_graceful_shutdown_timeout_s": 0}, False),
+        ({"serve_graceful_shutdown_timeout_s": 1.5}, False),
+    ],
+)
+def test_graceful_shutdown_timeout(
+    schemas: dict[str, dict], filename: str, settings: dict, valid: bool
+) -> None:
+    """The graceful shutdown timeout, at the top level or under context_servers."""
+    config = settings if filename == generator.SERVE_SCHEMA else {"context_servers": settings}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("dwdp_config", "valid"),
+    [
+        ({"enable_dense": True, "dwdp_size": 16}, True),
+        ({"enable_dense": False}, True),
+        ({"enable_dense": "always"}, False),
+        ({"enable_dense_dwdp": True}, False),
+        ({"enable_experts": False, "enable_dense": True}, True),
+        ({"enable_experts": "no"}, False),
+        ({"copy_mode": "gather"}, True),
+        ({"copy_mode": "per_slice"}, True),
+        ({"copy_mode": None}, True),
+        ({"copy_mode": "fast"}, False),
+        ({"copy_mode": "gather", "gather_kernel": "tma"}, True),
+        ({"copy_mode": "gather", "gather_kernel": "register"}, True),
+        ({"copy_mode": "gather", "gather_kernel": "fast"}, False),
+    ],
+)
+def test_dense_dwdp_setting(
+    schemas: dict[str, dict], filename: str, dwdp_config: dict, valid: bool
+) -> None:
+    """enable_experts, enable_dense, copy_mode and gather_kernel, also under context_servers."""
+    config = {"dwdp_config": dwdp_config}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+_DENSE_ONLY = {"enable_experts": False, "enable_dense": True}
+
+
+@pytest.mark.parametrize(
+    ("dwdp_config", "error"),
+    [
+        ({}, None),
+        ({"enable_dense": True}, None),
+        ({"enable_experts": True, "enable_dense": False}, None),
+        (_DENSE_ONLY, None),
+        ({**_DENSE_ONLY, "dwdp_size": 1, "contention_opt": False}, None),
+        ({**_DENSE_ONLY, "copy_mode": "gather"}, None),
+        ({"enable_experts": False}, "nothing to distribute"),
+        ({"enable_experts": False, "enable_dense": False}, "nothing to distribute"),
+        ({**_DENSE_ONLY, "dwdp_size": 4}, "configure expert DWDP"),
+        ({**_DENSE_ONLY, "num_groups": 2}, "configure expert DWDP"),
+        (
+            {**_DENSE_ONLY, "num_experts_per_worker": 1, "num_prefetch_experts": 1},
+            "configure expert DWDP",
+        ),
+        ({**_DENSE_ONLY, "contention_opt": True}, "configure expert DWDP"),
+        ({**_DENSE_ONLY, "num_prefetch_slots": 3}, "configure expert DWDP"),
+        ({"contention_opt": True}, None),
+        ({"contention_opt": True, "copy_mode": None}, None),
+        ({"contention_opt": True, "copy_mode": "batched"}, None),
+        ({"contention_opt": True, "copy_mode": "gather"}, "selects batched copies"),
+        ({"contention_opt": True, "copy_mode": "per_slice"}, "selects batched copies"),
+        ({"contention_opt": False, "copy_mode": "gather"}, None),
+        ({"copy_mode": "gather", "gather_kernel": "tma"}, None),
+        ({"copy_mode": "gather", "gather_kernel": None}, None),
+        ({**_DENSE_ONLY, "copy_mode": "gather", "gather_kernel": "register"}, None),
+        ({"gather_kernel": "tma"}, "gather_kernel selects the kernel"),
+        ({"copy_mode": None, "gather_kernel": "tma"}, "gather_kernel selects the kernel"),
+        ({"copy_mode": "batched", "gather_kernel": "register"}, "gather_kernel selects the kernel"),
+    ],
+)
+def test_dwdp_modes_match_runtime(
+    schemas: dict[str, dict], dwdp_config: dict[str, object], error: str | None
+) -> None:
+    """Both schemas accept a DwdpConfig mode combination exactly when DwdpConfig does."""
+    from tensorrt_llm.llmapi.llm_args import DwdpConfig
+
+    if error is None:
+        DwdpConfig(**dwdp_config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            DwdpConfig(**dwdp_config)
+
+    config = {"dwdp_config": dwdp_config}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == (error is None), filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == (error is None), section
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
@@ -288,6 +744,44 @@ def test_llm_model_fields_have_schema(schemas: dict[str, dict]) -> None:
         disagg["$defs"]["DisaggServerBlock"],
     ):
         _assert_model_fields_in_schema(TorchLlmArgs, schema["properties"])
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("config_name", "algorithm"),
+    [("DeepSeekSparseAttentionConfig", "dsa"), ("DeepSeekV4SparseAttentionConfig", "deepseek_v4")],
+)
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_sparse_offload_indexer_default(
+    schemas: dict[str, dict], filename: str, config_name: str, algorithm: str, enabled: bool | None
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import (
+        DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
+    )
+
+    config_cls = {
+        "dsa": DeepSeekSparseAttentionConfig,
+        "deepseek_v4": DeepSeekV4SparseAttentionConfig,
+    }[algorithm]
+    sparse_config: dict[str, str | bool] = {"algorithm": algorithm}
+    if enabled is not None:
+        sparse_config["enable_kv_cache_offload"] = enabled
+    schema = schemas[filename]
+    definition = schema["$defs"][config_name]
+    field = "use_cute_dsl_paged_mqa_logits"
+    assert definition["properties"][field]["default"] is True
+    assert config_cls.model_validate(sparse_config).use_cute_dsl_paged_mqa_logits is True
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"sparse_attention_config": sparse_config})
+    for value in (False, True):
+        explicit = {**sparse_config, field: value}
+        assert validator.is_valid({"sparse_attention_config": explicit})
+        assert config_cls.model_validate(explicit).use_cute_dsl_paged_mqa_logits is value
+    for invalid in (None, "invalid", 2):
+        assert not validator.is_valid(
+            {"sparse_attention_config": {**sparse_config, field: invalid}}
+        )
 
 
 def test_model_field_guard_detects_missing_fields_and_aliases() -> None:
@@ -459,6 +953,39 @@ def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:
         assert not validator.is_valid({"node_id": value})
 
 
+@pytest.mark.parametrize(
+    ("partition", "valid"),
+    [
+        ({}, True),
+        ({"num_experts_per_worker": 0, "num_prefetch_experts": 0}, True),
+        ({"num_experts_per_worker": 1, "num_prefetch_experts": 1}, True),
+        ({"num_experts_per_worker": 2, "num_prefetch_experts": 1}, True),
+        ({"num_experts_per_worker": 1}, False),
+        ({"num_prefetch_experts": 1}, False),
+        ({"num_experts_per_worker": 0, "num_prefetch_experts": 1}, False),
+        ({"num_experts_per_worker": 1, "num_prefetch_experts": 0}, False),
+    ],
+)
+def test_dwdp_expert_partition_matches_runtime(
+    schemas: dict[str, dict], partition: dict[str, int], valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import DwdpConfig
+
+    if valid:
+        DwdpConfig(**partition)
+    else:
+        with pytest.raises(ValueError, match="set both"):
+            DwdpConfig(**partition)
+
+    config = {"dwdp_config": partition}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section
+
+
 def test_runtime_only_union_does_not_disable_validation() -> None:
     class RuntimeObject:
         pass
@@ -507,6 +1034,45 @@ def test_runtime_only_fields_are_preserved(nullable: bool, union: bool) -> None:
     assert not validator.is_valid({})
     for value in (None, "name", 1, True, [], {}):
         assert validator.is_valid({"external_hook": value}) == (nullable and value is None)
+
+
+@pytest.mark.parametrize("decoding_type", ["Eagle", "Eagle3"])
+def test_eagle_yaml_draft_length(schemas: dict[str, dict], decoding_type: str) -> None:
+    from pydantic import TypeAdapter, ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import SpeculativeConfig
+
+    config = yaml.safe_load(f"""
+speculative_config:
+  decoding_type: {decoding_type}
+  speculative_model: /path/to/draft
+  max_draft_len: 8
+""")
+    adapter = TypeAdapter(SpeculativeConfig)
+    parsed = adapter.validate_python(config["speculative_config"])
+    assert parsed.max_draft_len == 8
+    assert parsed.max_total_draft_tokens == 8
+    assert adapter.validate_json(parsed.model_dump_json()).max_draft_len == 8
+
+    validators = [
+        Draft202012Validator(schemas[generator.SERVE_SCHEMA]),
+        Draft202012Validator(schemas[generator.DISAGG_SCHEMA]),
+    ]
+    for validator in validators:
+        validator.validate(config)
+    for section in ("context_servers", "generation_servers"):
+        validators[1].validate({section: config})
+
+    for retired_value in (None, 8):
+        invalid = copy.deepcopy(config)
+        invalid["speculative_config"]["num_eagle_layers"] = retired_value
+        invalid = yaml.safe_load(yaml.safe_dump(invalid))
+        with pytest.raises(ValidationError, match="num_eagle_layers"):
+            adapter.validate_python(invalid["speculative_config"])
+        for validator in validators:
+            assert not validator.is_valid(invalid)
+        for section in ("context_servers", "generation_servers"):
+            assert not validators[1].is_valid({section: invalid})
 
 
 def test_nested_validation_alias(schemas: dict[str, dict]) -> None:
@@ -607,6 +1173,8 @@ def test_checked_in_schemas_are_current() -> None:
 def test_check_detects_stale_files_without_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
+    for name in ("generate_serve_schema", "generate_disagg_schema", "generate_visual_gen_schema"):
+        monkeypatch.setitem(generator.write_schemas.__globals__, name, lambda: {"type": "object"})
     paths = generator.write_schemas(tmp_path)
     generator.write_schemas(tmp_path, check=True)
     if change == "missing":
@@ -614,12 +1182,190 @@ def test_check_detects_stale_files_without_writing(
     elif change == "modified":
         paths[0].write_text("{}\n", encoding="utf-8")
     else:
-        from tensorrt_llm import version
-
-        monkeypatch.setattr(version, "__version__", version.__version__ + ".post1")
+        version = generator._source_version() + ".post1"
+        monkeypatch.setitem(generator.write_schemas.__globals__, "_source_version", lambda: version)
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     with pytest.raises(ValueError, match="Missing or stale configuration schemas"):
         generator.write_schemas(tmp_path, check=True)
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
     generator.write_schemas(tmp_path)
     generator.write_schemas(tmp_path, check=True)
+
+
+def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> None:
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    for filename, command in generator._SCHEMA_COMMANDS.items():
+        (schema_dir / filename).write_text(
+            json.dumps(
+                {
+                    "$comment": "preserve this metadata",
+                    "$id": f"https://example.invalid/old/{filename}",
+                    "title": f"TensorRT-LLM old {command}",
+                    "sentinel": {"preserved": True},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    command = [
+        sys.executable,
+        "-S",
+        str(_REPO_ROOT / "scripts/generate_trtllm_serve_schemas.py"),
+        "--sync-version",
+        "--output-dir",
+        str(schema_dir),
+    ]
+    before_sync = {path.name: path.read_bytes() for path in schema_dir.iterdir()}
+    result = subprocess.run(command + ["--check"], capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0
+    assert "Missing or stale configuration schemas" in result.stderr
+    assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_sync
+
+    subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
+    version = generator._source_version()
+    before_check = {}
+    for filename, expected_command in generator._SCHEMA_COMMANDS.items():
+        path = schema_dir / filename
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        assert schema["$id"] == f"{generator._DOCS_URL}/{version}/_static/schemas/{filename}"
+        assert schema["title"] == f"TensorRT-LLM {version} {expected_command}"
+        assert schema["$comment"] == "preserve this metadata"
+        assert schema["sentinel"] == {"preserved": True}
+        before_check[filename] = path.read_bytes()
+
+    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True, timeout=60)
+    assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_check
+
+
+@pytest.mark.parametrize(("indent", "sort_keys"), [(None, True), (2, False)])
+def test_version_metadata_sync_preserves_current_file_formatting(
+    tmp_path: Path, indent: int | None, sort_keys: bool
+) -> None:
+    """Current metadata must pass checks and updates without reformatting JSON."""
+    version = generator._source_version()
+    for filename, command in generator._SCHEMA_COMMANDS.items():
+        schema = {
+            "type": "object",
+            "title": f"TensorRT-LLM {version} {command}",
+            "$id": f"{generator._DOCS_URL}/{version}/_static/schemas/{filename}",
+        }
+        (tmp_path / filename).write_text(
+            json.dumps(schema, indent=indent, sort_keys=sort_keys) + "\n", encoding="utf-8"
+        )
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    for check in (True, False):
+        generator.sync_schema_version_metadata(tmp_path, check=check)
+        assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+@pytest.mark.parametrize("change", ["missing", "malformed"])
+def test_version_metadata_sync_validates_all_files_before_writing(
+    tmp_path: Path, change: str
+) -> None:
+    """A bad final snapshot must not leave preceding snapshots modified."""
+    paths = [tmp_path / filename for filename in generator._SCHEMA_COMMANDS]
+    for path in paths:
+        path.write_text('{"type": "object", "title": "old"}\n', encoding="utf-8")
+    if change == "missing":
+        paths[-1].unlink()
+        error = ValueError
+    else:
+        paths[-1].write_text("{\n", encoding="utf-8")
+        error = json.JSONDecodeError
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    with pytest.raises(error):
+        generator.sync_schema_version_metadata(tmp_path)
+
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+_EXPERT_LAUNCH = {"dwdp_config": {"dwdp_size": 16}, "cuda_graph_config": None}
+_ATTACHED_LAUNCH = {
+    "dwdp_config": {"dwdp_size": 16, "enable_dense": True},
+    "cuda_graph_config": None,
+    "disable_overlap_scheduler": True,
+}
+_STANDALONE_LAUNCH = {
+    "dwdp_config": _DENSE_ONLY,
+    "cuda_graph_config": None,
+    "tensor_parallel_size": 4,
+    "enable_attention_dp": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("launch", "error"),
+    [
+        (_EXPERT_LAUNCH, None),
+        ({**_EXPERT_LAUNCH, "dwdp_config": {"dwdp_size": 1}}, "dwdp_size > 1"),
+        ({**_EXPERT_LAUNCH, "cuda_graph_config": {}}, "does not support CUDA graphs"),
+        ({**_EXPERT_LAUNCH, "pipeline_parallel_size": 2}, "pipeline and context parallelism"),
+        (_ATTACHED_LAUNCH, None),
+        (
+            {**_ATTACHED_LAUNCH, "tensor_parallel_size": 2, "enable_attention_dp": True},
+            "with tensor",
+        ),
+        ({**_ATTACHED_LAUNCH, "disable_overlap_scheduler": False}, "disable_overlap_scheduler"),
+        ({**_ATTACHED_LAUNCH, "torch_compile_config": {}}, "torch_compile_config=None"),
+        ({**_ATTACHED_LAUNCH, "sleep_config": {}}, "sleep_config=None"),
+        ({**_ATTACHED_LAUNCH, "enable_locality_domains": True}, "enable_locality_domains"),
+        (_STANDALONE_LAUNCH, None),
+        ({**_STANDALONE_LAUNCH, "tensor_parallel_size": 1}, "tensor_parallel_size=1"),
+        ({**_STANDALONE_LAUNCH, "enable_attention_dp": False}, "enable_attention_dp=False"),
+        ({**_STANDALONE_LAUNCH, "cuda_graph_config": {}}, "cuda_graph_config=None"),
+        ({**_STANDALONE_LAUNCH, "lora_config": {}}, "lora_config=None"),
+        ({**_STANDALONE_LAUNCH, "pipeline_parallel_size": 2}, "pipeline_parallel_size=1"),
+    ],
+)
+def test_dwdp_launch_rules_match_runtime(
+    schemas: dict[str, dict], launch: dict[str, object], error: str | None
+) -> None:
+    """Both schemas refuse the values TorchLlmArgs.validate_dwdp_launch() refuses.
+
+    They refuse them at the top level and in each server block of a disaggregated configuration.
+    """
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    if error is None:
+        TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
+    else:
+        with pytest.raises(ValueError, match=error):
+            TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
+
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(launch) == (error is None), filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: launch}) == (error is None), section
+
+
+@pytest.mark.parametrize(
+    "launch",
+    [
+        {"dwdp_config": {"dwdp_size": 16}},
+        {"dwdp_config": {"dwdp_size": 16, "enable_dense": True}},
+        {"dwdp_config": _DENSE_ONLY},
+    ],
+    ids=["expert", "attached", "standalone"],
+)
+def test_dwdp_launch_rules_leave_unset_fields_to_runtime(
+    schemas: dict[str, dict], launch: dict[str, object]
+) -> None:
+    """The schemas accept a launch that leaves out a field the DWDP rules constrain.
+
+    The field may come from the command line or, in a disaggregated configuration, from the top
+    level, so runtime validation decides.
+    """
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    with pytest.raises(ValueError, match="DWDP"):
+        TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        assert Draft202012Validator(schemas[filename]).is_valid(launch), filename

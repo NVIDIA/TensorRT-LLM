@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -667,6 +667,10 @@ def run(
     torch_stream = torch.cuda.current_stream()
     # Get the raw stream pointer as a CUstream
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
+
+    # Read only by kernels built with use_expert_counts=True, which this driver does not set.
+    expert_capacity = cutlass.Int32(0)
+
     # Compile gemm kernel
     # sfc_tensor is optional and can be set as None (Python's None value) if not needed.
     compiled_gemm = cute.compile(
@@ -683,6 +687,7 @@ def run(
         token_id_mapping,
         num_non_exiting_tiles,
         alpha,
+        expert_capacity,
         max_active_clusters,
         current_stream,
     )
@@ -701,6 +706,7 @@ def run(
         token_id_mapping,
         num_non_exiting_tiles,
         alpha,
+        expert_capacity,
         current_stream,
     )
 
@@ -1024,6 +1030,7 @@ def run(
             token_id_mapping,
             num_non_exiting_tiles,
             alpha,
+            expert_capacity,
             current_stream,
         )
 

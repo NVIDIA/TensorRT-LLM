@@ -7,6 +7,7 @@ import gc
 import json
 import os
 import time
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -423,8 +424,9 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
         if isinstance(v, torch.Tensor):
             return v.clone()
         if isinstance(v, Modality):
-            # NOTE: must be kept in sync with Modality dataclass fields.
-            return Modality(
+            # Preserve modality subclasses when cloning the shared tensor fields.
+            return replace(
+                v,
                 latent=v.latent.clone(),
                 timesteps=v.timesteps.clone(),
                 positions=v.positions.clone(),
@@ -640,6 +642,10 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    _transformer_class = LTXModel
+    _cuda_graph_runner_class = _LTX2CUDAGraphRunner
+    _supports_quantized_attention = False
+
     def __init__(self, model_config):
         _sa_cfg = model_config.attention.sparse_attention_config
         if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
@@ -765,7 +771,11 @@ class LTX2Pipeline(BasePipeline):
         fall back to the same defaults the reference uses.
         """
         attn_cfg = getattr(self.pipeline_config, "attention", None)
-        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
+        if (
+            attn_cfg is not None
+            and getattr(attn_cfg, "quant_attention_config", None) is not None
+            and not self._supports_quantized_attention
+        ):
             raise NotImplementedError(
                 "Quantized attention is not yet supported for the LTX-2 pipeline."
             )
@@ -784,7 +794,7 @@ class LTX2Pipeline(BasePipeline):
             f"apply_gated_attention={apply_gated_attention}"
         )
 
-        self.transformer = LTXModel(
+        self.transformer = self._transformer_class(
             model_type=LTXModelType.AudioVideo,
             num_attention_heads=getattr(cfg, "num_attention_heads", 32),
             attention_head_dim=getattr(cfg, "attention_head_dim", 128),
@@ -847,7 +857,7 @@ class LTX2Pipeline(BasePipeline):
         if not self.pipeline_config.cuda_graph.enable:
             return
 
-        runner = _LTX2CUDAGraphRunner(
+        runner = self._cuda_graph_runner_class(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._get_or_create_cuda_graph_shared_pool(),
         )

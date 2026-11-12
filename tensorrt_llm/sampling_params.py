@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import json
+import operator
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, make_dataclass
 from typing import Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -137,7 +139,11 @@ class LogitsProcessor(ABC):
             req_id (int): Request id.
             logits (torch.Tensor): Logits tensor to be modified.
             token_ids (List[List[int]]): Token ids produced by the request so far.
-                The shape is beam_width * sequence_length.
+                The shape is beam_width * sequence_length. Under beam search on the
+                PyTorch backend, row ``i`` is the prompt plus the hypothesis held by the
+                beam whose logits are row ``i`` of ``logits``; beams that already
+                finished are not included. With the overlap scheduler the history
+                trails the beam's newest token by one step, as for every request.
             stream_ptr (int, optional): The operation stream used by the logits tensor.
                 Not required for PyTorch backend.
             client_id (int, optional): An optional client id.
@@ -256,6 +262,7 @@ class SamplingParams:
 
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
         thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
+        watermarking (bool, optional): Whether to watermark the generated text. Takes effect only when the engine is configured with `watermark_config`. None or True requests a watermark; False opts this request out (unless the engine sets `allow_request_opt_out=False`). Greedy and beam-search requests cannot carry a watermark and are generated normally. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -342,6 +349,8 @@ class SamplingParams:
     guided_decoding: Optional[GuidedDecodingParams] = None
     thinking_token_budget: Optional[int] = None
 
+    watermarking: Optional[bool] = None
+
     # Tokenizer-related configs
     ignore_eos: bool = False
     detokenize: bool = True
@@ -370,6 +379,12 @@ class SamplingParams:
                 self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
 
         self._validate()
+
+    def __reduce_ex__(self, protocol):
+        # Pickle the field values in field order; subclasses may add fields.
+        if type(self) is not SamplingParams:
+            return object.__reduce_ex__(self, protocol)
+        return _restore_sampling_params, (_get_sampling_params_state(self),)
 
     def _validate(self):
         """Verify the sampling parameters.
@@ -665,7 +680,7 @@ class SamplingParams:
         # | Sampling    | use_beam_search | beam_width == 1        |
         # | Sampling    | n               | num_return_sequences   |
         # | Sampling    | best_of         | no corresponding param |
-        fields = {f for f in dir(tllme.SamplingConfig) if not f.startswith("__")}
+        fields = _sampling_config_fields()
         unmatched_params = [
             "num_return_sequences",
             "beam_width",
@@ -684,12 +699,7 @@ class SamplingParams:
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(self) -> tllme.OutputConfig:
-        sampling_param_fields = set(dir(SamplingParams))
-        fields = [
-            f
-            for f in dir(tllme.OutputConfig)
-            if not f.startswith("__") and f in sampling_param_fields
-        ]
+        fields = _output_config_fields()
 
         config_kwargs = {f: getattr(self, f) for f in fields}
 
@@ -700,13 +710,9 @@ class SamplingParams:
                 "internally enabling context logits for prompt logprobs computation. "
                 "context logits will be dropped after computation as the user didn't explicitly request them."
             )
-            # TODO: Find a more elegant way to do this.
-            # NOTE: This is an internal hack, so we can entirely avoid introducing
-            # `prompt_logprobs` into the executor bindings and further into
-            # model engine / sampler.
-            # This is because, prompt_logprobs is a derived quantity from
-            # context logits, and the capability to post-compute it
-            # already exists in the worker. (see _get_logprobs in base_worker.py)
+            # The context-output flag requests per-position predictions.
+            # Python workers carry prompt-logprob options separately to
+            # distinguish compact probability results from full logits.
             config_kwargs["return_context_logits"] = True
 
         if config_kwargs.get("additional_model_outputs") is not None:
@@ -747,3 +753,35 @@ class SamplingParams:
             )
         else:
             return None
+
+
+_SAMPLING_PARAMS_FIELDS = tuple(f.name for f in fields(SamplingParams))
+_get_sampling_params_state = operator.attrgetter(*_SAMPLING_PARAMS_FIELDS)
+# Only its generated ``__init__`` is used: one store per field, no ``__post_init__``.
+_set_sampling_params_state = make_dataclass(
+    "_SamplingParamsState", _SAMPLING_PARAMS_FIELDS, repr=False, eq=False
+).__init__
+
+
+def _restore_sampling_params(state: tuple) -> "SamplingParams":
+    sampling_params = object.__new__(SamplingParams)
+    _set_sampling_params_state(sampling_params, *state)
+    return sampling_params
+
+
+@functools.cache
+def _sampling_config_fields() -> frozenset[str]:
+    """Return the ``tllme.SamplingConfig`` field names.
+
+    They are fixed by the bindings, so the ``dir()`` scan runs once instead of once per request.
+    """
+    return frozenset(f for f in dir(tllme.SamplingConfig) if not f.startswith("__"))
+
+
+@functools.cache
+def _output_config_fields() -> tuple[str, ...]:
+    """Return the ``tllme.OutputConfig`` field names that ``SamplingParams`` also defines."""
+    sampling_param_fields = set(dir(SamplingParams))
+    return tuple(
+        f for f in dir(tllme.OutputConfig) if not f.startswith("__") and f in sampling_param_fields
+    )

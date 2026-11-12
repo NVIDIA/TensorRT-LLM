@@ -19,6 +19,8 @@ and answers the internal coordination API that the forked worker processes call:
 
     POST /select   {"role", "routing_key", "req_id", "exclude_server"}
       -> {"server": "host:port", "info": {...}, "req_id": <int|null>}
+         ("server" is null, and nothing is reserved, when the router needs
+         more routing input, e.g. info["routing_content_required"])
     POST /finish   {"role", "req_id", "success"}  -> {}
     POST /renew    {"role", "req_id"}  -> {}
     GET  /cluster_info -> {...}

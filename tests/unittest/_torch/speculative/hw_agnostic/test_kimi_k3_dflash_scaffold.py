@@ -393,7 +393,17 @@ def test_capture_taps_the_next_layers_aggregated_stream():
             self.layer_idx = idx
             self.proj, self.norm = layer_w[idx]
 
-        def __call__(self, hidden_states, block_residual, num_snapshots, attn_metadata, capture):
+        def __call__(
+            self,
+            hidden_states,
+            block_residual,
+            num_snapshots,
+            attn_metadata,
+            capture,
+            helix_a2a=None,
+            defer_moe_residual=False,
+            fresh_block_residual=False,
+        ):
             # What the real layer computes on the way into its attention, and
             # hands to the tap: the aggregated stream the previous layer's
             # consumer sees.
@@ -423,6 +433,8 @@ def test_capture_taps_the_next_layers_aggregated_stream():
         output_attn_res_proj=out_proj,
         output_attn_res_norm=out_norm,
         num_attn_res_snapshots=num_layers,
+        helix_a2a=None,
+        helix_a2a_first_layer=num_layers,
     )
 
     KimiLinearModel.forward(
@@ -499,11 +511,12 @@ def test_aux_capture_taps_the_selected_stream(monkeypatch, aggregated):
         attn_res_block_size=4,
         input_layernorm=lambda h: h,
         is_kda=True,
-        linear_attn=lambda h, md: torch.zeros_like(h),
+        linear_attn=lambda h, md, prequantized_input=None: torch.zeros_like(h),
         mlp_res_proj=proj,
         mlp_res_norm=norm,
         post_attention_layernorm=lambda h: h,
         is_moe=False,
+        token_sliced=False,
         mlp=lambda h: torch.zeros_like(h),
     )
     spec_md = SimpleNamespace(
@@ -554,7 +567,17 @@ def test_aux_capture_tail_follows_the_same_switch(monkeypatch, aggregated):
         def __init__(self, idx):
             self.layer_idx = idx
 
-        def __call__(self, hidden_states, block_residual, num_snapshots, attn_metadata, capture):
+        def __call__(
+            self,
+            hidden_states,
+            block_residual,
+            num_snapshots,
+            attn_metadata,
+            capture,
+            helix_a2a=None,
+            defer_moe_residual=False,
+            fresh_block_residual=False,
+        ):
             block_residual[num_snapshots] = hidden_states * (self.layer_idx + 1)
             return hidden_states + (self.layer_idx + 1), num_snapshots + 1
 
@@ -575,6 +598,8 @@ def test_aux_capture_tail_follows_the_same_switch(monkeypatch, aggregated):
         output_attn_res_proj=out_proj,
         output_attn_res_norm=out_norm,
         num_attn_res_snapshots=num_layers,
+        helix_a2a=None,
+        helix_a2a_first_layer=num_layers,
     )
 
     mkl.KimiLinearModel.forward(

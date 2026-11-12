@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
+#include "tensorrt_llm/nanobind/common/tokenIds.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/ATen.h>
@@ -150,10 +151,8 @@ void initBindings(nb::module_& m)
         .def("set_generated_tokens", &GenLlmReq::setGeneratedTokens, nb::arg("generated_beam_tokens"))
         .def("pause", &GenLlmReq::pause, nb::arg("max_input_len"))
         .def_prop_rw("max_sent_token_len", &GenLlmReq::getMaxSentTokenLen, &GenLlmReq::setMaxSentTokenLen)
-        .def_prop_ro("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
         .def_prop_rw("lora_config", &GenLlmReq::getLoraConfig, &GenLlmReq::setLoraConfig)
         .def_prop_rw("lora_weights", &GenLlmReq::getLoraWeights, &GenLlmReq::setLoraWeights)
-        .def_prop_ro("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
         .def_prop_ro("lora_task_id", &GenLlmReq::getLoraTaskId)
         .def_prop_rw("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
         .def_prop_rw("decoding_iter", &GenLlmReq::getDecodingIter, &GenLlmReq::setDecodingIter)
@@ -237,6 +236,16 @@ void initBindings(nb::module_& m)
                     hashes = *self.getMultimodalHashes().value();
                 }
                 return hashes;
+            })
+        .def_prop_ro("multimodal_uuids",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<std::optional<std::string>>> uuids = std::nullopt;
+                if (self.getMultimodalUuids())
+                {
+                    uuids = *self.getMultimodalUuids().value();
+                }
+                return uuids;
             })
         .def_prop_ro("multimodal_positions",
             [](GenLlmReq& self)
@@ -347,10 +356,8 @@ void initBindings(nb::module_& m)
         .def(
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
+                tb::LlmRequest::SizeType32 max_new_tokens, nb::handle input_tokens_handle,
                 executor::SamplingConfig sampling_config, bool is_streaming,
-                std::optional<at::Tensor> prompt_embedding_table,
-                std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
                 std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_lengths,
@@ -381,13 +388,12 @@ void initBindings(nb::module_& m)
                     return tensorPtr;
                 };
 
-                auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
 
-                new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
-                    prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,
-                    multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
+                new (self) tb::LlmRequest{request_id, max_new_tokens, NanobindUtils::toVecTokens(input_tokens_handle),
+                    sampling_config, is_streaming, multimodal_hashes, multimodal_positions, multimodal_lengths,
+                    multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
                     kv_cache_retention_config, draft_tokens, exclude_input_from_output, encoder_input_tokens, priority,
                     encoder_input_length, encoder_output_length, llm_request_type, input_token_extra_ids,
                     return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
@@ -395,8 +401,7 @@ void initBindings(nb::module_& m)
                     std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
-            nb::arg("is_streaming"), nb::arg("prompt_embedding_table") = std::nullopt,
-            nb::arg("prompt_vocab_size") = std::nullopt, nb::arg("multimodal_hashes") = std::nullopt,
+            nb::arg("is_streaming"), nb::arg("multimodal_hashes") = std::nullopt,
             nb::arg("multimodal_positions") = std::nullopt, nb::arg("multimodal_lengths") = std::nullopt,
             nb::arg("multimodal_uuids") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
             nb::arg("lora_weights") = std::nullopt, nb::arg("lora_config") = std::nullopt,
@@ -412,9 +417,13 @@ void initBindings(nb::module_& m)
             nb::arg("cache_salt") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
+        .def(nb::init<tb::LlmRequest const&, tb::LlmRequest::RequestIdType>(), nb::arg("parent_request"),
+            nb::arg("child_id"))
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
             nb::arg("max_draft_len"), nb::arg("enable_kv_cache_reuse") = false)
         .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
+        .def("_register_child_request", &tb::LlmRequest::registerChildRequest, nb::arg("child"))
+        .def_prop_ro("_native_child_requests", &GenLlmReq::getChildRequests)
         .def("create_result", &tb::LlmRequest::createResult)
         .def("create_serialized_result",
             [](tb::LlmRequest& self)

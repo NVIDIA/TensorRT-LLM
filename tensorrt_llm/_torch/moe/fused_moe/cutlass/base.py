@@ -36,12 +36,7 @@ from ..activation import (
     MoEActivationSupport,
 )
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
-from ..impl_contract import (
-    MoERunContext,
-    identity_quant_of,
-    require_comm_plan,
-    require_layer_quant_format,
-)
+from ..impl_contract import MoERunContext, require_comm_plan
 from ..impl_environment import collect_moe_environment
 from ..quantization import MoEWeightLoadingMode
 from ..routing import BaseMoeRoutingMethod
@@ -143,18 +138,6 @@ class CutlassFusedMoEBase(MoEImplBase):
         limit=ActivationParamShape.PER_EXPERT_TENSOR,
         clamp_after_silu=True,
     )
-
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        super().__init_subclass__(**kwargs)
-        descriptor = cls.__dict__.get("descriptor")
-        if descriptor is None:
-            return
-        # The scheduler reads these as class attributes and the registry
-        # publishes the descriptor; deriving one from the other leaves a single
-        # source.
-        cls.scheduler_kind = descriptor.scheduler_kind
-        cls.capabilities = descriptor.capabilities
-        cls.input_requirement = descriptor.input_requirement
 
     def __init__(
         self,
@@ -263,13 +246,6 @@ class CutlassFusedMoEBase(MoEImplBase):
             return
         self._check_quant_config_is_my_format()
         super().create_weights()
-
-    def _check_quant_config_is_my_format(self) -> None:
-        """Fail loudly if this layer ended up on a leaf of the wrong format.
-
-        See :func:`..impl_contract.require_layer_quant_format`.
-        """
-        require_layer_quant_format(self, identity_quant_of(type(self)))
 
     def _check_configs(self) -> None:
         assert self._weights_created

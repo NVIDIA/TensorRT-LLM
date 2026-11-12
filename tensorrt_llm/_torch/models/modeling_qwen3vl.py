@@ -23,8 +23,11 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 )
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    VisionNormalization,
     _is_mm_disagg,
     filter_mm_token_from_input_ids,
+    normalize_vision_pixels,
+    vision_normalization_from_processor,
 )
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -38,7 +41,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
+from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -62,6 +65,7 @@ from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
+    _qwen_vision_item_partitions,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -89,7 +93,8 @@ def _expand_prompt_token_ids_for_mm_handoff(
     image_token_id: int,
     video_token_id: int,
     vision_start_token_id: int,
-) -> DisaggPrefillMultimodalInputs:
+    mm_hashes: list[list[int]] | None = None,
+) -> tuple[list[int], MultimodalParams]:
     """Expand Qwen3-VL image/video placeholders and emit sparse MM layout.
 
     Qwen handoff has one coarse <image_pad> or <video_pad> token per item.
@@ -120,7 +125,8 @@ def _expand_prompt_token_ids_for_mm_handoff(
 
     mm_token_lengths: List[int] = []
     mm_token_offsets: List[int] = []
-    item_types: List[int] = []
+    item_refs: list[tuple[str, int]] = []
+    local_counts = {"image": 0, "video": 0}
     item_run_cu_offsets: List[int] = [0]
     run_positions: List[int] = []
     run_lengths: List[int] = []
@@ -147,7 +153,9 @@ def _expand_prompt_token_ids_for_mm_handoff(
         mm_token_offsets.append(run_start)
         mm_token_lengths.append(prompt_mm_length)
         multimodal_embedding_lengths.append(mm_token_num)
-        item_types.append(0 if token_id == image_token_id else 1)
+        modality = "image" if token_id == image_token_id else "video"
+        item_refs.append((modality, local_counts[modality]))
+        local_counts[modality] += 1
         run_positions.append(run_start)
         run_lengths.append(prompt_mm_length)
         item_run_cu_offsets.append(len(run_positions))
@@ -162,17 +170,18 @@ def _expand_prompt_token_ids_for_mm_handoff(
     if write_pos != final_length:
         raise RuntimeError(f"Write position mismatch: {write_pos} != {final_length}")
 
-    return DisaggPrefillMultimodalInputs(
-        prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+    params = MultimodalParams.from_embeddings(
+        mm_handles,
+        MultimodalItemMetadata(item_refs, output_embedding_lengths=multimodal_embedding_lengths),
+        multimodal_hashes=mm_hashes,
         multimodal_lengths=mm_token_lengths,
         multimodal_positions=mm_token_offsets,
-        multimodal_embedding_lengths=multimodal_embedding_lengths,
         multimodal_item_run_cu_offsets=item_run_cu_offsets,
         multimodal_run_positions=run_positions,
         multimodal_run_lengths=run_lengths,
         special_token_offsets=special_token_offsets,
-        item_types=item_types,
     )
+    return expanded_ids.to(torch.int32).tolist(), params
 
 
 def _decide_do_sample_frames(
@@ -422,7 +431,13 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 m["total_num_frames"] = len(vd.frames)
                 video_metadata.append(m)
 
-        return self.processor(
+        do_rescale = proc_kwargs.pop("do_rescale", do_rescale)
+        normalization = self._get_vision_normalization(mm_data, mm_processor_kwargs)
+        host_do_rescale = do_rescale
+        if normalization:
+            do_rescale = False
+            proc_kwargs["do_normalize"] = False
+        processor_kwargs = dict(
             text=[text],
             images=images,
             videos=videos,
@@ -432,6 +447,46 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             video_metadata=video_metadata,
             **proc_kwargs,
         )
+        processed = self.processor(**processor_kwargs)
+        if normalization:
+            if any(
+                modality in normalization and processed[pixel_key].dtype != torch.uint8
+                for modality, pixel_key in (
+                    ("image", "pixel_values"),
+                    ("video", "pixel_values_videos"),
+                )
+            ):
+                # The processor returned non-uint8 pixels even with rescale and normalize off, so
+                # the device lookup table cannot be applied. Rerun it with the host settings.
+                processor_kwargs["do_rescale"] = host_do_rescale
+                processor_kwargs.pop("do_normalize")
+                return self.processor(**processor_kwargs)
+            processed["vision_normalization"] = normalization
+        return processed
+
+    def _get_vision_normalization(
+        self, mm_data: dict[str, Any], mm_processor_kwargs: dict[str, Any]
+    ) -> dict[str, VisionNormalization]:
+        if not self._vision_gpu_normalize or mm_processor_kwargs:
+            return {}
+
+        normalization = {}
+        for modality in ("image", "video"):
+            items = mm_data.get(modality)
+            if not items:
+                continue
+            frames = (
+                items if modality == "image" else [frame for item in items for frame in item.frames]
+            )
+            processor = getattr(self.processor, f"{modality}_processor", None)
+            params = vision_normalization_from_processor(frames, processor, self.dtype)
+            if params is None:
+                return {}
+            # The existing CPU call forces rescale on for raw images and videos.
+            if not processor.do_rescale:
+                return {}
+            normalization[modality] = params
+        return normalization
 
     def get_num_tokens_per_video(
         self,
@@ -482,21 +537,24 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     def build_disagg_prefill_multimodal_inputs(
-        self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
-    ) -> DisaggPrefillMultimodalInputs:
+        self,
+        inputs: TextPrompt,
+        mm_handles: List[Dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
             mm_handles: List of multimodal embedding handles.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
-        # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
@@ -525,6 +583,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
             vision_start_token_id=self.config.vision_start_token_id,
+            mm_hashes=mm_hashes,
         )
 
 
@@ -936,6 +995,15 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._rope_position_ids_buffer = torch.arange(
             max_num_tokens, dtype=torch.int32, device=self.device
         )
+        if (
+            self.model_config.multimodal_config is not None
+            and self.model_config.multimodal_config.vision_gpu_normalize
+        ):
+            # Warm the shared lookup kernel for the encoder output dtype.
+            normalize_vision_pixels(
+                torch.zeros((1, 1, 1024), dtype=torch.uint8, device=self.device),
+                VisionNormalization(1.0, (0.0,), (1.0,), self.patch_embed.proj.weight.dtype),
+            )
 
     def set_attn_max_seq_len(self, max_seq_len: int) -> None:
         if max_seq_len <= 0:
@@ -1203,6 +1271,10 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        if pixel_values.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(
+                f"Patch projection requires normalized floating pixels, got {pixel_values.dtype}"
+            )
         grid_rows = grid_thw.tolist()
         seq_lens: List[int] = []
         for t, h, w in grid_rows:
@@ -1301,7 +1373,21 @@ def _qwen3vl_build_batched_input(
         for mp in multimodal_params:
             bucket = mp.multimodal_data.get(m)
             if bucket is not None:
-                pixels.append(bucket[pv_key])
+                if bucket[pv_key].dtype not in (
+                    torch.uint8,
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                ):
+                    raise ValueError(f"Unsupported pixel dtype: {bucket[pv_key].dtype}")
+                pixel_values = bucket[pv_key]
+                if pixel_values.dtype == torch.uint8:
+                    # Normalize each raw bucket before concatenation can promote its dtype.
+                    shape = pixel_values.shape
+                    pixel_values = normalize_vision_pixels(
+                        pixel_values.view(-1, 3, shape[-1] // 3), bucket["vision_normalization"]
+                    ).view(shape)
+                pixels.append(pixel_values)
                 grids.append(bucket[thw_key])
     return {
         "pixel_values": torch.cat(pixels, dim=0),
@@ -1379,6 +1465,8 @@ class Qwen3VisionModelBase(nn.Module):
         the hidden dim. Modality-agnostic — image and video items are
         distinguished only by ``grid_thw`` rows (image ``t=1``, video ``t>1``).
         """
+        if pixel_values.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported pixel dtype: {pixel_values.dtype}")
         pixel_values = pixel_values.to(self.model_dtype)
         embeds, deepstack = self.visual(pixel_values, grid_thw=grid_thw)
         # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
@@ -1409,13 +1497,21 @@ class Qwen3VisionModelBase(nn.Module):
         `split_lengths`, so the rows must be in request-then-prompt order.
         Delegating to `encode_multimodal_by_groups` runs the same
         modality-batched ViT the aggregated path uses and applies the
-        per-request `mm_item_order` reorder before returning.
+        per-request `item_metadata.item_refs` reorder before returning.
         """
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_mm_encoder_item_scheduling = True
+    supports_vision_gpu_normalize = True
+
+    def get_multimodal_item_partitions(
+        self,
+        param: MultimodalParams,
+        modality: str,
+    ) -> dict[str, MultimodalItemPartition] | None:
+        return _qwen_vision_item_partitions(param, modality)
 
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
@@ -1491,9 +1587,12 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
                 persistent=False,
             )
             rotary_dim = self.rotary_emb.rotary_cos_sin.shape[-1]
+            # Zero-filled so that every rank and role starts from identical
+            # buffer bytes; weight manifests and staged-receiver checks hash
+            # and compare buffers byte for byte.
             self.register_buffer(
                 "mrope_rotary_cos_sin_workspace",
-                torch.empty(
+                torch.zeros(
                     (1, model_config.max_num_tokens * rotary_dim * 2),
                     dtype=torch.float32,
                     device="cuda",

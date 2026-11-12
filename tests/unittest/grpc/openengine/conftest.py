@@ -10,10 +10,13 @@ and a change to the context contract would be caught by whichever copy happened
 to model it.
 """
 
-from types import SimpleNamespace
-from typing import Any, Sequence
+from __future__ import annotations
 
-import grpc
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Sequence
+
+if TYPE_CHECKING:
+    import grpc
 
 
 class AbortError(Exception):
@@ -45,6 +48,12 @@ class FakeServicerContext:
 
     def cancelled(self) -> bool:
         return self.is_cancelled
+
+    def code(self) -> grpc.StatusCode | None:
+        return self.abort_code
+
+    def time_remaining(self) -> float | None:
+        return None
 
     def add_done_callback(self, callback: Any) -> None:
         self.done_callbacks.append(callback)

@@ -60,6 +60,7 @@ worker_config:
       backend: TRTLLM
     cache_transceiver_config:
       backend: NIXL
+      kv_cache_bounce_size_mb: 512
     disable_overlap_scheduler: false
     num_postprocess_workers: 4
     stream_interval: 20
@@ -82,4 +83,5 @@ worker_config:
       use_low_precision_moe_combine: true
     cache_transceiver_config:
       backend: NIXL
+      kv_cache_bounce_size_mb: 512
     disable_overlap_scheduler: false

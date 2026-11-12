@@ -31,6 +31,8 @@ using Grain = uint4;
 constexpr uint32_t ctaSize = 128;
 constexpr uint32_t nbBufs = 4;
 constexpr uint32_t grainBytes = sizeof(Grain);
+constexpr uint32_t lowBandwidthBytesPerCta = 8u << 20;
+constexpr uint32_t lowBandwidthMaxSplits = 16;
 
 using MMTask = Task<MemAddress, MemAddress>;
 
@@ -114,7 +116,8 @@ CUresult launchBatchedCopyImpl(
     {
         pTasks = reinterpret_cast<std::array<MMTask, N> const*>(tasks);
     }
-    uint32_t const nbSplits = lowBandwidth ? 1 : divUp(nbBytes, grainBytes * ctaSize * 2);
+    uint32_t const nbSplits = lowBandwidth ? std::min(divUp(nbBytes, lowBandwidthBytesPerCta), lowBandwidthMaxSplits)
+                                           : divUp(nbBytes, grainBytes * ctaSize * 2);
     void* args[] = {(void*) pTasks, (void*) &nbBytes};
     static CUkernel const kernel = []() -> CUkernel
     {
@@ -129,8 +132,9 @@ CUresult launchBatchedCopyImpl(
         stream, args, nullptr);
 }
 
-// When bandwidth is low, e.g. when host memory is involved, we avoid splitting as fewer CTAs should be enough to
-// saturate the bandwidth.
+// When bandwidth is low, e.g. when host memory is involved, few CTAs are enough to saturate it, so a task is split
+// over at most lowBandwidthMaxSplits CTAs of lowBandwidthBytesPerCta each. A single CTA per task would leave large
+// pages (e.g. a recurrent-state page holding every linear-attention layer) bound by one SM's bandwidth.
 CUresult launchBatchedCopy(bool lowBandwidth, std::vector<MMTask> const& tasks, uint32_t nbBytes, cudaStream_t stream)
 {
     constexpr uint32_t maxN = 256;

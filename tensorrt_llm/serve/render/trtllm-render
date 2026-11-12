@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""``trtllm-render`` entry point.
+
+``import tensorrt_llm`` links ``libcuda.so.1``, which a container with no GPU does not have. When it cannot
+be loaded, this loads the CUDA toolkit stub in its place so the renderer starts on a CPU-only host. It is a
+script outside the package so that importing ``tensorrt_llm`` anywhere else is unchanged.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import glob
+import os
+import re
+import sys
+import warnings
+
+
+def _version(path: str) -> list:
+    return [int(part) for part in re.findall(r"\d+", path)]
+
+
+def _stub_candidates() -> list:
+    """Toolkit stubs, most preferred first: ``$CUDA_HOME``, ``/usr/local/cuda``, then the newest versioned."""
+    roots = [os.environ["CUDA_HOME"]] if os.environ.get("CUDA_HOME") else []
+    roots.append("/usr/local/cuda")
+    roots += sorted(glob.glob("/usr/local/cuda-*"), key=_version, reverse=True)
+    candidates, seen = [], set()
+    for root in roots:
+        for pattern in ("lib64/stubs/libcuda.so", "targets/*/lib/stubs/libcuda.so"):
+            for stub in sorted(glob.glob(os.path.join(root, pattern))):
+                if os.path.realpath(stub) not in seen:
+                    seen.add(os.path.realpath(stub))
+                    candidates.append(stub)
+    return candidates
+
+
+def _load_cuda_stub_if_needed() -> str | None:
+    """Load a toolkit stub when ``libcuda.so.1`` is missing; return its path, or None if not needed."""
+    try:
+        ctypes.CDLL("libcuda.so.1")
+        return None
+    except OSError:
+        pass
+    failures = []
+    for stub in _stub_candidates():
+        try:
+            ctypes.CDLL(stub, mode=ctypes.RTLD_GLOBAL)
+        except OSError as error:
+            failures.append(f"{stub}: {error}")
+            continue
+        warnings.filterwarnings("ignore", message="CUDA initialization:", category=UserWarning)
+        return stub
+    sys.exit(
+        "trtllm-render: libcuda.so.1 not found and no usable CUDA toolkit stub under $CUDA_HOME or "
+        "/usr/local/cuda*; install the CUDA toolkit stubs or expose a GPU driver"
+        + "".join(f"\n  tried {failure}" for failure in failures)
+    )
+
+
+def main() -> None:
+    stub = _load_cuda_stub_if_needed()
+    from tensorrt_llm.logger import logger
+    from tensorrt_llm.serve.render.__main__ import main as render_main
+
+    if stub:
+        logger.info(
+            f"trtllm-render: no GPU driver found; running CPU-only with the CUDA stub {stub}"
+        )
+    render_main()
+
+
+if __name__ == "__main__":
+    main()

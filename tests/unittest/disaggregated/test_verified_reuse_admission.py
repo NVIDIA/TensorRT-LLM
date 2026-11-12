@@ -33,7 +33,6 @@ from unittest.mock import MagicMock, Mock
 import numpy as np
 import pytest
 
-import tensorrt_llm._torch.disaggregation.native.bounce as bounce_mod
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
@@ -61,7 +60,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.disaggregation.transceiver import (
+    KvCacheTransceiverV2,
+    _chunk_bytes_by_kind,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -69,6 +71,15 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 # Helpers (mirroring test_chunked_transfer.py)
 # ---------------------------------------------------------------------------
+
+
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
 
 
 def _make_params(rid: int = 42) -> DisaggregatedParams:
@@ -104,7 +115,6 @@ def _make_rx_session(
         prompt_len=prompt_len,
     )
     session.receive(_make_chunk(prompt_len), expected_write_bytes=expected_write_bytes)
-    session._receiver._bounce.is_bounced.return_value = False
     return session
 
 
@@ -120,12 +130,14 @@ def _make_recv_task(expected_write_bytes=None) -> KVRecvTask:
 
 
 def _success(session, transfer_size: int, peer_rank: int = 0) -> None:
+    _publish_report_tokens(session)
     session.process_kv_agent_result(
         peer_rank=peer_rank,
         receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.SUCCESS,
         transfer_size=transfer_size,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
 
@@ -211,12 +223,14 @@ class TestRxSessionVerification:
     def test_failed_result_bytes_do_not_count(self):
         session = _make_rx_session(expected_write_bytes=4096)
         session._kv_tasks[0].expected_transfers = 1
+        _publish_report_tokens(session)
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.FAILED,
             transfer_size=4096,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
         assert session._kv_tasks[0].verified_write_bytes == 0
         assert not session.kv_write_verified()
@@ -341,7 +355,6 @@ def _make_sender() -> transfer_mod.Sender:
     sender._instance_rank = 5
     sender._device_id = 0
     sender._agent = Mock()
-    sender._bounce = Mock()
     sender._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="ctx", instance_rank=5)
     )
@@ -380,13 +393,11 @@ def _deliver_kv(monkeypatch, submit_result):
         receiver_slice_id=0,
         is_last_slice=True,
     )
-    monkeypatch.setattr(bounce_mod, "build_send_request", Mock(return_value=(Mock(), None)))
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=Mock()))
     monkeypatch.setattr(transfer_mod.Sender, "_submit_transfer", Mock(return_value=submit_result))
     sender._deliver_kv_to_agent(write_meta)
     dealer.send.assert_called_once()
-    return transfer_mod._KV_RESULT_PREFIX.unpack(
-        dealer.send.call_args.args[0][1][: transfer_mod._KV_RESULT_PREFIX.size]
-    )
+    return transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])
 
 
 class TestSenderAttestation:
@@ -504,7 +515,7 @@ def _ignored_role_page_table() -> KVCachePageTable:
 
 def _expected_write_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
     """The receiver-side expectation, exactly as the transceiver computes it."""
-    return KvCacheTransceiverV2._chunk_num_bytes(SimpleNamespace(_page_table=page_table), chunk)
+    return sum(_chunk_bytes_by_kind(page_table, chunk))
 
 
 def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:

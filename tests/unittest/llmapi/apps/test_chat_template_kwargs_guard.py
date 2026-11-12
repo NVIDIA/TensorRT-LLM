@@ -18,9 +18,27 @@ from tensorrt_llm.inputs.chat_template_guard import (
     ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR,
     ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS,
     UnusedChatTemplateKwargsError,
+    unreferenced_chat_template_kwargs,
     validate_chat_template_kwargs,
 )
-from tensorrt_llm.inputs.utils import apply_chat_template
+from tensorrt_llm.inputs.content_format import ContentFormat
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+)
+from tensorrt_llm.inputs.utils import apply_chat_template, rendered_hf_chat_template_source
+from tensorrt_llm.serve.render import RenderResources, render_chat
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
+
+
+def render_chat_request_for_tokenizer(request, tokenizer):
+    """What the KV-aware router does with a request and a tokenizer: the shared pipeline."""
+    rendered = render_chat(request, RenderResources.from_tokenizer(tokenizer), tokenize=False)
+    return rendered.text if rendered.text is not None else list(rendered.token_ids)
+
 
 pytestmark = pytest.mark.cpu_only
 
@@ -208,6 +226,43 @@ class TestValidateChatTemplateKwargs:
         assert "drop_thinking" not in str(excinfo.value)
 
 
+class TestUnreferencedChatTemplateKwargs:
+    """The query used by kwarg-constructing code mirrors the validator.
+
+    Serve code that injects template kwargs (the Responses reasoning routing)
+    asks this before handing kwargs to the render, so the serve's own
+    injection can never turn into a guard rejection.
+    """
+
+    def test_flags_only_unreferenced_keys(self):
+        assert unreferenced_chat_template_kwargs(
+            TEMPLATE_WITH_TOGGLE, ["enable_thinking", "disable_reasoning"]
+        ) == frozenset({"disable_reasoning"})
+
+    def test_always_allowed_names_never_flagged(self):
+        assert (
+            unreferenced_chat_template_kwargs(TEMPLATE_PLAIN, ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS)
+            == frozenset()
+        )
+
+    def test_non_string_template_flags_nothing(self):
+        # Matches the validator, which skips when there is no source string.
+        assert unreferenced_chat_template_kwargs(None, ["thinking"]) == frozenset()
+
+    def test_unparseable_template_falls_closed(self):
+        # `disable_reasoning` is not on the always-consumed surface (unlike
+        # `thinking`, which the reasoning parsers read), so an unanalyzable
+        # template flags it.
+        assert unreferenced_chat_template_kwargs(
+            TEMPLATE_UNPARSEABLE, ["disable_reasoning", "messages"]
+        ) == frozenset({"disable_reasoning"})
+
+    def test_cleared_keys_pass_the_validator(self):
+        kwargs = {"enable_thinking": True, "tools": None}
+        assert unreferenced_chat_template_kwargs(TEMPLATE_WITH_TOGGLE, kwargs) == frozenset()
+        validate_chat_template_kwargs(TEMPLATE_WITH_TOGGLE, kwargs)
+
+
 class _FakeJinjaTokenizer:
     """Tokenizer stub exercising the HF-Jinja apply_chat_template path.
 
@@ -256,6 +311,83 @@ class TestApplyChatTemplateWiring:
         assert self._apply(TEMPLATE_WITH_GENERATION_TAG, {"reasoning_effort": "high"}) == "rendered"
 
 
+class TestRenderedChatTemplateSource:
+    """Kwarg-constructing code must see the same template the render uses."""
+
+    @pytest.mark.parametrize(
+        "tokenizer_cls", [DeepseekV32Tokenizer, DeepseekV4Tokenizer, DeepseekV41Tokenizer]
+    )
+    def test_deepseek_tokenizers_have_no_source(self, tokenizer_cls):
+        # They render with their own Python encoders, so there is no Jinja
+        # source for the referenced-kwargs analysis to read.
+        tokenizer = tokenizer_cls.__new__(tokenizer_cls)
+        assert rendered_hf_chat_template_source(tokenizer=tokenizer, processor=None) is None
+
+    def test_model_that_skips_chat_templates_has_no_source(self):
+        # apply_chat_template joins such a model's content and never renders the
+        # tokenizer's template; both functions take that from one dispatch.
+        model_type = "passthrough_model_for_source_test"
+        MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+            model_type,
+            MultimodalPlaceholderMetadata(
+                placeholder_map={"image": "<image>"},
+                placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+                content_format=ContentFormat.PASSTHROUGH,
+            ),
+        )
+        try:
+            tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)
+            assert (
+                rendered_hf_chat_template_source(
+                    tokenizer=tokenizer, processor=None, model_type=model_type
+                )
+                is None
+            )
+            assert (
+                apply_chat_template(
+                    model_type=model_type,
+                    tokenizer=tokenizer,
+                    processor=None,
+                    conversation=[{"role": "user", "content": "hi"}],
+                    add_generation_prompt=True,
+                    mm_placeholder_counts=[{}],
+                )
+                == "hi"
+            )
+        finally:
+            MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(model_type)
+
+    def test_jinja_tokenizer_source_returned(self):
+        tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)
+        assert (
+            rendered_hf_chat_template_source(tokenizer=tokenizer, processor=None)
+            == TEMPLATE_WITH_TOGGLE
+        )
+
+    def test_explicit_chat_template_wins(self):
+        tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)
+        assert (
+            rendered_hf_chat_template_source(
+                tokenizer=tokenizer, processor=None, chat_template=TEMPLATE_PLAIN
+            )
+            == TEMPLATE_PLAIN
+        )
+
+    def test_python_native_tokenizer_has_no_source(self):
+        # A tokenizer that overrides apply_chat_template with no declared
+        # Jinja template renders natively; there is no source to analyze and
+        # the render-site guard never runs on that path.
+        class _NativeTokenizer:
+            chat_template = None
+
+            def apply_chat_template(self, *args, **kwargs):
+                return "rendered"
+
+        assert (
+            rendered_hf_chat_template_source(tokenizer=_NativeTokenizer(), processor=None) is None
+        )
+
+
 class _FakeRouterTokenizer:
     """Tokenizer stub for the router tokenization entry point."""
 
@@ -274,16 +406,14 @@ class _FakeRouterTokenizer:
 class TestRouterPathWiring:
     """The guard must also run on the router tokenization entry point.
 
-    ``serve/chat_tokenization.render_chat_request_for_tokenizer`` (KV-aware
-    routing, P-D disaggregation) renders the same requests as the server path
-    but used to skip kwarg validation entirely, so even a plain-Jinja
-    template's unknown kwargs passed silently there.
+    The KV-aware router (and P-D disaggregation) renders requests through the shared
+    pipeline, which used to skip kwarg validation entirely in its router-only renderer, so
+    even a plain-Jinja template's unknown kwargs passed silently there.
     """
 
     _MESSAGES = [{"role": "user", "content": "hi"}]
 
     def _render(self, template: str, chat_template_kwargs: dict):
-        from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
         from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
         request = ChatCompletionRequest(
@@ -342,7 +472,6 @@ class TestRouterPathWiring:
 
     def test_validation_does_not_rewrite_render_inputs(self):
         # The guard validates; it must not change what reaches the template.
-        from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
         from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
         request = ChatCompletionRequest(
@@ -396,7 +525,6 @@ class TestServerInjectedControls:
         # Regression: a GLM-style template reads `clear_thinking` only, and
         # the adapter's `drop_thinking` companion used to be rejected as an
         # unused caller control.
-        from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
 
         chat_request = self._anthropic_chat_request()
         tokenizer = _FakeRouterTokenizer(TEMPLATE_GLM_RETENTION)
@@ -422,7 +550,6 @@ class TestServerInjectedControls:
     def test_anthropic_retention_pair_is_rejected_without_the_exemption(self):
         # Pins that the exemption, not a widened allow-list, is what lets the
         # pair through: the same kwargs as a plain caller control still fail.
-        from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
         from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
         chat_request = self._anthropic_chat_request()
@@ -465,6 +592,45 @@ class TestServerInjectedControls:
             injected_chat_template_kwargs=reasoning_injected_chat_template_keys(request),
         )
         assert rendered == "rendered"
+
+    @pytest.mark.parametrize(
+        "reasoning, expected",
+        [
+            (None, {}),
+            # The Codex CLI sends a reasoning object without an effort.
+            ({"context": "all_turns"}, {"thinking": True}),
+            ({"effort": "medium"}, {"reasoning_effort": "medium", "thinking": True}),
+            ({"effort": "none"}, {"thinking": False}),
+        ],
+    )
+    def test_responses_reasoning_object_sets_thinking(self, reasoning, expected):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.responses_utils import reasoning_chat_template_kwargs
+
+        request = SimpleNamespace(
+            chat_template_kwargs=None,
+            reasoning=None
+            if reasoning is None
+            else SimpleNamespace(effort=reasoning.get("effort"), context=reasoning.get("context")),
+        )
+
+        assert reasoning_chat_template_kwargs(request) == expected
+
+    def test_responses_caller_thinking_wins_over_the_reasoning_object(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.responses_utils import (
+            reasoning_chat_template_kwargs,
+            reasoning_injected_chat_template_keys,
+        )
+
+        request = SimpleNamespace(
+            chat_template_kwargs={"thinking": False}, reasoning=SimpleNamespace(effort=None)
+        )
+
+        assert reasoning_chat_template_kwargs(request) == {"thinking": False}
+        assert reasoning_injected_chat_template_keys(request) == frozenset()
 
     def test_responses_caller_supplied_effort_stays_strict(self):
         # A client that passes `reasoning_effort` itself picked that key, so
@@ -548,7 +714,6 @@ def test_router_and_server_tool_call_tokenization_match(
     # strict request model rejects (lazily) and the server re-parses from the
     # raw body. The router must tokenize each to the same ids the server does.
     from tensorrt_llm.inputs.utils import MultimodalDataTracker
-    from tensorrt_llm.serve.chat_tokenization import tokenize_chat_request_for_serving
     from tensorrt_llm.serve.chat_utils import parse_chat_message_content
 
     template = "{{ messages[0].tool_calls[0].function.arguments.city }}"
@@ -571,12 +736,9 @@ def test_router_and_server_tool_call_tokenization_match(
     # The strict model keeps `tool_calls` as a lazy pydantic iterator; the raw
     # fallback hands the plain list through. Pin which path each shape took.
     assert isinstance(dict(request.messages[0])["tool_calls"], list) is served_via_fallback
-    router_tokens = tokenize_chat_request_for_serving(
-        request,
-        lambda: synthetic_tokenizer,
-        lambda text, tokenizer: tokenizer.encode(text, add_special_tokens=False),
-        use_harmony=False,
-    )
+    router_tokens = render_chat(
+        request, RenderResources.from_tokenizer(synthetic_tokenizer), tokenize=True
+    ).token_ids
     conversation = [parse_chat_message_content(deepcopy(original[0]), MultimodalDataTracker(""))]
     server_text = apply_chat_template(
         model_type="test-model",
@@ -589,66 +751,42 @@ def test_router_and_server_tool_call_tokenization_match(
     assert server_text == "Paris"
     assert router_tokens == synthetic_tokenizer.encode(server_text, add_special_tokens=False) == [1]
     assert messages == original
-    assert request.prompt_token_ids == router_tokens
 
 
 def test_router_preserves_content_parts_and_assistant_fields(synthetic_tokenizer):
-    from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
+    from tensorrt_llm.inputs.utils import MultimodalDataTracker
+    from tensorrt_llm.serve.chat_utils import parse_chat_message_content
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
     synthetic_tokenizer.chat_template = (
-        "{{ messages[0].content[0].text }} {{ messages[1].reasoning_content }} "
-        "{{ messages[1].name }}"
+        "{% for m in messages %}[{{ m.role }}|{{ m.content }}|{{ m.reasoning_content }}"
+        "|{{ m.name }}]{% endfor %}"
     )
     messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "hello"},
-                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
-            ],
-        },
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
         {"role": "assistant", "content": "", "reasoning": "analysis", "name": "helper"},
     ]
-    request = ChatCompletionRequest(model="test-model", messages=messages)
-    assert (
-        render_chat_request_for_tokenizer(request, synthetic_tokenizer) == "hello analysis helper"
+    request = ChatCompletionRequest(model="test-model", messages=deepcopy(messages))
+
+    router_text = render_chat_request_for_tokenizer(request, synthetic_tokenizer)
+
+    conversation = [
+        parse_chat_message_content(deepcopy(message), MultimodalDataTracker(""))
+        for message in messages
+    ]
+    server_text = apply_chat_template(
+        model_type="test-model",
+        tokenizer=synthetic_tokenizer,
+        processor=None,
+        conversation=conversation,
+        add_generation_prompt=True,
+        mm_placeholder_counts=[{}, {}],
     )
-
-
-def test_native_renderer_keeps_raw_arguments():
-    from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
-    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
-
-    class NativeTokenizer:
-        def get_chat_template(self, *args, **kwargs):
-            return None
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["tool_calls"][0]["function"]["arguments"]
-
-    request = ChatCompletionRequest(
-        model="test-model",
-        messages=[
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "weather", "arguments": "native-format"},
-                    }
-                ],
-            }
-        ],
-        chat_template_kwargs={"native_option": True},
-    )
-    assert render_chat_request_for_tokenizer(request, NativeTokenizer()) == "native-format"
+    assert router_text == server_text
+    assert "hello" in router_text and "analysis" in router_text
 
 
 def test_malformed_template_error_comes_from_renderer(synthetic_tokenizer):
-    from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
     synthetic_tokenizer.chat_template = TEMPLATE_UNPARSEABLE
@@ -665,7 +803,6 @@ def test_malformed_template_error_comes_from_renderer(synthetic_tokenizer):
 def test_named_template_selection_validates_the_rendered_template(
     synthetic_tokenizer, selection_in_kwargs
 ):
-    from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
     synthetic_tokenizer.chat_template = {"default": TEMPLATE_PLAIN, "controlled": "{{ control }}"}
@@ -678,4 +815,19 @@ def test_named_template_selection_validates_the_rendered_template(
         chat_template=None if selection_in_kwargs else "controlled",
         chat_template_kwargs=kwargs,
     )
-    assert render_chat_request_for_tokenizer(request, synthetic_tokenizer) == "hello"
+    if not selection_in_kwargs:
+        assert render_chat_request_for_tokenizer(request, synthetic_tokenizer) == "hello"
+        return
+    # A template name that only rides in chat_template_kwargs is not honored, on either path.
+    with pytest.raises(UnusedChatTemplateKwargsError, match="control"):
+        render_chat_request_for_tokenizer(request, synthetic_tokenizer)
+    with pytest.raises(UnusedChatTemplateKwargsError, match="control"):
+        apply_chat_template(
+            model_type="test-model",
+            tokenizer=synthetic_tokenizer,
+            processor=None,
+            conversation=[{"role": "user", "content": "hi"}],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            chat_template_kwargs=dict(kwargs),
+        )

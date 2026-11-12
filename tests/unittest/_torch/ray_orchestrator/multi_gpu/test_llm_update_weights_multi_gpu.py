@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import re
+import time
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -80,6 +81,7 @@ def _run_multi_gpu_update_weights(
     tokenizer_dir: Optional[str] = None,
     warm_before_update: bool = False,
     generate_fn: Callable = run_generate,
+    threshold: float = 0.9,
 ) -> None:
     """Run the shared warm/update/finalize/reference-comparison workflow."""
     if prompts_texts is None:
@@ -121,7 +123,7 @@ def _run_multi_gpu_update_weights(
 
         llm._collective_rpc("update_weights", (None,))
         llm_logits, ref_logits = generate_fn(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
+        compare_logits(llm_logits, ref_logits, threshold=threshold)
 
 
 def _run_fp8_update_weights(model_dir: str, fp8_model_dir: str, partial: bool) -> None:
@@ -553,6 +555,23 @@ def _run_generate_qwen35_35b(llm, hf_model, prompts, sampling_params):
     return llm_logits, ref_logits
 
 
+def _prefetch_flashinfer_trtllm_gen_artifacts(attempts: int = 3) -> None:
+    """Download FlashInfer's TRT-LLM-Gen artifacts once, before the Ray workers start."""
+    try:
+        from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+    except ImportError:
+        return
+    enable_rubin = torch.cuda.get_device_capability() == (10, 7)
+    for attempt in range(1, attempts + 1):
+        try:
+            gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+            return
+        except AssertionError:
+            if attempt == attempts:
+                raise
+            time.sleep(5 * attempt)
+
+
 def _run_qwen35_35b_update(
     model_dir: str,
     partial: bool,
@@ -562,6 +581,7 @@ def _run_qwen35_35b_update(
     if not os.path.isdir(model_dir):
         pytest.skip(f"Model directory {model_dir} does not exist")
 
+    _prefetch_flashinfer_trtllm_gen_artifacts()
     device_ids = list(range(tp_size))
     hf_model = RefQwen35_35BModelWithIPCHandles(model_dir, device_ids=device_ids)
     cuda_graph_config = (
@@ -610,6 +630,7 @@ def _run_qwen35_35b_fp8_update(partial: bool) -> None:
     if not os.path.isdir(model_dir):
         pytest.skip(f"Model directory {model_dir} does not exist")
 
+    _prefetch_flashinfer_trtllm_gen_artifacts()
     device_ids = list(range(4))
     checkpoint = RefQwen35_35BFP8CheckpointWithIPCHandles(model_dir, device_ids)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
@@ -1309,6 +1330,8 @@ def _run_qwen35_mxfp8_update(
         prompts_texts=["Hello, my name is", "The future of AI is"],
         warm_before_update=True,
         generate_fn=_mxfp8_generate_with_stats,
+        # The engine also quantizes activations to MXFP8; the BF16 reference does not.
+        threshold=0.85,
     )
 
 

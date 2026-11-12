@@ -16,6 +16,7 @@ import json
 import threading
 from typing import List, Optional, Union
 
+from ..llmapi._load_balance_env import uses_collective_shutdown
 from ..llmapi.mpi_session import (MpiPoolSession, MpiSession,
                                   validate_session_world_size)
 from ..llmapi.utils import logger_debug, print_colored
@@ -31,6 +32,9 @@ from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
 
 
 class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
+
+    # Bound on each acknowledged RPC of the collective shutdown handshake.
+    _COLLECTIVE_SHUTDOWN_TIMEOUT_S = 300.0
 
     def __init__(
         self,
@@ -109,7 +113,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         """
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
             return [json.loads(s) if isinstance(s, str) else s for s in stats]
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
@@ -181,7 +186,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
         except Exception:
             stats = []
 
@@ -293,9 +299,23 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def setup_engine_remote(self):
         return self.rpc_client.setup_engine().remote(need_response=True)
 
+    def _uses_collective_shutdown(self) -> bool:
+        return uses_collective_shutdown(
+            getattr(self, "worker_kwargs", {}).get("llm_args"))
+
     def shutdown_remote(self):
         logger_debug("Shutting down rpc remote", color="yellow")
-        self.rpc_client.shutdown().remote(need_response=False)
+        if not self._uses_collective_shutdown():
+            self.rpc_client.shutdown().remote(need_response=False)
+            return
+        # Cleanup must be acknowledged before main_task is allowed to close the
+        # server. The second RPC commits that acknowledged all-rank result; its
+        # response is sent before RpcWorker wakes main_task. The timeout keeps
+        # a dead rank zero from hanging the caller, e.g. an atexit shutdown.
+        timeout = self._COLLECTIVE_SHUTDOWN_TIMEOUT_S
+        self.rpc_client.shutdown().remote(timeout=timeout, need_response=True)
+        self.rpc_client.commit_shutdown().remote(timeout=timeout,
+                                                 need_response=True)
 
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
@@ -317,6 +337,67 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def shutdown(self):
         if self._shutdown_event.is_set():
             return
+        if not self._uses_collective_shutdown():
+            self._shutdown_rank_local()
+            return
+        self._shutdown_event.set()
+        logger_debug("Shutting down GenerationExecutorRpcProxy", color="yellow")
+
+        # Keep the server, MPI workers, and retry gate live until every rank has
+        # acknowledged cleanup. RpcWorker resets its engine shutdown guard on a
+        # failed attempt, so the caller may invoke shutdown() again explicitly.
+        try:
+            self.shutdown_remote()
+        except BaseException:
+            self._shutdown_event.clear()
+            raise
+
+        # Stop the response loop only after cleanup and commit are acknowledged.
+        if self.main_loop and self.main_loop_task_obj:
+            logger_debug("Cancelling main loop task.", color="yellow")
+            try:
+                self.main_loop.call_soon_threadsafe(
+                    self.main_loop_task_obj.cancel)
+            except Exception as e:
+                logger_debug(f"Error cancelling main loop task: {e}",
+                             color="yellow")
+
+        if self.main_loop_thread and threading.current_thread(
+        ) != self.main_loop_thread:
+            self.main_loop_thread.join(timeout=2.0)
+            if self.main_loop_thread.is_alive():
+                logger.warning("Main loop thread did not exit gracefully")
+
+        shutdown_errors = []
+        # Worker futures complete only after followers observe the commit and
+        # rank zero has joined its RPC server. Always converge them, including
+        # for an externally owned pool, before allowing that pool to be reused.
+        for future in getattr(self, "worker_futures", []):
+            try:
+                future.result()
+            except BaseException as error:
+                shutdown_errors.append(error)
+
+        if self.mpi_session is not None:
+            if self._owns_mpi_session:
+                logger_debug("Shutting down mpi session", color="yellow")
+                try:
+                    self.mpi_session.shutdown()
+                except BaseException as error:
+                    shutdown_errors.append(error)
+            logger_debug("Mpi session shutdown", color="yellow")
+            self.mpi_session = None
+
+        try:
+            self.rpc_client.close()
+        except BaseException as error:
+            shutdown_errors.append(error)
+
+        if shutdown_errors:
+            raise shutdown_errors[0]
+
+    def _shutdown_rank_local(self):
+        """Best-effort teardown for configurations without collective EP resources."""
         self._shutdown_event.set()
         logger_debug("Shutting down GenerationExecutorRpcProxy", color="yellow")
 

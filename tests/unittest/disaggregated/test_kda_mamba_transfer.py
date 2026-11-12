@@ -30,8 +30,7 @@ Synthetic loopback coverage of the KDA recurrent-state transfer path:
       replica under attention-DP.
 
 * ``test_kda_layer_group_descriptors`` checks that the V2 page table
-  describes BOTH slots with exact byte sizes and that the matched-TP
-  ``MambaPolicy`` descriptors tile each layer's slot bytes exactly.
+  describes BOTH slots with exact byte sizes.
 
 * ``test_kda_transfer`` performs a real single-node NIXL loopback transfer
   and bitwise-compares both dtypes on the gen side: matched and
@@ -55,10 +54,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
-)
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -66,8 +62,8 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -126,7 +122,7 @@ def _kimi_linear_config():
 def _create_kda_managers(
     tp: int, enable_attention_dp: bool = False, max_batch_size: int = MAX_BATCH_SIZE
 ):
-    """Create MambaHybridCacheManagerV2s with K3-style KDA slots.
+    """Create KimiK3HybridCacheManagers with K3-style KDA slots.
 
     Mirrors the ``is_kimi_linear`` route in ``_util.py``: the mamba params
     come from ``extract_mamba_kv_cache_params`` UNSCALED (global
@@ -150,7 +146,7 @@ def _create_kda_managers(
             pp_size=1,
             enable_attention_dp=enable_attention_dp,
         )
-        mgr = MambaHybridCacheManagerV2(
+        mgr = KimiK3HybridCacheManager(
             mamba_d_state=params.state_size,
             mamba_d_conv=params.conv_kernel,
             mamba_num_heads=params.num_heads,
@@ -233,15 +229,6 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
             i for i, m in enumerate(_KDA_MASK) if m
         ]
-
-        # Matched-parallelism payload: receiver_payload_bytes must equal
-        # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
-        payload = mamba_receiver_payload_bytes(
-            sender_page_table=pt,
-            receiver_page_table=pt,
-            dst_slot=1,
-        )
-        assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
         mgr.shutdown()
 

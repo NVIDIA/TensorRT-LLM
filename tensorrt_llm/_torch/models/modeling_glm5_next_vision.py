@@ -44,7 +44,11 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...inputs.multimodal import MultimodalParams
+from ...inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from ...inputs.registry import BaseMultimodalDummyInputsBuilder, BaseMultimodalInputProcessor
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -904,11 +908,20 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         pixels_side = side * self._patch_size
         image = Image.new("RGB", (pixels_side, pixels_side), (127, 127, 127))
         out = self.processor.image_processor(images=[image] * num_images, return_tensors="pt")
+        encoder_token_lengths = out["image_grid_thw"].prod(dim=-1).tolist()
+        metadata = MultimodalItemMetadata(
+            item_refs=[("image", i) for i in range(num_images)],
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=[
+                length // self.spatial_merge_unit for length in encoder_token_lengths
+            ],
+        )
         return {
             "image": {
                 "pixel_values": out["pixel_values"].to(dtype or self._dtype),
                 "image_grid_thw": out["image_grid_thw"],
-            }
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
         }
 
     # -- request processing ----------------------------------------------------
@@ -923,8 +936,9 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if not images and not video_datas:
             # Text-only fast path: identical to the tokenizer and no
             # multimodal payload, so the tower is never touched.
-            input_ids = self._tokenizer(text_prompt, return_tensors="pt").input_ids
-            return input_ids[0].to(torch.int32).tolist(), None
+            # A Python list straight from the tokenizer: a tensor round trip costs
+            # milliseconds on long prompts.
+            return self._tokenizer(text_prompt).input_ids, None
 
         # Media loaders may deliver pre-rescaled float tensors (the server
         # default) instead of PIL / uint8; tell the HF processor not to

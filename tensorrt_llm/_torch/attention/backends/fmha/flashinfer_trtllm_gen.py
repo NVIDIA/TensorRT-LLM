@@ -66,6 +66,7 @@ from .phased import FmhaParams, PhasedFmha
 from .utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
+    get_multi_ctas_kv_counter_size,
     get_multi_processor_count_for_device,
     get_trtllm_gen_context_workspace_size,
 )
@@ -215,23 +216,6 @@ def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
 
 if IS_FLASHINFER_AVAILABLE:
     _install_flashinfer_mla_decode_tuning_config_cache()
-
-
-_MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
-
-
-def _get_multi_ctas_kv_counter_size(
-    num_heads: int,
-    max_num_sequences: int,
-    multi_processor_count: int,
-) -> int:
-    num_counters = max(num_heads * max_num_sequences, multi_processor_count)
-    aligned_num_counters = (
-        (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
-        // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-        * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-    )
-    return aligned_num_counters * torch.int32.itemsize
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -859,9 +843,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # One counter per head per decoder sequence; beam search expands each
         # request into ``beam_width`` sequences.
-        required_counter_size = _get_multi_ctas_kv_counter_size(
+        max_num_sequences = metadata.max_num_sequences or metadata.max_num_requests
+        required_counter_size = get_multi_ctas_kv_counter_size(
             attn.num_heads,
-            metadata.max_num_sequences or metadata.max_num_requests,
+            max_num_sequences,
             self._multi_processor_count,
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
@@ -890,8 +875,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise RuntimeError(f"{type(self).__name__} requires output.")
         fp8_context_fmha = self._use_fp8_context_fmha(output, attention_input_type)
 
-        workspace_max_tokens = max(num_tokens, metadata.max_context_length)
-        workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
+        workspace_max_tokens = max(num_tokens, metadata.max_context_length, max_num_sequences)
+        workspace_max_gen_tokens = max(num_gen_tokens, max_num_sequences)
         required_workspace_size = _get_workspace_size(
             dtype=q.dtype,
             num_tokens=workspace_max_tokens,
@@ -899,7 +884,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             num_heads=attn.num_heads,
             num_kv_heads=attn.num_kv_heads,
             head_size=attn.head_dim,
-            max_num_requests=metadata.max_num_requests,
+            max_num_requests=max_num_sequences,
             rotary_embedding_dim=attn.rope_dim,
             fp8_context_fmha=fp8_context_fmha,
         )
@@ -1122,9 +1107,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if attention_input is None:
             raise RuntimeError("trtllm-gen generation requires QKV or query input.")
         attn = params.attn
-        meta = params.meta
         fwd = params.fwd
-        rope_params = attn.rope_params
         bmm1_scale_static = get_bmm1_scale(attn)
         attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
@@ -1143,7 +1126,61 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             max_kv_len,
             window_left,
             is_multi_token_gen,
-        ) = thop.trtllm_gen_generation_preprocess(
+        ) = self._run_generation_preprocess(
+            params,
+            attention_input,
+            batch_beam,
+            bmm1_scale_static,
+            attention_chunk_size,
+            fp8_context_fmha,
+        )
+
+        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
+        if has_fp4_kv and kv_scale_pool is None:
+            raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
+        if has_fp4_kv or fp8_context_fmha:
+            q_processed = (
+                q_processed.view(torch.uint8)
+                .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
+                .view(torch.float8_e4m3fn)
+                .view(params.num_tokens, attn.num_heads, attn.head_dim)
+            )
+        gen_bmm1_scale = (
+            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
+        )
+        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
+
+        self._run_generation_decode(
+            params,
+            q_processed,
+            kv_pool,
+            block_tables,
+            kv_scale_pool,
+            max_kv_len,
+            window_left,
+            None if is_multi_token_gen else params.input_seq_length,
+            max_q_len if is_multi_token_gen else None,
+            cu_seqlens if is_multi_token_gen else None,
+            gen_bmm1_scale,
+            gen_bmm2_scale,
+            fmha_workspace,
+        )
+
+    def _run_generation_preprocess(
+        self,
+        params: FmhaParams,
+        attention_input: torch.Tensor,
+        batch_beam: int,
+        bmm1_scale_static: float,
+        attention_chunk_size: int,
+        fp8_context_fmha: bool,
+    ) -> tuple:
+        """C++ generation preprocess: query, K / V append into the paged cache, FMHA scales and cache views."""
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        rope_params = attn.rope_params
+        return thop.trtllm_gen_generation_preprocess(
             attention_input,  # qkv_input (also accepts Q-only input for cached KV)
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
@@ -1189,49 +1226,46 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.is_cross,  # is_cross
         )
 
-        q_len_per_req = None if is_multi_token_gen else params.input_seq_length
-        decode_max_q_len = max_q_len if is_multi_token_gen else None
-        decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
-
-        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
-        if has_fp4_kv and kv_scale_pool is None:
-            raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or fp8_context_fmha:
-            q_processed = (
-                q_processed.view(torch.uint8)
-                .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
-                .view(torch.float8_e4m3fn)
-                .view(params.num_tokens, attn.num_heads, attn.head_dim)
-            )
-        gen_bmm1_scale = (
-            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
-        )
-        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
-
+    def _run_generation_decode(
+        self,
+        params: FmhaParams,
+        q: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_scale_pool: Optional[torch.Tensor],
+        max_kv_len: int,
+        window_left: int,
+        q_len_per_req: Optional[int],
+        max_q_len: Optional[int],
+        cu_seqlens: Optional[torch.Tensor],
+        bmm1_scale,
+        bmm2_scale,
+        fmha_workspace: torch.Tensor,
+    ) -> None:
+        """Generation attention over the cache the preprocess wrote: q_len_per_req tokens per request, or for
+        non-uniform q lengths (q_len_per_req None) max_q_len and cu_seqlens."""
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
+            query=q,
             kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
             seq_lens=params.sequence_lengths,
             max_seq_len=max_kv_len,
-            bmm1_scale=gen_bmm1_scale,
-            bmm2_scale=gen_bmm2_scale,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             window_left=window_left,
             out=params.output,
-            sinks=fwd.attention_sinks,
+            sinks=params.fwd.attention_sinks,
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
             backend="trtllm-gen",
             q_len_per_req=q_len_per_req,
-            max_q_len=decode_max_q_len,
-            cum_seq_lens_q=decode_cu_seqlens,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cu_seqlens,
             kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
             bmm1_scale_log2=(
-                _get_bmm1_scale_log2(gen_bmm1_scale)
-                if isinstance(gen_bmm1_scale, torch.Tensor)
-                else None
+                _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else None
             ),
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )

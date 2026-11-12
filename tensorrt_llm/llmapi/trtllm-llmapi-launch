@@ -341,7 +341,14 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         exec_child_command "$@"
     }
 
+    # Resolve the installed launcher once, including symlinks, without site hooks.
+    stop_path=$(run_child_command python3 -S -c \
+        'import os, sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1], strict=True)), "_llmapi_mpi_stop.py"))' \
+        "${BASH_SOURCE[0]}") || stop_path=
     guard_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_llmapi_process_guard.py"
+    if [ -n "$stop_path" ]; then
+        guard_path="${stop_path%/*}/_llmapi_process_guard.py"
+    fi
     guard_directory=$(mktemp -d "${TMPDIR:-/tmp}/trtllm-launch-guards.XXXXXXXX")
 
     function start_guarded_command {
@@ -437,7 +444,12 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     shutdown_polls_remaining=$((stop_timeout * 10))
     stop_pid=
     if command_running "$server_pid"; then
-        if start_guarded_command stop python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop; then
+        stop_command=(python3 "$stop_path")
+        if [ ! -f "$stop_path" ] || [ ! -r "$stop_path" ]; then
+            log_stderr "MPI stop helper unavailable; falling back to the TensorRT-LLM module stop command"
+            stop_command=(python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop)
+        fi
+        if start_guarded_command stop "${stop_command[@]}"; then
             stop_pid=$started_guard_pid
         else
             stop_exit_code=$?

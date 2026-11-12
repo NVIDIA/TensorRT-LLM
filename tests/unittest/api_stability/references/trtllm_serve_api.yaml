@@ -55,6 +55,12 @@
 models:
   CompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       model:
         kind: openai
         type: str
@@ -274,6 +280,12 @@ models:
       thinking_token_budget:
         kind: extension
         type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      watermarking:
+        kind: extension
+        type: Optional[bool]
         default: null
         status: prototype
         required: false
@@ -508,6 +520,12 @@ models:
 
   ChatCompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       messages:
         kind: openai
         type: List[ChatCompletionMessageParam]
@@ -586,10 +604,22 @@ models:
         default: null
         status: stable
         required: false
+      service_tier:
+        kind: openai
+        type: Optional[Literal['auto', 'default', 'flex', 'scale', 'priority', 'fast']]
+        default: null
+        status: stable
+        required: false
       stop:
         kind: openai
         type: Optional[Union[str, List[str]]]
         default: <factory:list>
+        status: stable
+        required: false
+      store:
+        kind: openai
+        type: Optional[bool]
+        default: null
         status: stable
         required: false
       stream:
@@ -642,7 +672,7 @@ models:
         required: false
       reasoning_effort:
         kind: openai
-        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high', 'max', 'none']]
+        type: Optional[ReasoningEffort | Literal['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'none']]
         default: "ReasoningEffort.LOW"
         status: stable
         required: false
@@ -658,11 +688,23 @@ models:
         default: null
         status: prototype
         required: false
+      watermarking:
+        kind: extension
+        type: Optional[bool]
+        default: null
+        status: prototype
+        required: false
       prompt_ignore_length:
         kind: extension
         type: Optional[int]
         default: 0
         status: beta
+        required: false
+      client_metadata:
+        kind: extension
+        type: Optional[Dict[str, str]]
+        default: null
+        status: prototype
         required: false
       best_of:
         kind: extension
@@ -1039,11 +1081,29 @@ models:
 
   ResponsesRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       background:
         kind: openai
         type: Optional[bool]
         default: false
         status: stable
+        required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
         required: false
       include:
         kind: openai
@@ -1104,6 +1164,18 @@ models:
         type: Optional[ResponsePrompt]
         default: null
         status: stable
+        required: false
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
       reasoning:
         kind: openai
@@ -1192,6 +1264,18 @@ models:
 
   ResponsesResponse:
     fields:
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
+        required: false
+      finish_reason:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       id:
         kind: openai
         type: str
@@ -1202,6 +1286,12 @@ models:
         kind: openai
         type: int
         default: <factory:<lambda>>
+        status: stable
+        required: false
+      incomplete_details:
+        kind: openai
+        type: Optional[IncompleteDetails]
+        default: null
         status: stable
         required: false
       instructions:
@@ -1240,6 +1330,18 @@ models:
         default: null
         status: stable
         required: true
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       temperature:
         kind: openai
         type: float

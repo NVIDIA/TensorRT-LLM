@@ -353,7 +353,7 @@ def prepare_references(
     ids, tags = _build_presentation(
         pipeline.tokenizer, prompt, references, image_counts, video_counts, timestamps
     )
-    prompt_embeds = pipeline._encode_text_tokens(ids, vision)
+    prompt_embeds = pipeline._encode_reference_text_tokens(ids, vision)
     visual_latents, audio_latents = [], []
     audio_mean = torch.tensor(pipeline.audio_vae.config.latents_mean).view(1, 1, -1)
     audio_std = torch.tensor(pipeline.audio_vae.config.latents_std).view(1, 1, -1)
@@ -378,10 +378,13 @@ def prepare_references(
                 .permute(3, 0, 1, 2)[None]
             )
             visual_latents.append(pipeline._encode_visual_condition(pixels))
+    # Keep each VAE on the GPU while encoding its references in presentation order.
+    for reference in references:
         if reference.has_audio:
-            posterior = pipeline.audio_vae.encode(
-                reference.audio.to(pipeline.device)[:, None], return_dict=False
-            )[0]
+            with pipeline.offloader.context_if_requested("audio_vae"):
+                posterior = pipeline.audio_vae.encode(
+                    reference.audio.to(pipeline.device)[:, None], return_dict=False
+                )[0]
             latents = posterior.mode().float().cpu().transpose(1, 2)
             audio_latents.append(
                 ((latents - audio_mean) / audio_std).reshape(

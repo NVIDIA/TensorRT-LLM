@@ -97,14 +97,14 @@ def test_metadata_prepare_batch_indices():
     assert meta.batch_indices_cuda[:3].tolist() == [0, 1, 2]
 
 
-def _make_worker(enable_confidence_scheduling=False):
+def _make_worker(enable_confidence_scheduling=False, enable_fused_confidence_scheduler=False):
     cfg = types.SimpleNamespace(
         max_draft_len=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         enable_confidence_scheduling=enable_confidence_scheduling,
-        enable_fused_confidence_scheduler=False,
-        confidence_sps_table_path=None,
-        confidence_sts_path=None,
+        enable_fused_confidence_scheduler=enable_fused_confidence_scheduler,
+        confidence_cost_table_path=None,
+        confidence_calibration_path=None,
     )
     from tensorrt_llm.mapping import Mapping
 
@@ -136,8 +136,8 @@ def test_worker_lazy_init_window_buffers():
     assert worker._valid_len.shape == (9,)
     assert worker._position_initialized.shape == (9,)
     assert worker._scratch_slot == 8
-    # Dummy-id floor separates real request ids from CUDA-graph padding ids.
-    assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
+    # Both CUDA-graph padding families lie at or above the dummy-id floor.
+    assert worker._graph_dummy_id_floor == (1 << 64) - 2 * (worker.max_draft_len + 1)
     # The scratch row is never handed out through the free pool.
     assert list(worker._free_slots) == list(range(8))
     assert worker._batch_to_slot is not None
@@ -422,17 +422,22 @@ def test_prepare_assigns_slots_to_disagg_generation_requests():
     assert worker._batch_to_slot[:2].tolist() == [s0, s1]
 
 
-def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
+@pytest.mark.parametrize("physical_k", [3, 4, 5])
+@pytest.mark.parametrize("variant", [0, 1])
+def test_prepare_keeps_dummy_generation_requests_on_scratch_row(physical_k, variant):
     """ADP-idle (id 0) and CUDA-graph padding dummies never consume a real slot."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import cuda_graph_dummy_request_id
     from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 
     worker = _make_worker()
+    worker.spec_config.max_draft_len = physical_k
     meta = _make_metadata(max_num_requests=4)
-    worker._lazy_init(_fake_draft_model(), meta)
+    draft_model = _fake_draft_model()
+    draft_model.block_size = physical_k
+    worker._lazy_init(draft_model, meta)
     meta._dspark_worker = worker
 
-    graph_dummy = CUDA_GRAPH_DUMMY_REQUEST_ID - worker.max_draft_len
+    graph_dummy = cuda_graph_dummy_request_id(physical_k, variant=variant, max_draft_len=physical_k)
     meta.request_ids = [1000, ATTENTION_DP_DUMMY_REQUEST_ID, graph_dummy]
     meta.num_generations = 3
     meta.prepare()
@@ -1173,6 +1178,16 @@ def test_recycled_confidence_slot_is_reset_to_neutral():
     slot = worker._assign_slot(100, reset=False)
 
     assert torch.sigmoid(worker._confidence_logits[slot]).min().item() > 0.999
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_verify_planner_device_windows_follow_the_config(fused):
+    worker = _make_worker(
+        enable_confidence_scheduling=True, enable_fused_confidence_scheduler=fused
+    )
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+
+    assert worker.verify_planner.device_windows is fused
 
 
 def test_confidence_state_is_absent_when_scheduling_is_disabled():

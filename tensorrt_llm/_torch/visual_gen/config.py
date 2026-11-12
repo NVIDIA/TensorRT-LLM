@@ -635,7 +635,20 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
         extra_attrs.update(resolved_pipeline_config)
 
-        h3_workflow = resolved_pipeline_config.get("workflow")
+        model_index_path = checkpoint_path / "model_index.json"
+        if not model_index_path.exists():
+            model_index_path = checkpoint_path / "modular_model_index.json"
+        model_index = {}
+        if model_index_path.exists():
+            with open(model_index_path) as f:
+                model_index = json.load(f)
+
+        h3_workflow = None
+        if model_index.get("_class_name") == "MiniMaxH3ModularPipeline" or (
+            model_index.get("_class_name") is None
+            and model_index.get("transformer") == ["diffusers", "MiniMaxH3Transformer3DModel"]
+        ):
+            h3_workflow = resolved_pipeline_config.get("workflow")
         if h3_workflow is not None:
             if h3_workflow not in ("fl2va", "ref2va"):
                 raise ValueError("MiniMax-H3 workflow must be 'fl2va' or 'ref2va'.")
@@ -670,12 +683,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if not getattr(pretrained_config, "_name_or_path", None):
                 pretrained_config._name_or_path = str(checkpoint_path)
 
-            model_index_path = checkpoint_path / "model_index.json"
-            if not model_index_path.exists():
-                model_index_path = checkpoint_path / "modular_model_index.json"
             if model_index_path.exists():
-                with open(model_index_path) as f:
-                    model_index = json.load(f)
                 if "boundary_ratio" in model_index and "transformer_2" in model_index:
                     transformer_2_spec = model_index.get("transformer_2")
                     if transformer_2_spec and transformer_2_spec[0] is not None:
@@ -687,6 +695,15 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             native_config = cls._try_load_safetensors_config(checkpoint_path)
 
             if native_config is not None:
+                if "transformer" in native_config and (
+                    "vae" in native_config or "audio_vae" in native_config
+                ):
+                    from .models.ltx23.pipeline_ltx23 import detect_native_ltx_pipeline
+
+                    if detect_native_ltx_pipeline(native_config) == "LTX23Pipeline":
+                        ltx23_workflow = resolved_pipeline_config.get("workflow", "generation")
+                        if ltx23_workflow not in ("generation", "retake"):
+                            raise ValueError("LTX-2.3 workflow must be 'generation' or 'retake'.")
                 transformer_dict = native_config.get("transformer", {})
                 component_config_dicts["transformer"] = transformer_dict
                 transformer_2_dict = native_config.get("transformer_2")

@@ -49,6 +49,12 @@ option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
+set(TRTLLM_MODELING_V2_TARGETS
+    "all"
+    CACHE
+      STRING
+      "modeling_v2 native targets to build: all, none, or a list of <family>/<target> globs"
+)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
