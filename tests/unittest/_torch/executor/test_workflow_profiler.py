@@ -1,0 +1,1100 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Workflow metadata and current inference-boundary contracts (CPU only)."""
+
+import inspect
+import json
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
+
+import pytest
+import torch
+from _torch.disaggregation.test_disagg_loop_transcript import _pp_executor
+from profiler_test_utils import (
+    decode_node_metadata,
+    execution_trace_observer,
+    profiler_nodes,
+    select_regions,
+)
+
+from tensorrt_llm import _profiler as profiler
+from tensorrt_llm._torch.pyexecutor import cuda_graph_runner, py_executor
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import inputs as decoder_inputs
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as decoder_runner
+from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
+
+
+def _request(**values: object) -> SimpleNamespace:
+    """Construct the host dummy flags consumed by workflow metadata."""
+    fields = dict(is_attention_dp_dummy=False, is_cuda_graph_dummy=False, is_dummy_request=False)
+    fields.update(values)
+    fields.setdefault(
+        "is_dummy",
+        any(
+            fields[name]
+            for name in ("is_attention_dp_dummy", "is_cuda_graph_dummy", "is_dummy_request")
+        ),
+    )
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize(
+    ("context_tokens", "generation_requests", "expected"),
+    [(16, 0, "trtllm::prefill"), (0, 4, "trtllm::decode"), (16, 4, "trtllm::mixed")],
+)
+def test_phase_tracks_scheduled_work(
+    context_tokens: int, generation_requests: int, expected: str
+) -> None:
+    assert py_executor._forward_phase_scope_name(context_tokens, generation_requests) == expected
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.profiler, "ExecutionTraceObserver"), reason="requires ExecutionTraceObserver"
+)
+def test_direct_tensor_metadata_and_decorator_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Describe direct tensors while preserving the decorated call signature."""
+    select_regions(monkeypatch, "workflow")
+    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
+    scalar = torch.tensor(7, dtype=torch.int64)
+    result = object()
+    path = tmp_path / "execution.json"
+
+    @profiler.record_workflow_scope("workflow::decorated")
+    def wrapped(value: torch.Tensor, *, offset: torch.Tensor, nested: object) -> object:
+        """Verify direct and nested argument identity before returning a sentinel."""
+        assert value is tensor and offset is scalar
+        assert nested is container
+        return result
+
+    container = {"ignored": [tensor]}
+    with execution_trace_observer(path) as observer:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ) as trace:
+            assert wrapped(tensor, offset=scalar, nested=container) is result
+            with profiler.record_workflow_scope("workflow::context", tensor, container):
+                torch.ones(1)
+    nodes = {node["name"]: node for node in profiler_nodes(path)}
+    region, metadata = decode_node_metadata(nodes["workflow::decorated"])
+    assert region == "workflow"
+    assert metadata == {
+        "workflow.tensor_count": 2,
+        "workflow.tensor.0.shape": [4, 3],
+        "workflow.tensor.0.dtype": "torch.float32",
+        "workflow.tensor.0.stride": [1, 4],
+        "workflow.tensor.0.device": "cpu",
+        "workflow.tensor.1.shape": [],
+        "workflow.tensor.1.dtype": "torch.int64",
+        "workflow.tensor.1.stride": [],
+        "workflow.tensor.1.device": "cpu",
+    }
+    assert decode_node_metadata(nodes["workflow::context"])[1]["workflow.tensor_count"] == 1
+    chrome_path = tmp_path / "chrome.json"
+    trace.export_chrome_trace(str(chrome_path))
+    names = {event.get("name") for event in json.loads(chrome_path.read_text())["traceEvents"]}
+    assert {"workflow::decorated", "workflow::context"} <= names
+    assert inspect.signature(wrapped).parameters.keys() == {"value", "offset", "nested"}
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("selected", [False, True])
+def test_metadata_factory_is_lazy(
+    monkeypatch: pytest.MonkeyPatch, active: bool, selected: bool
+) -> None:
+    """Inspect tensor metadata only when workflow is selected and active."""
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
+    calls = 0
+
+    def fail_metadata(tensor: torch.Tensor, prefix: str = "") -> dict[str, profiler.MetadataValue]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("observational metadata failure")
+
+    monkeypatch.setattr(profiler, "tensor_metadata", fail_metadata)
+    tensor = torch.ones(1)
+
+    @profiler.record_workflow_scope("workflow::lazy")
+    def wrapped(value: torch.Tensor) -> torch.Tensor:
+        return value
+
+    if active:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+            assert wrapped(tensor) is tensor
+    else:
+        assert wrapped(tensor) is tensor
+    assert calls == int(active and selected)
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("error", [RuntimeError("operation"), KeyboardInterrupt("operation")])
+def test_wrapped_exception_identity(
+    monkeypatch: pytest.MonkeyPatch, selected: bool, error: BaseException
+) -> None:
+    """Preserve body exception identity in decorator and context forms."""
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
+
+    @profiler.record_workflow_scope("workflow::exception")
+    def wrapped() -> None:
+        raise error
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        with pytest.raises(type(error)) as caught:
+            wrapped()
+        assert caught.value is error
+        with pytest.raises(type(error)) as caught:
+            with profiler.record_workflow_scope("workflow::exception_context"):
+                raise error
+        assert caught.value is error
+
+
+def test_none_selection_suppresses_real_trace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Emit no workflow scope when startup selection excludes workflow."""
+    select_regions(monkeypatch)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        with profiler.record_workflow_scope("workflow::disabled", torch.ones(1)):
+            torch.ones(1)
+    assert "workflow::disabled" not in {event.name for event in trace.events()}
+
+
+@pytest.mark.parametrize(
+    ("context_tokens", "generation_requests", "phase", "fails"),
+    [
+        (16, 0, "trtllm::prefill", False),
+        (0, 4, "trtllm::decode", False),
+        (16, 4, "trtllm::mixed", False),
+        (16, 4, "trtllm::mixed", True),
+    ],
+)
+@pytest.mark.parametrize("active,selected", [(True, True), (False, True), (True, False)])
+@pytest.mark.parametrize("is_warmup", [False, True])
+def test_executor_forward_preserves_replay_and_diagnostic_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    context_tokens: int,
+    generation_requests: int,
+    phase: str,
+    fails: bool,
+    active: bool,
+    selected: bool,
+    is_warmup: bool,
+) -> None:
+    """Execute the current forward owner with only CUDA/model operations replaced."""
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
+    monkeypatch.setattr(py_executor.ExpertStatistic, "set_iter", Mock())
+    if not (active and selected):
+
+        def unexpected_scope(*args: object, **kwargs: object) -> None:
+            pytest.fail("Inactive forward must not construct a profiling scope")
+
+        monkeypatch.setattr(py_executor, "_forward_phase_scope_name", unexpected_scope)
+    events: list[str] = []
+    result = object()
+    failure = RuntimeError("model failed")
+    default_stream = SimpleNamespace(wait_event=lambda event: events.append("default_wait"))
+    execution_stream = SimpleNamespace(wait_event=lambda event: events.append("execution_wait"))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: default_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    route_capture = SimpleNamespace(
+        set_iter=lambda iteration: events.append("route_iter"),
+        prepare=lambda *args, **kwargs: events.append("route_prepare"),
+        finish_forward=lambda: events.append("route_finish"),
+        abort_forward=lambda: events.append("route_abort"),
+    )
+    batch = SimpleNamespace(
+        context_requests=[_request(context_chunk_size=context_tokens)] if context_tokens else [],
+        generation_requests=[_request() for _ in range(generation_requests)],
+        num_context_requests=int(context_tokens > 0),
+        num_generation_requests=generation_requests,
+    )
+
+    def forward(*args: object, **kwargs: object) -> object:
+        """Check forwarded model arguments and record body execution order."""
+        assert args == (batch, resources, None)
+        assert kwargs == {
+            "cache_indirection_buffer": cache_indirection,
+            "enable_spec_decode": False,
+            "runtime_draft_len": 0,
+        }
+        events.append("model")
+        if fails:
+            raise failure
+        return result
+
+    resources = object()
+    cache_indirection = object()
+    executor = py_executor.PyExecutor.__new__(py_executor.PyExecutor)
+    executor.is_warmup = is_warmup
+    vars(executor).update(
+        iter_counter=7,
+        model_engine=SimpleNamespace(route_capture=route_capture, forward=forward),
+        enable_kv_cache_reuse=False,
+        enable_spec_decode=False,
+        runtime_draft_len=0,
+        enable_attention_dp=False,
+        dist=SimpleNamespace(mapping=Mapping()),
+        kv_connector_manager=None,
+        _finish_inforward_snapshots=False,
+        _loop_on_execution_stream=False,
+        _stream_ordering_events=[SimpleNamespace(record=lambda stream: None) for _ in range(2)],
+        _route_cache_capacity=None,
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        execution_stream=execution_stream,
+        resource_manager=resources,
+        sampler=SimpleNamespace(get_cache_indirection=lambda: cache_indirection),
+        _compute_adp_dummy_tokens=lambda requests: (3, 2),
+        _attach_encoder_output_to_execution_stream=lambda requests: events.append("attach"),
+        _mark_cross_kv_projection_consumed=lambda requests: events.append("consume"),
+        _kv_connector_wait_for_save=lambda: events.append("save"),
+        _maybe_record_hang_diagnostic_phase=lambda name, *args, **kwargs: events.append(name),
+        _handle_errors=lambda message: events.append(message),
+    )
+    with execution_trace_observer(tmp_path / "forward.json") as observer:
+        with (
+            torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+            )
+            if active
+            else nullcontext()
+        ) as trace:
+            actual = py_executor.PyExecutor._forward_step(executor, batch)
+    if active and selected:
+        nodes = profiler_nodes(tmp_path / "forward.json")
+        for name in ("trtllm::forward",):
+            node = next(node for node in nodes if node["name"] == name)
+            fields = decode_node_metadata(node)[1]
+            assert fields["workflow.executor.iteration"] == 7
+            assert fields["workflow.executor.is_warmup"] is is_warmup
+            assert (
+                fields["workflow.batch.live_requests"]
+                == int(context_tokens > 0) + generation_requests
+            )
+            assert fields["workflow.batch.scheduled_context_tokens"] == context_tokens
+        chrome_path = tmp_path / "forward-chrome.json"
+        trace.export_chrome_trace(str(chrome_path))
+        names = {event.get("name") for event in json.loads(chrome_path.read_text())["traceEvents"]}
+        assert {"trtllm::forward", phase} <= names
+        phase_event = next(event for event in trace.events() if event.name == phase)
+        assert phase_event.cpu_parent is not None
+        assert phase_event.cpu_parent.name == "trtllm::forward"
+    elif trace is not None:
+        assert not any(event.name.startswith("trtllm::") for event in trace.events())
+    assert executor._iter_adp_dummy_ctx_tokens == 3
+    assert executor._iter_adp_dummy_gen_tokens == 2
+    prefix = ["forward_call", "route_iter"]
+    if not is_warmup:
+        prefix.append("route_prepare")
+    prefix.extend(["execution_wait", "attach", "model"])
+    if fails:
+        assert actual is None
+        assert events == [*prefix, "forward_error", "route_abort", "model failed"]
+    else:
+        assert actual is result
+        assert events == [
+            *prefix,
+            "forward_returned",
+            "consume",
+            "default_wait",
+            "save",
+            "route_finish",
+            "forward_complete",
+        ]
+
+
+@pytest.mark.parametrize("active,selected", [(False, True), (True, False), (True, True)])
+def test_explicit_metadata_is_lazy_and_observational(
+    monkeypatch: pytest.MonkeyPatch, active: bool, selected: bool, tmp_path: Path
+) -> None:
+    """Missing factory gating or swallowing a body exception breaks this contract."""
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
+    calls = []
+    value = torch.ones(2)
+    failure = RuntimeError("body")
+
+    def metadata(tensor: torch.Tensor, *, fails: bool = False) -> dict[str, profiler.MetadataValue]:
+        """Record factory calls and optionally inject a metadata failure."""
+        calls.append(tensor)
+        if fails:
+            raise ValueError("metadata")
+        return {"workflow.owner.count": 3}
+
+    @profiler.record_workflow_scope("workflow::explicit", metadata_factory=metadata)
+    def wrapped(tensor: torch.Tensor, *, fails: bool = False) -> torch.Tensor:
+        """Return the input tensor or raise the original body failure."""
+        if fails:
+            raise failure
+        return tensor
+
+    with (
+        execution_trace_observer(tmp_path / "explicit.json") as observer,
+        (
+            torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+            )
+            if active
+            else nullcontext()
+        ),
+    ):
+        assert wrapped(value) is value
+        with pytest.raises(RuntimeError) as caught:
+            wrapped(value, fails=True)
+        assert caught.value is failure
+    assert len(calls) == 2 * int(active and selected)
+    assert inspect.signature(wrapped).parameters.keys() == {"tensor", "fails"}
+    assert wrapped.__name__ == "wrapped"
+    if active and selected:
+        node = next(
+            node
+            for node in profiler_nodes(tmp_path / "explicit.json")
+            if node["name"] == "workflow::explicit"
+        )
+        fields = decode_node_metadata(node)[1]
+        assert fields["workflow.owner.count"] == 3
+        assert fields["workflow.tensor.0.shape"] == [2]
+
+
+def test_batch_dummy_counts_mapping_and_microbatch_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Counting padded lists as live occupancy or dropping PP slot must fail."""
+    select_regions(monkeypatch, "workflow")
+    mapping = SimpleNamespace(
+        rank=3,
+        world_size=8,
+        tp_rank=1,
+        tp_size=2,
+        pp_rank=1,
+        pp_size=2,
+        cp_rank=0,
+        cp_size=2,
+        moe_ep_rank=1,
+        moe_ep_size=2,
+    )
+    owner = SimpleNamespace(
+        iter_counter=19,
+        dist=SimpleNamespace(mapping=mapping),
+        is_warmup=True,
+        enable_attention_dp=True,
+    )
+    batch = SimpleNamespace(
+        context_requests=[
+            _request(context_chunk_size=5),
+            _request(context_chunk_size=2, is_attention_dp_dummy=True),
+            _request(context_chunk_size=3, is_dummy_request=True),
+        ],
+        generation_requests=[
+            _request(),
+            _request(is_cuda_graph_dummy=True, is_dummy_request=True),
+        ],
+    )
+    with (
+        execution_trace_observer(tmp_path / "batch.json") as observer,
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ),
+    ):
+        with profiler.record_workflow_scope(
+            "batch",
+            metadata_factory=lambda: py_executor._forward_workflow_metadata(
+                owner, batch, microbatch_id=2
+            ),
+        ):
+            torch.ones(1)
+    node = next(node for node in profiler_nodes(tmp_path / "batch.json") if node["name"] == "batch")
+    fields = decode_node_metadata(node)[1]
+    assert fields["workflow.executor.microbatch_slot"] == 2
+    assert fields["workflow.attention_dp_enabled"] is True
+    assert fields["workflow.executor.is_warmup"] is True
+    assert fields["workflow.rank"] == 3 and fields["workflow.moe_ep_rank"] == 1
+    assert fields["workflow.batch.scheduled_context_requests"] == 3
+    assert fields["workflow.batch.scheduled_generation_requests"] == 2
+    assert fields["workflow.batch.live_requests"] == 2
+    assert fields["workflow.batch.live_context_requests"] == 1
+    assert fields["workflow.batch.live_generation_requests"] == 1
+    assert fields["workflow.batch.attention_dp_dummy_requests"] == 1
+    assert fields["workflow.batch.cuda_graph_dummy_requests"] == 1
+    assert fields["workflow.batch.generic_dummy_requests"] == 2
+    assert fields["workflow.batch.scheduled_context_tokens"] == 10
+    assert fields["workflow.batch.live_context_tokens"] == 5
+
+
+@pytest.mark.parametrize("warmup_only", [False, True])
+@pytest.mark.parametrize(
+    "temperature_only,ragged_verify_bucket",
+    [(False, None), (True, None), (False, 12), (True, 12)],
+)
+def test_decoder_capture_and_replay_named_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    warmup_only: bool,
+    temperature_only: bool,
+    ragged_verify_bucket: int | None,
+) -> None:
+    """Actual graph owners must not present padded token rows as live requests."""
+    select_regions(monkeypatch, "workflow")
+    monkeypatch.setattr(
+        cuda_graph_runner, "with_multi_stream", lambda value: nullcontext(), raising=False
+    )
+    monkeypatch.setattr(
+        cuda_graph_runner, "piecewise_cuda_graph", lambda value: nullcontext(), raising=False
+    )
+    monkeypatch.setattr(
+        cuda_graph_runner, "make_weak_ref", lambda value: lambda: value, raising=False
+    )
+    graph = SimpleNamespace(replay=lambda: None, pool=lambda: None, reset=lambda: None)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: graph)
+    monkeypatch.setattr(
+        cuda_graph_runner, "nccl_window_graph_capture", lambda *args, **kwargs: nullcontext()
+    )
+    key = cuda_graph_runner.KeyType(
+        batch_size=4,
+        draft_len=2,
+        temperature_only=temperature_only,
+        ragged_verify_bucket=ragged_verify_bucket,
+    )
+    attn = object()
+    inputs = {
+        "input_ids": torch.arange(12),
+        "position_ids": torch.arange(12).reshape(1, 12),
+        "attn_metadata": attn,
+    }
+    owner = object.__new__(cuda_graph_runner.CUDAGraphRunner)
+    vars(owner).update(
+        config=SimpleNamespace(use_mrope=False),
+        max_beam_width=1,
+        padding_enabled=True,
+        is_warmup_only=warmup_only,
+        WARMUP_STEPS=1,
+        shared_static_tensors={
+            "input_ids": torch.zeros(12, dtype=torch.int64),
+            "position_ids": torch.zeros(1, 12, dtype=torch.int64),
+        },
+        graph_metadata={},
+        graphs={},
+        graph_outputs={},
+        memory_pool=object(),
+        _step_input_prologue_keys={},
+        _pre_replay_hooks=[],
+    )
+    with (
+        execution_trace_observer(tmp_path / "graph.json") as observer,
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ) as trace,
+    ):
+        cuda_graph_runner.CUDAGraphRunner.capture(
+            owner, key, lambda inputs: inputs["input_ids"] + 1, inputs
+        )
+        if not warmup_only:
+            for live_count, staged_count in ((1, 0), (3, 12)):
+                batch = SimpleNamespace(
+                    context_requests=[],
+                    generation_requests=[_request() for _ in range(live_count)],
+                )
+                executor = SimpleNamespace(
+                    iter_counter=live_count,
+                    is_warmup=False,
+                    enable_attention_dp=False,
+                    dist=SimpleNamespace(mapping=Mapping()),
+                )
+                with profiler.record_workflow_scope(
+                    "parent",
+                    metadata_factory=lambda: py_executor._forward_workflow_metadata(
+                        executor, batch
+                    ),
+                ):
+                    cuda_graph_runner.CUDAGraphRunner.replay(
+                        owner,
+                        key,
+                        inputs,
+                        position_id_offsets=None,
+                        static_inputs_staged=staged_count,
+                    )
+    nodes = profiler_nodes(tmp_path / "graph.json")
+    graph_nodes = [node for node in nodes if node["name"].startswith("trtllm::cuda_graph_")]
+    assert len(graph_nodes) == (1 if warmup_only else 3)
+    for node in graph_nodes:
+        fields = decode_node_metadata(node)[1]
+        assert fields["workflow.graph.kind"] == "decoder"
+        assert fields["workflow.graph.key.batch_size"] == 4
+        assert fields["workflow.graph.key.draft_len"] == 2
+        assert fields["workflow.graph.key.short_seq_len_mode"] is False
+        assert fields["workflow.graph.key.temperature_only"] is temperature_only
+        assert fields["workflow.graph.key.ragged_verify_bucket"] == ragged_verify_bucket
+        assert fields["workflow.graph.key.sample_type"] == "FULL"
+        assert fields["workflow.graph.batch_capacity"] == 4
+        assert fields["workflow.graph.token_capacity"] == 12
+        assert fields["workflow.graph.input_token_rows"] == 12
+        assert fields["workflow.graph.padding_enabled"] is True
+        assert "workflow.batch.live_requests" not in fields
+        assert "workflow.graph.padding_requests" not in fields
+    first = decode_node_metadata(graph_nodes[0])[1]
+    assert first["workflow.graph.operation"] == ("warmup_only" if warmup_only else "capture")
+    if not warmup_only:
+        parent_counts = [
+            decode_node_metadata(node)[1]["workflow.batch.live_requests"]
+            for node in nodes
+            if node["name"] == "parent"
+        ]
+        assert parent_counts == [1, 3]
+    trace.export_chrome_trace(str(tmp_path / "chrome.json"))
+    assert "trtllm::cuda_graph_capture" in {
+        event.get("name")
+        for event in json.loads((tmp_path / "chrome.json").read_text())["traceEvents"]
+    }
+
+
+@pytest.mark.parametrize("kind", ["decoder", "encoder"])
+@pytest.mark.parametrize("operation", ["capture", "replay"])
+def test_graph_metadata_accepts_additive_call_keywords(kind: str, operation: str) -> None:
+    """New execution kwargs must not silently discard graph scope metadata."""
+    owner = SimpleNamespace(
+        padding_enabled=True,
+        is_warmup_only=False,
+        WARMUP_STEPS=1,
+        max_beam_width=1,
+        feature_mode=True,
+        _get_num_tokens_for_key=lambda key: 12,
+    )
+    key = cuda_graph_runner.KeyType(4, 2) if kind == "decoder" else (4, 12, 3)
+    inputs = {
+        "input_ids": torch.arange(12),
+        "encoder_hidden_states": torch.ones(5, 8),
+    }
+    factory = getattr(cuda_graph_runner, f"_{kind}_{operation}_workflow_metadata")
+    args = (
+        (owner, key, lambda inputs: None, inputs)
+        if operation == "capture"
+        else (owner, key, inputs)
+    )
+    fields = factory(*args, future_execution_option=object())
+    assert fields["workflow.graph.kind"] == kind
+    assert fields["workflow.graph.operation"] == operation
+    if kind == "decoder":
+        assert fields["workflow.graph.encoder_hidden_state_rows"] == 5
+
+
+@pytest.mark.parametrize(
+    "features,expected_shape",
+    [
+        pytest.param(torch.ones(2, 8), [2, 8], id="tensor-compatibility"),
+        pytest.param([], None, id="empty-list"),
+        pytest.param([torch.tensor(1)], None, id="scalar"),
+        pytest.param([torch.ones(1, 8), object()], None, id="non-tensor"),
+        pytest.param([torch.ones(1, 8), torch.ones(1, 9)], None, id="different-widths"),
+        pytest.param(
+            [torch.ones(1, 8), torch.ones(1, 8, dtype=torch.float64)],
+            None,
+            id="different-dtypes",
+        ),
+    ],
+)
+def test_encoder_feature_shape_compatibility(
+    features: torch.Tensor | list[object], expected_shape: list[int] | None
+) -> None:
+    """Report packed feature shapes only for compatible tensor inputs."""
+    owner = SimpleNamespace(padding_enabled=True, WARMUP_STEPS=1)
+    fields = cuda_graph_runner._encoder_graph_workflow_metadata(
+        owner, (4, 12, 3), {"input_features": features}, "replay"
+    )
+    if expected_shape is None:
+        assert "workflow.graph.input_feature_shape" not in fields
+    else:
+        assert fields["workflow.graph.input_feature_shape"] == expected_shape
+
+
+@pytest.mark.parametrize("operation", ["capture", "replay"])
+@pytest.mark.parametrize(
+    "source_lengths,has_source_counts",
+    [
+        pytest.param([3, 3], True, id="plain-int-lengths"),
+        pytest.param(None, False, id="missing-lengths"),
+        pytest.param([3, True], False, id="bool-length"),
+        pytest.param([torch.tensor(3)], False, id="tensor-length"),
+    ],
+)
+def test_encoder_graph_preserves_source_and_key_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+    source_lengths: list[int | torch.Tensor] | None,
+    has_source_counts: bool,
+) -> None:
+    """Keep encoder bucket capacities distinct from host source counts."""
+    select_regions(monkeypatch, "workflow")
+    result = object()
+    owner = SimpleNamespace(
+        feature_mode=True,
+        padding_enabled=True,
+        is_warmup_only=False,
+        WARMUP_STEPS=1,
+        _replay_features=lambda key, inputs: result,
+        _prepare_feature_capture=lambda key, inputs: (inputs, None),
+        _get_capture_stream=lambda: None,
+        _contains_nested_tensor=lambda output: False,
+        graph_metadata={},
+        graphs={},
+        graph_outputs={},
+        memory_pool=object(),
+    )
+    monkeypatch.setattr(
+        cuda_graph_runner, "with_multi_stream", lambda value: nullcontext(), raising=False
+    )
+    monkeypatch.setattr(
+        cuda_graph_runner, "piecewise_cuda_graph", lambda value: nullcontext(), raising=False
+    )
+    monkeypatch.setattr(cuda_graph_runner, "make_weak_ref", lambda value: value, raising=False)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: SimpleNamespace(pool=lambda: None))
+    monkeypatch.setattr(
+        cuda_graph_runner, "nccl_window_graph_capture", lambda *args, **kwargs: nullcontext()
+    )
+    inputs = {
+        "input_features": [torch.ones(1, 8), torch.ones(1, 8)],
+        "attn_metadata": object(),
+    }
+    if source_lengths is not None:
+        inputs[cuda_graph_runner._ENCODER_SOURCE_SEQ_LENS] = source_lengths
+    with (
+        execution_trace_observer(tmp_path / "encoder.json") as observer,
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ),
+    ):
+        if operation == "replay":
+            actual = cuda_graph_runner.EncoderCUDAGraphRunner.replay(owner, (4, 12, 3), inputs)
+        else:
+            actual = cuda_graph_runner.EncoderCUDAGraphRunner.capture(
+                owner, (4, 12, 3), lambda inputs: result, inputs
+            )
+        assert actual is result
+    node = next(
+        node
+        for node in profiler_nodes(tmp_path / "encoder.json")
+        if node["name"] == f"trtllm::cuda_graph_{operation}"
+    )
+    fields = decode_node_metadata(node)[1]
+    assert fields["workflow.graph.kind"] == "encoder"
+    assert fields["workflow.graph.operation"] == operation
+    assert fields["workflow.graph.key.padded_batch_size"] == 4
+    assert fields["workflow.graph.key.padded_total_tokens"] == 12
+    assert fields["workflow.graph.key.max_seq_len_bucket"] == 3
+    assert fields["workflow.graph.input_feature_shape"] == [2, 8]
+    if has_source_counts:
+        assert fields["workflow.graph.source_requests"] == 2
+        assert fields["workflow.graph.source_tokens"] == 6
+        assert fields["workflow.graph.padding_requests"] == 2
+        assert fields["workflow.graph.padding_tokens"] == 6
+    else:
+        for name in ("source_requests", "source_tokens", "padding_requests", "padding_tokens"):
+            assert f"workflow.graph.{name}" not in fields
+    assert "workflow.graph.key.draft_len" not in fields
+
+
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_eager_model_physical_rows_are_not_generation_requests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_dummy: bool
+) -> None:
+    """Speculative rows must retain their physical dimension, not request count."""
+    select_regions(monkeypatch, "workflow")
+    tensor = torch.ones(9, dtype=torch.int64)
+    owner = SimpleNamespace(
+        _model_caller=lambda **kwargs: kwargs["input_ids"],
+        _eager_workspace_reclaimer=None,
+        _moe_workspace_reclaimer=None,
+    )
+    with (
+        execution_trace_observer(tmp_path / "model.json") as observer,
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ),
+    ):
+        assert (
+            decoder_runner.DecoderRunner._model_forward(
+                owner, is_dummy=is_dummy, input_ids=tensor, attn_metadata=object()
+            )
+            is tensor
+        )
+    node = next(
+        node
+        for node in profiler_nodes(tmp_path / "model.json")
+        if node["name"] == "trtllm::model_forward"
+    )
+    fields = decode_node_metadata(node)[1]
+    assert fields["workflow.model.input_token_rows"] == 9
+    assert fields["workflow.executor.is_warmup"] is is_dummy
+    assert "workflow.batch.live_generation_requests" not in fields
+
+
+@pytest.mark.parametrize("route", ["_forward_step_inter_pp", "_forward_step"])
+def test_pp_loop_call_propagates_actual_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route: str
+) -> None:
+    """Call forward owners directly and preserve the caller's microbatch slot."""
+    select_regions(monkeypatch, "workflow")
+    batch = SimpleNamespace(
+        context_requests=[], generation_requests=[_request()], context_requests_last_chunk=[]
+    )
+    owner = SimpleNamespace(
+        iter_counter=6,
+        enable_attention_dp=False,
+        dist=SimpleNamespace(mapping=Mapping(world_size=4, pp_size=4)),
+        runtime_draft_len=0,
+        is_warmup=False,
+        model_engine=SimpleNamespace(runtime_draft_len=0),
+        perf_manager=SimpleNamespace(record_perf_events=lambda *args: nullcontext()),
+        _update_request_states=lambda batch: None,
+        sampler=SimpleNamespace(SampleState=lambda **kwargs: None),
+    )
+
+    @profiler.record_workflow_scope(
+        "pp-forward", metadata_factory=py_executor._forward_workflow_metadata
+    )
+    def forward(
+        executor: object, scheduled_requests: object, *, microbatch_id: int | None = None
+    ) -> None:
+        pass
+
+    owner._forward_step = lambda *args, **kwargs: forward(owner, *args, **kwargs)
+    owner._forward_step_inter_pp = lambda *args, **kwargs: (
+        py_executor.PyExecutor._forward_step_inter_pp(owner, *args, **kwargs)
+    )
+    monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace(record=lambda: None))
+    monkeypatch.setattr(py_executor, "SamplerEvent", lambda **kwargs: None, raising=False)
+    with (
+        execution_trace_observer(tmp_path / "pp.json") as observer,
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ),
+    ):
+        if route == "_forward_step_inter_pp":
+            py_executor.PyExecutor._forward_step_inter_pp(owner, batch, microbatch_id=3)
+        else:
+            owner._forward_step(batch, microbatch_id=3)
+    node = next(
+        node for node in profiler_nodes(tmp_path / "pp.json") if node["name"] == "pp-forward"
+    )
+    fields = decode_node_metadata(node)[1]
+    assert fields["workflow.executor.microbatch_slot"] == 3
+    assert fields["workflow.executor.iteration"] == 6
+
+
+@pytest.mark.parametrize("last_pp_rank", [False, True])
+def test_executor_pp_loop_passes_consecutive_slots(
+    monkeypatch: pytest.MonkeyPatch, last_pp_rank: bool
+) -> None:
+    """Pass slots zero and one from the real loop to the selected forward owner."""
+    owner = _pp_executor(monkeypatch, [], rank=int(last_pp_rank))
+    owner.num_micro_batches = 2
+    owner.micro_batches = [None, None]
+    owner.send_expected_batch_num_handles = [None, None]
+    owner.kv_cache_transceiver = None
+    owner.guided_decoder = None
+    owner.pp_multi_stream_sample = False
+    owner.disable_overlap_scheduler = True
+    owner.resource_manager = Mock()
+    owner.perf_manager = SimpleNamespace(record_perf_events=lambda *args: nullcontext())
+    owner._step_scope = lambda batch: nullcontext()
+    owner._can_queue = Mock(return_value=(True, True))
+    owner.executed_batch_queue = SimpleNamespace(put=owner.executed_batch_response_queue.put)
+    if last_pp_rank:
+        owner.dist.recv_object = Mock(side_effect=[0, 1])
+    for name in (
+        "_add_inflight_ids",
+        "_prepare_disagg_gen_transmission_complete",
+        "_handle_dynamic_draft_len",
+        "_maybe_record_hang_diagnostic_phase",
+        "_handle_executed_batch",
+        "_handle_guided_decoder_errors",
+        "_update_request_states",
+    ):
+        monkeypatch.setattr(owner, name, Mock())
+
+    batches = [py_executor.ScheduledRequests(), py_executor.ScheduledRequests()]
+    for batch in batches:
+        batch.generation_requests = [_request(py_batch_idx=0)]
+    owner._pp_schedule_and_propagate = lambda slot: (batches[slot], [], 0, False)
+    shutdown = iter([False, False, True])
+
+    def fetch_new_requests() -> list[object]:
+        owner.is_shutdown = next(shutdown)
+        return []
+
+    owner._fetch_and_activate_new_requests = fetch_new_requests
+    sample_state = SimpleNamespace(sampler_event=Mock())
+    owner._sample_async = lambda batch, outputs: sample_state
+    slots: list[int | None] = []
+    forwarded_batches: list[object] = []
+
+    def forward(batch: object, *timing_events: object, microbatch_id: int | None = None) -> object:
+        slots.append(microbatch_id)
+        forwarded_batches.append(batch)
+        return {"logits": object()} if last_pp_rank else sample_state
+
+    def wrong_forward(*args: object, **kwargs: object) -> None:
+        pytest.fail("The loop selected the wrong PP forward owner")
+
+    owner._forward_step = forward if last_pp_rank else wrong_forward
+    owner._forward_step_inter_pp = wrong_forward if last_pp_rank else forward
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda *args: nullcontext())
+
+    py_executor.PyExecutor._executor_loop_pp(owner)
+
+    assert slots == [0, 1]
+    assert forwarded_batches == batches
+    assert owner.iter_counter == 2
+    assert owner._event_loop_completed
+
+
+def test_prepare_inputs_owner_scope_preserves_exception_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the real input-preparation boundary visible when its first dependency fails."""
+    select_regions(monkeypatch, "workflow")
+    failure = KeyboardInterrupt("prepare inputs failed")
+
+    def fail_prefill_flag(enabled: bool) -> None:
+        raise failure
+
+    monkeypatch.setattr(
+        decoder_inputs, "set_per_request_prefill_cuda_graph_flag", fail_prefill_flag
+    )
+    preparer = decoder_inputs.DecoderInputPreparer.__new__(decoder_inputs.DecoderInputPreparer)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            preparer.prepare_inputs(
+                scheduled_requests=py_executor.ScheduledRequests(),
+                kv_cache_manager=None,
+                attn_metadata=None,
+                enable_spec_decode=False,
+                runtime_draft_len=0,
+                is_dummy=False,
+            )
+
+    assert caught.value is failure
+    assert [event.name for event in trace.events()].count("trtllm::prepare_inputs") == 1
+
+
+@pytest.mark.parametrize("pp_size,expected", [(1, 0), (2, None)])
+def test_microbatch_slot_unknown_is_not_a_numeric_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pp_size: int, expected: int | None
+) -> None:
+    """Omit unknown pipeline slots while preserving the single-stage zero slot."""
+    select_regions(monkeypatch, "workflow")
+    owner = SimpleNamespace(
+        iter_counter=1,
+        is_warmup=False,
+        enable_attention_dp=False,
+        dist=SimpleNamespace(mapping=Mapping(world_size=pp_size, pp_size=pp_size)),
+    )
+    batch = SimpleNamespace(context_requests=[], generation_requests=[])
+    with (
+        execution_trace_observer(tmp_path / "unknown.json") as observer,
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ),
+    ):
+        with profiler.record_workflow_scope(
+            "unknown", metadata_factory=lambda: py_executor._forward_workflow_metadata(owner, batch)
+        ):
+            pass
+    node = next(
+        node for node in profiler_nodes(tmp_path / "unknown.json") if node["name"] == "unknown"
+    )
+    fields = decode_node_metadata(node)[1]
+    if expected is None:
+        assert "workflow.executor.microbatch_slot" not in fields
+    else:
+        assert fields["workflow.executor.microbatch_slot"] == expected
+    assert fields["workflow.attention_dp_enabled"] is False
+    assert fields["workflow.executor.is_warmup"] is False
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_graph_metadata_failure_keeps_replay_body_exception(
+    monkeypatch: pytest.MonkeyPatch, selected: bool
+) -> None:
+    """Keep graph replay exceptions independent of metadata selection or failure."""
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
+    calls = []
+
+    def fail_metadata(*args: object) -> dict[str, profiler.MetadataValue]:
+        calls.append(None)
+        raise ValueError("observational")
+
+    monkeypatch.setattr(cuda_graph_runner, "_decoder_graph_workflow_metadata", fail_metadata)
+    error = RuntimeError("graph replay body")
+
+    def replay() -> None:
+        raise error
+
+    key = cuda_graph_runner.KeyType(batch_size=1, draft_len=0)
+    attn = object()
+    owner = object.__new__(cuda_graph_runner.CUDAGraphRunner)
+    vars(owner).update(
+        config=SimpleNamespace(use_mrope=False),
+        max_beam_width=1,
+        graph_metadata={key: {"attn_metadata": attn, "spec_metadata": None}},
+        shared_static_tensors={"input_ids": torch.zeros(1), "position_ids": torch.zeros(1, 1)},
+        graphs={key: SimpleNamespace(replay=replay, reset=lambda: None)},
+        graph_outputs={},
+        memory_pool=None,
+        _step_input_prologue_keys={},
+        _pre_replay_hooks=[],
+    )
+    owner._get_num_tokens_for_key = lambda key: 1
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        with pytest.raises(RuntimeError) as caught:
+            cuda_graph_runner.CUDAGraphRunner.replay(
+                owner,
+                key,
+                {
+                    "input_ids": torch.ones(1),
+                    "position_ids": torch.ones(1, 1),
+                    "attn_metadata": attn,
+                },
+            )
+        assert caught.value is error
+    assert len(calls) == int(selected)
+
+
+@pytest.mark.parametrize(
+    "method,scope_name,args,dependency",
+    [
+        (
+            "_prepare_and_schedule_batch",
+            "trtllm::prepare_batch",
+            (),
+            "_release_unused_connector_reservations",
+        ),
+        ("_schedule", "trtllm::schedule", (), "_maybe_record_hang_diagnostic_phase"),
+        ("_sample_async", "trtllm::sampling", (None, None), "_maybe_record_hang_diagnostic_phase"),
+        ("_update_requests", "trtllm::update_requests", (None,), "sampler"),
+        ("_handle_responses", "trtllm::handle_responses", (), "perf_manager"),
+    ],
+)
+def test_executor_owner_scope_preserves_body_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    scope_name: str,
+    args: tuple[object, ...],
+    dependency: str,
+) -> None:
+    """Observe real owner entry points, independent of aliases or source layout."""
+    select_regions(monkeypatch, "workflow")
+    error = KeyboardInterrupt("owner body")
+    fail = Mock(side_effect=error)
+    owner = SimpleNamespace(dist=SimpleNamespace(rank=0), active_requests=[])
+    if dependency == "sampler":
+        owner.sampler = SimpleNamespace(update_requests=fail)
+    elif dependency == "perf_manager":
+        owner.perf_manager = SimpleNamespace(get_timestamp=fail)
+    else:
+        setattr(owner, dependency, fail)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            getattr(py_executor.PyExecutor, method)(owner, *args)
+    assert caught.value is error
+    fail.assert_called_once()
+    assert sum(event.name == scope_name for event in trace.events()) == 1
+
+
+def test_encoder_replay_rows_agree_in_metadata_phase_and_step_label() -> None:
+    """Count encoder replay for both live and scheduled context work."""
+    from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+
+    replay = EncoderReplay(request_id=1, cache_identity=7, global_end=9, start=0)
+    live = _request(context_chunk_size=3, py_ced_replay=replay)
+    dummy = _request(context_chunk_size=2, is_dummy_request=True)
+    batch = SimpleNamespace(
+        context_requests=[live, dummy],
+        generation_requests=[],
+        num_context_requests=2,
+        num_generation_requests=0,
+    )
+    owner = SimpleNamespace(
+        iter_counter=1,
+        is_warmup=False,
+        enable_attention_dp=False,
+        dist=SimpleNamespace(mapping=Mapping()),
+    )
+    fields = py_executor._forward_workflow_metadata(owner, batch, future_adapter_option=True)
+    assert fields["workflow.batch.scheduled_context_tokens"] == 14
+    assert fields["workflow.batch.live_context_tokens"] == 12
+    assert fields["workflow.phase"] == "prefill"
+    assert (
+        py_executor.PyExecutor._build_step_scope_label(owner, batch) == "step[EXTEND bs=2 toks=14]"
+    )
+    replay.consumed = True
+    fields = py_executor._forward_workflow_metadata(owner, batch)
+    assert fields["workflow.batch.scheduled_context_tokens"] == 5
+    assert fields["workflow.batch.live_context_tokens"] == 3
+
+
+def test_live_workflow_counts_use_request_dummy_contract() -> None:
+    owner = SimpleNamespace(
+        iter_counter=1,
+        is_warmup=False,
+        enable_attention_dp=False,
+        dist=SimpleNamespace(mapping=Mapping()),
+    )
+    batch = SimpleNamespace(context_requests=[], generation_requests=[_request(is_dummy=True)])
+    fields = py_executor._forward_workflow_metadata(owner, batch)
+    assert fields["workflow.batch.live_requests"] == 0
+
+
+@pytest.mark.parametrize("failure_phase", ["setup", "entry", "cleanup"])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_metadata_free_phase_scope_preserves_operation_outcome(
+    monkeypatch: pytest.MonkeyPatch, failure_phase: str, body_fails: bool
+) -> None:
+    """Removing duplicate metadata must retain fail-open phase instrumentation."""
+    select_regions(monkeypatch, "workflow")
+    monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: True)
+    scope = MagicMock()
+    observational = RuntimeError("phase instrumentation")
+    if failure_phase == "entry":
+        scope.__enter__.side_effect = observational
+    elif failure_phase == "cleanup":
+        scope.__exit__.side_effect = observational
+
+    def record(name: str, args: str | None = None) -> object:
+        assert name == "trtllm::prefill" and args is None
+        if failure_phase == "setup":
+            raise observational
+        return scope
+
+    monkeypatch.setattr(torch.profiler, "record_function", record)
+    body_error = KeyboardInterrupt("forward body")
+    calls = []
+
+    def run() -> None:
+        with profiler.record_function_metadata_scope("trtllm::prefill", "workflow"):
+            calls.append(True)
+            if body_fails:
+                raise body_error
+
+    if body_fails:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            run()
+        assert caught.value is body_error
+    else:
+        run()
+    assert calls == [True]
