@@ -35,7 +35,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
-from .combined import CombinedFmha
+from .combined import CombinedFmha, generation_rows_uniform
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes, step_planning_fmha_lib_classes
@@ -132,6 +132,9 @@ class _FmhaCacheKey(NamedTuple):
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
+    # Whether every generation row carries generation_seq_len_q tokens: a row without drafts can
+    # sit next to 1 + K rows, and libraries that slice the tokens into equal rows decline that.
+    generation_rows_uniform: bool
     attention_mask_type: AttentionMaskType
     has_variable_window: bool
     use_spec_decoding: bool
@@ -381,8 +384,10 @@ class FmhaManager:
         Batch size and generation Q length use ceiling grid buckets based on
         TRTLLM-Gen JIT warmup candidates. Each candidate and its predecessor
         are separate grid points so a support boundary at the candidate cannot
-        alias with the interval below it. Generation Q lengths are uniform in
-        the executor, including padded speculative-decoding batches.
+        alias with the interval below it. The executor pads linear
+        speculative-decoding rows to a uniform Q length, but a row without
+        drafts keeps one token, so the key also records whether the
+        generation rows are uniform.
 
         The batch fields describe the complete source scheduler batch, even
         when ``q`` contains only one compacted phase. Ordinary attention
@@ -413,10 +418,12 @@ class FmhaManager:
             metadata.num_generations, _FMHA_CACHE_BATCH_SIZE_GRID
         )
         generation_seq_len_q = 0
+        rows_uniform = True
         if attention_input_type != AttentionInputType.context_only and metadata.num_generations > 0:
             generation_num_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
                 generation_num_tokens -= metadata.num_ctx_tokens
+            rows_uniform = generation_rows_uniform(q, metadata, generation_num_tokens)
             generation_seq_len_q = generation_num_tokens // metadata.num_generations
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
@@ -427,6 +434,7 @@ class FmhaManager:
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
+            generation_rows_uniform=rows_uniform,
             attention_mask_type=attention_mask_type,
             has_variable_window=forward_args.variable_window_token_starts is not None,
             use_spec_decoding=metadata.use_spec_decoding,

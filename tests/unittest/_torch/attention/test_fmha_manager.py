@@ -23,7 +23,10 @@ import torch
 from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
 
 from tensorrt_llm._torch.attention.backends.fmha import manager as fmha_manager
-from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
+from tensorrt_llm._torch.attention.backends.fmha.combined import (
+    CombinedFmha,
+    generation_rows_uniform,
+)
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -334,6 +337,41 @@ def test_only_flash_attn4_opts_in_to_whole_batch_pairing() -> None:
         for name, cls in FMHA_LIBS.items()
         if getattr(cls, "pairs_with_whole_batch_context", False)
     } == {"flash_attn4_generation"}
+
+
+def test_fmha_cache_separates_non_uniform_generation_rows() -> None:
+    """Two rows of 3 + 3 and of 1 + 5 tokens (a row without drafts next to a 1 + K row) have the
+    same batch size and average Q length; a library selected for the first must not be reused from
+    the cache for the second."""
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    uniform_only = FakeFmha(
+        attn,
+        "uniform-only",
+        events,
+        request_support_predicate=lambda q, metadata: generation_rows_uniform(q, metadata),
+    )
+    fallback = FakeFmha(attn, "fallback", events)
+    manager.fmha_libs = [uniform_only, fallback]
+    q = torch.empty((6, 4))
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    metadata_by_rows = {}
+    for uniform, gen_lens in ((True, [3, 3]), (False, [1, 5])):
+        metadata = _make_metadata(num_contexts=0, num_generations=2, use_spec_decoding=True)
+        metadata.seq_lens = torch.tensor(gen_lens, dtype=torch.int32)
+        metadata.max_total_draft_tokens = 4
+        metadata_by_rows[uniform] = metadata
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        for _ in range(2):
+            selected = {
+                uniform: manager.select(
+                    attn, q, None, None, metadata_by_rows[uniform], forward_args
+                )
+                for uniform in (True, False)
+            }
+            assert selected == {True: uniform_only, False: fallback}
+
+    assert len(manager._cache) == 2
 
 
 @pytest.mark.parametrize(("lower_q_length", "upper_q_length"), [(3, 4), (7, 8)])

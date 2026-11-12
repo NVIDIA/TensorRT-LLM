@@ -70,7 +70,8 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # Opt-in shared-prefix generation path (TLLM_FMHA_LIBS=+sampling_shared_prefix).
         # It must precede flashinfer_trtllm_gen, which takes every generation
         # batch it supports. It declines eager batches without a shared prefix
-        # but serves every n-sample batch a CUDA graph is captured for.
+        # but serves every batch it plans when a CUDA graph is captured for it,
+        # n = 1 requests included (each attended on its own).
         "sampling_shared_prefix": SamplingSharedPrefixFmha,
         # Opt-in FlashAttention-4 generation path on SM90 (TLLM_FMHA_LIBS=+flash_attn4_generation):
         # decode and linear speculative verification. After sampling_shared_prefix, which takes the

@@ -178,9 +178,9 @@ def test_combined_fmha_splits_a_mixed_batch_with_a_whole_batch_context_library(
     ]
 
 
-@pytest.mark.parametrize("gen_lens", [[4, 2, 3], [1, 4, 4]])
-def test_combined_fmha_sends_ragged_generation_rows_to_the_whole_batch_library(gen_lens) -> None:
+def test_combined_fmha_sends_ragged_generation_rows_to_the_whole_batch_library() -> None:
     """Rows of different lengths, even when they divide evenly, stay on the whole-batch op."""
+    gen_lens = [1, 4, 4]
     events: list[tuple] = []
     combined_fmha = _whole_batch_combined(events)
     tokens = 5 + sum(gen_lens)

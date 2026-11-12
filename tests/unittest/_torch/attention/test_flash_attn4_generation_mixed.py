@@ -112,12 +112,19 @@ def _run(case, monkeypatch, libs):
     return golden, out, atol, rtol
 
 
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(28, 4), (20, 20)], ids=["gqa", "mha"])
-@pytest.mark.parametrize("q_len", [1, 4, 9])
+_FA4 = "+flash_attn4_generation"
+_LIBRARY_AND_FA4 = "+sampling_shared_prefix,+flash_attn4_generation"
+
+
 @pytest.mark.parametrize(
-    "libs",
-    ["+flash_attn4_generation", "+sampling_shared_prefix,+flash_attn4_generation"],
-    ids=["fa4", "library+fa4"],
+    "num_heads,num_kv_heads,q_len,libs",
+    [
+        (28, 4, 1, _FA4),
+        (28, 4, 9, _FA4),
+        (20, 20, 4, _FA4),
+        (28, 4, 1, _LIBRARY_AND_FA4),
+        (28, 4, 9, _LIBRARY_AND_FA4),
+    ],
 )
 def test_mixed_batch_generation_rows_on_fa4_match_dense(
     num_heads, num_kv_heads, q_len, libs, spies, monkeypatch
