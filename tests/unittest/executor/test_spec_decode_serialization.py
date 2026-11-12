@@ -27,8 +27,7 @@ not they enabled the feature.
 The omission is deliberately scoped to this one field: unrelated optional
 fields that clients may rely on being present must still serialize as null.
 
-GPU-free logic, but importing the serving protocol is unproven on the CPU-only
-CI stage, so this file is wired into a GPU list (l0_a10.yml) like its siblings.
+GPU-free; runs in the CPU-Generic stages through l0_cpu.yml.
 """
 
 import pytest
