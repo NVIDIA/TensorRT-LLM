@@ -1662,7 +1662,7 @@ class KvCacheCreator:
         return reserve
 
     def _get_eager_logits_memory_reserve(self, profiled: bool) -> int:
-        """Reserve a full eager logits batch, subtracting one profiled row."""
+        """Reserve eager logits for LM-head or explicitly sized producers."""
         if not self._mapping.is_last_pp_rank():
             return 0
         model = self._model_engine.model
@@ -1683,7 +1683,9 @@ class KvCacheCreator:
                                               None)
         if get_logits_memory_per_token is not None:
             return num_rows * get_logits_memory_per_token()
-        lm_head = model.lm_head
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None:
+            return 0
         output_dtype = lm_head.output_dtype or lm_head.dtype
         bytes_per_logit = output_dtype.itemsize
         if output_dtype != torch.float32:
