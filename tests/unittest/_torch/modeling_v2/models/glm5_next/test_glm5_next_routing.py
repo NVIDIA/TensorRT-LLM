@@ -48,8 +48,6 @@ def _on_sm100(monkeypatch):
 
 
 def _llm_args(mode: str, **kwargs) -> TorchLlmArgs:
-    """The engine arguments of a deployment that serves the checkpoint text only, as the targets require."""
-    kwargs.setdefault("disable_mm_encoder", True)
     return TorchLlmArgs(model=_DUMMY_MODEL, modeling_v2=mode, **kwargs)
 
 
@@ -139,15 +137,20 @@ def test_other_deployments_route_to_the_split_target(mode, spec_config, mapping_
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode, **llm_kwargs))) == _SPLIT
 
 
+@pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize(
-    "spec_config", [None, MTPDecodingConfig(max_draft_len=3)], ids=["no-spec", "mtp3"]
+    "spec_config, target",
+    [(None, _SPLIT), (MTPDecodingConfig(max_draft_len=3), _FUSED)],
+    ids=["no-spec", "mtp3"],
 )
-def test_flash_with_the_multimodal_encoder_does_not_match(spec_config):
-    """The targets run no vision tower, so a deployment that keeps the multimodal encoder falls back."""
-    config = _model_config(_flash_config(), spec_config=spec_config)
-    assert modeling_v2_resolve(config, _llm_args("auto", disable_mm_encoder=False)) is None
-    with pytest.raises(ValueError, match="multimodal encoder enabled"):
-        modeling_v2_resolve(config, _llm_args("require", disable_mm_encoder=False))
+@pytest.mark.parametrize("disable_mm_encoder", [False, True], ids=["mm-encoder", "text-only"])
+def test_flash_routes_with_or_without_the_multimodal_encoder(
+    mode, spec_config, target, disable_mm_encoder
+):
+    """Routing does not read the encoder setting: the targets refuse image and video requests at admission."""
+    config = _model_config(_flash_config(), spec_config=spec_config, **_TEP4)
+    llm_args = _llm_args(mode, disable_mm_encoder=disable_mm_encoder)
+    assert _qualified(modeling_v2_resolve(config, llm_args)) == target
 
 
 @pytest.mark.parametrize(
