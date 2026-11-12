@@ -197,10 +197,14 @@ def _step0_epilogue_kernel(
     """One program per request ``i`` (every write is to row ``i`` only; ``seq_lens_ptr`` is never written)."""
     i = tl.program_id(0)
     is_ctx = i < num_contexts
-    offs = tl.arange(0, BLOCK_C)
-    lens = tl.load(seq_lens_ptr + offs, mask=(offs <= i) & is_ctx, other=0).to(tl.int64)
     acc = tl.load(num_accepted_ptr + i).to(tl.int64)
-    # contexts: cumsum(seq_lens)[i] - 1 (last prompt token); generations: last accepted token of the block
+    # contexts: cumsum(seq_lens)[i] - 1 (last prompt token), summed in BLOCK_C tiles so that the tile does not
+    # follow the context count; generations: last accepted token of the block
+    ctx_end = tl.where(is_ctx, i + 1, 0)
+    lens = tl.zeros([BLOCK_C], dtype=tl.int64)
+    for c0 in range(0, ctx_end, BLOCK_C):
+        offs = c0 + tl.arange(0, BLOCK_C)
+        lens += tl.load(seq_lens_ptr + offs, mask=offs < ctx_end, other=0).to(tl.int64)
     gid = tl.where(
         is_ctx,
         tl.sum(lens, axis=0) - 1,
@@ -311,7 +315,8 @@ def step0_epilogue(
         K=draft_len,
         R=rows,
         H=h,
-        BLOCK_C=max(16, triton.next_power_of_2(max(num_contexts, 1))),
+        # One tile for every context count: the kernel loops over context blocks.
+        BLOCK_C=64,
         BLOCK_H=triton.next_power_of_2(h),
         LAST=last,
         num_warps=4,

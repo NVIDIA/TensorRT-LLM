@@ -87,7 +87,7 @@ def test_fused_accept_matches_unfused(force, num_contexts, num_gens, monkeypatch
 
 @pytest.mark.parametrize(
     "num_contexts,num_gens,k,rows",
-    [(3, 5, 6, 3), (2, 0, 7, 3), (0, 64, 8, 0), (1, 1, 1, 0)],
+    [(3, 5, 6, 3), (2, 0, 7, 3), (0, 64, 8, 0), (1, 1, 1, 0), (130, 2, 3, 0)],
 )
 def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
     # rows = 0: 1-D position ids, else [rows, tokens] MRoPE positions.
@@ -211,7 +211,16 @@ def test_accept_kernels_compile_once_across_batch_splits():
 
     run(3, 2)
     compiled = [len(kernel.device_caches[device][0]) for kernel in kernels]
-    # Up to 16 context requests: the step-0 context tile grows above that.
-    for num_contexts, num_gens in [(1, 0), (16, 0), (0, 1), (0, 16), (0, 17), (2, 5), (1, 130)]:
+    for num_contexts, num_gens in [
+        (1, 0),
+        (16, 0),
+        (17, 0),
+        (0, 1),
+        (0, 16),
+        (0, 17),
+        (2, 5),
+        (1, 130),
+        (130, 1),
+    ]:
         run(num_contexts, num_gens)
     assert [len(kernel.device_caches[device][0]) for kernel in kernels] == compiled
