@@ -25,6 +25,7 @@ Tests for:
 
 import inspect
 import random
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -55,7 +56,10 @@ from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
     GenAdmissionConfig,
     GenAdmissionWaitingQueue,
 )
-from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankKvCacheStats
+from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import (
+    RankKvCacheStats,
+    RankSpecDecodingStats,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.conversation_params import ConversationParams
@@ -311,8 +315,13 @@ class TestRankState:
         assert RankIterStatsPayload.deserialize(payload.serialize(include_kv_cache_load)) == payload
         assert RankState.deserialize(state.serialize(include_kv_cache_load)) == state
 
-    def test_kv_snapshot_wire_schema_is_stable(self) -> None:
+    def test_snapshot_wire_schema_is_stable(self) -> None:
         """Pin field order and the complete versioned frame independently of roundtrips."""
+        assert RankSpecDecodingStats._fields == (
+            "num_draft_tokens",
+            "num_accepted_tokens",
+            "num_requests_with_draft_tokens",
+        )
         assert RankKvCacheStats._fields == (
             "max_num_blocks",
             "free_num_blocks",
@@ -344,6 +353,7 @@ class TestRankState:
                 kv_load_timestamp_ns=123,
                 kv_cache_stats=RankKvCacheStats(100, 80, 20, 16, 40, 30, 7, 5, 0.375),
                 cross_kv_cache_stats=RankKvCacheStats(60, 45, 15, 32, 25, 18, 4, 3, 0.25),
+                specdec_stats=RankSpecDecodingStats(15, 9, 5),
             ),
             num_context_requests=3,
             num_generation_requests=4,
@@ -355,10 +365,11 @@ class TestRankState:
             7,
             321,
             2,  # Rank state prefix.
-            -1,
+            -2,
             1,
             1,
-            1,  # Version and load/primary/cross presence flags.
+            1,
+            1,  # Version and load/primary/cross/speculative-decoding presence flags.
             1,
             9,
             2,
@@ -389,6 +400,9 @@ class TestRankState:
             4,
             3,
             0.25,  # Cross KV snapshot.
+            15,
+            9,
+            5,  # Speculative-decoding snapshot.
             3,
             4,
             6,
@@ -417,6 +431,43 @@ class TestRankState:
             RankState.deserialize(wire)
         with pytest.raises(ValueError, match="requires"):
             RankIterStatsPayload.deserialize(state.iter_stats.serialize()[:-1])
+
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    @pytest.mark.parametrize("include_kv_cache_stats", [False, True])
+    def test_specdec_snapshot_roundtrip_preserves_tail(
+        self, include_kv_cache_load: bool, include_kv_cache_stats: bool
+    ) -> None:
+        """Carry rank-local speculative-decoding counters with or without a KV snapshot."""
+        payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=7,
+            num_context_requests=2,
+            num_gen_requests=5,
+            kv_used_blocks=4 if include_kv_cache_load else -1,
+            kv_total_blocks=10 if include_kv_cache_load else -1,
+            kv_load_timestamp_ns=123 if include_kv_cache_load else 0,
+            kv_cache_stats=(
+                RankKvCacheStats(10, 8, 2, 16, 3, 2, 1, 1, 0.5) if include_kv_cache_stats else None
+            ),
+            specdec_stats=RankSpecDecodingStats(15, 9, 5),
+        )
+        state = RankState(
+            rank=2,
+            num_active_requests=7,
+            num_active_tokens=100,
+            num_retiring_requests=1,
+            iter_stats=payload,
+            num_context_requests=2,
+            num_generation_requests=5,
+            num_connector_transfers=3,
+            connector_poll_failed=True,
+        )
+
+        assert RankIterStatsPayload.deserialize(payload.serialize(include_kv_cache_load)) == payload
+        assert RankState.deserialize(state.serialize(include_kv_cache_load)) == state
+        # Zero counters are a measurement and stay distinct from an absent snapshot.
+        idle = replace(payload, specdec_stats=RankSpecDecodingStats(0, 0, 0))
+        assert RankIterStatsPayload.deserialize(idle.serialize(include_kv_cache_load)) == idle
 
 
 class TestDefaultADPRouter:
