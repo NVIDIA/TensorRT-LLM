@@ -1526,7 +1526,10 @@ def test_scheduler_spin_cycles_convert_timeouts_at_the_nominal_clock():
     ],
 )
 def test_scheduler_spin_bound_follows_warmup_transitions_and_autotuning(
-    monkeypatch, environ, warmup_cycles, serving_cycles
+    monkeypatch: pytest.MonkeyPatch,
+    environ: dict[str, str],
+    warmup_cycles: int,
+    serving_cycles: int,
 ):
     guard_module = _moe_comm_timeout_guard_module(monkeypatch)
     guard = guard_module.MoECommTimeoutGuard(environ=environ, is_capturing=lambda: False)

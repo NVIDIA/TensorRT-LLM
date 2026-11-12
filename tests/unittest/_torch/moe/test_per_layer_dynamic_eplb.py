@@ -267,7 +267,9 @@ def _patch_halo_q_builder(monkeypatch: pytest.MonkeyPatch, builder: MagicMock) -
     monkeypatch.setitem(PER_LAYER_DYNAMIC_PLANNERS, "halo_q", spec)
 
 
-def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
+def test_bind_backend_is_idempotent_before_scheduler_construction(
+    monkeypatch: pytest.MonkeyPatch,
+):
     group = _Group()
     builder = MagicMock(return_value=group)
     _patch_halo_q_builder(monkeypatch, builder)
@@ -299,7 +301,7 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
 
 
 def test_bind_backend_requires_the_layer_arena_and_rejects_another_backend(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     builder = MagicMock(return_value=_Group())
     _patch_halo_q_builder(monkeypatch, builder)

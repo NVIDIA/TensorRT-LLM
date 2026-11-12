@@ -2833,7 +2833,7 @@ def test_megamoe_cutedsl_init_raises_bootstrap_failure(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
         PerLayerDynamicMoeLoadBalancer,
