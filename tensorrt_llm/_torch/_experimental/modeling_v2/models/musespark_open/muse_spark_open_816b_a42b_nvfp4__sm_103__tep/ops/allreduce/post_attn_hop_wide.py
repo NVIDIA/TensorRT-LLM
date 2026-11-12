@@ -2112,9 +2112,11 @@ class PostAttnHopWide(OpWrapper):
 
     Loud preconditions: `wide_supported` must hold. A caller choosing between this
     collective and the built-in all-reduce decides on `wide_takes` alone, which every rank
-    answers alike, and makes the layout fit with `post_attn_hop.readable`. Not certified:
-    rows outside 9..1024, widths other than 8192, a weighted attention-side post norm,
-    eight ranks.
+    answers alike, and makes the layout fit with `post_attn_hop.readable`. Eight ranks
+    (TEP8, two GB300 trays) are certified on the served transport, 16..512 rows: every
+    row against the reference, and the one-shot and two-shot transports bitwise against
+    each other. Not certified: rows outside 9..1024, widths other than 8192, a weighted
+    attention-side post norm, eight ranks on the larger transport (513..1024 rows).
     """
 
     def __call__(

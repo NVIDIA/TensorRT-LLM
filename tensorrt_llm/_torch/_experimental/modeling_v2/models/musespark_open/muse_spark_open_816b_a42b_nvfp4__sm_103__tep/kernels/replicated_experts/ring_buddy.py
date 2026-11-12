@@ -118,9 +118,9 @@ MAX_ROWS = 16
 
 #: The stacked path's row cap per ``(SM, tensor-parallel size)`` where it is not
 #: ``MAX_ROWS`` (``max_rows_for``). sm103 tep8 also balances the decode steps of three
-#: and four requests (17..32 rows at K = 7): 32 rows of ``TOP_K`` slots are the 256 slots
-#: of one ``ring_buddy_assign`` program (``MAX_SLOTS``); measured at 6.4 / 8.3 us per layer
-#: net faster than the built-in path at 24 / 32 rows.
+#: and four requests (17..32 rows at K = 7): 32 rows of ``TOP_K`` slots are 256 of the
+#: ``MAX_SLOTS`` (512, 64 rows) one ``ring_buddy_assign`` program places; measured at
+#: 6.4 / 8.3 us per layer net faster than the built-in path at 24 / 32 rows.
 MAX_ROWS_BY_SM_TP = {(103, 8): 32}
 
 
@@ -827,7 +827,7 @@ def install(
     ``max_rows`` (``MAX_ROWS``; ``max_rows_for`` of the device and the TP size) is the
     largest decode call the stacked path takes on every layer but a half-window one
     (``HALF_MAX_ROWS``); larger calls keep the built-in path. At most
-    ``MAX_SLOTS // TOP_K`` (32), the rows of one ``ring_buddy_assign`` program.
+    ``MAX_SLOTS // TOP_K`` (64), the rows of one ``ring_buddy_assign`` program.
 
     A layer installed by an earlier call is refreshed in place (``_refresh``):
     its stacks follow the newly loaded parameters, its hooks are not wrapped

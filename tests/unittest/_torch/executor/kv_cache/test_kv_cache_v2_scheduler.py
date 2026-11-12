@@ -4959,11 +4959,12 @@ class TestMirrorAdmissionPreview:
 _INTERVAL_ENV = "TRTLLM_SCHED_PREFILL_DECODE_INTERVAL"
 _SPF_ENV = "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST"
 _SPF_WAIT_ENV = "TRTLLM_SCHED_SPF_MAX_WAIT_PASSES"
+_SPF_AGE_ENV = "TRTLLM_SCHED_SPF_MAX_AGE_PASSES"
 
 
 @pytest.fixture
 def admission_env(monkeypatch):
-    for name in (_INTERVAL_ENV, _SPF_ENV, _SPF_WAIT_ENV):
+    for name in (_INTERVAL_ENV, _SPF_ENV, _SPF_WAIT_ENV, _SPF_AGE_ENV):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -5202,6 +5203,47 @@ class TestShortestPrefillFirstPolicy:
             assert long_ctx.context_chunk_size == 128
             _admit_chunk(long_ctx)
 
+    def test_age_bound_promotes_a_prompt_that_keeps_progressing(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "2")
+        admission_env.setenv(_SPF_AGE_ENV, "3")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=192, ctx_chunk_config=(None, 64))
+        assert sched._shortest_prefill_first.max_age_passes == 3
+        long_ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        admitted = []
+        for request_id in range(2, 7):
+            out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 64)], set())
+            admitted.append((ids(out.context_requests), long_ctx.context_chunk_size))
+            _admit_chunk(long_ctx)
+        # Request 1 gets tokens every pass, so the waiting clock never promotes it (see
+        # test_prompt_that_keeps_progressing_does_not_age). The age bound counts from its
+        # arrival instead: from the third pass after it, request 1 goes first and takes
+        # the whole budget, and stays first while it waits.
+        assert admitted == [
+            ([1, 2], 128),
+            ([1, 3], 128),
+            ([1, 4], 128),
+            ([1], 192),
+            ([1], 192),
+        ]
+
+    def test_age_bound_promotes_before_the_wait_bound(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "100")
+        admission_env.setenv(_SPF_AGE_ENV, "2")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=210)
+        long_ctx = make_ctx_request(1, 200)
+        admitted = []
+        for request_id in (2, 3, 4):
+            out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 100)], set())
+            admitted.append(ids(out.context_requests))
+        # The wait bound (100 passes) is far off; the age bound promotes request 1 two
+        # passes after it arrived, and the shorter arrival no longer fits behind it.
+        assert admitted == [[2], [3], [1]]
+        # Arrival passes are kept per pending request and dropped once it leaves.
+        assert sched._shortest_prefill_first._arrived_at == {1: 1, 4: 3}
+
     def test_prompt_crowded_out_ages(self, admission_env):
         admission_env.setenv(_SPF_ENV, "1")
         admission_env.setenv(_SPF_WAIT_ENV, "2")
@@ -5384,6 +5426,7 @@ def backoff_env(monkeypatch):
         _INTERVAL_ENV,
         _SPF_ENV,
         _SPF_WAIT_ENV,
+        _SPF_AGE_ENV,
         _BACKOFF_ENV,
         _DIAG_ENV,
         _DIAG_PASSES_ENV,

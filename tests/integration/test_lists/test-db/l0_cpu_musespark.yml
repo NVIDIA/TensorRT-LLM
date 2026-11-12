@@ -18,6 +18,13 @@ l0_cpu_musespark:
   - unittest/llmapi/apps/test_musespark_serve_extensions.py
   # Picked up on l0_cpu through the unittest/_torch/modeling directory entry.
   - unittest/_torch/modeling/test_modeling_musespark_open_preprocess.py
+  - unittest/_torch/modeling/test_modeling_musespark_open_fp8_projections.py
+  # The sm103 TEP target's lever registry and composition tables; also on l0_cpu.yml.
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/test_modeling_v2_levers.py
+  # The shortest-prefill-first scheduler policies Muse Spark Open context workers serve;
+  # l0_cpu.yml runs the whole file through unittest/_torch/executor.
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestShortestPrefillFirstPolicy
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestShortestPrefillFirstBounds
   # The cpu_only tests of DFlash on the TRTLLM attention backend, the shared target/draft KV
   # cache and the disaggregated KV transfer; l0_gb300_musespark.yml runs the rest.
   - unittest/_torch/speculative/hw_agnostic/test_dflash_draft_kv.py

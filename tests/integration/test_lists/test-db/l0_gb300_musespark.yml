@@ -58,6 +58,8 @@ l0_gb300_musespark:
   # The Muse modeling_v2 composition over a TRTLLM drafter's paged context.
   - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/test_modeling_v2_drafter_context.py
   - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/test_modeling_v2_staged_block_offsets.py
+  # The tep8 wide dense GEMM cells: every row of a 9..32-row split-K call gets its 8-row bits (one GPU).
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/gemm/test_modeling_v2_dense_gemm.py
   # Rejection-sampled steps on the Muse modeling_v2 fast paths.
   - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/test_modeling_v2_draft_path_sample.py
   - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/draft_head/test_modeling_v2_draft_head_sampled.py
