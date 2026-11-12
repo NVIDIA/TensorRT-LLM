@@ -29,13 +29,18 @@ class _RecordingLogitsProcessor:
         return self.logits
 
 
-def test_default_target_logits_are_the_logits_processors():
+@pytest.mark.parametrize("shard_state", [False, True])
+def test_default_target_logits_are_the_logits_processors(shard_state):
     logits = torch.randn(3, 16)
     processor = _RecordingLogitsProcessor(logits)
     hidden, lm_head, attn_metadata = torch.randn(3, 8), object(), object()
     # A worker without a vocab-parallel path: the metadata is not even read.
     worker = object.__new__(Eagle3OneModelWorker)
     SpecWorkerBase.__init__(worker)
+    if shard_state:
+        # Shard state on a worker whose acceptance does not verify on the shard.
+        worker.verifies_on_target_shard = False
+        worker._vocab_parallel_argmax = worker._samples_sharded_temperature = True
 
     out = SpecWorkerBase.target_logits(
         worker, hidden, lm_head, processor, attn_metadata, object(), object()

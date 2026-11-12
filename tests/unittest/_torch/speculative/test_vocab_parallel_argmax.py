@@ -222,6 +222,7 @@ def test_greedy_batch_takes_the_shard(enabled_worker, gathered):
         "custom_logits_processor",
         "relaxed_acceptance_mtp",
         "relaxed_acceptance_eagle3",
+        "thop_mtp",
         "no_rows",
     ],
 )
@@ -242,6 +243,12 @@ def test_fallback_keeps_the_gathered_logits(case, enabled_worker, gathered):
         assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange=None)
         assert worker._verifies_target_by_argmax()
         worker.spec_config.use_relaxed_acceptance_for_thinking = True
+        assert not worker._verifies_target_by_argmax()
+    elif case == "thop_mtp":
+        # The THOP kernel reads the full-vocab logits.
+        worker = _bare_covered_worker(MTPWorker)
+        assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange=None)
+        worker.is_thop = True
         assert not worker._verifies_target_by_argmax()
     elif case == "temperature_only":
         md.is_all_greedy_sample, md.temperature_only = False, True
@@ -353,18 +360,35 @@ def _accept(kind, worker, logits, md, attn_metadata):
     return worker.sample_and_accept_draft_tokens(logits, attn_metadata, md)
 
 
-@pytest.mark.parametrize("kind", ["mtp", "eagle3", "mtp_eagle", "draft_target", "pard", "sa"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "mtp",
+        "eagle3",
+        "mtp_eagle",
+        "draft_target",
+        "pard",
+        "sa",
+        # A watermark configuration samples through the watermark helper;
+        # without a key exchange, and with more rows than it takes.
+        "eagle3_watermark",
+        "mtp_watermark",
+    ],
+)
 def test_covered_worker_acceptance_on_shard_matches_gathered(kind):
     """Each covered worker's own acceptance (including PARD's 2K-row layout)
     accepts the same tokens and counts from the target logits' vocab shard as
     from the gathered logits, including the draft tokens accepted on tied
-    maxima."""
+    maxima. Rows the key exchange does not take go through the NCCL pair
+    exchange."""
     from tensorrt_llm._torch.speculative.draft_target import DraftTargetOneModelWorker
     from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker, MTPEagleWorker
     from tensorrt_llm._torch.speculative.mtp import MTPWorker
     from tensorrt_llm._torch.speculative.pard import PARDWorker
     from tensorrt_llm._torch.speculative.sa_worker import SAWorker
 
+    watermark = kind.endswith("_watermark")
+    kind = kind.removesuffix("_watermark")
     cls = {
         "mtp": MTPWorker,
         "eagle3": Eagle3OneModelWorker,
@@ -407,6 +431,7 @@ def test_covered_worker_acceptance_on_shard_matches_gathered(kind):
             runtime_draft_len=k,
             draft_tokens=draft_tokens,
             mtp_hidden_states_manager=SimpleNamespace(sa_manager=None),
+            watermark_ready=watermark,
         )
 
     def flatten(accepted, num_accepted):
@@ -423,6 +448,9 @@ def test_covered_worker_acceptance_on_shard_matches_gathered(kind):
         worker._vocab_parallel_argmax = True
         worker._target_pair_exchange = exchange
         worker._target_head_mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+        if watermark and kind == "mtp":
+            # A key exchange sized below the batch's rows.
+            worker.key_exchange = SimpleNamespace(MAX_ROWS=num_ctx)
         return flatten(
             *_accept(kind, worker, _shard(full, tp, rank), metadata(True), attn_metadata)
         )
