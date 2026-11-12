@@ -289,6 +289,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     ):
         monkeypatch.setattr(warmup, method, observe(method))
     monkeypatch.setattr(graphs, "run_cuda_graph_warmup", observe("_run_cuda_graph_warmup"))
+    warmup._prims_ts_dense_mla_warmup.run.side_effect = observe("_prims_ts_dense_mla_warmup")
     monkeypatch.setattr(warmup_module, "warmup_sampling_module", Mock())
     monkeypatch.setattr(warmup_module, "log_mem_snapshot", Mock())
     monkeypatch.setattr(warmup_module.AutoTuner, "get", Mock())
@@ -316,6 +317,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         ("_run_cuda_graph_warmup", True),
         ("_run_cuda_graph_warmup", True),
         ("_general_warmup", not enabled),
+        ("_prims_ts_dense_mla_warmup", True),
     ]
     assert not model._bypass_active
     warmup._prims_ts_dense_mla_warmup.run.assert_called_once_with(

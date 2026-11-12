@@ -18,6 +18,8 @@ from unittest.mock import Mock, create_autospec
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
 _ROOT = Path(__file__).resolve().parents[4]
 _FMHA = _ROOT / "tensorrt_llm/_torch/attention/backends/fmha"
 _MODULE_NAME = "tensorrt_llm._torch.attention.backends.fmha._isolated_mla_warmup"
@@ -429,23 +431,3 @@ def test_selected_provider_and_capture_gates(
         torch.cuda, "is_current_stream_capturing", Mock(side_effect=AssertionError("CUDA touched"))
     )
     assert _run(warmer, planners, cpu_model) == (0, 0)
-
-
-def test_startup_hook_is_after_graphs_and_not_gated_on_graph_enablement() -> None:
-    source = _ROOT / "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/warmup.py"
-    tree = ast.parse(source.read_text())
-    scheduled = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_warmup_scheduled"
-    )
-    phases = [
-        (index, ast.unparse(node))
-        for index, node in enumerate(scheduled.body)
-        if isinstance(node, ast.With)
-    ]
-    graph_index = next(index for index, text in phases if "self._graphs.warmup_and_capture" in text)
-    prewarm_index = next(
-        index for index, text in phases if "self._prims_ts_dense_mla_warmup.run" in text
-    )
-    assert prewarm_index > graph_index

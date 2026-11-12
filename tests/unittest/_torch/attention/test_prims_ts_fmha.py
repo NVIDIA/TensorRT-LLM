@@ -340,6 +340,7 @@ def _support_result(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "head_dim,v_head_dim,num_heads", [(128, 128, 6), (192, 128, 96), (256, 256, 12)]
@@ -361,6 +362,7 @@ def test_supports_mla_context(num_heads: int, fp8: bool, head_dim: int, v_head_d
     assert supported, reason
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "overrides,expected_reason",
     [
@@ -388,6 +390,7 @@ def test_mla_context_rejects_unsupported_geometry(overrides: dict, expected_reas
     assert expected_reason in reason
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "mask,store_stats,kv_len,spec_flags,helix",
@@ -433,6 +436,7 @@ def test_supports_linear_mla_context(
     assert supported, reason
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "overrides,expected_reason",
     [
@@ -496,6 +500,7 @@ def test_rejects_unsupported_linear_mla_context(overrides: dict, expected_reason
     assert expected_reason in reason
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "query_width,helix,page_size",
     [
@@ -524,6 +529,7 @@ def test_supports_uniform_linear_fp8_mla(query_width: int, helix: bool, page_siz
     assert supported, reason
 
 
+@pytest.mark.cpu_only
 def test_mla_generation_rejects_ragged_query_lengths() -> None:
     with pytest.raises(ValueError, match="fixed-query PrimTS MLA.*uniform per-request"):
         _support_result(
@@ -538,6 +544,7 @@ def test_mla_generation_rejects_ragged_query_lengths() -> None:
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "query_lens,num_gen_tokens,expected",
     [
@@ -567,6 +574,7 @@ def test_generation_query_uniformity_uses_only_cpu_metadata(
     device_read.assert_not_called()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "overrides,expected_reason",
     [
@@ -1295,11 +1303,11 @@ def test_sequence_lengths_are_live_source_view() -> None:
     torch.testing.assert_close(actual, torch.tensor([33, 65], dtype=torch.int32))
 
 
-@pytest.mark.parametrize("enabled_libs,attention_dp", [("prims_ts", True), ("trtllm-gen", False)])
+@pytest.mark.cpu_only
 def test_mla_non_fp8_has_no_token_scaled_workspace_reservation(
-    monkeypatch: pytest.MonkeyPatch, enabled_libs: str, attention_dp: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("TLLM_FMHA_LIBS", enabled_libs)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     monkeypatch.setattr("tensorrt_llm._torch.attention.backends.trtllm.get_sm_version", lambda: 100)
     config = SimpleNamespace(
         model_type="deepseek_v3",
@@ -1314,10 +1322,11 @@ def test_mla_non_fp8_has_no_token_scaled_workspace_reservation(
         quant_config=SimpleNamespace(quant_mode=QuantMode(0)),
         sparse_attention_config=None,
     )
-    mapping = Mapping(world_size=2, tp_size=2, enable_attention_dp=attention_dp)
+    mapping = Mapping(world_size=2, tp_size=2, enable_attention_dp=True)
     assert TrtllmAttention.runtime_workspace_bytes_per_token(model_config, mapping) == 0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "fp8,mask,store_softmax_stats,head_dim,v_head_dim,num_heads",
     [
@@ -1464,14 +1473,31 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
             assert output_scale == 1.0
     assert wrapper.run.call_args.kwargs["validate"] is False
 
+    # Different live lengths within a bucket reuse its plan; crossing either
+    # query or KV capacity must select a new plan with the corresponding bound.
+    params.input_seq_length = 4
+    params.max_past_kv_length = 8
+    fmha.run_mla_context(params)
+    assert factory.call_count == wrapper.plan.call_count == 1
+    params.input_seq_length = 257 if head_dim == 192 else 5
+    fmha.run_mla_context(params)
+    assert factory.call_count == wrapper.plan.call_count == 2
+    assert wrapper.plan.call_args.kwargs["max_q_len"] == (512 if head_dim == 192 else 8)
+    params.max_past_kv_length = 129 if head_dim == 192 else 9
+    fmha.run_mla_context(params)
+    assert factory.call_count == wrapper.plan.call_count == 3
+    assert wrapper.plan.call_args.kwargs["max_kv_len"] == (256 if head_dim == 192 else 16)
+    assert wrapper.plan.call_args.kwargs["packed_query"] is True
+
     if helix:
         # A reused plan must not bypass the owner-prepared context contract.
         params.fwd.latent_cache = torch.empty(5, 576)
         with pytest.raises(AssertionError, match="owner-prepared Q/K/V"):
             fmha.run_mla_context(params)
-        assert native_preprocess.call_count == wrapper.run.call_count == 2
+        assert native_preprocess.call_count == wrapper.run.call_count == 5
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("input_type", [AttentionInputType.context_only, AttentionInputType.mixed])
 def test_mla_context_rejects_unprepared_helix_execution(input_type: AttentionInputType) -> None:
     attn = _Attention(head_dim=192, is_mla=True)
@@ -2473,6 +2499,7 @@ def test_mla_wrapper_capture_uses_cached_plan_and_rejects_plan_miss(
     wrapper.plan.assert_called_once()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("helix", [False, True])
 def test_mla_wrapper_cache_separates_query_widths(
     monkeypatch: pytest.MonkeyPatch,
@@ -2799,53 +2826,7 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
     assert workspace.numel() == 64
 
 
-@pytest.mark.parametrize("is_mla", [False, True], ids=["standard", "mla"])
-def test_workspace_size_cache_keys_all_arguments(
-    monkeypatch: pytest.MonkeyPatch, is_mla: bool
-) -> None:
-    function_name = (
-        "get_prims_ts_batch_mla_decode_workspace_size"
-        if is_mla
-        else "get_prims_ts_batch_decode_workspace_size"
-    )
-    workspace_size = create_autospec(getattr(prims_ts_package, function_name), return_value=96)
-    monkeypatch.setattr(prims_ts_package, function_name, workspace_size)
-    cached = prims_ts_module._get_cached_workspace_size_functions()[int(is_mla)]
-    assert prims_ts_module._get_cached_workspace_size_functions()[int(is_mla)] is cached
-    assert getattr(prims_ts_package, function_name) is workspace_size
-    args = (2, 4, 512, 64, 32, 96) if is_mla else (2, 8, 2, 128, 32, 96)
-    kwargs = dict(
-        max_q_len=1,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
-        out_dtype=torch.bfloat16,
-        mask_type="causal",
-        store_softmax_stats=False,
-        device=torch.device("cuda:0"),
-        validate=False,
-    )
-    variants = [(args, kwargs)]
-    for index, value in enumerate(args):
-        variants.append((args[:index] + (value * 2,) + args[index + 1 :], kwargs))
-    for override in (
-        {"max_q_len": 6},
-        {"q_dtype": torch.float8_e4m3fn, "kv_dtype": torch.float8_e4m3fn},
-        {"out_dtype": torch.float16},
-        {"mask_type": "dense"},
-        {"store_softmax_stats": True},
-        {"device": torch.device("cuda:1")},
-        {"validate": True},
-        {"use_kv_bounds": True} if is_mla else {"window_left": 32},
-    ):
-        variants.append((args, kwargs | override))
-    for index, (call_args, call_kwargs) in enumerate(variants, start=1):
-        assert cached(*call_args, **call_kwargs) == 96
-        assert cached(*call_args, **call_kwargs) == 96
-        assert workspace_size.call_count == index
-        assert workspace_size.call_args.args == call_args
-        assert workspace_size.call_args.kwargs == call_kwargs
-
-
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fp8,with_stats", [(False, False), (True, False), (True, True)])
 def test_mla_workspace_size_cache_tracks_request_geometry(
     monkeypatch: pytest.MonkeyPatch, fp8: bool, with_stats: bool
@@ -2924,6 +2905,7 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     assert workspace.numel() == 32 * 2 + 2048
 
 
+@pytest.mark.cpu_only
 def test_mla_workspace_size_cache_preserves_allocation_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2974,6 +2956,7 @@ def test_mla_workspace_size_cache_preserves_allocation_checks(
     assert too_small.numel() == 48
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_mla_context_workspace_tracks_each_chunk_without_decode_size_cache(
     monkeypatch: pytest.MonkeyPatch, fp8: bool

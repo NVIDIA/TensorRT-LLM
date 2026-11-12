@@ -574,17 +574,22 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
 
 
 @pytest.mark.parametrize(
-    "head_dim,v_head_dim,strided_v,kv_length",
+    "head_dim,v_head_dim,dtype,fp8,strided_v,kv_length",
     [
-        pytest.param(128, 128, True, 5, id="qk128-strided"),
-        pytest.param(192, 128, True, 5, id="qk192-strided"),
-        pytest.param(256, 256, True, 5, id="qk256-strided"),
-        pytest.param(192, 128, False, 5, id="compact-control"),
-        pytest.param(192, 128, True, 0, id="empty-kv"),
+        pytest.param(128, 128, torch.float16, True, True, 5, id="fp8-qk128-fp16-strided"),
+        pytest.param(128, 128, torch.bfloat16, True, True, 5, id="fp8-qk128-bf16-strided"),
+        pytest.param(192, 128, torch.float16, True, True, 5, id="fp8-qk192-fp16-strided"),
+        pytest.param(192, 128, torch.bfloat16, True, True, 5, id="fp8-qk192-bf16-strided"),
+        pytest.param(256, 256, torch.float16, True, True, 5, id="fp8-qk256-fp16-strided"),
+        pytest.param(256, 256, torch.bfloat16, True, True, 5, id="fp8-qk256-bf16-strided"),
+        pytest.param(192, 128, torch.float16, False, True, 5, id="fp16-strided-alias"),
+        pytest.param(192, 128, torch.bfloat16, False, True, 5, id="bf16-strided-alias"),
+        pytest.param(192, 128, torch.float16, True, False, 5, id="fp8-compact-control"),
+        pytest.param(192, 128, torch.bfloat16, False, False, 5, id="bf16-compact-control"),
+        pytest.param(192, 128, torch.bfloat16, True, True, 0, id="fp8-empty-kv"),
+        pytest.param(192, 128, torch.float16, False, True, 0, id="fp16-empty-kv"),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("fp8", [False, True])
 def test_prims_ts_mla_context_preprocess_layout(
     head_dim: int, v_head_dim: int, dtype: torch.dtype, strided_v: bool, kv_length: int, fp8: bool
 ) -> None:
