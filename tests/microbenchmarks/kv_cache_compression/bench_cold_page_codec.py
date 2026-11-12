@@ -6,19 +6,29 @@ A cold-page quantization provider (``ColdPageQuantizationCompressionConfig``) en
 from the GPU hot cache into cold pages in pinned host memory when KVCM offloads them, and
 decodes them back when KVCM onboards them. This benchmark times TurboQuant
 (``quant="turboquant"``) and, as the reference, NVFP4 (``quant="nvfp4"``) on these KVCM
-lifecycles (``tokens_per_block`` 32, no model weights needed):
+lifecycles (no model weights needed):
 
-    case                      KV    TurboQuant  pages/call  geometry
-    llama8b-bf16-mse4         bf16  mse 4-bit   256         Llama-3.1-8B: 32 x {K, V} x 8 x 32 x 128
-    llama8b-bf16-mse3         bf16  mse 3-bit   256         as llama8b
-    llama8b-bf16-prod4        bf16  prod 4-bit  256         as llama8b
-    llama8b-fp8-mse4          fp8   mse 4-bit   256         as llama8b
-    mla576-bf16-mse4          bf16  mse 4-bit   256         DeepSeek-V3 MLA: 61 x {K} x 1 x 32 x 576
-    gqa-hd64-bf16-mse4        bf16  mse 4-bit   256         GQA: 36 x {K, V} x 8 x 32 x 64
-    llama8b-bf16-mse4-8pages  bf16  mse 4-bit   8           as llama8b; a latency case
+    case                       KV    TurboQuant  pages/call  geometry
+    glm5-bf16-mse4             bf16  mse 4-bit   256         GLM-5 MLA: 78 x {K} x 1 x 32 x 576
+    glm5-bf16-mse3             bf16  mse 3-bit   256         as glm5
+    glm5-skiprope-bf16-mse4    bf16  mse 4-bit   256         as glm5, skip_rope_quantization
+    mla-fp8-mse4               fp8   mse 4-bit   256         DeepSeek-V3.2 / Kimi-K3 MLA: 61 x {K} x 1 x 32 x 576
+    dsv4-csa-bf16-mse4         bf16  mse 4-bit   256         DeepSeek-V4 CSA: 18 x {compressed, indexer} x 1 x 32
+                                                             x {512, 34}, 128-token Pages
+    dsv4-csa-skiprope-bf16-mse4  bf16  mse 4-bit   256       as dsv4-csa, skip_rope_quantization
+    llama8b-bf16-mse4          bf16  mse 4-bit   256         Llama-3.1-8B GQA: 32 x {K, V} x 8 x 32 x 128
+    llama8b-bf16-prod4         bf16  prod 4-bit  256         as llama8b
+    gqa-hd64-bf16-mse4         bf16  mse 4-bit   256         GQA: 36 x {K, V} x 8 x 32 x 64
+    glm5-bf16-mse4-8pages      bf16  mse 4-bit   8           as glm5; a latency case
 
-Geometry is layers x buffers x KV heads x tokens per Page x elements per vector; the MLA latent
-is 512 NoPE + 64 RoPE elements. The latency case is fixed-cost bound and is compared with NVFP4.
+Geometry is layers x buffers x KV heads x rows per Page x elements per row. The MLA latent is 512
+NoPE + 64 RoPE elements; with skip_rope_quantization both formats copy the 64 RoPE elements. A
+DeepSeek-V4 CSA Page holds one compressed row per 4 of its 128 tokens: 448 NoPE elements, which
+both formats quantize, and 64 RoPE elements, which TurboQuant always copies (NVFP4 quantizes them
+unless skip_rope_quantization is set, so dsv4-csa-skiprope compares like with like); the 68-byte FP4
+indexer row (34 BF16 elements) is copied too. Each CSA layer follows its SWA layer, which another
+lifecycle stores, so only the CSA layers are timed. The latency case is fixed-cost bound and is
+compared with NVFP4.
 
 Method. Each format builds its provider through the public interface
 (``create_kv_cache_compression_manager`` -> ``build_codec_state`` -> ``configure``) over its own
@@ -45,7 +55,7 @@ mode and NVFP4 only need a finite nMSE. Results that fail do not count.
 Run on one GPU, from the repository root::
 
     python3 tests/microbenchmarks/kv_cache_compression/bench_cold_page_codec.py \
-        [--cases llama8b-bf16-mse4,mla576-bf16-mse4] [--formats turboquant,nvfp4] \
+        [--cases glm5-bf16-mse4,dsv4-csa-bf16-mse4] [--formats turboquant,nvfp4] \
         [--warmup 3] [--reps 20] [--json results.json] [--profile]
 
 ``--profile`` also lists the GPU kernels and copies of one encode and one decode per format and
@@ -100,24 +110,53 @@ class Case:
     bits: int
     pages: int
     latency: bool = False
+    skip_rope: bool = False
+    tokens_per_block: int = TOKENS_PER_BLOCK
 
     @property
-    def slot_shape(self) -> tuple[int, int, int]:
-        return (self.kv_heads, TOKENS_PER_BLOCK, self.head_dim)
+    def deepseek_v4(self) -> bool:
+        return self.model_type == "deepseek_v4"
 
-    @property
-    def slot_bytes(self) -> int:
-        return math.prod(self.slot_shape) * RUNTIMES[self.runtime][0].itemsize
+    def slot_shape(self, role: str) -> tuple[int, int, int]:
+        """[KV heads, rows, elements] of one Page of ``role``."""
+        if self.deepseek_v4:
+            elements = self.head_dim if role == _DSV4_COMPRESS else _DSV4_INDEXER_ELEMENTS
+            return (1, self.tokens_per_block // 4, elements)
+        return (self.kv_heads, self.tokens_per_block, self.head_dim)
+
+    def slot_bytes(self, role: str) -> int:
+        return math.prod(self.slot_shape(role)) * RUNTIMES[self.runtime][0].itemsize
 
     @property
     def page_elements(self) -> int:
-        return self.layers * len(self.roles) * math.prod(self.slot_shape)
+        return self.layers * sum(math.prod(self.slot_shape(role)) for role in self.roles)
 
     @property
     def hot_page_bytes(self) -> int:
-        return self.layers * len(self.roles) * self.slot_bytes
+        return self.layers * sum(self.slot_bytes(role) for role in self.roles)
 
 
+_DSV4_SWA = "deepseek_v4_swa"
+_DSV4_COMPRESS = "deepseek_v4_compress"
+_DSV4_INDEXER = "deepseek_v4_indexer_compress"
+_DSV4_INDEXER_ELEMENTS = 34  # the FP4 indexer row: 64 bytes of codes and 4 bytes of scales
+_GLM_5 = {
+    "model": "GLM-5 MLA latent (512 NoPE + 64 RoPE)",
+    "model_type": "glm_moe_dsa",
+    "layers": 78,
+    "roles": ("key",),
+    "kv_heads": 1,
+    "head_dim": 576,
+}
+_DSV4_CSA = {
+    "model": "DeepSeek-V4 CSA rows (448 NoPE + 64 RoPE) and indexer rows",
+    "model_type": "deepseek_v4",
+    "layers": 18,
+    "roles": (_DSV4_COMPRESS, _DSV4_INDEXER),
+    "kv_heads": 1,
+    "head_dim": 512,
+    "tokens_per_block": 128,
+}
 _LLAMA_8B = {
     "model": "Llama-3.1-8B",
     "model_type": "llama",
@@ -127,7 +166,7 @@ _LLAMA_8B = {
     "head_dim": 128,
 }
 _MLA = {
-    "model": "DeepSeek-V3 MLA latent (512 NoPE + 64 RoPE)",
+    "model": "DeepSeek-V3.2 / Kimi-K3 MLA latent (512 NoPE + 64 RoPE)",
     "model_type": "deepseek_v3",
     "layers": 61,
     "roles": ("key",),
@@ -145,15 +184,34 @@ _GQA_64 = {
 CASES = {
     case.name: case
     for case in (
+        Case("glm5-bf16-mse4", **_GLM_5, runtime="bf16", mode="mse", bits=4, pages=256),
+        Case("glm5-bf16-mse3", **_GLM_5, runtime="bf16", mode="mse", bits=3, pages=256),
+        Case(
+            "glm5-skiprope-bf16-mse4",
+            **_GLM_5,
+            runtime="bf16",
+            mode="mse",
+            bits=4,
+            pages=256,
+            skip_rope=True,
+        ),
+        Case("mla-fp8-mse4", **_MLA, runtime="fp8", mode="mse", bits=4, pages=256),
+        Case("dsv4-csa-bf16-mse4", **_DSV4_CSA, runtime="bf16", mode="mse", bits=4, pages=256),
+        Case(
+            "dsv4-csa-skiprope-bf16-mse4",
+            **_DSV4_CSA,
+            runtime="bf16",
+            mode="mse",
+            bits=4,
+            pages=256,
+            skip_rope=True,
+        ),
         Case("llama8b-bf16-mse4", **_LLAMA_8B, runtime="bf16", mode="mse", bits=4, pages=256),
-        Case("llama8b-bf16-mse3", **_LLAMA_8B, runtime="bf16", mode="mse", bits=3, pages=256),
         Case("llama8b-bf16-prod4", **_LLAMA_8B, runtime="bf16", mode="prod", bits=4, pages=256),
-        Case("llama8b-fp8-mse4", **_LLAMA_8B, runtime="fp8", mode="mse", bits=4, pages=256),
-        Case("mla576-bf16-mse4", **_MLA, runtime="bf16", mode="mse", bits=4, pages=256),
         Case("gqa-hd64-bf16-mse4", **_GQA_64, runtime="bf16", mode="mse", bits=4, pages=256),
         Case(
-            "llama8b-bf16-mse4-8pages",
-            **_LLAMA_8B,
+            "glm5-bf16-mse4-8pages",
+            **_GLM_5,
             runtime="bf16",
             mode="mse",
             bits=4,
@@ -166,8 +224,10 @@ CASES = {
 
 def _model_engine(case: Case) -> SimpleNamespace:
     """A stand-in model engine with the fields ``create_kv_cache_compression_manager`` reads."""
-    if case.model_type == "deepseek_v3":
+    if case.model_type in ("deepseek_v3", "glm_moe_dsa"):
         fields = {"kv_lora_rank": 512, "qk_rope_head_dim": 64}
+    elif case.deepseek_v4:
+        fields = {}
     else:
         fields = {"num_key_value_heads": case.kv_heads, "head_dim": case.head_dim}
     pretrained_config = PretrainedConfig(num_hidden_layers=case.layers, **fields)
@@ -183,15 +243,21 @@ def _model_engine(case: Case) -> SimpleNamespace:
     )
 
 
+def _layer_ids(case: Case) -> range:
+    """KVCM layer ids of the timed lifecycle: every layer, or the CSA layers after each SWA layer."""
+    return range(1, 2 * case.layers, 2) if case.deepseek_v4 else range(case.layers)
+
+
 def _make_source(case: Case) -> dict[tuple[int, str], torch.Tensor]:
     """Fixed-seed source slots ``[pages, KV heads, tokens, elements]`` per (layer, role)."""
     generator = torch.Generator(device="cuda").manual_seed(SEED)
-    outliers = {3: 20.0, case.head_dim // 2 + 1: 15.0, case.head_dim - 2: 10.0}
     dtype = RUNTIMES[case.runtime][0]
     source = {}
-    for layer in range(case.layers):
+    for layer in _layer_ids(case):
         for role in case.roles:
-            values = torch.randn((case.pages, *case.slot_shape), generator=generator, device="cuda")
+            shape = case.slot_shape(role)
+            outliers = {3: 20.0, shape[-1] // 2 + 1: 15.0, shape[-1] - 2: 10.0}
+            values = torch.randn((case.pages, *shape), generator=generator, device="cuda")
             for channel, scale in outliers.items():
                 values[..., channel] *= scale
             if dtype == torch.float8_e4m3fn:
@@ -224,7 +290,9 @@ def _build_codec(case: Case, fmt: str, source: dict, perm: torch.Tensor) -> _Cod
     options = {"turboquant_bits": case.bits, "turboquant_mode": case.mode}
     manager = create_kv_cache_compression_manager(
         ColdPageQuantizationCompressionConfig(
-            quant=fmt, skip_rope_quantization=False, **(options if fmt == "turboquant" else {})
+            quant=fmt,
+            skip_rope_quantization=case.skip_rope,
+            **(options if fmt == "turboquant" else {}),
         ),
         model_engine=_model_engine(case),
         kv_cache_config=KvCacheConfig(enable_block_reuse=True, host_cache_size=1 << 30),
@@ -232,30 +300,39 @@ def _build_codec(case: Case, fmt: str, source: dict, perm: torch.Tensor) -> _Cod
     if not getattr(manager, "provides_cold_page_codec", False):
         raise RuntimeError(f"the factory returned {manager!r}, not a cold-page codec provider")
 
-    pages, slot_bytes = case.pages, case.slot_bytes
+    pages = case.pages
     hot = {}
     for key, values in source.items():
         # NaN in the decode half exposes any slot that decode leaves unwritten.
         hot[key] = torch.full(
-            (2 * pages, *case.slot_shape), math.nan, dtype=values.dtype, device="cuda"
+            (2 * pages, *values.shape[1:]), math.nan, dtype=values.dtype, device="cuda"
         )
         hot[key][:pages] = values
-    cache_config = SimpleNamespace(
-        tokens_per_block=TOKENS_PER_BLOCK,
-        layers=tuple(
-            AttentionLayerConfig(
-                layer_id=layer,
-                buffers=[BufferConfig(role=role, size=slot_bytes) for role in case.roles],
-            )
-            for layer in range(case.layers)
-        ),
-    )
+    layers = [
+        AttentionLayerConfig(
+            layer_id=layer,
+            buffers=[BufferConfig(role=role, size=case.slot_bytes(role)) for role in case.roles],
+        )
+        for layer in _layer_ids(case)
+    ]
+    kvcm_layers = len(layers)
+    if case.deepseek_v4:
+        # Every model layer starts with its SWA layer, which is stored by another lifecycle.
+        swa_bytes = case.tokens_per_block * case.head_dim * RUNTIMES[case.runtime][0].itemsize
+        swa = [BufferConfig(role=_DSV4_SWA, size=swa_bytes)]
+        layers = [
+            entry
+            for layer in layers
+            for entry in (AttentionLayerConfig(layer_id=layer.layer_id - 1, buffers=swa), layer)
+        ]
+        kvcm_layers = 2 * case.layers
+    cache_config = SimpleNamespace(tokens_per_block=case.tokens_per_block, layers=tuple(layers))
     state = manager.build_codec_state(
         cache_config,
         runtime_dtype=RUNTIMES[case.runtime][1],
         pp_layers=tuple(range(case.layers)),
-        num_kv_heads_per_layer=(case.kv_heads,) * case.layers,
-        head_dim_per_layer=(case.head_dim,) * case.layers,
+        num_kv_heads_per_layer=(case.kv_heads,) * kvcm_layers,
+        head_dim_per_layer=(case.head_dim,) * kvcm_layers,
         is_draft=False,
     )
     lifecycle = SimpleNamespace(
@@ -263,12 +340,12 @@ def _build_codec(case: Case, fmt: str, source: dict, perm: torch.Tensor) -> _Cod
             layer: {
                 role: SimpleNamespace(
                     raw_base=hot[(layer, role)].data_ptr(),
-                    raw_slot_bytes=slot_bytes,
-                    raw_bytes=slot_bytes,
+                    raw_slot_bytes=case.slot_bytes(role),
+                    raw_bytes=case.slot_bytes(role),
                 )
                 for role in case.roles
             }
-            for layer in range(case.layers)
+            for layer in _layer_ids(case)
         }
     )
     (properties,) = manager.configure(state, [lifecycle])
@@ -363,12 +440,14 @@ def _run_case(
     case: Case, args: argparse.Namespace, bandwidth: dict, stream: torch.cuda.Stream
 ) -> dict:
     """Time every format on one case, check its round trip, print and return the results."""
-    roles = ", ".join(case.roles)
+    buffers = ", ".join(
+        f"{role} {'x'.join(map(str, case.slot_shape(role)))}" for role in case.roles
+    )
     print(
-        f"\n{case.name}: {case.model}, {case.layers} layers x {{{roles}}}"
-        f" x {case.kv_heads} KV heads x {TOKENS_PER_BLOCK} tokens x {case.head_dim} {case.runtime}"
+        f"\n{case.name}: {case.model}, {case.layers} layers x {{{buffers}}} {case.runtime}"
         f" ({case.hot_page_bytes / 2**20:.2f} MiB/page), {case.pages} pages/call;"
         f" TurboQuant {case.mode} {case.bits}-bit"
+        + (", skip_rope_quantization" if case.skip_rope else "")
     )
     source = _make_source(case)
     perm = torch.randperm(case.pages, generator=torch.Generator().manual_seed(SEED)).to(torch.int32)

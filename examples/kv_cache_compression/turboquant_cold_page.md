@@ -37,11 +37,14 @@ values, applies the scale, and rotates back.
 | Setting | Algorithm | Use it for |
 | --- | --- | --- |
 | `turboquant_mode: mse`, 2, 3, or 4 bits | The paper's Algorithm 1: the smallest reconstruction error for the bit width | The default; K and V reconstruction |
-| `turboquant_mode: mse`, 2.5 or 3.5 bits | Two Algorithm 1 instances per vector: in each group of vectors that share a page, layer, buffer, and KV head, the half of the channels with the most energy uses one bit more than the other half | Bit widths between the integer settings, with outlier channels kept more precise |
+| `turboquant_mode: mse`, 2.5 or 3.5 bits | Two Algorithm 1 instances per vector: in each group of vectors that share a page, layer, buffer, and KV head, half of the channels use one bit more than the other half; channels with more than four times the median channel energy are always in that half | Bit widths between the integer settings, with outlier channels kept more precise |
 | `turboquant_mode: prod`, 2, 3, or 4 bits | The paper's Algorithm 2: `mse` with one bit fewer, plus a 1-bit QJL sign of the residual and the residual norm | Unbiased estimates of the inner products between queries and decoded keys, at a larger reconstruction error |
 
-The fractional settings rank channels by their energy in the Page being
-encoded, so the split adapts to every Page without calibration. The rotation
+The fractional settings choose the high-bit half from the channel energies in
+the Page being encoded: the outlier channels, whose energy exceeds four times
+the median channel energy, and then the lowest-numbered other channels until
+half of the channels are chosen. The split adapts to every Page without
+calibration. The rotation
 and QJL matrices are fixed by `turboquant_seed` and generated identically in
 every process.
 
@@ -355,40 +358,54 @@ Repeated offload and onboard of the same Page re-encodes the decoded values ever
 | `prod` 4 / 3 / 2 | 0.051 / 0.18 / 0.55 | 0.31 / 1.9 / 16.8 |
 
 Integer-bit `mse` reproduces its codes, so the error does not grow. Fractional bits choose the
-outlier channels from the decoded data again and mostly keep them. `prod` stays unbiased per
-round trip, but every re-encoding adds fresh QJL noise, so prefer `mse` when Pages migrate
-repeatedly.
+outlier channels from the decoded data again and mostly keep them. `prod` is unbiased for one
+encoding (in expectation over the QJL projection); a re-encoding adds QJL error again, with the
+same seeded projection, so its error grows quickly with the number of round trips. Prefer `mse`
+when Pages migrate repeatedly.
 
 ### Encode and Decode Time
 
 `tests/microbenchmarks/kv_cache_compression/bench_cold_page_codec.py` times one encode and one
 decode call (256 Pages per call unless noted, cold Pages in pinned host memory, median of 20)
-for TurboQuant and NVFP4 on the same GPU, and the speed of light (SOL) of the same transfer.
-On one GB300 whose pinned-host link measured 121 GB/s GPU-to-host and 125 GB/s host-to-GPU:
+for TurboQuant and NVFP4 on the same GPU, and the speed of light (SOL) of the same transfer. On
+one GB300, with the pinned memory on the GPU's own CPU socket (the GPU reads it at 211 GB/s and
+writes it at 193 GB/s) and on the other socket (125 GB/s and 122 GB/s):
 
-| Case | Geometry | TurboQuant | Encode us (% SOL, vs NVFP4) | Decode us (% SOL, vs NVFP4) |
+| Case | Geometry and TurboQuant setting | Cold Page KiB, TurboQuant / NVFP4 | Own socket: encode / decode us (vs NVFP4) | Other socket: encode / decode us (vs NVFP4) |
 | --- | --- | --- | --- | --- |
-| `llama8b-bf16-mse4` | Llama-3.1-8B, 32 x {K, V} x 8 x 32 x 128, BF16 | `mse` 4 | 2290 (99.5%, 0.91x) | 2230 (98.8%, 0.92x) |
-| `llama8b-bf16-mse3` | same | `mse` 3 | 1765 (97.8%, 0.70x) | 1693 (98.6%, 0.70x) |
-| `llama8b-bf16-prod4` | same | `prod` 4 | 2338 (100%, 0.93x) | 2290 (99.2%, 0.94x) |
-| `llama8b-fp8-mse4` | same, FP8 | `mse` 4 | 2289 (99.5%, 0.92x) | 2228 (98.9%, 0.92x) |
-| `mla576-bf16-mse4` | DeepSeek-V3 MLA, 61 x {K} x 1 x 32 x 576, BF16 | `mse` 4 | 1420 (85.2%, 1.05x) | 1581 (74.0%, 1.21x) |
-| `gqa-hd64-bf16-mse4` | 36 x {K, V} x 8 x 32 x 64, BF16 | `mse` 4 | 1340 (98.5%, 0.95x) | 1300 (98.2%, 0.95x) |
-| `llama8b-bf16-mse4-8pages` | as `llama8b`, 8 Pages per call | `mse` 4 | 91 (78.5%, 0.95x) | 92 (75.1%, 0.99x) |
+| `glm5-bf16-mse4` | GLM-5 MLA latent, 78 x {K} x 1 x 32 x 576, BF16, `mse` 4 | 717 / 790 | 1076 / 1106 (0.98x / 1.11x) | 1601 / 1575 (0.92x / 0.94x) |
+| `glm5-bf16-mse3` | same, `mse` 3 | 541 / 790 | 848 / 1213 (0.77x / 1.22x) | 1229 / 1522 (0.72x / 0.91x) |
+| `glm5-skiprope-bf16-mse4` | same, `mse` 4, `skip_rope_quantization` (512 values quantized) | 941 / 1014 | 1788 / 1908 (1.28x / 1.50x) | 2049 / 3198 (0.93x / 1.50x) |
+| `mla-fp8-mse4` | DeepSeek-V3.2 / Kimi-K3 MLA latent, 61 x {K} x 1 x 32 x 576, FP8, `mse` 4 | 560 / 618 | 799 / 857 (0.94x / 1.10x) | 1242 / 1230 (0.93x / 0.94x) |
+| `dsv4-csa-bf16-mse4` | DeepSeek-V4 CSA, 18 x {compressed, indexer} x 1 x 32 x {512, 34}, BF16, `mse` 4 | 237 / 220 | 366 / 375 (0.53x / 1.19x) | 547 / 532 (0.53x / 0.98x) |
+| `dsv4-csa-skiprope-bf16-mse4` | same, `skip_rope_quantization` (NVFP4 also keeps RoPE) | 237 / 252 | 365 / 383 (1.03x / 1.17x) | 549 / 536 (1.00x / 0.99x) |
+| `llama8b-bf16-mse4` | Llama-3.1-8B GQA, 32 x {K, V} x 8 x 32 x 128, BF16, `mse` 4 | 1056 / 1152 | 1455 / 1334 (0.92x / 0.92x) | 2286 / 2244 (0.92x / 0.93x) |
+| `llama8b-bf16-prod4` | same, `prod` 4 | 1088 / 1152 | 1854 / 1380 (1.17x / 0.95x) | 2340 / 2310 (0.94x / 0.96x) |
+| `gqa-hd64-bf16-mse4` | GQA, 36 x {K, V} x 8 x 32 x 64, BF16, `mse` 4 | 612 / 648 | 851 / 786 (0.94x / 0.96x) | 1329 / 1320 (0.94x / 0.96x) |
+| `glm5-bf16-mse4-8pages` | as `glm5-bf16-mse4`, 8 Pages per call | 717 / 790 | 64 / 83 (1.24x / 1.76x) | 73 / 100 (1.03x / 1.47x) |
 
-Both formats are bound by the host link for conventional K/V Pages, so TurboQuant is faster than
-NVFP4 by roughly the ratio of their cold-page sizes. The host-link bandwidth depends on the GPU
-and on which CPU socket the pinned memory lives on; on a GB300 with a faster link (about
-200 GB/s), the `prod` encode and the 576-value MLA latent are no longer link bound, and the MLA
-case takes about 1.6x the NVFP4 time. Run the benchmark on your system before relying on these
-numbers.
+Conventional K/V Pages are bound by the host link in both formats (96-100% of SOL), so
+TurboQuant takes about the NVFP4 time scaled by the cold-page size; only the `prod` encode, which
+also projects the residual, is compute bound on the faster link. MLA latents and DeepSeek-V4
+CSA rows need more decode work per byte, because every instance (256 or 448 values) is rotated
+back on tensor cores: on the faster link their decode takes 1.1-1.2x the NVFP4 time, while
+encode stays at or below it; on the slower link both are link bound and TurboQuant is faster.
+With `skip_rope_quantization` the GLM-5 latent is a single 512-value instance, whose decode
+accumulates its output in two blocks and reads the codes twice; it takes 1.5x the NVFP4 time.
+NVFP4's default DeepSeek-V4 format quantizes RoPE as two FP4 components, which makes its encode
+slow; `dsv4-csa-skiprope-bf16-mse4` compares like with like. Small calls are bound by fixed
+costs, such as the one decode launch per instance of a 576-value latent. The launch shapes of
+rows wider than 256 values were measured on GB300 (SM103) and apply to SM100-family GPUs; other
+GPUs use generic shapes. Run the benchmark on your system before relying on these numbers.
 
 ### End-to-End Accuracy
 
 `examples/kv_cache_compression/cold_tier_accuracy.py` prefills synthetic prefixes of
 name-and-code facts, pushes their Pages to the Host tier with unrelated prompts, and then asks
-exact-match questions whose prefixes must be onboarded and decoded again; iteration statistics
-confirm that every question's prefix was reused from the Host tier. With TP4/EP4 on four
+exact-match questions whose prefixes must be onboarded and decoded again. A run counts only if
+the iteration statistics of its question phase show Attention Pages reused from the cold tier
+(Disk with `--disk`) and bytes onboarded; they do not show which questions those Pages served.
+With TP4/EP4 on four
 GB300 GPUs, greedy decoding, two 6144-token prefixes, and 400 questions:
 
 | Model | none | NVFP4 | TQ `mse` 4 | TQ `mse` 3.5 | TQ `mse` 3 | TQ `mse` 2.5 | TQ `prod` 4 |
