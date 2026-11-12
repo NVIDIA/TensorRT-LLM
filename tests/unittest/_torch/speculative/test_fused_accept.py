@@ -64,7 +64,7 @@ def _run(worker, logits, draft, num_contexts, batch_size, fused, monkeypatch):
 
 
 @pytest.mark.parametrize("force", [0.0, 3.0, 3.8, 9.0])
-@pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (2, 3), (0, 64), (3, 0)])
+@pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (2, 3), (0, 64), (3, 0), (65, 70)])
 def test_fused_accept_matches_unfused(force, num_contexts, num_gens, monkeypatch):
     k = 6
     batch = num_contexts + num_gens
@@ -83,6 +83,43 @@ def test_fused_accept_matches_unfused(force, num_contexts, num_gens, monkeypatch
         assert torch.equal(acc_r[num_contexts:], acc_f[num_contexts:])
         if ref_w._force_accept_rng_counter is not None:
             assert torch.equal(ref_w._force_accept_rng_counter, fused_w._force_accept_rng_counter)
+
+
+@pytest.mark.parametrize("force", [3.0, 3.44])
+def test_fused_accept_reuses_the_compiled_kernel_across_batches(force, monkeypatch):
+    from _torch.helpers import triton_num_compiled
+
+    from tensorrt_llm._torch.speculative.fused_accept import _strict_accept_kernel
+
+    k = 5
+    worker = _worker(force)
+    draft_rows = torch.zeros((80, k), dtype=torch.int32, device="cuda")
+
+    def accept(num_contexts, num_gens, first_row):
+        logits, _ = _inputs(num_contexts, max(num_gens, 1), k, [0, k], seed=num_gens)
+        logits = logits[: num_contexts + num_gens * (k + 1)]
+        draft = draft_rows[first_row : first_row + num_gens]
+        _run(worker, logits, draft, num_contexts, num_contexts + num_gens, True, monkeypatch)
+
+    # The request counts are 0, 1, multiples of 16 and neither, from one to more than 64 rows, and an
+    # odd first row misaligns the draft slice.
+    batches = [
+        (0, 17, 0),
+        (1, 31, 1),
+        (16, 17, 3),
+        (17, 16, 0),
+        (3, 32, 5),
+        (20, 1, 2),
+        (0, 64, 0),
+        (2, 5, 7),
+        (1, 0, 0),
+        (65, 70, 1),
+    ]
+    accept(*batches[0])
+    compiled = triton_num_compiled(_strict_accept_kernel)
+    for batch in batches[1:]:
+        accept(*batch)
+    assert triton_num_compiled(_strict_accept_kernel) == compiled
 
 
 @pytest.mark.parametrize(

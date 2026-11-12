@@ -35,9 +35,15 @@ import triton
 import triton.language as tl
 
 MAX_DRAFT_LEN = 31  # columns of the accept tile (k + 1 <= 32)
+# Rows per loop iteration of _strict_accept_kernel. Fixed, like the arguments in its do_not_specialize
+# list, so one compiled variant per draft length and forcing mode serves every batch.
+_STRICT_ACCEPT_BLOCK_B = 64
 
 
-@triton.jit
+# The kernel does not specialize on arguments that follow the batch composition (the request counts and
+# the draft tokens sliced at them): a specialization flips when a count becomes 1 or a multiple of 16 or
+# a slice loses 16-byte alignment, and would compile a kernel variant mid-serving.
+@triton.jit(do_not_specialize=["draft_ptr", "num_contexts", "num_gens"])
 def _strict_accept_kernel(
     target_ptr,  # [num_contexts + num_gens * (K + 1)] sampled target tokens (any int dtype)
     draft_ptr,  # [num_gens, K] draft tokens of the previous step
@@ -139,7 +145,6 @@ def fused_strict_accept(
             pool = counter = num_accepted  # unused in mode 1
         pool_mask = pool_size - 1
     draft = draft_tokens.contiguous() if num_gens > 0 else num_accepted
-    block_b = max(16, min(64, triton.next_power_of_2(max(num_gens, num_contexts, 1))))
     _strict_accept_kernel[(1,)](
         target_tokens,
         draft,
@@ -158,7 +163,7 @@ def fused_strict_accept(
         COUNTER_STRIDE=int(c_stride),
         SLOT_STRIDE=int(s_stride),
         POOL_MASK=int(pool_mask),
-        BLOCK_B=block_b,
+        BLOCK_B=_STRICT_ACCEPT_BLOCK_B,
         BLOCK_K=max(8, triton.next_power_of_2(k + 1)),
         num_warps=1,
     )
