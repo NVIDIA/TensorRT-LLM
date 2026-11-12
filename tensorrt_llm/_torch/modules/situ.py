@@ -14,6 +14,7 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
 
+from ..custom_ops.fast_custom_op import fast_custom_op
 from ..flashinfer_utils import get_env_enable_pdl
 
 
@@ -108,7 +109,7 @@ def situ_and_mul_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@torch.library.custom_op("trtllm::situ_and_mul", mutates_args=())
+@fast_custom_op("trtllm::situ_and_mul", mutates_args=())
 def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: Optional[float] = None) -> torch.Tensor:
     """Run fused SiTU on a packed ``[num_tokens, 2 * d]`` input."""
     b, n = x.shape
