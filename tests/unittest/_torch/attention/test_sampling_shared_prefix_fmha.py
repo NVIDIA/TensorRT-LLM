@@ -227,32 +227,30 @@ def test_step_stats_count_request_steps_per_kv_manager():
     lib.reset_step_stats()
 
 
-def test_executor_reports_only_its_own_rank_counters(monkeypatch):
-    """The executor reports the counters of the enabled libraries that keep them, under their record
-    field; records appended on behalf of another attention-DP rank carry none (they are local)."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+def test_step_stats_are_reported_only_while_the_library_is_enabled(monkeypatch):
+    """The executor reports ``fmha_step_stats``: the counters of the enabled libraries that keep
+    them, under their record field; None (nothing added to the record) when none is enabled."""
+    from tensorrt_llm._torch.attention.backends.fmha.registry import (
+        fmha_step_stats,
+        reset_fmha_step_stats,
+    )
 
-    executor = object.__new__(PyExecutor)
-    executor.dist = SimpleNamespace(rank=0, tp_rank=0)
-    executor.kv_cache_manager = _Manager()
+    manager = _Manager()
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+sampling_shared_prefix")
     lib.reset_step_stats()
-    lib._record_step(_stats_meta(executor.kv_cache_manager, [5, 6]), None)
-    expected = {
+    lib._record_step(_stats_meta(manager, [5, 6]), None)
+    assert fmha_step_stats(manager) == {
         "sharedPrefixAttnStats": {
             "requestSteps": 2,
             "shareableRequestSteps": 0,
             "sharedRequestSteps": 0,
         }
     }
-    assert executor._fmha_step_stats() == expected
-    assert executor._fmha_step_stats(attention_dp_rank=0) == expected
-    assert executor._fmha_step_stats(attention_dp_rank=1) is None
-    executor.kv_cache_manager = None
-    assert executor._fmha_step_stats() is None
-    executor.kv_cache_manager = _Manager()
+    assert fmha_step_stats(None) is None
+    reset_fmha_step_stats(manager)
+    assert fmha_step_stats(manager)["sharedPrefixAttnStats"]["requestSteps"] == 0
     monkeypatch.delenv("TLLM_FMHA_LIBS")
-    assert executor._fmha_step_stats() is None
+    assert fmha_step_stats(manager) is None
     lib.reset_step_stats()
 
 
