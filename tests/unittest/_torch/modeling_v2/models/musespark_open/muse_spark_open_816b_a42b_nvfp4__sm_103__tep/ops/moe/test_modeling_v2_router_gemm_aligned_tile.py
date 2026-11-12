@@ -53,12 +53,30 @@ def test_aligned_tile_logits_bit_identical(monkeypatch, rows):
     hidden = torch.randn(rows, mod.HIDDEN, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(mod.EXPERTS, mod.HIDDEN, device="cuda", dtype=torch.float32) * 0.02
 
+    tiles = []
+    real_gemm = mod._gemm
+
+    def spy(tile):
+        tiles.append(tile)
+        return real_gemm(tile)
+
+    monkeypatch.setattr(mod, "_gemm", spy)
+
     monkeypatch.setattr(mod, "ALIGNED_ROW_TILE", False)
     default = mod.router_gemm(hidden, weight, 0.5)
     monkeypatch.setattr(mod, "ALIGNED_ROW_TILE", True)
     aligned = mod.router_gemm(hidden, weight, 0.5)
     torch.cuda.synchronize()
 
+    # The tile reached the kernel compile; the two arms really ran different tiles.
+    assert tiles == list(TILES[rows])
+    if rows in (44, 72, 136, 200, 257):
+        assert tiles[0] != tiles[1]
+
     assert default.shape == (rows, mod.EXPERTS)
     assert torch.isfinite(default).all()
+    # Independent float64 check of the aligned arm (tolerance of the BF16x3 kernel test), so a
+    # wrong result is told apart from a merely non-bitwise one.
+    expected = mod.router_gemm.reference(hidden, weight, 0.5)
+    torch.testing.assert_close(aligned, expected, rtol=1e-4, atol=2e-5)
     assert torch.equal(aligned, default)
