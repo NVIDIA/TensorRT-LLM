@@ -215,6 +215,20 @@ def test_worker_lazy_init_configures_generation_autotuner_once():
     draft_model.configure_generation_autotuner.assert_called_once_with(8)
 
 
+def test_worker_tunes_generation_batch_not_seq_slot_pool():
+    """With a 2x seq-slot pool, the autotuner still gets the engine's generation batch."""
+    worker = _make_worker()
+    draft_model = _fake_draft_model()
+    draft_model.configure_generation_autotuner = Mock()
+    metadata = _make_metadata(max_num_requests=4, num_seq_slots=8)
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+
+    worker._lazy_init(draft_model, graph_metadata)
+
+    draft_model.configure_generation_autotuner.assert_called_once_with(4)
+    assert worker._ctx_len.shape == (9,)
+
+
 def test_worker_rejects_mismatched_block_size():
     worker = _make_worker()
     draft_model = _fake_draft_model()
