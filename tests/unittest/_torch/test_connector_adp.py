@@ -116,6 +116,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor._profile_manager = MagicMock()
     executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.draft_model_engine = None
+    executor.enable_joint_kv_cache_reuse = False
     executor.sampler = None
     executor.worker_thread = MagicMock()
     executor._shutdown_sleep_wakeup_listeners = MagicMock()

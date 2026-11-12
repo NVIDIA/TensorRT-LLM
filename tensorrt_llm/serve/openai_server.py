@@ -23,7 +23,7 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple, Union)
 
 import msgspec
 import uvicorn
@@ -51,13 +51,14 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
-from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.llm import LLM, PreprocessedInputs, RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
@@ -86,7 +87,8 @@ from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
+                                                resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request,
     validate_subagent_affinity)
@@ -146,6 +148,8 @@ from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
 from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
+from tensorrt_llm.serve.tokenization_owners import (TokenizationOwners,
+                                                    start_tokenization_owners)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -163,6 +167,14 @@ from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
+
+
+def _preprocess_in_conversation(
+        routing_id: Optional[str],
+        preprocess_fn: Callable[[], PreprocessedInputs]) -> PreprocessedInputs:
+    """Run ``preprocess_fn`` with its prompt tagged as conversation ``routing_id``."""
+    with tokenization_routing_key(routing_id):
+        return preprocess_fn()
 
 
 def _is_visual_gen_instance(obj) -> bool:
@@ -755,6 +767,10 @@ class OpenAIServer(_VideoRoutesMixin):
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
+        self._tokenization_owners: Optional[
+            TokenizationOwners] = start_tokenization_owners(
+                multi_frontend_serving,
+                getattr(generator, "input_processor", None))
         self._shared_clock_offset: Optional[SharedClockOffset] = (
             SharedClockOffset(
                 os.path.dirname(multi_frontend_serving.launcher_uds))
@@ -867,6 +883,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         pass
             if self._launcher_forwarder is not None:
                 await self._launcher_forwarder.close()
+            if self._tokenization_owners is not None:
+                await asyncio.to_thread(self._tokenization_owners.close)
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -1689,7 +1707,8 @@ class OpenAIServer(_VideoRoutesMixin):
         if self.disagg_cluster_config:
             self.disagg_cluster_storage = create_cluster_storage_client(
                 self.disagg_cluster_config.cluster_uri,
-                self.disagg_cluster_config.cluster_name)
+                self.disagg_cluster_config.cluster_name,
+                **self.disagg_cluster_config.cluster_storage_options())
             self.disagg_cluster_worker = DisaggClusterWorker(
                 self.server_role, self.host, self.port,
                 self.disagg_cluster_config, self.disagg_cluster_storage)
@@ -2486,11 +2505,19 @@ class OpenAIServer(_VideoRoutesMixin):
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
+                preprocess = functools.partial(preprocess_fn, prompt,
+                                               sampling_params,
+                                               disaggregated_params)
+                if self._tokenization_owners is not None:
+                    # A disaggregated context worker gets the sub-agent's
+                    # parent id only from the signed header.
+                    preprocess = functools.partial(
+                        _preprocess_in_conversation,
+                        scheduling_params.subagent_affinity_id
+                        or get_request_conversation_id(request), preprocess)
                 loop = asyncio.get_event_loop()
                 generate_inputs = await loop.run_in_executor(
-                    self._input_proc_executor,
-                    functools.partial(preprocess_fn, prompt, sampling_params,
-                                      disaggregated_params))
+                    self._input_proc_executor, preprocess)
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,

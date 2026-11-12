@@ -139,6 +139,7 @@ class _KVCacheManagerConfigFieldSpec:
     pool_rebalance: object = None
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
     host_sparse_pool_quota: object = None
+    regions: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -160,6 +161,9 @@ PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
 PoolRebalanceConfig = _cpp.PoolRebalanceConfig
+RegionAllocationUnit = _cpp.RegionAllocationUnit
+RegionBuffer = _cpp.RegionBuffer
+RegionConfig = _cpp.RegionConfig
 ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
@@ -287,6 +291,9 @@ __all__ = [
     "SlotDesc",
     "SlotDescVariant",
     "PoolRebalanceConfig",
+    "RegionAllocationUnit",
+    "RegionBuffer",
+    "RegionConfig",
     "SsmLayerConfig",
     "StreamingBlockRemovedData",
     "StreamingBlockStoredData",
