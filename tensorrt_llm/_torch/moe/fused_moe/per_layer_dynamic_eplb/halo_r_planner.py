@@ -475,8 +475,10 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     build a ``HaloRRelayEndpoint``. For CUDA graphs it overrides four more:
     ``plan_finish`` lends the constant READY generation, ``_wait_route_epoch``
     waits for the constant route target and resets the counter,
-    ``_check_owner`` lets MAIN change between layer calls behind a MAIN-to-MAIN
-    fence, and ``finish`` joins COPY into MAIN. Every other method is HALO-Q's.
+    ``_bind_main_stream`` lets MAIN change between layer calls behind a
+    MAIN-to-MAIN fence, and ``finish`` joins COPY into MAIN. All five are
+    hooks the base group declares; its owner checks (``_check_owner``) are
+    shared. Every other method is HALO-Q's.
     It adds ``forget_helper_residency`` for weight reloads.
     """
 
@@ -600,7 +602,7 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             self.auxiliary_sms,
         )
 
-    def _check_owner(self) -> None:
+    def _bind_main_stream(self, handle: int) -> None:
         """Bind the current stream as MAIN for this layer call.
 
         HALO-Q binds MAIN once for life. The breakable graph runner warms up
@@ -619,22 +621,12 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         capture stream (``wait_stream``). Without that order, its route wait
         could pass on a replayed launch's routes.
         """
-        if self._closed:
-            raise RuntimeError("Rebalance scheduler group is closed")
-        if torch._C._cuda_getDevice() != self.device:
-            raise RuntimeError("Rebalance submission requires its bound CUDA device")
-        handle = torch._C._cuda_getCurrentRawStream(self.device)
-        if handle == self._execution_stream_handle:
-            return
         if self._plan_part is not None or self._generation != self._finished_generation:
             raise RuntimeError("one HALO-R layer call must stay on one MAIN stream")
         streams = self._main_streams
         stream = streams.get(handle)
         if stream is None:
-            stream = torch.cuda.current_stream(self.device)
-            if handle == self._stream_handle or stream.priority <= self.copy_stream.priority:
-                raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
-            streams[handle] = stream
+            stream = streams[handle] = self._validate_main_stream(handle)
         previous = streams.get(self._execution_stream_handle)
         if previous is not None:
             if torch.cuda.is_current_stream_capturing():

@@ -747,7 +747,7 @@ def test_group_overrides_construction_and_the_four_graph_hooks() -> None:
     assert overridden == {
         "__init__",
         "_bind_copy_endpoint",
-        "_check_owner",
+        "_bind_main_stream",
         "_wait_route_epoch",
         "plan_finish",
         "finish",

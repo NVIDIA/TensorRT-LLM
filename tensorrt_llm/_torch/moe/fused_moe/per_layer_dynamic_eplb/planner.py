@@ -123,7 +123,16 @@ class _LiveBankLeaseProvider:
 
 
 class RebalanceSlotSchedulerGroup:
-    """One layer's scheduler, copy endpoint, and paired consumer generations."""
+    """One layer's scheduler, copy endpoint, and paired consumer generations.
+
+    HALO-Q's group. Another planner's group subclasses it and, besides
+    ``__init__``, overrides only these hooks, each documented with what an override must keep:
+    ``_bind_copy_endpoint`` (the copy endpoint), ``_bind_main_stream`` (whether
+    MAIN may change), ``_wait_route_epoch`` (MAIN's route wait),
+    ``plan_finish`` (the READY generation lent to MegaMoE) and ``finish``
+    (the release of a generation). The checks every planner shares, such as
+    ``_check_owner`` and the generation pairing, stay here.
+    """
 
     # Names the planner in this group's errors.
     planner_name = "HALO-Q"
@@ -237,8 +246,12 @@ class RebalanceSlotSchedulerGroup:
             )
         if error != driver.CUresult.CUDA_SUCCESS or not supported:
             raise RuntimeError("MoE rebalance requires 64-bit CUDA stream memory operations")
-        # CTAs of the fused launches whose routes are written, and its value
-        # after the latest launch. Only those launches change it.
+        # The device route counter: each CTA of a fused launch adds one once
+        # its routes are written, and MAIN's route wait (_wait_route_epoch)
+        # waits on it. HALO-Q's counter only grows, and _route_target is its
+        # value after the latest launch. A group whose route wait resets the
+        # counter (HALO-R's) waits for a constant instead and ignores
+        # _route_target.
         self._route_epoch = torch.zeros(1, dtype=torch.int64, device=f"cuda:{self.device}")
         self._route_epoch_ptr = int(self._route_epoch.data_ptr())
         self._route_target = 0
@@ -328,6 +341,11 @@ class RebalanceSlotSchedulerGroup:
         self.arena = None
 
     def _check_owner(self) -> None:
+        """Check that this open group's device and MAIN stream are current.
+
+        Every planner shares it. A current stream other than the bound MAIN
+        goes to the ``_bind_main_stream`` hook.
+        """
         if self._closed:
             raise RuntimeError("Rebalance scheduler group is closed")
         # Runs several times per layer: read the raw device and stream instead
@@ -337,17 +355,41 @@ class RebalanceSlotSchedulerGroup:
         handle = torch._C._cuda_getCurrentRawStream(self.device)
         if handle == self._execution_stream_handle:
             return
+        self._bind_main_stream(handle)
+
+    def _bind_main_stream(self, handle: int) -> None:
+        """Hook: ``_check_owner`` calls it when the current stream (raw ``handle``) is not the bound MAIN.
+
+        HALO-Q binds MAIN once for life. An override decides whether and when
+        MAIN may change, must pass a stream it has not validated before
+        through ``_validate_main_stream`` and must set
+        ``_execution_stream_handle``.
+        """
         if self._execution_stream_handle is not None:
             raise RuntimeError(
                 "Rebalance MAIN stream cannot change; every executor of a model "
                 "engine must submit on its one execution stream"
             )
+        self._validate_main_stream(handle)
+        self._execution_stream_handle = handle
+
+    def _validate_main_stream(self, handle: int) -> torch.cuda.Stream:
+        """Return the current stream, raw ``handle``, if it can be MAIN: not COPY and of lower priority."""
         stream = torch.cuda.current_stream(self.device)
         if handle == self._stream_handle or stream.priority <= self.copy_stream.priority:
             raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
-        self._execution_stream_handle = handle
+        return stream
 
     def _wait_route_epoch(self, stream_handle: int) -> None:
+        """Hook: queue on ``stream_handle`` (MAIN) a wait until the latest launch's routes are written.
+
+        HALO-Q waits until the route counter reaches ``_route_target``. An
+        override must queue a device wait that no MAIN work queued after it
+        can pass before every CTA of the latest launch has written its routes,
+        and must not wait on the host. It may skip the wait only for a launch
+        whose capture has ended, so that its kernel never runs; its ``finish``
+        then aborts the endpoint.
+        """
         (error,) = self._driver.cuStreamWaitValue64(
             stream_handle, self._route_epoch_ptr, self._route_target, self._wait_value_geq
         )
@@ -418,6 +460,10 @@ class RebalanceSlotSchedulerGroup:
 
         It queues no device work itself: plan_schedule() checked the owner of
         this pending plan, and the route wait checks it again.
+
+        Hook: returns the physical routes and the READY generation that
+        MegaMoE's gate waits for, HALO-Q's launched generation. An override
+        must call this method and may only replace the generation it returns.
         """
         if part is not self._plan_part or part is None:
             raise RuntimeError("plan_finish requires this group's pending plan")
@@ -468,6 +514,9 @@ class RebalanceSlotSchedulerGroup:
         The consumer is ``completion_event``, or without it the MAIN work
         queued so far: the MegaMoE launch that read this generation, if any.
         The next fused launch, submitted on MAIN, orders COPY after it.
+
+        Hook: an override must call this method before it queues any work;
+        after it, the override may join COPY into MAIN or abort its endpoint.
         """
         self._check_owner()
         if (

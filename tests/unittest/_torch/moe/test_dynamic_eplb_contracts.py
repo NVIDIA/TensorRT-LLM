@@ -1416,7 +1416,7 @@ def test_rebalance_submission_binds_one_main_stream_for_every_thread():
     group_cls = _extract_class(
         _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/planner.py",
         "RebalanceSlotSchedulerGroup",
-        {"_check_owner"},
+        {"_check_owner", "_bind_main_stream", "_validate_main_stream"},
         {"torch": torch},
     )
     group = group_cls()
