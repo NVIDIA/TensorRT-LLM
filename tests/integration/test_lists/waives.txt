@@ -247,4 +247,3 @@ unittest/llmapi/test_llm_args.py::TestKvCacheManagerV2AutoResolution::test_requi
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_llm_disagg_streaming_gen_cancelled[PYTHON] SKIP (https://nvbugs/6903683)
-unittest/others/test_web_dependency_security.py::test_web_framework_security_floors SKIP (https://nvbugs/6930053)
