@@ -23,7 +23,7 @@ context steps.
 Runs on four GB300s with the ranks already in place: pytest under `trtllm-llmapi-launch`, as
 the whole-model accuracy class runs, with the checkpoint under `LLM_MODELS_ROOT` as
 `Mistral-Large-4-1T-A52B-NVFP4` (or `mistral-large-4-nvfp4`) in its Mistral-native
-format, which the engine loads with checkpoint_format "mistral_large_4". Skipped where the
+format, which the engine loads with checkpoint_format "mistral". Skipped where the
 checkpoint is absent, below four GPUs, or off sm_103.
 """
 
@@ -113,7 +113,7 @@ def llm():
         )
     with LLM(
         str(path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         modeling_v2="require",
         env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
         enable_iter_perf_stats=True,

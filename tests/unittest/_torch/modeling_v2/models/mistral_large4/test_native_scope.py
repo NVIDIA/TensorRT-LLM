@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Mistral-Large-4 native paths leave the other Mistral-native formats as they were.
+"""The Mistral-Large-4 native paths leave the other Mistral-native checkpoints as they were.
 
-`mistral` and `mistral_large_3` checkpoints share MistralNativeInputProcessor, the image
-processor, the params.json adaptation and the HF config lookup with `mistral_large_4`. Only
-Mistral-Large-4 places images at [IMG] markers, keeps prompt token ids and loads its config
-from params.json for the LLM API. The other formats keep the vLLM mapping of a native
-`quantization` block.
+Mistral-Large-4 is read through the same `mistral` format as the other Mistral-native
+checkpoints, and shares MistralNativeInputProcessor, the image processor, the params.json
+adaptation and the HF config lookup with them. Only Mistral-Large-4 places images at [IMG]
+markers, keeps prompt token ids and loads its config from params.json for the LLM API. The
+other checkpoints keep the vLLM mapping of a native `quantization` block.
 """
 
 from types import SimpleNamespace
@@ -114,10 +114,12 @@ def test_other_formats_keep_the_vllm_quantization_mapping(qscheme_act):
         _remap_mistral_quantization_args(_fp8(**_BLOCK_FP8))
 
 
-@pytest.mark.parametrize(
-    "checkpoint_format", ["mistral_large_4", "mistral", "mistral_large_3", None]
-)
-def test_hf_config_lookup_names_only_the_mistral_large_4_format(monkeypatch, checkpoint_format):
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3", "HF", None])
+@pytest.mark.parametrize("is_mistral_large_4", [True, False])
+def test_hf_config_lookup_names_the_native_format_only_for_mistral_large_4(
+    monkeypatch, checkpoint_format, is_mistral_large_4
+):
+    from tensorrt_llm._torch.models.checkpoints.mistral import config_loader
     from tensorrt_llm.llmapi import llm as llm_module
 
     calls = []
@@ -126,9 +128,12 @@ def test_hf_config_lookup_names_only_the_mistral_large_4_format(monkeypatch, che
         "load_hf_model_config",
         staticmethod(lambda model, **kwargs: calls.append(kwargs)),
     )
+    monkeypatch.setattr(
+        config_loader, "is_mistral_large4_checkpoint", lambda path: is_mistral_large_4
+    )
     args = SimpleNamespace(model="m", trust_remote_code=False, checkpoint_format=checkpoint_format)
     llm_module.BaseLLM._try_load_hf_model_config(SimpleNamespace(args=args))
     expected = {"trust_remote_code": False}
-    if checkpoint_format == "mistral_large_4":
-        expected["checkpoint_format"] = "mistral_large_4"
+    if is_mistral_large_4 and checkpoint_format in ("mistral", "mistral_large_3"):
+        expected["checkpoint_format"] = checkpoint_format
     assert calls == [expected]

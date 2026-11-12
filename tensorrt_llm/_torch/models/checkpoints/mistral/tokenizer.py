@@ -196,10 +196,17 @@ class MistralTokenizer(TransformersTokenizer):
         )
 
     @functools.cached_property
+    def renders_grammars(self) -> bool:
+        """Whether mistral-common's grammar factory supports this tokenizer."""
+        from mistral_common.guidance.grammar_factory import GrammarFactory
+
+        return GrammarFactory.is_supported(self.mistral)
+
+    @functools.cached_property
     def _grammar_factory(self) -> tuple["GrammarFactory", str]:
         from mistral_common.guidance.grammar_factory import GrammarFactory
 
-        if not GrammarFactory.is_supported(self.mistral):
+        if not self.renders_grammars:
             raise ValueError(
                 f"mistral-common renders no grammars for this tokenizer (version v{self.version})."
             )

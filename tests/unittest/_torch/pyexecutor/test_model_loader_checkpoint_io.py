@@ -618,6 +618,31 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     assert "checkpoint_finalization_seconds" in loader.metrics
 
 
+def test_model_loader_lets_a_model_read_its_own_checkpoint() -> None:
+    events = []
+
+    class _Model:
+        def load_checkpoint(self, checkpoint_dir):
+            events.append(("load_checkpoint", checkpoint_dir))
+
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader._call_load_weights = MagicMock()
+    weights_preloaded = loader._materialize_checkpoint_weights(
+        _SessionCheckpointLoader(events),
+        "/checkpoint",
+        _Model(),
+        object(),
+        {"mapping": object()},
+    )
+
+    assert not weights_preloaded
+    assert events == [("load_checkpoint", "/checkpoint")]
+    loader._call_load_weights.assert_not_called()
+    assert "weight_population_seconds" in loader.metrics
+    assert "checkpoint_preparation_seconds" not in loader.metrics
+
+
 def test_shadow_plan_disabled_does_not_call_inspection_hooks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

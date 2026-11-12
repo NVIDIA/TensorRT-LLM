@@ -830,10 +830,6 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         self._config = config
         self._dtype = self._config.torch_dtype
         self._model_path = model_path
-        # Mistral-Large-4 keeps native chat token ids end to end; the other
-        # Mistral-native checkpoints keep the text-prompt path.
-        self._native_chat = getattr(config, "model_type",
-                                    None) == "mistral_large_4"
         self.supports_token_id_mm_expansion = self._native_chat
         self._tokenizer = MistralTokenizer.from_pretrained(model_path)
         self._processor = MistralCommonImageProcessor(
@@ -847,6 +843,12 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
     @property
     def config(self) -> PretrainedConfig:
         return self._config
+
+    @property
+    def _native_chat(self) -> bool:
+        """Mistral-Large-4 keeps native chat token ids end to end; the other
+        Mistral-native checkpoints keep the text-prompt path."""
+        return getattr(self._config, "model_type", None) == "mistral_large_4"
 
     @property
     def tokenizer(self) -> AutoTokenizer:
@@ -918,7 +920,8 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         images = self.processor.image_list(
             inputs.get("multi_modal_data", {}).get("image"))
         if not images:
-            if any(token in self.get_mm_token_ids() for token in token_ids):
+            if self._has_vision_encoder() and any(
+                    token in self.get_mm_token_ids() for token in token_ids):
                 raise ValueError("Image tokens require image data")
             return token_ids, None
         processed = self.processor(text="", images=images)

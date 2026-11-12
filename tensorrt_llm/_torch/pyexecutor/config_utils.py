@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-import json
-import os
 from collections.abc import Mapping as AbcMapping
 from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Union
 
@@ -1052,23 +1050,14 @@ def _require_native_format_for_mistral_large_4(model_name_or_path: str) -> None:
     """Name the format a Mistral-Large-4 checkpoint needs.
 
     It ships Mistral-native files only (params.json, tekken.json, consolidated
-    safetensors), which checkpoint_format="mistral_large_4" reads.
+    safetensors), which checkpoint_format="mistral" reads.
     """
-    params_path = os.path.join(str(model_name_or_path), "params.json")
-    if not os.path.isfile(params_path):
-        return
     from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-        _is_mistral_large4
-    try:
-        with open(params_path) as f:
-            params = json.load(f)
-    except (OSError, ValueError):
-        return  # Not a Mistral-native checkpoint the default format could be confused with.
-    if isinstance(params, dict) and _is_mistral_large4(params):
+        is_mistral_large4_checkpoint
+    if is_mistral_large4_checkpoint(model_name_or_path):
         raise ValueError(
             f"{model_name_or_path} is a Mistral-Large-4 checkpoint in the "
-            "Mistral-native format; load it with "
-            "checkpoint_format='mistral_large_4'")
+            "Mistral-native format; load it with checkpoint_format='mistral'")
 
 
 def load_pretrained_config(model_name_or_path: str,
@@ -1077,14 +1066,10 @@ def load_pretrained_config(model_name_or_path: str,
                            | None = None,
                            **kwargs) -> transformers.PretrainedConfig:
     if checkpoint_format in (CheckpointFormat.MISTRAL,
-                             CheckpointFormat.MISTRAL_LARGE_3,
-                             CheckpointFormat.MISTRAL_LARGE_4):
+                             CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
-        loader = MistralConfigLoader()
-        if checkpoint_format == CheckpointFormat.MISTRAL_LARGE_4:
-            return loader.load_pretrained_config(model_name_or_path)
-        return loader.load(model_name_or_path).pretrained_config
+        return MistralConfigLoader().load_pretrained_config(model_name_or_path)
 
     _require_native_format_for_mistral_large_4(model_name_or_path)
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(

@@ -182,6 +182,19 @@ def _is_mistral_large4(config: dict) -> bool:
     return bool(config.get("dsa") and config.get("kv_lora_rank") and config.get("lerope"))
 
 
+def is_mistral_large4_checkpoint(checkpoint_dir: str | Path) -> bool:
+    """Whether a directory's params.json describes a Mistral-Large-4 model."""
+    params_path = Path(checkpoint_dir) / "params.json"
+    if not params_path.is_file():
+        return False
+    try:
+        with open(params_path) as f:
+            params = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(params, dict) and _is_mistral_large4(params)
+
+
 _MISTRAL_LARGE4_MISTRAL_COMMON = "1.13.0"
 
 
@@ -389,15 +402,18 @@ def _remap_moe_args(config: dict) -> dict:
 ######################
 
 
-@register_config_loader(CheckpointFormat.MISTRAL_LARGE_4)
 @register_config_loader(CheckpointFormat.MISTRAL)
 @register_config_loader(CheckpointFormat.MISTRAL_LARGE_3)
 class MistralConfigLoader(BaseConfigLoader):
     def load_pretrained_config(self, checkpoint_dir: str) -> PretrainedConfig:
-        """Read and adapt the native params.json for an explicit Mistral format."""
+        """The checkpoint's params.json as the `PretrainedConfig` its model reads."""
         _, config = self._parse_mistral_config(checkpoint_dir)
-        config._name_or_path = str(checkpoint_dir)
-        return config
+        if isinstance(config, MistralLarge4Config):
+            # `load` builds this model's ModelConfig with ModelConfig.from_pretrained,
+            # which reads the adapted config back from here.
+            config._name_or_path = str(checkpoint_dir)
+            return config
+        return self.load(checkpoint_dir).pretrained_config
 
     def _load_mistral_config_dict(
         self, checkpoint_dir: str | Path, config_file_name: str
@@ -454,7 +470,7 @@ class MistralConfigLoader(BaseConfigLoader):
             # The shared builder derives DSA metadata and per-layer ModelOpt quantization
             # from the native config returned by load_pretrained_config.
             return ModelConfig.from_pretrained(
-                checkpoint_dir, checkpoint_format=CheckpointFormat.MISTRAL_LARGE_4, **kwargs
+                checkpoint_dir, checkpoint_format=CheckpointFormat.MISTRAL, **kwargs
             )
 
         # Some checkpoints lack torch_dtype, populate with dtype

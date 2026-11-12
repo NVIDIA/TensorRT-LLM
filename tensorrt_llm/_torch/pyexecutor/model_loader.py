@@ -2499,6 +2499,16 @@ class ModelLoader:
                                         load_weights_kwargs: dict) -> bool:
         """Keep loader-specific work alive through weight materialization."""
         self._startup_metadata["checkpoint_io_policy"] = None
+        if getattr(type(model), "load_checkpoint", None) is not None:
+            # The model reads its checkpoint's files itself, so the checkpoint
+            # loader opens nothing and no weight mapper applies.
+            with timing_metric(
+                    ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
+                    self._metrics):
+                model.load_checkpoint(checkpoint_dir)
+                if torch.cuda.is_available():  # CPU guard
+                    torch.cuda.synchronize()
+            return False
         with _timed_checkpoint_weight_session(
                 checkpoint_loader, checkpoint_dir, self._metrics,
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,

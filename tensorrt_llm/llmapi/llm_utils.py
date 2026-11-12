@@ -136,6 +136,15 @@ class ModelLoader:
             setattr(quant_config, key, value)
         self.llm_args.quant_config = quant_config
 
+    def _is_mistral_large4_checkpoint(self) -> bool:
+        """Whether the model is a Mistral-Large-4 checkpoint read in the Mistral-native format."""
+        if self.llm_args.checkpoint_format not in (
+                CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3):
+            return False
+        from .._torch.models.checkpoints.mistral.config_loader import \
+            is_mistral_large4_checkpoint
+        return is_mistral_large4_checkpoint(self._model_dir)
+
     def _update_from_hf_quant_config(self) -> bool:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
 
@@ -188,7 +197,9 @@ class ModelLoader:
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
         hf_config = None
-        if self.llm_args.checkpoint_format == CheckpointFormat.MISTRAL_LARGE_4:
+        if self._is_mistral_large4_checkpoint():
+            # Its params.json states the ModelOpt quantization a config.json
+            # would.
             from .._torch.models.checkpoints.mistral.config_loader import \
                 MistralConfigLoader
             hf_config = MistralConfigLoader().load_pretrained_config(

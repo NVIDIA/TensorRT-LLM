@@ -631,7 +631,7 @@ def _mistral_large4_model_config(checkpoint_dir: Path, fp8_kv_cache: bool = True
     # moe_backend is explicit so that no GPU is needed to resolve AUTO.
     return ModelConfig.from_pretrained(
         str(checkpoint_dir),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
         max_seq_len=9216,
         max_num_tokens=9216,
@@ -751,7 +751,7 @@ def test_mistral_large4_fp8_kv_cache_reaches_llm_args(tmp_path, kv_cache_dtype, 
     (tmp_path / "params.json").write_text(json.dumps(_mistral_large4_native_params()))
     llm_args = TorchLlmArgs(
         model=str(tmp_path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         kv_cache_config=KvCacheConfig(dtype=kv_cache_dtype),
     )
 
@@ -795,7 +795,7 @@ def test_mistral_large4_modelopt_mixed_precision_keeps_quantized_layers(tmp_path
     (tmp_path / "params.json").write_text(json.dumps(_mistral_large4_native_params()))
     model_config = ModelConfig.from_pretrained(
         str(tmp_path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
         max_seq_len=32768,
         max_num_tokens=32768,
@@ -820,7 +820,7 @@ def test_mistral_large4_modelopt_mixed_precision_keeps_quantized_layers(tmp_path
 
     llm_args = TorchLlmArgs(
         model=str(tmp_path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         kv_cache_config=KvCacheConfig(dtype="fp8"),
     )
     assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
@@ -943,36 +943,20 @@ def test_mistral_large4_native_checkpoint(tmp_path, kv_cache_dtype):
     assert not hasattr(config, "num_nextn_predict_layers")
     # Native parsing is selected explicitly in both the client and engine paths.
     assert isinstance(
-        load_pretrained_config(str(tmp_path), checkpoint_format="mistral_large_4"),
+        load_pretrained_config(str(tmp_path), checkpoint_format="mistral"),
         MistralLarge4Config,
     )
     assert isinstance(
-        ModelLoader.load_hf_model_config(str(tmp_path), checkpoint_format="mistral_large_4"),
+        ModelLoader.load_hf_model_config(str(tmp_path), checkpoint_format="mistral"),
         MistralLarge4Config,
     )
     from tensorrt_llm._torch.pyexecutor.model_loader import construct_checkpoint_loader
 
-    checkpoint_loader = construct_checkpoint_loader(None, "mistral_large_4")
-    assert checkpoint_loader.checkpoint_format == "mistral_large_4"
+    # The checkpoint is read through the `mistral` format, as every Mistral-native one is;
+    # its modeling_v2 targets load the weights from the checkpoint's files themselves.
+    checkpoint_loader = construct_checkpoint_loader(None, "mistral")
+    assert checkpoint_loader.checkpoint_format == "mistral"
     assert isinstance(checkpoint_loader.config_loader, MistralConfigLoader)
-    # The format's own weight loader keeps the checkpoint mmapped and its mapper renames
-    # nothing; the HF loader does not recognize a params.json-only directory.
-    from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
-    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
-    from tensorrt_llm._torch.models.checkpoints.mistral.weight_loader import (
-        MistralLarge4WeightLoader,
-    )
-    from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import (
-        MistralLarge4WeightMapper,
-    )
-
-    assert type(checkpoint_loader.weight_loader) is MistralLarge4WeightLoader
-    assert checkpoint_loader.weight_loader._requires_lazy_safetensors(str(tmp_path))
-    assert not HfWeightLoader._requires_lazy_safetensors(str(tmp_path))
-    assert (
-        type(AutoCheckpointMapper.get("mistral_large_4", "MistralLarge4ForCausalLM"))
-        is MistralLarge4WeightMapper
-    )
     model_config = checkpoint_loader.load_config(
         str(tmp_path),
         mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
@@ -992,7 +976,7 @@ def test_mistral_large4_native_checkpoint(tmp_path, kv_cache_dtype):
     )
     llm_args = TorchLlmArgs(
         model=str(tmp_path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         kv_cache_config=KvCacheConfig(dtype=kv_cache_dtype),
     )
     assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
@@ -1004,7 +988,7 @@ def test_mistral_large4_native_checkpoint(tmp_path, kv_cache_dtype):
 
 @pytest.mark.parametrize("stale_config_json", [False, True], ids=["params_only", "stale_config"])
 def test_mistral_large4_requires_native_format(tmp_path, stale_config_json):
-    # A Mistral-Large-4 params.json loads only with checkpoint_format='mistral_large_4';
+    # A Mistral-Large-4 params.json loads only with checkpoint_format='mistral';
     # any other format raises an error naming it, even beside a config.json that states
     # model_type mistral_large_4.
     from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
@@ -1014,16 +998,13 @@ def test_mistral_large4_requires_native_format(tmp_path, stale_config_json):
         (tmp_path / "config.json").write_text(
             json.dumps(_mistral_large4_expected_config(hidden_size=128))
         )
-    native_format = "checkpoint_format='mistral_large_4'"
+    native_format = "checkpoint_format='mistral'"
     for checkpoint_format in (None, "HF"):
         with pytest.raises(ValueError, match=native_format):
             load_pretrained_config(str(tmp_path), checkpoint_format=checkpoint_format)
         with pytest.raises(ValueError, match=native_format):
             ModelConfig.from_pretrained(str(tmp_path), checkpoint_format=checkpoint_format)
-    assert (
-        load_pretrained_config(str(tmp_path), checkpoint_format="mistral_large_4").hidden_size
-        == 6144
-    )
+    assert load_pretrained_config(str(tmp_path), checkpoint_format="mistral").hidden_size == 6144
 
 
 @pytest.mark.parametrize("params", ["mistral", "mla_without_dsa", "invalid_json"])

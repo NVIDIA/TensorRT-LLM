@@ -134,9 +134,3 @@ class MistralLarge3WeightMapper(MistralWeightMapper):
                 "router_biases": "mlp.gate.e_score_correction_bias",
             }
         )
-
-
-@register_mapper(CheckpointFormat.MISTRAL_LARGE_4)
-class MistralLarge4WeightMapper(HfWeightMapper):
-    """The `mistral_large_4` format's mapper. Its modeling_v2 targets read the checkpoint's
-    Mistral-native tensor names in their own weight tables, so it renames nothing."""

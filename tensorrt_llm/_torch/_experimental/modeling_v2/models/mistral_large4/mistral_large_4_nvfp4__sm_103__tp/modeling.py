@@ -2497,6 +2497,9 @@ class ModelingV2MistralLarge4Nvfp4Sm103Tp(
     def load_weights(self, weights, *args, **kwargs):
         _weights.MODEL_WEIGHTS.load(self, weights)
 
+    def load_checkpoint(self, checkpoint_dir: str) -> None:
+        _weights.MODEL_WEIGHTS.load_checkpoint(self, checkpoint_dir)
+
     def post_load_weights(self):
         super().post_load_weights()
         self.model.post_load_weights()

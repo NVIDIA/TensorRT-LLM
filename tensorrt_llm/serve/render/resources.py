@@ -20,7 +20,6 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.serving_extensions import ServingExtension, get_serving_extension
 
@@ -227,11 +226,7 @@ class RenderResources:
         loaded = getattr(input_processor, "tokenizer", loaded)
 
         processor = None
-        if checkpoint_format not in (
-            CheckpointFormat.MISTRAL,
-            CheckpointFormat.MISTRAL_LARGE_3,
-            CheckpointFormat.MISTRAL_LARGE_4,
-        ):
+        if checkpoint_format not in ("mistral", "mistral_large_3"):
             try:
                 processor = AutoProcessor.from_pretrained(
                     model, trust_remote_code=trust_remote_code

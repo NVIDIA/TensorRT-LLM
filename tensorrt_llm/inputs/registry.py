@@ -1220,24 +1220,11 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format in (CheckpointFormat.HF, CheckpointFormat.MX,
-                             CheckpointFormat.MISTRAL_LARGE_4):
+    if checkpoint_format in (CheckpointFormat.HF, CheckpointFormat.MX):
         try:
             model_config = ModelConfig.from_pretrained(
-                model_path_or_dir,
-                trust_remote_code=trust_remote_code,
-                checkpoint_format=checkpoint_format)
+                model_path_or_dir, trust_remote_code=trust_remote_code)
             config = model_config.pretrained_config
-            if (checkpoint_format == CheckpointFormat.MISTRAL_LARGE_4
-                    and getattr(config, "vision_config", None) is not None):
-                from tensorrt_llm._torch.models.modeling_mistral import \
-                    MistralNativeInputProcessor
-                return MistralNativeInputProcessor(
-                    model_path_or_dir,
-                    config,
-                    tokenizer,
-                    trust_remote_code=trust_remote_code,
-                    **kwargs)
         except (ValueError, EnvironmentError) as e:
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."

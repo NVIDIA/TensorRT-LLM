@@ -176,6 +176,10 @@ a Modeling V1 model class, and can override any of these steps:
 * **Constructor:** builds the model structure and parameters.
 * **`load_weights`:** loads checkpoint weights into the model. Put weight
   mapping, transformation and sharding in `weights.py`.
+* **`load_checkpoint`** (optional): reads the checkpoint directory itself. When
+  a target defines it, the engine calls it in place of `load_weights` and opens
+  no checkpoint file of its own. Use it for a checkpoint the target streams
+  from its files, in its on-disk tensor names.
 * **`post_load_weights`:** prepares the loaded weights, for example by
   transforming them or precomputing derived state. The default implementation
   in `DecoderModelForCausalLM` runs alias setup, weight transforms and derived

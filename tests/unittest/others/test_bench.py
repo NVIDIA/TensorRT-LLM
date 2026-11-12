@@ -522,19 +522,15 @@ def test_cli_options_read_the_checkpoint_format(tmp_path):
     env = BenchmarkEnvironment(
         model="Mistral Large 4", checkpoint_path=tmp_path, workspace=tmp_path
     )
-    params = {
-        "extra_llm_api_options": _native_options(tmp_path, checkpoint_format="mistral_large_4")
-    }
+    params = {"extra_llm_api_options": _native_options(tmp_path, checkpoint_format="mistral")}
     options = get_general_cli_options(params, env)
-    assert options.checkpoint_format == "mistral_large_4"
+    assert options.checkpoint_format == "mistral"
     with mock.patch(
         "tensorrt_llm.bench.benchmark.load_pretrained_config",
         return_value=SimpleNamespace(model_type="mistral_large_4"),
     ) as load:
         assert options.model_type == "mistral_large_4"
-    load.assert_called_once_with(
-        tmp_path, trust_remote_code=True, checkpoint_format="mistral_large_4"
-    )
+    load.assert_called_once_with(tmp_path, trust_remote_code=True, checkpoint_format="mistral")
     assert get_general_cli_options({}, env).checkpoint_format is None
 
 
@@ -544,7 +540,7 @@ def test_settings_need_explicit_limits_for_a_native_checkpoint(tmp_path, limits)
         "tp": 4,
         "pp": 1,
         "ep": 4,
-        "extra_llm_api_options": _native_options(tmp_path, checkpoint_format="mistral_large_4"),
+        "extra_llm_api_options": _native_options(tmp_path, checkpoint_format="mistral"),
         **limits,
     }
     with pytest.raises(ValueError, match="--max_batch_size and --max_num_tokens"):
@@ -559,7 +555,7 @@ def test_settings_take_explicit_limits_for_a_native_checkpoint(tmp_path):
         "max_batch_size": 16,
         "max_num_tokens": 32768,
         "extra_llm_api_options": _native_options(
-            tmp_path, checkpoint_format="mistral_large_4", enable_chunked_prefill="false"
+            tmp_path, checkpoint_format="mistral", enable_chunked_prefill="false"
         ),
     }
     metadata = SimpleNamespace(max_isl=4096, avg_isl=1024, avg_osl=256)

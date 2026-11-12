@@ -11,4 +11,3 @@ class CheckpointFormat(StrEnum):
     MX = "MX"
     MISTRAL = "mistral"
     MISTRAL_LARGE_3 = "mistral_large_3"
-    MISTRAL_LARGE_4 = "mistral_large_4"

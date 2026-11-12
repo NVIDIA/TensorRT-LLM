@@ -570,8 +570,7 @@
         "HF",
         "MX",
         "mistral",
-        "mistral_large_3",
-        "mistral_large_4"
+        "mistral_large_3"
       ],
       "title": "CheckpointFormat",
       "type": "string"

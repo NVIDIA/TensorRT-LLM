@@ -39,6 +39,7 @@ import importlib
 import os
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import click
@@ -302,9 +303,9 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 # ===========================================================================
 
 
-def _make_native_mistral_wrapper(checkpoint_format: str | None) -> LmEvalWrapper:
+def _make_native_mistral_wrapper(model_type: str | None) -> LmEvalWrapper:
     fake_llm = MagicMock()
-    fake_llm.args.checkpoint_format = checkpoint_format
+    fake_llm._hf_model_config = SimpleNamespace(model_type=model_type)
     return LmEvalWrapper(fake_llm)
 
 
@@ -1968,12 +1969,17 @@ def test_native_mistral_eval_defers_chat_until_image_geometry_is_available():
     assert "prompt" not in submitted
 
 
+# The config an LLM reads from a Mistral-Large-4 checkpoint, as far as lm-eval reads it.
+_MISTRAL_LARGE_4_CONFIG = SimpleNamespace(model_type="mistral_large_4")
+
+
 def test_native_mistral_eval_does_not_require_a_synthetic_hf_config():
     from types import SimpleNamespace
 
     wrapper = _make_multimodal_wrapper(model_type="mistral_large_4")
     llm = SimpleNamespace(
-        args=SimpleNamespace(checkpoint_format="mistral_large_4"), _hf_model_dir="/no-config-json"
+        _hf_model_config=SimpleNamespace(model_type="mistral_large_4"),
+        _hf_model_dir="/no-config-json",
     )
     assert wrapper._get_model_type(llm) == "mistral_large_4"
 
@@ -2025,7 +2031,7 @@ def test_native_text_chat_keeps_control_ids_through_harness(
 
     monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, str(window))
     llm = _canned_llm(_E2E_RESPONSES)
-    llm.args.checkpoint_format = "mistral_large_4"
+    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
     llm.tokenizer.name_or_path = "native-test"
     llm.tokenizer.chat_template = None
     llm.tokenizer.encode.side_effect = AssertionError("Native chat must keep token IDs")
@@ -2111,7 +2117,7 @@ def test_native_text_chat_real_tekken_keeps_control_ids(source):
     history = [{"role": "user", "content": "What is 2+2?"}]
     partial = history + [{"role": "assistant", "content": "The answer is"}]
     llm = MagicMock()
-    llm.args.checkpoint_format = "mistral_large_4"
+    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
     llm.tokenizer = tokenizer
     contexts = set()
     for kwargs in settings:
@@ -2153,10 +2159,12 @@ def test_native_text_chat_real_tekken_keeps_control_ids(source):
     assert len(contexts) == len(settings)
 
 
-@pytest.mark.parametrize("checkpoint_format", ["mistral_large_4", "hf"])
-def test_text_eval_plain_prompts_are_unchanged(checkpoint_format):
+@pytest.mark.parametrize("model_type", ["mistral_large_4", "llama"])
+def test_text_eval_plain_prompts_are_unchanged(model_type):
+    from types import SimpleNamespace
+
     llm = _canned_llm(["ok"])
-    llm.args.checkpoint_format = checkpoint_format
+    llm._hf_model_config = SimpleNamespace(model_type=model_type)
     wrapper = LmEvalWrapper(llm)
     prompt = "<s>[INST]literal user text[/INST]"
     assert wrapper._prepare_prompt(prompt) == prompt
@@ -2168,7 +2176,7 @@ def test_native_text_chat_encoding_and_continuation():
     from tensorrt_llm.evaluate.lm_eval import _NATIVE_CHAT_TOKENS_PREFIX
 
     llm = MagicMock()
-    llm.args.checkpoint_format = "mistral_large_4"
+    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
     llm.tokenizer.apply_chat_template.return_value = [1, 3, 1000, 4, 1001]
     wrapper = LmEvalWrapper(llm, chat_template_kwargs={"reasoning_effort": "none"})
     context = wrapper.apply_chat_template(
@@ -2181,6 +2189,6 @@ def test_native_text_chat_encoding_and_continuation():
     assert kwargs["continue_final_message"] is True
     assert kwargs["reasoning_effort"] == "none"
     llm.tokenizer.encode.assert_not_called()
-    llm.args.checkpoint_format = "hf"
+    llm._hf_model_config = SimpleNamespace(model_type="llama")
     non_native = LmEvalWrapper(llm)
     assert non_native._prepare_prompt(context) == context
