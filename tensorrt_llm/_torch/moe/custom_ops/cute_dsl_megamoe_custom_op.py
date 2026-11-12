@@ -169,9 +169,9 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 _TACTIC_LEN = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
-# SMs whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter work
-# ids; measured on SM103, and SM100 runs the same kernel.
-_ATOMIC_COUNTER_HELPER_SMS = (100, 103)
+# SM versions whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter
+# work ids; measured on SM103, and SM100 runs the same kernel.
+_ATOMIC_COUNTER_TWIN_SM_VERSIONS = (100, 103)
 _DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
 _TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
@@ -1047,6 +1047,24 @@ def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
     return 0, int(local_bytes), 0, int(shared_bytes), f"export-{type(kernel).__name__}"
 
 
+def _require_megamoe_shared_workspace(
+    kernel, shared_workspace: torch.Tensor, num_experts_per_rank: int
+) -> None:
+    """Refuse a caller's shared workspace smaller than ``kernel`` addresses.
+
+    Its layout grows with the expert count and the token bucket, so a workspace sized for
+    another problem lets the kernel write and read past the end of the allocation.
+    """
+    _, needed = kernel.get_workspace_sizes()
+    have = shared_workspace.numel() * shared_workspace.element_size()
+    if have < int(needed):
+        raise ValueError(
+            f"MegaMoE-CuteDSL: the shared workspace has {have} bytes, but the kernel for "
+            f"{num_experts_per_rank} experts per rank needs {int(needed)}; size it with "
+            f"query_megamoe_kernel_properties for this runner's problem."
+        )
+
+
 def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
     """Return the per-row byte width the MegaMoE kernel expects for the
     activation SF tensor.
@@ -1296,9 +1314,9 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             )
 
 
-def _with_atomic_counter_work_ids(candidates: List[Tuple], sm_version: int) -> List[Tuple]:
+def _with_atomic_counter_work_ids(candidates: list[Tuple], sm_version: int) -> list[Tuple]:
     """The candidates of a helper-bearing (load-balanced) launch and, on
-    _ATOMIC_COUNTER_HELPER_SMS, each one's twin with atomic-counter work ids.
+    _ATOMIC_COUNTER_TWIN_SM_VERSIONS, each one's twin with atomic-counter work ids.
 
     The autotuner then chooses the work-id mode per shape.
 
@@ -1308,7 +1326,7 @@ def _with_atomic_counter_work_ids(candidates: List[Tuple], sm_version: int) -> L
     from its candidate only in the work-id field and is validated again. Other
     SMs keep their candidates.
     """
-    if sm_version not in _ATOMIC_COUNTER_HELPER_SMS:
+    if sm_version not in _ATOMIC_COUNTER_TWIN_SM_VERSIONS:
         return list(candidates)
     tactics = list(candidates)
     canonical = [tuple(_unpack_tactic(tactic)) for tactic in candidates]
@@ -2839,6 +2857,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tactic_t,
                 allow_fallback=use_default_tactic,
             )
+            if shared_workspace is not None:
+                _require_megamoe_shared_workspace(
+                    kernel, shared_workspace, self.num_experts_per_rank
+                )
 
             # form-B accumulates the top-k reduction into ``combine_output``,
             # so its live rows MUST start at 0; the CALLER zeros [:num_tokens]

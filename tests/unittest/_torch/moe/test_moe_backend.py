@@ -4533,25 +4533,25 @@ def test_sm107_kimi_k3_genphase_tactics_take_precedence() -> None:
         )
 
 
-# Tokens of a small helper-bearing launch; the GPU test below also runs 8192 tokens, the per-rank
-# prefill size of a DeepSeek-V4-Pro layer under per-layer dynamic EPLB.
+# Tokens of a small helper-bearing launch, and the per-rank prefill size of a DeepSeek-V4-Pro layer
+# under per-layer dynamic EPLB, whose bucket's tuned tactics come with grid-stride work ids only.
 _MEGAMOE_HELPER_TOKENS = 256
+_MEGAMOE_PREFILL_TOKENS = 8192
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("sm_version", [100, 103])
 def test_megamoe_helper_bearing_candidates_offer_atomic_counter_work_ids(sm_version: int) -> None:
-    """A load-balanced launch on SM100 / SM103 can pick every candidate with grid-stride or with
-    atomic-counter work ids.
+    """Every candidate of a load-balanced launch on SM100 / SM103 comes with its atomic-counter twin.
 
     A helper-bearing launch runs on the full grid while the helper-copy kernel can still hold some
     SMs, so the CTAs that start late need not own a static grid-stride share of the tiles. The
-    8192-token bucket's tuned tactics come with grid-stride work ids only.
+    prefill bucket's tuned tactics come with grid-stride work ids only, so it has both modes.
     """
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
     tactics = megamoe_op.enumerate_megamoe_candidate_tactics(
-        8192, sm_version=sm_version, load_balance=True
+        _MEGAMOE_PREFILL_TOKENS, sm_version=sm_version, load_balance=True
     )
     fields = [tuple(megamoe_op._unpack_tactic(tactic)) for tactic in tactics]
     # The fifth canonical field is the work-id mode.
@@ -4576,6 +4576,43 @@ def test_megamoe_helper_bearing_work_ids_keep_sm107_candidates() -> None:
     assert megamoe_op._with_atomic_counter_work_ids(sm107, 107) == list(sm107)
 
 
+@pytest.mark.cpu_only
+def test_megamoe_runner_refuses_a_shared_workspace_smaller_than_its_kernel_needs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner given another problem's shared workspace fails before it launches.
+
+    The shared layout grows with the slot count, so a workspace sized for 16 slots is short for a
+    runner with two more helper slots; the kernel would write and read past its end.
+    """
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    needed = 4096
+    kernel = SimpleNamespace(get_workspace_sizes=lambda: (0, needed))
+    runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
+    runner.world_size, runner.num_experts_per_rank, runner._profiling_scratch = 1, 18, None
+    monkeypatch.setattr(
+        runner, "_resolve_kernel_descriptor", lambda tactic, allow_fallback: (kernel, tactic)
+    )
+    launched = []
+    monkeypatch.setattr(
+        megamoe_op,
+        "_get_or_alloc_local_workspace",
+        lambda *args, **kwargs: launched.append(args) or torch.zeros(0, dtype=torch.uint8),
+    )
+    inputs = [torch.empty(1)] * 12
+    with pytest.raises(ValueError, match=r"has 4095 bytes, but the kernel for 18 experts"):
+        runner.forward(
+            inputs,
+            tactic=("not", "the", "default"),
+            peer_offsets=[0],
+            shared_workspace=torch.empty(needed - 1, dtype=torch.uint8),
+        )
+    assert not launched
+
+
 def _with_slot_copies(tensor: torch.Tensor, slots: int, sources: Tuple[int, ...]) -> torch.Tensor:
     """``tensor`` (expert-major over ``slots`` slots) with byte copies of slots ``sources`` appended."""
     if tensor.dim() == 0:
@@ -4597,7 +4634,7 @@ def _clone_launch_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("num_tokens", [_MEGAMOE_HELPER_TOKENS, 8192])
+@pytest.mark.parametrize("num_tokens", [_MEGAMOE_HELPER_TOKENS, _MEGAMOE_PREFILL_TOKENS])
 def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
     monkeypatch: pytest.MonkeyPatch, num_tokens: int
 ) -> None:
@@ -4758,6 +4795,26 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
             combine_format=launch["combine_format"],
             helper_expert_count=len(sources),
         )
+        # The shared workspace layout grows with the slot count: the backend's is sized for
+        # ``slots``, so the helper runner gets its own, sized as the backend sizes one.
+        helper_workspace_bytes, _ = megamoe_op.query_megamoe_kernel_properties(
+            world_size=1,
+            num_topk=top_k,
+            num_experts_per_rank=slots + len(sources),
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=launch["intermediate_size_per_partition"],
+            expand_intermediate_size_per_partition=launch["expand_intermediate_size_per_partition"],
+            max_tokens_per_rank=launch["max_tokens_per_rank"],
+            apply_topk_in_fc1=launch["apply_topk_in_fc1"],
+            swiglu_alpha=launch["swiglu_alpha"],
+            swiglu_beta=launch["swiglu_beta"],
+            gate_up_clamp=launch["gate_up_clamp"],
+            situ_beta=launch["act_alpha"],
+            situ_linear_beta=launch["act_beta"],
+            in_kernel_fc2_reduce=launch["in_kernel_fc2_reduce"],
+            combine_format=launch["combine_format"],
+        )
+        helper_workspace = torch.zeros(helper_workspace_bytes, dtype=torch.uint8, device="cuda")
 
         def inputs(output: torch.Tensor) -> List[torch.Tensor]:
             return [
@@ -4785,7 +4842,7 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
                 inputs(output),
                 tactic=tactic,
                 peer_offsets=launch["peer_offsets"],
-                shared_workspace=launch["shared_workspace"],
+                shared_workspace=helper_workspace,
             )
             torch.cuda.synchronize()
             return output
@@ -4798,15 +4855,27 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
             in_kernel_fc2_reduce=launch["in_kernel_fc2_reduce"],
             combine_format=launch["combine_format"],
         )
-        cases = {
-            "default selection": -1,
-            "default tactic, grid-stride work ids": default,
-            # The last tactic is the default's atomic-counter twin, or the default itself when it
-            # already takes its tiles by atomic counter.
-            "default tactic, atomic-counter work ids": megamoe_op._with_atomic_counter_work_ids(
-                [default], sm_version
-            )[-1],
-        }
+        cases = {"default selection": -1}
+        # Each tactic runs once (every run compiles its kernel): the selection's own tactic is
+        # skipped when it comes up again below. Tactics hold lists, so they are compared by repr.
+        selected = megamoe_op._default_megamoe_tactic_for_key(
+            runner.unique_id(), num_tokens=num_tokens
+        )
+        seen = {repr(tuple(megamoe_op._unpack_tactic(selected)))}
+
+        def add(name: str, tactic) -> None:
+            key = repr(tuple(megamoe_op._unpack_tactic(tactic)))
+            if key not in seen:
+                seen.add(key)
+                cases[name] = tactic
+
+        add("default tactic, grid-stride work ids", default)
+        # The last tactic is the default's atomic-counter twin, or the default itself when it
+        # already takes its tiles by atomic counter.
+        add(
+            "default tactic, atomic-counter work ids",
+            megamoe_op._with_atomic_counter_work_ids([default], sm_version)[-1],
+        )
         mismatched = {}
         with torch.inference_mode():
             for name, tactic in cases.items():

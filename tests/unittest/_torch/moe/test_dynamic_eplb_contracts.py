@@ -2011,7 +2011,7 @@ def _autotune_helpers(torch):
         "_TOKEN_BACK_READY_GRANULARITIES",
         "_TACTIC_LEN",
         "_TACTIC_LEN_V4",
-        "_ATOMIC_COUNTER_HELPER_SMS",
+        "_ATOMIC_COUNTER_TWIN_SM_VERSIONS",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",
         "_GEOMETRIES",
