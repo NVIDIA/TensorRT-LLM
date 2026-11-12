@@ -126,7 +126,7 @@ OPENAI_CHAT_BACKEND_MODELS = {
 SPEC_DEC_REAL_DATASET_MODELS = {
     **{
         model: "cnn_dailymail"
-        for model in DEEPSEEK_V41_MODELS
+        for model in DEEPSEEK_V41_MODELS | QWEN38_MTP_MODELS
     },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
