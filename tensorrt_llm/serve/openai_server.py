@@ -696,6 +696,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self._enable_runtime_control_endpoints = enable_runtime_control_endpoints
         self._runtime_control_api_key = runtime_control_api_key
         self._runtime_control_replay_cache = RuntimeControlReplayCache()
+        # The gather in flight for GET /memory_report, shared by concurrent requests.
+        self._memory_report_task: Optional[asyncio.Future] = None
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -1452,21 +1454,19 @@ class OpenAIServer(_VideoRoutesMixin):
         stack mode, source paths, and each request makes every rank build a
         report next to its executor loop. The route therefore takes the
         runtime-control request signing, like ``/memory_status``, and exists
-        only when the monitor's full mode is requested (by
-        ``memory_monitor_config.mode`` or ``TLLM_MEM_MONITOR``) and a
-        runtime-control key is set. Sleep mode is not needed. The key is the
+        only when ``memory_monitor_config`` selects full mode (the
+        arguments fold ``TLLM_MEM_MONITOR`` into it) and a runtime-control
+        key is set. Sleep mode is not needed. The key is the
         server's ``runtime_control_api_key`` or, failing that,
         ``TRTLLM_RUNTIME_CONTROL_API_KEY``. With several frontends the route
         is not served, since each frontend keeps its own replay cache. The
         frontend is rank 0 and serves every rank's report, so
         ``TLLM_MEM_MONITOR_RANKS`` does not decide whether it exists.
         """
-        from tensorrt_llm._torch.memory.monitor import (configure,
-                                                        full_mode_requested)
+        from tensorrt_llm._torch.memory.monitor.settings import full_mode_in
 
-        args = getattr(self.generator, "args", None)
-        configure(getattr(args, "memory_monitor_config", None))
-        if not full_mode_requested():
+        args = self.generator.args
+        if not full_mode_in(args.memory_monitor_config):
             return
         api_key = (self._runtime_control_api_key
                    or os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY"))
@@ -1476,7 +1476,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 "TRTLLM_RUNTIME_CONTROL_API_KEY to serve it with signed "
                 "requests. LLM.get_memory_report() returns the same reports.")
             return
-        if getattr(args, "num_serve_frontends", 1) > 1:
+        if args.num_serve_frontends > 1:
             logger.info(
                 "GET /memory_report is not served with num_serve_frontends > "
                 "1: request signing keeps its replay cache per frontend.")
@@ -3897,7 +3897,7 @@ class OpenAIServer(_VideoRoutesMixin):
         See ``LLM.get_memory_report``. Concurrent requests share one
         in-flight gather rather than each asking every rank again.
         """
-        task = getattr(self, "_memory_report_task", None)
+        task = self._memory_report_task
         if task is None or task.done():
             task = asyncio.ensure_future(
                 self._call_runtime_memory_method("get_memory_report"))

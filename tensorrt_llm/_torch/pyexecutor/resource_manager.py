@@ -28,8 +28,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.memory.monitor.names import REGION_LORA_DEVICE_CACHE
-from tensorrt_llm._torch.memory.monitor.startup import region as monitor_region
+from tensorrt_llm._torch.memory.monitor import names as monitor_names
+from tensorrt_llm._torch.memory.monitor import startup as monitor_startup
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
 from tensorrt_llm._utils import (get_size_in_bytes, prefer_pinned,
@@ -3354,7 +3354,8 @@ class PeftCacheManager(BaseResourceManager):
         )
         # The device LoRA cache is allocated here, in C++, with no size
         # exposed to Python; the memory monitor names it by measuring.
-        with monitor_region(REGION_LORA_DEVICE_CACHE, per_executor=True):
+        with monitor_startup.region(monitor_names.REGION_LORA_DEVICE_CACHE,
+                                    per_executor=True):
             self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                             model_config=model_config,
                                             world_config=world_config,

@@ -973,8 +973,18 @@ class BaseWorker(GenerationExecutor):
         is replaced by a line saying so.
         """
         from tensorrt_llm._torch.memory.monitor import current_rank
+        from tensorrt_llm._torch.memory.monitor.providers import NOT_MONITORED
         from tensorrt_llm._torch.memory.monitor.triggers import report_now
 
+        token = getattr(self.engine, "_memory_monitor_token", None)
+        if token is not None and not token.monitored:
+            # Another executor in this process holds the monitor; a report
+            # would describe that executor's memory.
+            dist = getattr(self.engine, "dist", None)
+            world_size = dist.world_size if dist is not None else 1
+            return [
+                f"rank {rank}: {NOT_MONITORED}" for rank in range(world_size)
+            ]
         # Answered on an RPC thread, whose current device is not necessarily
         # the one this worker serves on; report_now selects it.
         own = report_now(tag="on_demand",

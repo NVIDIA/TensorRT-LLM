@@ -2022,8 +2022,18 @@ class _TorchLLM(BaseLLM):
         Returns:
             list[str]: One entry per rank, rank 0 first: its report, or one
             line saying why there is none (not gathered, not answered in
-            time, or the report could not be built).
+            time, or the report could not be built). With
+            ``encode_only=True`` the encoder runs in this process, and the one
+            entry is this process's report.
         """
+        if self._encode_only:
+            from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+            report = report_now(tag="on_demand", force=True, save=False)
+            return [
+                report or
+                "rank 0: the report could not be built; see this process's log"
+            ]
         replies = self._collective_rpc("get_memory_report")
         return [
             report for reply in replies if reply for report in reply if report

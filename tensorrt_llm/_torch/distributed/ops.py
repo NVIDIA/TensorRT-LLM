@@ -28,9 +28,8 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
                                                           MnnvlMemory)
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
-from tensorrt_llm._torch.memory.monitor.names import \
-    REGION_TORCH_DISTRIBUTED_NCCL
-from tensorrt_llm._torch.memory.monitor.startup import region as monitor_region
+from tensorrt_llm._torch.memory.monitor import names as monitor_names
+from tensorrt_llm._torch.memory.monitor import startup as monitor_startup
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_pybind11_abi
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -157,7 +156,7 @@ def warmup_named_allreduce_topologies(model: nn.Module) -> None:
         if isinstance(module, AllReduce) and module._group_name:
             mappings.setdefault(module._group_name, module.mapping)
     # The first collective on each group creates its NCCL communicator.
-    with monitor_region(REGION_TORCH_DISTRIBUTED_NCCL):
+    with monitor_startup.region(monitor_names.REGION_TORCH_DISTRIBUTED_NCCL):
         for group_name in sorted(mappings):
             _warmup_named_allreduce_topology(mappings[group_name], group_name)
 

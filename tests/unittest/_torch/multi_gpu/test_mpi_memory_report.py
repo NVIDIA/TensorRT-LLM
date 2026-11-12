@@ -17,10 +17,9 @@
 Rank 0 answers report requests and, in the memory monitor's full mode,
 gathers the other ranks' reports over its own communicator; without full
 mode the other ranks are listed as not gathered. Full mode is requested
-either through ``TLLM_MEM_MONITOR`` or through ``memory_monitor_config``,
-which has to reach every worker. Either way the executor
-shuts down promptly afterwards: a rank's report listener must not keep it in
-MPI.
+through ``memory_monitor_config``, which has to reach every worker. Either
+way the executor shuts down promptly afterwards: a rank's report listener
+must not keep it in MPI.
 """
 
 import time
@@ -37,18 +36,12 @@ _SHUTDOWN_BOUND_S = 60.0
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
-@pytest.mark.parametrize(
-    "requested_by", ["env", "config", None], ids=["full_env", "full_config", "default"]
-)
-def test_every_rank_has_an_entry_and_shutdown_is_prompt(monkeypatch, requested_by):
-    full_mode = requested_by is not None
+@pytest.mark.parametrize("full_mode", [True, False], ids=["full_config", "default"])
+def test_every_rank_has_an_entry_and_shutdown_is_prompt(monkeypatch, full_mode):
     # Read by the MPI workers, which inherit TLLM* variables.
-    if requested_by == "env":
-        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    else:
-        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+    monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
     extra = {}
-    if requested_by == "config":
+    if full_mode:
         extra["memory_monitor_config"] = MemoryMonitorConfig(mode="full")
     llm = LLM(
         model=_MODEL_PATH,

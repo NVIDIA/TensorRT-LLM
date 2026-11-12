@@ -18,6 +18,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._startup_errors import OomKind, out_of_memory_kind
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
 from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
@@ -46,12 +47,12 @@ if TYPE_CHECKING:
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
-from ..memory import monitor as gpu_memory_monitor
-from ..memory.monitor import pools as gpu_memory_pools
-from ..memory.monitor import providers as gpu_memory_providers
-from ..memory.monitor import startup as gpu_memory_startup
-from ..memory.monitor import tagging as gpu_memory_tagging
-from ..memory.monitor import triggers as gpu_memory_triggers
+from ..memory.monitor import pools as monitor_pools
+from ..memory.monitor import providers as monitor_providers
+from ..memory.monitor import settings as monitor_settings
+from ..memory.monitor import startup as monitor_startup
+from ..memory.monitor import tagging as monitor_tagging
+from ..memory.monitor import triggers as monitor_triggers
 from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
@@ -144,7 +145,7 @@ class _ExecutorMemoryMonitor:
         self._total_gpu_memory_bytes = torch.cuda.mem_get_info()[1]
         self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
         # The memory monitor reuses these names and suggestions in its reports.
-        gpu_memory_startup.set_stage_advice(
+        monitor_startup.set_stage_advice(
             {
                 k.value: v
                 for k, v in self.memory_type_friendly_names.items()
@@ -217,15 +218,16 @@ class _ExecutorMemoryMonitor:
     def _maybe_explain_if_oom(self, e: Exception, *,
                               current_stage: ExecutorMemoryType,
                               free_gpu_memory_bytes_pre: int) -> Optional[str]:
-        if isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e):
-            msg = "Executor creation failed due to insufficient GPU memory."
-        elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
-              and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
-              in str(e)):
-            msg = f"Executor creation failed with NCCL error: {str(e)}"
-            return msg
-        else:
+        # The same test startup classification and the memory monitor use;
+        # host-memory failures get no GPU memory explanation.
+        kind = out_of_memory_kind(e)
+        if kind is None or kind is OomKind.HOST:
             return None
+        if (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e) and
+                "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
+                in str(e)):
+            return f"Executor creation failed with NCCL error: {str(e)}"
+        msg = "Executor creation failed due to insufficient GPU memory."
 
         msg = "\n".join([
             msg,
@@ -254,18 +256,17 @@ class _ExecutorMemoryMonitor:
         """Catches OOM and prints instructive message."""
 
         free_gpu_memory_bytes_pre = torch.cuda.mem_get_info()[0]
-        monitor_process_pre = gpu_memory_startup.begin_stage(
-            current_stage.value)
+        monitor_process_pre = monitor_startup.begin_stage(current_stage.value)
 
         try:
             # Tag what the step allocates so the memory monitor can name its
             # owner; a no-op unless the monitor is in full mode.
-            with gpu_memory_tagging.tag(current_stage.value):
+            with monitor_tagging.tag(current_stage.value):
                 yield
         except Exception as e:
-            gpu_memory_startup.record_failed_stage(current_stage.value,
-                                                   free_gpu_memory_bytes_pre,
-                                                   monitor_process_pre)
+            monitor_startup.record_failed_stage(current_stage.value,
+                                                free_gpu_memory_bytes_pre,
+                                                monitor_process_pre)
             explanation = self._maybe_explain_if_oom(
                 e,
                 current_stage=current_stage,
@@ -275,10 +276,10 @@ class _ExecutorMemoryMonitor:
             raise RuntimeError(explanation) from e
         else:
             free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
-            gpu_memory_startup.record_stage(current_stage.value,
-                                            free_gpu_memory_bytes_pre,
-                                            free_gpu_memory_bytes_post,
-                                            monitor_process_pre)
+            monitor_startup.record_stage(current_stage.value,
+                                         free_gpu_memory_bytes_pre,
+                                         free_gpu_memory_bytes_post,
+                                         monitor_process_pre)
             self._samples.append(
                 self._GpuMemoryUsageSample(
                     creation_stage=current_stage,
@@ -1378,7 +1379,7 @@ def _create_py_executor(
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         # Resources each executor owns are named for the final executor only.
-        gpu_memory_startup.set_sizing_pass(estimating_kv_cache)
+        monitor_startup.set_sizing_pass(estimating_kv_cache)
 
         # Without the estimation, build_managers sizes the final KV cache from
         # the device memory free now, so DWDP is set up first: the KV cache
@@ -1491,7 +1492,7 @@ def _create_py_executor(
                 kv_cache_creator.teardown_managers(resources)
                 gc.collect()
                 torch.cuda.empty_cache()
-            gpu_memory_startup.set_sizing_pass(False)
+            monitor_startup.set_sizing_pass(False)
 
             with allocation_scope(ExecutorMemoryType.KV_CACHE):
                 # Before estimating KV cache size, a minimal KV cache has been allocated using
@@ -1582,19 +1583,13 @@ def create_py_executor(
     """
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
-    # The memory monitor's settings; environment variables override them.
-    gpu_memory_monitor.configure(
-        getattr(llm_args, "memory_monitor_config", None))
-    # Components registered with the memory monitor from here on belong to
-    # this executor and are dropped at its shutdown.
-    monitor_token = gpu_memory_providers.begin_executor()
+    # The memory monitor follows one executor per process, the first one
+    # alive; the others are built and served without it.
+    monitor_token = _begin_monitor(llm_args)
     try:
-        # Creation runs allocations out of memory on purpose and catches the
-        # error, so no OOM is reported meanwhile, not even for an executor
-        # already serving in this process.
-        with gpu_memory_triggers.suspend_reporting(
-        ), gpu_memory_tagging.startup_window(), monitor_executor_initialization(
-        ), _StartupTimer("executor_creation") as startup_timer:
+        with _monitor_startup_scope(
+                monitor_token.monitored), monitor_executor_initialization(
+                ), _StartupTimer("executor_creation") as startup_timer:
             py_executor = _create_py_executor_impl(
                 _startup_timer=startup_timer,
                 llm_args=llm_args,
@@ -1604,9 +1599,8 @@ def create_py_executor(
                 resource_governor_queue=resource_governor_queue,
             )
     except BaseException:
-        gpu_memory_providers.end_executor(monitor_token)
-        gpu_memory_tagging.forget_startup_of(monitor_token)
-        gpu_memory_startup.set_sizing_pass(False)
+        monitor_providers.end_executor(monitor_token)
+        monitor_startup.set_sizing_pass(False)
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):
@@ -1626,17 +1620,53 @@ def create_py_executor(
                     "Failed to roll back dense DWDP after PyExecutor construction "
                     f"error\n{traceback.format_exc()}")
         raise
-    # Armed only once startup is over: KV sizing, warmup and graph capture
-    # run allocations into the wall on purpose and catch the error. The
-    # executor releases it at shutdown; reports describe its device.
     py_executor._memory_monitor_token = monitor_token
-    py_executor._oom_reporter_armed = gpu_memory_triggers.install_oom_reporter(
-        device=getattr(py_executor, "device_id", None),
-        owner=monitor_token,
-        world_size=getattr(getattr(llm_args, "parallel_config", None),
-                           "world_size", None))
-    if py_executor._oom_reporter_armed:
-        # Classify the pools startup created now rather than inside the first
-        # report, which may run on the executor thread during an OOM.
-        gpu_memory_pools.prime()
+    if monitor_token.monitored:
+        # Armed only once startup is over: KV sizing, warmup and graph
+        # capture run allocations into the wall on purpose and catch the
+        # error. The executor releases it at shutdown, through
+        # end_executor; reports describe its device.
+        monitor_triggers.install_oom_reporter(
+            device=py_executor.device_id,
+            owner=monitor_token,
+            world_size=llm_args.parallel_config.world_size)
+    # Classify the pools startup created now, in every mode, rather than
+    # inside the first report: that may be an OOM report on the executor
+    # thread, or a report request answered next to the serving loop.
+    monitor_pools.prime()
     return py_executor
+
+
+def _begin_monitor(llm_args: TorchLlmArgs) -> "monitor_providers.ExecutorToken":
+    """Register the executor about to be built with the memory monitor.
+
+    The monitor follows the first executor alive in the process. For it,
+    ``memory_monitor_config`` is applied, with the environment's overrides
+    ``TorchLlmArgs`` folded in already, and a rank filter that selects none
+    of the job's ranks is ignored before startup is recorded, so it does not
+    turn the record off. Any other executor leaves the monitor's settings as
+    they are.
+    """
+    monitor_settings.configure(llm_args.memory_monitor_config,
+                               read_environment=False,
+                               world_size=llm_args.parallel_config.world_size)
+    return monitor_providers.begin_executor()
+
+
+@contextmanager
+def _monitor_startup_scope(monitored: bool):
+    """The memory monitor's view of an executor being built.
+
+    For the monitored executor: creation runs allocations out of memory on
+    purpose and catches the error, so no OOM is reported meanwhile, and its
+    startup is recorded. Any other executor leaves the monitor alone: it
+    records nothing (the monitor drops what it registers), and the
+    monitored executor's OOMs are still reported while it is built.
+    """
+    if monitored:
+        with monitor_triggers.suspend_reporting(
+        ), monitor_tagging.startup_window():
+            yield
+    else:
+        with monitor_startup.recording_paused():
+            yield

@@ -113,6 +113,7 @@ class _DummyPyExecutor:
         self.execution_stream = execution_stream
         self.started = False
         self.closed = False
+        self.device_id = 0
 
     def shutdown(self):
         self.closed = True
@@ -259,7 +260,8 @@ def _make_llm_args():
             calibration_layer_indices=None,
         ),
         cuda_graph_config=None,
-        parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
+        parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace(), world_size=1),
+        memory_monitor_config=None,
         get_runtime_sizes=lambda: (1, 128, 128, 4),
     )
 
@@ -493,13 +495,17 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
     monkeypatch.setattr(py_executor_creator, "timing_metric", _timing_metric)
     monkeypatch.setattr(py_executor_creator, "_create_py_executor", _raise_during_creation)
 
+    llm_args = SimpleNamespace(
+        memory_monitor_config=None, parallel_config=SimpleNamespace(world_size=1)
+    )
     with pytest.raises(RuntimeError, match="creation failed"):
-        py_executor_creator.create_py_executor(SimpleNamespace())
+        py_executor_creator.create_py_executor(llm_args)
 
     assert captured_metrics == {"total_py_executor_creation_seconds": 1.5}
 
     py_executor = object.__new__(PyExecutor)
     py_executor._metrics = {"worker_start_seconds": 0.25}
+    py_executor.device_id = 0
 
     def _return_executor(*, creation_metrics: dict[str, float], **kwargs: object) -> PyExecutor:
         assert "total_py_executor_creation_seconds" not in creation_metrics
@@ -507,7 +513,7 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
         return py_executor
 
     monkeypatch.setattr(py_executor_creator, "_create_py_executor", _return_executor)
-    result = py_executor_creator.create_py_executor(SimpleNamespace())
+    result = py_executor_creator.create_py_executor(llm_args)
 
     assert result is py_executor
     assert result.metrics == {

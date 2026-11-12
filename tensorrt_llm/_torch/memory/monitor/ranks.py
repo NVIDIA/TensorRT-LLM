@@ -19,10 +19,12 @@ the MPI executor. Rank 0 asks the other ranks over a communicator duplicated
 for this purpose when the executor starts, and each of them answers from a
 listener thread with a report of its own process.
 
-Set up only while the monitor is on: the duplicated communicator and one
-listener thread per rank are the whole cost, and the listener polls for a
-request every fraction of a second rather than blocking in ``recv``, which
-some MPI implementations implement by spinning a CPU core.
+Set up only in the monitor's full mode, for the executor that serves (not
+the KV-sizing pass), and only when MPI allows calls from several threads. The
+duplicated communicator and one listener thread per rank are the whole cost:
+the listener polls for a request every fraction of a second rather than
+blocking in ``recv``, which some MPI implementations implement by spinning a
+CPU core, and stopping frees the communicator.
 
 A rank that does not answer in time is reported as such rather than holding
 up the others; its late answer is recognised by its sequence number and
@@ -42,8 +44,12 @@ import threading
 import time
 from typing import Any
 
-from tensorrt_llm._torch.pyexecutor.mpi_polling import message_ready, try_recv
+import torch
+
+from tensorrt_llm._torch.distributed.mpi_polling import message_ready, try_recv
 from tensorrt_llm.logger import logger
+
+from . import triggers
 
 __all__ = ["RankReporter"]
 
@@ -63,6 +69,9 @@ _abandoned_sends: list[Any] = []
 class RankReporter:
     """Rank 0 gathers; every other rank answers from a listener thread."""
 
+    #: What a gather overlapping shutdown says for each rank it did not hear from.
+    SHUTTING_DOWN = _SHUTTING_DOWN
+
     def __init__(self, comm: Any, rank: int, world_size: int, device: int | None) -> None:
         self._comm = comm
         self._rank = rank
@@ -79,10 +88,6 @@ class RankReporter:
             self._thread.start()
 
     def _listen(self) -> None:
-        import torch
-
-        from .triggers import report_now
-
         if self._device is not None:
             torch.cuda.set_device(self._device)
         while not self._stop.is_set():
@@ -91,7 +96,9 @@ class RankReporter:
                     self._stop.wait(_POLL_S)
                     continue
                 sequence = self._comm.recv(source=0, tag=_REQUEST_TAG)
-                report = report_now(tag="on_demand", rank=self._rank, force=True, save=False)
+                report = triggers.report_now(
+                    tag="on_demand", rank=self._rank, force=True, save=False
+                )
                 if not self._deliver(self._comm.isend((sequence, report), dest=0, tag=_REPLY_TAG)):
                     return
             except Exception as exc:  # a diagnostic must not kill the rank
@@ -156,9 +163,11 @@ class RankReporter:
                     if stopped
                     else f"rank {source}: no report within {timeout:g} s"
                 )
-            if stopped and pending:
-                # stop() could not drain while this gather held the lock.
+            if stopped:
+                # stop() could neither drain nor free while this gather held
+                # the lock.
                 self._drain_quietly()
+                self._free_comm()
             return [replies[source] for source in sorted(replies)]
 
     def _drain_replies(self) -> None:
@@ -176,22 +185,47 @@ class RankReporter:
                 f"({type(exc).__name__}: {exc})"
             )
 
-    def stop(self) -> None:
-        """End this rank's listener. Each rank stops its own. Never raises.
+    def _free_comm(self) -> None:
+        """Free the duplicated communicator once nothing here uses it any more.
 
-        A gather still running returns promptly and drains its own replies.
+        mpi4py does not free a communicator when it is garbage collected, and
+        an MPI library has a limited number of them.
+        """
+        comm, self._comm = self._comm, None
+        if comm is None:
+            return
+        try:
+            comm.Free()
+        except RuntimeError as exc:  # mpi4py's MPI.Exception derives from it
+            logger.warning(
+                f"memory monitor: could not free the rank report communicator "
+                f"({type(exc).__name__}: {exc})"
+            )
+
+    def stop(self) -> None:
+        """End this rank's listener and free its communicator. Never raises.
+
+        Each rank stops its own. A gather still running returns promptly,
+        drains its own replies and frees the communicator.
         """
         self._stop.set()
-        if self._rank == 0 and self._gather_lock.acquire(blocking=False):
-            try:
-                self._drain_quietly()
-            finally:
-                self._gather_lock.release()
+        if self._rank == 0:
+            if self._gather_lock.acquire(blocking=False):
+                try:
+                    self._drain_quietly()
+                    self._free_comm()
+                finally:
+                    self._gather_lock.release()
+            return
         if self._thread is not None:
             timeout = 2 * _POLL_S + 5
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
+                # Still in an MPI call: freeing its communicator under it
+                # would be an error.
                 logger.warning(
                     f"memory monitor: rank {self._rank}'s report listener did not stop "
                     f"within {timeout:g} s"
                 )
+                return
+        self._free_comm()

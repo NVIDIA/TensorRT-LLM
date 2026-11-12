@@ -88,7 +88,10 @@ def test_errors_from_other_threads(reports, monkeypatch):
     assert not periodic_running(), "periodic reports are off unless an interval is set"
 
     # How the KV transfer workers report a failed delivery.
-    logger.error("_process_task_queue[0]: unhandled exception: CUDA error: out of memory")
+    logger.error(
+        "_process_task_queue[0]: unhandled exception: CUDA out of memory. "
+        "Tried to allocate 2.00 GiB. GPU 0"
+    )
     _wait_for_logged_report()
     assert len(reports) == 1 and reports[0][0] == "out_of_memory", "a logged OOM"
 
@@ -136,10 +139,13 @@ def test_a_logged_oom_is_reported_without_holding_up_the_logging_thread(monkeypa
     monkeypatch.setattr(triggers, "_attached", True)
     triggers.install_oom_reporter()
     try:
-        logger.error("Encountered an error in forward function: CUDA out of memory")
+        logger.error(
+            "Encountered an error in forward function: CUDA out of memory. "
+            "Tried to allocate 2.00 GiB. GPU 0"
+        )
         assert seen == [], "logger.error returned before the report was built"
         assert started.wait(30), "the report is being built meanwhile"
-        logger.error("CUDA out of memory")  # a burst starts one report
+        logger.error("CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0")  # one report
         release.set()
         _wait_for_logged_report()
     finally:
@@ -156,12 +162,41 @@ class TestOnRequest:
     def test_worker_reports_even_with_the_monitor_off(self, monkeypatch, tmp_path):
         from tensorrt_llm.executor.base_worker import BaseWorker
 
-        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "0")
         monkeypatch.setenv(triggers.DIR_VAR, str(tmp_path))
         worker = SimpleNamespace(engine=SimpleNamespace(device_id=torch.cuda.current_device()))
         (text,) = BaseWorker.get_memory_report(worker)
         assert "This process uses" in text
         assert not list(tmp_path.iterdir()), "on-demand reports are not written to files"
+
+
+@pytest.mark.cpu_only
+def test_an_encode_only_llm_reports_its_own_process(monkeypatch):
+    from tensorrt_llm.llmapi.llm import LLM
+
+    monkeypatch.setattr(triggers, "report_now", lambda **kw: f"report ({kw['tag']})")
+    llm = SimpleNamespace(_encode_only=True)
+    assert LLM.get_memory_report(llm) == ["report (on_demand)"]
+
+    monkeypatch.setattr(triggers, "report_now", lambda **kw: None)
+    assert LLM.get_memory_report(llm) == [
+        "rank 0: the report could not be built; see this process's log"
+    ]
+
+
+@pytest.mark.cpu_only
+def test_async_llm_gathers_every_workers_reports():
+    import asyncio
+
+    from tensorrt_llm._torch.async_llm import AsyncLLM
+
+    async def collective_rpc(method):
+        assert method == "get_memory_report"
+        return [["rank 0 report", "rank 1 report"], None, ["", "rank 2 report"]]
+
+    llm = SimpleNamespace(collective_rpc=collective_rpc)
+    reports = asyncio.run(AsyncLLM.get_memory_report(llm))
+    assert reports == ["rank 0 report", "rank 1 report", "rank 2 report"]
 
 
 @pytest.mark.cpu_only
@@ -171,7 +206,11 @@ def test_every_rank_has_an_entry(monkeypatch):
 
     # Under MPI without full mode only rank 0 answers; the rest are named.
     engine = SimpleNamespace(
-        dist=SimpleNamespace(rank=0, world_size=3), _disable_mpi=False, _rank_reporter=None
+        dist=SimpleNamespace(rank=0, world_size=3),
+        _disable_mpi=False,
+        _rank_reporter=None,
+        _memory_monitor_released=False,
+        _memory_monitor_token=None,
     )
     engine.gather_memory_reports = lambda: PyExecutor.gather_memory_reports(engine)
     monkeypatch.setattr(triggers, "report_now", lambda **kw: None)
@@ -187,8 +226,7 @@ def test_every_rank_has_an_entry(monkeypatch):
 
 @needs_gpu
 def test_real_out_of_memory_is_reported_once_it_escapes(monkeypatch, tmp_path):
-    """A real PyTorch OOM through the armed observer, in the default mode."""
-    monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+    """A real PyTorch OOM through the armed observer, in full mode."""
     monkeypatch.setenv(triggers.DIR_VAR, str(tmp_path))
     assert triggers.install_oom_reporter(rank=0)
     try:
@@ -238,6 +276,7 @@ def test_llm_returns_each_workers_report():
     from tensorrt_llm.executor.proxy import _check_collective_rpc_guard
 
     llm = object.__new__(LLM)
+    llm._encode_only = False
     # Rank 0's worker answers for every rank under MPI; Ray workers each
     # answer for themselves. Either way one flat list comes back.
     llm._collective_rpc = MagicMock(return_value=[["rank 0", "rank 1"], None, ["rank 2"]])
@@ -284,6 +323,11 @@ class _FakeComm:
     def isend(self, obj, dest, tag):
         self.send(obj, dest, tag)
         return _Pkl5Request(done=True)
+
+    freed = 0
+
+    def Free(self):
+        self.freed += 1
 
 
 def _ranks(monkeypatch, world, listening):
@@ -380,6 +424,28 @@ def test_a_gather_overlapping_shutdown_returns_at_once(monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_stopping_frees_each_ranks_communicator(monkeypatch):
+    """mpi4py frees no communicator on garbage collection; each LLM would leak one."""
+    reporters, _, _ = _ranks(monkeypatch, 3, {1, 2})
+    comms = [r._comm for r in reporters]
+    for r in reporters:
+        r.stop()
+        r.stop()  # a second stop frees nothing more
+    assert [c.freed for c in comms] == [1, 1, 1]
+
+    # A gather still running when rank 0 stops frees it once it has drained.
+    reporters, _, _ = _ranks(monkeypatch, 2, set())
+    comm = reporters[0]._comm
+    gathering = threading.Thread(target=lambda: reporters[0].gather(timeout=30))
+    gathering.start()
+    time.sleep(0.1)
+    reporters[0].stop()
+    assert comm.freed == 0, "not freed under the running gather"
+    gathering.join(5)
+    assert comm.freed == 1
+
+
+@pytest.mark.cpu_only
 def test_stopping_logs_an_mpi_error_instead_of_raising(monkeypatch):
     from tensorrt_llm._torch.memory.monitor import ranks
 
@@ -396,52 +462,8 @@ def test_stopping_logs_an_mpi_error_instead_of_raising(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_bounded_receive_is_shared_with_the_sleep_wakeup_acks(monkeypatch):
-    from tensorrt_llm._torch.pyexecutor import mpi_polling
-    from tensorrt_llm._torch.pyexecutor import py_executor as pe
-
-    box, lock = {}, threading.Lock()
-    rank0, rank1 = _FakeComm(0, box, lock), _FakeComm(1, box, lock)
-
-    # Rejected messages are received and dropped; the first kept one returns.
-    for message in ("stale", "late", "current"):
-        rank1.send(message, dest=0, tag=7)
-    assert mpi_polling.try_recv(rank0, 1, 7, accept=lambda m: m == "current") == (
-        True,
-        "current",
-    ), "stale messages before the current one are dropped"
-    assert mpi_polling.try_recv(rank0, 1, 7) == (False, None), "nothing left"
-
-    # A deadline already passed raises, naming what was awaited.
-    with pytest.raises(TimeoutError, match="timed out waiting for report from rank 1"):
-        mpi_polling.recv_until(rank0, 1, 7, time.monotonic(), poll_interval_s=0.001, what="report")
-
-    # The lower-case object API is used when present.
-    lower = SimpleNamespace(iprobe=lambda source, tag: True)
-    assert mpi_polling.message_ready(lower, 1, 7), "iprobe is consulted"
-    with pytest.raises(RuntimeError):
-        mpi_polling.message_ready(object(), 1, 7)
-
-    # Sleep/wakeup ACKs for another operation or phase are dropped; the
-    # matching one is returned and the timeout text is unchanged.
-    warnings = []
-    monkeypatch.setattr(pe.logger, "warning", warnings.append)
-    ack = pe._SleepWakeupTag.ACK
-    rank1.send({"op_id": "old", "phase": "sleep"}, dest=0, tag=ack)
-    rank1.send({"op_id": "new", "phase": "prepare"}, dest=0, tag=ack)
-    rank1.send({"op_id": "new", "phase": "sleep", "status": "ok"}, dest=0, tag=ack)
-    got = pe._recv_sleep_wakeup_ack_until(
-        rank0, 1, time.monotonic() + 5, expected_op_id="new", expected_phase="sleep"
-    )
-    assert got["status"] == "ok", "the matching ACK is returned"
-    assert len(warnings) == 2 and all("Ignoring stale sleep/wakeup ACK" in w for w in warnings)
-    with pytest.raises(TimeoutError, match="timed out waiting for sleep/wakeup ACK from rank 1"):
-        pe._recv_sleep_wakeup_ack(rank0, 1, 0.0)
-
-
-@pytest.mark.cpu_only
 def test_nvml_is_initialised_once_per_process(monkeypatch):
-    """Every reading used to open and close its own NVML session."""
+    """Readings share one NVML session per process and one handle per device."""
     import os
 
     from tensorrt_llm._torch.memory.monitor import capability
@@ -474,7 +496,6 @@ def test_nvml_is_initialised_once_per_process(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: SimpleNamespace(uuid="x"))
     for _ in range(5):
         assert capability.nvml_process_usage(0) == (7 * MB, "")
-        assert capability._nvml_available()
     assert calls == {"init": 1, "shutdown": 0, "handle": 1}, "one session, one handle"
 
     def fails(*_args):
@@ -500,5 +521,5 @@ def test_nvml_is_initialised_once_per_process(monkeypatch):
 
     fake.nvmlInit = init_fails
     assert capability.nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
-    assert not capability._nvml_available()
+    assert capability.nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
     assert calls["init"] == 2

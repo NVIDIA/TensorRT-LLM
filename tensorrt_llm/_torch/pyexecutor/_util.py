@@ -50,14 +50,11 @@ from ..attention.backends.sparse.params import \
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
-from ..memory.monitor import startup as _monitor_startup
-from ..memory.monitor.names import REGION_KV_TRANSFER_BUFFERS
-from ..memory.monitor.providers import \
-    register_provider as _monitor_register_provider
-from ..memory.monitor.providers import \
-    unregister_providers_of as _monitor_unregister_providers_of
+from ..memory.monitor import names as monitor_names
+from ..memory.monitor import providers as monitor_providers
+from ..memory.monitor import startup as monitor_startup
 from ..memory.monitor.providers.kv_cache import \
-    KvCacheProvider as _MonitorKvCacheProvider
+    KvCacheProvider as MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..modules.dwdp.dense.manager import DenseDwdpManager
@@ -163,7 +160,8 @@ def _register_kv_cache_monitor_providers(
         if manager is None or any(manager is other for other in seen):
             continue
         seen.append(manager)
-        _monitor_register_provider(_MonitorKvCacheProvider(manager, role))
+        monitor_providers.register_provider(
+            MonitorKvCacheProvider(manager, role))
 
 
 def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
@@ -2168,7 +2166,7 @@ class KvCacheCreator:
         # sizing KV pool, which the final KV cache replaces, so it is taken
         # out of the non-KV peak; the workspace reserves are added to it.
         if py_executor is not None and not self._skip_est:
-            _monitor_startup.record_memory_plan(
+            monitor_startup.record_memory_plan(
                 peak_memory - allocated_bytes + kv_budget_reserves,
                 activation_bytes)
 
@@ -3691,11 +3689,11 @@ class KvCacheCreator:
                 original_max_seq_len)
 
         # Each pool is a separate allocation, usually the largest in the
-        # process, and nothing outside this function has a handle on its
-        # manager, so register them here rather than leaving them to be
-        # rediscovered. A draft model that shares the target's manager is
-        # skipped so the pool is not counted twice. Providers hold the
-        # managers weakly.
+        # process, so the memory monitor is handed the managers here, where
+        # they are built. They are dropped from it before they are shut down
+        # (PyExecutor._shutdown_resource_managers, teardown_managers). A draft
+        # model that shares the target's manager is skipped so the pool is
+        # not counted twice. Providers hold the managers weakly.
         _register_kv_cache_monitor_providers(kv_cache_manager,
                                              draft_kv_cache_manager,
                                              cross_kv_cache_manager)
@@ -3718,7 +3716,8 @@ class KvCacheCreator:
         for manager_type in (ResourceManagerType.KV_CACHE_MANAGER,
                              ResourceManagerType.DRAFT_KV_CACHE_MANAGER,
                              ResourceManagerType.CROSS_KV_CACHE_MANAGER):
-            _monitor_unregister_providers_of(resources.get(manager_type))
+            monitor_providers.unregister_providers_of(
+                resources.get(manager_type))
         compression_manager = resources.pop(
             ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, None)
         if compression_manager is not None:
@@ -4988,7 +4987,8 @@ def create_py_executor_resources(
 
     # Disaggregated serving's KV transfer buffers are allocated in C++ with
     # no size exposed to Python; the memory monitor names them by measuring.
-    with _monitor_startup.region(REGION_KV_TRANSFER_BUFFERS, per_executor=True):
+    with monitor_startup.region(monitor_names.REGION_KV_TRANSFER_BUFFERS,
+                                per_executor=True):
         kv_cache_transceiver = create_kv_cache_transceiver(
             mapping, dist, kv_cache_manager, attention_type,
             cache_transceiver_config, mamba_cache_manager)
