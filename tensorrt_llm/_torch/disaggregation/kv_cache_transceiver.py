@@ -3,7 +3,10 @@
 
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -429,9 +432,50 @@ class KvCacheTransceiver(ABC):
         """
         raise NotImplementedError
 
+    def cancel_gen_logically(
+            self,
+            req: LlmRequest,
+            ready: Optional["torch.cuda.Event"] = None) -> bool:
+        """Accept logical GEN cancellation without authorizing memory release.
+
+        Args:
+            req: Model-idle generation request to cancel.
+            ready: Unpublished destination's outstanding admission fence, if any.
+
+        Returns:
+            Whether cancellation was accepted under a qualified retirement policy.
+            The caller must still use cancel_request to establish safe retirement.
+            Under that policy, the transceiver retains a passed ready fence until
+            cancel_request returns True, even if an earlier failure makes this
+            method return False. Unsupported implementations return False without
+            taking ownership of ready.
+        """
+        return False
+
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
         return False
+
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        """Whether a context send is still waiting for its peer to ask for the data.
+
+        ``respond_and_send_async`` only posts the send; nothing is written until
+        the generation peer requests it, which can be long after the context
+        finished when the peer's request queues behind a full generation batch.
+        Runtimes that can observe that boundary report it here so the transfer
+        timeout measures the transfer rather than the peer's queueing delay.
+        The default keeps the timeout unchanged for runtimes that cannot.
+        """
+        return False
+
+    def context_transfer_peer_ready_time(self,
+                                         req: LlmRequest) -> Optional[float]:
+        """``time.monotonic()`` at which every peer rank had asked for this send.
+
+        The transfer timeout is measured from this moment when it is later than
+        the send itself. None when unknown, which keeps the timeout unchanged.
+        """
+        return None
 
     def supports_idle_request_cancellation(self,
                                            req: Optional[LlmRequest] = None

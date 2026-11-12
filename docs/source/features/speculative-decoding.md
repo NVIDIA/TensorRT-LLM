@@ -4,8 +4,7 @@ Speculative decoding is a technique for accelerating LLM inference at low batch 
 
 ## Quick Start
 
-For all speculation algorithms, when speculation is enabled, a single sequence of draft tokens with length `max_draft_len` is created for every request. There is currently no way to dynamically disable speculation, thus speed ups are only observable at low batch sizes.
-
+The maximum draft length is controlled by `max_draft_len`. EAGLE 3 and single-layer MTP-Eagle (`use_mtp_vanilla=False`) can optionally generate a [dynamic draft tree](#dynamic-tree-mode) with `use_dynamic_tree=True`. For supported linear drafting modes, advanced runtime controls can adjust draft length or disable speculation as the batch size or acceptance rate changes. See [Advanced runtime controls](#advanced-runtime-controls) for supported modes, examples, and current limitations.
 
 ### Draft/Target
 
@@ -52,15 +51,17 @@ EAGLE 3 can be combined with the [Suffix Automaton enhancement](#suffix-automato
 
 #### Dynamic Tree Mode
 
-Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.
+Dynamic tree mode enables tree-structured draft generation for EAGLE 3 and MTP-Eagle, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.
 
-To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingConfig` and provide the following parameters:
+With `MTPDecodingConfig`, dynamic trees require a checkpoint with exactly one MTP layer and `use_mtp_vanilla=False` (MTP-Eagle). Vanilla MTP and multi-layer MTP checkpoints do not support this dynamic-tree path. The MTP-Eagle dynamic-tree path supports greedy decoding only; non-greedy sampling is unsupported.
+
+To enable dynamic tree mode, set `use_dynamic_tree=True` on `Eagle3DecodingConfig` or a supported MTP-Eagle `MTPDecodingConfig` and provide the following parameters:
 
 * `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation.
 * `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
 * `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
 
-When `use_dynamic_tree=True`, the dynamic tree CUDA buffers are pre-allocated based on the `LLM`'s `max_batch_size`, which is propagated internally and must not be passed directly to `Eagle3DecodingConfig`.
+When `use_dynamic_tree=True`, the dynamic tree CUDA buffers are pre-allocated based on the `LLM`'s `max_batch_size`, which is propagated internally and must not be passed directly to the speculative decoding configuration.
 
 ```python
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
@@ -78,6 +79,8 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 
 ```{note}
 Dynamic tree mode is currently **not supported** for models that use sliding window attention or MLA (Multi-Latent Attention), such as DeepSeek and gpt-oss models.
+
+`max_concurrency` and `draft_len_schedule` support linear drafting only. Do not combine either option with `use_dynamic_tree=True`; the combination can fail during startup or CUDA graph warmup.
 ```
 
 ### NGram
@@ -283,6 +286,67 @@ speculative_config = SADecodingConfig(max_draft_len=4)
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
 
+## Advanced runtime controls
+
+### Batch-size-based draft lengths
+
+These batch-size controls are advanced options; `draft_len_schedule` is an **experimental developer interface**. Use them with the mode and configuration restrictions below. `max_concurrency` and `draft_len_schedule` are mutually exclusive: configure one at startup, and the runtime selects the draft length for each scheduled batch.
+
+Dynamic draft lengths are supported for the following linear drafting modes:
+
+| Configuration | Supported execution mode |
+| --- | --- |
+| `MTPDecodingConfig` | One-model MTP and MTP-Eagle |
+| `Eagle3DecodingConfig` | One-model EAGLE 3 |
+| `DraftTargetDecodingConfig` | One-model draft/target |
+| `PARDDecodingConfig`, `DFlashDecodingConfig` | PARD and DFlash |
+| `SADecodingConfig` | Standalone Suffix Automaton (SA) |
+
+Here, one-model execution runs the target and drafter in one engine; it can still load a separate draft checkpoint. These controls do not provide support for legacy two-model execution paths. For EAGLE 3 and MTP, leave `use_dynamic_tree=False`.
+
+Schedule keys are **inclusive upper bounds** on the scheduled batch size, including context and generation requests. The runtime uses the first key greater than or equal to the batch size. Above the largest key, the draft length is zero and speculation is disabled. For example:
+
+```yaml
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model: /path/to/eagle3_model
+  draft_len_schedule:
+    4: 3
+    8: 2
+```
+
+This uses three draft tokens at batch sizes 1–4, two at batch sizes 5–8, and disables speculation at batch size 9 and above. Speculation can resume when the batch size decreases.
+
+Specify an explicit `max_draft_len` and a nonempty schedule. Keys must be positive integers, values must be nonnegative integers no greater than `max_draft_len`, and the smallest key must map exactly to `max_draft_len`. For example, `max_draft_len: 4` with `{8: 2, 32: 1}` is rejected. With CUDA graphs enabled (`cuda_graph_config` is not `None`), setting a schedule automatically enables `cuda_graph_config.enable_padding` and merges its keys into `cuda_graph_config.batch_sizes` for graph coverage.
+
+`max_concurrency=N` is a shortcut for a cutoff: for the supported modes above, it is translated to `draft_len_schedule: {N: max_draft_len}`. There are current limitations to this shortcut:
+
+* Set `max_draft_len` explicitly for MTP. If it is inferred later from the checkpoint, the translation is not repeated and the cutoff is ignored.
+* Rebuilding a translated configuration from serialized arguments loses the private translation marker and raises the mutual-exclusion error. This happens when applying model defaults (including Qwen3-Next, Qwen3.5, DeepSeek-V4, Nemotron-H, and Gemma 4) and when converting `decoding_type: Eagle` to `Eagle3`. Use an explicit `draft_len_schedule` with `max_draft_len`, and use `Eagle3` directly.
+
+For a cutoff at batch size four with three draft tokens, replace the example's schedule with `{4: 3}` and keep `max_concurrency` unset. This avoids the shortcut's translation limitations. For MTP, choose a `max_draft_len` supported by the checkpoint.
+
+Other drafting configurations differ:
+
+* Deprecated NGram honors `max_concurrency`, but its drafter interprets schedule keys as lower bounds instead of the upper bounds described above. Do not use `draft_len_schedule` with NGram.
+* Deprecated user-provided drafting returns the supplied drafter unchanged. Fields on `UserProvidedDecodingConfig` are not forwarded to it; configure a custom `Drafter` directly and account for its schedule semantics.
+* DSpark does not implement these batch-size controls. Do not rely on either field to adjust or disable DSpark drafting.
+
+### Acceptance-rate cutoff
+
+For configurations that support disabling speculation, set both `acceptance_rate_window_size=N` (a positive integer) and `acceptance_rate_threshold` (between 0 and 1) to enable the rolling acceptance-rate cutoff. After at least `N` recorded samples, speculation is disabled permanently for that executor once the average of the latest `N` recorded acceptance ratios falls below the threshold. Unlike the batch-size cutoff, this does not re-enable speculation when conditions improve.
+
+```{warning}
+The cutoff can underestimate acceptance when a batch-size schedule shortens the draft: it can divide the accepted-token count by the larger reserved draft-token count instead of the number actually verified in that iteration. With the schedule above at batch size 5, accepting both verified draft tokens per request can therefore record `2/3`. A window of 1 and a threshold of `0.9` then permanently disable speculation even though every verified draft token was accepted.
+
+Dynamic trees have the same limitation: the recorded denominator can be the total tree-token budget rather than the verified path length. For example, accepting a complete six-token path in a 60-token tree can record `6/60`, causing a threshold above `0.1` to permanently disable speculation.
+
+Leave the acceptance-rate cutoff disabled when using dynamic trees, `draft_len_schedule`, or `max_concurrency` in the current implementation.
+```
+
+The feature is disabled when the window is unset or zero, or the threshold is unset. Model-specific restrictions still apply; for example, Kimi K3 helix rejects these acceptance-rate options.
+
 ## Usage with `trtllm-bench` and `trtllm-serve`
 
 ```{eval-rst}
@@ -296,7 +360,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `MTP`
 * `Eagle3`
 * `NGram` (deprecated; use `SA` instead)
-* `DraftTarget`
+* `Draft_Target`
 * `PARD`
 * `DFlash`
 * `SA`

@@ -32,16 +32,111 @@ def parse_name(classname, name, filename):
         return filename + "::" + name
 
 
-def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
-                             rerun_1_file, rerun_2_file, test_to_line):
-    # Parse results xml and write failed tests to the appropriate rerun files.
-    # Returns a set of all test names that appeared in the xml (ran tests).
+RERUN_POLICY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 os.pardir, "config", "rerun_policy.yml")
+
+
+def _is_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_seconds(value):
+    return isinstance(
+        value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
+# The rerun policy keys and what each accepts. Their values live only in
+# jenkins/config/rerun_policy.yml, whose `default` sets every key and describes
+# each one.
+RERUN_POLICY_KEYS = {
+    "rerun_enabled": lambda value: isinstance(value, bool),
+    "rerun_twice_max_duration_s": _is_seconds,
+    "rerun_once_max_duration_s": _is_seconds,
+    "max_failed_tests": lambda value: value is None or _is_count(value),
+}
+
+
+def _validate_rerun_policy(policy, where):
+    unknown = sorted(set(policy) - set(RERUN_POLICY_KEYS))
+    if unknown:
+        raise ValueError(f"{where}: unknown rerun policy keys {unknown}")
+    for key, value in policy.items():
+        if not RERUN_POLICY_KEYS[key](value):
+            raise ValueError(f"{where}: invalid value {value!r} for {key}")
+
+
+def stage_matches(stage_name, pattern):
+    # Matches like stageMatchesPattern in jenkins/L0_Test.groovy: the exact
+    # name, or a pattern whose `*` matches any run of characters.
+    regex = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(regex, stage_name) is not None
+
+
+def load_rerun_policy(stage_name=None, policy_file=RERUN_POLICY_FILE):
+    """Return (policy, rule) for stage_name from policy_file.
+
+    The policy is the file's `default`, which must set every key, overridden by
+    the first `stages` rule whose `match` matches stage_name. rule is that
+    rule's `match` pattern, or None when no rule matches or stage_name is None.
+    Every rule is validated, not only the one that applies, so a typo fails
+    every stage.
+    """
+    # Imported here so the other subcommands run without PyYAML.
+    import yaml
+
+    with open(policy_file) as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"{policy_file}: expected a mapping at the top level")
+    unknown = sorted(set(config) - {"default", "stages"})
+    if unknown:
+        raise ValueError(f"{policy_file}: unknown top-level keys {unknown}")
+
+    default = config.get("default") or {}
+    if not isinstance(default, dict):
+        raise ValueError(f"{policy_file}: `default` must be a mapping")
+    _validate_rerun_policy(default, f"{policy_file}: default")
+    missing = sorted(set(RERUN_POLICY_KEYS) - set(default))
+    if missing:
+        raise ValueError(f"{policy_file}: default does not set {missing}")
+    policy = dict(default)
+
+    rules = config.get("stages") or []
+    if not isinstance(rules, list):
+        raise ValueError(f"{policy_file}: `stages` must be a list")
+    matched_rule = None
+    for index, rule in enumerate(rules):
+        where = f"{policy_file}: stages[{index}]"
+        if not isinstance(rule, dict):
+            raise ValueError(f"{where} must be a mapping")
+        overrides = dict(rule)
+        pattern = overrides.pop("match", None)
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError(f"{where} needs a non-empty `match`")
+        _validate_rerun_policy(overrides, where)
+        if (stage_name is not None and matched_rule is None
+                and stage_matches(stage_name, pattern)):
+            matched_rule = pattern
+            policy.update(overrides)
+
+    if policy["rerun_twice_max_duration_s"] > policy[
+            "rerun_once_max_duration_s"]:
+        raise ValueError(
+            f"{policy_file}: rerun_twice_max_duration_s is greater than "
+            f"rerun_once_max_duration_s for stage {stage_name}")
+    return policy, matched_rule
+
+
+def _failed_tests_from_xml(xml_filename):
+    # Returns (names of all tests in the results xml, failed or errored tests).
+    # Each failed test is (name, duration in seconds, its <testcase> element).
     ran_tests = set()
+    failed_tests = []
     if not os.path.exists(xml_filename):
         # No results were ever flushed (e.g. the only test in this run was
         # killed before completing) - nothing "ran" as far as this xml goes.
         print(f"No {xml_filename} found, treating as no tests ran")
-        return ran_tests
+        return ran_tests, failed_tests
     tree = ET.parse(xml_filename)
     root = tree.getroot()
     suite_list = root.findall('testsuite')
@@ -53,28 +148,14 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
             ran_tests.add(test_name)
             if case.find('failure') is not None or \
                case.find('error') is not None:
-                duration = float(case.attrib.get('time', 0))
-                if duration <= 5 * 60:
-                    rerun_2_file.write(test_to_line[test_name] + '\n')
-                    print(test_name +
-                          " will rerun 2 times, because duration <= 5 min")
-                elif duration <= 10 * 60:
-                    rerun_1_file.write(test_to_line[test_name] + '\n')
-                    print(test_name +
-                          " will rerun 1 time, because duration <= 10 min")
-                elif any(failSig.lower() in ET.tostring(
-                        case, encoding='unicode').lower()
-                         for failSig in failSignaturesList):
-                    rerun_1_file.write(test_to_line[test_name] + '\n')
-                    print(test_name +
-                          " will rerun 1 time, because of fail signature")
-                else:
-                    rerun_0_file.write(test_to_line[test_name] + '\n')
-                    print(
-                        test_name +
-                        " will not rerun, because duration > 10 min and no failure signature matches"
-                    )
-    return ran_tests
+                failed_tests.append(
+                    (test_name, float(case.attrib.get('time', 0)), case))
+    return ran_tests, failed_tests
+
+
+def _matches_fail_signature(case, failSignaturesList):
+    case_text = ET.tostring(case, encoding='unicode').lower()
+    return any(failSig.lower() in case_text for failSig in failSignaturesList)
 
 
 def extract_passed_tests(output_file, xml_filenames):
@@ -126,19 +207,30 @@ def extract_passed_tests(output_file, xml_filenames):
                     out_file.write(test_name + '\n')
 
 
-def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
-                              test_list_filename, unfinished_test_filename):
-    # Generate rerun test lists:
+def generate_rerun_tests_list(outdir,
+                              xml_filename,
+                              failSignaturesList,
+                              test_list_filename,
+                              unfinished_test_filename,
+                              policy=None):
+    # Generate rerun test lists under policy (the `default` of
+    # jenkins/config/rerun_policy.yml when None):
+    # rerun_2.txt (will rerun 2 times), rerun_1.txt (will rerun 1 time) and
+    # rerun_0.txt (will not rerun).
     # Part 1. Tests that are failed or errored in the test results xml file:
-    #    - If test duration <= 5 min: add to rerun_2.txt (will rerun 2 times)
-    #    - If test duration > 5 min and <= 10 min: add to rerun_1.txt (will rerun 1 time)
-    #    - If test duration > 10 min but contains fail signatures in error message: add to rerun_1.txt
-    #    - If test duration > 10 min and no known failure signatures: add to rerun_0.txt (will not rerun)
-    # Part 2. Tests that are unfinished:
+    #    - If test duration <= rerun_twice_max_duration_s: add to rerun_2.txt
+    #    - If test duration <= rerun_once_max_duration_s: add to rerun_1.txt
+    #    - If longer but contains fail signatures in error message: add to rerun_1.txt
+    #    - If longer and no known failure signatures: add to rerun_0.txt
+    # Part 2. Tests that are unfinished (still running when the pytest process
+    #    ended, e.g. killed by pytest-timeout's thread method, which CI uses):
     #    add to rerun_0.txt (will not rerun)
     # Part 3. Tests that are not run
     #    add to rerun_1.txt (will rerun 1 time)
-    print(failSignaturesList)
+    # Finally, every test goes to rerun_0.txt when reruns are disabled, or when
+    # more than max_failed_tests tests failed or are unfinished.
+    if policy is None:
+        policy, _ = load_rerun_policy()
 
     rerun_0_filename = os.path.join(outdir, 'rerun_0.txt')
     rerun_1_filename = os.path.join(outdir, 'rerun_1.txt')
@@ -162,6 +254,9 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
     # Get tests that terminated unexpectedly from unfinished_test_filename.
     # e.g. unfinished_test_line: "stage_name/test_name1"
     # unfinished_tests: ["test_name1", "test_name2", "test_name3"]
+    # A unittest entry is recorded as its wrapper,
+    # "stage_name/test_unittests.py::test_unittests_v2[unittest/...]", and is
+    # named "unittest/..." in the test list, as parse_name names it.
     unfinished_tests = []
     if unfinished_test_filename and os.path.exists(unfinished_test_filename):
         with open(unfinished_test_filename, 'r') as f:
@@ -170,28 +265,63 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
                 if not line:
                     continue
                 test_name = line.split('/', 1)[1] if '/' in line else line
+                if test_name.startswith("test_unittests.py::"):
+                    test_name = parse_name("", test_name, "test_unittests.py")
                 unfinished_tests.append(test_name)
+
+    twice_max = policy["rerun_twice_max_duration_s"]
+    once_max = policy["rerun_once_max_duration_s"]
+    # (test name, rerun times, reason), in the order the lists are written.
+    decisions = []
+
+    # Part 1: process failed/error tests from results xml
+    ran_tests, failed_tests = _failed_tests_from_xml(xml_filename)
+    for test, duration, case in failed_tests:
+        if duration <= twice_max:
+            decisions.append((test, 2, f"duration <= {twice_max}s"))
+        elif duration <= once_max:
+            decisions.append((test, 1, f"duration <= {once_max}s"))
+        elif _matches_fail_signature(case, failSignaturesList):
+            decisions.append((test, 1, "of fail signature"))
+        else:
+            decisions.append(
+                (test, 0,
+                 f"duration > {once_max}s and no failure signature matches"))
+
+    unfinished_count = 0
+    for test in tests:
+        if test in ran_tests:
+            continue
+        # Part 2: process unfinished tests
+        elif test in unfinished_tests:
+            unfinished_count += 1
+            decisions.append((test, 0, "it terminated unexpectedly"))
+        # Part 3: process tests that did not run
+        else:
+            decisions.append((test, 1, "it did not run"))
+
+    failed_count = len(failed_tests) + unfinished_count
+    max_failed = policy["max_failed_tests"]
+    if not policy["rerun_enabled"]:
+        decisions = [(test, 0, "reruns are disabled for this stage")
+                     for test, _, _ in decisions]
+    elif max_failed is not None and failed_count > max_failed:
+        decisions = [
+            (test, 0, f"{failed_count} tests failed or terminated "
+             f"unexpectedly, more than max_failed_tests ({max_failed})")
+            for test, _, _ in decisions
+        ]
 
     with open(rerun_0_filename, 'w') as rerun_0_file, \
          open(rerun_1_filename, 'w') as rerun_1_file, \
          open(rerun_2_filename, 'w') as rerun_2_file:
-        # Part 1: process failed/error tests from results xml
-        ran_tests = process_xml_failed_tests(xml_filename, failSignaturesList,
-                                             rerun_0_file, rerun_1_file,
-                                             rerun_2_file, test_to_line)
-
-        for test in tests:
-            if test in ran_tests:
-                continue
-            # Part 2: process unfinished tests
-            elif test in unfinished_tests:
-                rerun_0_file.write(test_to_line[test] + '\n')
-                print(test +
-                      " will not rerun because it terminated unexpectedly.")
-            # Part 3: process tests that did not run
+        rerun_files = {0: rerun_0_file, 1: rerun_1_file, 2: rerun_2_file}
+        for test, times, reason in decisions:
+            rerun_files[times].write(test_to_line[test] + '\n')
+            if times == 0:
+                print(f"{test} will not rerun, because {reason}")
             else:
-                rerun_1_file.write(test_to_line[test] + '\n')
-                print(test + " will rerun 1 time, because it did not run")
+                print(f"{test} will rerun {times} time(s), because {reason}")
 
     # Remove empty files
     for filename in [rerun_0_filename, rerun_1_filename, rerun_2_filename]:
@@ -602,11 +732,28 @@ if __name__ == '__main__':
                             required=False,
                             default=None,
                             help='File containing unfinished tests')
+        parser.add_argument(
+            '--stage-name',
+            required=False,
+            default=None,
+            help='Stage whose rule in the rerun policy applies; without '
+            'it, the policy\'s default applies')
+        parser.add_argument('--rerun-policy',
+                            required=False,
+                            default=RERUN_POLICY_FILE,
+                            help='Rerun policy file')
         args = parser.parse_args(sys.argv[2:])
         failSignaturesList = args.fail_signatures.split(',')
-        generate_rerun_tests_list(args.output_dir, args.input_file,
-                                  failSignaturesList, args.test_list,
-                                  args.unfinished_test_file)
+        policy, rule = load_rerun_policy(args.stage_name, args.rerun_policy)
+        source = f"stage rule '{rule}'" if rule else "default"
+        print(f"Rerun policy for {args.stage_name or 'unnamed stage'} "
+              f"({source}): {policy}")
+        generate_rerun_tests_list(args.output_dir,
+                                  args.input_file,
+                                  failSignaturesList,
+                                  args.test_list,
+                                  args.unfinished_test_file,
+                                  policy=policy)
 
     elif (sys.argv[1] == "merge_junit_xmls"):
         parser = argparse.ArgumentParser()
