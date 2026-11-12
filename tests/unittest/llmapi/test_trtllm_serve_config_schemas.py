@@ -538,6 +538,31 @@ def test_visual_gen_linear_steps_require_quant_and_reject_lora(schemas, quant, l
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize("steps", [[], [0]], ids=["no-step-exclusion", "step-exclusion"])
+@pytest.mark.parametrize(
+    ("group_config", "valid_with_steps"),
+    [
+        pytest.param({}, False, id="missing-weights"),
+        pytest.param({"weights": {}}, False, id="missing-dynamic"),
+        pytest.param({"weights": {"dynamic": False}}, False, id="static-weights"),
+        pytest.param({"weights": {"dynamic": True}}, True, id="dynamic-weights"),
+    ],
+)
+def test_visual_gen_grouped_linear_steps_require_dynamic_weights(
+    schemas: dict[str, dict], group_config: dict, valid_with_steps: bool, steps: list[int]
+) -> None:
+    config = {
+        "quant_config": {
+            "quant_algo": "FP8",
+            "dynamic": True,
+            "config_groups": {"group_0": group_config},
+            "ignored_steps": steps,
+        }
+    }
+    errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
+    assert (not errors) == (not steps or valid_with_steps), [error.message for error in errors]
+
+
 def _tagged_unions(node: object):
     if isinstance(node, dict):
         if "discriminator" in node:

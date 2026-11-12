@@ -427,6 +427,23 @@ def generate_visual_gen_schema() -> dict:
                             {
                                 "if": {"properties": {"config_groups": {"maxProperties": 0}}},
                                 "then": {"properties": {"dynamic": {"const": True}}},
+                                "else": {
+                                    "properties": {
+                                        "config_groups": {
+                                            "additionalProperties": {
+                                                "type": "object",
+                                                "required": ["weights"],
+                                                "properties": {
+                                                    "weights": {
+                                                        "type": "object",
+                                                        "required": ["dynamic"],
+                                                        "properties": {"dynamic": {"const": True}},
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    }
+                                },
                             }
                         ],
                     },
