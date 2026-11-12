@@ -27,6 +27,9 @@ class PythonRequestInputs:
     multimodal_data: dict[str, Any] | None = None
     scheduling_params: SchedulingParams | None = None
     num_logprobs: int | None = 0
+    context_logits_explicit: bool = True
+    prompt_logprobs: int | None = None
+    prompt_logprobs_simple_format: bool = False
     disaggregated_params: DisaggregatedParams | None = None
     lora_path: str | None = None
     lora_ckpt_source: str | None = None
@@ -38,6 +41,7 @@ class PythonRequestInputs:
     conversation_params: ConversationParams | None = None
     uncached_prefill_tokens: int | None = None
     kv_hints: KvHintsSnapshot | None = None
+    watermarking: bool | None = None
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":
@@ -51,6 +55,11 @@ class PythonRequestInputs:
             multimodal_data=getattr(request, "py_multimodal_data", None),
             scheduling_params=getattr(request, "py_scheduling_params", None),
             num_logprobs=getattr(request, "py_num_logprobs", 0),
+            context_logits_explicit=getattr(request, "py_context_logits_explicit", True),
+            prompt_logprobs=getattr(request, "py_prompt_logprobs", None),
+            prompt_logprobs_simple_format=getattr(
+                request, "py_prompt_logprobs_simple_format", False
+            ),
             disaggregated_params=getattr(request, "py_disaggregated_params", None),
             lora_path=getattr(request, "py_lora_path", None),
             lora_ckpt_source=getattr(request, "py_lora_ckpt_source", None),
@@ -62,6 +71,7 @@ class PythonRequestInputs:
             conversation_params=getattr(request, "py_conversation_params", None),
             uncached_prefill_tokens=getattr(request, "py_uncached_prefill_tokens", None),
             kv_hints=getattr(request, "py_kv_hints", None),
+            watermarking=getattr(request, "py_watermarking", None),
         )
 
 
