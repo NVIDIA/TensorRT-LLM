@@ -1138,6 +1138,64 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         ]
         return int(layer_id), DeepseekV4AttentionType.COMPRESS.role
 
+    def _decode_mixed_precision_window(self, request_id: int, start: int, end: int) -> None:
+        """Decode the whole compressed rows of tokens `[start, end)` from the NVFP4 COMPRESS pool
+        into the FP8 high rows, as the read decodes them."""
+        from ..dsa.backend import (
+            _NVFP4_MAX_BLOCK_SCALE,
+            _NVFP4_MAX_VALUE,
+            _get_nvfp4_mla_kv_cache_amax,
+        )
+
+        amax = _get_nvfp4_mla_kv_cache_amax()
+        scale = torch.full((1,), amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE), device="cuda")
+        row_bytes = (self.head_dim + self.nvfp4_residual_dim) // 2
+        layers = list(self.mixed_precision_high_layers.items())
+        tables = torch.full(
+            (len(layers), 2, self.max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+        for index, (local, high_layer) in enumerate(layers):
+            compress_layer, role = self._mixed_precision_layer_page(local)
+            self._fill_page_table(compress_layer, [request_id], tables[index, :1].numpy(), role)
+            self._fill_page_table(high_layer, [request_id], tables[index, 1:].numpy())
+        tables = tables.cuda(non_blocking=True).long()
+        for index, (local, _) in enumerate(layers):
+            layer_idx = self.pp_layers[local]
+            ratio = self._compress_ratios[layer_idx]
+            if end // ratio <= start // ratio:
+                continue
+            rows = torch.arange(start // ratio, end // ratio, device="cuda")
+            rows_per_page = self.compressed_block_sizes[layer_idx]
+            pages = rows // rows_per_page
+            data_pool, scale_pool = self.get_compress_pool_buffers(ratio)
+            # Pool rows as deepseek_v4_local_to_global_indices computes them.
+            layer_rows = (
+                self.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
+                - self.compress_pool_ptrs[ratio]
+            ) // row_bytes
+            pool_rows = layer_rows + tables[index, 0][pages] * rows_per_page + rows % rows_per_page
+            decoded = torch.empty(
+                (end // ratio - start // ratio, 1, self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device="cuda",
+            )
+            # The gather rewrites its index tensor in place, so it gets a temporary one.
+            torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+                data_pool,
+                scale_pool,
+                pool_rows.to(torch.int32).view(-1, 1),
+                decoded,
+                scale,
+                self.nvfp4_residual_dim,
+                data_pool.numel() // row_bytes,
+            )
+            high = self._get_mixed_precision_buffers(local, "NHD", "high")
+            high = high.view(high.shape[0], rows_per_page, -1)
+            high[tables[index, 1][pages], rows % rows_per_page] = decoded.view(len(rows), -1)
+
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
         Add DeepSeek-V4 layers and warmup constraints to the cache config.

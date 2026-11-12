@@ -6,7 +6,7 @@
 import contextlib
 import functools
 import os
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, NamedTuple, Protocol
 
@@ -69,15 +69,11 @@ _BREAK_GRAPH_NUM_CONTEXTS = (1, 2)
 def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
     is_multimodal_decode_compatible: Callable[[LlmRequest], bool] | None = None,
-    restoring_request_ids: Collection[int] = (),
 ) -> tuple[ScheduledRequests, frozenset[int]]:
     """Build a decode-shaped graph candidate for final one-token contexts.
 
     Multimodal rows remain fail-closed unless the engine proves that their one
     remaining prompt token is representable by the existing decode provider.
-    A request in ``restoring_request_ids`` stays a context row: its first forward
-    fills its fresh high-precision last-N pages from the low-precision pool, and
-    only the context path does that.
     """
     if scheduled_requests.num_context_requests == 0:
         return scheduled_requests, frozenset()
@@ -97,7 +93,6 @@ def _make_single_token_context_graph_batch(
             or request.is_generation_only_request
             or request.py_disaggregated_params is not None
             or request.py_mm_encoder_event is not None
-            or request.py_request_id in restoring_request_ids
             or (
                 request.py_multimodal_data is not None
                 and (
@@ -465,9 +460,7 @@ class DecoderCudaGraphs:
         ):
             return scheduled_requests, frozenset()
         return _make_single_token_context_graph_batch(
-            scheduled_requests,
-            self._is_final_multimodal_context_decode_compatible,
-            getattr(kv_cache_manager, "mixed_precision_restore_requests", ()),
+            scheduled_requests, self._is_final_multimodal_context_decode_compatible
         )
 
     def _is_final_multimodal_context_decode_compatible(self, request: LlmRequest) -> bool:

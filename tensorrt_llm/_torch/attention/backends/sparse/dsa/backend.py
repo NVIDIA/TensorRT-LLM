@@ -25,7 +25,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..mixed_precision_high_rows import (
     mixed_precision_high_row_indices,
     overlay_mixed_precision_high_rows,
-    restore_mixed_precision_high_rows,
 )
 from ..offload_kernels import gather_sparse_batch_rows, merge_sparse_arena_indices
 from .indexer import (
@@ -198,8 +197,6 @@ class DSATrtllmAttention(TrtllmAttention):
             return self._sparse_offload_arena_indices(topk_indices, metadata, forward_args), None
 
         local_layer_idx = self.get_local_layer_idx(metadata)
-        if not is_generation and metadata.mixed_precision_high_restore is not None:
-            self._restore_mixed_precision_high_rows(metadata, local_layer_idx)
         kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4 and not is_generation:
             metadata._ensure_pool_view_cached()
@@ -322,42 +319,6 @@ class DSATrtllmAttention(TrtllmAttention):
                 f"No DSA read path for mixed-precision high rows with a {kv_cache_dtype} pool"
             )
         return topk_indices_global, None
-
-    def _restore_mixed_precision_high_rows(
-        self, metadata: DSAtrtllmAttentionMetadata, local_layer_idx: int
-    ) -> None:
-        """Fill fresh last-N high rows from the NVFP4 pool, decoded as the sparse read decodes them."""
-        requests, positions = metadata.mixed_precision_high_restore
-        manager = metadata.kv_cache_manager
-        metadata._ensure_pool_view_cached()
-        page_index_scale, layer_offset = manager.get_primary_pool_page_index_params(local_layer_idx)
-        tokens_per_block = metadata._cached_tokens_per_block
-        pool_rows = torch.ops.trtllm.convert_req_index_to_global(
-            requests,
-            metadata._cached_block_table_ctx,
-            positions.view(-1, 1),
-            tokens_per_block,
-            1,
-            page_index_scale * tokens_per_block,
-            layer_offset,
-        )
-        rows = torch.empty(
-            (positions.numel(), 1, manager.head_dim),
-            dtype=torch.float8_e4m3fn,
-            device=positions.device,
-        )
-        torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
-            metadata.host_kv_cache_pool_pointers,
-            metadata.host_kv_cache_pool_mapping,
-            pool_rows,
-            rows,
-            torch.empty_like(pool_rows),
-            self._nvfp4_mla_kv_scale_quant_orig,
-            local_layer_idx,
-            manager.mla_kv_cache_residual_dim,
-            metadata._cached_num_pool_tokens,
-        )
-        restore_mixed_precision_high_rows(self, metadata, rows, requests, positions)
 
     def _sparse_offload_arena_indices(
         self,

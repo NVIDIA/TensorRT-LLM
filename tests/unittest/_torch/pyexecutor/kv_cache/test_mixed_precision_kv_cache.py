@@ -261,8 +261,8 @@ def test_native_common_reuse_and_window_retention(make_manager, policy, reused_t
 
 
 def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
-    """A prefix whose high-precision last-N pages were evicted is reused in full; the first
-    forward restores those pages from the low-precision history."""
+    """A prefix whose high-precision last-N pages were evicted is reused in full; resuming the
+    cache decodes those pages from the low-precision history."""
     manager = make_manager(config=mixed_config(mixed_precision_reuse_last_n_from_low=True))
     block = manager.tokens_per_block
     staging = MixedPrecisionKVStaging(
@@ -287,29 +287,22 @@ def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
     reader = _request(2, tokens[:512] + [9999])
     assert manager.prepare_context(reader)
     assert manager.kv_cache_map[2].num_committed_tokens == 512
-    assert manager.mixed_precision_restore_requests == {2}
     # Suspended before its first forward, the cache resumes without selecting again.
     manager.kv_cache_map[2].suspend()
-    assert manager.prepare_context(reader)
-    assert manager.mixed_precision_restore_requests == {2}
-    assert manager.resize_context(reader, 1)
+    assert manager.prepare_context(reader) and manager.resize_context(reader, 1)
     low_pages, high_pages = (table[0] for table in manager.get_mixed_precision_page_tables([2], 0))
     # The sink page was claimed with the prefix, pages 1 and 2 left the window, 3 is fresh.
     assert high_pages[0] >= 0 and high_pages[1:3] == [kv.BAD_PAGE_INDEX] * 2
     assert high_pages[3] >= 0
-    high[high_pages[3]] = 1000  # stands in for whatever a fresh page holds
     low_before = low[low_pages].clone()
     pool.zero_()
 
     staging.update([2], [512], [1], capture_graph=False)
-    assert not manager.mixed_precision_restore_requests
     staging.convert(0)
-    # The sink keeps its high-precision values. Page 3 holds the same low-precision values as
-    # the evicted pages 1 and 2, and its fresh high page now stores them.
-    assert torch.equal(pool[0], page_values)
+    # The sink keeps its high-precision values. Pages 1 and 2 decode from the low pool, and the
+    # resume left that same decoded window in the fresh high page 3.
+    assert torch.equal(pool[0], page_values) and torch.equal(high[high_pages[0]], page_values)
     assert torch.equal(pool[3], pool[1]) and not torch.equal(pool[3], page_values)
-    assert torch.equal(high[high_pages[3]], pool[3])
-    assert torch.equal(high[high_pages[0]], page_values)
     assert torch.equal(low[low_pages], low_before)
     manager.free_resources(reader)
 
@@ -318,8 +311,8 @@ def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
 @pytest.mark.parametrize("window", ["mixed_dtype", "cold_page"])
 def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
     """A prefix whose high-precision last-N pages were evicted is reused in full, or with
-    recompute only up to the block boundary before them. The cold-page window copies the window
-    from the layer's own pages at resume; the mixed dtype decodes it in the first forward."""
+    recompute only up to the block boundary before them. The resume restores the window: the
+    cold-page window copies the layer's own pages, checked here."""
     options = dict(
         mixed_precision_reuse_last_n_from_low=True, mixed_precision_recompute_last_n=recompute
     )
@@ -345,10 +338,7 @@ def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
     reader = _request(2, tokens[:512] + [9999])
     assert manager.prepare_context(reader)
     assert manager.kv_cache_map[2].num_committed_tokens == reused
-    if window == "mixed_dtype":
-        assert manager.mixed_precision_restore_requests == {2}
-    else:
-        assert not manager.mixed_precision_restore_requests
+    if window == "cold_page":
         torch.cuda.synchronize()
         pages = torch.full((2, 1, 8), -1, dtype=torch.int32)
         manager.fill_mixed_precision_page_tables([2], 0, pages.numpy())
@@ -381,7 +371,6 @@ def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
     # The target backed off from 512 to 384; the draft takes 384 too.
     reader = _request(2, tokens[:512] + [9999])
     assert draft.prepare_context_cache(reader, 384) == 384
-    assert draft.mixed_precision_restore_requests == {2}
     draft.free_resources(reader)
 
 
@@ -1089,6 +1078,96 @@ def test_reuse_last_n_from_low_on_sparse_managers(high_dtype):
         manager.shutdown()
 
 
+def _nvfp4_pool(num_pool_tokens, row_width):
+    """NVFP4 data and scale pools whose rows all decode differently."""
+    codes = torch.arange(1, num_pool_tokens + 1, dtype=torch.uint8, device="cuda")
+    data_pool = (codes | (codes << 4))[:, None].expand(-1, row_width // 2).contiguous()
+    scale_pool = torch.full(
+        (num_pool_tokens, row_width // 16), 2.0, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    return data_pool, scale_pool
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="NVFP4 MLA gather requires Blackwell",
+)
+@pytest.mark.parametrize(
+    "backend,residual_dim", [("dsa", 64), ("deepseek_v4", 0), ("deepseek_v4", 64)]
+)
+def test_sparse_managers_decode_the_window_from_the_nvfp4_pool(backend, residual_dim):
+    """A sparse manager decodes a fresh window from its NVFP4 pool into the FP8 high rows as the
+    read decodes it; a compressed row needs all of its tokens, and other high rows stay."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import (
+        _get_nvfp4_mla_kv_cache_amax,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+
+    head_dim = 576 if backend == "dsa" else 512
+    row_bytes = (head_dim + residual_dim) // 2
+    data_pool, scale_pool = _nvfp4_pool(12, head_dim + residual_dim)
+    pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    pointers[0, 0] = torch.tensor([data_pool.data_ptr(), scale_pool.data_ptr()])
+    # Two rows a page: DSA rows are tokens, DeepSeek-V4 rows compress 4 tokens of 8-token blocks.
+    # The request's own pages are 2, 0, 3 and its high pages 0, 2, 3 (page 0 holds its sink).
+    own_pages, high_pages, high_layer = [2, 0, 3], [0, 2, 3], 1
+    high = torch.full((4, 1, 2, 1, head_dim), 448.0, dtype=torch.float8_e4m3fn, device="cuda")
+
+    def fill(layer, request_ids, out, role=None):
+        out[0, :3] = high_pages if layer == high_layer else own_pages
+
+    manager = SimpleNamespace(
+        tokens_per_block=2 if backend == "dsa" else 8,
+        max_blocks_per_seq=3,
+        head_dim=head_dim,
+        mla_kv_cache_residual_dim=residual_dim,
+        nvfp4_residual_dim=residual_dim,
+        mixed_precision_high_layers={0: high_layer},
+        _fill_page_table=fill,
+        _get_mixed_precision_buffers=lambda *args: high,
+        get_pool_block_indices=lambda *args, **kwargs: torch.tensor([own_pages]),
+        get_primary_pool_page_index_params=lambda layer: (1, 0),
+        get_unique_primary_pool=lambda: torch.empty(6, 1),
+        kv_cache_pool_pointers=pointers,
+        kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
+        pp_layers=[0],
+        _compress_ratios={0: 4},
+        compressed_block_sizes={0: 2},
+        _mixed_precision_layer_page=lambda local: (5, None),
+        get_compress_pool_buffers=lambda ratio: (data_pool, scale_pool),
+        # This DeepSeek-V4 layer's rows start 2 rows into its ratio's pool.
+        get_buffers=lambda *args: SimpleNamespace(data_ptr=lambda: 4096 + 2 * row_bytes),
+        compress_pool_ptrs={4: 4096},
+    )
+    if backend == "dsa":
+        DSACacheManagerV2._decode_mixed_precision_window(manager, 7, 2, 5)
+        # Tokens 2, 3 -> pool rows 0, 1; token 4 -> pool row 6.
+        pool_rows = [0, 1, 6]
+    else:
+        # Tokens 8-21 cover the whole compressed rows 2-4.
+        DeepseekV4CacheManager._decode_mixed_precision_window(manager, 7, 8, 22)
+        # Rows 2, 3 -> pool rows 2, 3; row 4 -> pool row 2 + 3 * 2 = 8.
+        pool_rows = [2, 3, 8]
+    scale = torch.tensor([_get_nvfp4_mla_kv_cache_amax() / (448.0 * 6.0)], device="cuda")
+    read = torch.empty((3, 1, head_dim), dtype=torch.float8_e4m3fn, device="cuda")
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        data_pool,
+        scale_pool,
+        torch.tensor(pool_rows, dtype=torch.int32, device="cuda").view(-1, 1),
+        read,
+        scale,
+        residual_dim,
+        data_pool.shape[0],
+    )
+    # Rows 2, 3 sit in high page 2 and row 4 in high page 3; the rest keep the sentinel.
+    expected = torch.full_like(high, 448.0).view(torch.uint8)
+    expected[[2, 2, 3], 0, [0, 1, 0]] = read.view(torch.uint8)
+    assert torch.equal(high.view(torch.uint8), expected)
+
+
 def test_deepseek_v4_cold_page_window_high_layers_share_the_compress_pools():
     """With the cold-page window a DeepSeek-V4 high layer copies its COMPRESS page into that
     ratio's pool, where the backend reads it by row."""
@@ -1252,7 +1331,7 @@ def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
         cache = SimpleNamespace(
             num_committed_tokens=cached[1], cuda_stream=torch.cuda.current_stream().cuda_stream
         )
-        manager._copy_cold_page_window(1, cache)
+        manager._restore_last_n_window(1, cache)
         torch.cuda.synchronize()
         for layer_idx, ratio in ((1, 4), (2, 128)):
             own = manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).view(torch.uint8)

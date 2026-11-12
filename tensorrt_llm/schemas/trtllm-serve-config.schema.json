@@ -3417,7 +3417,7 @@
         },
         "mixed_precision_reuse_last_n_from_low": {
           "default": false,
-          "description": "Mixed-precision KV and the cold-page first/last-N window: reuse a cached prefix in full even when the high-precision copy of its last N tokens was evicted. The first forward then restores that copy from the history (the low-precision pool, or with the cold-page window the layer's own pages), so those tokens keep the history's precision. When False (default), reuse stops where the high-precision copy is still complete and the rest is recomputed.",
+          "description": "Mixed-precision KV and the cold-page first/last-N window: reuse a cached prefix in full even when the high-precision copy of its last N tokens was evicted. Resuming the cache then restores that copy from the history (the low-precision pool, or with the cold-page window the layer's own pages), so those tokens keep the history's precision. When False (default), reuse stops where the high-precision copy is still complete and the rest is recomputed.",
           "status": "prototype",
           "title": "Mixed Precision Reuse Last N From Low",
           "type": "boolean"

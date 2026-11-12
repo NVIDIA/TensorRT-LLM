@@ -83,9 +83,6 @@ class MixedPrecisionKVStaging:
         self.kv_cache_pool_mapping = torch.zeros((max(self.pools) + 1, 2), dtype=torch.int32)
         self.page_counts: List[int] = []
         self.page_tables: Dict[int, torch.Tensor] = {}
-        # Table owner -> (read tables, restore tables, restore spans, capacity) for a batch
-        # whose requests restore fresh last-N pages from the low pool.
-        self.restores: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = {}
         self.lengths: Optional[torch.Tensor] = None
         self.max_new_tokens_per_request = 0
         self.read_capacity = 0
@@ -113,10 +110,7 @@ class MixedPrecisionKVStaging:
             self.page_counts.append(min(pages, self.max_blocks_per_seq))
         batch = len(lengths)
         max_pages = -(-self.max_seq_len // self.block_size)
-        # Context forwards, the only ones that restore, never run in a captured graph.
-        restore_spans = manager.take_mixed_precision_restore_spans(request_ids, cached_lengths)
         self.page_tables = {}
-        self.restores = {}
         for layer_idx in self.pools:
             owner = self.table_owner[layer_idx]
             if owner in self.page_tables:
@@ -126,8 +120,6 @@ class MixedPrecisionKVStaging:
                 (2, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )
             manager.fill_mixed_precision_page_tables(request_ids, owner, tables.numpy())
-            if restore_spans:
-                self._prepare_restore(owner, tables, restore_spans)
             self.page_tables[layer_idx] = buffers.get_buffer(
                 (2, self.rows, max_pages),
                 torch.int32,
@@ -151,29 +143,6 @@ class MixedPrecisionKVStaging:
             self.max_blocks_per_seq if capture_graph else max(self.page_counts, default=0)
         ) * self.tokens_per_block
 
-    def _prepare_restore(
-        self, owner: int, tables: torch.Tensor, restore_spans: Sequence[Tuple[int, int, int]]
-    ) -> None:
-        """Plan restoring `restore_spans`, (batch row, first token, end token) each: the read
-        decodes those tokens from the low pool instead of their fresh high pages, and a second pass
-        copies them to the high pages."""
-        read, restore = tables.clone(), tables.clone()
-        # The low pool already holds these tokens.
-        restore[0] = -1
-        spans = torch.zeros((2, tables.shape[1]), dtype=torch.int32)
-        for row, start, end in restore_spans:
-            if start < end:
-                read[1, row, start // self.block_size :] = -1
-                spans[0, row], spans[1, row] = start, end
-        capacity = int((spans[1] - spans[0]).max())
-        if capacity > 0:
-            self.restores[owner] = (
-                read.cuda(non_blocking=True),
-                restore.cuda(non_blocking=True),
-                spans.cuda(non_blocking=True),
-                capacity,
-            )
-
     def convert(self, layer_idx: int, *, writeback: bool = False) -> None:
         """Gather both pools into staging, or write the new tokens back to them."""
         from ...attention.kernels.blackwell.mixed_precision_kv import convert_mixed_precision_kv
@@ -182,32 +151,17 @@ class MixedPrecisionKVStaging:
         # The kernel derives each request's staging span from the page count it
         # is handed, so pass only the rows of this batch.
         staging = staging[: len(self.page_counts) * self.max_blocks_per_seq]
-        restore = None if writeback else self.restores.get(self.table_owner[layer_idx])
         convert_mixed_precision_kv(
             writeback,
             self.max_new_tokens_per_request if writeback else self.read_capacity,
             staging,
             low,
             high,
-            self.page_tables[layer_idx] if restore is None else restore[0],
+            self.page_tables[layer_idx],
             self.lengths,
             self.layout,
             low_dtype=self.mixed_precision_low_dtype,
         )
-        if restore is not None:
-            # Copy the tokens just decoded from the low pool into the fresh high pages.
-            _, tables, spans, capacity = restore
-            convert_mixed_precision_kv(
-                True,
-                capacity,
-                staging,
-                low,
-                high,
-                tables,
-                spans,
-                self.layout,
-                low_dtype=self.mixed_precision_low_dtype,
-            )
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:
         """Return the staging cache of ``layer_idx`` in the requested layout."""

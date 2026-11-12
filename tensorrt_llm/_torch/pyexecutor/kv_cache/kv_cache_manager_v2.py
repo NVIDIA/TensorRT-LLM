@@ -1999,8 +1999,6 @@ class KVCacheManagerV2(BaseResourceManager):
     _own_pool_is_mixed_precision_low = False
     mixed_precision_reuse_last_n_from_low = False
     mixed_precision_recompute_last_n = False
-    # Requests whose next forward restores their fresh last-N high pages from the low pool.
-    mixed_precision_restore_requests: set[int] = set()
     # Requests whose cache made its one reuse-group selection, at its first resume.
     _mixed_precision_selected: set[int] = set()
     # Read by KvCacheCreator: a subclass that overrides the context
@@ -4683,7 +4681,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # this value so the profiling run allocates it at its final size.
         self.mixed_precision_max_seq_len = max_seq_len
         self._shared_kv_layers: set[int] = set()
-        self.mixed_precision_restore_requests: set[int] = set()
         self._mixed_precision_selected: set[int] = set()
         # Tests pass plain config stand-ins that predate the mixed-precision fields.
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
@@ -5887,22 +5884,19 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self._resume_and_restore(req.py_request_id, kv_cache, selected):
             return False
         self._mixed_precision_selected.add(req.py_request_id)
-        # Restore the fresh last-N pages from the history: the cold-page window copies them now,
-        # the mixed dtype decodes them in the first forward. A disaggregated generation request
-        # receives them from the context worker instead.
+        # The prefix came without some last-N pages: restore them from the history now. A
+        # disaggregated generation request receives them from the context worker instead.
         if (
             len(selected) < len(windows)
             and kv_cache.num_committed_tokens > 0
             and not req.is_disagg_generation_init_state
         ):
-            if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
-                self._copy_cold_page_window(req.py_request_id, kv_cache)
-            else:
-                self.mixed_precision_restore_requests.add(req.py_request_id)
+            self._restore_last_n_window(req.py_request_id, kv_cache)
         return True
 
-    def _fresh_window_span(self, request_id: int, end: int) -> tuple[int, int]:
-        """`(first token, end)`: the cached tokens a request holds in fresh last-N high pages."""
+    def _restore_last_n_window(self, request_id: int, kv_cache: _KVCache) -> None:
+        """Fill the fresh last-N high pages of a resumed prefix from its history, on the cache's
+        stream after the resume's own copies, as ordinary reuse readies its pages."""
         table = np.full((1, self.max_blocks_per_seq), -1, dtype=np.int32)
         # Every high layer holds the same pages, so one table serves them all.
         high_layer = next(iter(self.mixed_precision_high_layers.values()))
@@ -5910,50 +5904,76 @@ class KVCacheManagerV2(BaseResourceManager):
         # The sink pages came with the prefix; every later page the request holds is fresh.
         sinks = -(-self.first_n // self.tokens_per_block)
         fresh = np.flatnonzero(table[0, sinks:] >= 0)
-        return min((sinks + int(fresh[0])) * self.tokens_per_block, end) if fresh.size else end, end
-
-    def _copy_cold_page_window(self, request_id: int, kv_cache: _KVCache) -> None:
-        """Cold-page window: copy the fresh last-N high pages of a resumed prefix from the pages
-        they mirror, which share their pool and page layout (checked at init)."""
-        start, end = self._fresh_window_span(request_id, kv_cache.num_committed_tokens)
-        if start == end:
+        end = kv_cache.num_committed_tokens
+        start = (sinks + int(fresh[0])) * self.tokens_per_block if fresh.size else end
+        if start >= end:
             return
-        pages = slice(start // self.tokens_per_block, -(-end // self.tokens_per_block))
-        table = np.full((1, self.max_blocks_per_seq), -1, dtype=np.int32)
-        # After the resume's own copies, which run on the cache's stream.
         with torch.cuda.stream(torch.cuda.ExternalStream(kv_cache.cuda_stream)):
-            for local, high_layer in self.mixed_precision_high_layers.items():
-                high = self._get_mixed_precision_buffers(local, "NHD", "high")
-                source_layer, role = self._mixed_precision_layer_page(local)
-                address = self.impl.get_mem_pool_base_address(
-                    source_layer, role, PageIndexMode.SHARED
-                )
-                source = convert_to_torch_tensor(
-                    TensorWrapper(address, self.mixed_precision_high_dtype, list(high.shape))
-                )
-                self._fill_page_table(source_layer, [request_id], table, role)
-                source_pages = torch.from_numpy(table[0, pages].astype(np.int64)).to(high.device)
-                self._fill_page_table(high_layer, [request_id], table)
-                high_pages = torch.from_numpy(table[0, pages].astype(np.int64)).to(high.device)
-                high[high_pages] = source[source_pages]
+            if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
+                self._copy_cold_page_window(request_id, start, end)
+            else:
+                self._decode_mixed_precision_window(request_id, start, end)
 
-    def take_mixed_precision_restore_spans(
-        self, request_ids: Sequence[int], cached_lengths: Sequence[int]
-    ) -> list[tuple[int, int, int]]:
-        """`(batch row, first token, end token)` of each request in `request_ids` whose forward
-        restores its fresh last-N high pages: its cached tokens `[first token, end token)`. Each
-        request is taken once."""
-        pending = self.mixed_precision_restore_requests
-        if not pending:
-            return []
-        rows = [row for row, request_id in enumerate(request_ids) if request_id in pending]
-        if not rows:
-            return []
-        pending.difference_update(request_ids[row] for row in rows)
-        return [
-            (row, *self._fresh_window_span(request_ids[row], int(cached_lengths[row])))
-            for row in rows
-        ]
+    def _copy_cold_page_window(self, request_id: int, start: int, end: int) -> None:
+        """Cold-page window: copy the high pages of tokens `[start, end)` from the pages they
+        mirror, which share their pool and page layout (checked at init)."""
+        pages = slice(start // self.tokens_per_block, -(-end // self.tokens_per_block))
+        layers = list(self.mixed_precision_high_layers.items())
+        tables = torch.full(
+            (len(layers), 2, self.max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+        for index, (local, high_layer) in enumerate(layers):
+            source_layer, role = self._mixed_precision_layer_page(local)
+            self._fill_page_table(source_layer, [request_id], tables[index, :1].numpy(), role)
+            self._fill_page_table(high_layer, [request_id], tables[index, 1:].numpy())
+        tables = tables.cuda(non_blocking=True)[:, :, pages].long()
+        for index, (local, _) in enumerate(layers):
+            high = self._get_mixed_precision_buffers(local, "NHD", "high")
+            source_layer, role = self._mixed_precision_layer_page(local)
+            address = self.impl.get_mem_pool_base_address(source_layer, role, PageIndexMode.SHARED)
+            source = convert_to_torch_tensor(
+                TensorWrapper(address, self.mixed_precision_high_dtype, list(high.shape))
+            )
+            high[tables[index, 1]] = source[tables[index, 0]]
+
+    def _decode_mixed_precision_window(self, request_id: int, start: int, end: int) -> None:
+        """Mixed dtype: decode the low pool of the pages holding tokens `[start, end)` into their
+        high pages. Whole pages: both pools lay a page out alike, so the decode needs no attention
+        layout, and the tokens past `end` are written before they are read."""
+        from ...attention.kernels.blackwell.mixed_precision_kv import convert_mixed_precision_kv
+
+        end = -(-end // self.tokens_per_block) * self.tokens_per_block
+        layers = list(self.mixed_precision_high_layers.items())
+        tables = torch.full(
+            (len(layers), 2, 1, self.max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+        for index, (local, high_layer) in enumerate(layers):
+            self._fill_page_table(local, [request_id], tables[index, 0].numpy())
+            self._fill_page_table(high_layer, [request_id], tables[index, 1].numpy())
+        tables = tables.cuda(non_blocking=True)
+        lengths = torch.tensor(
+            [[start], [end]], dtype=torch.int32, pin_memory=prefer_pinned()
+        ).cuda(non_blocking=True)
+        for index, (local, _) in enumerate(layers):
+            high = self._get_mixed_precision_buffers(local, "NHD", "high")
+            convert_mixed_precision_kv(
+                False,
+                end - start,
+                high,
+                self._get_mixed_precision_buffers(local, "NHD", "low"),
+                high,
+                tables[index],
+                lengths,
+                "NHD",
+                low_dtype=self.mixed_precision_low_dtype,
+                restore=True,
+            )
 
     def _mixed_precision_recompute_limit(self, req: LlmRequest, kv_cache: _KVCache) -> int | None:
         """Reuse limit that leaves a missing high-precision last-N window to be recomputed, or None.
@@ -8520,7 +8540,6 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.discard_pending_stats()
         if self._sharing is not None:
             self._sharing._on_free(request_id, kv_cache)
-        self.mixed_precision_restore_requests.discard(request_id)
         self._mixed_precision_selected.discard(request_id)
         kv_cache.close()
         self.impl.clear_stats_excluded(request_id)
