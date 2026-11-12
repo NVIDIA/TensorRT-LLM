@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adopted from
 # https://github.com/vllm-project/vllm/blob/200bbf92e8861e2458a6f90bca73f40cc3b1ad1f/benchmarks/benchmark_serving.py
 # SPDX-License-Identifier: Apache-2.0
@@ -61,18 +62,18 @@ class BenchmarkMetrics:
     request_goodput: float
     output_throughput: float
     total_token_throughput: float
-    mean_ttft_ms: float
-    median_ttft_ms: float
-    std_ttft_ms: float
-    percentiles_ttft_ms: list[tuple[float, float]]
-    mean_tpot_ms: float
-    median_tpot_ms: float
-    std_tpot_ms: float
-    percentiles_tpot_ms: list[tuple[float, float]]
-    mean_itl_ms: float
-    median_itl_ms: float
-    std_itl_ms: float
-    percentiles_itl_ms: list[tuple[float, float]]
+    mean_ttft_ms: float | None
+    median_ttft_ms: float | None
+    std_ttft_ms: float | None
+    percentiles_ttft_ms: list[tuple[float, float | None]]
+    mean_tpot_ms: float | None
+    median_tpot_ms: float | None
+    std_tpot_ms: float | None
+    percentiles_tpot_ms: list[tuple[float, float | None]]
+    mean_itl_ms: float | None
+    median_itl_ms: float | None
+    std_itl_ms: float | None
+    percentiles_itl_ms: list[tuple[float, float | None]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
     # a request to receiving a complete response.
@@ -153,7 +154,8 @@ def calculate_metrics(
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
-    all_tpots: list[float] = []
+    all_tpots: list[float | None] = []
+    all_ttfts: list[float | None] = []
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
@@ -177,15 +179,21 @@ def calculate_metrics(
                               add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += input_requests[i].prompt_len
-            tpot = 0
-            if output_len > 1:
-                latency_minus_ttft = outputs[i].latency - outputs[i].ttft
-                tpot = latency_minus_ttft / (output_len - 1)
-                tpots.append(tpot)
-            # Note: if output_len <= 1, we regard tpot as 0 for goodput
+            # Non-streaming backends use -1 when TTFT cannot be measured.
+            # Keep missing values aligned for per-request SLO evaluation.
+            ttft = outputs[i].ttft if outputs[i].ttft >= 0 else None
+            all_ttfts.append(ttft)
+            tpot = None
+            if ttft is not None:
+                ttfts.append(ttft)
+                # A single-token response has no decode interval. Preserve its
+                # zero TPOT for goodput, but exclude it from TPOT statistics.
+                tpot = 0.0
+                if output_len > 1:
+                    tpot = (outputs[i].latency - ttft) / (output_len - 1)
+                    tpots.append(tpot)
+                itls += outputs[i].itl
             all_tpots.append(tpot)
-            itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
             completed += 1
@@ -208,7 +216,7 @@ def calculate_metrics(
         slo_values = []
 
         if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
+            valid_metrics.append(all_ttfts)
             slo_values.append(goodput_config_dict["ttft"] /
                               MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
@@ -221,7 +229,8 @@ def calculate_metrics(
                               MILLISECONDS_TO_SECONDS_CONVERSION)
 
         for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+            is_good_req = all(r is not None and s >= r
+                              for s, r in zip(slo_values, req_metric))
             if is_good_req:
                 good_completed += 1
 
@@ -248,22 +257,27 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) *
-        1000,  # ttfts is empty if streaming is not supported by backend
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
-        percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
-                             for p in selected_percentiles],
-        mean_tpot_ms=np.mean(tpots or 0) * 1000,
-        std_tpot_ms=np.std(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
-        percentiles_tpot_ms=[(p, np.percentile(tpots or 0, p) * 1000)
-                             for p in selected_percentiles],
-        mean_itl_ms=np.mean(itls or 0) * 1000,
-        std_itl_ms=np.std(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
-        percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000)
-                            for p in selected_percentiles],
+        mean_ttft_ms=float(np.mean(ttfts)) * 1000 if ttfts else None,
+        std_ttft_ms=float(np.std(ttfts)) * 1000 if ttfts else None,
+        median_ttft_ms=float(np.median(ttfts)) * 1000 if ttfts else None,
+        percentiles_ttft_ms=[
+            (p, float(np.percentile(ttfts, p)) * 1000 if ttfts else None)
+            for p in selected_percentiles
+        ],
+        mean_tpot_ms=float(np.mean(tpots)) * 1000 if tpots else None,
+        std_tpot_ms=float(np.std(tpots)) * 1000 if tpots else None,
+        median_tpot_ms=float(np.median(tpots)) * 1000 if tpots else None,
+        percentiles_tpot_ms=[
+            (p, float(np.percentile(tpots, p)) * 1000 if tpots else None)
+            for p in selected_percentiles
+        ],
+        mean_itl_ms=float(np.mean(itls)) * 1000 if itls else None,
+        std_itl_ms=float(np.std(itls)) * 1000 if itls else None,
+        median_itl_ms=float(np.median(itls)) * 1000 if itls else None,
+        percentiles_itl_ms=[
+            (p, float(np.percentile(itls, p)) * 1000 if itls else None)
+            for p in selected_percentiles
+        ],
         mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
         median_e2el_ms=np.median(e2els or 0) * 1000,
@@ -530,6 +544,10 @@ async def benchmark(
         print(
             f"=====================!CHECK LOG FOR ERRORS!====================")
 
+    measured_ttfts = [
+        output.ttft if output.success and output.ttft >= 0 else None
+        for output in outputs
+    ]
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -554,7 +572,7 @@ async def benchmark(
         },
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
-        "ttfts": [output.ttft for output in outputs],
+        "ttfts": measured_ttfts,
         "itls": [output.itl for output in outputs],
         "e2els": [output.latency for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
@@ -567,6 +585,9 @@ async def benchmark(
             "output_tps_per_w": metrics.output_tps_per_w,
             "total_gpu_power_w": metrics.total_gpu_power_w,
         }
+
+    def format_metric(value: float | None) -> str:
+        return "N/A" if value is None else f"{value:.2f}"
 
     def process_one_metric(
         # E.g., "ttft"
@@ -590,28 +611,38 @@ async def benchmark(
         display_unit = f" ({unit_suffix})" if unit_suffix else ""
 
         print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
-        print("{:<40} {:<10.2f}".format(
+        print("{:<40} {:<10}".format(
             f"Mean {metric_name}{display_unit}:",
-            getattr(metrics, f"mean_{metric_attribute_name}{attr_suffix}")))
-        print("{:<40} {:<10.2f}".format(
+            format_metric(
+                getattr(metrics,
+                        f"mean_{metric_attribute_name}{attr_suffix}"))))
+        print("{:<40} {:<10}".format(
             f"Median {metric_name}{display_unit}:",
-            getattr(metrics, f"median_{metric_attribute_name}{attr_suffix}")))
+            format_metric(
+                getattr(metrics,
+                        f"median_{metric_attribute_name}{attr_suffix}"))))
         if hasattr(metrics, f"std_{metric_attribute_name}{attr_suffix}"):
-            print("{:<40} {:<10.2f}".format(
+            print("{:<40} {:<10}".format(
                 f"Std Dev {metric_name}{display_unit}:",
-                getattr(metrics, f"std_{metric_attribute_name}{attr_suffix}")))
+                format_metric(
+                    getattr(metrics,
+                            f"std_{metric_attribute_name}{attr_suffix}"))))
             result[f"std_{metric_attribute_name}{attr_suffix}"] = getattr(
                 metrics, f"std_{metric_attribute_name}{attr_suffix}")
         if hasattr(metrics, f"min_{metric_attribute_name}{attr_suffix}"):
-            print("{:<40} {:<10.2f}".format(
+            print("{:<40} {:<10}".format(
                 f"Min {metric_name}{display_unit}:",
-                getattr(metrics, f"min_{metric_attribute_name}{attr_suffix}")))
+                format_metric(
+                    getattr(metrics,
+                            f"min_{metric_attribute_name}{attr_suffix}"))))
             result[f"min_{metric_attribute_name}{attr_suffix}"] = getattr(
                 metrics, f"min_{metric_attribute_name}{attr_suffix}")
         if hasattr(metrics, f"max_{metric_attribute_name}{attr_suffix}"):
-            print("{:<40} {:<10.2f}".format(
+            print("{:<40} {:<10}".format(
                 f"Max {metric_name}{display_unit}:",
-                getattr(metrics, f"max_{metric_attribute_name}{attr_suffix}")))
+                format_metric(
+                    getattr(metrics,
+                            f"max_{metric_attribute_name}{attr_suffix}"))))
             result[f"max_{metric_attribute_name}{attr_suffix}"] = getattr(
                 metrics, f"max_{metric_attribute_name}{attr_suffix}")
 
@@ -623,8 +654,9 @@ async def benchmark(
         for p, value in getattr(
                 metrics, f"percentiles_{metric_attribute_name}{attr_suffix}"):
             p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(
-                f"P{p_word} {metric_name}{display_unit}:", value))
+            print("{:<40} {:<10}".format(
+                f"P{p_word} {metric_name}{display_unit}:",
+                format_metric(value)))
             result[f"p{p_word}_{metric_attribute_name}{attr_suffix}"] = value
 
     # Print avg_decoded_tokens_per_iter statistics if available
@@ -671,6 +703,10 @@ def check_goodput_args(args):
                 raise ValueError(f"Invalid value found, {slo_name}: {slo_val}. "
                                  "The service level objective value should be "
                                  "non-negative.")
+    if args.non_streaming and {"ttft", "tpot"} & goodput_config_dict.keys():
+        raise ValueError(
+            "TTFT and TPOT goodput objectives require streaming responses. "
+            "Use an e2el objective with --non-streaming.")
     return goodput_config_dict
 
 
@@ -702,8 +738,10 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     ignored_metrics = ["ttfts", "itls", "e2els", "generated_texts", "errors"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
-        metrics={k: [results[k]]
-                 for k in metrics if k in results},
+        metrics={
+            k: [results[k]]
+            for k in metrics if k in results and results[k] is not None
+        },
         extra_info={
             k: results[k]
             for k in results if k not in metrics and k not in ignored_metrics
