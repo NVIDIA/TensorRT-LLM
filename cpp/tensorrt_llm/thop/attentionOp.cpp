@@ -2905,6 +2905,10 @@ void MLA::prepareInputs(FmhaParams& p, bool isGen)
                         && v.size(1) == num_heads * mMLAParams.v_head_dim,
                     "FP8 MLA context k / v must be [kv_tokens, num_heads * qk_head_dim] / [kv_tokens, num_heads * "
                     "v_head_dim].");
+                // The FMHA reads p.total_kv_len rows straight out of the caller's k / v;
+                // reject a short tensor instead of reading past its end.
+                TORCH_CHECK(k.size(0) >= p.total_kv_len && v.size(0) >= p.total_kv_len,
+                    "FP8 MLA context k / v must hold at least total_kv_len (", p.total_kv_len, ") tokens.");
                 if (p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value())
                 {
                     auto const& quantQ = p.fwd.quant_q_buffer.value();

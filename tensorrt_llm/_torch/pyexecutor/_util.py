@@ -16,7 +16,7 @@ import copy
 import dataclasses
 import os
 from contextlib import ExitStack
-from typing import Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -94,6 +94,9 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .scheduler.gen_preemption import (headroom_for_args,
                                        unsupported_headroom_reason)
 from .seq_slot_manager import SeqSlotManager
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 
 GB = 1 << 30
 _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
@@ -2346,7 +2349,8 @@ class KvCacheCreator:
             backend = getattr(draft_model, "dflash_attention_backend", None)
         return backend
 
-    def _loaded_standalone_dspark_drafter(self):
+    def _loaded_standalone_dspark_drafter(
+            self) -> Optional["DFlashForCausalLM"]:
         """The loaded standalone DSpark drafter, whose declarations decide how
         it reads its context, or None.
 

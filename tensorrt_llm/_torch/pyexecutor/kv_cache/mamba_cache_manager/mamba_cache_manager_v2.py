@@ -134,7 +134,7 @@ def _insert_draft_pool_ratio(
     life_cycle_block_bytes: Sequence[int],
     full_history: Sequence[bool],
     draft_life_cycle: int,
-) -> List[float]:
+) -> list[float]:
     """Pool ratio per lifecycle with the drafter's share inserted.
 
     ``target_ratio`` lists the other lifecycles' shares in registration order.
@@ -520,12 +520,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @staticmethod
     def _append_draft_layers(
         draft_layer_specs: Sequence[KVCacheLayerSpec],
-        mamba_layer_mask: List[bool],
-        layer_mask: Optional[List[bool]],
-        num_kv_heads: Union[int, List[Optional[int]]],
+        mamba_layer_mask: list[bool],
+        layer_mask: list[bool] | None,
+        num_kv_heads: int | list[int | None],
         *,
         k_only: bool,
-    ) -> Tuple[List[bool], Optional[List[bool]], Union[int, List[Optional[int]]]]:
+    ) -> tuple[list[bool], list[bool] | None, int | list[int | None]]:
         """Masks and KV heads with a standalone drafter's layers appended.
 
         The masks describe this manager's recurrent and target attention
