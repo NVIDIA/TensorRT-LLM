@@ -3044,6 +3044,11 @@ class KVCacheCompressionManager(BaseResourceManager):
     def has_independent_draft_kv_cache(self) -> bool:
         return self.draft_kv_cache_manager is not None
 
+    @property
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` tokens per sequence left unquantized in cold tiers, else None."""
+        return None
+
     def create_cold_page_codec(
         self,
         cache_config: object,

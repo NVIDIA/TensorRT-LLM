@@ -36,11 +36,21 @@ from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...speculative import SpecMetadata
-from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
-from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+from ...utils import (
+    EventType,
+    Fp8PerTokenQuantizedTensor,
+    get_model_extra_attrs,
+    is_gdn_replay_enabled,
+    is_torch_compiling,
+)
+from ..linear import FP8QDQLinearMethod, FP8RowwiseLinearMethod, Linear, TensorParallelMode
 from ..low_m_gemm import low_m_gemm_dispatcher
 from ..low_m_mma_gemm import conv_supported, low_m_mma_gemm, warp_mma_supported
 from ..multi_stream_utils import maybe_execute_in_parallel_deferred_join
+from ..rms_norm_fp8_per_token import (
+    rms_norm_gated_fp8_per_token,
+    rms_norm_gated_fp8_per_token_eligible,
+)
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
 from .fuse_elementwise_ops import (
@@ -73,6 +83,8 @@ class FusedVerifyPlan(NamedTuple):
     replay_metadata: object
     layer_cache: object
     state_indices: torch.Tensor
+    # Rows of the replay history and its bookkeeping; the state slots unless the manager keeps them apart.
+    replay_indices: torch.Tensor
     conv_weight: torch.Tensor
 
 
@@ -561,6 +573,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
         self.aux_stream = aux_stream
+        self._out_proj_fp8_per_token = False
 
         self.fused_verify = (
             fused_verify
@@ -578,6 +591,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def cache_derived_state(self) -> None:
         """Attach downstream static quantization state after loading weights."""
         self.norm.fp8_scale = None
+        # The gated norm emits per-token FP8 directly for an FP8 rowwise out_proj.
+        self._out_proj_fp8_per_token = isinstance(
+            self.out_proj.quant_method, FP8RowwiseLinearMethod
+        )
         if isinstance(self.out_proj.quant_method, FP8QDQLinearMethod):
             scale = self.out_proj.quant_method.get_static_input_scale(self.out_proj)
             # detach() strips the Parameter wrapper so nn.Module.__setattr__
@@ -661,7 +678,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def _compute_tokenwise_inputs(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | Fp8PerTokenQuantizedTensor,
         h_fp8: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.cuda.Event]]:
         """Project to (mixed_qkv, z, a, b, ba_ready).
@@ -683,8 +700,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             def _compute_projected_states_qkvz():
                 return self.in_proj_qkvz(qkvz_input)
 
+            # The unquantized in_proj_ba reads the BF16 copy of a pre-quantized input.
+            hidden_states_ba = hidden_states
+            if isinstance(hidden_states, Fp8PerTokenQuantizedTensor):
+                hidden_states_ba = hidden_states.unquantized_hidden_states
+
             def _compute_projected_states_ba():
-                return self.in_proj_ba(hidden_states)
+                return self.in_proj_ba(hidden_states_ba)
 
             projected_states_qkvz, projected_states_ba, ba_ready = (
                 maybe_execute_in_parallel_deferred_join(
@@ -723,8 +745,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # output whose (heads, head_dim) block is contiguous per token; the
         # gated norm reads it through its token stride instead of packing a
         # copy.
+        attn_out = attn_out.reshape(-1, self.head_v_dim)
+        if self._out_proj_fp8_per_token and (rms_norm_gated_fp8_per_token_eligible(attn_out, z)):
+            fp8_out, scale = rms_norm_gated_fp8_per_token(
+                attn_out, z, self.norm.weight, self.norm.eps
+            )
+            return self.out_proj(
+                Fp8PerTokenQuantizedTensor(fp8_out, scale), all_reduce_params=all_reduce_params
+            )
         attn_out = rms_norm_gated_token_major(
-            attn_out.reshape(-1, self.head_v_dim),
+            attn_out,
             z,
             self.norm.weight,
             self.norm.eps,
@@ -772,12 +802,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         layer_cache = kv_cache_manager.mamba_layer_cache(self.layer_idx)
         if layer_cache is None or layer_cache.intermediate_conv_window is None:
             return None
-        state_indices = attn_metadata.mamba_metadata.state_indices[:num_decodes]
+        mamba_metadata = attn_metadata.mamba_metadata
+        state_indices = mamba_metadata.state_indices[:num_decodes]
+        # Metadata without replay slots of their own addresses the history by the state slots.
+        replay_indices = getattr(
+            mamba_metadata, "replay_state_indices", mamba_metadata.state_indices
+        )[:num_decodes]
         if not (
             _FUSED_VERIFY_MIN_TOKENS <= draft_token_num <= _FUSED_VERIFY_MAX_TOKENS
             and replay_metadata.replay_history_size == _FUSED_VERIFY_HISTORY
             and layer_cache.temporal.dtype == torch.bfloat16
             and state_indices.dtype == torch.int32
+            and replay_indices.dtype == torch.int32
         ):
             return None
         conv_weight = self.conv1d.weight
@@ -790,6 +826,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             replay_metadata=replay_metadata,
             layer_cache=layer_cache,
             state_indices=state_indices,
+            replay_indices=replay_indices,
             conv_weight=conv_weight,
         )
 
@@ -820,6 +857,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             layer_cache.old_dt,
             layer_cache.cache_buf_idx,
             layer_cache.prev_num_accepted_tokens,
+            plan.replay_indices,
         )
 
     def _fused_verify_inproj(
@@ -918,6 +956,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         output_d=None,
         packed_qkv=None,
         use_all_layer_commit=False,
+        replay_indices_d=None,
     ):
         """Run MTP target verification via the replay kernel.
 
@@ -927,6 +966,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         old_dt<->cumulative G.
         With FlashInfer ring replay, the history lives in per-layer rings and
         each slot's ring start (cache_base) instead.
+        The checkpoint is addressed by ``state_indices_d``; the history and its
+        bookkeeping by ``replay_indices_d``, which default to the state slots.
         """
         assert replay_metadata is not None, (
             "GDN replay enabled but replay metadata was not allocated."
@@ -940,9 +981,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 "GDN cached replay requires draft_token_num <= 8 and replay_history_size <= 16."
             )
         state_indices = state_indices_d[:num_decodes]
+        replay_indices = (
+            state_indices if replay_indices_d is None else replay_indices_d[:num_decodes]
+        )
         if layer_cache.cache_base is not None:
             # FlashInfer reads the history length and ring start per batch row.
-            slots = state_indices.long()
+            # It addresses the rings by the state slot, so ring buffers share
+            # the recurrent-state slots and the replay slots equal them.
+            slots = replay_indices.long()
             return flashinfer_cached_replay_update(
                 q=query,
                 k=key,
@@ -985,6 +1031,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             packed_qkv=packed_qkv,
             use_all_layer_commit=use_all_layer_commit,
             output=output_d,
+            replay_indices=replay_indices,
         )
 
     def forward_decode(
@@ -1088,6 +1135,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     output_d,
                     packed_qkv=mixed_qkv,
                     use_all_layer_commit=kwargs.get("use_cached_replay_all_layer_commit", False),
+                    replay_indices_d=kwargs.get("replay_state_indices_d"),
                 ).view(
                     1,
                     num_decodes * draft_token_num,
@@ -1480,6 +1528,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     kwargs.get("replay_n_writes"),
                     output_d,
                     use_all_layer_commit=kwargs.get("use_cached_replay_all_layer_commit", False),
+                    replay_indices_d=kwargs.get("replay_state_indices_d"),
                 ).reshape(1, num_decode_tokens, out_v_heads, self.head_v_dim)
             elif _can_use_flashinfer_gdn_verify(
                 ssm_states, self.head_k_dim, self.head_v_dim, draft_token_num
@@ -1720,6 +1769,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
+        # Metadata without replay slots of their own addresses the history by the state slots.
+        replay_state_indices_d = getattr(
+            mamba_metadata, "replay_state_indices", mamba_metadata.state_indices
+        )[num_prefills : num_prefills + num_decodes]
         if num_prefills > 0:
             # PyExecutor guarantees prefill requests are placed before decode requests
             has_initial_states_p = has_initial_states[:num_prefills]
@@ -1780,6 +1833,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "num_decode_tokens": num_decode_tokens,
             "state_indices_p": state_indices_p,
             "state_indices_d": state_indices_d,
+            "replay_state_indices_d": replay_state_indices_d,
             "num_prefill": num_prefills,
             "num_decodes": num_decodes,
             "intermediate_state_indices": intermediate_state_indices,

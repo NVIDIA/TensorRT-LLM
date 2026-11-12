@@ -15,6 +15,7 @@
 import os
 import threading
 import time
+import traceback
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
@@ -48,7 +49,10 @@ from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
-from tensorrt_llm._torch.disaggregation.native.retirement import QuiescenceFatalEvent
+from tensorrt_llm._torch.disaggregation.native.retirement import (
+    QuiescenceFatalEvent,
+    RetirementDeadline,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TransferWorker,
@@ -471,6 +475,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions: Dict[int, RxSessionBase] = {}
         self._send_reqs = {}
         self._recv_reqs = {}
+        self._cancelled_receive_fences: Dict[int, tuple[torch.cuda.Event, RetirementDeadline]] = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         try:
@@ -703,6 +708,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Preflight may refuse closure while DMA remains active. Start the
         # bounded drain before that refusal, not only in worker.shutdown().
         self._transfer_worker.request_shutdown()
+        for rid in list(getattr(self, "_cancelled_receive_fences", {})):
+            if not self._retire_cancelled_receive_fence(rid):
+                raise RuntimeError(f"Unpublished receive {rid} still owns destination memory")
         # This flag records completed teardown, not an attempted shutdown. If
         # an active owner refuses closure, leave it false so shutdown can be
         # retried after the physical operation drains.
@@ -788,7 +796,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
-                slot = self._get_mamba_slot_for_request(req)
+                slot = self._get_mamba_slot_for_request(req) if lg.pool_views else None
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
@@ -981,7 +989,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_retirable = []
         for rid in to_process:
             session = self._recv_sessions[rid]
-            if not self._ownership_blocks_retirement(session):
+            if not self._retirement_blocked(session):
                 locally_retirable.append(rid)
         idle_skip = self._gen_idle_poll_skip
         deferred = self._gen_deferred_receives
@@ -1085,7 +1093,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif session.has_failed():
                 if self._ownership_blocks_retirement(session):
                     if isinstance(session, RxSession):
-                        session.notify_cancel()
+                        try:
+                            session.notify_cancel()
+                        except RuntimeError as error:
+                            # Notification failure is not retirement evidence.
+                            # Keep the owner under its original grace deadline.
+                            logger.warning(
+                                f"Receive {rid} cancellation notification failed; "
+                                f"retaining resources and retrying: {error}\n{traceback.format_exc()}"
+                            )
+                    continue
+                if self._retirement_blocked(session):
                     continue
                 failed.append(rid)
         return completed, failed
@@ -1148,6 +1166,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return False
         resources_drained = getattr(session, "resources_drained", None)
         return resources_drained is None or not resources_drained()
+
+    @classmethod
+    def _retirement_blocked(cls, session: object) -> bool:
+        """Whether a terminal session must stay open for an accessor that may still be active.
+
+        Besides ownership-held resources, this covers a failed receive whose
+        other writers have not all reported yet (see
+        ``RxSession.failed_receive_awaits_writers``).
+        """
+        if cls._ownership_blocks_retirement(session):
+            return True
+        return isinstance(session, RxSession) and session.failed_receive_awaits_writers()
 
     def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
         """Close one terminal session or fail-stop instead of diverging locally."""
@@ -1272,9 +1302,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return self._enable_pipelined_transfer
 
     def has_inflight_transfer(self, req: LlmRequest) -> bool:
-        """Whether a transfer session still owns this request's resources."""
+        """Whether a transfer session or cancelled admission fence retains resources."""
         rid = get_unique_rid(req)
-        return rid in self._send_sessions or rid in self._recv_sessions
+        return (
+            rid in self._send_sessions
+            or rid in self._recv_sessions
+            or rid in getattr(self, "_cancelled_receive_fences", {})
+        )
+
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        # Waiting until every peer rank's REQUEST_DATA has arrived (receiver_ready),
+        # even while the ranks that already asked are being written. A retired,
+        # cancelled or failed send is not waiting and must time out normally.
+        session = self._send_sessions.get(get_unique_rid(req))
+        if session is None or session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            return False
+        return not session.receiver_ready
+
+    def context_transfer_peer_ready_time(self, req: LlmRequest) -> Optional[float]:
+        session = self._send_sessions.get(get_unique_rid(req))
+        return None if session is None else getattr(session, "peer_ready_time", None)
 
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether req's send session was torn down before its last slice."""
@@ -1731,7 +1778,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
-                if self._ownership_blocks_retirement(session):
+                # A cancel after a failure must not free pages a writer is still writing.
+                if self._retirement_blocked(session):
                     continue
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
@@ -1747,10 +1795,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 # RxSession.wait_complete() already withholds FAILED while an
-                # ownership-enabled accessor remains active. Keep the caller
-                # boundary fail-closed as well so alternate/test session
+                # accessor may remain active. Keep the caller boundary
+                # fail-closed as well so alternate/test session
                 # implementations cannot authorize request retirement early.
-                if self._ownership_blocks_retirement(session):
+                if self._retirement_blocked(session):
                     continue
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
@@ -1871,7 +1919,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             time.sleep(min(0.001, remaining_s))
 
     def check_gen_transfer_complete(self):
-        return len(self._recv_sessions) == 0
+        return not self._recv_sessions and not getattr(self, "_cancelled_receive_fences", {})
 
     def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
         """Verify the V2 scheduler pre-declared prompt_len as history.
@@ -1915,11 +1963,48 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             and not self.has_inflight_transfer(req)
         )
 
+    def cancel_gen_logically(
+        self, req: LlmRequest, ready: Optional[torch.cuda.Event] = None
+    ) -> bool:
+        """Close GEN admission while retaining unquiesced destination resources.
+
+        Args:
+            req: Model-idle generation request in the ownership-enabled profile.
+            ready: Unpublished destination's local CUDA admission fence, if any.
+
+        Returns:
+            Whether cancellation is the committed logical outcome. An earlier
+            failure and legacy configurations keep their existing response path.
+            With the bridge enabled, a passed ready fence remains retained until
+            cancel_request returns True, even when this method returns False.
+        """
+        if not getattr(self, "_fp4_mla_bridge_enabled", False):
+            return False
+        rid = get_unique_rid(req)
+        if ready is not None:
+            fences = getattr(self, "_cancelled_receive_fences", None)
+            if fences is None:
+                fences = self._cancelled_receive_fences = {}
+            if rid not in fences:
+                # Register before querying: a CUDA error must not drop the only
+                # root or leave an unobservable accessor without a grace clock.
+                owner = self._transfer_worker.create_receive_retirement(req.py_request_id)
+                self._recv_reqs[rid] = req
+                fences[rid] = (ready, owner)
+                owner.retain_unproven(req, "cancelled receive admission")
+        session = self._recv_sessions.get(rid)
+        if session is not None:
+            session.cancel_local()
+        return req.state != LlmRequestState.DISAGG_TRANS_ERROR and (
+            session is None or session.status != SessionStatus.ERROR
+        )
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False if any task is mid-write (TRANSFERRING); caller must
-        retry next iteration. Returns True when safe to free KV memory.
+        Returns False while a session or cancelled admission fence may access
+        request memory; caller must retry next iteration. Returns True only
+        after transfer and local CUDA claims settle, permitting resource release.
         """
         rid = get_unique_rid(req)
 
@@ -1964,7 +2049,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if rid in self._recv_sessions:
             session = self._recv_sessions[rid]
-            session.cancel()
+            if getattr(self, "_fp4_mla_bridge_enabled", False):
+                session.cancel_local()
+                # Logical acceptance may already have closed admission. Peer
+                # notification is retryable and deduplicated by the session.
+                session.notify_cancel()
+            else:
+                session.cancel()
             if session.has_transferring_tasks():
                 has_transferring = True
             elif session.close() is False:
@@ -1982,8 +2073,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                     self._emit_transfer_settled("gen", rid, req, session, "cancelled")
 
+        if not self._retire_cancelled_receive_fence(rid):
+            has_transferring = True
+
         if has_transferring:
             return False
+        return True
+
+    def _retire_cancelled_receive_fence(self, rid: int) -> bool:
+        """Release an unpublished receive root only after its CUDA fence completes.
+
+        Args:
+            rid: Transfer identity of the destination being retired.
+
+        Returns:
+            Whether no unproven local access remains for this destination.
+        """
+        fences = getattr(self, "_cancelled_receive_fences", {})
+        if rid not in fences:
+            return True
+        ready, owner = fences[rid]
+        if not ready.query() or not owner.settle(self._recv_reqs[rid]) or not owner.close():
+            return False
+        del fences[rid]
+        if rid not in self._recv_sessions:
+            self._recv_reqs.pop(rid, None)
         return True
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
