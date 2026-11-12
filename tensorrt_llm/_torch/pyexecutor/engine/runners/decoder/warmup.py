@@ -437,6 +437,17 @@ class DecoderWarmup:
         generation_only = self.mapping.has_cp_helix() or is_decode_only(
             self.sparse_attention_config
         )
+        # A capturable guided decoder rules out the general warmup's generation
+        # requests only: the autotuner below runs its context step with the
+        # decoder installed. Run the context requests anyway, so that the
+        # autotuner's max-token step is not the engine's first forward (with
+        # the buffers it allocates lazily) and runs after the release below,
+        # as it does without guided decoding.
+        can_run_context_warmup = can_run_general_warmup or self._agreement.agree_flag(
+            self._context_warmups_supported
+            and not generation_only
+            and not isinstance(kv_cache_manager, MambaHybridCacheManager)
+        )
 
         log_mem_snapshot("warmup/before_warmup")
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
@@ -462,7 +473,7 @@ class DecoderWarmup:
                     resource_manager, can_run_general_warmup and not generation_only
                 )
 
-        if can_run_general_warmup:
+        if can_run_context_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
             with self._warmup_timer.phase(
                 "general", metrics=self._metrics, metric_name="general_warmup_seconds"
@@ -472,6 +483,12 @@ class DecoderWarmup:
                     warmup_requests_configs = self._generation_warmup_shapes(
                         warmup_requests_configs
                     )
+                elif not can_run_general_warmup:
+                    warmup_requests_configs = [
+                        (num_tokens, num_gen_tokens)
+                        for num_tokens, num_gen_tokens in warmup_requests_configs
+                        if num_gen_tokens == 0
+                    ]
                 warmup_requests_configs = self._agreement.agree_shapes(warmup_requests_configs)
                 # Currently graph has not been captured, disable cuda graph for this warmup.
                 with self._graphs.no_cuda_graph():
@@ -987,6 +1004,10 @@ class DecoderWarmup:
                     # Peers are inside the same forward's collectives and
                     # cannot follow a rank-local skip.
                     raise
+                if self.guided_decoder is not None:
+                    # Input preparation enqueues the batch before model forward.
+                    # An OOM may leave it unconsumed, or leave callbacks pending.
+                    self.guided_decoder.reset_warmup_state()
                 logger.warning(
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping."

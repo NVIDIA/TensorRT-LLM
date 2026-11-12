@@ -364,9 +364,13 @@ class AttentionMetadata:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager,
-                              "mixed_precision_high_layers", None)
-        return isinstance(high_layers, dict) and bool(high_layers)
+        manager = self.kv_cache_manager
+        high_layers = getattr(manager, "mixed_precision_high_layers", None)
+        # The cold-page window keeps the history at the high precision and reads
+        # the high rows through the page tables instead of a staging copy.
+        return (isinstance(high_layers, dict) and bool(high_layers)
+                and manager.mixed_precision_low_dtype
+                != manager.mixed_precision_high_dtype)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
