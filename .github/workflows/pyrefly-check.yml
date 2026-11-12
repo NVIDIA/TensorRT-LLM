@@ -68,7 +68,7 @@ jobs:
           # Both scans use the target branch's Pyrefly configuration and wrapper scripts.
           git -C "$PYREFLY_MERGED_ROOT" restore --source "$base_sha" --worktree -- pyproject.toml scripts
       - name: Install target branch dependencies
-        id: install
+        id: base_install
         timeout-minutes: 15
         working-directory: ${{ env.PYREFLY_BASE_ROOT }}
         # Without the project dependencies every third-party import is a diagnostic.
@@ -82,6 +82,19 @@ jobs:
         env:
           PYREFLY_REPORT_PATH: ${{ env.PYREFLY_REPORT_DIR }}/base.json
         run: bash scripts/run_pyrefly.sh --full-project
+      # A PR that changes the dependencies is checked with its own versions. This runs
+      # after the target branch check, and pip installs only the packages that differ.
+      - name: Install merged PR dependencies
+        id: merged_install
+        timeout-minutes: 15
+        working-directory: ${{ env.PYREFLY_MERGED_ROOT }}
+        run: |
+          # The merge is staged but not committed, so this compares it with the target branch.
+          if git diff --cached --quiet -- 'requirements*.txt' 'constraints*.txt'; then
+            echo "The PR does not change the dependencies."
+          else
+            python3 -m pip install --no-cache-dir -r requirements-dev.txt
+          fi
       - name: Check merged PR
         id: merged_check
         timeout-minutes: 5
@@ -97,8 +110,9 @@ jobs:
           BASE_SHA: ${{ steps.prepare.outputs.base_sha }}
           CHECK_ERROR: >-
             ${{ steps.prepare.outcome != 'success' && 'Could not merge the PR into the current target branch. See workflow logs.' ||
-                steps.install.outcome != 'success' && 'Could not install the target branch dependencies. See workflow logs.' ||
+                steps.base_install.outcome != 'success' && 'Could not install the target branch dependencies. See workflow logs.' ||
                 steps.base_check.outcome != 'success' && 'The target branch check did not complete. See workflow logs.' ||
+                steps.merged_install.outcome != 'success' && 'Could not install the merged PR dependencies. See workflow logs.' ||
                 steps.merged_check.outcome != 'success' && 'The merged PR check did not complete. See workflow logs.' || '' }}
         run: |
           python3 .github/scripts/pyrefly_diff.py \
