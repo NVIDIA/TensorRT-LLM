@@ -551,8 +551,8 @@ l0_b200:
   # Covered by H100 pre_merge for primary HW-agnostic signal; keep B200 runtime
   # canary in post_merge for CUDA IPC / virtual memory / profiling paths.
   - unittest/_torch/misc
-  # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
-  # checkpoint); ~13 min, too heavy for pre_merge. Mirrors l0_gb300_multi_gpus.
+  # Kimi K3 routing shape (896 experts, top_k 16) on the TRTLLM backend.
+  # Single-GPU, random weights; too heavy for pre_merge.
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   # Keep new full-corpus EAGLE-3 baselines in post_merge until repeated green
   # runs establish stable references.
