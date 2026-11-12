@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Introduction
 
-This guide describes how to serve Mistral Large 4 with TensorRT LLM on NVIDIA GB300 GPUs. It covers obtaining the checkpoint and its format, the supported deployments, installing the software, launching `trtllm-serve` on one or two nodes, the model-specific API behavior, example requests, accuracy verification and the known limitations. The configurations below are validated on GB300, most of them by the accuracy tests in `tests/integration/defs/accuracy/modeling_v2/test_mistral_large4.py`; configurations outside these tables are not validated.
+This guide describes how to serve Mistral Large 4 with TensorRT LLM on NVIDIA GB300 GPUs. It covers obtaining the checkpoint and its format, the supported deployments, installing the software, launching `trtllm-serve` on one or two nodes, the model-specific API behavior, example requests, accuracy verification and the known limitations. The configurations below are validated on GB300, most of them by the accuracy tests in `tests/integration/defs/accuracy/modeling_v2/mistral_large4/`; configurations outside these tables are not validated.
 
 This source checkout also supports NVIDIA VR200 (`sm_107`) for all six parallel layouts, with DSpark enabled or disabled. See [VR200 Accuracy Validation](#vr200-accuracy-validation) for the verified scope. The installation and launch recipes below describe GB300; VR200 requires a source checkout containing the SM107 targets.
 
@@ -520,17 +520,17 @@ See [Disaggregated Serving](../features/disagg-serving.md) for the general setup
 
 ## Running Evaluations to Verify Accuracy (Optional)
 
-The accuracy tests in `tests/integration/defs/accuracy/modeling_v2/test_mistral_large4.py` build the configurations above through the LLM API and compare the scores with the references in `tests/integration/defs/accuracy/references/` (`gsm8k.yaml`, `gpqa_diamond.yaml`, `mmmu.yaml`, `ruler.yaml` and `acceptance_length.yaml`). They read the checkpoint from `${LLM_MODELS_ROOT}/Mistral-Large-4-1T-A52B-NVFP4`, the [downloaded](#download-the-checkpoint) NVFP4 repository, and the datasets from `LLM_MODELS_ROOT`. The tests are not part of the release container or the wheel: run them from a checkout of this branch with its development requirements (`requirements-dev.txt`), as in the [source build](#build-from-source) environment. On a node with 4 GB300 GPUs:
+The accuracy tests in `tests/integration/defs/accuracy/modeling_v2/mistral_large4/` (one directory per target, the shared harness in `_common.py`) build the configurations above through the LLM API and compare the scores with the references in `tests/integration/defs/accuracy/references/` (`gsm8k.yaml`, `gpqa_diamond.yaml`, `mmmu.yaml`, `ruler.yaml` and `acceptance_length.yaml`). They read the checkpoint from `${LLM_MODELS_ROOT}/Mistral-Large-4-1T-A52B-NVFP4`, the [downloaded](#download-the-checkpoint) NVFP4 repository, and the datasets from `LLM_MODELS_ROOT`. The tests are not part of the release container or the wheel: run them from a checkout of this branch with its development requirements (`requirements-dev.txt`), as in the [source build](#build-from-source) environment. On a node with 4 GB300 GPUs:
 
 ```bash
 cd tests/integration/defs
 export LLM_MODELS_ROOT=/path/to/models
 
 # GSM8K on the NVFP4 TEP4 deployment, without speculative decoding.
-pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k[tep4]"
+pytest -v "accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k[tep4]"
 
 # The quick profile on TEP4 with DSpark: GSM8K, RULER, image and acceptance-length checks.
-pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick]"
+pytest -v "accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick]"
 ```
 
 `test_accuracy` is parameterized by profile and deployment, as `test_accuracy[<profile>-<deployment>]`:
@@ -547,7 +547,7 @@ The 8-GPU cases run on two nodes with 4 GPUs each, under `trtllm-llmapi-launch`.
 
 ### VR200 Accuracy Validation
 
-The gate classes `TestModelingV2MistralLarge4Nvfp4Sm107Tep`, `TestModelingV2MistralLarge4Nvfp4Sm107Dep` and `TestModelingV2MistralLarge4Nvfp4Sm107Tp` in `tests/integration/defs/accuracy/modeling_v2/test_mistral_large4.py` define the VR200 accuracy configurations: `test_accuracy` runs with DSpark and `test_accuracy_without_dspark` without it. Validation covered 24 base configurations: TEP4, TP4, DEP4, TEP8, TP8 and DEP8, each at `max_seq_len` 32768 and 1048576, with DSpark enabled and disabled:
+The gate classes `TestModelingV2MistralLarge4Nvfp4Sm107Tep`, `TestModelingV2MistralLarge4Nvfp4Sm107Dep` and `TestModelingV2MistralLarge4Nvfp4Sm107Tp`, in the `mistral_large_4_nvfp4__sm_107__*` directories of `tests/integration/defs/accuracy/modeling_v2/mistral_large4/`, define the VR200 accuracy configurations: `test_accuracy` runs with DSpark and `test_accuracy_without_dspark` without it. Validation covered 24 base configurations: TEP4, TP4, DEP4, TEP8, TP8 and DEP8, each at `max_seq_len` 32768 and 1048576, with DSpark enabled and disabled:
 
 * The six TEP4, TP4 and DEP4 configurations at `max_seq_len` 1048576 each passed `full` and `long_full`, for 12 panels covering GSM8K, MMMU, GPQA Diamond, RULER, image, cache and execution-coverage checks.
 * The other 18 configurations each passed the complete 1,319-question GSM8K evaluation.

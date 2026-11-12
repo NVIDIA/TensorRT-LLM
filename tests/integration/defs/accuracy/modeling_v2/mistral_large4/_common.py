@@ -12,9 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the mistral_large4 modeling_v2 targets.
+"""Shared harness for the mistral_large4 modeling_v2 accuracy targets.
 
-Every test here passes ``modeling_v2="require"`` to ``LLM``. Under ``"auto"`` a
+Each target's gate class is in ``<target>/test_accuracy.py``. It names the target's
+architecture and layout and lists its tests, which run the ``_test_*`` implementations here;
+the layouts and the deployments are here too.
+
+Every test passes ``modeling_v2="require"`` to ``LLM``. Under ``"auto"`` a
 configuration that missed a target's criteria -- or fell outside its bounds --
 would quietly fall back to the built-in implementation, pass, and report the
 built-in's numbers as the target's.
@@ -39,8 +43,8 @@ from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_E
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, DSparkDecodingConfig, KvCacheConfig
 
-from ...conftest import llm_models_root
-from ..accuracy_core import (
+from ....conftest import llm_models_root
+from ...accuracy_core import (
     GSM8K,
     MMMU,
     GPQADiamond,
@@ -48,8 +52,8 @@ from ..accuracy_core import (
     acceptance_length_from_iteration_stats,
     assert_acceptance_length,
 )
-from . import llguidance_panel, multimodal, ruler, spec_evidence
-from ._env import scoped_env_overrides
+from .. import llguidance_panel, multimodal, ruler, spec_evidence
+from .._env import scoped_env_overrides
 
 # Certification is per GPU architecture, and a receipt from another one says nothing here:
 # each gate class runs only on its target's architecture.
@@ -90,6 +94,11 @@ _BOUNDS_1M = dict(_BOUNDS, max_seq_len=1048576, enable_chunked_prefill=True)
 # FP8; the checkpoint's quant_algo is MIXED_PRECISION, so the harness reads the
 # MIXED_PRECISION / FP8 row.
 _KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
+
+
+# The profiles ``test_accuracy`` runs, and the ones ``test_accuracy_without_dspark`` runs.
+PROFILES = ["quick", "full", "long_lite", "long_full"]
+PROFILES_WITHOUT_DSPARK = ["full", "long_full"]
 
 
 def pytest_generate_tests(metafunc):
@@ -195,8 +204,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         layout = cls.LAYOUTS[int(name.removeprefix(cls.LAYOUT))]
         return layout, (_BOUNDS_1M if ctx == "1m" else _BOUNDS)
 
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k(self, deployment):
+    def _test_gsm8k(self, deployment):
         """The identity accuracy gate, at the harness default protocol.
 
         That is the protocol the registered reference was set under, so the anchor and the
@@ -228,8 +236,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
     class GSM8K24Shot(GSM8K):
         MAX_INPUT_LEN = 8192
 
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k_24shot(self, deployment):
+    def _test_gsm8k_24shot(self, deployment):
         """24-shot GSM8K, where the indexer's selection prunes every prompt.
 
         `trtllm-eval gsm8k --num_fewshot 24 --max_input_length 8192`, otherwise the harness
@@ -260,8 +267,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
     )
 
-    @pytest.mark.skip_less_device(4)
-    def test_passkey_retrieval(self, deployment):
+    def _test_passkey_retrieval(self, deployment):
         """The long-context witness: a passkey recalled from a ~30000-token prompt.
 
         At three depths of the prompt, greedy decoding must reproduce the passkey. A wrong
@@ -298,9 +304,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 answer = llm.generate([prompt], params)[0].outputs[0].text
                 assert str(key) in answer, (depth, tokens, answer)
 
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("profile", ["quick", "full", "long_lite", "long_full"])
-    def test_accuracy(self, deployment, profile, tmp_path, monkeypatch, record_property):
+    def _test_accuracy(self, deployment, profile, tmp_path, monkeypatch, record_property):
         """Every profile runs native DSpark; full profiles add fresh spec OFF GSM8K.
 
         ``long_lite`` and ``long_full`` run on the 1M specializations only: RULER rows at 64K,
@@ -314,9 +318,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
             deployment, profile, tmp_path, monkeypatch, record_property, use_dspark=True
         )
 
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("profile", ["full", "long_full"])
-    def test_accuracy_without_dspark(
+    def _test_accuracy_without_dspark(
         self, deployment, profile, tmp_path, monkeypatch, record_property
     ):
         """The complete accuracy and cache protocol with native DSpark disabled.
@@ -658,8 +660,7 @@ class _TpTarget(_Nvfp4Target):
         ),
     }
 
-    @pytest.mark.skip_less_device(4)
-    def test_llguidance(self, tmp_path, record_property):
+    def _test_llguidance(self, tmp_path, record_property):
         """Guided decoding with llguidance on tp4 with native DSpark, over frontend-rendered chat ids.
 
         Cases (llguidance_panel): JSON, JSON after a reasoning section, and mistral-common's tool
@@ -697,39 +698,3 @@ class _TpTarget(_Nvfp4Target):
         (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         failures = [failure for failure in summary["failures"] if failure.startswith("FAIL")]
         assert not failures, failures
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Tep(_TepTarget):
-    """mistral-large-4-nvfp4 / sm_103 / tep, the language model."""
-
-    pytestmark = skip_not_sm103
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Dep(_DepTarget):
-    """mistral-large-4-nvfp4 / sm_103 / dep, the language model."""
-
-    pytestmark = skip_not_sm103
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_TpTarget):
-    """mistral-large-4-nvfp4 / sm_103 / tp, the language model."""
-
-    pytestmark = skip_not_sm103
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm107Tep(_TepTarget):
-    """mistral-large-4-nvfp4 / sm_107 / tep, the language model."""
-
-    pytestmark = skip_not_sm107
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm107Dep(_DepTarget):
-    """mistral-large-4-nvfp4 / sm_107 / dep, the language model."""
-
-    pytestmark = skip_not_sm107
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm107Tp(_TpTarget):
-    """mistral-large-4-nvfp4 / sm_107 / tp, the language model."""
-
-    pytestmark = skip_not_sm107
