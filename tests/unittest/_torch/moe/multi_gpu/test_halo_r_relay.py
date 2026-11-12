@@ -26,6 +26,13 @@ After the launches since the previous check, every rank compares:
   per-layer helper slots, the residency table with a model of it, on every
   rank.
 
+``test_halo_q_cases`` runs the reference and residency cases with HALO-Q, the
+default planner, through the same arena, gate and copies. There is no HALO-Q
+reference plan here, so each launch is checked against its own helper
+experts: every route goes to its owner or to a helper slot that holds its
+expert, every helper row holds its expert bytewise, through the MAIN-side
+copies and after the launch, and the READY row holds the launch's generation.
+
 ``test_halo_r_traps`` makes one launch fail on purpose: a status word set
 before the route release, a READY cell that never arrives, or a CTA that
 cannot become resident. The failing rank must trap in that call, and its
@@ -364,9 +371,17 @@ class _Kernels:
         args = ((ns,), (ctypes.c_ulonglong,))
         self._launch(self.delay, 1, 32, 0, args, stream)
 
-    def launch_gate(self, ready: torch.Tensor, stream: torch.cuda.Stream, blocks: int) -> None:
+    def launch_gate(
+        self, ready: torch.Tensor, stream: torch.cuda.Stream, blocks: int, expected: int = _READY
+    ) -> None:
         args = (
-            (ready.data_ptr(), ready.numel(), _READY, _GATE_TIMEOUT_NS, self.timed_out.data_ptr()),
+            (
+                ready.data_ptr(),
+                ready.numel(),
+                expected,
+                _GATE_TIMEOUT_NS,
+                self.timed_out.data_ptr(),
+            ),
             (
                 ctypes.c_void_p,
                 ctypes.c_int,
@@ -399,8 +414,9 @@ def _skip_reason() -> str | None:
     return None
 
 
-# A build without the SM100 + CUDA 13.1 kernels registers the ops but throws on use.
-_PLACEHOLDER_MESSAGE = "HALO-R requires CUDA 13.1+"
+# A build without the SM100 + CUDA 13.1 kernels registers the ops but throws on use,
+# with this text for HALO-R and for HALO-Q's copy.
+_PLACEHOLDER_MESSAGE = "requires CUDA 13.1+"
 # A skip reason that means this GPU and CUDA should run HALO-R but the build cannot.
 _BUILD_SKIP = "the build has no HALO-R kernels: "
 
@@ -411,7 +427,10 @@ def _cuda_at_least(major: int, minor: int) -> bool:
 
 
 class _Layers:
-    """HALO-R groups of consecutive MoE layers on one model-level manager, and a model of their state."""
+    """HALO-R (or HALO-Q) groups of consecutive MoE layers on one model-level manager.
+
+    It also keeps a model of their state.
+    """
 
     def __init__(
         self,
@@ -423,6 +442,7 @@ class _Layers:
         helper_slot_mode: str = "shared_banks",
         bundle_dims: tuple = (_HIDDEN, _INTERMEDIATE),
         helper_slots: int = _HELPER_SLOTS,
+        planner: str = "halo_r",
     ) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
             PerLayerDynamicMoeLoadBalancer,
@@ -439,12 +459,13 @@ class _Layers:
         self.experts = _HOME_EXPERTS * world
         self.auxiliary_sms = auxiliary_sms
         self.helper_slots = helper_slots
+        self.planner = planner
         self.resident = helper_slot_mode == "per_layer_resident"
         config = SimpleNamespace(
             num_slots=self.experts + world * helper_slots,
             auxiliary_sms=auxiliary_sms,
             helper_slot_mode=helper_slot_mode,
-            planner="halo_r",
+            planner=planner,
         )
         self.manager = PerLayerDynamicMoeLoadBalancer(ep_rank=rank, ep_size=world, config=config)
         self.mapping = SimpleNamespace(moe_ep_size=world, moe_ep_rank=rank, local_rank=device)
@@ -467,8 +488,9 @@ class _Layers:
         # HALO-R's helper sets carry no multicast object, so its arenas have
         # neither HALO levels nor multicast destinations.
         pool = self.arenas[0].provider.pool
-        assert not pool.helper_multicast and not any(s.level_specs for s in pool.sets)
-        assert not any(arena.bound.destination_ptrs for arena in self.arenas)
+        if planner == "halo_r":
+            assert not pool.helper_multicast and not any(s.level_specs for s in pool.sets)
+            assert not any(arena.bound.destination_ptrs for arena in self.arenas)
         # The helper set of each layer: shared banks alternate, per-layer slots do not.
         self.banks = [int(arena.provider.layer.helper_set) for arena in self.arenas]
         self._helper_views = {}
@@ -486,6 +508,8 @@ class _Layers:
         self.copy_delay_ns = _COPY_DELAY_NS
         self.groups = []
         self.launches = [0] * count
+        # Per layer, the READY value its last launch lent: HALO-R's constant, HALO-Q's generation.
+        self.ready_values = [0] * count
         self.receiver_copies = [0] * count
         self.receiver_skips = [0] * count
         self.last_copies = 0
@@ -510,6 +534,14 @@ class _Layers:
     def routes(self, step: int, tokens: int) -> torch.Tensor:
         return _routes(step, self.rank, tokens, self.experts, self.device)
 
+    def bound(self, layer: int) -> Any:
+        """The bound arena of ``layer`` that holds its planes.
+
+        HALO-Q's hierarchical binding keeps them on its ``base``.
+        """
+        bound = self.arenas[layer].bound
+        return getattr(bound, "base", bound)
+
     def ready_row(self, layer: int) -> torch.Tensor:
         return self.arenas[layer].terminal_flags_tensor().view(torch.int64)
 
@@ -517,7 +549,7 @@ class _Layers:
         """This rank's helper rows of ``layer``, one uint8 view per plane, made outside any capture."""
         views = self._helper_views.get(layer)
         if views is None:
-            bound = self.arenas[layer].bound
+            bound = self.bound(layer)
             views = self._helper_views[layer] = [
                 _row(
                     int(bound.local_plane_views[plane].data_ptr()) + _HOME_EXPERTS * int(nbytes),
@@ -530,7 +562,7 @@ class _Layers:
 
     def load_weights(self, layer: int) -> None:
         """Write this rank's home experts of ``layer`` with the pattern of its current weights."""
-        bound = self.arenas[layer].bound
+        bound = self.bound(layer)
         for plane, nbytes in enumerate(bound.plane_bytes):
             base = int(bound.local_plane_views[plane].data_ptr())
             for local in range(_HOME_EXPERTS):
@@ -554,10 +586,18 @@ class _Layers:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
             build_halo_r_slot_scheduler_group,
         )
+        from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
+            build_rebalance_slot_scheduler_group,
+        )
 
+        build = (
+            build_halo_r_slot_scheduler_group
+            if self.planner == "halo_r"
+            else build_rebalance_slot_scheduler_group
+        )
         for layer, arena in enumerate(self.arenas):
             self.groups.append(
-                build_halo_r_slot_scheduler_group(
+                build(
                     arena=arena,
                     manager=self.manager,
                     mapping=self.mapping,
@@ -595,11 +635,12 @@ class _Layers:
             group.copy_stream.wait_event(fork)
             self.kernels.launch_delay(group.copy_stream, self.copy_delay_ns)
         physical, ready = group.plan(routes, defer_wait=False)
-        if int(ready) != _READY:
+        if self.planner == "halo_r" and int(ready) != _READY:
             raise RuntimeError(f"layer {layer} lent READY {int(ready)}, not {_READY}")
+        self.ready_values[layer] = int(ready)
         slots = physical.clone()
         blocks = self.gate_blocks if gate_blocks is None else gate_blocks
-        self.kernels.launch_gate(self.ready_row(layer), main, blocks)
+        self.kernels.launch_gate(self.ready_row(layer), main, blocks, int(ready))
         rows = [row.clone() for row in self.helper_rows(layer)]
         group.finish()
         copies = (slots, rows)
@@ -672,6 +713,9 @@ class _Layers:
                 failures.append(f"rank {rank}: {where}: expert {expert} in helper slot {slot}")
             else:
                 moved[(expert, destination)] = moved.get((expert, destination), 0) + 1
+        if plan.broadcasts is None:
+            # No reference quota: only where each route went is checked.
+            return failures
         totals = {}
         for part in MPI.COMM_WORLD.allgather(moved):
             for key, value in part.items():
@@ -684,7 +728,7 @@ class _Layers:
     def _row_failures(self, layer: int, plan, rows: list, where: str) -> list:
         """Every helper row this rank received holds the owner's expert, byte for byte."""
         failures = []
-        bound = self.arenas[layer].bound
+        bound = self.bound(layer)
         for helper, expert in enumerate(plan.helper_table[self.rank]):
             if expert < 0:
                 continue
@@ -703,7 +747,10 @@ class _Layers:
         A single tensor is one launch. Every launch updates the model and is
         checked against its own plan through its MAIN-side copies; the last
         one's plan, outputs and helper rows are also compared as they are now.
+        HALO-Q launches are checked by ``_check_own_helpers``.
         """
+        if self.planner != "halo_r":
+            return self._check_own_helpers(layer, routes)
         routes_list = [routes] if isinstance(routes, torch.Tensor) else list(routes)
         copies = self.pending[layer]
         if len(copies) != len(routes_list):
@@ -763,6 +810,52 @@ class _Layers:
                 failures.append(f"rank {rank}: {where}: residency {native} != {table}")
             if any(other != native for other in MPI.COMM_WORLD.allgather(native)):
                 failures.append(f"rank {rank}: {where}: residency differs across ranks")
+        return failures
+
+    def _check_own_helpers(self, layer: int, routes: torch.Tensor) -> list:
+        """Check one launch against the helper experts it reports, without a reference plan.
+
+        Every route goes to its owner's home slot or to a helper slot that
+        holds its expert, every helper row of this rank holds its expert
+        bytewise, both through the MAIN-side copies and as they are now, and
+        the READY row holds the launch's READY value and every status word is 0.
+        """
+        if not isinstance(routes, torch.Tensor) or len(self.pending[layer]) != 1:
+            raise RuntimeError("a HALO-Q launch is checked on its own")
+        launch_copies = self.pending[layer][0]
+        self.pending[layer] = []
+        rank = self.rank
+        group = self.groups[layer]
+        scheduler = group.scheduler
+        where = f"layer {layer} launch {self.launches[layer]}"
+        helpers = scheduler.outputs.hot_expert_ids.cpu().tolist()
+        plan = SimpleNamespace(helper_table=MPI.COMM_WORLD.allgather(helpers), broadcasts=None)
+        self.last_plan = plan
+        failures = []
+        if launch_copies is not None:
+            slots, rows = launch_copies
+            failures += self._route_failures(
+                plan, routes, slots, f"{where} routes after the route wait"
+            )
+            failures += self._row_failures(layer, plan, rows, f"{where} helper rows at the gate")
+        slots = scheduler.outputs.physical_slot_ids[: routes.shape[0]]
+        failures += self._route_failures(plan, routes, slots, f"{where} routes now")
+        # A later layer on the same shared bank has refilled its helper rows since.
+        if self.bank_user.get(self.banks[layer]) == layer:
+            failures += self._row_failures(
+                layer, plan, self.helper_rows(layer), f"{where} rows now"
+            )
+        if any(scheduler.status.cpu().tolist()):
+            failures.append(f"rank {rank}: {where}: status words {scheduler.status.cpu().tolist()}")
+        cells = self.ready_row(layer).cpu().tolist()
+        if cells != [self.ready_values[layer]] * self.ep:
+            failures.append(
+                f"rank {rank}: {where}: READY row {cells}, lent {self.ready_values[layer]}"
+            )
+        timed_out = int(self.kernels.timed_out.item())
+        if timed_out:
+            failures.append(f"rank {rank}: {where}: {timed_out} gate CTAs timed out on READY")
+            self.kernels.timed_out.zero_()
         return failures
 
     def shutdown(self) -> None:
@@ -884,7 +977,7 @@ def _case_resident_repeat(layers: _Layers) -> list:
     if not holders:
         raise _Skip(f"no rank receives a helper expert in these routes at EP {layers.ep}")
     sentinel_rank = holders[0]
-    nbytes = int(layers.arenas[0].bound.plane_bytes[0])
+    nbytes = int(layers.bound(0).plane_bytes[0])
     row = layers.helper_rows(0)[0][:nbytes]
     sentinel = torch.full((nbytes,), 0x5A, dtype=torch.uint8, device=layers.device)
     if rank == sentinel_rank:
@@ -920,7 +1013,8 @@ def _case_resident_sequence(layers: _Layers) -> list:
         failures += layers.check(0, routes)
         if _any_rank(failures):
             break
-    if layers.receiver_skips[0] == 0:
+    # The receiver counters are HALO-R's.
+    if layers.planner == "halo_r" and layers.receiver_skips[0] == 0:
         failures.append(f"rank {rank}: no receiver was ever skipped")
     return failures
 
@@ -1632,6 +1726,9 @@ _CASES = {
         _HELPER_SLOTS,
     ),
 }
+# HALO-Q, the default planner, on the same checks without a reference plan (_check_own_helpers).
+for _case in ("reference", "resident_sequence", "resident_layers"):
+    _CASES[f"halo_q_{_case}"] = _CASES[_case]
 _TRAPS = ("status_word", "ready_drain_timeout", "grid_rendezvous_timeout")
 for _kind in _TRAPS:
     _CASES[f"trap_{_kind}"] = (
@@ -1664,7 +1761,10 @@ def _run_worker(case: str) -> tuple[str | None, list[str]]:
         dims = (
             _PRODUCTION_BUNDLE if case.endswith("production_bundle") else (_HIDDEN, _INTERMEDIATE)
         )
-        layers = _Layers(rank, world, device, count, auxiliary_sms, mode, dims, helper_slots)
+        planner = "halo_q" if case.startswith("halo_q_") else "halo_r"
+        layers = _Layers(
+            rank, world, device, count, auxiliary_sms, mode, dims, helper_slots, planner
+        )
         if case.startswith("gate_under_hog"):
             _starve_relay(layers)
         try:
@@ -1737,8 +1837,19 @@ def _skip(reason: str) -> None:
     pytest.skip(reason)
 
 
-@pytest.mark.parametrize("case", [case for case in _CASES if not case.startswith("trap_")])
+@pytest.mark.parametrize(
+    "case", [case for case in _CASES if not case.startswith(("trap_", "halo_q_"))]
+)
 def test_halo_r_cases(monkeypatch, case) -> None:
+    results = _run_on_every_rank(monkeypatch, case)
+    _skip_if_any(results)
+    failures = [failure for _, rank_failures in results for failure in rank_failures]
+    assert not failures, "\n".join(failures[:20])
+
+
+@pytest.mark.parametrize("case", [case for case in _CASES if case.startswith("halo_q_")])
+def test_halo_q_cases(monkeypatch, case) -> None:
+    """The reference and residency cases with HALO-Q, checked against its own helper experts."""
     results = _run_on_every_rank(monkeypatch, case)
     _skip_if_any(results)
     failures = [failure for _, rank_failures in results for failure in rank_failures]
