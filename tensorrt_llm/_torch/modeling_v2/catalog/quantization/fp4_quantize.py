@@ -45,7 +45,7 @@ class Fp4Quantize(OpWrapper):
     is something a consumer has to be told, not something its shape shows.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_120})
 
     # deepseek-r1 reaches this op from both layouts: the swizzled one feeding
     # nvfp4_gemm in the dense and shared-expert MLPs, the linear one feeding the
