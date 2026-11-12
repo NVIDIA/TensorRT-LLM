@@ -62,10 +62,12 @@ from .modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from .modeling_qwen2vl import (
+    _QWEN_VIDEO_BATCH_AS,
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
     _concat_qwen_vision_inputs,
     _prepare_qwen_vl_mrope_config,
+    _qwen_encoder_device_paths,
     _qwen_vision_item_partitions,
 )
 from .modeling_utils import (
@@ -1369,10 +1371,11 @@ def _qwen3vl_vision_input(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build one ViT input from the encoder group's batched payload keys.
 
-    Raw uint8 rows are normalized with the processor's record before the
-    image and video rows are concatenated, so torch.cat cannot promote their dtype.
-    The group encodes payloads apart when their pixel dtype or record
-    differs, so one record serves every raw key of a call.
+    The encoder group batches video rows after the image rows (``batch_as``),
+    so a call normally passes only the image keys. Raw uint8 rows are
+    normalized with the processor's record; the group encodes payloads apart
+    when their pixel dtype or record differs, so one record serves every raw
+    row of a call, and image and video rows cannot promote each other's dtype.
     """
 
     def prepare(pixels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -1491,7 +1494,17 @@ class Qwen3VisionModelBase(nn.Module):
         `Qwen3VLModelBase.mm_encoder_groups`, which delegates here) and the
         mm-encoder-only `forward` consume this.
         """
-        return (EncoderGroup(modalities=("image", "video"), encoder_fn=self.encode_batched),)
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self.encode_batched,
+                batch_as=_QWEN_VIDEO_BATCH_AS,
+            ),
+        )
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return _qwen_encoder_device_paths(self.visual)
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Standalone mm-encoder-only executor entry.
@@ -1503,7 +1516,13 @@ class Qwen3VisionModelBase(nn.Module):
         modality-batched ViT the aggregated path uses and applies the
         per-request `item_metadata.item_refs` reorder before returning.
         """
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [
+            encode_multimodal_by_groups(
+                self.mm_encoder_groups,
+                multimodal_params,
+                getattr(self, "multimodal_data_device_paths", None),
+            )
+        ]
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):

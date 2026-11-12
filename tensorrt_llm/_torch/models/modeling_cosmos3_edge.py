@@ -72,7 +72,12 @@ from .modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from .modeling_multimodal_utils import VisionNormalization
-from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, _prepare_qwen_vl_vision_attn_metadata
+from .modeling_qwen2vl import (
+    _QWEN_VIDEO_BATCH_AS,
+    Qwen2_5_VLVisionAttention,
+    _prepare_qwen_vl_vision_attn_metadata,
+    _qwen_encoder_device_paths,
+)
 from .modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModelBase,
@@ -477,10 +482,26 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
-        return (EncoderGroup(modalities=("image", "video"), encoder_fn=self.encode_batched),)
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self.encode_batched,
+                batch_as=_QWEN_VIDEO_BATCH_AS,
+            ),
+        )
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return _qwen_encoder_device_paths(self.visual)
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [
+            encode_multimodal_by_groups(
+                self.mm_encoder_groups,
+                multimodal_params,
+                getattr(self, "multimodal_data_device_paths", None),
+            )
+        ]
 
 
 class Cosmos3EdgeAttention(Attention):

@@ -1215,7 +1215,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 raise ValueError(
                     "Gemma4 requests containing multiple multimodal input types are not supported."
                 )
-        return encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)
+        return encode_multimodal_by_groups(
+            self.mm_encoder_groups,
+            multimodal_params,
+            getattr(self, "multimodal_data_device_paths", None),
+        )
 
     @staticmethod
     def get_sub_model_config(

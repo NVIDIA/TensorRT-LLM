@@ -1312,6 +1312,48 @@ def test_qwen2_vision_encoders_take_the_declared_keys() -> None:
 
 
 @pytest.mark.cpu_only
+def test_qwen_vision_encoders_move_the_media_their_model_lists() -> None:
+    """Each Qwen encoder moves in its call exactly the media paths its model leaves to it."""
+    from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeModel
+    from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+    from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
+
+    class _NativeTower(torch.nn.Module, MultimodalEncoderMixin):
+        pass
+
+    native = modeling_qwen2vl._qwen_encoder_device_paths(_NativeTower())
+    hf = modeling_qwen2vl._qwen_encoder_device_paths(torch.nn.Module())
+    assert set(hf) - set(native) == {"image.image_grid_thw", "video.video_grid_thw"}
+
+    def media(paths):
+        return {path for path in paths if path.split(".")[0] in ("image", "video")}
+
+    # (model, its tower type): Qwen2-VL keeps the HF tower; the others are native.
+    for model, encoder_paths in (
+        (modeling_qwen2vl.Qwen2VLModel, hf),
+        (modeling_qwen2vl.Qwen2_5_VLModel, native),
+        (Exaone4_5_ForConditionalGeneration, native),
+        (modeling_qwen3vl.Qwen3VLModel, native),
+        (Qwen3MoeVLModel, native),
+        (Cosmos3EdgeModel, native),
+    ):
+        model_paths = model.multimodal_data_device_paths.fget(None)
+        assert media(model_paths) == media(encoder_paths), model.__name__
+    for encoder in (
+        modeling_qwen2vl.Qwen2VisionModelBase,
+        modeling_qwen3vl.Qwen3VisionModelBase,
+    ):
+        vision = SimpleNamespace(visual=_NativeTower())
+        assert encoder.multimodal_data_device_paths.fget(vision) == native
+        (group,) = encoder.mm_encoder_groups.fget(SimpleNamespace(encode_batched=None))
+        assert group.batch_as == {
+            "pixel_values_videos": "pixel_values",
+            "video_grid_thw": "image_grid_thw",
+        }
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("support_fused_qkv", [True, False])
 @pytest.mark.parametrize("rope_impl", ["torch", "flash_attn", "flashinfer"])
 def test_qwen2_5_vision_attention_reuses_fused_qkv(
@@ -2559,13 +2601,16 @@ def test_normalization_mixed_raw_and_float_batches(dtype: torch.dtype) -> None:
         legacy_input, torch.cat([expected, expected, expected_video, expected_video])
     )
     assert legacy_input.dtype == dtype
-    # Raw and normalized pixels of one modality, and different records, encode
-    # apart; each call holds one record, and the rows return in prompt order.
-    assert [call["vision_normalization"] for call in new.calls] == [spec, video_spec]
-    assert [call["pixel_values"].dtype for call in new.calls] == [torch.uint8, dtype]
-    assert [call["pixel_values_videos"].dtype for call in new.calls] == [dtype, torch.uint8]
-    for pixels, _ in new.visual.inputs:
-        assert torch.equal(pixels, torch.cat([expected, expected_video]))
+    # Video rows are batched after the image rows under one key, so raw and normalized
+    # pixels, and different records, encode apart; each call holds one record, and the
+    # rows return in prompt order.
+    assert [call.get("vision_normalization") for call in new.calls] == [spec, None, video_spec]
+    assert [call["pixel_values"].dtype for call in new.calls] == [torch.uint8, dtype, torch.uint8]
+    assert all("pixel_values_videos" not in call for call in new.calls)
+    expected_inputs = [expected, torch.cat([expected, expected_video]), expected_video]
+    assert len(new.visual.inputs) == len(expected_inputs)
+    for (pixels, _), expected_pixels in zip(new.visual.inputs, expected_inputs):
+        assert torch.equal(pixels, expected_pixels)
     assert batched.dtype == dtype
     assert torch.equal(batched, _qwen3_encode(legacy, params))
     assert torch.equal(batched, torch.cat([_qwen3_encode(new, [param]) for param in params]))

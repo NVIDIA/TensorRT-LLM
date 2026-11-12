@@ -1571,7 +1571,12 @@ class Qwen2VisionModelBase(nn.Module):
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
         """One group: the ViT tells image and video items apart by their grid rows."""
         return (EncoderGroup(modalities=("image", "video"),
-                             encoder_fn=self.encode_batched), )
+                             encoder_fn=self.encode_batched,
+                             batch_as=_QWEN_VIDEO_BATCH_AS), )
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return _qwen_encoder_device_paths(self.visual)
 
     @nvtx_range("Qwen2VisionModelBase forward()")
     @torch.inference_mode()
@@ -1580,8 +1585,9 @@ class Qwen2VisionModelBase(nn.Module):
             multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Encode the batch; rows come back in request order, then prompt order."""
         return [
-            encode_multimodal_by_groups(self.mm_encoder_groups,
-                                        multimodal_params)
+            encode_multimodal_by_groups(
+                self.mm_encoder_groups, multimodal_params,
+                getattr(self, "multimodal_data_device_paths", None))
         ]
 
 
@@ -2284,6 +2290,26 @@ def _qwen_vision_input_partitions(
     }
 
 
+# Video rows and grids are batched after the image ones under the image keys,
+# so the ViT gets one input without a device concatenation.
+_QWEN_VIDEO_BATCH_AS = {
+    "pixel_values_videos": "pixel_values",
+    "video_grid_thw": "image_grid_thw",
+}
+
+
+def _qwen_encoder_device_paths(visual: torch.nn.Module) -> List[str]:
+    """Native towers consume host grids; the older HF tower needs device grids."""
+    paths = [
+        "image.pixel_values", "video.pixel_values_videos",
+        "multimodal_embedding", "mrope_config.mrope_position_ids",
+        "mrope_config.mrope_position_deltas"
+    ]
+    if not isinstance(visual, MultimodalEncoderMixin):
+        paths.extend(("image.image_grid_thw", "video.video_grid_thw"))
+    return paths
+
+
 def _concat_qwen_vision_inputs(
     pixel_values: Optional[torch.Tensor],
     image_grid_thw: Optional[torch.Tensor],
@@ -2293,8 +2319,8 @@ def _concat_qwen_vision_inputs(
     """Concatenate one call's image and video patch rows, image rows first.
 
     The ViT tells items apart only by their grid rows, so image and video
-    items share one call. The encoder group has already batched each payload
-    key across requests.
+    items share one call. The encoder group already batches video rows after
+    the image rows (``batch_as``), so it passes only the image keys.
     """
     pixels = [p for p in (pixel_values, pixel_values_videos) if p is not None]
     grids = [g for g in (image_grid_thw, video_grid_thw) if g is not None]
@@ -2388,6 +2414,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Qwen2VisionModelBase(
                 mm_encoder_config, kwargs.get('vision_model_class', None))
+            # The encoder's groups, so the executor leaves raw media to the encoder call.
+            self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups
         else:
             self.mm_encoder = None
 

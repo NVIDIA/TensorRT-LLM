@@ -228,6 +228,8 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         if not _is_mm_disagg():
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Exaone4_5_VisionModel(mm_encoder_config, Qwen2_5_VisionModel)
+            # The encoder's groups, so the executor leaves raw media to the encoder call.
+            self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups
         else:
             self.mm_encoder = None
 

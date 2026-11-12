@@ -1026,8 +1026,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         if (self._vision_tower is None or self._multi_modal_projector is None):
             raise ValueError(
                 "Raw multimodal inputs require a local multimodal encoder.")
-        return encode_multimodal_by_groups(self.mm_encoder_groups,
-                                           list(multimodal_params))
+        return encode_multimodal_by_groups(
+            self.mm_encoder_groups, list(multimodal_params),
+            getattr(self, "multimodal_data_device_paths", None))
 
     def get_language_model_extra_forward_kwargs(
         self,

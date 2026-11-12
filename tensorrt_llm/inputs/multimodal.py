@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from blake3 import blake3
 
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
                                                  BaseModalityData, VideoData,
                                                  _hash_serialized_item)
@@ -177,18 +177,66 @@ def batch_by_item_partitions(
 
 def _batch_item_values(values: Sequence[Any],
                        axis: int,
-                       padding_value: int | float = 0) -> Any:
+                       padding_value: int | float = 0,
+                       device: str | torch.device | None = None) -> Any:
     """Batch item values along ``axis`` as ``batch_by_item_partitions`` does.
 
     For callers that need only the batched value, such as the encoder builder.
+    With ``device``, the batch is made on that device: host tensors are copied
+    once, straight into their place (`_batch_to_device`), and tensors in lists
+    are moved as ``MultimodalParams.to_device`` moves them.
     """
     first = values[0]
     if isinstance(first, torch.Tensor):
-        return _cat_padded(values, axis, padding_value)
+        if device is None:
+            return _cat_padded(values, axis, padding_value)
+        return _batch_to_device(values, axis, padding_value, device)
     if isinstance(first, (list, tuple)) and axis == 0:
-        return type(first)([item for items in values for item in items])
+        batched = type(first)([item for items in values for item in items])
+        return batched if device is None else _move_to_device(batched, device)
     raise TypeError(
         "Item fields must be tensors or lists/tuples on item axis zero")
+
+
+def _move_to_device(value: Any, device: str | torch.device) -> Any:
+    """Move the tensors in ``value`` as ``MultimodalParams.to_device`` does."""
+    return MultimodalParams()._apply_tensor_operation(
+        value, "to_device", device=device, pin_memory=prefer_pinned())
+
+
+def _batch_to_device(values: Sequence[torch.Tensor], axis: int,
+                     padding_value: int | float,
+                     device: str | torch.device) -> torch.Tensor:
+    """Make the `_cat_padded` result on ``device`` straight from host values.
+
+    The device's `StagedUploader` allocates the batch once on its copy stream
+    and copies each host value into its place through its pinned staging
+    buffers, so nothing is copied on the device and the copies do not queue
+    behind compute. Values already on a device, Confidential Compute (pageable
+    copies) and stream capture take the per-value copy and device `_cat_padded`;
+    every value is moved to ``device`` (one already there is used as it is).
+    """
+    from tensorrt_llm._torch.host_staging import staged_uploader
+    first = values[0]
+    if len({(value.dtype, value.ndim) for value in values}) > 1:
+        raise ValueError("Item tensors of one field must share dtype and rank")
+    if (any(value.device.type != "cpu" for value in values)
+            or not prefer_pinned() or torch.cuda.is_current_stream_capturing()):
+        moved = [(maybe_pin_memory(value) if value.device.type == "cpu" else
+                  value).to(device, non_blocking=True) for value in values]
+        return _cat_padded(moved, axis, padding_value)
+    axis %= first.dim()
+    shapes = [value.shape for value in values]
+    padded = [max(sizes) for sizes in zip(*shapes)]
+    padded[axis] = sum(shape[axis] for shape in shapes)
+    ragged = any(shape[dim] != padded[dim] for shape in shapes
+                 for dim in range(first.dim()) if dim != axis)
+    starts = accumulate((shape[axis] for shape in shapes), initial=0)
+    return staged_uploader(device).upload_pieces(
+        padded, first.dtype,
+        [(value, [start if dim == axis else 0 for dim in range(first.dim())])
+         for value, start in zip(values, starts)],
+        padding_value if ragged else None)
 
 
 def _batched_item_lengths(

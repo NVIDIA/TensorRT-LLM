@@ -23,10 +23,13 @@ import torch
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalEncoderContractError,
+    _device_keys,
     _lengths_by_modality,
     _reorder_embeds_by_manifest,
     build_batched_input_by_partitions,
     encode_multimodal_by_groups,
+    release_encoded_media,
+    request_device_paths,
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -573,3 +576,178 @@ class TestEncodeByGroups:
             params.append(_request([("image", 0, 2)], {"image": image}, {"image": partitions}))
         with pytest.raises(MultimodalEncoderContractError, match=message):
             encode_multimodal_by_groups([group], params)
+
+
+class TestDevicePaths:
+    """Which paths the executor moves per request, and which the encoder call batches."""
+
+    PATHS = [
+        "image.pixel_values",
+        "video.pixel_values_videos",
+        "image",
+        "audio.audio_features.data",
+        "multimodal_embedding",
+        "mrope_config.mrope_position_ids",
+    ]
+
+    @staticmethod
+    def _model(groups, paths=PATHS):
+        return SimpleNamespace(mm_encoder_groups=groups, multimodal_data_device_paths=paths)
+
+    def test_default_builder_models_leave_batched_media_keys_to_the_encoder_call(self):
+        model = self._model((EncoderGroup(("image", "video"), lambda **kwargs: None),))
+        # A whole modality or a nested key is not a key the builder batches: still per request.
+        assert request_device_paths(model) == [
+            "image",
+            "audio.audio_features.data",
+            "multimodal_embedding",
+            "mrope_config.mrope_position_ids",
+        ]
+
+    def test_media_of_a_modality_without_a_group_still_moves_per_request(self):
+        model = self._model((EncoderGroup(("image",), lambda **kwargs: None),))
+        assert "video.pixel_values_videos" in request_device_paths(model)
+        assert "image.pixel_values" not in request_device_paths(model)
+
+    @pytest.mark.parametrize(
+        "groups",
+        [
+            (),
+            (EncoderGroup(("image",), lambda **kwargs: None, lambda params: {}),),
+            (
+                EncoderGroup(("image",), lambda **kwargs: None),
+                EncoderGroup(("video",), lambda **kwargs: None, lambda params: {}),
+            ),
+            (SimpleNamespace(modalities=("image",)),),
+            None,
+        ],
+        ids=["no_groups", "own_builder", "one_own_builder", "duck_typed", "not_a_sequence"],
+    )
+    def test_other_models_move_every_path_per_request(self, groups):
+        assert request_device_paths(self._model(groups)) == self.PATHS
+
+    def test_no_path_list_moves_everything(self):
+        group = EncoderGroup(("image",), lambda **kwargs: None)
+        assert request_device_paths(SimpleNamespace(mm_encoder_groups=(group,))) is None
+        assert request_device_paths(self._model((group,), paths=None)) is None
+
+    def test_only_media_paths_give_an_empty_list(self):
+        model = self._model((EncoderGroup(("audio",), lambda **kwargs: None),), ["audio.features"])
+        assert request_device_paths(model) == []
+
+    def test_device_keys_tell_the_call_from_the_per_request_paths(self):
+        # True: the encoder call makes the key on the GPU; False: the executor moves it per
+        # request (a whole modality is key ""; a nested path names its payload key).
+        assert _device_keys(self.PATHS) == {
+            "image": {"pixel_values": True, "": False},
+            "video": {"pixel_values_videos": True},
+            "audio": {"audio_features": False},
+        }
+        assert _device_keys(["image.a.b", "image.a"]) == {"image": {"a": True}}
+        assert _device_keys(None) == {}
+
+
+class TestBatchAs:
+    @staticmethod
+    def _image_video(video_dtype=torch.float32):
+        image, image_partitions = _image([(1, 2), (2, 1)])
+        video = {"frames": _rows((5, 3)).to(video_dtype), "frame_grid": torch.tensor([[3]])}
+        video_partitions = {
+            "frames": MultimodalItemPartition(item_lengths=(3,)),
+            "frame_grid": MultimodalItemPartition(),
+        }
+        image["grid"] = torch.tensor([[2], [1]])
+        image_partitions["grid"] = MultimodalItemPartition()
+        return _request(
+            [("video", 0, 3), ("image", 0, 2), ("image", 1, 1)],
+            {"image": image, "video": video},
+            {"image": image_partitions, "video": video_partitions},
+        )
+
+    def test_mapped_keys_are_batched_after_the_target_key(self):
+        calls = []
+
+        def encode(pixels, grid):
+            calls.append((pixels[:, 0].tolist(), grid[:, 0].tolist()))
+            return pixels
+
+        group = EncoderGroup(
+            ("image", "video"), encode, batch_as={"frames": "pixels", "frame_grid": "grid"}
+        )
+        out = encode_multimodal_by_groups([group], [self._image_video()])
+        assert calls == [([1, 1, 2, 5, 5, 5], [2, 1, 3])]
+        assert out[:, 0].tolist() == [5, 5, 5, 1, 1, 2]
+
+    def test_mapped_keys_with_another_dtype_are_encoded_apart(self):
+        calls = []
+
+        def encode(pixels, grid):
+            calls.append((pixels.dtype, pixels[:, 0].tolist()))
+            return pixels.float()
+
+        group = EncoderGroup(
+            ("image", "video"), encode, batch_as={"frames": "pixels", "frame_grid": "grid"}
+        )
+        out = encode_multimodal_by_groups([group], [self._image_video(torch.bfloat16)])
+        assert calls == [(torch.float32, [1, 1, 2]), (torch.bfloat16, [5, 5, 5])]
+        assert out[:, 0].tolist() == [5, 5, 5, 1, 1, 2]
+
+    def test_mapped_keys_with_another_device_policy_are_encoded_apart(self):
+        """A key the owner sends to the GPU never shares a batch with one it keeps on the host."""
+        calls = []
+
+        def encode(pixels, grid):
+            calls.append(pixels[:, 0].tolist())
+            return pixels
+
+        group = EncoderGroup(
+            ("image", "video"), encode, batch_as={"frames": "pixels", "frame_grid": "grid"}
+        )
+        # The executor moves the whole image modality per request (here it stays where the test
+        # put it); the video frames are kept on the host, so they get their own call.
+        out = encode_multimodal_by_groups([group], [self._image_video()], ["image"])
+        assert calls == [[1, 1, 2], [5, 5, 5]]
+        assert out[:, 0].tolist() == [5, 5, 5, 1, 1, 2]
+
+
+class TestReleaseEncodedMedia:
+    """Raw media leaves the request once its whole output is held and nothing encodes again."""
+
+    @staticmethod
+    def _request(media_device="cpu", **extra):
+        data = {
+            "image": {"pixels": torch.ones(4, 2, device=media_device), "grid": torch.ones(1, 3)},
+            "mrope_config": {"mrope_position_deltas": torch.zeros(1)},
+            "multimodal_embed_mask_cumsum": torch.arange(4),
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata([("image", 0)], [4], [4]),
+            "multimodal_embedding": torch.zeros(4, 2),
+            **extra,
+        }
+        return SimpleNamespace(py_multimodal_data=data, py_mm_encoder_state=None)
+
+    def test_held_output_drops_host_media_and_keeps_the_rest(self):
+        request = self._request()
+        kept = {key: value for key, value in request.py_multimodal_data.items() if key != "image"}
+        release_encoded_media(request)
+        assert request.py_multimodal_data == kept
+
+    @pytest.mark.parametrize(
+        "change",
+        ["no_output", "chunk_output", "item_scheduling", "media_on_a_device"],
+    )
+    def test_media_stays_while_an_encoder_call_may_read_it(self, change):
+        request = self._request(media_device="meta" if change == "media_on_a_device" else "cpu")
+        data = request.py_multimodal_data
+        if change == "no_output":
+            del data["multimodal_embedding"]
+        elif change == "chunk_output":
+            data["multimodal_embedding_is_chunk"] = True
+        elif change == "item_scheduling":
+            request.py_mm_encoder_state = object()
+        release_encoded_media(request)
+        assert "image" in data
+
+    def test_requests_without_media_are_left_alone(self):
+        request = SimpleNamespace(py_multimodal_data=None, py_mm_encoder_state=None)
+        release_encoded_media(request)
+        assert request.py_multimodal_data is None
