@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import async_tensor_h2d, prefer_pinned
+from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -853,8 +853,7 @@ class DFlashWorker(SpecWorkerBase):
                 return True
             table = self._ctx_kv_manager.get_draft_block_table(request_ids[:num_seqs])
             # Pinned: a pageable upload would wait for the step in flight.
-            if prefer_pinned():
-                table = table.pin_memory()
+            table = maybe_pin_memory(table)
             self._ctx_block_tables[:num_seqs].copy_(table, non_blocking=True)
             self._ctx_block_counts[:num_seqs].copy_(
                 torch.tensor(
