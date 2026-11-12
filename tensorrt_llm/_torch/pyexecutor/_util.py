@@ -51,7 +51,8 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.multimodal import (get_multimodal_data_device_paths,
+                                 is_multimodal_model)
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -1552,7 +1553,7 @@ class KvCacheCreator:
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
         """Build one processed MM encoder batch at its scheduling limits."""
-        if not isinstance(self._model_engine.model, MultimodalModelMixin):
+        if not is_multimodal_model(self._model_engine.model):
             return []
         if isinstance(
                 self._profiling_stage_data,
@@ -1627,11 +1628,8 @@ class KvCacheCreator:
                         "multimodal_data",
                         "cuda",
                         pin_memory=prefer_pinned(),
-                        target_keywords=getattr(
-                            self._model_engine.model,
-                            "multimodal_data_device_paths",
-                            None,
-                        ),
+                        target_keywords=get_multimodal_data_device_paths(
+                            self._model_engine.model),
                     )
                 # The clone is retained only for memory accounting; no tensor
                 # data is consumed after this profiling forward returns.

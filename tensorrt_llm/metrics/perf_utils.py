@@ -18,9 +18,40 @@ Kept in tensorrt_llm/metrics/ so that this logic has no GPU / heavy
 dependencies and can be unit-tested without a full TensorRT-LLM install.
 """
 
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
 from .enums import MetricNames, RequestEventTiming
+
+_input_processing_observer: ContextVar[Callable[[str, float, str | None], None] | None] = (
+    ContextVar("input_processing_observer", default=None)
+)
+
+
+def _start_input_processing() -> float | None:
+    return time.perf_counter() if _input_processing_observer.get() is not None else None
+
+
+def _record_input_processing(
+    stage: str, started: float | None, modality: str | None = None
+) -> None:
+    if started is not None:
+        observer = _input_processing_observer.get()
+        if observer is not None:
+            observer(stage, time.perf_counter() - started, modality)
+
+
+@contextmanager
+def _time_input_processing(stage: str, modality: str | None = None) -> Iterator[None]:
+    """Measure an input stage only within an opted-in request context."""
+    started = _start_input_processing()
+    try:
+        yield
+    finally:
+        _record_input_processing(stage, started, modality)
 
 
 def process_req_perf_metrics(

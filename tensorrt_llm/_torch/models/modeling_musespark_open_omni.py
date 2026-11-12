@@ -46,7 +46,7 @@ per-image position reset. Image rows are windowed by the decoder's variable
 sliding-window schedule exactly like ordinary text.
 """
 
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -1045,7 +1045,7 @@ class MuseSparkOpenVisionEncoder(nn.Module):
         if audio_args.get("input_mode") == "wav":
             self.audio_tower = MuseSparkOpenAudioEncoder(config.hidden_size)
 
-    def forward(self, multimodal_params: List[Any]) -> torch.Tensor:
+    def forward(self, multimodal_params: Sequence[Any]) -> torch.Tensor:
         ordered: List[Tuple[str, Any]] = []
         for params in multimodal_params:
             ordered.extend(_items_in_prompt_order(params))
@@ -1295,7 +1295,7 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
             "multimodal_embedding",
         ]
 
-    def encode_multimodal_inputs(self, multimodal_params: List[Any]) -> torch.Tensor:
+    def encode_multimodal_inputs(self, multimodal_params: Sequence[Any]) -> torch.Tensor:
         """The mixin's uniform encoder entry: one tower pass over the batch.
 
         Called by the startup KV-cache profiler, which runs the encoder at the

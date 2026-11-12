@@ -15,7 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -25,6 +25,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
 )
+from tensorrt_llm._torch.models.multimodal import SupportsMultimodal, is_multimodal_model
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -34,6 +35,62 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+
+
+@pytest.mark.cpu_only
+def test_model_contract_detection_does_not_evaluate_encoder_properties() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    # The default embedding properties raise: capability detection must not read them.
+    assert is_multimodal_model(model)
+    text_model = torch.nn.Module()
+    text_model.supports_encoder_cache = True
+    assert not is_multimodal_model(text_model)
+
+
+@pytest.mark.cpu_only
+def test_model_contract_defaults_do_not_enable_optional_features() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    config = ModelConfig()
+    assert not model.supports_encoder_cache
+    assert not model.supports_mm_encoder_item_scheduling
+    assert not model.supports_encoder_attention_backend
+    assert not model.support_mm_disagg
+    assert not model.supports_vision_gpu_normalize
+    assert model.encoder_forward_context is None
+    assert model.get_multimodal_encoder_parallel_modes(config) == {}
+    assert model.get_supported_encoder_attention_backends(config) == {}
+
+
+@pytest.mark.cpu_only
+def test_model_contract_cache_preserves_existing_implementation_hook() -> None:
+    model = MultimodalModelMixin()
+    model.model_config = ModelConfig(multimodal_config=MultimodalConfig())
+    contract: SupportsMultimodal = model
+    with patch.object(
+        model,
+        "_initialize_multimodal_encoder_cache",
+        wraps=model._initialize_multimodal_encoder_cache,
+    ) as initialize:
+        cache = contract.initialize_multimodal_encoder_cache(1024)
+    initialize.assert_called_once_with(1024)
+    assert contract.multimodal_encoder_cache is cache
+    assert model._multimodal_encoder_cache is cache
+    assert contract.initialize_multimodal_encoder_cache(1024) is cache
+
+
+@pytest.mark.cpu_only
+def test_mixin_defines_every_model_contract_member() -> None:
+    # CI type checking does not compare the mixin with the Protocol, so compare the names.
+    members = set(SupportsMultimodal.__annotations__) | {
+        name for name in vars(SupportsMultimodal) if not name.startswith("_")
+    }
+    missing = [
+        name
+        for name in sorted(members)
+        if not hasattr(MultimodalModelMixin, name)
+        and name not in MultimodalModelMixin.__annotations__
+    ]
+    assert not missing
 
 
 def make_embedding(
@@ -415,6 +472,7 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
     )
 
 
+@pytest.mark.cpu_only
 def test_encoder_cache_repeated_item_across_requests_skips_encoder():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -423,11 +481,15 @@ def test_encoder_cache_repeated_item_across_requests_skips_encoder():
     )
     first = make_keyed_multimodal_param()
     second = make_keyed_multimodal_param()
+    model.encoder_forward_context = MagicMock()
 
     first_embeddings = model._get_or_encode_multimodal_embeddings([first])
     second_embeddings = model._get_or_encode_multimodal_embeddings([second])
 
     assert model.encode_calls == 1
+    model.encoder_forward_context.assert_called_once_with()
+    model.encoder_forward_context.return_value.__enter__.assert_called_once_with()
+    model.encoder_forward_context.return_value.__exit__.assert_called_once()
     torch.testing.assert_close(second_embeddings, first_embeddings)
 
 
