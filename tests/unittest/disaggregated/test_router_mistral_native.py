@@ -16,18 +16,23 @@
 
 With ``checkpoint_format`` ``mistral`` or ``mistral_large_3`` the servers take the tokenizer,
 input processor and model configuration from the checkpoint's native files (``tekken.json``,
-``params.json``). The router loads the same resources, so a completion encodes to the ids
-the server would build, and a chat it cannot render routes on no ids instead of failing.
-Other checkpoint formats keep the Hugging Face tokenizer path.
+``params.json``) and render chats with mistral-common. The router loads the same resources,
+so a completion or chat encodes to the ids the server would build, and the server takes the
+router's chat ids when their rendering fingerprints agree. A chat the router cannot render
+routes on no ids instead of failing. Other checkpoint formats keep the Hugging Face
+tokenizer path.
 
 The checkpoints are read from LLM_MODELS_ROOT: Mistral-Large-3 as published (no
 ``config.json``), and Mistral-Small-4's ``params.json`` and ``tekken.json`` alone.
 """
 
+import base64
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
@@ -40,7 +45,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     ResponsesRequest,
 )
-from tensorrt_llm.serve.render import UnsupportedRenderError, render_chat
+from tensorrt_llm.serve.render import render_chat
 from tensorrt_llm.serve.render.resources import RenderResources
 from tensorrt_llm.serve.router import KvCacheAwareRouter
 
@@ -149,53 +154,117 @@ def test_completion_ids_are_the_servers(router, batched):
     assert request.prompt == ([expected, expected] if batched else expected)
 
 
-@pytest.mark.parametrize(
-    "fields",
-    [{}, {"tools": [_TOOL]}, {"tool_choice": "required", "tools": [_TOOL]}],
-    ids=["plain", "tools", "required_tool"],
-)
-def test_chat_the_renderer_refuses_routes_on_no_ids(router, fields):
-    """A chat the renderer refuses routes on no ids instead of failing.
+@pytest.fixture
+def worker_fingerprint(router, checkpoint):
+    model_dir, checkpoint_format = checkpoint
+    fingerprint = _worker_fingerprint(router._render_resources("m"), model_dir, checkpoint_format)
+    router._server_info = {_SERVER: {"render_fingerprint": fingerprint}}
+    yield fingerprint
+    router._server_info = {}
 
-    The server builds a Mistral-native chat prompt in its input processor, which the
-    renderer does not reproduce.
-    """
+
+def _servers_chat_ids(resources, messages, **fields):
+    """The ids a server renders for a chat (the chat route's rendering)."""
+    request = ChatCompletionRequest(model="m", messages=messages, **fields)
+    return render_chat(request, resources, tokenize=True).token_ids
+
+
+@pytest.mark.parametrize("fields", [{}, {"tools": [_TOOL]}], ids=["plain", "tools"])
+def test_chat_ids_are_the_servers_and_are_forwarded(router, worker_fingerprint, fields):
     resources = router._render_resources("m")
-    with pytest.raises(UnsupportedRenderError):
-        render_chat(ChatCompletionRequest(model="m", messages=_MESSAGES, **fields), resources)
+    expected = _servers_chat_ids(resources, _MESSAGES, **fields)
+    tokenizer = resources.tokenizer
+    assert expected == tokenizer.apply_chat_template(
+        _MESSAGES, tools=fields.get("tools"), tokenize=True, return_dict=False
+    )
     request = ChatCompletionRequest(model="m", messages=_MESSAGES, **fields)
+    key = router._routing_key_sync(request)
+    assert key["num_tokens"] == len(expected)
+    # The router's fingerprint is the server's, so the server takes the router's ids.
+    assert request.prompt_token_ids == expected
+
+
+def test_chat_ids_are_not_forwarded_to_a_server_that_renders_differently(router, checkpoint):
+    """A server whose tokenizer file differs renders differently; it renders for itself."""
+    model_dir, checkpoint_format = checkpoint
+    other = _model_dir(_ML3 if checkpoint_format == "mistral" else _SMALL4)
+    other_format = "mistral_large_3" if checkpoint_format == "mistral" else "mistral"
+    other_resources = RenderResources.load(str(other), checkpoint_format=other_format)
+    router._server_info = {
+        _SERVER: {
+            "render_fingerprint": _worker_fingerprint(other_resources, str(other), other_format)
+        }
+    }
+    try:
+        request = ChatCompletionRequest(model="m", messages=_MESSAGES)
+        assert router._routing_key_sync(request)["num_tokens"] > 0
+        assert request.prompt_token_ids is None
+        decision = router._write_back_decision("m")
+        assert decision.mismatched == {_SERVER: "renders differently (different fingerprint)"}
+    finally:
+        router._server_info = {}
+
+
+def test_a_chat_with_images_routes_on_its_length_and_is_not_forwarded(router, worker_fingerprint):
+    pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
+    buffer = BytesIO()
+    Image.new("RGB", (64, 48), (200, 30, 30)).save(buffer, "PNG")
+    image = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": image}},
+            ],
+        }
+    ]
+    request = ChatCompletionRequest(model="m", messages=messages)
+    key = router._routing_key_sync(request)
+    text_only = ChatCompletionRequest(
+        model="m", messages=[{"role": "user", "content": "What is this?"}]
+    )
+    assert key["num_tokens"] == len(
+        _servers_chat_ids(router._render_resources("m"), text_only.messages)
+    )
+    assert request.prompt_token_ids is None
+
+
+def test_a_chat_mistral_common_rejects_routes_on_no_ids(router, worker_fingerprint):
+    """The server answers a request mistral-common rejects; the router does not fail it."""
+    messages = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]
+    request = ChatCompletionRequest(model="m", messages=messages)
+    with pytest.raises(ValueError):
+        render_chat(request, router._render_resources("m"))
+    request = ChatCompletionRequest(model="m", messages=messages)
     key = router._routing_key_sync(request)
     assert key["num_tokens"] == 0
     assert key["conv_key"] is not None  # conversation affinity still applies
     assert request.prompt_token_ids is None
 
 
-def test_responses_request_routes_on_no_ids(router):
+def test_responses_request_routes_on_the_chat_ids(router):
     request = ResponsesRequest(model="m", input="Hi there [INST]", instructions="Be brief.")
-    assert router._routing_key_sync(request)["num_tokens"] == 0
+    expected = _servers_chat_ids(
+        router._render_resources("m"),
+        [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Hi there [INST]"},
+        ],
+    )
+    assert router._routing_key_sync(request)["num_tokens"] == len(expected)
 
 
 def test_render_fingerprint_matches_the_servers(router, checkpoint):
-    """The router and a server of the checkpoint report the same rendering fingerprint.
-
-    The mistral-common tokenizer's encoding is not identified completely, so ids rendered by
-    one side are never trusted by the other: the router forwards no chat ids.
-    """
+    """The router and a server of the checkpoint report the same, complete fingerprint."""
     model_dir, checkpoint_format = checkpoint
     resources = router._render_resources("m")
     local = resources.fingerprint()
     remote = _worker_fingerprint(resources, model_dir, checkpoint_format)
     assert local["digest"] == remote["digest"]
     assert local["compared"]["model_type"] == "mistral_common"
-    assert local["compared"]["tokenizer"]["complete"] is False
-
-    router._server_info = {_SERVER: {"render_fingerprint": remote}}
-    try:
-        decision = router._write_back_decision("m")
-        assert not decision.allowed
-        assert decision.mismatched == {_SERVER: "this side's tokenizer cannot be fully identified"}
-    finally:
-        router._server_info = {}
+    encoding = local["compared"]["tokenizer"]["encoding"]
+    assert encoding["kind"] == "mistral_common" and local["compared"]["tokenizer"]["complete"]
 
 
 @pytest.mark.parametrize("checkpoint_format", [None, "HF"])

@@ -774,14 +774,12 @@ class TestCountTokens:
 
     def test_a_passthrough_model_with_its_own_input_processor_is_counted(self, tokenizer) -> None:
         # A passthrough model carries its own input processor; the count uses the text tokenizer.
-        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
 
         class OwnProcessor:
             tokenizer = None
 
-        client = self._client(
-            tokenizer, model_type="mistral_common", input_processor=OwnProcessor()
-        )
+        client = self._client(tokenizer, model_type="llava_llama", input_processor=OwnProcessor())
 
         response = client.post("/v1/messages/count_tokens", json=self.BODY)
 
