@@ -11877,11 +11877,19 @@ class PyExecutor:
         a PP-synchronized termination is deferred until all stages agree, so
         the pause below would re-admit a request whose termination is still
         pending. Raises ``NotImplementedError`` in that case.
+
+        Encoder-decoder models raise ``NotImplementedError`` because pending
+        encoder steps can publish old-weight outputs after a reset and
+        unconsumed published outputs survive until re-encoding.
         """
         if self.dist.pp_size > 1:
             raise NotImplementedError(
                 "recompute_active_requests does not support pipeline "
                 f"parallelism (pp_size={self.dist.pp_size}).")
+        if self.is_encoder_decoder:
+            raise NotImplementedError(
+                "recompute_active_requests does not support encoder-decoder models."
+            )
         if self.previous_batch is not None:
             raise RuntimeError(
                 "recompute_active_requests requires a quiescent executor (no "

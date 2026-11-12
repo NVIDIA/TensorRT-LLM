@@ -38,8 +38,6 @@ DFLASH_FOLDED_DECODE_MAX_RATIO_PER_LAUNCH = 128
 _TRTLLM_GEN_INPUT_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float8_e4m3fn})
 _TRTLLM_GEN_MAX_HEADS_RATIO = 32
 _TRTLLM_GEN_TOKENS_PER_BLOCK = frozenset({16, 32, 64})
-# trtllm-gen ships no context kernels for these head sizes.
-_TRTLLM_GEN_UNSUPPORTED_CONTEXT_HEAD_SIZES = frozenset({72, 80, 96})
 
 
 @dataclass(frozen=True)
@@ -200,7 +198,6 @@ def validate_dflash_trtllm_gen_runtime(
     num_kv_heads: int,
     head_dim: int,
     tokens_per_block: int,
-    has_context_attention: bool,
     folded_block_size: Optional[int] = None,
 ) -> None:
     """Fail before cache allocation when DFlash's kernel shape is unsupported."""
@@ -227,8 +224,4 @@ def validate_dflash_trtllm_gen_runtime(
         raise RuntimeError(
             "DFlash TRTLLM attention does not support context-cache page size "
             f"{tokens_per_block}; supported sizes are {supported}."
-        )
-    if has_context_attention and head_dim in _TRTLLM_GEN_UNSUPPORTED_CONTEXT_HEAD_SIZES:
-        raise RuntimeError(
-            f"DFlash TRTLLM context attention does not support head dimension {head_dim}."
         )

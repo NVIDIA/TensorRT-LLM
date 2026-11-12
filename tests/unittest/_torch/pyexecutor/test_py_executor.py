@@ -1781,6 +1781,16 @@ def test_recompute_projects_cross_kv_once_per_cycle(encoder_input, pause, record
         assert split_encoder_from_decoder_context_requests([request]) == ([request], [])
 
 
+def test_recompute_active_requests_rejects_encoder_decoder() -> None:
+    executor = _make_handoff_executor()
+    executor.is_encoder_decoder = True
+    executor.dist.pp_size = 1
+    executor.previous_batch = None
+
+    with pytest.raises(NotImplementedError, match="encoder-decoder"):
+        executor.recompute_active_requests()
+
+
 def test_request_terminated_before_first_context_releases_packed_output(recorded_streams):
     cancelled, sibling = (
         _make_encoder_decoder_request(1, "token", 3),
