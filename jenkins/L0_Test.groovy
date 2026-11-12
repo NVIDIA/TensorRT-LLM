@@ -975,6 +975,9 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
     if (durationsPath) {
         testListCmd += ["--durations-path=${durationsPath}"]
     }
+    if (fileExists("${testDBList}.cbts")) {
+        testListCmd += ["--cbts-test-list=${testDBList}.cbts"]
+    }
     testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
     try {
@@ -2684,6 +2687,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     script: Utils.sshUserCmd(remote, "\"mv -f ${testListPathNode}.tmp ${testListPathNode}\"")
                 )
 
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    Utils.copyFileToRemoteHost(pipeline, remote,
+                        "${testListPathLocal}.cbts", "${testListPathNode}.cbts.tmp")
+                    Utils.exec(pipeline, script: Utils.sshUserCmd(remote,
+                        "\"mv -f ${testListPathNode}.cbts.tmp ${testListPathNode}.cbts\""))
+                }
+
                 if (infraDryRun) {
                     sh "mkdir -p ${llmPath} && : > ${waivesListPathLocal}"
                 } else {
@@ -2816,6 +2826,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    extraArgs += ["--cbts-test-list=${testListPathNode}.cbts"]
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
                         "--capture=fd",
@@ -3692,6 +3705,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
+// Explicit stage selection retains the original pytest-split assignment.
+def preserveCbtsShardScope() {
+    return testFilter[(TEST_STAGE_LIST)] != null || testFilter[(EXTRA_STAGE_LIST)] != null
+}
+
 // Keep config tuples shared with the stage closures so splits can be resized
 // after command-stage selection, without moving work outside the selected scope.
 @Field
@@ -3736,10 +3754,11 @@ def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
                (cbts.enable_multi_gpu && key =~ /\d+_GPUs/)
     }
 
-    // Repartition narrowed cases over the selected shards only. For example,
-    // --stage-list A10-PyTorch-6 must run group 1/1 when CBTS needs one shard,
-    // rather than moving its cases into an unselected A10-PyTorch-1 stage.
-    def narrowedJobs = filtered.findAll { key, _ -> cbtsStageConfigs.containsKey(key) }
+    // Full-scope runs can rebalance. Explicit stage selections keep their
+    // original group IDs and split counts, then intersect after pytest-split.
+    def narrowedJobs = filtered.findAll { key, _ ->
+        !preserveCbtsShardScope() && cbtsStageConfigs.containsKey(key)
+    }
     narrowedJobs.keySet().groupBy { it.replaceFirst(/-\d+-cbts$/, "") }.each { _, names ->
         def ordered = names.sort { cbtsStageConfigs[it][2] as int }
         def original = ordered.first() - CBTS_STAGE_SUFFIX
@@ -5386,7 +5405,19 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         "'${makoOpts}'"
     ].join(" ")
 
+    sh "rm -f ${testList}.cbts"
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
+    if (preserveCbtsShardScope() && testDBPath != "${llmSrc}/tests/integration/test_lists/test-db") {
+        def narrowedLines = readFile(file: testList).readLines().collect {
+            it.replace('ISOLATION,', '').replace(',ISOLATION', '').replace(' ISOLATION', '').trim()
+        }
+        writeFile file: "${testList}.cbts", text: narrowedLines.join('\n')
+        def sourceQuery = testDBQueryCmd.replace(
+            "-d ${testDBPath}", "-d ${llmSrc}/tests/integration/test_lists/test-db")
+        sh(label: "Render original test list for shard assignment", script: sourceQuery)
+        echo "CBTS: ${stageName} preserves its original shard; filtering cases after pytest-split"
+    }
+
     // Count non-empty lines, not newlines: trt-test-db writes the test names
     // with no trailing newline, so `wc -l` undercounts by one -- it reports 0
     // for a single-test render, which would trip the empty-list guard below
@@ -5396,7 +5427,8 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     // missing file, unreadable, etc.) still aborts the step instead of being
     // silently masked.
     def testCount = sh(returnStdout: true, script: "grep -c . -- ${testList} || test \$? -eq 1").trim()
-    def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
+    def testDBLabel = fileExists("${testList}.cbts") ? "source (CBTS after sharding)" :
+        ((cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source")
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
     if (testCount == "0") {

@@ -208,9 +208,11 @@ Fallback never expands to stages outside that scope. Narrowed test-db artifact
 failures likewise use the source test-db within the selected stages.
 
 Stage patterns match original stage names even when narrowed stages have a
-`-cbts` suffix. Shard counts are reduced after stage selection, and cases are
-repartitioned across the selected shards. An explicitly selected shard 6 can
-therefore execute as group 1/1 while retaining its stage name with `-cbts`.
+`-cbts` suffix. With `--stage-list` or `--extra-stage`, stages retain their
+original shard IDs and split counts. Pytest collects and splits the full source
+test list using the original durations, then intersects each shard with CBTS's
+selected cases. An empty intersection is a successful no-op. Cases never move
+from an unselected shard into a selected shard.
 
 ## Stage scheduling
 
@@ -300,10 +302,12 @@ a successful shadow candidate.
 `k = clamp(ceil(est_seconds / 2h), 1, stage.total_splits)` (cap parsed from
 `L0_Test.groovy`). `est_seconds` sums the `.test_durations` cache over the
 stage's kept entries (exact node-id, else subtree-sum, else average — over-counts
-toward the cap, never under-sizes). After command-stage selection,
-`filterCbtsStageJobs` keeps at most `k` selected shards per stage family and
-assigns contiguous group IDs within that selection. pytest-split then balances
-within them via `least_duration`.
+toward the cap, never under-sizes). Without explicit stage-list/extra-stage
+selection, `filterCbtsStageJobs` keeps at most `k` shards per stage family;
+pytest-split balances the narrowed list within them via `least_duration`.
+Explicit stage selection instead preserves the original shard assignment and
+applies `--cbts-test-list` after splitting. This applies to both ordinary and
+sbatch execution.
 
 `cbtsResizeSplits` also renames each narrowed stage with a `-cbts` suffix so its
 narrowed result is never reused (whole-stage `REUSE_STAGE_LIST` or per-test

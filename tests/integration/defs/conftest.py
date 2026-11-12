@@ -52,7 +52,9 @@ from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
 from .test_list_parser import (TestCorrectionMode, apply_waives,
                                get_test_name_corrections_v2, handle_corrections,
-                               modify_by_test_list, preprocess_test_list_lines)
+                               modify_by_test_list,
+                               parse_and_validate_test_list,
+                               preprocess_test_list_lines)
 from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
                                    makedirs, print_info, print_warning,
                                    wsl_to_win_path)
@@ -862,6 +864,13 @@ def pytest_addoption(parser):
         help="Path to the file containing the list of tests to run",
     )
     parser.addoption(
+        "--cbts-test-list",
+        action="store",
+        default=None,
+        help=
+        "Intersect the original shard with this CBTS test list after splitting",
+    )
+    parser.addoption(
         "--workspace",
         "--ws",
         action="store",
@@ -1114,7 +1123,28 @@ def pytest_collection_modifyitems(session, config, items):
     for item in items:
         if test_prefix and item._nodeid.startswith(f"{test_prefix}/"):
             item._nodeid = item._nodeid[len(f"{test_prefix}/"):]
+    # Resolve against the full collection before splitting; unselected shards
+    # must not affect matching or trigger test-list correction suggestions.
+    cbts_list = config.getoption("--cbts-test-list")
+    cbts_names = None
+    if cbts_list:
+        parsed = parse_and_validate_test_list(cbts_list,
+                                              config,
+                                              items,
+                                              check_for_corrections=False)
+        cbts_names = {
+            name[len(test_prefix) + 1:]
+            if test_prefix and name.startswith(f"{test_prefix}/") else name
+            for name in parsed[1]
+        }
     yield
+    if cbts_names is not None:
+        deselected = [item for item in items if item.nodeid not in cbts_names]
+        items[:] = [item for item in items if item.nodeid in cbts_names]
+        config.hook.pytest_deselected(items=deselected)
+        config._cbts_empty_shard = not items
+        print(f"CBTS: kept {len(items)} cases in the original shard; "
+              f"removed {len(deselected)}")
     for item in items:
         if test_prefix:
             item._nodeid = f"{test_prefix}/{item._nodeid}"
@@ -1609,4 +1639,8 @@ def pytest_runtest_setup(item):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if (exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
+            and getattr(session.config, "_cbts_empty_shard", False)
+            and not session.testsfailed):
+        session.exitstatus = pytest.ExitCode.OK
     _prefetch_hooks.pytest_sessionfinish(session, exitstatus)
