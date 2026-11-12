@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -21,7 +22,7 @@ import torch
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm.serve.openai_protocol import RerankDocument, RerankRequest, RerankV2Request
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.reranker import build_qwen3_rerank_input, format_qwen3_rerank_prompt
 
 _DEFAULT_QWEN3_RERANK_INSTRUCTION = (
@@ -74,23 +75,24 @@ class FakeBatcher:
         return SimpleNamespace(logits=torch.tensor([next(self.logits)]))
 
 
-def _server(logits, *, max_seq_len=4096, max_num_tokens=4096):
-    server = OpenAIServer.__new__(OpenAIServer)
-    server.model = "served-reranker"
-    server._encode_max_queue_size = 2048
-    server.tokenizer = CharacterTokenizer()
-    server.encode_batcher = FakeBatcher(logits)
-    server._input_proc_executor = None
-    encoder_executor = SimpleNamespace(max_seq_len=max_seq_len, max_num_tokens=max_num_tokens)
-    server.generator = SimpleNamespace(_encoder_executor=encoder_executor)
-    return server
+@contextmanager
+def _server(tmp_path, logits, *, max_seq_len=4096, max_num_tokens=4096):
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(
+            AggConfig(role=ServerRole.RERANK, model_name="served-reranker")
+        )
+        server.tokenizer = CharacterTokenizer()
+        server.encode_batcher = FakeBatcher(logits)
+        server.generator._encoder_executor.max_seq_len = max_seq_len
+        server.generator._encoder_executor.max_num_tokens = max_num_tokens
+        yield server
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("request_type", [RerankRequest, RerankV2Request])
 async def test_document_count_rejected_before_tokenization(tmp_path, request_type):
     with isolated_serve_env(tmp_path) as env:
-        server = env.build_openai_server(AggConfig())
+        server = env.build_openai_server(AggConfig(role=ServerRole.RERANK))
         server._encode_max_queue_size = 2
         server.tokenizer = Mock()
         server.encode_batcher = Mock()
@@ -111,13 +113,12 @@ async def test_document_count_rejected_before_tokenization(tmp_path, request_typ
 @pytest.mark.parametrize("queue_limit", [2, 0])
 async def test_document_count_at_limit_or_unbounded(tmp_path, request_type, queue_limit):
     with isolated_serve_env(tmp_path) as env:
-        server = env.build_openai_server(AggConfig())
+        server = env.build_openai_server(AggConfig(role=ServerRole.RERANK))
         server._encode_max_queue_size = queue_limit
         server.tokenizer = CharacterTokenizer()
         server.encode_batcher = FakeBatcher([0.0, 1.0])
-        server.generator._encoder_executor = SimpleNamespace(
-            max_seq_len=4096, max_num_tokens=4096
-        )
+        server.generator._encoder_executor.max_seq_len = 4096
+        server.generator._encoder_executor.max_num_tokens = 4096
         request = request_type(model="reranker", query="query", documents=["a", "b"])
 
         response = await server._rerank(request)
@@ -219,171 +220,171 @@ def test_request_schema_limit_validation():
 
 
 @pytest.mark.asyncio
-async def test_v1_rerank_sorts_top_n_and_returns_documents():
-    server = _server([-2.0, 3.0, 0.0])
-    request = RerankRequest(
-        model="reranker",
-        query="query",
-        documents=["low", RerankDocument(text="high"), "middle"],
-        top_n=2,
-        return_documents=True,
-    )
-    response = await server._rerank(request)
-    body = json.loads(response.body)
+async def test_v1_rerank_sorts_top_n_and_returns_documents(tmp_path):
+    with _server(tmp_path, [-2.0, 3.0, 0.0]) as server:
+        request = RerankRequest(
+            model="reranker",
+            query="query",
+            documents=["low", RerankDocument(text="high"), "middle"],
+            top_n=2,
+            return_documents=True,
+        )
+        response = await server._rerank(request)
+        body = json.loads(response.body)
 
-    assert [result["index"] for result in body["results"]] == [1, 2]
-    assert [result["document"]["text"] for result in body["results"]] == ["high", "middle"]
-    assert all(0.0 <= result["relevance_score"] <= 1.0 for result in body["results"])
-    assert body["usage"]["prompt_tokens"] == body["usage"]["total_tokens"]
-
-
-@pytest.mark.asyncio
-async def test_v1_rerank_reports_served_model():
-    server = _server([0.0])
-    request = RerankRequest(
-        model="requested-reranker",
-        query="query",
-        documents=["document"],
-    )
-
-    response = await server._rerank(request)
-    body = json.loads(response.body)
-
-    assert response.status_code == 200
-    assert body["model"] == "served-reranker"
+        assert [result["index"] for result in body["results"]] == [1, 2]
+        assert [result["document"]["text"] for result in body["results"]] == ["high", "middle"]
+        assert all(0.0 <= result["relevance_score"] <= 1.0 for result in body["results"])
+        assert body["usage"]["prompt_tokens"] == body["usage"]["total_tokens"]
 
 
 @pytest.mark.asyncio
-async def test_v1_rerank_forwards_instruction():
-    server = _server([0.0])
-    instruction = "custom task"
-    request = RerankRequest(
-        query="query",
-        documents=["document"],
-        instruction=instruction,
-    )
+async def test_v1_rerank_reports_served_model(tmp_path):
+    with _server(tmp_path, [0.0]) as server:
+        request = RerankRequest(
+            model="requested-reranker",
+            query="query",
+            documents=["document"],
+        )
 
-    response = await server._rerank(request)
-    prompt = server.tokenizer.decode(server.encode_batcher.inputs[0])
+        response = await server._rerank(request)
+        body = json.loads(response.body)
 
-    assert response.status_code == 200
-    assert f"<Instruct>: {instruction}\n" in prompt
+        assert response.status_code == 200
+        assert body["model"] == "served-reranker"
+
+
+@pytest.mark.asyncio
+async def test_v1_rerank_forwards_instruction(tmp_path):
+    with _server(tmp_path, [0.0]) as server:
+        instruction = "custom task"
+        request = RerankRequest(
+            query="query",
+            documents=["document"],
+            instruction=instruction,
+        )
+
+        response = await server._rerank(request)
+        prompt = server.tokenizer.decode(server.encode_batcher.inputs[0])
+
+        assert response.status_code == 200
+        assert f"<Instruct>: {instruction}\n" in prompt
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("max_tokens_per_doc", [None, 4])
-async def test_v1_rerank_reuses_query_tokenization(max_tokens_per_doc: int | None) -> None:
+async def test_v1_rerank_reuses_query_tokenization(tmp_path, max_tokens_per_doc: int | None) -> None:
     documents = ["first document", "second document", "third document"]
-    server = _server([0.0] * len(documents))
-    tokenizer = Mock(wraps=CharacterTokenizer())
-    server.tokenizer = tokenizer
-    request = RerankRequest(
-        query="query",
-        documents=documents,
-        instruction="custom task",
-        max_tokens_per_doc=max_tokens_per_doc,
-    )
-
-    response = await server._rerank(request)
-
-    assert response.status_code == 200
-    texts = [call.args[0] for call in tokenizer.encode.call_args_list]
-    assert texts.count(_QWEN3_RERANK_SUFFIX) == 1
-    assert texts.count(format_qwen3_rerank_prompt("query", "", "custom task")) == 1
-    overhead = 2 if max_tokens_per_doc is None else 3
-    assert len(texts) == len(documents) + overhead
-    for document, token_ids in zip(documents, server.encode_batcher.inputs):
-        expected_document = (
-            document if max_tokens_per_doc is None else document[:max_tokens_per_doc]
-        )
-        assert server.tokenizer.decode(token_ids) == format_qwen3_rerank_prompt(
-            "query", expected_document, "custom task"
+    with _server(tmp_path, [0.0] * len(documents)) as server:
+        tokenizer = Mock(wraps=CharacterTokenizer())
+        server.tokenizer = tokenizer
+        request = RerankRequest(
+            query="query",
+            documents=documents,
+            instruction="custom task",
+            max_tokens_per_doc=max_tokens_per_doc,
         )
 
+        response = await server._rerank(request)
 
-@pytest.mark.asyncio
-async def test_v1_rerank_transfers_logits_together(monkeypatch: pytest.MonkeyPatch) -> None:
-    server = _server([-1000.0, 1000.0, 0.0])
-    request = RerankRequest(query="query", documents=["low", "high", "middle"])
-    transferred_shapes = []
-
-    def scalar_sync_is_forbidden(*args, **kwargs) -> None:
-        pytest.fail("logits must be transferred together rather than with item()")
-
-    original_tolist = torch.Tensor.tolist
-
-    def record_tolist(tensor: torch.Tensor) -> list[float]:
-        transferred_shapes.append(tuple(tensor.shape))
-        return original_tolist(tensor)
-
-    monkeypatch.setattr(torch.Tensor, "item", scalar_sync_is_forbidden)
-    monkeypatch.setattr(torch.Tensor, "tolist", record_tolist)
-
-    response = await server._rerank(request)
-    body = json.loads(response.body)
-
-    assert response.status_code == 200
-    assert transferred_shapes == [(3,)]
-    assert [result["relevance_score"] for result in body["results"]] == [1.0, 0.5, 0.0]
+        assert response.status_code == 200
+        texts = [call.args[0] for call in tokenizer.encode.call_args_list]
+        assert texts.count(_QWEN3_RERANK_SUFFIX) == 1
+        assert texts.count(format_qwen3_rerank_prompt("query", "", "custom task")) == 1
+        overhead = 2 if max_tokens_per_doc is None else 3
+        assert len(texts) == len(documents) + overhead
+        for document, token_ids in zip(documents, server.encode_batcher.inputs):
+            expected_document = (
+                document if max_tokens_per_doc is None else document[:max_tokens_per_doc]
+            )
+            assert server.tokenizer.decode(token_ids) == format_qwen3_rerank_prompt(
+                "query", expected_document, "custom task"
+            )
 
 
 @pytest.mark.asyncio
-async def test_v1_rerank_truncates_to_encoder_token_budget():
-    server = _server([0.0], max_seq_len=4096, max_num_tokens=512)
-    request = RerankRequest(
-        query="query",
-        documents=["x" * 500],
-    )
+async def test_v1_rerank_transfers_logits_together(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with _server(tmp_path, [-1000.0, 1000.0, 0.0]) as server:
+        request = RerankRequest(query="query", documents=["low", "high", "middle"])
+        transferred_shapes = []
 
-    response = await server._rerank(request)
+        def scalar_sync_is_forbidden(*args, **kwargs) -> None:
+            pytest.fail("logits must be transferred together rather than with item()")
 
-    assert response.status_code == 200
-    assert len(server.encode_batcher.inputs) == 1
-    assert len(server.encode_batcher.inputs[0]) <= 512
+        original_tolist = torch.Tensor.tolist
 
+        def record_tolist(tensor: torch.Tensor) -> list[float]:
+            transferred_shapes.append(tuple(tensor.shape))
+            return original_tolist(tensor)
 
-@pytest.mark.asyncio
-async def test_v1_top_n_zero_returns_all_results():
-    server = _server([-1.0, 1.0])
-    request = RerankRequest(
-        model="reranker",
-        query="query",
-        documents=["low", "high"],
-        top_n=0,
-    )
-    response = await server._rerank(request)
-    body = json.loads(response.body)
+        monkeypatch.setattr(torch.Tensor, "item", scalar_sync_is_forbidden)
+        monkeypatch.setattr(torch.Tensor, "tolist", record_tolist)
 
-    assert response.status_code == 200
-    assert [result["index"] for result in body["results"]] == [1, 0]
+        response = await server._rerank(request)
+        body = json.loads(response.body)
+
+        assert response.status_code == 200
+        assert transferred_shapes == [(3,)]
+        assert [result["relevance_score"] for result in body["results"]] == [1.0, 0.5, 0.0]
 
 
 @pytest.mark.asyncio
-async def test_v2_wire_shape_omits_documents():
-    server = _server([1.0, -1.0])
-    request = RerankV2Request(model="reranker", query="query", documents=["first", "second"])
-    response = await server._rerank(request)
-    body = json.loads(response.body)
+async def test_v1_rerank_truncates_to_encoder_token_budget(tmp_path):
+    with _server(tmp_path, [0.0], max_seq_len=4096, max_num_tokens=512) as server:
+        request = RerankRequest(
+            query="query",
+            documents=["x" * 500],
+        )
 
-    assert set(body) == {"id", "results", "meta"}
-    assert body["meta"]["api_version"] == {"version": "2"}
-    assert [result["index"] for result in body["results"]] == [0, 1]
-    assert all("document" not in result for result in body["results"])
+        response = await server._rerank(request)
 
-
-@pytest.mark.asyncio
-async def test_v2_rejects_nonzero_priority():
-    server = _server([0.0])
-    request = RerankV2Request(model="reranker", query="query", documents=["document"], priority=1)
-    response = await server._rerank(request)
-
-    assert response.status_code == 400
+        assert response.status_code == 200
+        assert len(server.encode_batcher.inputs) == 1
+        assert len(server.encode_batcher.inputs[0]) <= 512
 
 
 @pytest.mark.asyncio
-async def test_invalid_model_output_is_internal_error():
-    server = _server([[1.0, 2.0]])
-    request = RerankRequest(query="query", documents=["document"])
-    response = await server._rerank(request)
+async def test_v1_top_n_zero_returns_all_results(tmp_path):
+    with _server(tmp_path, [-1.0, 1.0]) as server:
+        request = RerankRequest(
+            model="reranker",
+            query="query",
+            documents=["low", "high"],
+            top_n=0,
+        )
+        response = await server._rerank(request)
+        body = json.loads(response.body)
 
-    assert response.status_code == 500
+        assert response.status_code == 200
+        assert [result["index"] for result in body["results"]] == [1, 0]
+
+
+@pytest.mark.asyncio
+async def test_v2_wire_shape_omits_documents(tmp_path):
+    with _server(tmp_path, [1.0, -1.0]) as server:
+        request = RerankV2Request(model="reranker", query="query", documents=["first", "second"])
+        response = await server._rerank(request)
+        body = json.loads(response.body)
+
+        assert set(body) == {"id", "results", "meta"}
+        assert body["meta"]["api_version"] == {"version": "2"}
+        assert [result["index"] for result in body["results"]] == [0, 1]
+        assert all("document" not in result for result in body["results"])
+
+
+@pytest.mark.asyncio
+async def test_v2_rejects_nonzero_priority(tmp_path):
+    with _server(tmp_path, [0.0]) as server:
+        request = RerankV2Request(model="reranker", query="query", documents=["document"], priority=1)
+        response = await server._rerank(request)
+
+        assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_output_is_internal_error(tmp_path):
+    with _server(tmp_path, [[1.0, 2.0]]) as server:
+        request = RerankRequest(query="query", documents=["document"])
+        response = await server._rerank(request)
+
+        assert response.status_code == 500
