@@ -624,7 +624,7 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
         return decision.decider.decide(number)
 
     assert window(0, 6).tables == {}  # GPU 1 is the busiest: the copy would load it further
-    assert window(1, 2).tables == {} and seen["gains"][-1] == {}  # loses to home on window 0
+    assert window(1, 2).tables == {} and max(seen["gains"][-1].values()) < 0  # loses on window 0
     assert sorted(window(2, 2).tables) == [0, 1]  # gains on both windows: installed
     # Even rows while that install is not live, then expert 6 hot with it live: copying expert 6 to
     # GPU 0 gains most on this window, but on the previous one the home layout beats it: home.

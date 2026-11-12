@@ -568,9 +568,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         """Record the statistics of generation steps outside warmup only, and pass the generation
         requests' progress to the runtime when it asks for it."""
         recording = num_generation_requests > 0 and generation_only and not is_warmup
-        if self.off_reason is not None or (
-            self.runtime is not None and self.runtime.failure is not None
-        ):
+        if self.off_reason is not None or getattr(self.runtime, "failure", None) is not None:
             recording = False  # nothing reads the statistics of adaptive EPLB that is off
         if recording != self.recording:
             self.recording = recording

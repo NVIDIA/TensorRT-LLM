@@ -174,9 +174,9 @@ class _Decider:
         self.next_forwards: int | None = None
         self.open_call = 0
         self.awaiting_copy: dict[int, tuple] = {}
-        # (window, rows per forward [L, E], the requests they are priced at) of the last two windows.
+        # (window, rows per forward [L, E], the requests they stand for) of the last two windows.
         self.kept: deque[tuple[int, np.ndarray, float]] = deque(maxlen=2)
-        self.close_requests = 0.0
+        self.close_requests = self.largest_change = 0.0
 
     def handle(self, message: tuple) -> tuple:
         if message[0] == "window":
@@ -240,14 +240,17 @@ class _Decider:
         if min(total["accepted"], total["requests"]) > 0:
             accepted_per_step = total["accepted"] / total["requests"]
             steps_left = total["remaining"] / accepted_per_step / total["requests"]
-        # The rows are priced at the batch the new layouts will serve: the requests at this close,
-        # carried one window ahead at the rate they changed since the previous close, over their
-        # mean across the window, taken between the two closes (1 while the batch holds).
+        # A batch that changed between two closes more than it ever did (a steady batch never does, a
+        # draining one keeps doing so) is priced where the new layouts serve it: the requests at this
+        # close carried a window ahead at that rate, over their mean across the window.
         requests, before = total["requests"], self.close_requests
-        self.close_requests = requests
-        if min(requests, before) > 0.0:
-            requests *= requests / before
-            rows = rows * (requests / ((before + total["requests"]) / 2.0))
+        change = abs(requests / before - 1.0) if min(requests, before) > 0.0 else 0.0
+        self.close_requests, ahead = requests, None
+        if change > self.largest_change:
+            ahead = requests * requests / before
+            rows = rows * (ahead / ((before + requests) / 2.0))
+        self.largest_change = max(self.largest_change, change)
+        requests = ahead or ((before + requests) / 2.0 if before > 0.0 else requests)
         applied_window = stats[:, layers * (experts + 1) : layers * (experts + 2)].min(0)
         planned = np.flatnonzero(self.committed <= applied_window)
         new_layout = np.empty((len(planned), slots), dtype=np.int64)
@@ -269,7 +272,7 @@ class _Decider:
         home_shares = (home >= 0).astype(np.float64)
         home_gains = evaluate_gains(*current, home, home_shares, model, geometry)
         left, copy = steps_left or 0.0, copy_ms or 0.0
-        to_home = home_gains * left >= gains * left - copy
+        to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - copy)
         previous_load = None
         for i, layer in enumerate(planned.tolist()):
             # The latest kept window that neither the installed layout (planned on the window the
@@ -278,13 +281,13 @@ class _Decider:
             seen = next((x for x in reversed(self.kept) if x[0] != self.committed[layer]), None)
             if seen is not None:
                 previous_load = current[0].copy() if previous_load is None else previous_load
-                previous_load[i] = seen[1][layer] * (requests / seen[2] if seen[2] > 0.0 else 1.0)
+                previous_load[i] = seen[1][layer] * (ahead / seen[2] if ahead and seen[2] else 1.0)
         if previous_load is not None:
             # Both candidates must also gain on that window, and the plan beat the home layout there.
             earlier = (previous_load, *current[1:])
             plan_gains = evaluate_gains(*earlier, new_layout, new_shares, model, geometry)
             back_gains = evaluate_gains(*earlier, home, home_shares, model, geometry)
-            to_home |= back_gains * left >= plan_gains * left - copy
+            to_home |= (home_gains > 0.0) & (back_gains * left >= plan_gains * left - copy)
             gains, home_gains = np.minimum(gains, plan_gains), np.minimum(home_gains, back_gains)
         new_layout[to_home], new_shares[to_home] = home[to_home], home_shares[to_home]
         gains[to_home] = home_gains[to_home]
@@ -725,8 +728,7 @@ class AdaptiveRuntime:
         if self._apply_event_pairs:
             begin, end = self._apply_event_pairs.popleft()
         else:
-            begin = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         begin.record()
         if update.tables:
             first, stop = min(update.tables), max(update.tables) + 1
