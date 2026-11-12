@@ -20,17 +20,20 @@ import pytest
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
     EncodeCudaGraphConfig,
     KvCacheConfig,
+    RequestError,
     RequestOutput,
     SamplingParams,
     SchedulerConfig,
 )
 
-from ..conftest import llm_models_root
+from ..conftest import llm_models_root, skip_pre_ada
 
 _SOURCE_TEXT = "translate English to German: The house is wonderful."
 _MIXED_ENCODER_SOURCE_TEXTS = [
@@ -740,6 +743,57 @@ def _run_t5_pytorch_generate_encoder_decoder(
         )
 
 
+@skip_pre_ada
+def test_t5_pytorch_fp8_self_cache_with_model_dtype_cross_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    model_path = _get_t5_model_path("t5-small")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        dtype="bfloat16",
+        model_kwargs={"torch_dtype": "bfloat16"},
+        cuda_graph_config=None,
+        disable_overlap_scheduler=True,
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            dtype="fp8",
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=False,
+        ),
+        max_batch_size=1,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    ) as llm:
+        resources = llm._executor.engine.resource_manager
+        self_cache = resources.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        cross_cache = resources.get_resource_manager(ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        assert self_cache.dtype == DataType.FP8
+        assert cross_cache.dtype == DataType.BF16
+
+        previous_token_ids = None
+        for _ in range(3):
+            response = llm.generate(_SOURCE_TEXT, _sampling_params(1, 1), use_tqdm=False)
+            token_ids = _assert_t5_response(response, num_return_sequences=1)
+            _assert_expected_generation(
+                tokenizer, token_ids, exact_match=False, expected_token_ids_by_output=None
+            )
+            if previous_token_ids is not None:
+                assert token_ids == previous_token_ids
+            previous_token_ids = token_ids
+
+
 @pytest.mark.parametrize(
     "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
     "enable_cuda_graph,num_beams,num_return_sequences,exact_match,cuda_graph_batch_sizes,"
@@ -1038,6 +1092,71 @@ def test_t5_pytorch_block_reuse_is_disabled_for_v2(
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
     ) as llm:
         assert not llm._executor.engine.model_engine.attn_runtime_features.cache_reuse
+        response = llm.generate(_SOURCE_TEXT, sampling_params=sampling_params, use_tqdm=False)
+        assert (
+            list(response.outputs[0].token_ids) == _EXPECTED_OUTPUT_TOKEN_IDS_BY_MODEL["t5-small"]
+        )
+
+
+@pytest.mark.parametrize(
+    "use_kv_cache_manager_v2,use_python_scheduler",
+    [(True, False), (False, True), (False, False)],
+    ids=["kv-v2", "kv-v1-python-scheduler", "kv-v1-cpp-scheduler"],
+)
+def test_t5_encoder_input_above_max_num_tokens_fails_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    use_kv_cache_manager_v2: bool,
+    use_python_scheduler: bool,
+) -> None:
+    """An encoder input longer than max_num_tokens fails only its own request."""
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+
+    model_path = _get_t5_model_path("t5-small")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    source_ids = tokenizer.encode(" ".join([_SOURCE_TEXT] * 8), add_special_tokens=False)
+    assert len(source_ids) > _MAX_SEQUENCE_LENGTH
+    longest_ids = source_ids[: _MAX_SEQUENCE_LENGTH - 1] + [tokenizer.eos_token_id]
+    too_long_ids = source_ids[:_MAX_SEQUENCE_LENGTH] + [tokenizer.eos_token_id]
+    sampling_params = _sampling_params(num_beams=1, num_return_sequences=1)
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        cuda_graph_config=None,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+        ),
+        max_batch_size=1,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=use_python_scheduler),
+    ) as llm:
+        with pytest.raises(
+            RequestError,
+            match=(
+                rf"encoder tokens \({len(too_long_ids)}\) exceeds the limit value "
+                rf"\({_MAX_SEQUENCE_LENGTH}\) of one encoder iteration "
+                rf"\(max_num_tokens={_MAX_SEQUENCE_LENGTH},"
+            ),
+        ):
+            llm.generate(too_long_ids, sampling_params=sampling_params, use_tqdm=False)
+
+        # The executor keeps serving: the longest encoder input that fits, then
+        # the reference prompt with its exact greedy output.
+        _assert_t5_response(
+            llm.generate(longest_ids, sampling_params=sampling_params, use_tqdm=False),
+            num_return_sequences=1,
+        )
         response = llm.generate(_SOURCE_TEXT, sampling_params=sampling_params, use_tqdm=False)
         assert (
             list(response.outputs[0].token_ids) == _EXPECTED_OUTPUT_TOKEN_IDS_BY_MODEL["t5-small"]

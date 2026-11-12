@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WeightBuffer: Composite VA layout with zero-copy local + page-pool-backed remote double buffer.
+"""WeightBuffer: Composite VA layout with zero-copy local + page-pool-backed remote prefetch slots.
 
 The WeightBuffer is the central component of DWDP weight management. It creates
 a composite virtual address space that seamlessly combines:
@@ -44,6 +44,7 @@ except ImportError:
 from .page_pool import PagePool, compute_slot_sizes
 from .specs import EdgeInfo, LayerWeightSpecs, MnnvlHandleSet, PageAlignedLayout
 from .vmm import (
+    align_up,
     free_va,
     get_allocation_granularity,
     map_handle,
@@ -52,6 +53,99 @@ from .vmm import (
     tensor_from_ptr,
     unmap_va,
 )
+
+_GIB = 1 << 30
+_MIB = 1 << 20
+
+
+class PrefetchRingMemoryError(RuntimeError):
+    """The expert prefetch ring does not fit in the free device memory.
+
+    The ring is the page pool of the remote prefetch slots (``DwdpConfig.num_prefetch_slots``,
+    two by default), each holding the remote experts of one MoE layer.  ``WeightBuffer.create``
+    raises this before it allocates any page.  ``str()`` is the message; the attributes carry its
+    numbers.  The message is the only positional argument, so the error pickles, as the
+    executor's report of a failed setup requires.
+
+    Attributes:
+        needed_bytes: Bytes of every page of every slot.
+        free_bytes: Free device memory, read after emptying the caching allocator.
+        total_bytes: Device memory.
+        device_id: CUDA device ordinal.
+        slot_pages: Pages per slot.
+        page_size: Bytes per page.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        needed_bytes: int = 0,
+        free_bytes: int = 0,
+        total_bytes: int = 0,
+        device_id: int = -1,
+        slot_pages: Tuple[int, ...] = (),
+        page_size: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.needed_bytes = needed_bytes
+        self.free_bytes = free_bytes
+        self.total_bytes = total_bytes
+        self.device_id = device_id
+        self.slot_pages = tuple(slot_pages)
+        self.page_size = page_size
+
+
+def _describe_ring(slot_pages: Tuple[int, ...], page_size: int) -> str:
+    """The ring's size and pages, e.g. ``27.22 GiB (871 + 871 pages of 16 MiB, ...)``."""
+    per_slot = " + ".join(str(count) for count in slot_pages)
+    return (
+        f"{sum(slot_pages) * page_size / _GIB:.2f} GiB ({per_slot} pages of "
+        f"{page_size / _MIB:g} MiB, the remote experts of {len(slot_pages)} MoE layers)"
+    )
+
+
+def _check_ring_fits(slot_sizes: List[int], page_size: int, device_id: int) -> Tuple[int, ...]:
+    """Refuse a page pool larger than the free device memory, before any ``cuMemCreate``.
+
+    The pool is driver memory that blocks held by the PyTorch caching allocator cannot serve, so
+    those go back to the driver first (the transport ends with that too: a no-op in practice).
+    The pool takes whole pages per slot, as ``PagePool`` counts them.  Raising here, when the
+    pages of all slots exceed the free device memory, keeps every rank from failing in
+    ``cuMemCreate`` partway through the pool.
+
+    Returns:
+        The pages per slot.
+
+    Raises:
+        PrefetchRingMemoryError: The pages of all slots need more than the free memory.
+    """
+    slot_pages = tuple(align_up(size, page_size) // page_size for size in slot_sizes)
+    needed = sum(slot_pages) * page_size
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info(device_id)
+    if free >= needed:
+        return slot_pages
+    # Two slots are the fewest the prefetch runs with.
+    fewer_slots = (
+        ", fewer prefetch slots (DwdpConfig.num_prefetch_slots)" if len(slot_pages) > 2 else ""
+    )
+    raise PrefetchRingMemoryError(
+        f"[DWDP Setup] The expert prefetch ring does not fit on GPU {device_id}: its "
+        f"{len(slot_pages)} slots need {_describe_ring(slot_pages, page_size)}, but "
+        f"{free / _GIB:.2f} GiB of {total / _GIB:.2f} GiB is free. Every rank holds its resident "
+        f"experts, the weights it replicates and this ring at once: use a larger dwdp_size (fewer "
+        f"resident experts per rank){fewer_slots} or leave more memory free before the setup. On "
+        f"a model with dense DWDP roots (Kimi-K3), dense DWDP (dwdp_config.enable_dense) releases "
+        f"the replicated dense weights before the ring is allocated (see the [DWDP Dense] lines "
+        f"above).",
+        needed_bytes=needed,
+        free_bytes=free,
+        total_bytes=total,
+        device_id=device_id,
+        slot_pages=slot_pages,
+        page_size=page_size,
+    )
 
 
 @dataclass
@@ -82,7 +176,7 @@ class LayerBufferState:
 
 
 class WeightBuffer:
-    """Composite VA layout with zero-copy local + page-pool-backed remote double buffer.
+    """Composite VA layout with zero-copy local + page-pool-backed remote prefetch slots.
 
     The WeightBuffer does NOT copy any data. It only sets up VA mappings:
         - Local region: cuMemMap to MNNVL handle (zero-copy, no D2D)
@@ -108,6 +202,8 @@ class WeightBuffer:
         "_page_pool",
         "_layer_states",
         "_moe_layer_indices",
+        "_num_slots",
+        "_slot_of_layer",
         "_released",
     )
 
@@ -119,6 +215,7 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        num_slots: int,
         granularity: Optional[int] = None,
         pool_page_size: Optional[int] = None,
     ):
@@ -131,12 +228,21 @@ class WeightBuffer:
             local_end: Last local expert index (exclusive).
             dwdp_size: Number of DWDP ranks.
             device_id: CUDA device ordinal.
+            num_slots: Number of remote prefetch slots
+                (``DwdpConfig.num_prefetch_slots``); MoE order ``o`` maps its
+                remote experts to slot ``o % num_slots``.
             granularity: VMM page granularity. If None, queries device.
             pool_page_size: Pool page handle size in bytes. If None,
                 defaults to ``PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER *
                 granularity`` (16MB on GB200). Must be a multiple of
                 granularity.
+
+        Raises:
+            ValueError: If ``num_slots`` is less than 2.
         """
+        if num_slots < 2:
+            raise ValueError(f"num_slots must be at least 2, got {num_slots}")
+        self._num_slots = num_slots
         self._layer_weight_specs = layer_weight_specs
         self._handles = handles
         self._local_start = local_start
@@ -157,6 +263,9 @@ class WeightBuffer:
         self._page_pool: Optional[PagePool] = None
         self._layer_states: Dict[int, LayerBufferState] = {}
         self._moe_layer_indices: List[int] = sorted(layer_weight_specs.keys())
+        self._slot_of_layer: Dict[int, int] = {
+            layer_idx: order % num_slots for order, layer_idx in enumerate(self._moe_layer_indices)
+        }
         self._released = False
 
     @classmethod
@@ -168,13 +277,15 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        num_slots: int,
     ) -> WeightBuffer:
         """Create all VA mappings and remote page pool.
 
         Steps:
             1. Compute page-aligned layout for each (layer, weight) pair
                (num_experts comes from WeightSpec.num_experts per layer)
-            2. Allocate page pool for remote double buffer
+            2. Check that the page pool fits in the free device memory, then
+               allocate it for the remote prefetch slots
             3. Create per-layer composite VA mappings
             4. Create tensor views
 
@@ -186,12 +297,16 @@ class WeightBuffer:
             local_end: Last local expert index (exclusive).
             dwdp_size: Number of DWDP ranks.
             device_id: CUDA device ordinal.
+            num_slots: Number of remote prefetch slots, each holding the
+                remote experts of one MoE layer.
 
         Returns:
             Ready-to-use WeightBuffer with all VA mappings established.
 
         Raises:
             ValueError: If parameters are inconsistent.
+            PrefetchRingMemoryError: The page pool does not fit in the free
+                device memory; raised before any page is allocated.
         """
         # Validate inputs
         cls._validate_inputs(layer_weight_specs, handles, local_start, local_end, dwdp_size)
@@ -204,6 +319,7 @@ class WeightBuffer:
             local_end=local_end,
             dwdp_size=dwdp_size,
             device_id=device_id,
+            num_slots=num_slots,
         )
 
         try:
@@ -214,11 +330,8 @@ class WeightBuffer:
             # Step 2: Compute slot sizes and create page pool.
             # Because layouts already have pre/post sizes aligned to
             # pool_page_size, the slot sizes are automatically aligned too.
-            buffer_slot_assignments = {
-                layer_idx: buffer.buffer_index_for_layer(layer_idx)
-                for layer_idx in layer_weight_specs.keys()
-            }
-            slot_sizes = compute_slot_sizes(layouts, buffer_slot_assignments)
+            slot_sizes = compute_slot_sizes(layouts, buffer._slot_of_layer, num_slots)
+            slot_pages = _check_ring_fits(slot_sizes, buffer._pool_page_size, device_id)
 
             buffer._page_pool = PagePool.create(
                 slot_sizes, device_id, page_size=buffer._pool_page_size
@@ -230,7 +343,8 @@ class WeightBuffer:
 
             logger.info(
                 f"[WeightBuffer] Created for {len(buffer._moe_layer_indices)} layers, "
-                f"local experts [{local_start}, {local_end}), DWDP size {dwdp_size}"
+                f"local experts [{local_start}, {local_end}), DWDP size {dwdp_size}; prefetch "
+                f"ring {_describe_ring(slot_pages, buffer._pool_page_size)}"
             )
 
             return buffer
@@ -305,20 +419,16 @@ class WeightBuffer:
             [ pre_region | mnnvl_region | post_region ]
               (page pool)  (MNNVL handle)  (page pool)
 
-        - pre_region  : page-pool fabric pages for remote experts [0, local_start)
+        - pre_region  : page-pool pages for remote experts [0, local_start)
         - mnnvl_region: zero-copy mapping of the MNNVL fabric handle
                         (contains local experts [local_start, local_end))
-        - post_region : page-pool fabric pages for remote experts [local_end, N)
+        - post_region : page-pool pages for remote experts [local_end, N)
 
-        Routing table budget (GB200):
-            ~928 total entries
-            - 696 used by Transport (3 peers × 4 weights × 58 layers, persistent)
-            - 232 used here (1 entry per weight per layer, persistent for lifetime)
-            = exactly 928 = 0 remaining.
-
-        We achieve 1 routing entry per weight by calling set_access ONCE on the
-        full composite VA (va_base, total_size).  Calling it three times
-        (once per sub-region) would consume 696 entries here, exhausting the table.
+        The page-pool pages are local ``CU_MEM_HANDLE_TYPE_NONE`` handles
+        (``PagePool``); only the MNNVL region is a fabric handle.  The three
+        regions are mapped back to back into one reservation, and one
+        set_access call covers the full composite VA (va_base, total_size)
+        instead of one call per region.
         """
         weight_specs = self._layer_weight_specs[layer_idx]
         buf_slot = self.buffer_index_for_layer(layer_idx)
@@ -376,10 +486,8 @@ class WeightBuffer:
                     page_pool_offset += layout.post_pages
 
                 # --- Single set_access for the ENTIRE composite VA ---
-                # One cuMemSetAccess call = 1 routing table entry consumed.
-                # This is critical: calling it per sub-region would consume 3
-                # entries per weight per layer (696 total) and exhaust the
-                # routing table on top of Transport's 696 persistent entries.
+                # One call covers the whole reservation instead of one call
+                # per region.
                 set_access(va_base, layout.total_size, self._device_id)
 
                 # --- Create full [num_experts, ...] tensor view ---
@@ -390,7 +498,7 @@ class WeightBuffer:
                 #
                 # When pool_granularity > granularity, pre_size may be larger
                 # than page_start due to rounding.  The difference is
-                # pre_padding bytes of unused pool-backed space at the end of
+                # pre_padding bytes of unused pool-backed space at the start of
                 # the pre-region.  The tensor view must start at
                 # va_base + pre_padding so that expert index 0 maps to the
                 # correct physical memory:
@@ -546,25 +654,6 @@ class WeightBuffer:
         """
         return self.get_layout(layer_idx, name).data_offset
 
-    def compute_peer_data_offset(self, layer_idx: int, name: str, peer_local_start: int) -> int:
-        """Compute data_offset for a peer rank given their local_start.
-
-        layer_idx is required because different layers may have
-        different expert_bytes, affecting page alignment.
-
-        Args:
-            layer_idx: Layer index.
-            name: Weight name.
-            peer_local_start: The peer rank's local_start expert index.
-
-        Returns:
-            Data offset in bytes for the peer.
-        """
-        layout = self.get_layout(layer_idx, name)
-        peer_start_bytes = peer_local_start * layout.expert_bytes
-        peer_page_start = (peer_start_bytes // self._granularity) * self._granularity
-        return peer_start_bytes - peer_page_start
-
     # --- Layout queries (diagnostics, tests) ---
 
     def get_layout(self, layer_idx: int, name: str) -> PageAlignedLayout:
@@ -621,22 +710,27 @@ class WeightBuffer:
         """CUDA device ordinal."""
         return self._device_id
 
+    @property
+    def num_slots(self) -> int:
+        """Number of remote prefetch slots."""
+        return self._num_slots
+
     def buffer_index_for_layer(self, layer_idx: int) -> int:
-        """Double buffer slot: 0 or 1 based on MoE order (odd/even).
+        """Prefetch slot of a MoE layer: its MoE order modulo ``num_slots``.
+
+        This is the only definition of the slot mapping; the weight manager's
+        prefetch schedule is built from it.
 
         Args:
-            layer_idx: Layer index.
+            layer_idx: MoE layer index.
 
         Returns:
-            Buffer slot index (0 or 1).
-        """
-        # Find position of this layer in the MoE layer sequence
-        if layer_idx in self._moe_layer_indices:
-            moe_order = self._moe_layer_indices.index(layer_idx)
-        else:
-            moe_order = layer_idx
+            Buffer slot index in ``[0, num_slots)``.
 
-        return moe_order % 2
+        Raises:
+            KeyError: If ``layer_idx`` is not a MoE layer of this buffer.
+        """
+        return self._slot_of_layer[layer_idx]
 
     def weight_names(self, layer_idx: int) -> List[str]:
         """Get weight names for a specific layer.
@@ -733,10 +827,12 @@ class WeightBuffer:
         if self._page_pool is not None:
             info["page_pool"] = {
                 "page_size": self._page_pool.page_size,
-                "slot0_pages": self._page_pool.num_pages(0),
-                "slot1_pages": self._page_pool.num_pages(1),
-                "slot0_size": self._page_pool.slot_size(0),
-                "slot1_size": self._page_pool.slot_size(1),
+                "slot_pages": [
+                    self._page_pool.num_pages(slot) for slot in range(self._page_pool.num_slots)
+                ],
+                "slot_sizes": [
+                    self._page_pool.slot_size(slot) for slot in range(self._page_pool.num_slots)
+                ],
             }
 
         return info

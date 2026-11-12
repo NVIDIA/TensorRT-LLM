@@ -85,6 +85,12 @@ SCORE_TOKENS_PER_QK_GROUP = 8
 # per-split LSE rescale factors in SMEM.
 SPLIT_REDUCTION_SCALE_BARRIER_ID = 4
 
+# The same scale barrier in the standalone 2CTA split-KV reducers, where every
+# thread of the CTA joins it. A named barrier ID reserves all lower IDs, so ID
+# 4 limited these latency-bound 128-thread CTAs to three per SM (SM107); ID 1
+# leaves residency to registers and threads (eight CTAs).
+STANDALONE_REDUCTION_SCALE_BARRIER_ID = 1
+
 # SmemPResource uses adjacent CTA barriers for the two FP8 P producer instances
 # after byte-transposed STSM stores have published their SMEM payloads.
 SMEM_P_FP8_STORE_BARRIER_BASE_ID = 4
@@ -106,11 +112,7 @@ TMA_GATHER_ROWS = 4
 # Dense MLA kernels specialize paged-KV addressing for this explicit ABI set.
 # Each listed size exactly partitions a 128-token KV tile; other page sizes are
 # outside the current kernel ABI.
-SUPPORTED_MLA_PAGE_SIZES = (16, 32, 64, 128)
-
-# Both MLA launch families and their standalone reducers share one fixed
-# workspace/scheduler split capacity.
-MAX_MLA_SPLITS_KV = 128
+SUPPORTED_MLA_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 
 # Throughput 2CTA epilogue maps 128 local threads onto two 64-row groups and
 # 128-column output halves for vectorized GMEM publication.

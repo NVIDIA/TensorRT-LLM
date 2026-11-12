@@ -20,8 +20,11 @@ class Diagnostic(ValueError):
         *,
         example: str = "",
         owner: Literal["author", "maintainer"] = "author",
+        notification_text: str | None = None,
     ) -> None:
         self.problem, self.action, self.example, self.owner = problem, action, example, owner
+        # Observation-only changes must not notify authors about the same actionable result.
+        self.notification_text = notification_text
         super().__init__(problem)
 
     def __str__(self) -> str:

@@ -34,7 +34,7 @@ except ImportError:
 from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm._dlpack_utils import pack_strided_memory
-from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_disabled
+from tensorrt_llm._utils import is_sm_120f, mpi_comm, mpi_disabled
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1095,7 +1095,7 @@ class MnnvlMemory:
         # SM120/121 (RTX PRO 6000 Blackwell) lack NVSwitch fabric; MNNVL-class
         # all-to-all kernels deadlock there even when local NVLink bridges
         # report up.
-        if get_sm_version() in (120, 121):
+        if is_sm_120f():
             return False
         dev_id = torch.cuda.current_device()
         if MnnvlMemory._is_pcie_nvl_sku(dev_id):
@@ -1129,6 +1129,26 @@ class HelixCpMnnvlMemory(MnnvlMemory):
         return (
             mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
             mapping.cp_rank,
+        )
+
+
+class TpMnnvlMemory(MnnvlMemory):
+    """MNNVL memory shared by the ranks of a tensor-parallel group (ordered by TP rank).
+
+    Per-class state is separate from MnnvlMemory's, as for HelixCpMnnvlMemory.
+    """
+
+    @classmethod
+    def comm_process_group(cls, mapping: Mapping) -> Optional[Any]:
+        """ProcessGroup equivalent of comm_split_color_key for the non-MPI path."""
+        return mapping.tp_group_pg
+
+    @classmethod
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP+CP, ordering each group by TP rank."""
+        return (
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.tp_rank,
         )
 
 

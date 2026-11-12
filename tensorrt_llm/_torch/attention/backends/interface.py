@@ -14,6 +14,8 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ...attention.backends.prims_ts.vc_attention.quantization import \
+        VCAttentionOperands
     from ...model_config import ModelConfig
     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
     from ...pyexecutor.kv_cache.mixed_precision_staging import \
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from ..kernels.sage_quant import SageQuantized
+    from .fmha.gqa_decode import KvAppendPlan
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -36,6 +39,7 @@ from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
+from .cpp_schema import cpp_field
 from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
                             SparseRuntimeParams)
 
@@ -212,6 +216,9 @@ class AttentionMetadata:
     # first prepare() on a manager with mixed-precision layers.
     mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
         init=False, default=None, repr=False, compare=False)
+    # The same for the MTP layers of a separate draft manager; swapped in for draft forwards.
+    draft_mixed_precision_staging: "MixedPrecisionKVStaging | None" = field(
+        init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -353,47 +360,80 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
-    def _has_mixed_precision_kv(self) -> bool:
-        """Whether the KV cache manager holds mixed-precision layers."""
+    def _has_mixed_precision_staging(self) -> bool:
+        """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager, "high_layers", None)
+        high_layers = getattr(self.kv_cache_manager,
+                              "mixed_precision_high_layers", None)
         return isinstance(high_layers, dict) and bool(high_layers)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
-        """Create the staging copy on first use, then refresh it per batch."""
+        """Create the staging copies on first use, then refresh them per batch."""
+        self.mixed_precision_staging = self._refresh_mixed_precision_kv(
+            self.mixed_precision_staging, self.kv_cache_manager, "mixed",
+            layout, tokens_per_block)
+        draft = self.draft_kv_cache_manager
+        draft_high_layers = getattr(draft, "mixed_precision_high_layers", None)
+        # A draft view runs on the draft manager itself and has no draft of its own.
+        if (draft is not self.kv_cache_manager
+                and isinstance(draft_high_layers, dict) and draft_high_layers):
+            self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
+                self.draft_mixed_precision_staging, draft, "draft_mixed",
+                layout, tokens_per_block)
+
+    def sync_draft_mixed_precision_staging(
+            self) -> "MixedPrecisionKVStaging | None":
+        """Give the draft staging copy the target's lengths at the start of a draft forward.
+
+        A mixed-precision MTP draft manager holds the same tokens as the target manager,
+        and overlap-scheduler corrections may have changed the target's lengths on the
+        device since prepare().
+
+        Returns:
+            The draft staging copy; None without a separate mixed-precision draft manager.
+        """
+        draft = self.draft_mixed_precision_staging
+        if draft is not None:
+            draft.lengths.copy_(self.mixed_precision_staging.lengths)
+        return draft
+
+    def _refresh_mixed_precision_kv(
+            self, view: "MixedPrecisionKVStaging | None",
+            manager: KVCacheManagerV2, name: str, layout: str,
+            tokens_per_block: int) -> "MixedPrecisionKVStaging":
         from ...pyexecutor.kv_cache.mixed_precision_staging import \
             MixedPrecisionKVStaging
 
-        view = self.mixed_precision_staging
-        if view is None or view.manager is not self.kv_cache_manager:
+        if view is None or view.manager is not manager:
             # Built once per metadata object (eager or CUDA graph copy); the
             # reserved buffer-pool block is shared, so the staging copy is
             # allocated and zeroed once per rank and the KV budget profiling
             # run already accounts for it.
             buffers = (self.cuda_graph_buffers if self.cuda_graph_buffers
                        is not None else get_memory_buffers())
-            view = MixedPrecisionKVStaging(self.kv_cache_manager,
+            view = MixedPrecisionKVStaging(manager,
                                            buffers,
                                            rows=self.max_num_sequences
                                            or self.max_num_requests,
                                            layout=layout,
                                            pool_layout=self.kv_layout,
-                                           tokens_per_block=tokens_per_block)
+                                           tokens_per_block=tokens_per_block,
+                                           name=name)
             logger.info_once(
-                "Mixed-precision KV staging on this rank: "
+                f"Mixed-precision KV staging ({name}) on this rank: "
                 f"{view.staging_bytes / (1 << 20):.1f} MiB = {view.rows} "
                 f"requests x {view.max_blocks_per_seq} pages x "
                 f"{view.max_page_bytes} B ({layout}, {tokens_per_block} "
                 "tokens per page)",
-                key="mixed_precision_kv_staging")
-            self.mixed_precision_staging = view
+                key=f"{name}_precision_kv_staging")
         view.update(self.request_ids,
                     self.kv_cache_params.num_cached_tokens_per_seq,
                     self.seq_lens.tolist(),
                     capture_graph=self.is_cuda_graph)
         self._on_mixed_precision_kv_prepared(view)
+        return view
 
     def _on_mixed_precision_kv_prepared(
             self, view: "MixedPrecisionKVStaging") -> None:
@@ -403,7 +443,9 @@ class AttentionMetadata:
             self, layer_idx: int) -> Optional["MixedPrecisionKVStaging"]:
         """Return the staging cache of a mixed-precision layer, else None."""
         staging = self.mixed_precision_staging
-        if staging is None or layer_idx not in staging.pools:
+        if (staging is None or layer_idx not in staging.pools
+                or staging.manager is not self.kv_cache_manager):
+            # No staging for a layer without a mixed-precision high pool, or of a manager not in use.
             return None
         return staging
 
@@ -1004,48 +1046,36 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
+    # Caller-facing output buffer, allocated here when absent. Native kernels
+    # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
-
-    out_scale: Optional[torch.Tensor] = None
-    out_scale_sf: Optional[torch.Tensor] = None
-    kv_scale_orig_quant: Optional[torch.Tensor] = None
-    kv_scale_quant_orig: Optional[torch.Tensor] = None
-
-    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
-    attention_input_type: AttentionInputType = AttentionInputType.mixed
-    attention_window_size: Optional[int] = None
-    attention_mask_data: Optional[torch.Tensor] = None
-    attention_sinks: Optional[torch.Tensor] = None
-    relative_attention_bias: Optional[torch.Tensor] = None
-    relative_attention_max_distance: int = 0
-    cross_kv: Optional[torch.Tensor] = None
-
+    variable_window_token_starts: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    variable_window_token_ends: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale_sf: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
-    mrope_position_deltas: Optional[torch.Tensor] = None
-
+    mrope_position_deltas: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     softmax_stats_tensor: Optional[torch.Tensor] = None
-    chunked_prefill_buffer_batch_size: int = 1
-
-    cu_q_seqlens: Optional[torch.Tensor] = None
-    cu_kv_seqlens: Optional[torch.Tensor] = None
-    fmha_scheduler_counter: Optional[torch.Tensor] = None
-    # Testing only: skip the RoPE step of MLA generation (the standalone harness
-    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
-    # and inits the trtllm-gen scheduler buffers itself.
-    skip_mla_rope_generation: bool = False
-
-    mla_bmm1_scale: Optional[torch.Tensor] = None
-    mla_bmm2_scale: Optional[torch.Tensor] = None
+    attention_sinks: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    cu_q_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.uint32)
+    mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
-    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
-    # When non-None alongside `quant_q_buffer`, the C++ op skips
-    # `quantizeCopyInputToFp8Kernel`.
-    quant_scale_qkv: Optional[torch.Tensor] = None
-
-    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
+    cross_kv: Optional[torch.Tensor] = None
+    relative_attention_bias: Optional[torch.Tensor] = None
+    quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.float32)
     enable_dsv4_epilogue_fusion: bool = False
 
     # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
@@ -1054,6 +1084,13 @@ class AttentionForwardArgs:
     kv_norm_weight: Optional[torch.Tensor] = None
     kv_norm_eps: float = 1e-6
 
+    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
+    attention_input_type: AttentionInputType = AttentionInputType.mixed
+    attention_window_size: Optional[int] = None
+    attention_mask_data: Optional[torch.Tensor] = cpp_field(dtype=torch.bool)
+    relative_attention_max_distance: int = 0
+    chunked_prefill_buffer_batch_size: int = 1
+    skip_mla_rope_generation: bool = False
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
@@ -1069,12 +1106,24 @@ class AttentionForwardArgs:
     # E4M3 with one scale each, folded into the softmax and output scales.
     qk_fp8_per_tensor: bool = False
     v_fp8_per_tensor: bool = False
+    # VC-Attention recipe of the PrimTS FMHA library. The caller prepares the
+    # operands (K in grouped token order, V as E4M3 tile residuals with its
+    # scale and means, under QK8 the rotated E4M3 Q and K with their block
+    # scales) and the library runs the matching plan on them.
+    vc_attention: bool = False
+    vc_operands: Optional["VCAttentionOperands"] = None
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
+    # Attention output gate [num_tokens, ...] offered to the FMHA library: one that multiplies sigmoid(gate) into
+    # the output sets output_gate_applied, and the caller applies the gate otherwise.
+    output_gate: Optional[torch.Tensor] = None
+    output_gate_applied: bool = False
+    # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
+    kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
-    timestep: Optional[torch.Tensor] = None
+    timestep: Optional[Union[torch.Tensor, float]] = None
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
     # algorithm, resolved on the host by the caller. When set, backends use it
     # instead of reading ``timestep``, which CUDA Graph capture cannot do.
@@ -1086,8 +1135,7 @@ class AttentionForwardArgs:
 
     @property
     def mask_type(self) -> int:
-        """Integer mask type accepted by the C++ attention op
-        (``causal`` or ``padding``)."""
+        """Return the mask type this forward pass asks the native attention op for."""
         if self.attention_mask == PredefinedAttentionMask.CAUSAL:
             return int(AttentionMaskType.causal)
         if self.attention_mask == PredefinedAttentionMask.FULL:
@@ -1110,23 +1158,19 @@ _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
 
 
 def merge_attention_forward_args(
-    forward_args: Optional[AttentionForwardArgs],
-    kwargs: Dict[str, Any],
-) -> AttentionForwardArgs:
+        forward_args: Optional[AttentionForwardArgs],
+        kwargs: Dict[str, Any]) -> AttentionForwardArgs:
     """Merge legacy attention kwargs into explicit forward arguments."""
-
     unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
     if unknown_kwargs:
         raise ValueError(
             f"Unknown attention forward arguments: {unknown_kwargs}")
-
     if forward_args is not None:
         if kwargs:
             raise ValueError(
                 "Pass attention forward options either through forward_args "
                 f"or as legacy kwargs, not both: {sorted(kwargs)}")
         return forward_args
-
     return AttentionForwardArgs(**kwargs)
 
 

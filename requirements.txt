@@ -1,5 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cu132
 -c constraints.txt
+# filelock 4.2.1 requires Python 3.11+. Pin Python 3.10 to 3.20.3 to exclude
+# vulnerable releases 3.20.4 through 4.2.0; newer Python can use 4.2.1 or later.
+filelock==3.20.3; python_version < "3.11"
+filelock>=4.2.1; python_version >= "3.11"
 accelerate>=1.7.0
 build
 colored
@@ -22,7 +26,9 @@ pulp
 pandas
 h5py==3.12.1
 StrEnum
-sentencepiece>=0.1.99
+# sentencepiece>=0.2.3 bundles protobuf 7.36.1 gencode that fails to import on the protobuf<7
+# runtime below; it does not declare this, so pip cannot resolve around it. Lift with the protobuf pin.
+sentencepiece>=0.1.99,<0.2.3
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09 uses 2.14.0a0.
 # The floor is the NGC alpha, which PEP 440 orders below the public release of the same
 # series; the ceiling is that public release, which is what the resolver picks off the public
@@ -68,7 +74,7 @@ peft>=0.18.1,<0.19.0
 patchelf
 einops
 fla-core==0.5.2 # the Kimi Linear / Kimi K3 KDA layers import fla.modules and fla.ops when they load
-flashinfer-python==0.6.18
+flashinfer-python==0.7.2
 xgrammar==0.2.8
 llguidance==0.7.29
 jsonschema
@@ -106,7 +112,7 @@ cuda-core
 llist
 cuda-tile>=1.0.1
 nvidia-cuda-tileiras>=13.1,<13.2
-nvidia-cudnn-frontend>=1.27.0,<1.28
+nvidia-cudnn-frontend>=1.31.0,<1.32
 etcd-sdk-python==0.0.7
 # Required by the checked-in OpenEngine gRPC bindings.
 grpcio>=1.73.1,<2
@@ -114,6 +120,8 @@ grpcio>=1.73.1,<2
 grpcio-health-checking>=1.73.1,<1.82
 # etcd-sdk-python imports google.protobuf but omits it from its package metadata.
 # The binding lower bound comes from the CUTLASS DSL libraries, which need protobuf 6.x.
+# sentencepiece>=0.2.3 needs a protobuf>=7.36.1 runtime; drop the sentencepiece<0.2.3 cap
+# above only once this floor reaches 7.36.1.
 protobuf>=6.30.2,<7
 python-multipart
 cache-dit>=1.3.5

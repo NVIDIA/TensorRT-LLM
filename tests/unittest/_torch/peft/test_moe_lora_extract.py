@@ -74,6 +74,30 @@ def _make_lora_params(layer_idx, modules, num_seqs=1):
 
 
 # ---------------------------------------------------------------------------
+# Cache dtype propagation.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_propagates_fp8_cache_dtype():
+    layer_idx = 0
+    modules = {
+        LoraModuleType.MOE_H_TO_4H: (16, 0x1110, 0x1111),
+        LoraModuleType.MOE_4H_TO_H: (16, 0x2220, 0x2221),
+    }
+    lora_params = _make_lora_params(layer_idx, modules)
+    lora_params["data_type"] = torch.float8_e4m3fn
+
+    result = _extract(layer_idx, lora_params)
+
+    assert result is not None
+    assert result["lora_dtype"] == torch.float8_e4m3fn
+
+
+def test_extract_allows_fp8_cache_without_active_moe_weights():
+    assert _extract(0, {"data_type": torch.float8_e4m3fn}) is None
+
+
+# ---------------------------------------------------------------------------
 # Routing correctness (the swap regression).
 # ---------------------------------------------------------------------------
 

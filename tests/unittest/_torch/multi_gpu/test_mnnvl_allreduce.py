@@ -979,6 +979,73 @@ def test_mnnvl_rms_norm_fusion_without_residual(seq_len, hidden_size,
         assert r is True
 
 
+@torch.inference_mode()
+def run_fp8_payload_single_rank(tensor_parallel_size, input, residual,
+                                norm_weight, eps, reference_residual):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        input, residual = input.cuda(), residual.cuda()
+        norm_weight = norm_weight.cuda()
+        reference_residual = reference_residual.cuda()
+        os.environ["TLLM_TEST_MNNVL"] = "1"
+        MPI.COMM_WORLD.barrier()
+        mapping = Mapping(world_size=tensor_parallel_size,
+                          tp_size=tensor_parallel_size,
+                          rank=rank)
+
+        def params(fp8_payload):
+            return AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=eps,
+                fp8_payload=fp8_payload,
+            )
+
+        allreduce = MNNVLAllReduce(mapping, torch.bfloat16)
+        _, res_exact = allreduce(input, all_reduce_params=params(False))
+        norm_fp8, res_fp8 = allreduce(input, all_reduce_params=params(True))
+        torch.cuda.synchronize()
+        # Two E4M3 roundings (3 mantissa bits) on a per-256-element scale.
+        bound = 0.15 * reference_residual.float().abs().max().item()
+        err = (res_fp8.float() - reference_residual.float()).abs().max().item()
+        assert err <= bound, (err, bound)
+        assert not torch.equal(res_fp8,
+                               res_exact), "the E4M3 payload was not used"
+        assert torch.isfinite(norm_fp8.float()).all()
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        # The pool worker is reused: later tests must not see the MNNVL override.
+        os.environ.pop("TLLM_TEST_MNNVL", None)
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_fp8_payload_residual_rms_norm(mpi_pool_executor):
+    """fp8_payload: the two-shot residual RMSNorm call exchanges E4M3, close to the exact sum."""
+    torch.manual_seed(7)
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    seq_len, hidden_size, eps = 256, 4096, 1e-6  # two-shot (> 1 MiB message)
+    x = torch.randn((tensor_parallel_size, seq_len, hidden_size),
+                    dtype=torch.bfloat16)
+    residual = torch.randn((seq_len, hidden_size), dtype=torch.bfloat16)
+    norm_weight = torch.randn((hidden_size, ), dtype=torch.bfloat16)
+    reference_residual = (torch.sum(x.float(), dim=0) + residual.float()).to(
+        torch.bfloat16)
+    results = mpi_pool_executor.map(
+        run_fp8_payload_single_rank,
+        *zip(*[(tensor_parallel_size, x[i], residual, norm_weight, eps,
+                reference_residual) for i in range(tensor_parallel_size)]),
+    )
+    for r in results:
+        assert r is True
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

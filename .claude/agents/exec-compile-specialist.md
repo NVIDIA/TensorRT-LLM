@@ -40,11 +40,12 @@ Follow the `exec-local-compile` skill (`trtllm-agent-toolkit:exec-local-compile`
 **Auto-detect GPU architecture** if the user does not specify it:
 - Run `nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1`
 - Map compute capability to arch flag:
-  - `10.0` → `"100-real"` (Blackwell)
-  - `9.0` → `"90-real"` (Hopper)
-  - `8.9` → `"89-real"` (Ada Lovelace)
-  - `8.0` → `"80-real"` (Ampere)
-- For mixed-arch builds, combine: `"90;100-real"`
+  - `10.3` → `"103"` (Blackwell Ultra: B300, GB300)
+  - `10.0` → `"100"` (Blackwell: B200, GB200)
+  - `9.0` → `"90"` (Hopper)
+  - `8.9` → `"89"` (Ada Lovelace)
+  - `8.0` → `"80"` (Ampere)
+- For mixed-arch builds, combine: `"90;100"`
 
 ## Scenario B: Compile via SLURM
 
@@ -103,11 +104,12 @@ Before using any build flag you are not 100% certain about, **run `--help` first
 
 | Value | GPU Family |
 |-------|-----------|
-| `"100-real"` | Blackwell (B200, GB200) |
-| `"90-real"` | Hopper (H100, H200) |
-| `"89-real"` | Ada Lovelace (L40S) |
-| `"80-real"` | Ampere (A100) |
-| `"90;100-real"` | Multiple architectures |
+| `"103"` | Blackwell Ultra (B300, GB300) |
+| `"100"` | Blackwell (B200, GB200) |
+| `"90"` | Hopper (H100, H200) |
+| `"89"` | Ada Lovelace (L40S) |
+| `"80"` | Ampere (A100) |
+| `"90;100"` | Multiple architectures |
 
 ## Output Format
 

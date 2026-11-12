@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,8 +53,11 @@ def parse_test_list_or_db(test_list, trt_config):
 
         test_names = []
         context_name = os.path.basename(test_list).replace(".yml", "")
-        for condition in test_db_data[context_name]:
-            test_names.extend(condition["tests"])
+        if "tests" in test_db_data:
+            test_names = [entry["case"] for entry in test_db_data["tests"]]
+        else:
+            for condition in test_db_data[context_name]:
+                test_names.extend(condition["tests"])
 
     else:
         raise ValueError(f"Unexpected test list name: {test_list}")

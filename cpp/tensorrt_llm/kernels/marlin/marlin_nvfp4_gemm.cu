@@ -328,7 +328,7 @@ void marlinNvfp4Gemm(void const* act_bf16, void const* weight, void* output, voi
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(isMarlinNvfp4DenseSmSupported(sm),
-        "Marlin NVFP4 GEMM is only supported on SM89, SM90-99, and SM120/121; current SM = %d", sm);
+        "Marlin NVFP4 GEMM is only supported on SM89, SM90-99, and the SM120 family; current SM = %d", sm);
 
     int dev;
     cudaGetDevice(&dev);

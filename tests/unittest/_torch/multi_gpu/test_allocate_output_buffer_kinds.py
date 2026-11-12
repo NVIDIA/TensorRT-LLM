@@ -29,6 +29,13 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.autotuner import (
+    AutoTuner,
+    DistributedTuningStrategy,
+    TunableRunner,
+    TuningConfig,
+    autotune,
+)
 from tensorrt_llm._torch.distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -222,6 +229,56 @@ def _run_allreduce_nccl_window(tp_size, tp_rank, seq_len, hidden_size):
     return True
 
 
+def _run_parallel_tuning_then_window_allreduce(tp_size, tp_rank, seq_len, hidden_size):
+    """PARALLEL-tune a window-output runner, then all-reduce in a fresh window on every rank."""
+    from tensorrt_llm.bindings.internal.thop import BufferKind
+
+    def _allocate(ref, tp_group):
+        return torch.ops.trtllm.allocate_output(ref, int(BufferKind.NCCL_WINDOW), tp_group)
+
+    class WindowOutputRunner(TunableRunner):
+        def __init__(self, tp_group):
+            self.tp_group = tp_group
+
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0]
+
+        def forward(self, inputs, *, tactic=-1, **kwargs):
+            out, _ = _allocate(inputs[0], self.tp_group)
+            return out.copy_(inputs[0])
+
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
+    ref = torch.ones(seq_len, hidden_size, dtype=torch.bfloat16, device="cuda")
+    with discard_nccl_window_tensor_outputs(ref):
+        _, actual_kind_int = _allocate(ref, mapping.tp_group)
+    if actual_kind_int != int(BufferKind.NCCL_WINDOW):
+        return _SKIP
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(mapping)
+    try:
+        # A single tactic is profiled by rank 0 only.
+        with autotune():
+            tuner.choose_one(
+                "test_parallel_tuning_then_window_allreduce",
+                [WindowOutputRunner(mapping.tp_group)],
+                TuningConfig(distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL),
+                [ref],
+            )
+    finally:
+        tuner.setup_distributed_state(Mapping(), None)
+
+    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
+    with discard_nccl_window_tensor_outputs(ref):
+        out, actual_kind_int = _allocate(ref, mapping.tp_group)
+        assert actual_kind_int == int(BufferKind.NCCL_WINDOW)
+        out.copy_(ref)
+        result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
+        torch.testing.assert_close(result, torch.full_like(result, tp_size), atol=1e-2, rtol=1e-2)
+    return True
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize(
     "seq_len,hidden_size",
@@ -293,6 +350,21 @@ def test_allreduce_nccl_window_buffer(seq_len, hidden_size, mpi_pool_executor):
         mpi_pool_executor.map(
             run_single_rank,
             *zip(*[(tp_size, _run_allreduce_nccl_window, seq_len, hidden_size)] * tp_size),
+        )
+    )
+    for r in results:
+        assert r is True or r == _SKIP, f"Unexpected result: {r}"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_parallel_tuning_keeps_nccl_windows_symmetric(mpi_pool_executor):
+    tp_size = mpi_pool_executor.num_workers
+    results = list(
+        mpi_pool_executor.map(
+            run_single_rank,
+            *zip(*[(tp_size, _run_parallel_tuning_then_window_allreduce, 256, 4096)] * tp_size),
         )
     )
     for r in results:

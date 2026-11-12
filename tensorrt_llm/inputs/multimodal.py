@@ -23,7 +23,7 @@ from blake3 import blake3
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
                                                  BaseModalityData, VideoData,
-                                                 serialize_item)
+                                                 _hash_serialized_item)
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -638,9 +638,9 @@ class MultimodalInput:
     multimodal_uuids: Optional[List[Optional[str]]] = None
     """Optional user-provided UUIDs for multimodal data items.
 
-    When provided, these UUIDs will be returned in KV cache events instead of the
-    computed hash hex string. This enables deterministic cache identification across
-    sessions using user-defined stable identifiers.
+    When provided, these UUIDs are preserved in KV cache events. V1 reports the UUID
+    through the legacy ``hash`` field; V2 keeps the derived digest in ``hash`` and
+    reports the UUID through the optional ``uuid`` field.
 
     Each element can be:
     - A string UUID: Used as the cache identifier (returned in events)
@@ -1282,7 +1282,7 @@ def _update_hash(hasher, item: object) -> None:
     if isinstance(item, BaseModalityData):
         item.update_hash(hasher)
         return
-    hasher.update(serialize_item(item))
+    _hash_serialized_item(hasher, item)
 
 
 class MMHashResult(NamedTuple):

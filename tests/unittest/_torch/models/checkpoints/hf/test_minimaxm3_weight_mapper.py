@@ -178,10 +178,10 @@ def test_gate_bias_params_map() -> None:
     assert renamed["model.layers.3.block_sparse_moe.gate.weight"] is gate_weight
 
 
-def test_load_weights_accepts_base_mapper_without_params_map() -> None:
+def _make_layerless_model(model_class: type = MiniMaxM3ForCausalLM) -> MiniMaxM3ForCausalLM:
     config = SimpleNamespace(num_key_value_heads=_NUM_KV_HEADS, num_attention_heads=8)
     model_config = ModelConfig(pretrained_config=config, mapping=Mapping())
-    model = object.__new__(MiniMaxM3ForCausalLM)
+    model = object.__new__(model_class)
     torch.nn.Module.__init__(model)
     model.model_config = model_config
     # This mapper-only fixture has no decoder layers to refresh after loading.
@@ -189,6 +189,13 @@ def test_load_weights_accepts_base_mapper_without_params_map() -> None:
     model.model.layers = torch.nn.ModuleList()
     # Set by SpecDecOneEngineForCausalLM.__init__, which this test bypasses.
     model.spec_config = None
+    # Set by MiniMaxM3VLForConditionalGeneration.__init__ for text-only configs.
+    model.vision_tower = None
+    return model
+
+
+def test_load_weights_accepts_base_mapper_without_params_map() -> None:
+    model = _make_layerless_model()
     mapper = HfWeightMapper()
     source_name = "model.layers.3.block_sparse_moe.e_score_correction_bias"
     target_name = "model.layers.3.block_sparse_moe.gate.e_score_correction_bias"
@@ -201,3 +208,41 @@ def test_load_weights_accepts_base_mapper_without_params_map() -> None:
     assert call_kwargs["weight_mapper"] is mapper
     renamed = mapper.rename_by_params_map(call_kwargs["params_map"], {source_name: bias})
     assert renamed[target_name] is bias
+
+
+@pytest.mark.parametrize(
+    ("model_class", "checkpoint_prefix"),
+    [
+        (MiniMaxM3ForCausalLM, ""),
+        (MiniMaxM3VLForConditionalGeneration, "language_model."),
+    ],
+    ids=["text", "vl"],
+)
+def test_load_weights_converts_compressed_tensors_nvfp4_experts(
+    model_class: type, checkpoint_prefix: str
+) -> None:
+    model = _make_layerless_model(model_class)
+    expert = "model.layers.3.block_sparse_moe.experts.0.w1"
+    packed = torch.tensor([[1, 2]], dtype=torch.uint8)
+    block_scale = torch.ones(1, 1).to(torch.float8_e4m3fn)
+    weights = {
+        f"{checkpoint_prefix}{expert}.weight_packed": packed,
+        f"{checkpoint_prefix}{expert}.weight_scale": block_scale,
+        f"{checkpoint_prefix}{expert}.weight_global_scale": torch.tensor([4.0]),
+        f"{checkpoint_prefix}{expert}.input_global_scale": torch.tensor([0.0]),
+    }
+
+    with patch.object(DecoderModelForCausalLM, "load_weights") as base_load_weights:
+        model.load_weights(weights, weight_mapper=HfWeightMapper())
+
+    loaded = base_load_weights.call_args.kwargs["weights"]
+    assert set(loaded.keys()) == {
+        f"{expert}.weight",
+        f"{expert}.weight_scale",
+        f"{expert}.weight_scale_2",
+        f"{expert}.input_scale",
+    }
+    assert loaded[f"{expert}.weight"] is packed
+    assert loaded[f"{expert}.weight_scale"] is block_scale
+    torch.testing.assert_close(loaded[f"{expert}.weight_scale_2"], torch.tensor([0.25]))
+    torch.testing.assert_close(loaded[f"{expert}.input_scale"], torch.tensor([0.0]))

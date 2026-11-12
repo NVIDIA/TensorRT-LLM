@@ -121,7 +121,6 @@ def _make_reap_coordinator(*, requests_in_transfer, inflight_cancel_supported=Tr
         effects=effects,
         registry=_registry_over([]),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     return coordinator, transceiver, effects
 
@@ -304,6 +303,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch: pytest.Monke
         py_request_id=7,
         is_child=False,
         is_context_only_request=True,
+        is_generation_only_request=False,
         py_kv_transfer_timed_out=True,
         py_decoding_iter=3,
         finish_by_reason=Mock(),

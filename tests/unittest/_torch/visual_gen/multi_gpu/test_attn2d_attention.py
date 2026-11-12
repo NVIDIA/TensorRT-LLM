@@ -19,6 +19,7 @@ Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py -v
 """
 
+import contextlib
 import math
 import os
 
@@ -55,6 +56,16 @@ def _cleanup_mpi_env():
 # =============================================================================
 # Test-only inner backend: VanillaAttention with LSE output
 # =============================================================================
+
+
+@contextlib.contextmanager
+def _ieee_fp32_matmul():
+    saved = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved
 
 
 class _LSEVanillaAttention(nn.Module):
@@ -122,14 +133,17 @@ class _LSEVanillaAttention(nn.Module):
         k_t = k.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         v_t = v.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         k_t, v_t = self._expand_kv_heads(k_t, v_t)
-        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale  # [B, H, S_q, S_k]
         key_padding_mask = kwargs.get("key_padding_mask")
         self.saw_key_padding_mask = self.saw_key_padding_mask or key_padding_mask is not None
-        if key_padding_mask is not None:
-            scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
-        lse = torch.logsumexp(scores, dim=-1)  # [B, H, S_q]
-        attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v_t)  # [B, H, S_q, D]
+        # NGC PyTorch images set TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1. This stub must be exact
+        # fp32 attention so the comparison isolates the gather/all_to_all/combine path.
+        with _ieee_fp32_matmul():
+            scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale  # [B, H, S_q, S_k]
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
+            lse = torch.logsumexp(scores, dim=-1)  # [B, H, S_q]
+            attn = torch.softmax(scores, dim=-1)
+            out = torch.matmul(attn, v_t)  # [B, H, S_q, D]
         return out.to(q.dtype).transpose(1, 2).contiguous(), lse
 
 

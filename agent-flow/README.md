@@ -119,6 +119,19 @@ transport uses the SDK's public process/request APIs and one isolated
 notification observer to include child turns and account events. This observer
 is covered by transport tests against the pinned SDK.
 
+Runtime and permission policy belong to the launching environment. Claude uses the SDK's
+runtime selection unless `AGENT_FLOW_CLAUDE_CLI` explicitly names a binary; Codex uses its
+pinned runtime unless `CODEX_BIN` names one (PATH is a fallback only when no runtime package is
+installed). The adapters never compare installed versions to replace a runtime automatically.
+
+Neither adapter selects a sandbox or approval policy. Configure native CLI permissions before
+launching unattended work; the workflow's capability probe checks that required tools work.
+Codex `writable_roots` adds explicitly requested paths to its workspace-write configuration while
+preserving native roots; it does not change the sandbox mode or grant approvals. Requests for
+additional permission are declined with diagnostics because this transport has no interactive
+approval handler. Startup errors propagate once; retry/backoff belongs to the workflow or caller.
+Tool allow/deny lists and plugin/MCP scope remain per-session configuration.
+
 ## Tests
 
 ```bash
@@ -126,9 +139,6 @@ pip install -e '.[test]'
 python -m pytest tests
 pre-commit run -a
 ```
-
-Live Claude context-budget checks require local account configuration and are
-opt-in: `python -m pytest tests --run-live-backends -m live_backend`.
 
 ## Workflows
 

@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
 )
+from tensorrt_llm._torch.attention.backends.sparse.hooks import has_sparse_mla_hooks
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm.mapping import Mapping
 
@@ -59,22 +60,46 @@ def build_attention_metadata(
     draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
     enable_context_mla_with_cached_kv: bool | None = None,
     max_num_heads_per_kv: int | None = None,
+    enable_ragged_verification: bool = False,
 ) -> AttentionMetadata:
     """Construct attention metadata and resolve model-derived inputs."""
     pretrained_config = model_config.pretrained_config
+    sparse_attention_config = model_config.sparse_attention_config
+    sparse_mla = has_sparse_mla_hooks(getattr(sparse_attention_config, "algorithm", None))
     if enable_context_mla_with_cached_kv is None:
+        # Dense owner-only Helix prefill needs append indptrs even without cached tokens.
         enable_context_mla_with_cached_kv = is_mla(pretrained_config) and (
-            attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
+            attention_runtime_features.cache_reuse
+            or attention_runtime_features.chunked_prefill
+            or (not sparse_mla and mapping.has_cp_helix())
+        )
+    elif (
+        enable_context_mla_with_cached_kv is False
+        and is_mla(pretrained_config)
+        and not sparse_mla
+        and mapping.has_cp_helix()
+    ):
+        raise ValueError(
+            "Helix MLA requires enable_context_mla_with_cached_kv=True "
+            "to prepare owner-only KV append metadata"
         )
     if max_num_heads_per_kv is None:
         max_num_heads_per_kv = _get_max_num_heads_per_kv(model_config)
 
-    sparse_attention_config = model_config.sparse_attention_config
     sparse_metadata_params = (
         sparse_attention_config.to_sparse_metadata_params(pretrained_config=pretrained_config)
         if sparse_attention_config is not None
         else None
     )
+    metadata_kwargs = {}
+    if enable_ragged_verification:
+        from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+            DSAtrtllmAttentionMetadata,
+        )
+
+        if not issubclass(attention_backend.Metadata, DSAtrtllmAttentionMetadata):
+            raise ValueError("Ragged verification requires the DSA target metadata backend")
+        metadata_kwargs["enable_ragged_verification"] = True
     return attention_backend.Metadata(
         max_num_requests=max_batch_size,
         max_num_tokens=max_num_tokens,
@@ -88,4 +113,5 @@ def build_attention_metadata(
         cache_indirection=cache_indirection,
         max_num_heads_per_kv=max_num_heads_per_kv,
         sparse_metadata_params=sparse_metadata_params,
+        **metadata_kwargs,
     )

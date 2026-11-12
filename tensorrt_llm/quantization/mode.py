@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@ from typing import Optional
 
 from strenum import StrEnum
 
+from .._errors import UnsupportedError
 from .._utils import BaseEnumMeta
 
 
@@ -48,7 +49,17 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A16_NVFP4 = auto()
     NVFP4_AWQ = auto()
     NVFP4_ARC = auto()
+    NVFP4_PLUS = auto()
     NO_QUANT = auto()
+
+    @classmethod
+    def _missing_(cls, value):
+        # An unknown name, e.g. from a checkpoint quantized with a newer format.
+        # UnsupportedError is a ValueError, which Enum raises by default.
+        raise UnsupportedError(
+            f"{value!r} is not a valid {cls.__qualname__}",
+            hint="Upgrade TensorRT-LLM, or use a quantization format that this "
+            "version supports.")
 
 
 QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
@@ -103,6 +114,9 @@ class QuantMode(IntFlag):
     W4A16_MXFP4 = auto()
     # MXFP8 weights (e4m3 + UE8M0 1x32 block scales) with MXFP8 dynamic activations (W8A8).
     MXFP8 = auto()
+    # E2M1 weights and dynamic activations with UE5M3 1x32 block scales and no
+    # per-tensor scale (W4A4).
+    NVFP4_PLUS = auto()
 
     # The smallest power-of-two that is not used by a flag. Do not call auto() after that line.
     COUNT = auto()
@@ -203,6 +217,9 @@ class QuantMode(IntFlag):
     def has_mxfp8(self):
         return self._any(self.MXFP8)
 
+    def has_nvfp4_plus(self):
+        return self._any(self.NVFP4_PLUS)
+
     def has_mxfp4(self):
         return self._any(self.W4A8_MXFP4_FP8 | self.W4A8_MXFP4_MXFP8
                          | self.W4A16_MXFP4)
@@ -222,7 +239,8 @@ class QuantMode(IntFlag):
                               | self.W4A8_MXFP4_FP8
                               | self.W4A16_MXFP4
                               | self.W4A8_MXFP4_MXFP8
-                              | self.MXFP8)
+                              | self.MXFP8
+                              | self.NVFP4_PLUS)
         if exclude_kv_cache:
             return has_quant
 
@@ -262,7 +280,8 @@ class QuantMode(IntFlag):
                          use_w4a8_mxfp4_fp8=False,
                          use_w4a8_mxfp4_mxfp8=False,
                          use_w4a16_mxfp4=False,
-                         use_mxfp8=False):
+                         use_mxfp8=False,
+                         use_nvfp4_plus=False):
 
         def raise_error():
             raise ValueError(f"Unsupported combination of QuantMode args: "
@@ -282,7 +301,8 @@ class QuantMode(IntFlag):
                              f"{use_w4a8_mxfp4_fp8=}, "
                              f"{use_w4a8_mxfp4_mxfp8=}, "
                              f"{use_w4a16_mxfp4=}, "
-                             f"{use_mxfp8=}")
+                             f"{use_mxfp8=}, "
+                             f"{use_nvfp4_plus=}")
 
         # We must quantize weights when we quantize activations.
         if quantize_activations and not quantize_weights:
@@ -351,6 +371,9 @@ class QuantMode(IntFlag):
 
         if use_mxfp8:
             mode = mode | QuantMode.MXFP8
+
+        if use_nvfp4_plus:
+            mode = mode | QuantMode.NVFP4_PLUS
 
         return mode
 
@@ -443,6 +466,8 @@ class QuantMode(IntFlag):
             quant_mode = QuantMode.from_description(use_mxfp8=True)
         elif quant_algo == QuantAlgo.W4A16_NVFP4:
             quant_mode = QuantMode.from_description(use_nvfp4=True)
+        elif quant_algo == QuantAlgo.NVFP4_PLUS:
+            quant_mode = QuantMode.from_description(use_nvfp4_plus=True)
         else:
             quant_mode = QuantMode(0)
 
@@ -485,6 +510,8 @@ class QuantMode(IntFlag):
             self.has_w4a16_mxfp4(),
             'enable_mxfp8':
             self.has_mxfp8(),
+            'enable_nvfp4_plus':
+            self.has_nvfp4_plus(),
             'fp8_kv_cache':
             self.has_fp8_kv_cache(),
             'use_weight_only':
