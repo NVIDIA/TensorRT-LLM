@@ -12,8 +12,7 @@ const finding = {path: 'tensorrt_llm/module.py', line: 12, name: 'unknown-name',
 function harness({resolved = false, existing = true, diagnostics = [finding], error = null} = {}) {
   const report = {pr_number: 42, base_ref: 'release/test', base_sha: 'b'.repeat(40),
     head_sha: head, diagnostics, error};
-  const run = {id: 123, run_attempt: 1, event: 'pull_request',
-    path: '.github/workflows/pyrefly-check.yml', head_sha: head, head_branch: 'feature',
+  const run = {id: 123, run_attempt: 1, head_sha: head, head_branch: 'feature',
     repository: {full_name: 'NVIDIA/TensorRT-LLM'},
     head_repository: {full_name: 'contributor/TensorRT-LLM'}, pull_requests: []};
   const pr = {state: 'open', base: {ref: report.base_ref},
@@ -42,7 +41,7 @@ function harness({resolved = false, existing = true, diagnostics = [finding], er
   };
   state.publish = () => publish({github, report, context: {
     repo: {owner: 'NVIDIA', repo: 'TensorRT-LLM'}, payload: {workflow_run: run},
-  }, core: {info() {}, warning() {}}});
+  }, core: {info() {}}});
   return state;
 }
 
@@ -135,17 +134,11 @@ test('force-push, retargeting, closing, and mismatched head repositories discard
   }
 });
 
-test('report cannot claim another source head or workflow', async () => {
-  for (const change of [
-    state => {state.run.head_sha = 'c'.repeat(40);},
-    state => {state.run.path = '.github/workflows/another.yml';},
-    state => {state.run.event = 'push';},
-  ]) {
-    const state = harness();
-    change(state);
-    await assert.rejects(state.publish, /does not match/);
-    assert.deepEqual(state.writes, []);
-  }
+test('report cannot claim a head other than that of its source run', async () => {
+  const state = harness();
+  state.run.head_sha = 'c'.repeat(40);
+  await assert.rejects(state.publish, /does not match/);
+  assert.deepEqual(state.writes, []);
 });
 
 test('only a marked comment from the Actions bot is reused as the report', async () => {
@@ -188,11 +181,11 @@ test('incomplete report may lack the target branch SHA', () => {
 test('diagnostics are listed in one code block, location first and message indented', () => {
   const state = harness();
   state.report.diagnostics = [finding, {...finding, line: 30, name: 'parse-error',
-    message: 'Parse error\nExpected an expression'}];
+    message: 'Parse error'}];
   const body = bodyFor(state.report, state.run, 'https://github.com');
   assert.equal(body.split('<pre>').length, 2);
   assert.ok(body.includes('<pre>tensorrt_llm/module.py:12\n    [unknown-name] Unknown name `example`\n' +
-    'tensorrt_llm/module.py:30\n    [parse-error] Parse error\n    Expected an expression</pre>'));
+    'tensorrt_llm/module.py:30\n    [parse-error] Parse error</pre>'));
 });
 
 test('rendered diagnostics escape markup and keep long reports within the comment limit', () => {

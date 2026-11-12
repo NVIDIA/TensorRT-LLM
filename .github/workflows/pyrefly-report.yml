@@ -32,41 +32,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - id: artifact
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const run = context.payload.workflow_run;
-            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
-              ...context.repo, run_id: run.id, per_page: 100,
-            });
-            const name = `pyrefly-diff-${run.id}-${run.run_attempt}`;
-            core.setOutput('name', artifacts.some(item => item.name === name && !item.expired) ? name : '');
       - uses: actions/checkout@v6
-        if: steps.artifact.outputs.name != ''
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github/scripts
+      # Fails when the run stopped before it could write a report. The PR already shows
+      # that run as a failed check.
       - uses: actions/download-artifact@v8
-        if: steps.artifact.outputs.name != ''
         with:
-          name: ${{ steps.artifact.outputs.name }}
+          name: pyrefly-diff-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/pyrefly-diff
       - uses: actions/github-script@v8
-        if: steps.artifact.outputs.name != ''
         env:
           REPORT_PATH: ${{ runner.temp }}/pyrefly-diff/report.json
         with:
           script: |
-            const {existsSync, readFileSync, statSync} = require('node:fs');
+            const {readFileSync, statSync} = require('node:fs');
             const {publish} = require('./.github/scripts/pyrefly_report.js');
-            if (!existsSync(process.env.REPORT_PATH)) {
-              core.info('The run failed before it could write a report.');
-              return;
-            }
             if (statSync(process.env.REPORT_PATH).size > 10 * 1024 * 1024) {
               throw new Error('Pyrefly report exceeds 10 MiB.');
             }

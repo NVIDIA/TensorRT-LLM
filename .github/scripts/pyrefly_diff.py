@@ -29,21 +29,15 @@ def _source_lines(path: Path) -> list[str]:
     return path.read_text(errors="replace").splitlines()
 
 
-def _message(error: dict[str, Any]) -> str:
-    # The long description of some diagnostics embeds absolute paths of the scanned tree.
-    return error.get("concise_description") or error.get("description", "")
-
-
 def _fingerprint(
     error: dict[str, Any], root: Path, renames: dict[str, str]
 ) -> tuple[str, str, str, str]:
-    path = Path(error["path"])
-    if path.is_absolute() or ".." in path.parts:
-        raise ValueError(f"Expected a repository-relative diagnostic path: {path}")
+    path = error["path"]
     lines = _source_lines(root / path)
     line = error["line"]
-    source = lines[line - 1].strip() if isinstance(line, int) and 0 < line <= len(lines) else ""
-    return renames.get(path.as_posix(), path.as_posix()), error["name"], _message(error), source
+    source = lines[line - 1].strip() if 0 < line <= len(lines) else ""
+    # `description` embeds absolute paths of the scanned tree; `concise_description` does not.
+    return renames.get(path, path), error["name"], error["concise_description"], source
 
 
 def _new_diagnostics(
@@ -66,7 +60,7 @@ def _new_diagnostics(
                     "path": error["path"],
                     "line": error["line"],
                     "name": error["name"],
-                    "message": _message(error),
+                    "message": error["concise_description"],
                 }
             )
     return added
