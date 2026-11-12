@@ -315,6 +315,50 @@ TEST(MoeRebalanceHaloRPlannerTest, RejectsConfigurationsOutsideItsLimits)
         haloR::validPlannerConfig({.ep = 32, .experts = 384, .helperSlots = 4, .sendCount = 4, .localRank = 31}));
 }
 
+TEST(MoeRebalanceHaloRPlannerTest, PlansMovesOfUpToTheCandidateKeyRowLimit)
+{
+    // The kernel accepts route capacities below kMaxCandidateRows, so a move carries at most kMaxCandidateRows - 1
+    // rows; a candidate key holds them in its top 24 bits, above the order byte.
+    int const maxRows = static_cast<int>(haloR::kMaxCandidateRows - 1);
+    {
+        // Two ranks: rank 0's expert 0 holds every route of both ranks; the one move takes half of them.
+        std::vector<int> histogram(8, 0);
+        histogram[0] = 2 * maxRows;
+        haloR::PlannerConfig const cfg{.ep = 2, .experts = 8, .helperSlots = 1, .sendCount = 1, .localRank = 1};
+        PlanResult const r = runPlanner(histogram, cfg);
+        ASSERT_EQ(r.plan[1], 1);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kExpert, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kOwner, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kDestinationMask, 0), 0b10);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kHelperLowMask, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kHelperHighMask, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kRows, 0), maxRows);
+        EXPECT_EQ(std::vector<int>(r.quota.begin(), r.quota.begin() + cfg.ep), (std::vector<int>{maxRows, maxRows}));
+        EXPECT_EQ(r.loadAfter, (std::vector<int>{maxRows, maxRows}));
+        EXPECT_EQ(r.outIds, (std::vector<int>{0}));
+        EXPECT_EQ(r.outOwners, (std::vector<int>{0}));
+    }
+    {
+        // Four ranks: three successive moves of expert 0, two of them at the limit, fan the export out to ranks 1-3.
+        std::vector<int> histogram(16, 0);
+        histogram[0] = 4 * maxRows - 3;
+        haloR::PlannerConfig const cfg{.ep = 4, .experts = 16, .helperSlots = 2, .sendCount = 2, .localRank = 3};
+        PlanResult const r = runPlanner(histogram, cfg);
+        ASSERT_EQ(r.plan[1], 1);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kExpert, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kOwner, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kDestinationMask, 0), 0b1110);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kHelperLowMask, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kHelperHighMask, 0), 0);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kRows, 0), 3 * maxRows - 3);
+        std::vector<int> const expected{maxRows, maxRows, maxRows, maxRows - 3};
+        EXPECT_EQ(std::vector<int>(r.quota.begin(), r.quota.begin() + cfg.ep), expected);
+        EXPECT_EQ(r.loadAfter, expected);
+        EXPECT_EQ(r.outIds, (std::vector<int>{0, -1}));
+        EXPECT_EQ(r.outOwners, (std::vector<int>{0, -1}));
+    }
+}
+
 TEST(MoeRebalanceHaloRSlotTest, SelectedRoutesGoToOwnerOrHelperSlot)
 {
     int const home = 4;
@@ -327,6 +371,28 @@ TEST(MoeRebalanceHaloRSlotTest, SelectedRoutesGoToOwnerOrHelperSlot)
     EXPECT_EQ(haloR::selectedRouteSlot(9, 3, 2, mask, low, 0, home, localSlots), 3 * localSlots + home + 1);
     EXPECT_EQ(haloR::selectedRouteSlot(9, 0, 2, mask, low, 0, home, localSlots), -1);
     EXPECT_EQ(haloR::helperIndex(1U << 5, 1U << 5, 5), 3);
+}
+
+TEST(MoeRebalanceHaloRSlotTest, HighMaskSelectsHelperSlotsTwoAndThree)
+{
+    int const home = 4;
+    int const localSlots = home + haloR::kMaxHelperSlots;
+    // Expert 9 of owner 2 goes to rank 5 in helper slot 0, rank 0 in slot 1, rank 1 in slot 2 and rank 3 in slot 3.
+    // Rank 4's high bit is set although it is not a destination, so it is rejected.
+    unsigned const mask = (1U << 0) | (1U << 1) | (1U << 3) | (1U << 5);
+    unsigned const low = (1U << 0) | (1U << 3);
+    unsigned const high = (1U << 1) | (1U << 3) | (1U << 4);
+    EXPECT_EQ(haloR::helperIndex(low, high, 1), 2);
+    EXPECT_EQ(haloR::helperIndex(low, high, 3), 3);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 5, 2, mask, low, high, home, localSlots), 5 * localSlots + home);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 0, 2, mask, low, high, home, localSlots), 0 * localSlots + home + 1);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 1, 2, mask, low, high, home, localSlots), 1 * localSlots + home + 2);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 3, 2, mask, low, high, home, localSlots), 3 * localSlots + home + 3);
+    // The owner keeps its home slot, even with its own bits set in the masks.
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 2, 2, mask, low, high, home, localSlots), 2 * localSlots + 9 - 2 * home);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 2, 2, mask | (1U << 2), low, high | (1U << 2), home, localSlots),
+        2 * localSlots + 9 - 2 * home);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 4, 2, mask, low, high, home, localSlots), -1);
 }
 
 TEST(MoeRebalanceHaloRSlotTest, OwnerRoutesKeepTheirResidentSlot)
