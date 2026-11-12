@@ -247,9 +247,12 @@ def test_mla_cached_kv_context_fp8_inputs_non_unit_kv_scale(cached, new) -> None
     layer.kv_scale_orig_quant = 1.0 / layer.kv_cache_scaling_factor
     scale = layer.kv_scale_orig_quant
     assert isinstance(scale, torch.Tensor) and bool(torch.all(scale != 1.0))
+    # static_quantize_e4m3_per_tensor divides by its scale, so producing the
+    # contracted data (x * kv_scale_orig_quant) takes the reciprocal scale.
+    fp8_quantize_scale = layer.kv_scale_quant_orig
 
     def quantize(x: torch.Tensor) -> torch.Tensor:
-        return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, scale)[0]
+        return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, fp8_quantize_scale)[0]
 
     torch.manual_seed(7)
     batch = len(cached)
@@ -390,9 +393,12 @@ def test_mla_cached_kv_context_fp8_inputs_track_the_unquantized_reference(cached
     fp8_layer.kv_scale_orig_quant = 1.0 / fp8_layer.kv_cache_scaling_factor
     scale = fp8_layer.kv_scale_orig_quant
     assert isinstance(scale, torch.Tensor) and bool(torch.all(scale != 1.0))
+    # static_quantize_e4m3_per_tensor divides by its scale, so producing the
+    # contracted data (x * kv_scale_orig_quant) takes the reciprocal scale.
+    fp8_quantize_scale = fp8_layer.kv_scale_quant_orig
 
     def quantize(x: torch.Tensor) -> torch.Tensor:
-        return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, scale)[0]
+        return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, fp8_quantize_scale)[0]
 
     torch.manual_seed(7)
     batch = len(cached)
