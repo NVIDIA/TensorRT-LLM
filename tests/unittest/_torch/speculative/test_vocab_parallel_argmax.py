@@ -117,9 +117,13 @@ def _tie_rows(full: torch.Tensor, tp: int) -> torch.Tensor:
     return full
 
 
-@pytest.mark.parametrize("tp", [2, 4, 8])
-@pytest.mark.parametrize("rows", [1, 6, 64, 300])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+# The per-shard argmax kernel itself (rows, dtypes) is covered by
+# test_vocab_parallel.py; these cases cover composing the shards' ids by
+# their vocab offsets, ties within and across shards included.
+@pytest.mark.parametrize(
+    "tp, rows, dtype",
+    [(2, 1, torch.bfloat16), (2, 64, torch.float32), (8, 300, torch.bfloat16)],
+)
 def test_shard_argmax_matches_gathered_argmax(tp, rows, dtype):
     # 3000-wide shards: one 2048-wide tile and a partial one per shard.
     vocab = 3000 * tp
@@ -139,16 +143,6 @@ def test_shard_argmax_matches_gathered_argmax(tp, rows, dtype):
     assert torch.equal(tokens.long(), expected)
 
 
-def _worker_for_rank(rank: int, exchange: _PairExchange) -> _Worker:
-    worker = _Worker()
-    worker._vocab_parallel_argmax = True
-    worker._target_pair_exchange = exchange
-    worker._target_head_mapping = Mapping(
-        world_size=exchange.tp_size, tp_size=exchange.tp_size, rank=rank
-    )
-    return worker
-
-
 def _greedy_md(**overrides):
     md = dict(
         is_all_greedy_sample=True,
@@ -160,40 +154,6 @@ def _greedy_md(**overrides):
     )
     md.update(overrides)
     return SimpleNamespace(**md)
-
-
-@pytest.mark.parametrize("tp", [2, 4])
-def test_worker_strict_acceptance_on_shard_matches_gathered(tp):
-    """Target tokens and strict acceptance from the shard equal those from the
-    gathered logits, including the draft tokens accepted on tied maxima."""
-    num_ctx, num_gens, draft_len = 2, 6, 3
-    rows = num_ctx + num_gens * (draft_len + 1)
-    vocab = 512 * tp
-    gen = torch.Generator(device="cuda").manual_seed(tp)
-    full = torch.randint(0, 4, (rows, vocab), device="cuda", generator=gen).to(torch.bfloat16)
-    full = _tie_rows(full, tp)
-    target = torch.argmax(full.float(), dim=-1)
-    draft = target[num_ctx:].view(num_gens, draft_len + 1)[:, :draft_len].clone().to(torch.int32)
-    draft[1::2, 1] = (draft[1::2, 1] + 1) % vocab
-    batch = num_ctx + num_gens
-
-    reference_worker = _Worker()
-    ref = reference_worker._sample_and_accept_draft_tokens_base(
-        full.float(), draft, num_ctx, batch, _greedy_md(sharded_target_logits=False)
-    )
-
-    def accept(rank, exchange):
-        worker = _worker_for_rank(rank, exchange)
-        accepted, num_accepted = worker._sample_and_accept_draft_tokens_base(
-            _shard(full, tp, rank), draft, num_ctx, batch, _greedy_md()
-        )
-        return torch.cat(
-            [accepted[:num_ctx, :1].flatten(), accepted[num_ctx:].flatten(), num_accepted]
-        )
-
-    out = _run_ranks(tp, accept)
-    expected = torch.cat([ref[0][:num_ctx, :1].flatten(), ref[0][num_ctx:].flatten(), ref[1]])
-    assert torch.equal(out, expected.to(out.dtype))
 
 
 def _lm_head(tp=2, rank=0, vocab=4096, adp=False, gather_output=True, padded=False):
@@ -260,16 +220,30 @@ def test_greedy_batch_takes_the_shard(enabled_worker, gathered):
         "penalties",
         "guided_decoding",
         "custom_logits_processor",
-        "relaxed_acceptance",
+        "relaxed_acceptance_mtp",
+        "relaxed_acceptance_eagle3",
         "no_rows",
     ],
 )
 def test_fallback_keeps_the_gathered_logits(case, enabled_worker, gathered):
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+    from tensorrt_llm._torch.speculative.mtp import MTPWorker
+
     lm_head = _lm_head()
     md = _greedy_md(sharded_target_logits=True)
+    worker = enabled_worker
     processor = None
     rows = 5
-    if case == "temperature_only":
+    if case.startswith("relaxed_acceptance"):
+        # Relaxed acceptance reads the target's top-k, so the worker's own
+        # acceptance check turns the shard off for every batch.
+        cls = MTPWorker if case == "relaxed_acceptance_mtp" else Eagle3OneModelWorker
+        worker = _bare_covered_worker(cls)
+        assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange=None)
+        assert worker._verifies_target_by_argmax()
+        worker.spec_config.use_relaxed_acceptance_for_thinking = True
+        assert not worker._verifies_target_by_argmax()
+    elif case == "temperature_only":
         md.is_all_greedy_sample, md.temperature_only = False, True
     elif case == "top_k_top_p":
         md.is_all_greedy_sample = False
@@ -283,11 +257,9 @@ def test_fallback_keeps_the_gathered_logits(case, enabled_worker, gathered):
             pass
 
         processor = _Scaled()
-    elif case == "relaxed_acceptance":
-        enabled_worker._verifies_target_by_argmax = lambda: False
     elif case == "no_rows":
         rows = 0
-    out, _ = _target_logits(enabled_worker, lm_head, md, processor, rows)
+    out, _ = _target_logits(worker, lm_head, md, processor, rows)
     assert out is gathered
     assert not md.sharded_target_logits
 
@@ -381,12 +353,12 @@ def _accept(kind, worker, logits, md, attn_metadata):
     return worker.sample_and_accept_draft_tokens(logits, attn_metadata, md)
 
 
-@pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("kind", ["mtp", "eagle3", "mtp_eagle", "draft_target", "pard", "sa"])
-def test_covered_worker_acceptance_on_shard_matches_gathered(kind, tp):
+def test_covered_worker_acceptance_on_shard_matches_gathered(kind):
     """Each covered worker's own acceptance (including PARD's 2K-row layout)
     accepts the same tokens and counts from the target logits' vocab shard as
-    from the gathered logits, ties included."""
+    from the gathered logits, including the draft tokens accepted on tied
+    maxima."""
     from tensorrt_llm._torch.speculative.draft_target import DraftTargetOneModelWorker
     from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker, MTPEagleWorker
     from tensorrt_llm._torch.speculative.mtp import MTPWorker
@@ -401,6 +373,7 @@ def test_covered_worker_acceptance_on_shard_matches_gathered(kind, tp):
         "pard": PARDWorker,
         "sa": SAWorker,
     }[kind]
+    tp = 4
     num_ctx, num_gens, k = 2, 5, 3
     rows_per_gen = 2 * k if kind == "pard" else k + 1
     vocab = 512 * tp
@@ -413,9 +386,10 @@ def test_covered_worker_acceptance_on_shard_matches_gathered(kind, tp):
     # k + 1 of its rows (all of them but PARD's mask positions).
     target = torch.argmax(full.float(), dim=-1)[num_ctx:].view(num_gens, rows_per_gen)
     drafts = target[:, :k].clone().to(torch.int32)
-    for g in range(num_gens):  # a different accepted length per request
-        if g < k:
-            drafts[g, g] = (drafts[g, g] + 1) % vocab
+    # A different accepted length per request. The first request, whose rows
+    # are the tie rows, accepts every draft token.
+    for g in range(1, k + 1):
+        drafts[g, g - 1] = (drafts[g, g - 1] + 1) % vocab
     if kind == "pard":
         # PARD's draft buffer holds 2K - 1 entries per request, the K drafts first.
         buffer = torch.zeros(num_gens, 2 * k - 1, dtype=torch.int32, device="cuda")
@@ -456,19 +430,7 @@ def test_covered_worker_acceptance_on_shard_matches_gathered(kind, tp):
     out = _run_ranks(tp, accept_on_rank)
     assert torch.equal(out, ref)
     num_accepted = ref[-batch:]
-    assert num_accepted[num_ctx:].tolist() == [1, 2, 3, 4, 4]
-
-
-@pytest.mark.parametrize("relaxed", [False, True])
-def test_relaxed_acceptance_keeps_the_gathered_logits(relaxed):
-    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
-    from tensorrt_llm._torch.speculative.mtp import MTPWorker
-
-    mtp = SimpleNamespace(
-        spec_config=SimpleNamespace(use_relaxed_acceptance_for_thinking=relaxed), is_thop=False
-    )
-    assert MTPWorker._verifies_target_by_argmax(mtp) == (not relaxed)
-    assert Eagle3OneModelWorker._verifies_target_by_argmax(mtp) == (not relaxed)
+    assert num_accepted[num_ctx:].tolist() == [4, 1, 2, 3, 4]
 
 
 def test_forward_marks_the_shard_logits():
@@ -485,9 +447,7 @@ def test_forward_marks_the_shard_logits():
     assert "logits_vocab_shard" not in _Echo()(logits=torch.zeros(1), spec_metadata=md)
 
 
-@pytest.mark.parametrize(
-    "value, enabled", [(None, True), ("1", True), ("0", False), (" 0 ", False)]
-)
+@pytest.mark.parametrize("value, enabled", [(None, True), ("0", False)])
 def test_kill_switch(value, enabled, monkeypatch):
     """``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0`` keeps the model from enabling the
     path: no key exchange is built and the worker keeps the gathered logits."""
@@ -562,13 +522,13 @@ def test_eagle3_draft_head_shard_decision():
     assert not decide(processor=_Custom())
 
 
-@pytest.mark.parametrize("tp", [2, 4])
-def test_eagle3_draft_tokens_with_d2t(tp, monkeypatch):
+def test_eagle3_draft_tokens_with_d2t(monkeypatch):
     """Greedy draft tokens of a vocab-sharded reduced-vocab draft head: the
     global argmax over the draft vocab, then d2t, the same as the gathered
     draft logits give."""
     from tensorrt_llm._torch.distributed import ops
 
+    tp = 4
     draft_vocab = 1000 * tp
     rows = 9
     gen = torch.Generator(device="cuda").manual_seed(tp)

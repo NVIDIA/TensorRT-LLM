@@ -420,6 +420,9 @@ _CHECKS = {
     "worker_accept": _worker_accept_check,
     "worker_argmax": _worker_argmax_check,
 }
+# Checks that run at TP2 only: what they add over the other checks (the worker
+# plumbing) does not depend on the TP size.
+_TP2_ONLY_CHECKS = {"worker_argmax"}
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
@@ -434,7 +437,7 @@ def test_vocab_parallel_selection_tp2(check, mnnvl, mpi_pool_executor):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
 @pytest.mark.parametrize("mnnvl", _EXCHANGES)
-@pytest.mark.parametrize("check", list(_CHECKS))
+@pytest.mark.parametrize("check", [c for c in _CHECKS if c not in _TP2_ONLY_CHECKS])
 @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
 def test_vocab_parallel_selection_tp4(check, mnnvl, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
