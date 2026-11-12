@@ -22,6 +22,7 @@ import types
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import Any, Callable, Generator, cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1809,7 +1810,9 @@ def test_beam_search_cba_reorders_stop_window():
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_beam_search_handoff_keeps_receiving_rank_in_step() -> None:
+@pytest.mark.parametrize("speculative_d2h", [False, True])
+def test_beam_search_handoff_keeps_receiving_rank_in_step(
+        speculative_d2h: bool) -> None:
     """A pipeline-parallel rank that does not sample keeps beam search in step.
 
     Only the last pipeline-parallel rank samples; every other rank updates its
@@ -1837,6 +1840,7 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step() -> None:
                 max_total_draft_tokens=0,
                 disable_overlap_scheduler=True,
                 share_beam_search_state=True,
+                enable_speculative_beam_history_d2h=speculative_d2h,
             ))
 
     def make_requests() -> list[LlmRequest]:
@@ -1868,6 +1872,7 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step() -> None:
     sampled_store = sampling_rank.store.beam_search_store
     received_store = receiving_rank.store.beam_search_store
     assert sampled_store is not None and received_store is not None
+    received_store.cache_indirection.fill_(-1)
 
     for step, step_logits in enumerate(logits):
         scheduled = ScheduledRequests()
@@ -1884,6 +1889,11 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step() -> None:
         assert state.sampler_event is not None
         state.sampler_event.synchronize()
         sampling_rank.prepare_handoff(state)
+        assert state.host is not None and state.host.beam_handoff is not None
+        relay = state.host.beam_handoff
+        assert relay.cache_indirection.size(-1) == (
+            max(len(prompt) for prompt in prompts) + step + 1 -
+            min(len(prompt) for prompt in prompts))
         # The receiving rank gets only the host state, serialized between processes.
         relayed = SampleStateTorch(requests=received_requests,
                                    host=pickle.loads(pickle.dumps(state.host)))
@@ -1983,13 +1993,118 @@ def test_beam_search_handoff_returns_context_only_first_tokens() -> None:
     relayed = SampleStateTorch(requests=received_requests,
                                host=pickle.loads(pickle.dumps(state.host)))
     sampling_rank.update_requests(state)
-    receiving_rank.update_requests(relayed)
+    with patch.object(
+            torch.Tensor,
+            "cpu",
+            side_effect=AssertionError("relayed scores must stay on the host")):
+        receiving_rank.update_requests(relayed)
 
     for sampled, received in zip(sampled_requests, received_requests):
         first_gen_log_probs = sampled.py_result.first_gen_log_probs
         assert first_gen_log_probs is not None
         assert len(first_gen_log_probs) == beam_width
         assert received.py_result.first_gen_log_probs == first_gen_log_probs
+
+
+@pytest.fixture
+def beam_handoff_finishing_step(
+) -> tuple[TorchSampler, TorchSampler, SampleStateTorch, list[LlmRequest]]:
+    beam_width = 2
+    prompts = [[1, 2, 3], [4, 5, 6]]
+    sampling_params = SamplingParams(n=beam_width,
+                                     best_of=beam_width,
+                                     use_beam_search=True)
+
+    def make_sampler() -> TorchSampler:
+        return TorchSampler(
+            TorchSampler.Args(max_seq_len=16,
+                              max_draft_len=0,
+                              max_num_sequences=len(prompts),
+                              max_beam_width=beam_width,
+                              max_total_draft_tokens=0,
+                              disable_overlap_scheduler=True,
+                              share_beam_search_state=True))
+
+    def make_requests() -> list[LlmRequest]:
+        return [
+            LlmRequest(request_id=slot,
+                       seq_slot=slot,
+                       input_tokens=prompt,
+                       max_new_tokens=1,
+                       end_id=-1,
+                       sampling_config=SamplingConfig(
+                           sampling_params._get_sampling_config()),
+                       is_streaming=False)
+            for slot, prompt in enumerate(prompts)
+        ]
+
+    sampling_rank, receiving_rank = make_sampler(), make_sampler()
+    requests = make_requests()
+    scheduled = ScheduledRequests()
+    scheduled.context_requests_last_chunk = requests
+    state = sampling_rank.sample_async(
+        scheduled,
+        model_outputs={
+            "logits":
+            torch.arange(32, dtype=torch.float32, device="cuda").reshape(2, 16)
+        },
+        num_context_logits_prefix_sum=[0, 1, 2],
+    )
+    assert state.sampler_event is not None
+    state.sampler_event.synchronize()
+    return sampling_rank, receiving_rank, state, make_requests()
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_handoff_relays_builder_errors(
+    beam_handoff_finishing_step: tuple[TorchSampler, TorchSampler,
+                                       SampleStateTorch, list[LlmRequest]],
+) -> None:
+    sampling_rank, receiving_rank, state, received_requests = beam_handoff_finishing_step
+    assert state.beam_history_builders is not None
+
+    def fail_snapshot() -> BeamHistory:
+        raise torch.OutOfMemoryError("beam snapshot allocation failed")
+
+    state.beam_history_builders[0] = fail_snapshot
+    sampling_rank.prepare_handoff(state)
+    relayed = SampleStateTorch(requests=received_requests,
+                               host=pickle.loads(pickle.dumps(state.host)))
+    for sampler, sample_state in ((sampling_rank, state), (receiving_rank,
+                                                           relayed)):
+        with pytest.raises(RuntimeError,
+                           match="beam snapshot allocation failed"):
+            sampler.update_requests(sample_state)
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_handoff_requires_final_history(
+    beam_handoff_finishing_step: tuple[TorchSampler, TorchSampler,
+                                       SampleStateTorch, list[LlmRequest]],
+) -> None:
+    sampling_rank, receiving_rank, state, received_requests = beam_handoff_finishing_step
+    sampling_rank.prepare_handoff(state)
+    relayed = SampleStateTorch(requests=received_requests,
+                               host=pickle.loads(pickle.dumps(state.host)))
+    assert relayed.host is not None and relayed.host.beam_handoff is not None
+    histories = relayed.host.beam_handoff.beam_histories
+    assert histories is not None
+    del histories[received_requests[0].py_request_id]
+    with pytest.raises(RuntimeError, match="Missing finalized beam history"):
+        receiving_rank.update_requests(relayed)
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_handoff_requires_request_order(
+    beam_handoff_finishing_step: tuple[TorchSampler, TorchSampler,
+                                       SampleStateTorch, list[LlmRequest]],
+) -> None:
+    sampling_rank, receiving_rank, state, received_requests = beam_handoff_finishing_step
+    sampling_rank.prepare_handoff(state)
+    relayed = SampleStateTorch(requests=list(reversed(received_requests)),
+                               host=pickle.loads(pickle.dumps(state.host)))
+    with pytest.raises(AssertionError, match="relay request order"):
+        receiving_rank.update_requests(relayed)
 
 
 def create_default_request(test_params: GeneralTestParams) -> LlmRequest:

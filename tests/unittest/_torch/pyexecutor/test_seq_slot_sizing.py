@@ -738,6 +738,11 @@ def test_sampler_args_require_the_resolved_pool():
     assert "max_batch_size" not in params
 
 
+def test_sampler_args_require_beam_state_sharing() -> None:
+    params = inspect.signature(create_torch_sampler_args).parameters
+    assert params["share_beam_search_state"].default is inspect.Parameter.empty
+
+
 @pytest.mark.parametrize("slot_factor", [1, 2])
 def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
     max_batch_size = 8
@@ -750,6 +755,7 @@ def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
         enable_async_worker=False,
         enable_speculative_beam_history_d2h=False,
         max_num_sequences=max_num_sequences,
+        share_beam_search_state=False,
     )
     assert args.max_num_sequences == max_num_sequences
 

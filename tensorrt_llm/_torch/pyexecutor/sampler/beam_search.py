@@ -314,16 +314,20 @@ class BeamHistory:
 class BeamSearchHandoff:
     """Beam-search state of one step, for the pipeline-parallel ranks that do not sample.
 
-    Only the last pipeline-parallel rank samples, so only it holds the
-    beam-search store and can build the final beams. The other ranks still run
+    Only the last pipeline-parallel rank samples, so only its store is updated
+    by sampling, and only it holds the builders for the final beams. The other ranks still run
     attention over every beam, and the first one returns the results, so the
     last rank sends them this with the host state of each step.
     """
 
     request_ids: list[int]
     """The step's requests, in the row order of ``cache_indirection``."""
+    token_base: int
+    """Sequence position of the first relayed cache-indirection column."""
+    num_context_requests: int
+    """Number of leading requests whose prompt columns must be initialized."""
     cache_indirection: torch.Tensor
-    """[len(request_ids), max_beam_width, width] int, host copy of each
+    """[len(request_ids), max_beam_width, width - token_base] int, host copy of each
     request's cache indirection after the step, for the positions the next
     forward reads (``width`` covers the longest request)."""
     cum_log_probs: torch.Tensor
@@ -334,6 +338,8 @@ class BeamSearchHandoff:
     """Final beams of the requests the step finishes, by request id. Filled in
     on the last rank, once the step's copies have completed, right before the
     hand-off."""
+    error: str | None = None
+    """A builder failure to raise inside every rank's request-update handler."""
 
 
 def _gather_beam_path(
@@ -1781,6 +1787,16 @@ class BeamSearchHandler:
             return True
         return False
 
+    def cache_indirection_span(self, requests: list[LlmRequest]) -> tuple[int, int]:
+        """Return the generated-position range needed by the next attention step."""
+        store = self._store
+        assert store is not None
+        width = min(
+            store.cache_indirection.size(-1),
+            max(request.max_beam_num_tokens + 1 for request in requests),
+        )
+        return min(width, min(request.py_prompt_len for request in requests)), width
+
     @nvtx_range("_prepare_cba_group_host")
     def prepare_cba_group_host(
         self,
@@ -1811,12 +1827,10 @@ class BeamSearchHandler:
         both_host = torch.tensor([slots, widths], dtype=torch.int64, pin_memory=prefer_pinned())
         both_cuda = both_host.to(device="cuda", non_blocking=True)
         slots_cuda, widths_cuda = both_cuda[0], both_cuda[1]
-        num_tokens_max = max(request.max_beam_num_tokens + 1 for request in cba_requests)
-        attn_width = min(store.cache_indirection.size(-1), num_tokens_max)
         # The consumer reads only generated positions, so the per-step snapshot
         # of the [slot, beam, position] tensors starts at the smallest prompt
         # length of the group instead of copying the whole prompt region.
-        token_base = min(attn_width, min(request.py_prompt_len for request in cba_requests))
+        token_base, attn_width = self.cache_indirection_span(cba_requests)
         snap_width = min(
             cba.cba_tokens.size(-1),
             max(
@@ -1861,16 +1875,17 @@ class BeamSearchHandler:
         self,
         requests: list[LlmRequest],
         finish_reasons: torch.Tensor,
-    ) -> tuple[list[BeamHistoryBuilder | None], torch.cuda.Event | None]:
+    ) -> tuple[list[BeamHistoryBuilder | None], torch.cuda.Event | None, CBAGroupHost | None]:
         """Create the corrected tokens and logprobs for each beam of a request.
 
         The builders returned by this function create a beam history object containing
         the corrected tokens and logprobs for each beam of a request.
 
-        Returns (builders, side_stream_event). side_stream_event is set
+        Returns (builders, side_stream_event, host_snapshot). side_stream_event is set
         only when the speculative path queued copies; the caller must
         forward it to _record_sampler_event so SamplerEvent.synchronize
-        awaits the side stream before any builder is invoked.
+        awaits the side stream before any builder is invoked or the snapshot is
+        relayed. The PP relay can reuse the snapshot's host tensors.
         """
         # The snapshot is only ever read when a request finishes on this step,
         # so in speculative mode skip it entirely on steps where no request can
@@ -1890,7 +1905,7 @@ class BeamSearchHandler:
             # No snapshot. A builder falls back to a synchronous read if the
             # step turns out to have finished a request after all -- see
             # _deferred_cba_group.
-            return [self._speculative_builder(req) for req in requests], None
+            return [self._speculative_builder(req) for req in requests], None, None
 
         # Single `with` for both modes; nullcontext yields None.
         copier_ctx: AbstractContextManager[_SideStreamCopier | None] = (
@@ -1903,7 +1918,7 @@ class BeamSearchHandler:
             cba_group = self.prepare_cba_group_host(requests, finish_reasons, d2h_copier)
             builders = [_prepare_beam_history_cba(req, cba_group=cba_group) for req in requests]
         side_stream_event = copier.event if copier is not None else None
-        return builders, side_stream_event
+        return builders, side_stream_event, cba_group
 
     def _speculative_builder(self, request: LlmRequest) -> BeamHistoryBuilder:
         """Builder for a step whose snapshot was skipped.

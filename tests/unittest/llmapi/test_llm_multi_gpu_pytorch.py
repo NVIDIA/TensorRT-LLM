@@ -158,7 +158,7 @@ def test_llm_get_stats_async_pp2():
 
 
 @pytest.mark.gpu2
-def test_llm_beam_search_pp2():
+def test_llm_beam_search_pp2() -> None:
     """Beam search under pipeline parallelism returns every finalized beam.
 
     Only the last pipeline-parallel rank samples; the first rank, which returns
@@ -174,12 +174,27 @@ def test_llm_beam_search_pp2():
                                      logprobs=True)
     with LLM(model=llama_model_path,
              kv_cache_config=global_kv_cache_config,
+             pipeline_parallel_size=1,
+             max_beam_width=beam_width,
+             max_batch_size=1,
+             disable_overlap_scheduler=True,
+             cuda_graph_config=None) as llm:
+        reference_outputs = llm.generate(prompts,
+                                         sampling_params=sampling_params)
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kv_cache_config,
              pipeline_parallel_size=2,
-             max_beam_width=beam_width) as llm:
+             max_beam_width=beam_width,
+             max_batch_size=1,
+             disable_overlap_scheduler=True,
+             cuda_graph_config=None) as llm:
         outputs = llm.generate(prompts, sampling_params=sampling_params)
 
-    for prompt, output in zip(prompts, outputs):
+    for prompt, output, reference in zip(prompts, outputs, reference_outputs):
         beams = output.outputs
+        assert [list(beam.token_ids) for beam in beams
+                ] == [list(beam.token_ids)
+                      for beam in reference.outputs], prompt
         assert len(beams) == beam_width, prompt
         # Finalized beams are distinct paths, best first.
         assert len({tuple(beam.token_ids) for beam in beams}) == beam_width

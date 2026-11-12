@@ -5056,7 +5056,7 @@ def create_torch_sampler_args(
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
     max_num_sequences: int,
-    share_beam_search_state: bool = False,
+    share_beam_search_state: bool,
     watermark_config=None,
 ):
     # The sampler's per-slot state is indexed by sequence slots, so it must
