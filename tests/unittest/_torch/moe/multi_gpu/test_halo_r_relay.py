@@ -1591,7 +1591,7 @@ def _skip(reason: str) -> None:
 
 
 @pytest.mark.parametrize("case", [case for case in _CASES if not case.startswith("trap_")])
-def test_halo_r(monkeypatch, case) -> None:
+def test_halo_r_cases(monkeypatch, case) -> None:
     results = _run_on_every_rank(monkeypatch, case)
     _skip_if_any(results)
     failures = [failure for _, rank_failures in results for failure in rank_failures]
