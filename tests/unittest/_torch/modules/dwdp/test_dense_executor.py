@@ -115,6 +115,8 @@ def test_shutdown_exits_the_manager_it_holds_once_after_the_kv_caches(
     executor._profile_manager = SimpleNamespace(cleanup=lambda: None)
     executor.hang_detector = SimpleNamespace(detected=lambda: False)
     executor.worker_thread = SimpleNamespace(join=lambda: log.append("worker joined"))
+    executor._worker_phase_done = SimpleNamespace(wait=lambda: log.append("phase_done"))
+    executor._worker_phases = SimpleNamespace(put=lambda _phase: None)
     executor.enable_attention_dp = False
     executor.kv_connector_manager = None
     executor._kv_connector_failed = False
@@ -134,7 +136,7 @@ def test_shutdown_exits_the_manager_it_holds_once_after_the_kv_caches(
     executor.shutdown()
     executor.shutdown()
 
-    assert log == ["worker joined", "kv.shutdown", (f"{mode}.__exit__", True)]
+    assert log == ["phase_done", "worker joined", "kv.shutdown", (f"{mode}.__exit__", True)]
     manager.__exit__.assert_called_once_with(None, None, None)
     assert executor.dwdp_manager is None and executor.dense_dwdp_manager is None
     assert executor._closed and not hasattr(executor, "model_engine")

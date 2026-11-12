@@ -17,6 +17,7 @@
 import atexit
 import threading
 import time
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -186,6 +187,12 @@ def _executor(monkeypatch, pp_size: int) -> PyExecutor:
     executor.dist = SimpleNamespace(rank=0, world_size=1, pp_size=pp_size)
     executor.worker_lock = threading.Lock()
     executor.worker_started = False
+    executor.worker_thread = None
+    executor._worker_phases = Queue()
+    executor._worker_phase_done = threading.Event()
+    executor._worker_phase_done.set()
+    executor._event_loop_error = None
+    executor._fatal_error = None
     executor.num_micro_batches = 2
     executor._disable_mpi = False
     executor._mpi_progress_thread = None
@@ -239,7 +246,9 @@ def test_executor_stops_its_progress_thread_on_shutdown(monkeypatch, hang_detect
         if thread is not None:
             thread.stop()
         # The hang-detected path returns without joining these threads.
-        executor.worker_thread.join()
+        executor._worker_phases.put(None)
+        executor.worker_thread.join(timeout=5)
+        assert not executor.worker_thread.is_alive()
         executor.broadcast_sample_state_handler.join()
         executor._broadcast_mpi_comm.Free()
 
@@ -259,7 +268,9 @@ def test_executor_runs_without_progress_thread_when_unavailable(monkeypatch, cau
         executor.shutdown()
         assert exit_hooks.unregistered == []
     finally:
-        executor.worker_thread.join()
+        executor._worker_phases.put(None)
+        executor.worker_thread.join(timeout=5)
+        assert not executor.worker_thread.is_alive()
         executor.broadcast_sample_state_handler.join()
         executor._broadcast_mpi_comm.Free()
 

@@ -220,9 +220,10 @@ class TestAwaitResponseHelperEventLoopError:
         assert helper(timeout=0.01) is False
         assert sorted(helper.worker.popped) == [1, 2, 3]
 
-    def test_pushed_response_is_error_response_with_message(self):
+    @pytest.mark.parametrize("error_type", [RuntimeError, SystemExit, KeyboardInterrupt])
+    def test_pushed_response_is_error_response_with_message(self, error_type):
         """Pushed item is an ErrorResponse carrying the original error text."""
-        original = RuntimeError("KV cache OOM at iteration 42")
+        original = error_type("KV cache OOM at iteration 42")
         engine = _EngineStub(event_loop_error=original, is_shutdown=True)
         # Capture queue refs before they get popped from _results.
         helper = _make_helper(engine, num_pending=1)

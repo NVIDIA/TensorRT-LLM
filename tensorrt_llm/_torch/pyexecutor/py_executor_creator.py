@@ -1446,8 +1446,8 @@ def _create_py_executor(
         # create_py_executor_instance. Restore it here.
         peft_cache_config = py_executor.peft_cache_config
 
-    if estimating_kv_cache:
-        try:
+    try:
+        if estimating_kv_cache:
             assert kv_cache_creator is not None
             _move_model_engine_metrics(py_executor, model_engine, "initial")
             # Preserve profiling metrics across execution-state reinitialization.
@@ -1501,34 +1501,38 @@ def _create_py_executor(
                     max_num_sequences=max_num_seq_slots,
                 )
                 py_executor.rebind_resources(execution_resources)
-        except BaseException:
-            py_executor.shutdown()
-            raise
 
-    _adjust_torch_mem_fraction()
+        _adjust_torch_mem_fraction()
 
-    if mapping.rank == 0:
-        logger.info(f"LLM Args:\n{llm_args}")
+        if mapping.rank == 0:
+            logger.info(f"LLM Args:\n{llm_args}")
 
-    # Only the final executor advertises ready publishers.
-    events = getattr(llm_args.kv_cache_config, "kv_events_config", None)
-    if (getattr(llm_args, "_openengine_discovery", None) is not None
-            and events is not None and events.enable_kv_cache_events
-            and events.publisher == "zmq"):
-        from tensorrt_llm.grpc.openengine.node import initialize_node_discovery
-        initialize_node_discovery(py_executor)
-    try:
+        # Only the final executor advertises ready publishers.
+        events = getattr(llm_args.kv_cache_config, "kv_events_config", None)
+        if (getattr(llm_args, "_openengine_discovery", None) is not None
+                and events is not None and events.enable_kv_cache_events
+                and events.publisher == "zmq"):
+            from tensorrt_llm.grpc.openengine.node import \
+                initialize_node_discovery
+            initialize_node_discovery(py_executor)
         with _startup_timer.phase("executor_start_worker",
                                   metrics=creation_metrics,
                                   metric_name="worker_start_seconds"):
             py_executor.start_worker()
-    except BaseException:
-        if py_executor._openengine_node_server is not None:
-            py_executor._openengine_node_server.close()
-        raise
 
-    py_executor.metrics.update(initial_model_engine_metrics)
-    _move_model_engine_metrics(py_executor, model_engine, "final")
+        py_executor.metrics.update(initial_model_engine_metrics)
+        _move_model_engine_metrics(py_executor, model_engine, "final")
+
+    except BaseException:
+        # Creation owns the executor until it is returned. In particular, a
+        # profiling worker may be parked with live thread-local CUDA state.
+        try:
+            py_executor.shutdown()
+        except BaseException:
+            logger.error(
+                "Failed to shut down executor after startup failure:\n" +
+                traceback.format_exc())
+        raise
 
     return py_executor
 

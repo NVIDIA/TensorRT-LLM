@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
@@ -841,6 +842,13 @@ class PyExecutor:
         self._resources_released = False
         self._closed = False
         self._gen_preemption_settings = gen_preemption
+        # Retain CUDA library state the LLM profiling forward creates on this
+        # worker. The multimodal encoder dummy runs on the startup thread;
+        # libraries first used by a serving thread still initialize lazily.
+        self.worker_thread: Optional[threading.Thread] = None
+        self._worker_phases: Queue[Optional["PyExecutor"]] = Queue()
+        self._worker_phase_done = threading.Event()
+        self._worker_phase_done.set()
         self._initialize_execution(
             PyExecutorResources(
                 resource_manager=resource_manager,
@@ -1623,7 +1631,7 @@ class PyExecutor:
         self._validate_moe_a2a_checkpoint_support()
 
     def rebind_resources(self, resources: PyExecutorResources) -> None:
-        """Bind fresh resources after release_resources(), without starting workers.
+        """Bind fresh resources after release_resources(), without starting a phase.
 
         Call collectively on the startup thread. The previous phase must have
         exited cleanly; failed and finally closed executors cannot be reused.
@@ -2005,15 +2013,11 @@ class PyExecutor:
             # _executor_loop_cleanup is enough to wake local waiters.
             self._event_loop_error = e
             raise e
-        except BaseException:
-            # SystemExit / KeyboardInterrupt are NOT Exception, so they reach
-            # here rather than the handler above. Peers are just as stranded,
-            # but these are deliberate teardown signals -- the launcher is
-            # already tearing the job down -- and arming an MPI_Abort on top
-            # would turn a clean Ctrl-C into exit 137. Left unarmed on
-            # purpose; `crashed` stays False. Stated explicitly because the
-            # comment above describes the invariant the *Exception* path
-            # enforces, not this one.
+        except BaseException as error:
+            # Publish SystemExit / KeyboardInterrupt before cleanup wakes local
+            # waiters. Keep `crashed` False: the launcher is already tearing the
+            # job down, and MPI_Abort would turn a clean Ctrl-C into exit 137.
+            self._event_loop_error = error
             raise
         finally:
             # Armed BEFORE cleanup: cleanup can block without bound on a
@@ -2110,9 +2114,49 @@ class PyExecutor:
                 ". "
                 "Remove sleep_config to keep the current configuration.")
 
+    @staticmethod
+    def _run_worker_phases(phases: Queue[Optional["PyExecutor"]],
+                           phase_done: threading.Event) -> None:
+        while True:
+            executor = phases.get()
+            if executor is None:
+                return
+            try:
+                executor._event_loop_wrapper()
+            except BaseException as error:
+                # The wrapper records loop errors before cleanup. Also retain
+                # failures from its finally block before teardown can rebind;
+                # the thread can still appear alive while unwinding.
+                if executor._event_loop_error is None:
+                    executor._event_loop_error = error
+                raise
+            finally:
+                # Resource teardown must wait for the wrapper's cleanup,
+                # including on an exceptional exit, before rebinding.
+                # RPC followers may finish without an explicit shutdown. The
+                # parked thread must not keep their executor/model alive.
+                del executor
+                phase_done.set()
+
+    def _join_worker_thread(self) -> None:
+        if self.worker_thread is not None:
+            self.worker_thread.join()
+
     def start_worker(self):
+        """Start one execution phase, creating the persistent thread on first use.
+
+        Raises RuntimeError for closed or released executors, or a recorded
+        event-loop or fatal error. Repeated calls during a phase are idempotent.
+        """
         with self.worker_lock:
+            if self._closed or self._resources_released:
+                raise RuntimeError(
+                    "Cannot start an executor without bound resources")
+            if self._event_loop_error is not None or self._fatal_error is not None:
+                raise RuntimeError("Cannot restart a failed executor")
             if not self.worker_started:
+                assert self.worker_thread is None or self.worker_thread.is_alive(
+                ), "Executor thread exited without a recorded failure"
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -2139,9 +2183,9 @@ class PyExecutor:
                     # the executor thread's.
                     assert self._broadcast_mpi_comm is not None
                     assert self._broadcast_mpi_comm is not mpi_comm()
-                    # Fresh Events rather than clear(): an executor may be
-                    # started again after shutdown(), and a flag left set by
-                    # the previous run would disarm the new pump.
+                    # Fresh Events rather than clear(): release_resources()
+                    # and rebind_resources() allow another execution phase;
+                    # a flag left set by the previous phase would disarm its pump.
                     self._pp_mpi_progress_stop = threading.Event()
                     self._pp_mpi_progress_quiesced = threading.Event()
                     self._pp_mpi_progress = make_mpi_progress_pump(
@@ -2168,8 +2212,8 @@ class PyExecutor:
                     self.broadcast_sample_state_handler.start()
                 # Duplicate the communicator on the main thread for
                 # sleep/wakeup control messages.  MPI_Comm_dup is collective
-                # across all ranks and must run before any worker thread
-                # starts to avoid racing with the worker's MPI traffic.
+                # across all ranks and must run before the next execution
+                # phase starts to avoid racing with the worker's MPI traffic.
                 # Only needed when multi-rank sleep/wakeup is actually
                 # possible, i.e. MPI executor path (not Ray), sleep_config
                 # enabled, and more than one rank participating.
@@ -2189,9 +2233,19 @@ class PyExecutor:
                         self._sleep_wakeup_listener_thread.start()
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
-                self.worker_thread = threading.Thread(
-                    target=self._event_loop_wrapper, daemon=True)
-                self.worker_thread.start()
+                if self.worker_thread is None:
+                    worker_thread = threading.Thread(
+                        target=PyExecutor._run_worker_phases,
+                        args=(self._worker_phases, self._worker_phase_done),
+                        daemon=True)
+                    worker_thread.start()
+                    # Only the queue is retained by the finalizer, not self.
+                    weakref.finalize(self, self._worker_phases.put, None)
+                    self.worker_thread = worker_thread
+                self._worker_phase_done.clear()
+                # The queued phase owns the executor until the thread takes it;
+                # RPC followers may return immediately after this handoff.
+                self._worker_phases.put(self)
                 self.worker_started = True
             # Start the sampler's async worker, if it is enabled
             if (isinstance(self.sampler, AsyncWorkerMixin)
@@ -2488,7 +2542,10 @@ class PyExecutor:
 
         Call collectively after consuming profiling responses. Graph destruction
         precedes workspace release, and transfer registrations precede cache
-        release. Model engines, weights and the execution stream remain valid.
+        release. Model engines, weights and the execution stream remain valid,
+        as do the worker thread and CUDA library state the LLM profiling
+        forward creates on it. The multimodal encoder dummy runs on the startup
+        thread; libraries first used by a serving thread still initialize lazily.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")
@@ -2528,9 +2585,18 @@ class PyExecutor:
         self._resources_released = True
 
     def shutdown(self) -> None:
-        """Finally close the executor; closed executors cannot be rebound."""
+        """Request terminal worker exit and close the executor without rebinding.
+
+        The current execution phase finishes before the thread is joined and
+        resources are released. A detected hang returns without joining;
+        pending-DMA resources retain their existing owners.
+        """
         if self._closed:
             return
+        if self.worker_thread is not None:
+            # Terminal shutdown never starts another phase, even if cleanup
+            # raises. The current wrapper and its finally still run to completion.
+            self._worker_phases.put(None)
         # Capture model owners before any rank-local shutdown step can fail;
         # outer workers still need them for an all-rank unsafe preflight.
         terminal_engines = list(getattr(self, "_terminal_model_engines", ()))
@@ -2544,6 +2610,7 @@ class PyExecutor:
                     release_model_owned_graphs=True):
                 return
         else:
+            self._join_worker_thread()
             for engine in self._terminal_model_engines:
                 engine.release_executor_resources(
                     release_model_owned_graphs=True)
@@ -2562,6 +2629,8 @@ class PyExecutor:
                                      ) -> bool:
         """Stop execution and release GPU resources; retain model ownership."""
         if getattr(self, "_shutdown_runtime_complete", False):
+            if release_model_owned_graphs:
+                self._join_worker_thread()
             return self._release_execution_pools()
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
@@ -2599,11 +2668,13 @@ class PyExecutor:
             self._terminal_model_engines = ()
             return False
         if self.worker_started:
-            self.worker_thread.join()
+            self._worker_phase_done.wait()
+        if release_model_owned_graphs:
+            self._join_worker_thread()
         if self.kv_connector_manager is not None and not self._kv_connector_failed:
             self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1 and self.worker_started:
-            # The worker thread has exited, so no PP traffic needs progress.
+            # The execution phase has exited, so no PP traffic needs progress.
             self._pp_mpi_progress_stop.set()
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
@@ -2613,7 +2684,7 @@ class PyExecutor:
             self._pp_mpi_progress_quiesced.set()
             self._stop_mpi_progress_thread()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
-        # after the worker thread has joined, which guarantees that the non-rank-0
+        # after the execution phase has ended, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
         self._shutdown_sleep_wakeup_listeners()

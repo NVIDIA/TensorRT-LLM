@@ -13,9 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import sys
+import threading
+import weakref
 from contextlib import contextmanager
+from queue import Queue
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -921,3 +926,128 @@ def test_failed_resource_transition_closes_executor(monkeypatch, failure_stage):
     assert len(executors) == 1
     assert executors[0].closed
     assert not executors[0].started
+
+
+@pytest.mark.parametrize("failure_stage", ["adjust", "discovery", "start", "metrics"])
+def test_final_startup_failure_closes_parked_profiling_worker(monkeypatch, failure_stage):
+    startup_error = RuntimeError("final startup failed")
+    workers = []
+    executors = []
+    events = []
+    original_adjust = py_executor_creator._adjust_torch_mem_fraction
+
+    def fail(*args, **kwargs):
+        raise startup_error
+
+    def park(executor):
+        executor.stop_queue.get()
+
+    def shutdown(executor):
+        events.append("shutdown")
+        executor.stop_queue.put(None)
+        executor.worker.join(10)
+        assert not executor.worker.is_alive()
+        executor.closed = True
+
+    class EstimatingCacheCreator(_DummyKvCacheCreator):
+        def try_prepare_estimation(self):
+            return True
+
+        def configure_kv_cache_capacity(self, executor):
+            # Model a real bound worker retaining the executor after profiling.
+            executor.stop_queue = Queue()
+            executor.worker = threading.Thread(target=park, args=(executor,), daemon=True)
+            executor.worker.start()
+            workers.append(executor.worker)
+            executors.append(weakref.ref(executor))
+            if failure_stage == "adjust":
+                creation_patch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", fail)
+
+        def teardown_managers(self, resources):
+            resources.pop(ResourceManagerType.KV_CACHE_MANAGER)
+
+    monkeypatch.setattr(_DummyPyExecutor, "shutdown", shutdown)
+    if failure_stage == "start":
+        monkeypatch.setattr(_DummyPyExecutor, "start_worker", fail)
+    elif failure_stage == "discovery":
+        make_args = _make_llm_args
+
+        def discovery_args():
+            args = make_args()
+            args._openengine_discovery = object()
+            args.kv_cache_config.kv_events_config = SimpleNamespace(
+                enable_kv_cache_events=True, publisher="zmq"
+            )
+            return args
+
+        monkeypatch.setattr(sys.modules[__name__], "_make_llm_args", discovery_args)
+        monkeypatch.setitem(
+            sys.modules,
+            "tensorrt_llm.grpc.openengine.node",
+            SimpleNamespace(initialize_node_discovery=fail),
+        )
+    elif failure_stage == "metrics":
+        move_metrics = py_executor_creator._move_model_engine_metrics
+
+        def fail_final_metrics(executor, engine, phase):
+            if phase == "final":
+                fail()
+            move_metrics(executor, engine, phase)
+
+        monkeypatch.setattr(py_executor_creator, "_move_model_engine_metrics", fail_final_metrics)
+
+    try:
+        # The creator harness's patched factory records strong references to
+        # executors. Restore it before checking the worker's ownership lifetime.
+        with monkeypatch.context() as creation_patch:
+            with pytest.raises(RuntimeError) as error:
+                _run_create_py_executor(
+                    creation_patch,
+                    sm_version=100,
+                    kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+                    kv_cache_creator_cls=EstimatingCacheCreator,
+                )
+        assert py_executor_creator._adjust_torch_mem_fraction is original_adjust
+        assert error.value is startup_error
+        assert events == ["shutdown"]
+        assert len(workers) == 1 and not workers[0].is_alive()
+        # Drop the exception traceback, which otherwise owns the creator frame.
+        startup_error.__traceback__ = None
+        del error
+        gc.collect()
+        assert executors[0]() is None
+    finally:
+        # Keep failures bounded even if the creator stops calling shutdown.
+        for executor_ref in executors:
+            executor = executor_ref()
+            if executor is not None:
+                executor.stop_queue.put(None)
+        for worker in workers:
+            worker.join(10)
+            assert not worker.is_alive()
+
+
+def test_startup_cleanup_failure_preserves_original_error(monkeypatch):
+    startup_error = RuntimeError("startup failed")
+    cleanup_error = RuntimeError("shutdown failed")
+    shutdown_calls = []
+
+    def start(executor):
+        raise startup_error
+
+    def shutdown(executor):
+        shutdown_calls.append(executor)
+        raise cleanup_error
+
+    monkeypatch.setattr(_DummyPyExecutor, "start_worker", start)
+    monkeypatch.setattr(_DummyPyExecutor, "shutdown", shutdown)
+    log_error = Mock(wraps=py_executor_creator.logger.error)
+    monkeypatch.setattr(py_executor_creator.logger, "error", log_error)
+    with pytest.raises(RuntimeError) as error:
+        _run_create_py_executor(monkeypatch, sm_version=100, kv_cache_quant_algo=QuantAlgo.NO_QUANT)
+    assert error.value is startup_error
+    assert len(shutdown_calls) == 1
+    log_error.assert_called_once()
+    message = log_error.call_args.args[0]
+    assert "Failed to shut down executor after startup failure" in message
+    assert "shutdown failed" in message
