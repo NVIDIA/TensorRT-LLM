@@ -974,6 +974,13 @@ def _copy_weights_into_model(model_load_weights: Callable[..., None],
             torch.cuda.synchronize()
 
 
+def _model_reads_own_checkpoint(model: Any) -> bool:
+    """Whether the model defines `load_checkpoint(checkpoint_dir)` and reads its
+    checkpoint's files itself, so the checkpoint loader opens nothing and no
+    weight mapper applies."""
+    return getattr(type(model), "load_checkpoint", None) is not None
+
+
 def load_model_from_auto_load_format(
     checkpoint_loader: BaseCheckpointLoader,
     checkpoint_dir: str,
@@ -1029,9 +1036,7 @@ def load_model_from_auto_load_format(
             mx_loading.get_mx_load_weights_kwargs(model_config=model_config,
                                                   llm_args=llm_args,
                                                   qualification=qualification))
-    if getattr(type(model), "load_checkpoint", None) is not None:
-        # The model reads its checkpoint's files itself, so the checkpoint
-        # loader opens nothing and no weight mapper applies.
+    if _model_reads_own_checkpoint(model):
         weight_mapper = None
         startup_metadata["checkpoint_io_policy"] = None
         with timing_metric(
@@ -1606,11 +1611,8 @@ class ModelLoader:
                     self.spec_config.speculative_model)
 
         elif load_format == LoadFormat.DUMMY:
-            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                model, model_config)
-            initialize_dummy_weights(model)
-            if loads_draft_weights:
-                model.draft_model.load_weights_from_target_model(model)
+            self._initialize_dummy_weights(checkpoint_loader, model,
+                                           model_config, loads_draft_weights)
 
         elif load_format == LoadFormat.VISION_ONLY:
             # Vision weights are already loaded within the model.
@@ -1789,6 +1791,16 @@ class ModelLoader:
                                f"{self._checkpoint_loader!r}: {exc!r}")
             finally:
                 self._checkpoint_loader = None
+
+    def _initialize_dummy_weights(self, checkpoint_loader, model, config,
+                                  loads_draft_weights: bool) -> None:
+        """Fill the model with dummy weights instead of reading a checkpoint."""
+        if not _model_reads_own_checkpoint(model):
+            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                model, config)
+        initialize_dummy_weights(model)
+        if loads_draft_weights:
+            model.draft_model.load_weights_from_target_model(model)
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,
