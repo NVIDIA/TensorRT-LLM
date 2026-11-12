@@ -27,17 +27,10 @@ import os
 import pytest
 from utils.llm_data import llm_datasets_root
 
-try:
-    from tensorrt_llm.serve.harmony_adapter import HarmonyAdapter
+from tensorrt_llm.serve import harmony_adapter
+from tensorrt_llm.serve.harmony_adapter import HarmonyAdapter
 
-    _harmony_available = True
-except (ImportError, ModuleNotFoundError):
-    _harmony_available = False
-
-pytestmark = [
-    pytest.mark.cpu_only,
-    pytest.mark.skipif(not _harmony_available, reason="harmony_adapter not importable"),
-]
+pytestmark = pytest.mark.cpu_only
 
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
 TOOL_CALL = ("get_weather", '{"city":"Paris","unit":"c"}')
@@ -49,6 +42,9 @@ _CALL = (
 )
 
 _FINAL = "<|start|>assistant<|channel|>final<|message|>It is sunny.<|return|>"
+
+# A header the parser rejects at <|message|>: the channel marker has no name.
+_REJECTED_HEADER = "<|start|>assistant<|channel|><|message|>"
 
 # name -> (harmony completion text, expected tool calls, expected content)
 CASES = {
@@ -75,6 +71,24 @@ CASES = {
     ),
 }
 
+# Same layout as CASES. The parser rejects part of the completion, drops it and
+# resumes at the next <|start|>, so a complete message after the rejected part
+# must still reach the client. Streaming only: the non-streaming parser fails on
+# the whole completion instead of resuming.
+RECOVERY_CASES = {
+    "stray_channel_then_final": (_ANALYSIS + "<|channel|>" + _FINAL, [], "It is sunny."),
+    "rejected_header_then_final": (_ANALYSIS + _REJECTED_HEADER + _FINAL, [], "It is sunny."),
+    "rejected_header_then_tool_call": (_ANALYSIS + _REJECTED_HEADER + _CALL, [TOOL_CALL], ""),
+    # No <|start|> follows the rejected header, so the rest of that message is
+    # dropped at every batch size.
+    "rejected_header_not_restarted": (
+        _ANALYSIS + _REJECTED_HEADER + "final<|message|>It is sunny.<|return|>",
+        [],
+        "",
+    ),
+}
+STREAMING_CASES = {**CASES, **RECOVERY_CASES}
+
 # name -> (harmony completion text, expected (channel, recipient, text) messages).
 # A stray control token sits between two valid messages; the parser rejects it,
 # and the message after it must still be parsed.
@@ -93,6 +107,15 @@ MESSAGE_CASES = {
             ("analysis", None, "User wants weather. Call tool."),
             ("commentary", "functions.get_weather", TOOL_CALL[1]),
         ],
+    ),
+    "rejected_header_then_final": (
+        _ANALYSIS + _REJECTED_HEADER + _FINAL,
+        [("analysis", None, "User wants weather. Call tool."), ("final", None, "It is sunny.")],
+    ),
+    # No <|start|> follows the rejected header, so the rest of that message is dropped.
+    "rejected_header_not_restarted": (
+        _ANALYSIS + _REJECTED_HEADER + "final<|message|>It is sunny.<|return|>",
+        [("analysis", None, "User wants weather. Call tool.")],
     ),
 }
 
@@ -177,10 +200,10 @@ def _stream_messages(adapter, tokens, batch_sizes):
     return [(m.channel, m.recipient, "".join(part.text for part in m.content)) for m in messages]
 
 
-@pytest.mark.parametrize("case", list(CASES))
+@pytest.mark.parametrize("case", list(STREAMING_CASES))
 def test_streaming_is_batch_size_invariant(adapter, case):
     """Every batching yields the batch-size-1 output, which matches the expected one."""
-    text, expected_tool_calls, expected_content = CASES[case]
+    text, expected_tool_calls, expected_content = STREAMING_CASES[case]
     tokens = adapter.encoding.encode(text, allowed_special="all")
 
     reference = _stream(adapter, tokens, [1] * len(tokens))
@@ -218,4 +241,25 @@ def test_messages_recover_after_rejected_token(adapter, case):
     tokens = adapter.encoding.encode(text, allowed_special="all")
 
     assert _stream_messages(adapter, tokens, [1] * len(tokens)) == expected_messages
-    assert _stream_messages(adapter, tokens, [len(tokens)]) == expected_messages
+    mismatches = {
+        label: result
+        for label, schedule in _schedules(len(tokens))
+        if (result := _stream_messages(adapter, tokens, schedule)) != expected_messages
+    }
+    assert not mismatches, f"batch-dependent messages: {mismatches}"
+
+
+@pytest.mark.parametrize("stream", [_stream, _stream_messages], ids=["deltas", "messages"])
+def test_rejected_tokens_are_reported(adapter, monkeypatch, stream):
+    """Both streaming paths log an error for a batch with a rejected token, and only then."""
+    errors = []
+    monkeypatch.setattr(harmony_adapter.logger, "error", errors.append)
+
+    tokens = adapter.encoding.encode(_ANALYSIS + _FINAL, allowed_special="all")
+    stream(adapter, tokens, [len(tokens)])
+    assert not errors
+
+    tokens = adapter.encoding.encode(_ANALYSIS + "<|channel|>" + _FINAL, allowed_special="all")
+    stream(adapter, tokens, [len(tokens)])
+    assert len(errors) == 1
+    assert f"rejected 1 of {len(tokens)} token(s)" in errors[0]
