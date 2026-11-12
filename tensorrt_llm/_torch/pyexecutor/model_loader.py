@@ -699,6 +699,13 @@ def construct_checkpoint_loader(
     return checkpoint_loader
 
 
+def _model_reads_own_checkpoint(model: Any) -> bool:
+    """Whether the model defines `load_checkpoint(checkpoint_dir)` and reads its
+    checkpoint's files itself, so the checkpoint loader opens nothing and no
+    weight mapper applies."""
+    return getattr(type(model), "load_checkpoint", None) is not None
+
+
 @contextmanager
 def _legacy_weight_session(checkpoint_loader: Any, checkpoint_dir: str,
                            **kwargs: Any) -> Iterator[dict[str, Any]]:
@@ -1764,11 +1771,8 @@ class ModelLoader:
                     raise
 
             elif load_format == LoadFormat.DUMMY:
-                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                    model, config)
-                initialize_dummy_weights(model)
-                if loads_draft_weights:
-                    model.draft_model.load_weights_from_target_model(model)
+                self._initialize_dummy_weights(checkpoint_loader, model, config,
+                                               loads_draft_weights)
 
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.
@@ -2494,14 +2498,22 @@ class ModelLoader:
                     f"checkpoint weights via mod-indexing.")
         return config
 
+    def _initialize_dummy_weights(self, checkpoint_loader, model, config,
+                                  loads_draft_weights: bool) -> None:
+        """Fill the model with dummy weights instead of reading a checkpoint."""
+        if not _model_reads_own_checkpoint(model):
+            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                model, config)
+        initialize_dummy_weights(model)
+        if loads_draft_weights:
+            model.draft_model.load_weights_from_target_model(model)
+
     def _materialize_checkpoint_weights(self, checkpoint_loader,
                                         checkpoint_dir: str, model, config,
                                         load_weights_kwargs: dict) -> bool:
         """Keep loader-specific work alive through weight materialization."""
         self._startup_metadata["checkpoint_io_policy"] = None
-        if getattr(type(model), "load_checkpoint", None) is not None:
-            # The model reads its checkpoint's files itself, so the checkpoint
-            # loader opens nothing and no weight mapper applies.
+        if _model_reads_own_checkpoint(model):
             with timing_metric(
                     ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
                     self._metrics):
