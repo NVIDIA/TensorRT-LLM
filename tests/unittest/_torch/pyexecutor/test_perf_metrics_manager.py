@@ -1,15 +1,47 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
 
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.perf_metrics_manager import PerfMetricsManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "enabled,rank,compiled,multimodal",
+    [
+        (True, 0, False, True),
+        (False, 0, False, True),
+        (True, 1, False, True),
+        (True, 0, True, True),
+        (True, 0, False, False),
+    ],
+)
+def test_encoder_timing_callback_installation(enabled, rank, compiled, multimodal):
+    model = MultimodalModelMixin() if multimodal else SimpleNamespace(_encoder_forward_context=None)
+    model._encoder_forward_context = None
+    executor = SimpleNamespace(
+        model_engine=SimpleNamespace(model=SimpleNamespace(_orig_mod=model) if compiled else model),
+        enable_iter_perf_stats=enabled,
+        dist=SimpleNamespace(rank=rank),
+        perf_manager=MagicMock(),
+    )
+
+    PyExecutor._setup_encoder_perf_metrics(executor)
+
+    expected = (
+        executor.perf_manager.record_encoder_forward
+        if enabled and rank == 0 and multimodal
+        else None
+    )
+    assert model._encoder_forward_context == expected
 
 
 class _FakeEvent:
@@ -45,6 +77,78 @@ def _make_request(events, forward_start_time):
         ctx_gpu_sample_time=None,
     )
     return SimpleNamespace(py_perf_timing=timing), metric
+
+
+def test_encoder_timing_retains_unready_events_and_reports_each_call_once():
+    manager = PerfMetricsManager(enabled=False)
+    start, end = MagicMock(), MagicMock()
+    start.elapsed_time.return_value = 2.5
+    end.query.side_effect = [False, True]
+    manager.borrow_forward_timing_events = MagicMock(return_value=(start, end))
+
+    with manager.record_encoder_forward():
+        start.record.assert_called_once_with()
+        end.record.assert_not_called()
+    end.record.assert_called_once_with()
+
+    assert manager.take_encoder_gpu_times_ms() == []
+    assert manager._forward_event_pool == []
+    start.elapsed_time.assert_not_called()
+
+    assert manager.take_encoder_gpu_times_ms() == [2.5]
+    assert manager._forward_event_pool == [(start, end)]
+    assert manager.take_encoder_gpu_times_ms() == []
+    start.synchronize.assert_not_called()
+    end.synchronize.assert_not_called()
+
+
+def test_encoder_timing_discards_failed_events_without_reusing_them():
+    manager = PerfMetricsManager(enabled=False)
+    start, end = MagicMock(), MagicMock()
+    end.query.return_value = True
+    start.elapsed_time.side_effect = RuntimeError("invalid event")
+    manager._encoder_events = [(start, end)]
+
+    assert manager.take_encoder_gpu_times_ms() == []
+    assert manager._encoder_events == []
+    assert manager._forward_event_pool == []
+
+
+def test_encoder_events_are_reused_between_downsampled_stats_records():
+    manager = PerfMetricsManager(enabled=False)
+    start, end = MagicMock(), MagicMock()
+    start.elapsed_time.return_value = 2.5
+    end.query.return_value = True
+    manager._forward_event_pool = [(start, end)]
+
+    for _ in range(3):
+        with manager.record_encoder_forward():
+            pass
+
+    assert manager.take_encoder_gpu_times_ms() == [2.5, 2.5, 2.5]
+    assert manager._forward_event_pool == [(start, end)]
+
+
+@pytest.mark.parametrize("adp_rank", [None, 0, 1])
+def test_encoder_samples_are_not_duplicated_by_adp_fanout(adp_rank, monkeypatch):
+    monkeypatch.delenv("TLLM_METRICS_ALL_RANKS", raising=False)
+    manager = MagicMock()
+    manager.take_encoder_gpu_times_ms.return_value = [2.5]
+    executor = SimpleNamespace(
+        enable_attention_dp=True,
+        disable_overlap_scheduler=False,
+        dist=SimpleNamespace(tp_size=2, pp_size=1),
+        perf_manager=manager,
+        stats_lock=Lock(),
+        stats=[],
+        max_stats_len=100,
+    )
+
+    PyExecutor._append_iter_stats(executor, MagicMock(), attention_dp_rank=adp_rank)
+
+    expected = None if adp_rank == 1 else {"gpuTimesMS": [2.5]}
+    assert executor.stats[0][8] == expected
+    assert manager.take_encoder_gpu_times_ms.call_count == (adp_rank != 1)
 
 
 def _make_emitting_request(request_id):
