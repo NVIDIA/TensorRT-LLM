@@ -732,7 +732,7 @@ def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
 
 
 def throwaway_unfused_logits_elem_bound(
-    model: nn.Module, max_num_tokens: int, max_seq_len: int
+    model: nn.Module, max_num_tokens: int, max_seq_len: int, max_gen_tokens: int
 ) -> Optional[int]:
     """Largest MQA-logits tile the unfused path still allocates when the fused Top-K is active.
 
@@ -741,12 +741,15 @@ def throwaway_unfused_logits_elem_bound(
     multi-request chunks, packed to ``_packed_logits_elem_budget``, and shorter single-request
     chunks: at most ``max_num_tokens`` query rows over ``(min_context + max_num_tokens) /
     compress_ratio`` keys (under query splitting a rank gates on its own rows, while the gathered
-    keys cover the whole chunk). Only valid when MLA chunked prefill plans the prefill chunks.
+    keys cover the whole chunk). Decode is not tiled by the logits budget: its paged MQA logits
+    hold ``max_gen_tokens`` rows over ``max_seq_len / compress_ratio`` keys. Only valid when MLA
+    chunked prefill plans the prefill chunks.
 
     Args:
         model: Model whose DSA indexers are inspected.
         max_num_tokens: Max tokens of one forward step.
         max_seq_len: Max sequence length of the KV cache.
+        max_gen_tokens: Max decode query tokens of one step (requests x tokens per step).
 
     Returns:
         The tile bound in elements, or None if no indexer uses the fused path or one of them has
@@ -765,8 +768,13 @@ def throwaway_unfused_logits_elem_bound(
         if not runner.can_run(max_seq_len // ratio):
             return None
         short_keys = -(-(indexer._throwaway_topk_min_context + max_num_tokens) // ratio)
-        bound = max(bound, max_num_tokens * short_keys)
-    return min(bound, single_request_tile)
+        decode_keys = -(-max_seq_len // ratio)
+        bound = max(
+            bound,
+            min(max_num_tokens * short_keys, single_request_tile),
+            max_gen_tokens * decode_keys,
+        )
+    return bound
 
 
 @maybe_compile(dynamic=True)

@@ -1044,13 +1044,22 @@ def test_unfused_logits_bound_covers_short_and_packed_chunks(max_num_tokens, exp
     model = _model_with_indexers(
         (True, False, _ReadyRunner(), 1 << 16), (True, False, _ReadyRunner(), 1 << 16)
     )
-    assert throwaway_unfused_logits_elem_bound(model, max_num_tokens, _MAX_SEQ_LEN) == expected
+    # One decode token: 256K keys, far below the prefill terms.
+    bound = throwaway_unfused_logits_elem_bound(model, max_num_tokens, _MAX_SEQ_LEN, 1)
+    assert bound == expected
 
 
-def test_unfused_logits_bound_never_exceeds_the_full_tile():
+def test_unfused_logits_bound_caps_prefill_terms_at_the_full_tile():
     model = _model_with_indexers((True, False, _ReadyRunner(compress_ratio=1), 1 << 16))
-    # 64 rows x 4096 tokens = 262144 elements, below every other bound.
-    assert throwaway_unfused_logits_elem_bound(model, 64, 4096) == 64 * 4096
+    # 64 rows x 4096 tokens = 262144 elements, below the short-context term.
+    assert throwaway_unfused_logits_elem_bound(model, 64, 4096, 1) == 64 * 4096
+
+
+def test_unfused_logits_bound_covers_decode_logits():
+    """Decode logits are not tiled by the budget, so they bound the reserve from below."""
+    model = _model_with_indexers((True, False, _ReadyRunner(), 1 << 16))
+    # 2048 decode tokens x 256K compressed keys = 2^29 elements, above the 2^28 prefill term.
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 2048) == 1 << 29
 
 
 @pytest.mark.parametrize(
@@ -1067,7 +1076,7 @@ def test_unfused_logits_bound_never_exceeds_the_full_tile():
 )
 def test_unfused_logits_bound_needs_a_ready_runner_on_every_layer(specs):
     model = _model_with_indexers(*specs)
-    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN) is None
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 32) is None
 
 
 def _chunk_metadata(cached, new_tokens, compress_ratio):
