@@ -1049,6 +1049,7 @@ def _legacy_mistral_batch_pixel_values(
 
 
 class _MistralCpuEncoder:
+    multimodal_data_device_paths = []  # The media stays on the host.
     mm_encoder_groups = modeling_mistral.Mistral3VLM.mm_encoder_groups
     encode_multimodal_inputs = modeling_mistral.Mistral3VLM.encode_multimodal_inputs
     _get_image_features = modeling_mistral.Mistral3VLM._get_image_features

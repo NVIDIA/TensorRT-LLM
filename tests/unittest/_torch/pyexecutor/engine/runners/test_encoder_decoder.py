@@ -80,6 +80,28 @@ def test_encoder_decoder_rejects_mixed_token_and_feature_batch() -> None:
         )
 
 
+def test_feature_packing_uploads_host_features_through_the_shared_uploader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class Uploader:
+        def upload_pieces(self, shape, dtype, pieces):
+            calls.append((tuple(shape), dtype, [(value, tuple(start)) for value, start in pieces]))
+            return "packed"
+
+    monkeypatch.setattr(encoder_decoder_module, "staged_uploader", lambda device: Uploader())
+    stage = object.__new__(EncoderStage)
+    features = [torch.zeros(2, 3, 4), torch.ones(1, 3, 4)]
+    assert stage._pack_features(features) == "packed"
+    ((shape, dtype, pieces),) = calls
+    assert (shape, dtype) == ((3, 3, 4), torch.float32)
+    assert [(value is feature, start) for (value, start), feature in zip(pieces, features)] == [
+        (True, (0, 0, 0)),
+        (True, (2, 0, 0)),
+    ]
+
+
 def test_token_encoder_stack_applies_shared_embedding_scale_and_positions() -> None:
     embedding = Mock(side_effect=lambda input_ids: input_ids.to(torch.float32).unsqueeze(1))
     expected = torch.tensor([[2.0], [4.0], [6.0]])

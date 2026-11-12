@@ -1032,7 +1032,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
             raise ValueError(
                 "Raw multimodal inputs require a local multimodal encoder.")
         return encode_multimodal_by_groups(self.mm_encoder_groups,
-                                           list(multimodal_params))
+                                           list(multimodal_params),
+                                           self.multimodal_data_device_paths)
 
     def get_language_model_extra_forward_kwargs(
         self,

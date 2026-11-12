@@ -1997,6 +1997,144 @@ def test_estimation_workspace_failure_vote_includes_zero_rate_ranks(
     distributed.get.return_value.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
 
 
+def _profiled_peak_memory(
+    copy_pool_bytes: int,
+    llm_args: Mock,
+    mapping: Mapping,
+    item_scheduling: bool,
+    encoder_peak: int = 256,
+) -> tuple[int, int]:
+    """The peak memory the KV estimate sizes from, with an encoder profile and a copy-stream pool,
+    and the encodes the uploader then holds. The encoder step peaks at `encoder_peak` bytes, the
+    LLM step at 256."""
+    model_engine = Mock()
+    model_engine.mm_encoder_item_scheduling_enabled = item_scheduling
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    model_engine.model.model_config.is_encoder_decoder = False
+    model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
+    with patch.object(
+        KvCacheCreator,
+        "_get_model_kv_cache_manager_cls",
+        return_value=KVCacheManagerV2,
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            mapping=mapping,
+            net_max_seq_len=4096,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=4096,
+            max_batch_size=8,
+            kv_cache_config=KvCacheConfig(max_tokens=1024),
+            llm_args=llm_args,
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+    creator._mla_chunked_profile_length = None
+    py_executor = Mock()
+    py_executor.warmup_scope.return_value = nullcontext()
+    py_executor.dist.mapping.rank = 0
+    py_executor.dist.broadcast.side_effect = lambda value, root: value
+    py_executor.enqueue_requests.return_value = [1]
+    py_executor.await_responses.return_value = []
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
+    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+    uploader = SimpleNamespace(reserved_bytes=lambda: copy_pool_bytes, max_encodes_in_flight=2)
+    # The encoder step's peak until the reset after it, then the LLM step's.
+    reset_peak = Mock()
+    with (
+        patch.object(creator, "_get_token_num_for_estimation", return_value=256),
+        patch.object(creator, "_cal_max_memory", return_value=512) as cal_max_memory,
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(
+            torch.cuda,
+            "memory_stats",
+            side_effect=lambda: {
+                "allocated_bytes.all.current": 128,
+                "allocated_bytes.all.peak": encoder_peak if reset_peak.call_count < 2 else 256,
+            },
+        ),
+        patch.object(creator, "_encode_dummy_inputs", return_value=torch.zeros(4)),
+        patch("tensorrt_llm._torch.pyexecutor._util.staged_uploader", return_value=uploader),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=3)),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats", reset_peak),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
+            return_value=0,
+        ),
+    ):
+        assert creator.try_prepare_estimation()
+        creator.configure_kv_cache_capacity(py_executor)
+    return cal_max_memory.call_args.args[0], uploader.max_encodes_in_flight
+
+
+@pytest.mark.parametrize(
+    "disable_overlap_scheduler, encoder_side_stream_max_ahead, pp_size, item_scheduling, encodes",
+    [
+        pytest.param(True, 0, 1, False, 1, id="serialized"),
+        pytest.param(False, 0, 1, False, 2, id="overlap"),
+        pytest.param(True, 2, 1, False, 2, id="prefetch"),
+        pytest.param(True, 0, 4, False, 2, id="pp"),
+        pytest.param(True, 0, 1, True, 2, id="item-scheduling"),
+        pytest.param(False, 2, 4, False, 2, id="overlap-prefetch-pp"),
+    ],
+)
+def test_copy_stream_pool_reserves_the_uploader_bound(
+    disable_overlap_scheduler: bool,
+    encoder_side_stream_max_ahead: int,
+    pp_size: int,
+    item_scheduling: bool,
+    encodes: int,
+) -> None:
+    """The estimate reserves one profiled pool per encode the uploader holds, and the uploader
+    holds that many: one when each iteration waits for its sampler before the next encode (one PP
+    stage, no overlap scheduler, item scheduling or prefetch), otherwise two, not one per step or
+    prefetch."""
+    llm_args = Mock(
+        cache_transceiver_config=None,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        multimodal_config=SimpleNamespace(
+            encoder_side_stream_max_ahead=encoder_side_stream_max_ahead
+        ),
+    )
+    mapping = Mapping(world_size=pp_size, pp_size=pp_size)
+    without_pool, _ = _profiled_peak_memory(0, llm_args, mapping, item_scheduling)
+    with_pool, held = _profiled_peak_memory(64, llm_args, mapping, item_scheduling)
+    assert with_pool - without_pool == 64 * encodes
+    assert held == encodes
+
+
+@pytest.mark.parametrize(
+    "disable_overlap_scheduler, peak",
+    [pytest.param(True, 512, id="one-encode"), pytest.param(False, 576, id="two-encodes")],
+)
+def test_copy_stream_pool_keeps_an_encoder_dominant_peak(
+    disable_overlap_scheduler: bool, peak: int
+) -> None:
+    """When the encoder step peaks above the LLM step with its pool (512 > 256 + 64), the estimate
+    sizes from the encoder peak plus the pools of the other encodes the uploader holds."""
+    llm_args = Mock(
+        cache_transceiver_config=None,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        multimodal_config=SimpleNamespace(encoder_side_stream_max_ahead=0),
+    )
+    mapping = Mapping(world_size=1, pp_size=1)
+    # Without a pool, the estimate sizes from the LLM peak (256) plus reserves not set here.
+    reserves = _profiled_peak_memory(0, llm_args, mapping, False)[0] - 256
+    with_pool, _ = _profiled_peak_memory(64, llm_args, mapping, False, encoder_peak=512)
+    assert with_pool - reserves == peak
+
+
 @pytest.mark.parametrize("estimating", [False, True])
 @pytest.mark.parametrize("layer_limit", [None, 20])
 def test_csa2_creation_preserves_resolved_context_cache_boundary(estimating, layer_limit):

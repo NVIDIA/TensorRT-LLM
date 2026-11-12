@@ -92,13 +92,33 @@ def test_mm_encoder_runner_forward_skips_metadata_only_and_missing_length_reques
     assert params[0].multimodal_input is multimodal_input
     assert params[0].multimodal_data == requests[3].py_multimodal_data
     assert params[0].input_ids_start_offset == 6
-    to_device.assert_called_once_with(params[0], "multimodal_data", "cuda", pin_memory=True)
+    # An encoder without device paths moves every tensor per request, as before.
+    to_device.assert_called_once_with(
+        params[0], "multimodal_data", "cuda", pin_memory=True, target_keywords=None
+    )
     for request in requests:
         request.get_tokens.assert_not_called()
     assert result["logits"] is None
     assert result["mm_embedding_request_indices"] == [3]
     assert result["mm_embedding_lengths"] == [[2]]
     torch.testing.assert_close(result["mm_embeddings"][0], torch.arange(4).reshape(2, 2))
+
+
+def test_mm_encoder_runner_leaves_raw_media_to_the_encoder_call() -> None:
+    """A default-builder encoder moves only MRoPE per request; its forward moves the media."""
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup
+
+    model = SimpleNamespace(
+        extra_attrs={},
+        mm_encoder_groups=(EncoderGroup(("image", "video"), lambda **kwargs: None),),
+        multimodal_data_device_paths=[
+            "image.pixel_values",
+            "video.pixel_values_videos",
+            "mrope_config.mrope_position_ids",
+        ],
+    )
+    runner = MultimodalEncoderRunner(model, encoder_cache_enabled=False, moe_load_balancer=None)
+    assert runner._device_paths == ["mrope_config.mrope_position_ids"]
 
 
 def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> None:

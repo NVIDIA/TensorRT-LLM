@@ -524,7 +524,7 @@ def test_cosmos3_edge_vision_group_matches_legacy_packing(raw: bool) -> None:
 
     def encoder() -> SimpleNamespace:
         # SigLIP stand-in returns its patch rows; the projector sums each 2x2 block.
-        vision = SimpleNamespace(spatial_merge_size=2, inputs=[])
+        vision = SimpleNamespace(spatial_merge_size=2, inputs=[], multimodal_data_device_paths=[])
         vision.visual = lambda pixel_values, grid_thw, grid_cpu: (
             vision.inputs.append((pixel_values, grid_thw)) or pixel_values
         )

@@ -10,7 +10,10 @@ import torch
 from torch import nn
 from typing_extensions import Self
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    _build_request_multimodal_input,
+    request_device_paths,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -54,6 +57,9 @@ class MultimodalEncoderRunner(ScheduledModelRunner):
         self._model = model
         self._encoder_cache_enabled = encoder_cache_enabled
         self._moe_load_balancer = moe_load_balancer
+        # Raw media of default-builder encoders goes to the GPU in the encoder call; MRoPE
+        # still moves per request, for the CUDA IPC handoff. None moves every tensor.
+        self._device_paths = request_device_paths(model)
 
     @classmethod
     def create(cls, model: nn.Module, *, moe_load_balancer: MoeLoadBalancer | None = None) -> Self:
@@ -84,7 +90,12 @@ class MultimodalEncoderRunner(ScheduledModelRunner):
                 multimodal_data=request.py_multimodal_params.multimodal_data,
                 input_ids_start_offset=request_start,
             )
-            param.to_device("multimodal_data", "cuda", pin_memory=prefer_pinned())
+            param.to_device(
+                "multimodal_data",
+                "cuda",
+                pin_memory=prefer_pinned(),
+                target_keywords=self._device_paths,
+            )
             request_indices.append(request_idx)
             params.append(param)
             embedding_lengths.append(list(lengths))

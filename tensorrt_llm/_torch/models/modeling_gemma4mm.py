@@ -1239,7 +1239,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                         multimodal_data={**data, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
                     )
             views.append(param)
-        return encode_multimodal_by_groups(self.mm_encoder_groups, views)
+        return encode_multimodal_by_groups(
+            self.mm_encoder_groups,
+            views,
+            self.multimodal_data_device_paths,
+        )
 
     @staticmethod
     def get_sub_model_config(

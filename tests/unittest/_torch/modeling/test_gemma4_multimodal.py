@@ -160,6 +160,8 @@ class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
 
     supports_encoder_cache = True
     encode_multimodal_inputs = Gemma4ForConditionalGeneration.encode_multimodal_inputs
+    # The stub encoders run on the host, so the encoder call moves nothing to the GPU.
+    multimodal_data_device_paths = None
 
     def __init__(self, embedding_dim: int = 12) -> None:
         self.model_config = ModelConfig(
@@ -357,6 +359,7 @@ def _encode_normalization_buckets(buckets, modality="image"):
     model = SimpleNamespace(
         _get_image_features=lambda **kwargs: kwargs["pixel_values"].flatten(0, 1),
         _get_audio_features=None,
+        multimodal_data_device_paths=[],
     )
     model._encode_vision = Gemma4MultimodalModelBase._encode_vision.__get__(model)
     model.mm_encoder_groups = Gemma4MultimodalModelBase.mm_encoder_groups.__get__(model)
@@ -1684,12 +1687,15 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         ):
             embeddings = get_multimodal_embeddings(model.encode_multimodal_inputs, params)
 
-        expected = torch.tensor([[2.0], [1.0], [3.0]])
+        # The encoder call moves the listed pixel keys to the GPU; the payloads stay on the host.
+        expected = torch.tensor([[2.0], [1.0], [3.0]], device="cuda")
         torch.testing.assert_close(embeddings[0], expected)
         for param, expected_embedding in zip(params, expected, strict=True):
             torch.testing.assert_close(
                 param.multimodal_data["multimodal_embedding"], expected_embedding.unsqueeze(0)
             )
+            modality = next(iter(param.multimodal_data))
+            assert param.multimodal_data[modality]["pixel_values"].device.type == "cpu"
 
     def test_single_request_with_multiple_modalities_raises(self):
         """Mixed-modality requests are rejected until prompt-order handling is supported."""
@@ -2089,6 +2095,7 @@ class _StubVisionTower:
 class _Gemma4CpuEncoder:
     """Gemma4's encoder flow on CPU modules: a stub vision tower and a tiny random audio tower."""
 
+    multimodal_data_device_paths = []  # The media stays on the host.
     mm_encoder_groups = Gemma4MultimodalModelBase.mm_encoder_groups
     encode_multimodal_inputs = Gemma4MultimodalModelBase.encode_multimodal_inputs
     _encode_vision = Gemma4MultimodalModelBase._encode_vision
