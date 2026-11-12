@@ -704,28 +704,16 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
-        // Always re-tar the local stage directory and upload it directly, rather
-        // than trusting the last checkpoint uploaded by the checkpoint branch to
-        // still match it (the superseded-file rename above, or other
-        // post-snapshot writes, can leave it stale). Use --transform so tar
-        // contents carry the postTag filename without touching on-disk
-        // results*.xml files.
-        ensureStageResultNotUploaded("${stageName}${postTag}")
-        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-        uploadTestResult("results-${stageName}${postTag}.tar.gz", "test-results", attemptTargets(stageName, postTag))
-        deleteProgressArtifact(pipeline, stageName, postTag)
-
-        // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
+        // Collect coverage before packaging results.
         if (isCbtsStage(stageName)) {
-            CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
-                def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-                def cbtsLocalDir = "${stageName}/cbts"
-                def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
-                sh "mkdir -p ${cbtsLocalDir}"
-                try {
+            try {
+                CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+                    def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                    def cbtsLocalDir = "${stageName}/cbts${postTag}"
+                    def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                    sh "mkdir -p ${cbtsLocalDir}"
                     timeout(time: 5, unit: 'MINUTES') {
-                        // Freeze writers, then pack on the login node; an archive with no member is dropped.
+                        // Pack remote coverage and discard empty archives.
                         Utils.exec(
                             pipeline,
                             script: Utils.sshUserCmd(
@@ -744,16 +732,25 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                             numRetries: 3,
                         ) == 0
                         if (gotArchive) {
-                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                            // Aggregation flattens directories; tag retry filenames too.
+                            def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
+                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
                         } else {
                             echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
                         }
                     }
-                } catch (Exception e) {
-                    echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
                 }
+            } catch (Exception e) {
+                echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
             }
         }
+
+        // Archive current results, tagging XML members without renaming local files.
+        ensureStageResultNotUploaded("${stageName}${postTag}")
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        uploadTestResult("results-${stageName}${postTag}.tar.gz", "test-results", attemptTargets(stageName, postTag))
+        deleteProgressArtifact(pipeline, stageName, postTag)
     }
 
     if (localResultDirectoryMissing) {
@@ -1934,7 +1931,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             }
         }
 
-        slurmRunner = null
+        def slurmRunner = null
         echo "${stageName} Slurm partition timeout: ${partition.time}"
         def partitionTimeout = partition?.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
         if (cluster.containerRuntime.toString() == "DOCKER") {
@@ -7002,7 +6999,7 @@ def runLLMBuild(
 
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-grpc-smg.txt")
-    buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
+    def buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90;100;103;107;120;121'"
     } else {
@@ -8122,7 +8119,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
             if (checkPipStage) {
                 stage("[${toStageName(values[1], key)}] Run LLMAPI Test") {
-                    pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
+                    def pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
@@ -8491,7 +8488,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
         } else if (values.wheelInstalled) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
-                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                def imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
@@ -8500,7 +8497,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             }
         } else {
             stage(values.name) {
-                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                def imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE

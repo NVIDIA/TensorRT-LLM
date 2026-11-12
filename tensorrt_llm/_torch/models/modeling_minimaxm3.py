@@ -1258,6 +1258,8 @@ class MiniMaxM3Attention(Attention):
                     dtype=config.torch_dtype,
                     mapping=self.qkv_proj.mapping,
                     tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    # Unquantized unless the checkpoint declares per-layer
+                    # entries for the fused names below.
                     quant_config=None,
                     weights_loading_config=WeightsLoadingConfig(
                         weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
@@ -1271,6 +1273,10 @@ class MiniMaxM3Attention(Attention):
                     },
                     skip_create_weights_in_init=model_config.skip_create_weights_in_init,
                 )
+                # The checkpoint's index_q_proj / index_k_proj load into this
+                # projection; the model's quantization passes match their
+                # per-layer entries and exclusions by these names.
+                self.index_qk_proj.fused_checkpoint_names = ("index_q_proj", "index_k_proj")
 
             self.index_q_size = self.sparse_num_index_heads * self.sparse_index_dim
             self.index_k_size = self.sparse_index_dim

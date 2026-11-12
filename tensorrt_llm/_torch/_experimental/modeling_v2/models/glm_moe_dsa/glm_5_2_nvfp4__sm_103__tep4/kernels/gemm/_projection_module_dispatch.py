@@ -11,6 +11,11 @@ the selected tcgen05/TGV/persistent backend, and returns the registry ABI::
 The returned callable is pinned to the first M it sees.  The caller's registry
 already caches one callable per ``(device, op, M, N, K, path, compile_fn)``, so
 backend selection and compilation stay outside CUDA Graph replay.
+
+Its ``at_rows`` attribute launches the same compiled instance on fewer rows
+(``1..pinned M``), for the backends compiled on dynamic layouts (persistent and
+TGV): each row's output is bitwise the pinned M's for that row.  It raises before
+the first launch and on the tcgen05 backend, whose kernels are compiled for one M.
 """
 
 from collections.abc import Callable, Mapping
@@ -378,6 +383,10 @@ def make_build(
                     compiled_by_key[key] = compiled
                 compiled_fn = compiled
                 pinned_m = active_m
+                if instance.backend == "persistent" and active_m not in abi.pdl_enabled_m:
+                    # What a caller needs to compile the same kernel as a TVM-FFI function for
+                    # its eager calls (`cute_dsl_projection.with_eager_twin`).
+                    run_linear.persistent = (instance.schedule, abi.kernel_name_prefix)
             elif input_tensor.shape[0] != pinned_m:
                 raise ValueError(
                     f"{abi.module_name}: this build() instance is pinned to "
@@ -385,6 +394,29 @@ def make_build(
                 )
             return compiled_fn(input_tensor, weight, output)
 
+        def run_rows(
+            input_tensor: torch.Tensor,
+            weight: torch.Tensor,
+            output: torch.Tensor,
+        ) -> object:
+            """The pinned instance on ``1..pinned M`` rows (``launch_rows``)."""
+            launch_rows = getattr(compiled_fn, "launch_rows", None)
+            if launch_rows is None:
+                raise ValueError(
+                    f"{abi.module_name}: no runtime-M launch "
+                    f"({'not launched yet' if compiled_fn is None else 'backend is compiled for one M'})"
+                )
+            if not 0 < int(input_tensor.shape[0]) <= pinned_m:
+                raise ValueError(
+                    f"{abi.module_name}: runtime M={int(input_tensor.shape[0])} outside "
+                    f"1..{pinned_m} of this build() instance"
+                )
+            return launch_rows(input_tensor, weight, output)
+
+        run_linear.at_rows = run_rows
+        # Whether `at_rows` launches: the instance compiled (first launch) on a backend with
+        # a runtime-M launch.
+        run_linear.takes_rows = lambda: hasattr(compiled_fn, "launch_rows")
         return run_linear
 
     return build
