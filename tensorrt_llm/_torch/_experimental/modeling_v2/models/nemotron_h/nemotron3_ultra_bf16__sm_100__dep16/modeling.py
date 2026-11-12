@@ -35,8 +35,9 @@ checkpoint's noaux_tc selection) and returns the routed sum for this rank's own 
 A request the leaf turns down fails at construction; it is never served by another
 kernel. `UNCERTIFIED_GENERIC_CALLS` names that stock code.
 
-Tuning knobs (read once, at load): `TRTLLM_NEMOTRON_ULTRA_DEP16_LOWM_MAX_ROWS` and
-`TRTLLM_NEMOTRON_ULTRA_DEP16_FI_SSU_MIN_ROWS` (see below); the MoE layer's own knobs
+Tuning knobs (read once, at load): `TRTLLM_NEMOTRON_ULTRA_DEP16_LOWM_MAX_ROWS`,
+`TRTLLM_NEMOTRON_ULTRA_DEP16_FI_SSU_MIN_ROWS`, `TRTLLM_NEMOTRON_ULTRA_DEP16_MOE_FRONT_FIRST` and
+`TRTLLM_NEMOTRON_ULTRA_DEP16_SPLITK_MAX_ROWS` (see below); the MoE layer's own knobs
 are the engine's (`moe_config.max_num_tokens`, `TRTLLM_FORCE_COMM_METHOD`,
 `MEGAMOE_TACTIC_AUTOTUNE`, `MEGAMOE_COMBINE_FORMAT`).
 
@@ -70,6 +71,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.gemm.flashinfer_direct_bf16_gemm import (  # noqa: E501
     flashinfer_direct_bf16_gemm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.gemm.flashinfer_splitk_bf16_gemm import (  # noqa: E501
+    flashinfer_splitk_bf16_gemm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.norm.rms_norm_gated_grouped import (  # noqa: E501
     rms_norm_gated_grouped,
@@ -146,6 +150,42 @@ _LOWM_MAX_ROWS_CERTIFIED = 2
 #: them 128-byte aligned, and those rows start past the context tokens' in_proj rows.
 FI_SSU_MIN_ROWS_ENV = "TRTLLM_NEMOTRON_ULTRA_DEP16_FI_SSU_MIN_ROWS"
 _FI_SSU_MIN_ROWS_DEFAULT = 32
+#: Decode MoE block order. The shared expert forks onto the side stream as the block starts, and its
+#: GEMMs take the SMs the latency-bound front (the router GEMM, fc1_latent) needs. Set to 1, the
+#: decode step issues the router and fc1_latent first and forks the shared expert after them: the
+#: same kernels on the same inputs (Modeling V1's TRTLLM_NEMOTRON_H_MOE_FRONT_FIRST). Off by default.
+MOE_FRONT_FIRST_ENV = "TRTLLM_NEMOTRON_ULTRA_DEP16_MOE_FRONT_FIRST"
+#: Decode steps of more than LOWM_MAX_ROWS and at most this many rows on a rank run the projections
+#: in SPLITK_PROJECTIONS_ENV (by default those where FlashInfer's SM100 split-K kernel beats
+#: cublas_mm at dep16: mamba in_proj and out_proj, shared-expert up, fc1_latent, fc2_latent; see
+#: flashinfer_splitk_bf16_gemm) through it. 0 (the default) is off; at most 32.
+SPLITK_MAX_ROWS_ENV = "TRTLLM_NEMOTRON_ULTRA_DEP16_SPLITK_MAX_ROWS"
+_SPLITK_MAX_ROWS_CAP = 32
+#: Which decode projections the split-K kernel runs (comma-separated), of `_SPLITK_PROJECTIONS_ALL`.
+SPLITK_PROJECTIONS_ENV = "TRTLLM_NEMOTRON_ULTRA_DEP16_SPLITK_PROJECTIONS"
+_SPLITK_PROJECTIONS_ALL = frozenset(
+    {"in_proj", "out_proj", "qkv", "o_proj", "shared_up", "shared_down", "fc1_latent", "fc2_latent"}
+)
+# The projections where the split-K kernel beats cublas_mm at every row count from 4 to 32.
+_SPLITK_PROJECTIONS_DEFAULT = frozenset(
+    {"in_proj", "out_proj", "shared_up", "fc1_latent", "fc2_latent"}
+)
+
+
+def _env_projections(name: str) -> frozenset:
+    """The split-K projection set from the environment: the default when unset."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return _SPLITK_PROJECTIONS_DEFAULT
+    got = frozenset(x.strip() for x in raw.split(",") if x.strip())
+    bad = got - _SPLITK_PROJECTIONS_ALL
+    if bad:
+        raise ValueError(
+            f"{name}={raw!r}: unknown {sorted(bad)}; expected of {sorted(_SPLITK_PROJECTIONS_ALL)}"
+        )
+    return got
+
+
 # The checkpoint's time_step_limit (0, inf): softplus(dt + dt_bias) is not clamped.
 _DT_LIMIT = (0.0, float("inf"))
 
@@ -434,6 +474,9 @@ class NemotronUltraBf16Dep16ModelingV2(DecoderModel):
         self.side_stream: "torch.cuda.Stream | None" = None
         self.lowm_max_rows = _LOWM_MAX_ROWS_DEFAULT
         self.fi_ssu_min_rows = _FI_SSU_MIN_ROWS_DEFAULT
+        self.moe_front_first = False
+        self.splitk_max_rows = 0
+        self.splitk_projections = _SPLITK_PROJECTIONS_DEFAULT
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
 
@@ -449,6 +492,9 @@ class NemotronUltraBf16Dep16ModelingV2(DecoderModel):
             LOWM_MAX_ROWS_ENV, _LOWM_MAX_ROWS_DEFAULT, 0, _LOWM_MAX_ROWS_CERTIFIED
         )
         self.fi_ssu_min_rows = _env_rows(FI_SSU_MIN_ROWS_ENV, _FI_SSU_MIN_ROWS_DEFAULT, 1, None)
+        self.moe_front_first = _env_rows(MOE_FRONT_FIRST_ENV, 0, 0, 1) == 1
+        self.splitk_max_rows = _env_rows(SPLITK_MAX_ROWS_ENV, 0, 0, _SPLITK_MAX_ROWS_CAP)
+        self.splitk_projections = _env_projections(SPLITK_PROJECTIONS_ENV)
         if mapping.rank == 0:
             first = self.routed_experts[str(self.dims.moe_layers[0])]
             logger.info(
@@ -457,7 +503,9 @@ class NemotronUltraBf16Dep16ModelingV2(DecoderModel):
                 f"{self.model_config.moe_backend_requested}), exchange between the "
                 f"{mapping.moe_ep_size} ranks {_exchange(first)}, moe_max_num_tokens "
                 f"{first.moe_max_num_tokens}; decode low-M GEMMs up to {self.lowm_max_rows} "
-                f"rows, FlashInfer Mamba2 step from {self.fi_ssu_min_rows} rows"
+                f"rows, FlashInfer Mamba2 step from {self.fi_ssu_min_rows} rows, decode MoE "
+                f"front first {self.moe_front_first}, split-K GEMMs up to {self.splitk_max_rows} rows on "
+                f"{','.join(sorted(self.splitk_projections))}"
             )
         # Whether kernels that take the choice launch as programmatic dependents.
         self.pdl = get_env_enable_pdl()
@@ -817,6 +865,9 @@ class DecodeTarget:
         self._layers = _layer_views(core)
         self._lowm_max_rows = core.lowm_max_rows
         self._fi_ssu_min_rows = core.fi_ssu_min_rows
+        self._moe_front_first = core.moe_front_first
+        self._splitk_max_rows = core.splitk_max_rows
+        self._splitk_projections = core.splitk_projections
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: the metadata fields this target consumes
@@ -907,6 +958,11 @@ class DecodeTarget:
         num_tokens = h.shape[0]
         attn_out = torch.empty([num_tokens, d.q_width_r], dtype=h.dtype, device=h.device)
         lowm = num_tokens <= self._lowm_max_rows
+        sk = (
+            self._splitk_projections
+            if not lowm and num_tokens <= self._splitk_max_rows
+            else frozenset()
+        )
         fi_ssu = num_tokens >= self._fi_ssu_min_rows
 
         din, conv_c = d.d_inner_r, d.conv_r
@@ -921,6 +977,8 @@ class DecodeTarget:
                 ssm_state = bound.ssm[i]
                 if lowm:
                     zxbcdt = flashinfer_direct_bf16_gemm(x, L.in_w, core.pdl)
+                elif "in_proj" in sk:
+                    zxbcdt = flashinfer_splitk_bf16_gemm(x, L.in_w, core.pdl)
                 else:
                     zxbcdt = cublas_mm(x, L.in_w)
                 z = zxbcdt[:, :din]
@@ -966,10 +1024,15 @@ class DecodeTarget:
                 yn = rms_norm_gated_grouped(
                     y.reshape(num_tokens, din), z, L.gnorm, eps, d.norm_group
                 )
-                out = cublas_mm(yn, L.out_w)
+                if "out_proj" in sk:
+                    out = flashinfer_splitk_bf16_gemm(yn, L.out_w, core.pdl)
+                else:
+                    out = cublas_mm(yn, L.out_w)
             elif isinstance(L, _Attention):
                 if lowm:
                     qkv = flashinfer_direct_bf16_gemm(x, L.qkv, core.pdl)
+                elif "qkv" in sk:
+                    qkv = flashinfer_splitk_bf16_gemm(x, L.qkv, core.pdl)
                 else:
                     qkv = cublas_mm(x, L.qkv)
                 attn_out = thop_attention(
@@ -983,32 +1046,55 @@ class DecodeTarget:
                     **step,
                     **_CALL_CONSTANTS,
                 )
-                out = cublas_mm(attn_out, L.o)
+                if "o_proj" in sk:
+                    out = flashinfer_splitk_bf16_gemm(attn_out, L.o, core.pdl)
+                else:
+                    out = cublas_mm(attn_out, L.o)
             else:
                 # The shared expert reads only x: run it on the side stream while the
-                # routed experts run on the main one, joined before the sum.
+                # routed experts run on the main one, joined before the sum. Front first:
+                # the router and fc1_latent go before the fork (MOE_FRONT_FIRST_ENV).
                 side = core.side_stream
                 main = torch.cuda.current_stream()
+                if self._moe_front_first:
+                    logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
+                    if lowm:
+                        xl = flashinfer_direct_bf16_gemm(x, L.fc1_lat, core.pdl)
+                    elif "fc1_latent" in sk:
+                        xl = flashinfer_splitk_bf16_gemm(x, L.fc1_lat, core.pdl)
+                    else:
+                        xl = cublas_mm(x, L.fc1_lat)
                 side.wait_stream(main)
                 with torch.cuda.stream(side):
                     if lowm:
                         u = flashinfer_direct_bf16_gemm(x, L.sh_up, core.pdl)
+                    elif "shared_up" in sk:
+                        u = flashinfer_splitk_bf16_gemm(x, L.sh_up, core.pdl)
                     else:
                         u = cublas_mm(x, L.sh_up)
                     a = torch.square(torch.relu(u))
-                    shared = cublas_mm(a, L.sh_down)
-                logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
-                if lowm:
-                    xl = flashinfer_direct_bf16_gemm(x, L.fc1_lat, core.pdl)
-                else:
-                    xl = cublas_mm(x, L.fc1_lat)
+                    if "shared_down" in sk:
+                        shared = flashinfer_splitk_bf16_gemm(a, L.sh_down, core.pdl)
+                    else:
+                        shared = cublas_mm(a, L.sh_down)
+                if not self._moe_front_first:
+                    logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
+                    if lowm:
+                        xl = flashinfer_direct_bf16_gemm(x, L.fc1_lat, core.pdl)
+                    elif "fc1_latent" in sk:
+                        xl = flashinfer_splitk_bf16_gemm(x, L.fc1_lat, core.pdl)
+                    else:
+                        xl = cublas_mm(x, L.fc1_lat)
                 routed = L.experts(
                     xl,
                     logits,
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=False,
                 )
-                out = cublas_mm(routed, L.fc2_lat)
+                if "fc2_latent" in sk:
+                    out = flashinfer_splitk_bf16_gemm(routed, L.fc2_lat, core.pdl)
+                else:
+                    out = cublas_mm(routed, L.fc2_lat)
                 main.wait_stream(side)
                 out = out + shared
             x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)

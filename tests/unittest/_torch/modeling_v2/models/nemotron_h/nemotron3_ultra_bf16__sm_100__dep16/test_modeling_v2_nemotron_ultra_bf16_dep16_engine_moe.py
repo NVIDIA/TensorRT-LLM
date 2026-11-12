@@ -263,6 +263,10 @@ def test_a_request_the_engine_resolved_elsewhere_is_refused(monkeypatch):
         (M.LOWM_MAX_ROWS_ENV, " 1 ", 2, 0, 2, 1),
         (M.FI_SSU_MIN_ROWS_ENV, "8", 32, 1, None, 8),
         (M.FI_SSU_MIN_ROWS_ENV, "100000", 32, 1, None, 100000),
+        (M.MOE_FRONT_FIRST_ENV, None, 0, 0, 1, 0),
+        (M.MOE_FRONT_FIRST_ENV, "1", 0, 0, 1, 1),
+        (M.SPLITK_MAX_ROWS_ENV, None, 0, 0, M._SPLITK_MAX_ROWS_CAP, 0),
+        (M.SPLITK_MAX_ROWS_ENV, "32", 0, 0, M._SPLITK_MAX_ROWS_CAP, 32),
     ],
 )
 def test_knobs_read_their_value(monkeypatch, name, raw, default, lo, hi, want):
@@ -281,6 +285,9 @@ def test_knobs_read_their_value(monkeypatch, name, raw, default, lo, hi, want):
         (M.LOWM_MAX_ROWS_ENV, "-1", 0, 2, r"expected \[0, 2\]"),
         (M.FI_SSU_MIN_ROWS_ENV, "0", 1, None, "expected >= 1"),
         (M.FI_SSU_MIN_ROWS_ENV, "auto", 1, None, "expected an integer"),
+        (M.MOE_FRONT_FIRST_ENV, "2", 0, 1, r"expected \[0, 1\]"),
+        # the split-K kernel takes at most 32 rows
+        (M.SPLITK_MAX_ROWS_ENV, "33", 0, M._SPLITK_MAX_ROWS_CAP, r"expected \[0, 32\]"),
     ],
 )
 def test_knobs_refuse_values_out_of_bounds(monkeypatch, name, raw, lo, hi, missed):
@@ -289,9 +296,42 @@ def test_knobs_refuse_values_out_of_bounds(monkeypatch, name, raw, lo, hi, misse
         M._env_rows(name, 0, lo, hi)
 
 
+@pytest.mark.parametrize(
+    "raw, want",
+    [
+        (None, M._SPLITK_PROJECTIONS_DEFAULT),
+        ("", M._SPLITK_PROJECTIONS_DEFAULT),
+        ("in_proj", frozenset({"in_proj"})),
+        (" fc1_latent , fc2_latent ,", frozenset({"fc1_latent", "fc2_latent"})),
+    ],
+)
+def test_splitk_projections_read_their_value(monkeypatch, raw, want):
+    if raw is None:
+        monkeypatch.delenv(M.SPLITK_PROJECTIONS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.SPLITK_PROJECTIONS_ENV, raw)
+    assert M._env_projections(M.SPLITK_PROJECTIONS_ENV) == want
+
+
+def test_splitk_projections_refuse_unknown_names(monkeypatch):
+    monkeypatch.setenv(M.SPLITK_PROJECTIONS_ENV, "in_proj,router")
+    with pytest.raises(ValueError, match=r"unknown \['router'\]"):
+        M._env_projections(M.SPLITK_PROJECTIONS_ENV)
+
+
+def test_splitk_default_projections_are_known():
+    assert M._SPLITK_PROJECTIONS_DEFAULT <= M._SPLITK_PROJECTIONS_ALL
+
+
 def test_knob_names_survive_the_launcher():
     """trtllm-llmapi-launch drops MV2_, SLURM_, UCX_ and OMPI_ variables before the ranks start."""
-    for name in (M.LOWM_MAX_ROWS_ENV, M.FI_SSU_MIN_ROWS_ENV):
+    for name in (
+        M.LOWM_MAX_ROWS_ENV,
+        M.FI_SSU_MIN_ROWS_ENV,
+        M.MOE_FRONT_FIRST_ENV,
+        M.SPLITK_MAX_ROWS_ENV,
+        M.SPLITK_PROJECTIONS_ENV,
+    ):
         assert not name.startswith(("MV2_", "SLURM_", "UCX_", "OMPI_")), name
 
 
