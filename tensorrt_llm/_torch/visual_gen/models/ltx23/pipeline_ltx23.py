@@ -8,11 +8,13 @@ import math
 import os
 import weakref
 from dataclasses import fields, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.visual_gen.cache.teacache import register_extractor
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -29,7 +31,14 @@ from ..ltx2.ltx2_core.types import (
 )
 from ..ltx2.ltx2_core.video_vae import TilingConfig
 from ..ltx2.parallel_vae import tile_parallel_decode
-from ..ltx2.pipeline_ltx2 import LTX2Pipeline, _load_component_weights, _LTX2CUDAGraphRunner
+from ..ltx2.pipeline_ltx2 import (
+    LTX2Pipeline,
+    LTX2TeaCacheExtractor,
+    _load_component_weights,
+    _LTX2CUDAGraphRunner,
+    ltx2_force_one_stage_enabled,
+    resolve_ltx2_pipeline_extra_attrs,
+)
 from ..ltx2.text_cache import TextCache
 from .ltx23_core.audio_vae import LTX23VocoderConfigurator
 from .ltx23_core.connector import (
@@ -173,6 +182,8 @@ def detect_native_ltx_pipeline(config: dict) -> str:
     defaults={
         "text_encoder_path": "google/gemma-3-12b-it-qat-q4_0-unquantized",
         "workflow": "generation",
+        "spatial_upsampler_path": None,
+        "distilled_lora_path": None,
     },
     doc="Lightricks LTX-2.3 text-to-video generation and retake with audio.",
 )
@@ -188,17 +199,43 @@ class LTX23Pipeline(BasePipeline):
     def __init__(self, pipeline_config: "DiffusionPipelineConfig") -> None:
         if pipeline_config.parallel.cfg_size != 1:
             raise NotImplementedError("LTX-2.3 generation requires parallel.cfg_size=1.")
+        if pipeline_config.cache_backend == "cache_dit" and pipeline_config.cuda_graph.enable:
+            raise NotImplementedError(
+                "LTX-2.3 Cache-DiT requires cuda_graph_config.enable=False; "
+                "per-step block-cache decisions cannot replay a full-transformer CUDA graph."
+            )
         super().__init__(pipeline_config)
 
     @classmethod
     def resolve_variant(cls, config):
         workflow = config.extra_attrs.get("workflow", "generation")
         if workflow == "retake":
+            if any(
+                config.extra_attrs.get(key)
+                for key in ("spatial_upsampler_path", "distilled_lora_path")
+            ):
+                raise ValueError("LTX-2.3 two-stage auxiliary paths are not supported for retake.")
             from .pipeline_ltx23_retake import LTX23RetakePipeline
 
             return LTX23RetakePipeline
         if workflow != "generation":
             raise ValueError(f"Unsupported LTX-2.3 workflow: {workflow!r}")
+        if (
+            getattr(config, "cache_backend", None) in ("teacache", "cache_dit")
+            or ltx2_force_one_stage_enabled()
+        ):
+            return cls
+        checkpoint_path = getattr(config.primary_pretrained_config, "_name_or_path", "")
+        if checkpoint_path:
+            config.extra_attrs.update(
+                resolve_ltx2_pipeline_extra_attrs(Path(checkpoint_path), config.extra_attrs)
+            )
+        if config.extra_attrs.get("spatial_upsampler_path") and config.extra_attrs.get(
+            "distilled_lora_path"
+        ):
+            from .pipeline_ltx23_two_stages import LTX23TwoStagesPipeline
+
+            return LTX23TwoStagesPipeline
         return cls
 
     default_warmup_resolutions = LTX2Pipeline.default_warmup_resolutions
@@ -213,6 +250,15 @@ class LTX23Pipeline(BasePipeline):
     _setup_cuda_graphs = LTX2Pipeline._setup_cuda_graphs
     _transformer_class = LTX23Model
     _cuda_graph_runner_class = _LTX23CUDAGraphRunner
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.pipeline_config.cache_backend == "teacache":
+            self._apply_teacache_coefficients()
+            register_extractor(
+                "LTX23Model",
+                LTX2TeaCacheExtractor(LTX2Pipeline._compute_ltx2_timestep_embedding),
+            )
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         self.forward(
@@ -450,7 +496,7 @@ class LTX23Pipeline(BasePipeline):
         guidance_rescale: float = 0.0,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
-    ):
+    ) -> PipelineOutput:
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -636,7 +682,36 @@ class LTX23Pipeline(BasePipeline):
         audio_latents = extra_stream_latents["audio"]
 
         timer.mark_post_start()
+        return self._decode_denoise_output(
+            latents=latents,
+            audio_latents=audio_latents,
+            video_shape=video_shape,
+            audio_shape=audio_shape,
+            video_context=video_embeds,
+            audio_context=audio_embeds,
+            context_mask=connector_mask,
+            generator=generator,
+            timer=timer,
+            frame_rate=frame_rate,
+            output_type=output_type,
+        )
 
+    def _decode_denoise_output(
+        self,
+        *,
+        latents: torch.Tensor,
+        audio_latents: torch.Tensor,
+        video_shape: VideoLatentShape,
+        audio_shape: AudioLatentShape,
+        video_context: torch.Tensor,
+        audio_context: torch.Tensor,
+        context_mask: torch.Tensor | None,
+        generator: torch.Generator,
+        timer: CudaPhaseTimer,
+        frame_rate: float,
+        output_type: str,
+    ) -> PipelineOutput:
+        """Decode denoised streams; subclasses may refine them before decoding."""
         logger.info("Decoding video and audio...")
 
         def decode_video_fn(vid_latents):

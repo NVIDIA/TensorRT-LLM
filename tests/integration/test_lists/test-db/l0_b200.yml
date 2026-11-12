@@ -485,6 +485,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[nano-1gpu]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[super-1gpu]
@@ -633,6 +634,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[fp8]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_two_stage_lpips_against_golden
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[fp8]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[nvfp4]

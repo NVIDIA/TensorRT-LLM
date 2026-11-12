@@ -57,6 +57,42 @@ from .transformer_ltx2 import Stage2Groups
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 
+def _load_spatial_upsampler(
+    path: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    strict: bool = False,
+) -> torch.nn.Module:
+    """Load a spatial upsampler; strict mode rejects invalid metadata and weights."""
+    sft_paths = _find_safetensors_files(path)
+    if not sft_paths:
+        raise ValueError(f"No safetensors files found at {path}")
+    _prefetch_ltx2_safetensors_files(sft_paths)
+
+    config: Dict[str, Any] = {}
+    try:
+        with safetensors.torch.safe_open(sft_paths[0], framework="pt") as handle:
+            metadata = handle.metadata()
+            if metadata and "config" in metadata:
+                config = json.loads(metadata["config"])
+    except Exception:
+        if strict:
+            raise
+
+    upsampler = LatentUpsamplerConfigurator.from_config(config)
+    state_dict: Dict[str, torch.Tensor] = {}
+    for checkpoint in sft_paths:
+        with safetensors.torch.safe_open(checkpoint, framework="pt") as handle:
+            for key in handle.keys():
+                state_dict[key] = handle.get_tensor(key)
+
+    missing, unexpected = upsampler.load_state_dict(state_dict, strict=strict)
+    if missing:
+        logger.warning(f"Upsampler missing keys ({len(missing)}): {missing[:5]}")
+    return upsampler.to(device=device, dtype=dtype)
+
+
 class _TwoStagePhaseTimer(CudaPhaseTimer):
     """CudaPhaseTimer + the two-stage extras: the stage-2 refinement loop and
     the decode section.
@@ -206,6 +242,7 @@ def _load_lora_deltas(
     transformer: torch.nn.Module,
     transformer_prefix: str = "model.diffusion_model.",
     strength: float = 1.0,
+    strict: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Load LoRA weights and pre-compute parameter deltas.
 
@@ -254,6 +291,10 @@ def _load_lora_deltas(
             base_name = key[: -len(".alpha")]
             alpha_dict[base_name] = tensor.item()
 
+    if strict and down_keys.keys() != up_keys.keys():
+        missing = sorted(down_keys.keys() ^ up_keys.keys())
+        raise ValueError(f"Unpaired LoRA factors: {missing[:5]}")
+
     # Build list of prefixes to try stripping, ordered from longest to
     # shortest so we prefer the most specific match.  LoRA checkpoints
     # may use the full ``model.diffusion_model.`` prefix, or just the
@@ -276,6 +317,8 @@ def _load_lora_deltas(
 
         param_name = _map_lora_param_name(base_name, strip_prefixes)
         if not _has_lora_target(param_name, model_params):
+            if strict:
+                raise ValueError(f"LoRA target does not match the transformer: {base_name}")
             skipped_non_targets += 1
             continue
 
@@ -1181,35 +1224,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
             logger.info(f"Loading spatial upsampler from {spatial_upsampler_path}...")
-            sft_paths = _find_safetensors_files(spatial_upsampler_path)
-            if not sft_paths:
-                raise ValueError(f"No safetensors files found at {spatial_upsampler_path}")
-            _prefetch_ltx2_safetensors_files(sft_paths)
-
-            config: Dict[str, Any] = {}
-            try:
-                with safetensors.torch.safe_open(sft_paths[0], framework="pt") as f:
-                    meta = f.metadata()
-                    if meta and "config" in meta:
-                        config = json.loads(meta["config"])
-            except Exception:
-                pass
-
-            self.spatial_upsampler = LatentUpsamplerConfigurator.from_config(config)
-
-            state_dict: Dict[str, torch.Tensor] = {}
-            for path in sft_paths:
-                with safetensors.torch.safe_open(path, framework="pt") as f:
-                    for key in f.keys():
-                        state_dict[key] = f.get_tensor(key)
-
-            missing, unexpected = self.spatial_upsampler.load_state_dict(
-                state_dict,
-                strict=False,
-            )
-            if missing:
-                logger.warning(f"Upsampler missing keys ({len(missing)}): {missing[:5]}")
-            self.spatial_upsampler = self.spatial_upsampler.to(device=device, dtype=dtype)
+            self.spatial_upsampler = _load_spatial_upsampler(spatial_upsampler_path, device, dtype)
             logger.info("Spatial upsampler loaded")
         else:
             self.spatial_upsampler = None

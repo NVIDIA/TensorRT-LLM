@@ -392,10 +392,6 @@ class LTX23Model(LTXModel):
             self.audio_inner_dim, in_channels, out_channels, norm_eps, prefix="audio_"
         )
 
-    def _uses_cache_dit(self) -> bool:
-        # The LTX-2 Cache-DiT wrapper does not accept prompt timestep inputs.
-        return False
-
     def _compute_prompt_timestep(self, adaln, sigma, batch_size, dtype):
         """prompt_timestep from the global sigma (drives context K/V modulation)."""
         sigma_scaled = sigma * self.timestep_scale_multiplier
@@ -476,13 +472,30 @@ class LTX23Model(LTXModel):
         if audio_args is not None and audio_padding_mask is not None:
             audio_args = replace(audio_args, audio_padding_mask=audio_padding_mask)
 
-        for block in self.transformer_blocks:
-            video_args, audio_args = block(
-                video_args,
-                audio_args,
-                video_prompt_timestep=video_prompt_ts,
-                audio_prompt_timestep=audio_prompt_ts,
-            )
+        if self._uses_cache_dit():
+            self._cache_dit_video_args = video_args
+            self._cache_dit_audio_args = audio_args
+            vx = video_args.x if video_args is not None else None
+            ax = audio_args.x if audio_args is not None else None
+            for block in self.transformer_blocks:
+                vx, ax = block(
+                    vx,
+                    ax,
+                    video_prompt_timestep=video_prompt_ts,
+                    audio_prompt_timestep=audio_prompt_ts,
+                )
+            if video_args is not None:
+                video_args = replace(video_args, x=vx)
+            if audio_args is not None:
+                audio_args = replace(audio_args, x=ax)
+        else:
+            for block in self.transformer_blocks:
+                video_args, audio_args = block(
+                    video_args,
+                    audio_args,
+                    video_prompt_timestep=video_prompt_ts,
+                    audio_prompt_timestep=audio_prompt_ts,
+                )
 
         video_output = self._stream_output(video_args, is_audio=False)
         audio_output = self._stream_output(audio_args, is_audio=True)

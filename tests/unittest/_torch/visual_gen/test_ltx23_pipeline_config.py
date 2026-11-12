@@ -49,6 +49,8 @@ def test_ltx23_pipeline_config_defaults(ltx23_checkpoint: str) -> None:
     assert resolved == {
         "workflow": "generation",
         "text_encoder_path": "google/gemma-3-12b-it-qat-q4_0-unquantized",
+        "spatial_upsampler_path": None,
+        "distilled_lora_path": None,
     }
     assert args.pipeline_config == {}
 
@@ -57,9 +59,12 @@ def test_ltx23_pipeline_config_user_overrides(ltx23_checkpoint: str) -> None:
     overrides = {"workflow": "retake", "text_encoder_path": "/local/gemma"}
     args = VisualGenArgs(model=ltx23_checkpoint, pipeline_config=overrides)
 
-    assert (
-        PipelineLoader(args, device="cpu")._resolve_pipeline_config(ltx23_checkpoint) == overrides
-    )
+    resolved = PipelineLoader(args, device="cpu")._resolve_pipeline_config(ltx23_checkpoint)
+    assert resolved == {
+        **overrides,
+        "spatial_upsampler_path": None,
+        "distilled_lora_path": None,
+    }
 
 
 def test_ltx23_pipeline_config_rejects_unknown_keys(ltx23_checkpoint: str) -> None:
