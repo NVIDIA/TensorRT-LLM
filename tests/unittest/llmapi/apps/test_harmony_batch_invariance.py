@@ -174,9 +174,7 @@ def _stream_messages(adapter, tokens, batch_sizes):
                 )
     finally:
         adapter.cleanup_stream_state(request_id)
-    return [
-        (m.channel, m.recipient, "".join(part.text for part in m.content)) for m in messages
-    ]
+    return [(m.channel, m.recipient, "".join(part.text for part in m.content)) for m in messages]
 
 
 @pytest.mark.parametrize("case", list(CASES))
