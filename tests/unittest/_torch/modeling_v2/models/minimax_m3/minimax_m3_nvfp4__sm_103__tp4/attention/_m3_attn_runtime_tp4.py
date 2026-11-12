@@ -4,7 +4,7 @@
 
 One hybrid NVFP4 KV cache manager (``MiniMaxM3KVCacheManagerV2``) laid out as the target's: a dense layer in the FP8
 half, a sparse MSA layer in the NVFP4 half with its FP8 index-K cache, and (``draft=True``) the one-model Eagle3
-drafter's shared layer, read through the manager's FP8 draft view as the runtime's draft swap reads it. Metadata is
+drafter's shared layer, read through the manager's FP8 draft view as a draft metadata reads it. Metadata is
 the runtime's own type, filled by its own ``prepare()``; the backends are built the way the target builds them.
 
 The geometry is one rank's: 16 query heads over one KV head and one index head of dim 128. The mapping is a single

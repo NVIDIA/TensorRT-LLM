@@ -463,7 +463,7 @@ def remap_topk_to_global(
 
     Follows the native grouping rules: the leader of an active full+shared
     group computes the whole group in one launch and publishes it in
-    the DSA metadata's ``_group_remap_batched``; followers slice it; everything else
+    ``metadata._group_remap_batched``; followers slice it; everything else
     remaps per layer.
     """
     from tensorrt_llm._torch.attention.backends.sparse.dsa import backend as dsa_backend

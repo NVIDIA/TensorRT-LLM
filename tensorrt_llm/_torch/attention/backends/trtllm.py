@@ -113,7 +113,7 @@ class _ContextPlan:
     """Host state of a context-only trtllm-gen call, shared by the layers of one forward.
 
     TrtllmAttentionMetadata drops it whenever the lengths or the batch can change (prepare(), KV-length and
-    spec-dec updates, draft swaps); the bound tensors are also compared by identity. ``sig`` is the
+    spec-dec updates, draft refreshes); the bound tensors are also compared by identity. ``sig`` is the
     TrtllmAttention._context_plan_sig of the layer that built it.
     """
 

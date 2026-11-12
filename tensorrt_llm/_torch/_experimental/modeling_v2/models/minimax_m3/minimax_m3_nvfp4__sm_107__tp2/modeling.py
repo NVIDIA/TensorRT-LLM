@@ -4760,7 +4760,7 @@ class M3Eagle3Draft(nn.Module):
         _record("m3_draft_attention", int(md.num_tokens))
         if is_in_breakable_cuda_graph():
             # A context step's draft pass is captured with the target's: the attention runs in an eager break, on the
-            # step's metadata (the drafter's: the runtime's draft swap installs it on the target's object).
+            # step's metadata (the drafter's: the draft loop makes it the model's attention_metadata).
             if get_model_extra_attrs()["attention_metadata"]() is not md:
                 raise RuntimeError(
                     "MiniMax-M3 drafter under a breakable prefill CUDA graph: its metadata is not the step's"
