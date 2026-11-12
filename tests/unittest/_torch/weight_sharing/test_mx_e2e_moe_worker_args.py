@@ -23,6 +23,7 @@ to check that every rank realized the partition the row names.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -232,22 +233,31 @@ def test_moe_partition_asks_to_be_extended_for_another_moe_layout(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    "config",
+    "config, missing_key",
     [
+        # The dense-MLP `intermediate_size` does not stand in for `moe_intermediate_size`.
         pytest.param(
-            {"num_experts": 8, "intermediate_size": 64, "hidden_size": 32}, id="top-level"
+            {"num_experts": 8, "intermediate_size": 64, "hidden_size": 32},
+            "moe_intermediate_size",
+            id="top-level",
         ),
+        # Every other shape key sits next to the nested routed-expert count, so only the
+        # top-level `hidden_size` could fill the gap.
         pytest.param(
-            {"hidden_size": 32, "text_config": {"num_experts": 8, "intermediate_size": 64}},
+            {"hidden_size": 32, "text_config": {"num_experts": 8, "moe_intermediate_size": 64}},
+            "hidden_size",
             id="vlm-text-config",
         ),
     ],
 )
 def test_moe_partition_asks_to_be_extended_for_another_moe_config(
-    tmp_path: Path, config: dict[str, object]
+    tmp_path: Path, config: dict[str, object], missing_key: str
 ) -> None:
     """The shape keys are read only next to the routed-expert count, never from another section."""
-    with pytest.raises(AssertionError, match="teach `assert_moe_partition` this MoE config"):
+    with pytest.raises(
+        AssertionError,
+        match=re.escape(f"has no {[missing_key]}; teach `assert_moe_partition` this MoE config"),
+    ):
         assert_moe_partition(
             _moe_row(2),
             _final_manifests(2, _MOE_TP2_SHAPES),
