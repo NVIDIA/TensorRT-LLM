@@ -156,7 +156,6 @@ unittest/_torch/attention/sparse/csa2/test_module.py::test_fused_native_index_q_
 unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position[active] SKIP (https://nvbugs/7078630)
 unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position[inactive] SKIP (https://nvbugs/7078630)
 unittest/_torch/misc/test_guided_decoder_errors.py::test_executor_loop_fails_the_request_once_its_batch_is_synchronized SKIP (https://nvbugs/7068781)
-unittest/_torch/modeling/test_musespark_open_finalize_local.py::test_modules_import_without_cute_dsl SKIP (https://nvbugs/7083117)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py::test_allgather_op_matrix SKIP (https://nvbugs/6843474)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py::test_reducescatter_op_matrix SKIP (https://nvbugs/6843474)
 unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_draft_attention.py::test_certified_cells[a context chunk's draft rows] SKIP (https://nvbugs/7054055)

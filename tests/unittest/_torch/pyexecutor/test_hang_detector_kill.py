@@ -927,24 +927,8 @@ def test_loop_terminating_break_sets_the_completion_sentinel():
         )
 
 
-def test_completion_sentinel_is_reset_per_event_loop_run():
-    """The reset in _event_loop_wrapper is load-bearing, not redundant with __init__.
-
-    PyExecutor outlives a single loop run; without the reset a second run
-    starts with the sentinel left True by the first, so a genuine crash in it
-    is misread as a clean shutdown and no kill is armed.
-    """
-    import inspect
-
-    from tensorrt_llm._torch.pyexecutor import py_executor as pe
-
-    assert "self._event_loop_completed = False" in inspect.getsource(
-        pe.PyExecutor._event_loop_wrapper
-    )
-
-
 def test_second_loop_run_still_kills_after_a_clean_first_run(monkeypatch):
-    """Behavioral guard for the reset above: run clean, then crash, on ONE executor."""
+    """A clean first run must not suppress crash handling on the same executor's next run."""
     from tensorrt_llm._torch.pyexecutor import py_executor as pe
 
     events = []
