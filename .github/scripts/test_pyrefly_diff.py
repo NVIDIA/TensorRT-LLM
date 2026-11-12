@@ -39,7 +39,7 @@ class DiffTests(unittest.TestCase):
         self.base.mkdir()
         self.merged.mkdir()
 
-    def _run_cli(self, error: str = "") -> dict:
+    def _run_cli(self, error: str = "") -> tuple[int, dict]:
         output = Path(self.directory.name) / "output"
         event = Path(self.directory.name) / "event.json"
         event.write_text(
@@ -69,8 +69,8 @@ class DiffTests(unittest.TestCase):
             error,
         ]
         with patch("sys.argv", arguments), contextlib.redirect_stdout(io.StringIO()):
-            main()
-        return json.loads((output / "report.json").read_text())
+            status = main()
+        return status, json.loads((output / "report.json").read_text())
 
     def test_cli_compares_existing_reports_without_running_the_checker(self) -> None:
         (self.base / "module.py").write_text("unknown_name\n")
@@ -88,19 +88,22 @@ class DiffTests(unittest.TestCase):
                 )
             )
         (output / "changes").write_bytes(b"M\0module.py\0")
-        report = self._run_cli()
+        status, report = self._run_cli()
+        self.assertEqual(status, 0)
         self.assertEqual(report["base_ref"], "release/test")
         self.assertEqual(report["base_sha"], "b" * 40)
         self.assertEqual(report["diagnostics"], [_diagnostic(line=2, name="new_name")])
         self.assertIsNone(report["error"])
 
     def test_failed_workflow_step_produces_incomplete_report_without_scan_results(self) -> None:
-        report = self._run_cli(error="Could not install the target branch dependencies.")
+        status, report = self._run_cli(error="Could not install the target branch dependencies.")
+        self.assertEqual(status, 1)
         self.assertEqual(report["error"], "Could not install the target branch dependencies.")
         self.assertEqual(report["diagnostics"], [])
 
-    def test_missing_scan_report_is_incomplete(self) -> None:
-        report = self._run_cli()
+    def test_missing_scan_report_is_incomplete_and_fails(self) -> None:
+        status, report = self._run_cli()
+        self.assertEqual(status, 1)
         self.assertIn("base.json", report["error"])
         self.assertEqual(report["diagnostics"], [])
 

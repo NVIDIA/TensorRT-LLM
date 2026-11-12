@@ -93,8 +93,8 @@ async function publish({github, context, core, report}) {
   }
   const thread = await findThread(github, repo, report.pr_number);
   const clean = !report.error && !report.diagnostics.length;
-  // Only findings open a thread. An incomplete check shows as a skipped `result` job instead,
-  // so an infrastructure problem leaves no conversation to resolve.
+  // Only findings open a thread. An incomplete check shows as a failed job instead, so an
+  // infrastructure problem leaves no conversation to resolve.
   if (!thread && (clean || report.error)) return;
   const body = bodyFor(report, run, context.serverUrl || 'https://github.com');
   if (!thread) {
