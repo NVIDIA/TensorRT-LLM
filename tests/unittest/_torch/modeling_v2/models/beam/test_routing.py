@@ -155,6 +155,7 @@ def test_supported_cache_and_dflash_routes_remain_available(monkeypatch, spec, c
         cuda_graph_config=None,
         disable_overlap_scheduler=True,
         max_num_tokens=tokens,
+        checkpoint_format="beam_nvfp4",
         torch_compile_config=None,
         prefill_cuda_graph_backend="disabled",
     )
@@ -170,6 +171,9 @@ def test_supported_cache_and_dflash_routes_remain_available(monkeypatch, spec, c
     [
         ("cuda_graph_config", object(), "CUDA graphs"),
         ("disable_overlap_scheduler", False, "overlap scheduler"),
+        ("load_format", "dummy", "load_format must be auto"),
+        ("max_beam_width", 2, "max_beam_width must be 1"),
+        ("max_num_tokens", None, "max_num_tokens must be explicitly set"),
         ("torch_compile_config", object(), "torch_compile_config must be None"),
         ("prefill_cuda_graph_backend", "piecewise", "prefill_cuda_graph_backend must be disabled"),
         ("prefill_cuda_graph_backend", "breakable", "prefill_cuda_graph_backend must be disabled"),
@@ -190,3 +194,76 @@ def test_execution_mode_refused_before_checkpoint_access(monkeypatch, field, val
     with pytest.raises(_router_index.NoTarget, match=message):
         routing.route(config.pretrained_config, config.mapping, (10, 3), spec, None, llm_args=args)
     reads.assert_not_called()
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "chunked,reuse,spec",
+    [(False, False, None), (True, False, None), (False, True, None), (False, False, _dflash())],
+)
+def test_paged_context_page_size_admission(monkeypatch, page_size, chunked, reuse, spec):
+    target = type("Target", (), {})
+    monkeypatch.setitem(
+        sys.modules, _TARGET + ".modeling", NS(ModelingV2BeamFullModelNvfp4Sm103Tp4=target)
+    )
+    reads = Mock(return_value=None)
+    monkeypatch.setattr(routing, "checkpoint_refusal", reads)
+    config = _config()
+    args = NS(
+        checkpoint_format="beam_nvfp4",
+        max_num_tokens=8192,
+        enable_chunked_prefill=chunked,
+        kv_cache_config=NS(tokens_per_block=page_size, enable_block_reuse=reuse),
+    )
+    if page_size != 32 and (chunked or reuse or spec is not None):
+        with pytest.raises(
+            _router_index.NoTarget, match="kv_cache_config.tokens_per_block must be 32"
+        ):
+            routing.route(
+                config.pretrained_config, config.mapping, (10, 3), spec, None, llm_args=args
+            )
+        reads.assert_not_called()
+    else:
+        assert (
+            routing.route(
+                config.pretrained_config, config.mapping, (10, 3), spec, None, llm_args=args
+            )
+            is target
+        )
+        reads.assert_called_once()
+
+
+def test_loader_admission_precedes_checkpoint_access(monkeypatch):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.weights import (
+        BeamNvfp4CheckpointLoader,
+    )
+
+    target = type("Target", (), {})
+    monkeypatch.setitem(
+        sys.modules, _TARGET + ".modeling", NS(ModelingV2BeamFullModelNvfp4Sm103Tp4=target)
+    )
+    reads = Mock(return_value=None)
+    monkeypatch.setattr(routing, "checkpoint_refusal", reads)
+    config = _config()
+    args = NS(max_num_tokens=8192)
+    for loader, checkpoint_format in [(None, None), (object(), "beam_nvfp4")]:
+        args.checkpoint_loader, args.checkpoint_format = loader, checkpoint_format
+        with pytest.raises(
+            _router_index.NoTarget, match="checkpoint_loader=BeamNvfp4CheckpointLoader"
+        ):
+            routing.route(
+                config.pretrained_config, config.mapping, (10, 3), None, None, llm_args=args
+            )
+    reads.assert_not_called()
+    for loader, checkpoint_format in [
+        (None, "beam_nvfp4"),
+        (object.__new__(BeamNvfp4CheckpointLoader), None),
+    ]:
+        args.checkpoint_loader, args.checkpoint_format = loader, checkpoint_format
+        assert (
+            routing.route(
+                config.pretrained_config, config.mapping, (10, 3), None, None, llm_args=args
+            )
+            is target
+        )
+    assert reads.call_count == 2

@@ -63,7 +63,7 @@ def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Opt
     return "; ".join(reasons) or None
 
 
-def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
+def engine_refusal(llm_args: Optional[Any], spec_config: Optional[Any] = None) -> Optional[str]:
     """Report all unsupported scheduling options and token budgets for this eager target.
 
     CUDA graphs and overlap scheduling are unsupported by this target's host-synchronizing
@@ -81,8 +81,26 @@ def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
         reasons.append("prefill_cuda_graph_backend must be disabled for this eager Beam target")
     if not getattr(llm_args, "disable_overlap_scheduler", True):
         reasons.append("the overlap scheduler is not supported by this eager Beam target")
-    max_tokens = getattr(llm_args, "max_num_tokens", None)
-    if max_tokens is not None and not 1 <= max_tokens <= MAX_NUM_TOKENS:
+    load_format = getattr(llm_args, "load_format", "auto")
+    if str(getattr(load_format, "name", load_format)).lower() != "auto":
+        reasons.append("load_format must be auto")
+    if getattr(llm_args, "max_beam_width", 1) not in (None, 1):
+        reasons.append("beam search is not supported; max_beam_width must be 1")
+    cache = getattr(llm_args, "kv_cache_config", None)
+    paged_context = (
+        getattr(llm_args, "enable_chunked_prefill", False)
+        or getattr(cache, "enable_block_reuse", True)
+        or spec_config is not None
+    )
+    page_size = getattr(cache, "tokens_per_block", 32)
+    if paged_context and page_size != 32:
+        reasons.append(
+            "kv_cache_config.tokens_per_block must be 32 for Beam paged-context attention"
+        )
+    max_tokens = getattr(llm_args, "max_num_tokens", MAX_NUM_TOKENS)
+    if max_tokens is None:
+        reasons.append(f"max_num_tokens must be explicitly set in [1, {MAX_NUM_TOKENS}], not None")
+    elif not 1 <= max_tokens <= MAX_NUM_TOKENS:
         reasons.append(f"max_num_tokens {max_tokens} is outside [1, {MAX_NUM_TOKENS}]")
     return "; ".join(reasons) or None
 
@@ -148,7 +166,7 @@ def route(
     )
     quant_algo = _quant_algo(pretrained_config)
     speculation = speculation_refusal(spec_config, llm_args)
-    engine = engine_refusal(llm_args)
+    engine = engine_refusal(llm_args, spec_config)
     refusal = None
     if (
         compute_capability == SM
@@ -162,6 +180,18 @@ def route(
         and engine is None
         and kv_cache_quant_algo in (None, QuantAlgo.FP8)
     ):
+        from .full_model_nvfp4__sm_103__tp4.weights import BeamNvfp4CheckpointLoader
+
+        loader = getattr(llm_args, "checkpoint_loader", None)
+        registered_format = (
+            loader is None and getattr(llm_args, "checkpoint_format", None) == "beam_nvfp4"
+        )
+        if not registered_format and not isinstance(loader, BeamNvfp4CheckpointLoader):
+            raise NoTarget(
+                "this Beam target requires checkpoint_format='beam_nvfp4' or "
+                "checkpoint_loader=BeamNvfp4CheckpointLoader(); "
+                "the default HF checkpoint loader cannot populate its packed weights"
+            )
         refusal = checkpoint_refusal(pretrained_config, spec_config)
         if refusal is None:
             from .full_model_nvfp4__sm_103__tp4.modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4

@@ -76,6 +76,10 @@ The recipes under `examples/configs/curated/` hold these settings:
 | [`beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml) | Disaggregated context worker |
 | [`beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml) | Disaggregated generation worker |
 
+Set `max_num_tokens` to an integer from 1 through 8192; `null` is not supported.
+Paged-context attention (cache reuse, chunked prefill, or supported speculative decoding)
+requires `kv_cache_config.tokens_per_block: 32`.
+
 Each recipe selects the Beam target and its supporting pieces by name:
 
 - `modeling_v2: require` builds the ModelingV2 Beam target and fails clearly if the configuration
