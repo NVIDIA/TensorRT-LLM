@@ -3827,27 +3827,22 @@ class PyExecutor:
             if loop is not None:
                 loop_metrics = {"kind": "loop", "per_iter": dict(loop.per_iter)}
 
+        entry = IterationStatsRecord(
+            iteration_stats=stats,
+            request_stats=req_stats,
+            kv_iteration_stats=kv_iter_stats,
+            attention_dp_rank=attention_dp_rank,
+            host_step_time_ms=host_step_time_ms,
+            prev_device_step_time_ms=prev_device_step_time_ms,
+            scheduler_mode=scheduler_mode,
+            gpu_forward_time_ms=gpu_forward_time_ms,
+            executor_loop=loop_metrics)
+
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
                 and self.enable_attention_dp):
-            import json as _json
-            local_dict = _json.loads(stats.to_json_str())
-            if req_stats:
-                local_dict["requestStats"] = [
-                    _json.loads(r.to_json_str()) for r in req_stats
-                ]
-            append_kv_cache_iteration_stats(local_dict, kv_iter_stats)
-            if host_step_time_ms is not None:
-                local_dict["hostStepTimeMS"] = host_step_time_ms
-            if prev_device_step_time_ms is not None:
-                local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
-            if gpu_forward_time_ms is not None:
-                local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
-            local_dict["schedulerMode"] = scheduler_mode
-            local_dict["rank"] = self.dist.tp_rank
-            if loop_metrics is not None:
-                local_dict["executorLoop"] = loop_metrics
+            local_dict = entry.to_dict(tp_rank=self.dist.tp_rank)
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
             # desync (reached from per-rank-divergent gates).
             self._pending_iter_stats_dict = local_dict
@@ -3858,17 +3853,7 @@ class PyExecutor:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
-            self.stats.append(
-                IterationStatsRecord(
-                    iteration_stats=stats,
-                    request_stats=req_stats,
-                    kv_iteration_stats=kv_iter_stats,
-                    attention_dp_rank=attention_dp_rank,
-                    host_step_time_ms=host_step_time_ms,
-                    prev_device_step_time_ms=prev_device_step_time_ms,
-                    scheduler_mode=scheduler_mode,
-                    gpu_forward_time_ms=gpu_forward_time_ms,
-                    executor_loop=loop_metrics))
+            self.stats.append(entry)
 
     def _process_iter_stats(
         self,
