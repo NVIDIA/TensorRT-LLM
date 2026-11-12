@@ -13,10 +13,9 @@
 # limitations under the License.
 """OutOfScopeRule — claims changes outside product-test selection.
 
-Emits scope="noop" with no test contribution and sanity / perfsanity off.
-The main entry point still retains the always-run CPU stages; Build and
-repository checks run upstream. When other rules also fire, the "noop"
-scope gives way in `_combine_scopes` to the actionable scope.
+Emits scope="noop" with no product-test contribution and sanity / perfsanity
+off. CBTS infrastructure edits select CPU scripts tests. Noop changes add no
+CPU stages. Build and repository checks run upstream.
 
 `is_out_of_scope` is the single source of truth for these path patterns;
 `TestsDefRule` imports it to skip the same paths, so out-of-scope claims
@@ -32,7 +31,7 @@ from typing import Optional
 
 from cbts.blocks import Stage, YAMLIndex
 
-from ._helpers import reconstruct_diff_pre_image
+from ._helpers import reconstruct_diff_pre_image, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 # Exact files that affect repository metadata or external gates, but not the
@@ -72,7 +71,7 @@ OUT_OF_SCOPE_DIRECTORY_FILENAMES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 _STATIC_CHECK_TABLES = frozenset(
-    {"tool.ruff", "tool.isort", "tool.yapf", "tool.codespell", "tool.autoflake", "tool.mypy"}
+    {"tool.ruff", "tool.isort", "tool.yapf", "tool.codespell", "tool.autoflake", "tool.pyrefly"}
 )
 _TABLE_RE = re.compile(r"^\s*(\[\[?)([\w.-]+)(\]\]?)\s*(?:#.*)?$")
 
@@ -95,10 +94,8 @@ _TABLE_RE = re.compile(r"^\s*(\[\[?)([\w.-]+)(\]\]?)\s*(?:#.*)?$")
 #   results.
 # - tests/microbenchmarks/             : benchmarking scripts, not run
 #   by any L0 stage.
-# - jenkins/scripts/cbts/              : CBTS itself — rules, main, and
-#   debug tools that run at decision time. Edits change narrowing logic
-#   for future PRs but cannot affect the outcome of any test stage in
-#   the current PR.
+# - jenkins/scripts/cbts/              : CBTS infrastructure, validated by
+#   the CPU scripts suite rather than product test stages.
 OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     ".github/ISSUE_TEMPLATE/",
     ".codex/",
@@ -178,9 +175,9 @@ class OutOfScopeRule(Rule):
     def __init__(
         self, yaml_index: YAMLIndex, stages: dict[str, Stage], repo_root: Path | None = None
     ) -> None:
-        # Stored for parity with other rules' constructor shape; not used.
         self.yaml_index = yaml_index
         self._repo_root = repo_root
+        self._stages_by_yaml = stages_by_yaml_stem(stages)
 
     def _is_check_only_pyproject(self, path: str, pr: PRInputs) -> bool:
         if self._repo_root is None or Path(path).name != "pyproject.toml":
@@ -201,6 +198,25 @@ class OutOfScopeRule(Rule):
         }
         if not claimed:
             return None
+        if any(path.startswith("jenkins/scripts/cbts/") for path in claimed):
+            # The scripts suite includes CBTS tests and the infrastructure
+            # consumers of its command-line interfaces and selection artifacts.
+            filters = {
+                (block.yaml_stem, block.block_index): {"unittest/scripts": {"unittest/scripts"}}
+                for block in self.yaml_index.blocks
+                if block.yaml_stem == "l0_cpu" and "unittest/scripts" in block.tests
+            }
+            scripts_registered = bool(filters)
+            stages = resolve_affected_stages(filters, self.yaml_index, self._stages_by_yaml)
+            return RuleResult(
+                handled_files=claimed,
+                affected_stages=stages,
+                scope="testsonly" if scripts_registered and stages else None,
+                block_filters=filters,
+                sanity_relevant=False,
+                perfsanity_relevant=False,
+                reason="outofscope: CBTS infrastructure changes require CPU scripts tests",
+            )
         return RuleResult(
             handled_files=claimed,
             affected_stages=set(),

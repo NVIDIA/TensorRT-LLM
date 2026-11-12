@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,12 +22,30 @@
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
 
-using tensorrt_llm::common::op::UniqPtrWNullCopy;
+#include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace detail
+{
+
+struct TrtllmGenMaskSelection
+{
+    TrtllmGenAttentionMaskType maskType;
+    int32_t leftSlidingWindow = -1;
+    int32_t rightSlidingWindow = -1;
+    int32_t chunkedAttentionSize = 0;
+};
+
+TrtllmGenMaskSelection selectTrtllmGenMask(ContextAttentionMaskType attentionMaskType, int32_t slidingWindowSize,
+    int32_t chunkedAttentionSize, int32_t kvSeqLen);
+
+} // namespace detail
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -58,9 +76,9 @@ private:
     // Whether to enable trtllm-gen kernels.
     bool mUseTllmGen;
     // Runner for fmha v2 kernels (for SM <= 90)
-    UniqPtrWNullCopy<kernels::FusedMHARunnerV2> mFMHARunner;
+    std::unique_ptr<kernels::FusedMHARunnerV2> mFMHARunner;
     // Runner for trtllm-gen fmha kernels (for SM == 100)
-    UniqPtrWNullCopy<kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
+    std::unique_ptr<kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
     // Cached SM count to avoid repeated cudaDeviceGetAttribute calls in the per-iter
     // FMHA dispatch hot path (isSupported / run).
     int mMultiProcessorCount{0};

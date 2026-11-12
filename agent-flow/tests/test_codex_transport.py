@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -348,3 +351,22 @@ async def test_dynamic_tool_failures_return_explicit_unsuccessful_results(transp
         "unsupported_result": "Unsupported tool result",
     }[scenario]
     assert expected in response["contentItems"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "method", ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"]
+)
+async def test_native_approval_requests_are_declined_without_an_interactive_handler(
+    transport, method, caplog
+):
+    response = transport._client.server_request(method, {"threadId": "root"})
+    assert response == {"decision": "decline"}
+    assert "no interactive approval handler" in caplog.text
+
+
+async def test_permission_requests_do_not_grant_additional_access(transport, caplog):
+    response = transport._client.server_request(
+        "item/permissions/requestApproval", {"permissions": {"network": {"enabled": True}}}
+    )
+    assert response == {"permissions": {}, "scope": "turn"}
+    assert "request declined" in caplog.text

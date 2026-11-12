@@ -64,6 +64,11 @@ Environment
                                    (default 5); a client asking for more is
                                    clamped, so a prompt cannot make the
                                    server issue unbounded outbound traffic
+``TRTLLM_WEB_SEARCH_UNAVAILABLE``  what the Responses endpoint does with a
+                                   web_search tool it cannot honour:
+                                   ``ignore`` (default, serve the request
+                                   without offering the tool to the model)
+                                   or ``reject`` (a 400)
 """
 
 import asyncio

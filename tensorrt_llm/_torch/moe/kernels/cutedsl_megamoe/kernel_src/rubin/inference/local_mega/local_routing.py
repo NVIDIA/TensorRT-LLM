@@ -1,12 +1,10 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Routing support for the Rubin Local MegaMoE kernel."""
 
 import dataclasses
 from typing import Callable, ClassVar, Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -20,7 +18,13 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dsl_helpers import mark_alignment
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
-from .....helpers.ptx_helpers import cp_async_bulk_s2g, nanosleep, stg_b64, stg_f32, tma_load_1d
+from .....helpers.ptx_helpers import (
+    cp_async_bulk_s2g,
+    nanosleep,
+    stg_b64,
+    stg_f32,
+    tma_load_1d,
+)
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.software_sync import SoftwareGridSync
 from .....helpers.utils import ceil_div, round_up
@@ -87,16 +91,12 @@ class _SortedElement:
             return cls(flat_topk_index=Int32(packed), topk_score=None)
         scratch = cute.make_rmem_tensor((2,), cutlass.Int32)
         cute.recast_tensor(scratch, cutlass.Int64)[0] = packed
-        return cls(
-            flat_topk_index=scratch[0], topk_score=cute.recast_tensor(scratch, cutlass.Float32)[1]
-        )
+        return cls(flat_topk_index=scratch[0], topk_score=cute.recast_tensor(scratch, cutlass.Float32)[1])
 
 
 @cute.jit
 def _copy_atom(dtype, num_bits_per_copy: int):
-    return cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=num_bits_per_copy
-    )
+    return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=num_bits_per_copy)
 
 
 @cute.jit
@@ -113,9 +113,7 @@ def _smem_exclusive_prefix(
     num_elements = cute.size(input_tensor)
     scan_rows = num_elements // 4
     num_warps = block_thread_count // 32
-    input_vectors = cute.make_tensor(
-        input_tensor.iterator, cute.make_layout((scan_rows, 4), stride=(4, 1))
-    )
+    input_vectors = cute.make_tensor(input_tensor.iterator, cute.make_layout((scan_rows, 4), stride=(4, 1)))
     load_atom = _copy_atom(cutlass.Int32, 128)
 
     values = cute.make_rmem_tensor((4,), cutlass.Int32)
@@ -129,12 +127,7 @@ def _smem_exclusive_prefix(
             for element in cutlass.range_constexpr(4):
                 values[element] = Int32(0)
 
-        local_prefix = (
-            Int32(0),
-            values[0],
-            values[0] + values[1],
-            values[0] + values[1] + values[2],
-        )
+        local_prefix = (Int32(0), values[0], values[0] + values[1], values[0] + values[1] + values[2])
         lane_total = local_prefix[3] + values[3]
         inclusive = lane_total
         for step_log in cutlass.range_constexpr(5):
@@ -231,16 +224,13 @@ class _MetadataPushRouter(KernelComponent):
         self._validate_router_configuration()
         self.expert_count_padded = round_up(self.expert_count, 4)
         self.expert_count_with_trash = self.expert_count_padded + 1
-        self.router_elements_per_lane, self.router_data_cta_count = (
-            self._router_launch_configuration()
-        )
+        self.router_elements_per_lane, self.router_data_cta_count = self._router_launch_configuration()
         self.router_tokens_per_cta = self.router_elements_per_lane * self.router_warps_per_cta * 32
         self.router_push_cta_count = ceil_div(self.expert_count, self.router_warps_per_cta)
         self.router_grid_cta_count = max(self.router_data_cta_count + 1, self.router_push_cta_count)
         if self.router_grid_cta_count > self.promised_launchable_sm_count:
             raise ValueError(
-                "Router grid exceeds promised_launchable_sm_count; "
-                "all metadata-push CTAs must be concurrently resident."
+                "Router grid exceeds promised_launchable_sm_count; all metadata-push CTAs must be concurrently resident."
             )
         self._router_smem_workspace = self._build_router_smem_workspace()
 
@@ -267,18 +257,14 @@ class _MetadataPushRouter(KernelComponent):
         if self.expert_count > 16384:
             raise NotImplementedError("Local routing supports at most 16384 experts.")
         if self.topk > self.expert_count:
-            raise ValueError(
-                f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}."
-            )
+            raise ValueError(f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}.")
 
     def worst_case_padded_tokens(self, block: int) -> int:
         source_token_capacity = self.max_tokens
         routes_per_source_token = min(self.topk, self.expert_count)
         route_capacity = source_token_capacity * routes_per_source_token
         active_expert_capacity = min(self.expert_count, route_capacity)
-        route_budget_blocks = (
-            active_expert_capacity + (route_capacity - active_expert_capacity) // block
-        )
+        route_budget_blocks = active_expert_capacity + (route_capacity - active_expert_capacity) // block
         expert_bound_blocks = active_expert_capacity * int(ceil_div(source_token_capacity, block))
         return min(route_budget_blocks, expert_bound_blocks) * block
 
@@ -296,13 +282,8 @@ class _MetadataPushRouter(KernelComponent):
         maximum_data_cta_count = 128
         maximum_supported_tokens = maximum_cta_capacity * maximum_data_cta_count
         if routed_token_capacity > maximum_supported_tokens:
-            raise NotImplementedError(
-                f"The router supports at most {maximum_supported_tokens} routed tokens."
-            )
-        cta_capacity = min(
-            maximum_cta_capacity,
-            next_power_of_two(max(routed_token_capacity, minimum_cta_capacity)),
-        )
+            raise NotImplementedError(f"The router supports at most {maximum_supported_tokens} routed tokens.")
+        cta_capacity = min(maximum_cta_capacity, next_power_of_two(max(routed_token_capacity, minimum_cta_capacity)))
         elements_per_lane = cta_capacity // (self.router_warps_per_cta * 32)
         data_cta_count = ceil_div(routed_token_capacity, cta_capacity)
         return elements_per_lane, data_cta_count
@@ -311,18 +292,11 @@ class _MetadataPushRouter(KernelComponent):
         workspace = SmemWorkspace()
         overlay = workspace.create_overlay("local_mega.routing.router_smem.role")
         data_lifetime = overlay.add_lifetime("data_cta")
+        data_lifetime.register_tensor(self.router_data_histogram_region, cutlass.Int32, (self.expert_count_with_trash,))
         data_lifetime.register_tensor(
-            self.router_data_histogram_region, cutlass.Int32, (self.expert_count_with_trash,)
+            self.router_data_prefix_region, cutlass.Int32, (self.expert_count_with_trash,), byte_alignment=16
         )
-        data_lifetime.register_tensor(
-            self.router_data_prefix_region,
-            cutlass.Int32,
-            (self.expert_count_with_trash,),
-            byte_alignment=16,
-        )
-        data_lifetime.register_tensor(
-            self.router_data_warp_totals_region, cutlass.Int32, (self.router_warps_per_cta,)
-        )
+        data_lifetime.register_tensor(self.router_data_warp_totals_region, cutlass.Int32, (self.router_warps_per_cta,))
         data_lifetime.register_tensor(
             self.router_data_sorted_region,
             (cutlass.Int64 if self.apply_topk_at_fc1 else cutlass.Int32),
@@ -331,30 +305,18 @@ class _MetadataPushRouter(KernelComponent):
         )
         if self.router_data_cta_count > 1:
             data_lifetime.register_tensor(
-                self.router_data_base_region,
-                cutlass.Int32,
-                (self.expert_count_padded,),
-                byte_alignment=16,
+                self.router_data_base_region, cutlass.Int32, (self.expert_count_padded,), byte_alignment=16
             )
 
         helper_lifetime = overlay.add_lifetime("helper_cta")
         helper_lifetime.register_tensor(
-            self.router_helper_totals_region,
-            cutlass.Int32,
-            (self.expert_count_padded,),
-            byte_alignment=16,
+            self.router_helper_totals_region, cutlass.Int32, (self.expert_count_padded,), byte_alignment=16
         )
         helper_lifetime.register_tensor(
-            self.router_helper_prefix_region,
-            cutlass.Int32,
-            (self.expert_count_padded,),
-            byte_alignment=16,
+            self.router_helper_prefix_region, cutlass.Int32, (self.expert_count_padded,), byte_alignment=16
         )
         helper_lifetime.register_tensor(
-            self.router_helper_warp_totals_region,
-            cutlass.Int32,
-            (self.router_warps_per_cta,),
-            byte_alignment=16,
+            self.router_helper_warp_totals_region, cutlass.Int32, (self.router_warps_per_cta,), byte_alignment=16
         )
         workspace.finalize(max_bytes=self.router_smem_limit_bytes)
         return workspace
@@ -370,34 +332,14 @@ class _MetadataPushRouter(KernelComponent):
     def _register_router_workspace(self, workspace: DeviceWorkspace) -> None:
         maximum_routed_tokens = self.max_tokens * self.topk
         workspace.register(
-            self.sizes_region,
-            cutlass.Int32,
-            (self.expert_count_padded,),
-            buffer_space="shared",
-            reset="tail_reset",
+            self.sizes_region, cutlass.Int32, (self.expert_count_padded,), buffer_space="shared", reset="tail_reset"
         )
-        workspace.register(
-            self.sizes_ready_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset"
-        )
-        workspace.register(
-            self.metadata_ready_region,
-            cutlass.Int32,
-            (1,),
-            buffer_space="shared",
-            reset="tail_reset",
-        )
-        workspace.register(
-            self.sorted_metadata_region,
-            cutlass.Int64,
-            (maximum_routed_tokens,),
-            buffer_space="local",
-        )
+        workspace.register(self.sizes_ready_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
+        workspace.register(self.metadata_ready_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
+        workspace.register(self.sorted_metadata_region, cutlass.Int64, (maximum_routed_tokens,), buffer_space="local")
         if self.apply_topk_at_fc1:
             workspace.register(
-                self.sorted_scores_region,
-                cutlass.Float32,
-                (maximum_routed_tokens,),
-                buffer_space="local",
+                self.sorted_scores_region, cutlass.Float32, (maximum_routed_tokens,), buffer_space="local"
             )
         workspace.register(
             self.token_src_metadata_region,
@@ -408,34 +350,16 @@ class _MetadataPushRouter(KernelComponent):
         )
         if self.apply_topk_at_fc1:
             workspace.register(
-                self.fc1_topk_scores_region,
-                cutlass.Float32,
-                (self.worst_case_token_count,),
-                buffer_space="shared",
+                self.fc1_topk_scores_region, cutlass.Float32, (self.worst_case_token_count,), buffer_space="shared"
             )
+        workspace.register(self.pool_expert_base_region, cutlass.Int32, (self.expert_count,), buffer_space="local")
         workspace.register(
-            self.pool_expert_base_region, cutlass.Int32, (self.expert_count,), buffer_space="local"
+            self.source_expert_base_region, cutlass.Int32, (self.expert_count_padded,), buffer_space="local"
         )
         workspace.register(
-            self.source_expert_base_region,
-            cutlass.Int32,
-            (self.expert_count_padded,),
-            buffer_space="local",
+            self.sorted_metadata_ready_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
         )
-        workspace.register(
-            self.sorted_metadata_ready_region,
-            cutlass.Int32,
-            (1,),
-            buffer_space="local",
-            reset="tail_reset",
-        )
-        workspace.register(
-            self.push_table_ready_region,
-            cutlass.Int32,
-            (1,),
-            buffer_space="local",
-            reset="tail_reset",
-        )
+        workspace.register(self.push_table_ready_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset")
         if self.router_data_cta_count > 1:
             workspace.register(
                 self.router_size_counter_region,
@@ -445,18 +369,10 @@ class _MetadataPushRouter(KernelComponent):
                 reset="tail_reset",
             )
             workspace.register(
-                self.router_histogram_done_region,
-                cutlass.Int32,
-                (1,),
-                buffer_space="local",
-                reset="tail_reset",
+                self.router_histogram_done_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
             )
             workspace.register(
-                self.source_base_ready_region,
-                cutlass.Int32,
-                (1,),
-                buffer_space="local",
-                reset="tail_reset",
+                self.source_base_ready_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
             )
 
     def __extract_mlir_values__(self) -> list:
@@ -545,16 +461,10 @@ class _MetadataPushRouter(KernelComponent):
         if self._router_linear_cta_idx < Int32(self.router_data_cta_count):
             block_thread_count = self.router_warps_per_cta * 32
             trash_bucket = self.expert_count_padded
-            histogram = self._router_smem_workspace.tensor(
-                self.router_data_histogram_region, smem_base
-            )
+            histogram = self._router_smem_workspace.tensor(self.router_data_histogram_region, smem_base)
             prefix = self._router_smem_workspace.tensor(self.router_data_prefix_region, smem_base)
-            warp_totals = self._router_smem_workspace.tensor(
-                self.router_data_warp_totals_region, smem_base
-            )
-            sorted_elements = self._router_smem_workspace.tensor(
-                self.router_data_sorted_region, smem_base
-            )
+            warp_totals = self._router_smem_workspace.tensor(self.router_data_warp_totals_region, smem_base)
+            sorted_elements = self._router_smem_workspace.tensor(self.router_data_sorted_region, smem_base)
 
             zero_round_count = ceil_div(self.expert_count_with_trash, block_thread_count)
             for zero_round in cutlass.range_constexpr(zero_round_count):
@@ -595,12 +505,7 @@ class _MetadataPushRouter(KernelComponent):
 
             iket.range_push("router.sort")
             self._sort_router_elements(
-                expert_registers,
-                within_expert_indices,
-                score_registers,
-                sorted_elements,
-                prefix,
-                topk_indices.dtype,
+                expert_registers, within_expert_indices, score_registers, sorted_elements, prefix, topk_indices.dtype
             )
             cute.arch.sync_threads()
             iket.range_pop()
@@ -609,10 +514,7 @@ class _MetadataPushRouter(KernelComponent):
             cute.arch.sync_threads()
             if self._router_thread_idx == Int32(0):
                 cute.arch.atomic_add(
-                    self._device_workspace.ptr(self.sorted_metadata_ready_region),
-                    Int32(1),
-                    sem="release",
-                    scope="gpu",
+                    self._device_workspace.ptr(self.sorted_metadata_ready_region), Int32(1), sem="release", scope="gpu"
                 )
             iket.range_pop()
         elif self._router_linear_cta_idx == Int32(self.router_data_cta_count):
@@ -626,16 +528,10 @@ class _MetadataPushRouter(KernelComponent):
             block_thread_count = self.router_warps_per_cta * 32
             trash_bucket = self.expert_count_padded
             expert_round_count = ceil_div(self.expert_count_padded, block_thread_count)
-            histogram = self._router_smem_workspace.tensor(
-                self.router_data_histogram_region, smem_base
-            )
+            histogram = self._router_smem_workspace.tensor(self.router_data_histogram_region, smem_base)
             prefix = self._router_smem_workspace.tensor(self.router_data_prefix_region, smem_base)
-            warp_totals = self._router_smem_workspace.tensor(
-                self.router_data_warp_totals_region, smem_base
-            )
-            sorted_elements = self._router_smem_workspace.tensor(
-                self.router_data_sorted_region, smem_base
-            )
+            warp_totals = self._router_smem_workspace.tensor(self.router_data_warp_totals_region, smem_base)
+            sorted_elements = self._router_smem_workspace.tensor(self.router_data_sorted_region, smem_base)
             dump_base = self._router_smem_workspace.tensor(self.router_data_base_region, smem_base)
 
             zero_round_count = ceil_div(self.expert_count_with_trash, block_thread_count)
@@ -656,17 +552,12 @@ class _MetadataPushRouter(KernelComponent):
                 expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
                 if expert < Int32(self.expert_count_padded):
                     dump_base[expert] = Int32(
-                        cute.arch.atomic_add(
-                            size_counter + expert, histogram[expert], sem="relaxed", scope="gpu"
-                        )
+                        cute.arch.atomic_add(size_counter + expert, histogram[expert], sem="relaxed", scope="gpu")
                     )
             cute.arch.sync_threads()
             if self._router_thread_idx == Int32(0):
                 cute.arch.atomic_add(
-                    self._device_workspace.ptr(self.router_histogram_done_region),
-                    Int32(1),
-                    sem="release",
-                    scope="gpu",
+                    self._device_workspace.ptr(self.router_histogram_done_region), Int32(1), sem="release", scope="gpu"
                 )
 
             total_valid_routes = _smem_exclusive_prefix(
@@ -684,12 +575,7 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
             iket.range_push("router.sort")
             self._sort_router_elements(
-                expert_registers,
-                within_expert_indices,
-                score_registers,
-                sorted_elements,
-                prefix,
-                topk_indices.dtype,
+                expert_registers, within_expert_indices, score_registers, sorted_elements, prefix, topk_indices.dtype
             )
             cute.arch.sync_threads()
             iket.range_pop()
@@ -697,9 +583,7 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_push("router.wait_source_base")
             source_base_ready = self._device_workspace.ptr(self.source_base_ready_region)
             if self._router_thread_idx == Int32(0):
-                while cute.arch.load(source_base_ready, Int32, sem="acquire", scope="gpu") != Int32(
-                    1
-                ):
+                while cute.arch.load(source_base_ready, Int32, sem="acquire", scope="gpu") != Int32(1):
                     nanosleep(150)
             cute.arch.sync_threads()
             iket.range_pop()
@@ -715,10 +599,7 @@ class _MetadataPushRouter(KernelComponent):
             cute.arch.sync_threads()
             if self._router_thread_idx == Int32(0):
                 cute.arch.atomic_add(
-                    self._device_workspace.ptr(self.sorted_metadata_ready_region),
-                    Int32(1),
-                    sem="release",
-                    scope="gpu",
+                    self._device_workspace.ptr(self.sorted_metadata_ready_region), Int32(1), sem="release", scope="gpu"
                 )
             iket.range_pop()
         elif self._router_linear_cta_idx == Int32(self.router_data_cta_count):
@@ -735,9 +616,7 @@ class _MetadataPushRouter(KernelComponent):
         block_thread_count = self.router_warps_per_cta * 32
         totals = self._router_smem_workspace.tensor(self.router_helper_totals_region, smem_base)
         prefix = self._router_smem_workspace.tensor(self.router_helper_prefix_region, smem_base)
-        warp_totals = self._router_smem_workspace.tensor(
-            self.router_helper_warp_totals_region, smem_base
-        )
+        warp_totals = self._router_smem_workspace.tensor(self.router_helper_warp_totals_region, smem_base)
         size_counter = self._device_workspace.tensor(self.router_size_counter_region)
         source_expert_base = self._device_workspace.tensor(self.source_expert_base_region)
         expert_round_count = ceil_div(self.expert_count_padded, block_thread_count)
@@ -776,10 +655,7 @@ class _MetadataPushRouter(KernelComponent):
         cute.arch.sync_threads()
         if self._router_thread_idx == Int32(0):
             cute.arch.atomic_add(
-                self._device_workspace.ptr(self.source_base_ready_region),
-                Int32(1),
-                sem="release",
-                scope="gpu",
+                self._device_workspace.ptr(self.source_base_ready_region), Int32(1), sem="release", scope="gpu"
             )
         publish_sizes()
         iket.range_pop()
@@ -801,9 +677,7 @@ class _MetadataPushRouter(KernelComponent):
                 nanosleep(150)
         cute.arch.sync_threads()
 
-        global_expert = (
-            self._router_linear_cta_idx * Int32(self.router_warps_per_cta) + self._router_warp_idx
-        )
+        global_expert = self._router_linear_cta_idx * Int32(self.router_warps_per_cta) + self._router_warp_idx
         if global_expert < Int32(self.expert_count):
             sizes = self._device_workspace.tensor(self.sizes_region)
             source_expert_base = self._device_workspace.tensor(self.source_expert_base_region)
@@ -812,14 +686,10 @@ class _MetadataPushRouter(KernelComponent):
             source_begin = source_expert_base[global_expert]
             destination_begin = pool_expert_base[global_expert]
             source_metadata = self._device_workspace.ptr(self.sorted_metadata_region)
-            destination_metadata_address = self._device_workspace.ptr(
-                self.token_src_metadata_region
-            ).toint()
+            destination_metadata_address = self._device_workspace.ptr(self.token_src_metadata_region).toint()
             if cutlass.const_expr(self.apply_topk_at_fc1):
                 source_scores = self._device_workspace.ptr(self.sorted_scores_region)
-                destination_scores_address = self._device_workspace.ptr(
-                    self.fc1_topk_scores_region
-                ).toint()
+                destination_scores_address = self._device_workspace.ptr(self.fc1_topk_scores_region).toint()
             route_round_count = (route_count + Int32(31)) // Int32(32)
             for route_round in cutlass.range(route_round_count, unroll=1):
                 route = Int32(route_round) * Int32(32) + self._router_lane_idx
@@ -828,16 +698,12 @@ class _MetadataPushRouter(KernelComponent):
                     destination_position = destination_begin + route
                     metadata = cute.arch.load(source_metadata + source_position, cutlass.Int64)
                     stg_b64(
-                        destination_metadata_address
-                        + Int64(destination_position) * Int64(RoutingMetadata.nbytes),
+                        destination_metadata_address + Int64(destination_position) * Int64(RoutingMetadata.nbytes),
                         metadata,
                     )
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         score = cute.arch.load(source_scores + source_position, cutlass.Float32)
-                        stg_f32(
-                            destination_scores_address + Int64(destination_position) * Int64(4),
-                            score,
-                        )
+                        stg_f32(destination_scores_address + Int64(destination_position) * Int64(4), score)
 
         cute.arch.sync_threads()
         if self._router_thread_idx == Int32(0):
@@ -846,10 +712,7 @@ class _MetadataPushRouter(KernelComponent):
         cute.arch.sync_threads()
         if self._router_thread_idx == Int32(0):
             cute.arch.atomic_add(
-                self._device_workspace.ptr(self.metadata_ready_region),
-                Int32(1),
-                sem="release",
-                scope="gpu",
+                self._device_workspace.ptr(self.metadata_ready_region), Int32(1), sem="release", scope="gpu"
             )
 
     @cute.jit
@@ -858,9 +721,7 @@ class _MetadataPushRouter(KernelComponent):
         if self._router_warp_idx == Int32(0):
             with cute.arch.elect_one():
                 cp_async_bulk_s2g(
-                    self._device_workspace.ptr(self.sizes_region),
-                    smem_expert_counts.iterator,
-                    row_bytes,
+                    self._device_workspace.ptr(self.sizes_region), smem_expert_counts.iterator, row_bytes
                 )
                 cute.arch.cp_async_bulk_commit_group()
 
@@ -872,10 +733,7 @@ class _MetadataPushRouter(KernelComponent):
             cute.arch.sync_threads()
             if self._router_thread_idx == Int32(0):
                 cute.arch.atomic_add(
-                    self._device_workspace.ptr(self.sizes_ready_region),
-                    Int32(1),
-                    sem="release",
-                    scope="gpu",
+                    self._device_workspace.ptr(self.sizes_ready_region), Int32(1), sem="release", scope="gpu"
                 )
 
         return finalize
@@ -884,13 +742,9 @@ class _MetadataPushRouter(KernelComponent):
     def _compute_local_tables(self, smem_base: cute.Pointer) -> None:
         block_thread_count = self.router_warps_per_cta * 32
 
-        padded_totals = self._router_smem_workspace.tensor(
-            self.router_helper_totals_region, smem_base
-        )
+        padded_totals = self._router_smem_workspace.tensor(self.router_helper_totals_region, smem_base)
         prefix = self._router_smem_workspace.tensor(self.router_helper_prefix_region, smem_base)
-        warp_totals = self._router_smem_workspace.tensor(
-            self.router_helper_warp_totals_region, smem_base
-        )
+        warp_totals = self._router_smem_workspace.tensor(self.router_helper_warp_totals_region, smem_base)
         sizes = self._device_workspace.tensor(self.sizes_region)
 
         sizes_ready = self._device_workspace.ptr(self.sizes_ready_region)
@@ -908,8 +762,7 @@ class _MetadataPushRouter(KernelComponent):
             if expert < Int32(self.expert_count_padded):
                 expert_size = sizes[expert]
                 padded_totals[expert] = (
-                    (expert_size + Int32(self.token_padding_block - 1))
-                    // Int32(self.token_padding_block)
+                    (expert_size + Int32(self.token_padding_block - 1)) // Int32(self.token_padding_block)
                 ) * Int32(self.token_padding_block)
         cute.arch.sync_threads()
         _smem_exclusive_prefix(
@@ -929,10 +782,7 @@ class _MetadataPushRouter(KernelComponent):
         cute.arch.sync_threads()
         if self._router_thread_idx == Int32(0):
             cute.arch.atomic_add(
-                self._device_workspace.ptr(self.push_table_ready_region),
-                Int32(1),
-                sem="release",
-                scope="gpu",
+                self._device_workspace.ptr(self.push_table_ready_region), Int32(1), sem="release", scope="gpu"
             )
         iket.range_pop()
 
@@ -950,62 +800,46 @@ class _MetadataPushRouter(KernelComponent):
         elements_per_thread = load_round_count * elements_per_vector
 
         topk_flat = cute.make_tensor(topk_indices.iterator, cute.make_layout((maximum_elements,)))
-        topk_vectors = cute.logical_divide(
-            cute.zipped_divide(topk_flat, (tile_span,)), (elements_per_vector, None)
-        )
+        topk_vectors = cute.logical_divide(cute.zipped_divide(topk_flat, (tile_span,)), (elements_per_vector, None))
         load_atom = _copy_atom(topk_indices.dtype, 128)
         expert_registers = cute.make_rmem_tensor((elements_per_thread,), cutlass.Int32)
         if cutlass.const_expr(topk_indices.dtype.width == 64):
             raw_indices = cute.make_rmem_tensor((elements_per_thread,), topk_indices.dtype)
             raw_vectors = cute.zipped_divide(raw_indices, (elements_per_vector,))
             for load_round in cutlass.range_constexpr(load_round_count):
-                tile_begin = Int32(load_round * tile_span) + self._router_grid_thread_idx * Int32(
-                    elements_per_vector
-                )
+                tile_begin = Int32(load_round * tile_span) + self._router_grid_thread_idx * Int32(elements_per_vector)
                 if tile_begin < actual_elements:
                     cute.copy(
                         load_atom,
-                        mark_alignment(
-                            topk_vectors[(None, self._router_grid_thread_idx), load_round], 16
-                        ),
+                        mark_alignment(topk_vectors[(None, self._router_grid_thread_idx), load_round], 16),
                         raw_vectors[None, load_round],
                     )
         else:
             expert_vectors = cute.zipped_divide(expert_registers, (elements_per_vector,))
             for load_round in cutlass.range_constexpr(load_round_count):
-                tile_begin = Int32(load_round * tile_span) + self._router_grid_thread_idx * Int32(
-                    elements_per_vector
-                )
+                tile_begin = Int32(load_round * tile_span) + self._router_grid_thread_idx * Int32(elements_per_vector)
                 if tile_begin < actual_elements:
                     cute.copy(
                         load_atom,
-                        mark_alignment(
-                            topk_vectors[(None, self._router_grid_thread_idx), load_round], 16
-                        ),
+                        mark_alignment(topk_vectors[(None, self._router_grid_thread_idx), load_round], 16),
                         expert_vectors[None, load_round],
                     )
 
         score_registers = None
         if cutlass.const_expr(self.apply_topk_at_fc1):
             score_registers = cute.make_rmem_tensor((elements_per_thread,), cutlass.Float32)
-            scores_flat = cute.make_tensor(
-                topk_scores.iterator, cute.make_layout((maximum_elements,))
-            )
+            scores_flat = cute.make_tensor(topk_scores.iterator, cute.make_layout((maximum_elements,)))
             score_vectors = cute.logical_divide(
                 cute.zipped_divide(scores_flat, (tile_span,)), (elements_per_vector, None)
             )
             score_atom = _copy_atom(cutlass.Float32, elements_per_vector * 32)
             score_register_vectors = cute.zipped_divide(score_registers, (elements_per_vector,))
             for load_round in cutlass.range_constexpr(load_round_count):
-                tile_begin = Int32(load_round * tile_span) + self._router_grid_thread_idx * Int32(
-                    elements_per_vector
-                )
+                tile_begin = Int32(load_round * tile_span) + self._router_grid_thread_idx * Int32(elements_per_vector)
                 if tile_begin < actual_elements:
                     cute.copy(
                         score_atom,
-                        mark_alignment(
-                            score_vectors[(None, self._router_grid_thread_idx), load_round], 16
-                        ),
+                        mark_alignment(score_vectors[(None, self._router_grid_thread_idx), load_round], 16),
                         score_register_vectors[None, load_round],
                     )
 
@@ -1016,26 +850,21 @@ class _MetadataPushRouter(KernelComponent):
             if cutlass.const_expr(topk_indices.dtype.width == 64):
                 expert_registers[register_idx] = raw_indices_i32[2 * register_idx]
             token_idx, _ = self._router_value_coordinate(register_idx, topk_indices.dtype)
-            is_invalid = (
-                expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)
-            ) | (token_idx >= actual_token_count)
+            is_invalid = (expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)) | (
+                token_idx >= actual_token_count
+            )
             if is_invalid:
                 expert_registers[register_idx] = Int32(self.expert_count_padded)
         return expert_registers, score_registers
 
     @cute.jit
-    def _build_histogram(
-        self, expert_registers: cute.Tensor, histogram: cute.Tensor
-    ) -> cute.Tensor:
+    def _build_histogram(self, expert_registers: cute.Tensor, histogram: cute.Tensor) -> cute.Tensor:
         register_count = cute.size(expert_registers)
         within_expert_indices = cute.make_rmem_tensor((register_count,), cutlass.Int32)
         for register_idx in cutlass.range_constexpr(register_count):
             within_expert_indices[register_idx] = Int32(
                 cute.arch.atomic_add(
-                    histogram.iterator + expert_registers[register_idx],
-                    Int32(1),
-                    sem="relaxed",
-                    scope="cta",
+                    histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
                 )
             )
         cute.arch.sync_threads()
@@ -1055,41 +884,28 @@ class _MetadataPushRouter(KernelComponent):
         for register_idx in cutlass.range_constexpr(register_count):
             token_idx, topk_slot = self._router_value_coordinate(register_idx, topk_index_type)
             flat_topk_index = token_idx * Int32(self.topk) + topk_slot
-            destination = (
-                expert_run_starts[expert_registers[register_idx]]
-                + within_expert_indices[register_idx]
-            )
+            destination = expert_run_starts[expert_registers[register_idx]] + within_expert_indices[register_idx]
             if cutlass.const_expr(self.apply_topk_at_fc1):
-                sorted_elements[destination] = _SortedElement(
-                    flat_topk_index, score_registers[register_idx]
-                ).pack()
+                sorted_elements[destination] = _SortedElement(flat_topk_index, score_registers[register_idx]).pack()
             else:
                 sorted_elements[destination] = _SortedElement(flat_topk_index, None).pack()
 
     @cute.jit
-    def _router_value_coordinate(
-        self, register_idx: int, topk_index_type: type
-    ) -> Tuple[Int32, Int32]:
+    def _router_value_coordinate(self, register_idx: int, topk_index_type: type) -> Tuple[Int32, Int32]:
         elements_per_vector = 128 // topk_index_type.width
-        tile_span = (
-            elements_per_vector * self.router_data_cta_count * self.router_warps_per_cta * 32
-        )
+        tile_span = elements_per_vector * self.router_data_cta_count * self.router_warps_per_cta * 32
         flat_index = Int32(
             register_idx // elements_per_vector * tile_span + register_idx % elements_per_vector
         ) + self._router_grid_thread_idx * Int32(elements_per_vector)
         return (flat_index // Int32(self.topk), flat_index % Int32(self.topk))
 
     @cute.jit
-    def _dump_contiguous_router_output(
-        self, sorted_elements: cute.Tensor, total_valid_routes: Int32
-    ) -> None:
+    def _dump_contiguous_router_output(self, sorted_elements: cute.Tensor, total_valid_routes: Int32) -> None:
         block_thread_count = self.router_warps_per_cta * 32
         metadata_address = self._device_workspace.ptr(self.sorted_metadata_region).toint()
         if cutlass.const_expr(self.apply_topk_at_fc1):
             score_address = self._device_workspace.ptr(self.sorted_scores_region).toint()
-        dump_round_count = (total_valid_routes + Int32(block_thread_count - 1)) // Int32(
-            block_thread_count
-        )
+        dump_round_count = (total_valid_routes + Int32(block_thread_count - 1)) // Int32(block_thread_count)
         for dump_round in cutlass.range(dump_round_count, unroll=4):
             position = Int32(dump_round * block_thread_count) + self._router_thread_idx
             predicate = Int32(position < total_valid_routes)
@@ -1098,11 +914,7 @@ class _MetadataPushRouter(KernelComponent):
                 token=(element.flat_topk_index // Int32(self.topk)),
                 topk_slot=(element.flat_topk_index % Int32(self.topk)),
             )
-            stg_b64(
-                metadata_address + Int64(position) * Int64(RoutingMetadata.nbytes),
-                metadata.pack(),
-                predicate,
-            )
+            stg_b64(metadata_address + Int64(position) * Int64(RoutingMetadata.nbytes), metadata.pack(), predicate)
             if cutlass.const_expr(self.apply_topk_at_fc1):
                 stg_f32(score_address + Int64(position) * Int64(4), element.topk_score, predicate)
 
@@ -1128,9 +940,7 @@ class _MetadataPushRouter(KernelComponent):
                 for route_round in cutlass.range(route_round_count, unroll=1):
                     route = Int32(route_round) * Int32(32) + self._router_lane_idx
                     predicate = Int32(route < run_length)
-                    element = _SortedElement.from_packed(
-                        sorted_elements[predicate * (run_begin + route)]
-                    )
+                    element = _SortedElement.from_packed(sorted_elements[predicate * (run_begin + route)])
                     output_position = dump_begin + route
                     metadata = RoutingMetadata(
                         token=(element.flat_topk_index // Int32(self.topk)),
@@ -1142,11 +952,7 @@ class _MetadataPushRouter(KernelComponent):
                         predicate,
                     )
                     if cutlass.const_expr(self.apply_topk_at_fc1):
-                        stg_f32(
-                            score_address + Int64(output_position) * Int64(4),
-                            element.topk_score,
-                            predicate,
-                        )
+                        stg_f32(score_address + Int64(output_position) * Int64(4), element.topk_score, predicate)
 
     @cute.jit
     def expert_sizes(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
@@ -1171,9 +977,7 @@ class _MetadataPushRouter(KernelComponent):
         return device_workspace.ptr(self.token_src_metadata_region)
 
     @cute.jit
-    def wait_for_sizes_ready(
-        self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000
-    ) -> None:
+    def wait_for_sizes_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
         if lane_idx == Int32(0):
@@ -1183,9 +987,7 @@ class _MetadataPushRouter(KernelComponent):
         cute.arch.sync_warp()
 
     @cute.jit
-    def wait_for_metadata_ready(
-        self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000
-    ) -> None:
+    def wait_for_metadata_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
         if lane_idx == Int32(0):
@@ -1291,20 +1093,14 @@ class LocalRouting(KernelComponent):
         if self.expert_count > 16384:
             raise NotImplementedError("Local routing supports at most 16384 experts.")
         if self.topk > self.expert_count:
-            raise ValueError(
-                f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}."
-            )
+            raise ValueError(f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}.")
         if not 1 <= self.token_in_flag_batch <= 32:
-            raise ValueError(
-                f"token_in_flag_batch must be in [1, 32], got {self.token_in_flag_batch}."
-            )
+            raise ValueError(f"token_in_flag_batch must be in [1, 32], got {self.token_in_flag_batch}.")
         if self.tokens_per_fc1_ready_slot % self.token_padding_block != 0:
             raise ValueError("tokens_per_fc1_ready_slot must be divisible by token_padding_block.")
         element_block = self.activation_sf_vector_size * 4
         if self.hidden_size % element_block != 0:
-            raise ValueError(
-                f"{self.quant_kind} requires hidden_size divisible by {element_block}."
-            )
+            raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {element_block}.")
         if self.sf_padding_block % 128 != 0:
             raise ValueError("sf_padding_block must be a multiple of 128.")
 
@@ -1336,10 +1132,7 @@ class LocalRouting(KernelComponent):
 
     @property
     def max_fc1_ready_slot_count(self) -> int:
-        return (
-            self._router.worst_case_padded_tokens(self.tokens_per_fc1_ready_slot)
-            // self.tokens_per_fc1_ready_slot
-        )
+        return self._router.worst_case_padded_tokens(self.tokens_per_fc1_ready_slot) // self.tokens_per_fc1_ready_slot
 
     @property
     def token_src_metadata_region(self) -> str:
@@ -1374,9 +1167,7 @@ class LocalRouting(KernelComponent):
         return self._router.expert_sizes(device_workspace)
 
     @cute.jit
-    def wait_for_sizes_ready(
-        self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000
-    ) -> None:
+    def wait_for_sizes_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
         self._router.wait_for_sizes_ready(device_workspace, sleep_cycles)
 
     @cute.jit
@@ -1439,9 +1230,7 @@ class LocalRouting(KernelComponent):
             buffer_space="local",
             reset="tail_reset",
         )
-        activation_sf_element_count = (
-            self.worst_case_sf_token_count * self.activation_sf_hidden_padded
-        )
+        activation_sf_element_count = self.worst_case_sf_token_count * self.activation_sf_hidden_padded
         workspace.register(
             self.fc1_activation_sf_region,
             self.activation_sf_dtype,
@@ -1470,10 +1259,7 @@ class LocalRouting(KernelComponent):
         token_in_lifetime.register_tensor(
             self.token_in_sf_smem_region,
             self.activation_sf_dtype,
-            (
-                self.transfer_warp_count,
-                (self.activation_sf_vector_size, self.activation_sf_hidden_padded),
-            ),
+            (self.transfer_warp_count, (self.activation_sf_vector_size, self.activation_sf_hidden_padded)),
             stride=(self.activation_sf_hidden_padded, (0, 1)),
             byte_alignment=16,
         )
@@ -1487,14 +1273,10 @@ class LocalRouting(KernelComponent):
         layout = tile_atom_to_shape_SF(
             (self.worst_case_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
         )
-        return cute.make_tensor(
-            device_workspace.ptr(self.fc1_activation_sf_region), cute.select(layout, mode=[0, 1])
-        )
+        return cute.make_tensor(device_workspace.ptr(self.fc1_activation_sf_region), cute.select(layout, mode=[0, 1]))
 
     @cute.jit
-    def pre_reduced_activation_tensor(
-        self, device_workspace: DeviceWorkspace
-    ) -> Optional[cute.Tensor]:
+    def pre_reduced_activation_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
         """The (tokens, topk, hidden) combine staging plane, or None under in-kernel top-k reduction."""
         if cutlass.const_expr(self.reduce_topk_in_kernel):
             return None
@@ -1524,20 +1306,14 @@ class LocalRouting(KernelComponent):
         source_sizes = cute.make_tensor(sizes.iterator, cute.make_layout((self.expert_count,)))
         copy_elements = 4 if self.expert_count % 4 == 0 else 1
         source_size_vectors = cute.zipped_divide(
-            (
-                mark_alignment(source_sizes, 16)
-                if cutlass.const_expr(copy_elements == 4)
-                else source_sizes
-            ),
+            (mark_alignment(source_sizes, 16) if cutlass.const_expr(copy_elements == 4) else source_sizes),
             (copy_elements,),
         )
         destination_size_vectors = cute.zipped_divide(owned_sizes, (copy_elements,))
         size_vector_count = cute.size(destination_size_vectors, mode=[1])
         size_copy_atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(
-                cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL
-                if copy_elements == 4
-                else cute.nvgpu.LoadCacheMode.ALWAYS
+                cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL if copy_elements == 4 else cute.nvgpu.LoadCacheMode.ALWAYS
             ),
             cutlass.Int32,
             num_bits_per_copy=copy_elements * 32,
@@ -1548,9 +1324,7 @@ class LocalRouting(KernelComponent):
             vector_idx = Int32(size_copy_round * self.transfer_thread_count) + transfer_thread_idx
             if vector_idx < Int32(size_vector_count):
                 cute.copy(
-                    size_copy_atom,
-                    source_size_vectors[None, vector_idx],
-                    destination_size_vectors[None, vector_idx],
+                    size_copy_atom, source_size_vectors[None, vector_idx], destination_size_vectors[None, vector_idx]
                 )
         cute.arch.cp_async_commit_group()
         iket.range_pop()
@@ -1582,9 +1356,7 @@ class LocalRouting(KernelComponent):
         sf_copy_elements = 4
         source_sf_values = cute.slice_(warp_sf_stage, (0, None))
         source_sf_vectors = cute.zipped_divide(source_sf_values, (sf_copy_elements,))
-        sf_copy_atom = _copy_atom(
-            self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width)
-        )
+        sf_copy_atom = _copy_atom(self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width))
 
         next_dense_token = global_warp_idx
         expert_valid_begin = Int32(0)
@@ -1605,34 +1377,24 @@ class LocalRouting(KernelComponent):
             expert_valid_end = expert_valid_begin + expert_token_count
             pull_count = Int32(0)
             if next_dense_token < expert_valid_end:
-                pull_count = (
-                    expert_valid_end - next_dense_token + global_warp_count - Int32(1)
-                ) // global_warp_count
+                pull_count = (expert_valid_end - next_dense_token + global_warp_count - Int32(1)) // global_warp_count
 
             for pull_round in cutlass.range(pull_count, unroll=1):
                 dense_token_idx = next_dense_token + Int32(pull_round) * global_warp_count
                 token_in_expert = dense_token_idx - expert_valid_begin
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                 sf_token_idx = expert_sf_begin + token_in_expert
-                ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(
-                    self.tokens_per_fc1_ready_slot
-                )
+                ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
 
                 metadata = RoutingMetadata.load(
-                    token_metadata_pointer.toint()
-                    + Int64(pool_token_idx) * Int64(RoutingMetadata.nbytes)
+                    token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(RoutingMetadata.nbytes)
                 )
                 source_sf_row = self._local_routing_args.activation_sf[Int64(metadata.token), None]
 
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        warp_mbarrier, Int32(activation_sf_bytes)
-                    )
+                    cute.arch.mbarrier_arrive_and_expect_tx(warp_mbarrier, Int32(activation_sf_bytes))
                     tma_load_1d(
-                        warp_sf_stage.iterator,
-                        source_sf_row.iterator,
-                        warp_mbarrier,
-                        Int32(activation_sf_bytes),
+                        warp_sf_stage.iterator, source_sf_row.iterator, warp_mbarrier, Int32(activation_sf_bytes)
                     )
                 cute.arch.sync_warp()
                 cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
@@ -1640,9 +1402,7 @@ class LocalRouting(KernelComponent):
                 destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
                 destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
                 destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
-                destination_sf_vectors = cute.zipped_divide(
-                    destination_sf_values, (sf_copy_elements,)
-                )
+                destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
                 sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
                 for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
                     sf_vector_idx = Int32(sf_round * 32) + lane_idx
@@ -1655,17 +1415,14 @@ class LocalRouting(KernelComponent):
 
                 cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
-                flag_tracker = flag_tracker.accumulate(
-                    Int32(0), self.token_in_flag_batch, ready_address
-                )
+                flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
                 cute.arch.sync_warp()
                 pull_phase = pull_phase ^ Int32(1)
 
             next_dense_token = next_dense_token + pull_count * global_warp_count
             expert_valid_begin = expert_valid_end
             expert_sf_begin = expert_sf_begin + (
-                (expert_token_count + Int32(self.sf_padding_block - 1))
-                // Int32(self.sf_padding_block)
+                (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
             ) * Int32(self.sf_padding_block)
             expert_ready_slot_begin = expert_ready_slot_begin + (
                 (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
@@ -1692,9 +1449,7 @@ class LocalRouting(KernelComponent):
         )
         iket.range_pop()
         total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
-        global_reset_thread = (
-            self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
-        )
+        global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
         iket.range_push("tail.reset_workspace")
         self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
         self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)

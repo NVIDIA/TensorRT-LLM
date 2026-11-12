@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for the modular logger (auto module detection, per-module filtering)."""
 
+import importlib
 import logging
 from io import StringIO
 
@@ -238,6 +239,26 @@ class TestModuleLevelFiltering:
 
         # Cleanup
         singleton._module_levels = {}
+
+    def test_filtered_message_skips_caller_lookup(self, monkeypatch):
+        # The package re-exports the Logger singleton as ``tensorrt_llm.logger``,
+        # shadowing the submodule, so fetch the module object explicitly.
+        logger_module = importlib.import_module("tensorrt_llm.logger")
+
+        singleton = Logger()
+        monkeypatch.setattr(singleton, "_min_severity", "warning")
+        monkeypatch.setattr(singleton, "_module_levels", {})
+
+        def fail():
+            raise AssertionError("caller module looked up for a filtered message")
+
+        monkeypatch.setattr(logger_module, "_get_caller_module", fail)
+        singleton.info("filtered")
+        assert singleton.is_debug_enabled() is False
+        # A per-module override still needs the caller's module.
+        monkeypatch.setattr(singleton, "_module_levels", {"runtime": 10})
+        with pytest.raises(AssertionError, match="caller module"):
+            singleton.info("module filtered")
 
 
 class TestIsDebugEnabled:

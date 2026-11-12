@@ -31,11 +31,11 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() not in (120, 121),
+    not is_sm_120f(),
     reason=f"skip_softmax FMHA only dispatches on SM 120 / 121, got SM {get_sm_version()}",
 )
 

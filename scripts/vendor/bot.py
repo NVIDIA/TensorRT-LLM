@@ -35,6 +35,20 @@ _LOG = logging.getLogger("vendor-bot")
 _STATE_FILE = "state.sqlite"
 _STOP = threading.Event()
 _HEARTBEAT_SECONDS = 30
+_FEEDBACK_KEY = re.compile(r"<!-- vendor-bot-feedback:v1 ([0-9a-f]{64}) -->")
+_FEEDBACK_BASE = re.compile(r"<!-- vendor-bot-base:v1 ([^\s<>]+) -->")
+
+
+def _supported_base(branch: str) -> bool:
+    return branch == "main" or (branch.startswith("release/") and len(branch) > len("release/"))
+
+
+def _feedback_base(item: dict) -> str | None:
+    for line in item.get("body", "").splitlines():
+        match = _FEEDBACK_BASE.fullmatch(line)
+        if match:
+            return match[1]
+    return None
 
 
 def _now() -> str:
@@ -51,6 +65,20 @@ def _summary(error: object) -> str:
     text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[REDACTED]", text)
     text = re.sub(r"(?i)(authorization\s*[:=]\s*).+", r"\1[REDACTED]", text)
     return text[:500]
+
+
+def _upstream_feedback(proof: dict, vendor_name: str) -> str:
+    return (
+        "Upstream-main source ancestry is valid: pinned commit "
+        f"`{proof['promoted']}` contains canonical "
+        f"dev tip `{proof['checked_canonical_tip']}` and is reachable from "
+        f"the configured upstream branch at `{proof['upstream_observed_main']}`. "
+        f"No vendor-promotion metadata or upstream PR list is required for "
+        f"{field(vendor_name)} in this mode. Promotion will fast-forward dev to "
+        "the exact reviewed pin, not the moving upstream tip, and restore the canonical "
+        "lock URL/branch. This is **not** a code-review approval. Normal review and CI "
+        "still apply; promotion requires the source PR to merge and ancestry to remain valid."
+    )
 
 
 class Store:
@@ -202,6 +230,8 @@ class Monitor:
         store: Store,
         progress: Progress | None = None,
     ) -> None:
+        if not _supported_base(gh.base_branch):
+            raise ValueError("--base-branch must be main or release/<name>.")
         self.args, self.gh, self.store = args, gh, store
         self.progress = progress or Progress(store)
         self.actor = gh.get("user")["login"]
@@ -410,6 +440,22 @@ class Monitor:
                     break
                 self.progress.count("scanned")
                 if pr["base"]["ref"] != self.gh.base_branch:
+                    if not _supported_base(pr["base"]["ref"]) and pr["state"] == "open":
+                        snapshot = self._out_of_scope_snapshot(pr)
+                        if self.store.get(f"out_of_scope:{pr['number']}") != snapshot:
+                            comments, reviews = self._owned_feedback(pr)
+                            latest = max(comments, key=lambda item: int(item["id"]), default=None)
+                            marked = [
+                                item
+                                for item in reviews
+                                if item.get("body", "").startswith(self.marker)
+                            ]
+                            if (latest or marked) and self._cleanup_owner(
+                                latest, marked
+                            ) == self.gh.base_branch:
+                                tracked.add(pr["number"])
+                            else:
+                                self.store.put(f"out_of_scope:{pr['number']}", snapshot)
                     continue
                 number = pr["number"]
                 if pr["state"] == "closed" and not pr.get("merged_at"):
@@ -437,6 +483,54 @@ class Monitor:
         )
         return sorted(tracked)
 
+    def _owned_feedback(self, pr: dict) -> tuple[list[dict], list[dict]]:
+        number = pr["number"]
+        comments = [
+            item
+            for item in _pages(self.gh, f"{self.prefix}/issues/{number}/comments")
+            if item["user"]["login"] == self.actor and item.get("body", "").startswith(self.marker)
+        ]
+        reviews = (
+            [
+                item
+                for item in _pages(self.gh, f"{self.prefix}/pulls/{number}/reviews")
+                if item["user"]["login"] == self.actor
+            ]
+            if pr["state"] == "open" and pr["user"]["login"] != self.actor
+            else []
+        )
+        return comments, reviews
+
+    @staticmethod
+    def _cleanup_owner(latest: dict | None, reviews: list[dict]) -> str:
+        if latest and (base := _feedback_base(latest)):
+            return base
+        for review in sorted(reviews, key=lambda item: int(item["id"]), reverse=True):
+            if base := _feedback_base(review):
+                return base
+        # Unscoped legacy feedback has one cleanup owner across monitor instances.
+        return "main"
+
+    @staticmethod
+    def _out_of_scope_snapshot(pr: dict) -> dict:
+        return {
+            "base": pr["base"]["ref"],
+            "head": pr["head"]["sha"],
+            "updated_at": pr["updated_at"],
+        }
+
+    def _retargeted(self, pr: dict) -> None:
+        number = pr["number"]
+        if not _supported_base(pr["base"]["ref"]) and pr["state"] == "open":
+            if not self._feedback(pr, None, out_of_scope=True):
+                return
+            self.store.put(f"out_of_scope:{number}", self._out_of_scope_snapshot(pr))
+        else:
+            self._transition(number, "ignored", "PR targets a different consumer base branch")
+        self.store.put(
+            "tracked", [item for item in self.store.get("tracked", []) if item != number]
+        )
+
     def _transition(self, number: int, state: str, reason: str = "") -> None:
         observation = {"state": state, "reason": _summary(reason) if reason else ""}
         if self.store.get(f"observation:{number}") != observation:
@@ -450,17 +544,37 @@ class Monitor:
         problem: Diagnostic | None,
         *,
         attribution: dict[str, dict] | None = None,
+        upstream_proof: dict | None = None,
         no_promotion: bool = False,
-    ) -> None:
+        out_of_scope: bool = False,
+        source: manage.Vendor | None = None,
+    ) -> bool:
         number = pr["number"]
+        no_promotion = no_promotion or out_of_scope
         state = "blocked" if problem else "ignored" if no_promotion else "metadata_valid"
         message = (
-            f"@{pr['user']['login']} — vendor promotion needs {problem.owner} action:\n\n{problem}"
+            f"Vendor promotion needs {problem.owner} action:\n\n{problem}"
             "\n\nThe bot will recheck automatically on a later poll."
             if problem
             else "Vendor promotion metadata and source attribution are valid. "
             "This is **not** a code-review approval. Promotion still requires the source PR to merge."
         )
+        notification_message = message
+        if problem is not None and problem.notification_text is not None:
+            notification_message = (
+                f"Vendor promotion needs {problem.owner} action:\n\n{problem.notification_text}"
+                "\n\nThe bot will recheck automatically on a later poll."
+            )
+        if upstream_proof is not None and problem is None:
+            message = _upstream_feedback(upstream_proof, self.gh.vendor_name)
+            notification_message = _upstream_feedback(
+                upstream_proof
+                | {
+                    "checked_canonical_tip": "LATEST_DEV_TIP",
+                    "upstream_observed_main": "UPSTREAM_TIP",
+                },
+                self.gh.vendor_name,
+            )
         if no_promotion:
             message = (
                 f"This PR does not require vendor promotion for {field(self.gh.vendor_name)} "
@@ -468,11 +582,24 @@ class Monitor:
                 "no longer applies; no upstream-PR metadata is required by this monitor. "
                 "This is **not** a code-review approval. Normal review and CI still apply."
             )
+            notification_message = message
+        if out_of_scope:
+            message = (
+                f"This PR now targets {field(pr['base']['ref'])}, outside the vendor bot's "
+                "supported targets (`main` and `release/<name>`). Vendor validation and "
+                "promotion are not required by this bot on development branches. The previous "
+                "vendor-metadata objection no longer applies. This PR will leave active "
+                "tracking after cleanup; retargeting it to an explicitly monitored branch "
+                "will trigger fresh validation. This is **not** a code-review approval. "
+                "Normal review and CI still apply."
+            )
+            notification_message = message
         if attribution:
             details = metadata.similarity_feedback(attribution, self.gh.upstream_repo)
             if details:
                 message += "\n\n" + details
-        body = f"{self.marker}\n{message}"
+                notification_message += "\n\n" + details
+        head = promote._sha(pr["head"]["sha"])
         dismissal_notice = (
             "\n\nAn authorized reviewer must dismiss the automated metadata "
             "review; this account lacks dismissal permission."
@@ -483,101 +610,49 @@ class Monitor:
                 state,
                 str(problem) if problem else "dry run; no feedback published",
             )
-            return
+            return False
         # Check immutable head and description immediately before feedback. A
         # concurrent author edit will be retried on the next poll.
         current = self.gh.get(f"{self.prefix}/pulls/{number}")
-        if current["base"]["ref"] != self.gh.base_branch:
+        if out_of_scope and (
+            _supported_base(current["base"]["ref"]) or current["base"]["ref"] != pr["base"]["ref"]
+        ):
+            self._transition(number, "deferred", "PR target changed; retry next poll")
+            return False
+        if not out_of_scope and current["base"]["ref"] != self.gh.base_branch:
             self._transition(number, "ignored", "PR targets a different consumer base branch")
-            return
+            return False
         if no_promotion and current["state"] != "open":
             self._transition(number, "ignored", "PR is no longer open")
-            return
+            return False
         if current["head"]["sha"] != pr["head"]["sha"] or current.get("body") != pr.get("body"):
             self._transition(
                 number, "deferred", "source head or description changed; retry next poll"
             )
-            return
-        comments = list(_pages(self.gh, f"{self.prefix}/issues/{number}/comments"))
-        existing = [
-            item
-            for item in comments
-            if item["user"]["login"] == self.actor and item.get("body", "").startswith(self.marker)
-        ]
-        if len(existing) > 1:
-            raise ValueError("Multiple bot feedback comments; inspect before continuing.")
-        reviews = (
-            [
-                item
-                for item in _pages(self.gh, f"{self.prefix}/pulls/{number}/reviews")
-                if item["user"]["login"] == self.actor
-            ]
-            if current["state"] == "open" and current["user"]["login"] != self.actor
-            else []
-        )
-        automated = [
+            return False
+        existing, reviews = self._owned_feedback(current)
+        latest = max(existing, key=lambda item: int(item["id"]), default=None)
+        marked_reviews = [
             item
             for item in reviews
-            if item.get("body", "").startswith(self.marker) and item["state"] == "CHANGES_REQUESTED"
+            if item.get("body", "").startswith(self.marker)
+            and item["state"] in ("CHANGES_REQUESTED", "DISMISSED")
         ]
+        if out_of_scope and self._cleanup_owner(latest, marked_reviews) != self.gh.base_branch:
+            self._transition(number, "ignored", "Retargeting cleanup belongs to another monitor")
+            return True
+        automated = [item for item in marked_reviews if item["state"] == "CHANGES_REQUESTED"]
         manual = [
             item
             for item in reviews
             if not item.get("body", "").startswith(self.marker)
             and item["state"] in ("APPROVED", "CHANGES_REQUESTED")
         ]
-        if no_promotion and not existing and not automated:
+        if no_promotion and latest is None and not marked_reviews:
             self._transition(number, "ignored", "not a promotable update for this canonical vendor")
-            return
-        if existing:
-            if existing[0]["body"] != body and not (
-                not problem and existing[0]["body"] == body + dismissal_notice
-            ):
-                self.gh.api(
-                    f"{self.prefix}/issues/comments/{existing[0]['id']}",
-                    method="PATCH",
-                    payload={"body": body},
-                )
-                _LOG.info("PR #%s: updated metadata feedback comment", number)
-        else:
-            existing = [
-                self.gh.api(
-                    f"{self.prefix}/issues/{number}/comments", method="POST", payload={"body": body}
-                )
-            ]
-            _LOG.info("PR #%s: posted metadata feedback comment", number)
-        if current["state"] != "open" or current["user"]["login"] == self.actor:
-            self._transition(
-                number,
-                state,
-                str(problem) if problem else "feedback reconciled; not a code-review approval",
-            )
-            return
-        if problem and problem.owner == "author":
-            review_body = (
-                f"{self.marker}\n{problem.problem}\n\nSee the vendor-bot comment for "
-                "the specific fix and the latest validation result."
-            )
-            for review in automated:
-                if review["body"] != review_body:
-                    self.gh.api(
-                        f"{self.prefix}/pulls/{number}/reviews/{review['id']}",
-                        method="PUT",
-                        payload={"body": review_body},
-                    )
-                    _LOG.info("PR #%s: updated metadata review %s", number, review["id"])
-            if not automated and not manual:
-                self.gh.api(
-                    f"{self.prefix}/pulls/{number}/reviews",
-                    method="POST",
-                    payload={
-                        "event": "REQUEST_CHANGES",
-                        "commit_id": pr["head"]["sha"],
-                        "body": review_body,
-                    },
-                )
-                _LOG.info("PR #%s: requested metadata changes", number)
-        elif not problem:
+            return True
+        dismissal_blocked = False
+        if not problem:
             for review in automated:
                 # Never replace a metadata objection with APPROVE or dismiss a
                 # human review. GitHub may require an authorized human dismissal.
@@ -586,7 +661,12 @@ class Monitor:
                         f"{self.prefix}/pulls/{number}/reviews/{review['id']}/dismissals",
                         method="PUT",
                         payload={
-                            "message": "Automated vendor metadata issue resolved; code review remains required.",
+                            "message": (
+                                "PR targets a development branch; automated vendor objection "
+                                "no longer applies. Code review remains required."
+                            )
+                            if out_of_scope
+                            else "Automated vendor metadata issue resolved; code review remains required.",
                             "event": "DISMISS",
                         },
                     )
@@ -600,27 +680,100 @@ class Monitor:
                         number,
                         review["id"],
                     )
-                    self._transition(
-                        number, "blocked", "Authorized human must dismiss metadata review"
-                    )
-                    if existing and existing[0]["body"] != body + dismissal_notice:
-                        self.gh.api(
-                            f"{self.prefix}/issues/comments/{existing[0]['id']}",
-                            method="PATCH",
-                            payload={"body": body + dismissal_notice},
-                        )
-                    return
-            if existing and existing[0]["body"] == body + dismissal_notice:
-                self.gh.api(
-                    f"{self.prefix}/issues/comments/{existing[0]['id']}",
-                    method="PATCH",
-                    payload={"body": body},
+                    dismissal_blocked = True
+        if dismissal_blocked:
+            message += dismissal_notice
+            notification_message += dismissal_notice
+        fingerprint = metadata.fingerprint(
+            {
+                "vendor": self.gh.vendor_name,
+                "base_branch": self.gh.base_branch,
+                "source": {"url": source.url, "branch": source.branch, "commit": source.commit}
+                if source is not None
+                else None,
+                "state": state,
+                "message": notification_message,
+            }
+        )
+        # Only the newest bot-owned result counts: A -> B -> A must notify again.
+        # The fingerprint is durable on GitHub even if the POST response or SQLite is lost.
+        lines = latest["body"].splitlines() if latest else []
+        recorded = _FEEDBACK_KEY.fullmatch(lines[1]) if len(lines) > 1 else None
+        if recorded is None or recorded[1] != fingerprint:
+            body = (
+                f"{self.marker}\n<!-- vendor-bot-feedback:v1 {fingerprint} -->\n"
+                f"<!-- vendor-bot-base:v1 {self.gh.base_branch} -->\n"
+                f"### Vendor validation: {field(self.gh.vendor_name)}\n\n"
+                f"@{pr['user']['login']} — {message}\n\n"
+                f"Checked PR revision: [`{head[:12]}`]"
+                f"(https://github.com/{self.gh.consumer_repo}/pull/{number}/commits/{head}). "
+                "This is a snapshot; newer results are posted as new comments. "
+                "Observed dev/upstream tip SHAs may be stale: tip movement alone does not "
+                "post a new comment when the result is unchanged. Fetch the live branch "
+                "before rebasing or choosing a new pin."
+            )
+            if source is not None:
+                body += (
+                    f"\n\nChecked source: {field(source.url)} / {field(source.branch)}, "
+                    f"pin `{source.commit}`."
                 )
+            if latest is not None:
+                body += (
+                    f"\n\nSupersedes [previous vendor validation]"
+                    f"(https://github.com/{self.gh.consumer_repo}/pull/{number}"
+                    f"#issuecomment-{latest['id']})."
+                )
+            latest = self.gh.api(
+                f"{self.prefix}/issues/{number}/comments", method="POST", payload={"body": body}
+            )
+            _LOG.info("PR #%s: posted metadata feedback comment %s", number, latest["id"])
+        feedback_url = (
+            f"https://github.com/{self.gh.consumer_repo}/pull/{number}#issuecomment-{latest['id']}"
+        )
+        review_status = (
+            "not applicable on this target branch"
+            if out_of_scope
+            else f"needs {problem.owner} action"
+            if problem
+            else "no source-validation objection"
+        )
+        review_body = (
+            f"{self.marker}\n<!-- vendor-bot-base:v1 {self.gh.base_branch} -->\n"
+            f"Vendor validation result: {review_status}."
+            f"\n\n[Latest vendor validation and step-by-step fix]({feedback_url})."
+        )
+        for review in marked_reviews:
+            if review["body"] != review_body:
+                self.gh.api(
+                    f"{self.prefix}/pulls/{number}/reviews/{review['id']}",
+                    method="PUT",
+                    payload={"body": review_body},
+                )
+                _LOG.info("PR #%s: updated metadata review %s", number, review["id"])
+        if (
+            problem
+            and problem.owner == "author"
+            and not automated
+            and not manual
+            and current["state"] == "open"
+            and current["user"]["login"] != self.actor
+        ):
+            self.gh.api(
+                f"{self.prefix}/pulls/{number}/reviews",
+                method="POST",
+                payload={"event": "REQUEST_CHANGES", "commit_id": head, "body": review_body},
+            )
+            _LOG.info("PR #%s: requested metadata changes", number)
         self._transition(
             number,
-            state,
-            str(problem) if problem else "feedback reconciled; not a code-review approval",
+            "blocked" if dismissal_blocked else state,
+            "Authorized human must dismiss metadata review"
+            if dismissal_blocked
+            else str(problem)
+            if problem
+            else "feedback reconciled; not a code-review approval",
         )
+        return not dismissal_blocked
 
     def _inputs(self, pr: dict) -> tuple[manage.Vendor, manage.Vendor] | None:
         for change in _pages(self.gh, f"{self.prefix}/pulls/{pr['number']}/files"):
@@ -781,7 +934,7 @@ class Monitor:
         self.progress.operation("inspecting", number)
         pr = self.gh.get(f"{self.prefix}/pulls/{number}")
         if pr["base"]["ref"] != self.gh.base_branch:
-            self._transition(number, "ignored", "PR targets a different consumer base branch")
+            self._retargeted(pr)
             return
         if pr["state"] == "closed" and not pr.get("merged"):
             self._transition(number, "ignored", "closed without merging")
@@ -813,19 +966,31 @@ class Monitor:
             if current.to_mapping() != reviewed.to_mapping():
                 self._transition(number, "ignored", "historical pin is no longer pending promotion")
                 return
-            promote._check_current(self.gh, plan)
         try:
             self.progress.operation("validating_metadata", number)
-            entry = metadata.parse(pr.get("body") or "", self.gh.vendor_name, self.gh.upstream_repo)
+            if pr.get("merged"):
+                upstream_proof = promote._check_current(self.gh, plan)
+            else:
+                upstream_proof = promote._check_source(self.gh, previous, reviewed)
+            entry, evidence = None, None
             cache = self.args.workdir / "sources.git"
-            # Until provenance is committed, decisions follow current remote
-            # inputs, not whichever upstream heads a previous process cached.
-            _, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
+            if upstream_proof is None:
+                entry = metadata.parse(
+                    pr.get("body") or "", self.gh.vendor_name, self.gh.upstream_repo
+                )
+                # Until provenance is committed, decisions follow current remote
+                # inputs, not whichever upstream heads a previous process cached.
+                _, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
+            # Attribution may take long enough for another consumer's promotion
+            # to advance the shared canonical branch. Do not report stale inputs as valid.
+            upstream_proof = promote._check_source(self.gh, previous, reviewed)
         except Diagnostic as error:
-            self._feedback(pr, error)
+            self._feedback(pr, error, source=reviewed)
             return
         self.progress.operation("reconciling_feedback", number)
-        self._feedback(pr, None, attribution=evidence)
+        self._feedback(
+            pr, None, attribution=evidence, upstream_proof=upstream_proof, source=reviewed
+        )
         if not pr.get("merged"):
             return
         # Re-read mutable description/head before any promotion. Immutable lock
@@ -836,19 +1001,20 @@ class Monitor:
                 number, "deferred", "source head or description changed; retry next poll"
             )
             return
-        arguments.upstream_pr = [str(item) for item in entry["upstream_prs"]]
-        arguments.unpaired_reason = entry["unpaired_reason"]
-        arguments.source_repo = cache if cache.exists() else None
+        if entry is not None:
+            arguments.upstream_pr = [str(item) for item in entry["upstream_prs"]]
+            arguments.unpaired_reason = entry["unpaired_reason"]
+            arguments.source_repo = cache if cache.exists() else None
         self.progress.operation("planning_promotion", number)
         plan = promote._make_plan(
             arguments,
             self.gh,
-            auto_match=bool(entry["upstream_prs"]),
-            resolutions=entry["resolutions"],
+            auto_match=entry is not None and bool(entry["upstream_prs"]),
+            resolutions=entry["resolutions"] if entry is not None else None,
         )
         # Attribution evidence is versioned with the durable promotion record.
         # Reuse the original published record on retries rather than replacing it.
-        if plan.completed_pr is None:
+        if plan.completed_pr is None and entry is not None:
             plan.record["contributor_metadata"] = {
                 "source_head": pr["head"]["sha"],
                 "metadata_digest": metadata.fingerprint(entry),
@@ -1143,7 +1309,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--fork", required=True, help="Consumer publishing fork OWNER/REPO.")
     run.add_argument("--consumer-repo", default="NVIDIA/TensorRT-LLM")
-    run.add_argument("--base-branch", default="main")
+    run.add_argument(
+        "--base-branch",
+        default="main",
+        help="Exact consumer target: main or release/<name>. Other branches are not monitored.",
+    )
     run.add_argument("--upstream-branch", default="main")
     run.add_argument(
         "--repo",
@@ -1204,6 +1374,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.interval < 30:
             raise ValueError("--interval must be at least 30 seconds.")
+        if not _supported_base(args.base_branch):
+            raise ValueError("--base-branch must be main or release/<name>.")
         if not manage._NAME_PATTERN.fullmatch(args.vendor):
             raise ValueError("Invalid vendor key.")
         for name in (args.consumer_repo, args.upstream_repo, args.canonical_repo, args.fork):

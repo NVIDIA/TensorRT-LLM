@@ -15,7 +15,7 @@ How the touch DB is turned into a decision about which cases to run. Collection 
 Tier 1  rules      every changed file claimed by a rule → narrow per the rule
    │               some file left unclaimed (residual)
    ▼
-Tier 2  coverage   residual is all core Python and all present in the DB → scope=coverage
+Tier 2  coverage   residual is all Python with test-attributed DB rows → scope=coverage
    │               any condition unmet → decline
    ▼
         full fallback                                                     scope=null
@@ -32,18 +32,19 @@ Precision comes down to which qualname a changed line lands on. The shared
 
 | Changed line sits in | Attributed to | Note |
 |---|---|---|
-| A function or method body | `Class.method` / `func` | the only precise case |
+| A function or method body | `Class.method` / `func` | precise |
+| A closure body | `outer.<locals>.inner` | also precise: recorded under its own qualname, same as any function |
 | A module-level statement | `<module>` | module body, executed once at import |
 | A class body (class attribute) | `ClassName` | class body, executed once at import |
 | **A signature or decorator line** | **the enclosing scope** | a method's `def` line lands on `ClassName`, not on the method |
-| A closure body (`<locals>`) | **the nearest recorded enclosing scope** | changing `inner` in `def outer(): def inner()` lands on `outer` |
+| A lambda or genexpr body | **the nearest enclosing named def** | `_collect_scopes` only discovers named `def`/`class` statements; changing a lambda in `def outer(): f = lambda: ...` lands on `outer` |
 
-The last three are where both the precision and the correctness problems come from: **the
+The last two are where both the precision and the correctness problems come from: **the
 attributed qualname's DB rows do not represent the changed code's executions.**
 
-DB qualnames come from `co_qualname`, so they match what the AST derives (`Class.method`), but
-comprehensions, lambdas and closures are skipped during collection, so those names do not exist
-in the DB at all.
+DB qualnames come from `co_qualname`, so they match what the AST derives (`Class.method`,
+`outer.<locals>.inner`), but collection drops lambda and genexpr frames since selection has no way
+to resolve a line to them (`COLLECTION.md` §5.1), so those names do not exist in the DB at all.
 
 ## 3. The decline gates
 
@@ -52,12 +53,33 @@ of:
 
 | Gate | Condition |
 |---|---|
-| Non-core file | `path` is not a `.py` under `tensorrt_llm/` (checked on the **repo path**, not `canon()`) |
-| File absent from the DB | `file_has_touch_rows(cf)` is false — new or uninstrumented, so "who touches it" is unknown rather than empty |
+| Non-Python file | `path` is not a `.py`; the selector requires Python source to map changed lines to qualnames |
+| Shared pytest state | changed symbols reach non-function/unknown-scope fixtures, session/collection hooks, cached helpers, unresolved decorators, or explicit persistent-state mutations; local and imported dependencies are followed |
+| File without attributed coverage | `file_has_touch_rows(cf)` is false — absent, uninstrumented, or recorded only under the empty test context, so "who touches it" is unknown rather than empty |
 | **Unbounded import-executed change** | a changed line lands on a class body, signature / decorator, or unsupported module statement; the conservative exceptions are below |
 | No usable patch | the forge API omitted the diff (binary / rename / oversized), so the changed scope is unknown |
 | Unparsable source | the AST walk failed, so lines cannot be mapped to qualnames |
 | Closure change with no wider row set | see the next section |
+
+Python paths in `examples/`, `scripts/`, and other repository directories use the same
+coverage and impact checks as `tensorrt_llm/`, including `conftest.py` and test helpers.
+AST checks distinguish ordinary helper/function-fixture body edits from changes that reach
+shared fixtures, session/collection hooks, or cached/stateful helpers. Only the latter decline,
+because execution rows omit cached consumers (COLLECTION.md §5.4). Fixture scope is resolved
+from its decorator; nonliteral/unknown scopes and unrecognized decorators decline. Local dependencies,
+fixture parameters, and repository-visible imported helpers propagate this restriction.
+Class method references include qualified dependencies; aliases, inherited methods, and
+unresolved attribute dispatch conservatively include same-named local methods.
+Module/class initialization assignments are shared bindings: a helper body change reaching
+one declines even if the imports occur inside individual tests. Function-local assignments
+remain per-call. Both source images are checked, including removed shared dependencies.
+Unrelated shared fixtures in the same file do not block ordinary helper edits.
+Coverage explicitly requests diffs for all Python files, as DocsRule already does.
+Repository-relative DB keys retain their full path, so
+`examples/tensorrt_llm/x.py` cannot borrow coverage from `tensorrt_llm/x.py`.
+Existing Tier-1 forced fallbacks, missing/tainted test capture, and the residual patch
+compatibility check still apply. File-level records do not waive the import-time or
+changed-scope checks below.
 
 ## 4. Bounding low-risk import-executed changes
 
@@ -143,24 +165,31 @@ callers without treating all import-time execution as safe or assuming that `_` 
 
 ### 4.1 Closures
 
-A closure body is not recorded at all, so a changed closure is attributed to its nearest recorded
-enclosing scope and put through `_underrecorded_bound(cf, qualname)`:
+A named closure's body is recorded under its own qualname (`COLLECTION.md` §2.1), so both ways a
+changed line reaches it resolve to the closure itself, not its enclosing def:
 
-```
-file rows > that qualname's rows  →  use the file rows (the wider bound)
-otherwise                        →  decline, run in full
-```
+- **A direct line change inside the closure** resolves to that qualname through `qualnames_for_lines`
+  and goes through the ordinary `_qualname_impact` path below like any other function:
+  `tests_touching_func(f, q)` if it has rows, a local-caller bound or the configured no-data fallback
+  (file-level by default) if it does not yet.
+- **Binding-consumer resolution** — "does this def use a binding that just changed" — is a separate
+  mechanism, `_FunctionNames` in `python_change_analysis.py`. `_recorded_definition_groups` records a
+  nested def under its own qualname, so it gets its own fact there too; only a nested def's *signature*
+  (decorators, defaults, annotations), which genuinely runs in the outer scope at definition time, rolls
+  up into the outer def's own fact (`_include_signature_loads`) — its body, which only runs when the
+  nested def itself is later called, gets its own independent `_FunctionNames` fact instead, same as
+  any other qualname in `definition_groups`. A closure built by one test and invoked by a different one
+  (a cached decorator, a session-scoped fixture) is why this distinction matters: resolving to the outer
+  def would only find the constructing test, missing the one that actually depends on the binding.
 
-`tests_touching_func(f, q)` is by construction a subset of `tests_touching_file(f)`, so a strictly
-larger file set contains tests the qualname set does not — tests that recorded some *other* function
-in the same file, which is what makes the file exercised beyond import time. When the two are equal
-the file is only ever recorded at import time (`__init__.py` and similar, 881 of 1149 files) and no
-bound exists.
-
-This bound carries the same incompleteness as the file-level widening of §4. It is narrower in blast radius
-(4.3% of core-Python commits touch a closure, against 82.6% for import-executed lines) but it is not
-sound either: a decorator's `wrapper` is created at import time, so the enclosing scope it attributes
-to can itself be import-only.
+One case remains conservative by construction: **a lambda or genexpr body** attributes to its nearest
+enclosing *named* def, since `_collect_scopes` only discovers named `def`/`class` statements. A lambda or
+genexpr can appear anywhere an expression can, nested inside each other and themselves to arbitrary depth,
+so there is no static-analysis path to resolve a changed line to it directly; collection follows this by
+dropping their frames too (`COLLECTION.md` §5.1). The enclosing def's rows stand in instead, but only
+reflect when the enclosing def *itself* ran, not when the lambda inside it did, so the gap is the same
+shape as the cached-closure case above: a lambda created by one test and invoked by another gives the
+invoking test no rows on the enclosing def, and it can be missed.
 
 ## 5. Full impact resolution
 
@@ -173,8 +202,7 @@ for each residual file:
        │    ├ external reference / import-time consumer → decline
        │    └ local consumers → rows / local caller bound / no-data fallback
        ├ other import-executed change          → decline
-       ├ closure         → _underrecorded_bound(cf, q)      bound or decline
-       ├ has DB rows     → tests_touching_func(cf, q)       precise
+       ├ has DB rows     → tests_touching_func(cf, q)       precise (includes closures, §4.1)
        └ no DB rows      → no_data_policy fallback (file by default)
 ```
 
@@ -259,7 +287,8 @@ GET Artifactory pin at <PR number>/<PR head>:
 when no pin:
    Jenkins REST lastBuild                        → newest build number N
    for b in N .. N-49:                            (_MAX_PROBE)
-      ranged GET both architecture tarballs      → skip b unless both exist
+      read helper --exists, both tarballs         → skip b unless both exist,
+                                                    or when a read fails in transfer
       GET build_info.txt, parse `commit=`         → sha; skip when absent
       first complete pair with a known sha        → latest coverage DB
    Python writes the build/commit pin locally
@@ -338,8 +367,8 @@ large DB artifacts are downloaded. If it passes, Tier 2 uses the original forge 
 After Tier 1 computes the residual, `--resolve-pin FILE` returns a reuse/create/decline plan.
 Groovy uploads `FILE` only for a create plan, before any large download. `--prepare DIR --build
 BUILD --paths-json PATH` then resolves the PR base, validates the pinned pair's residual
-compatibility, streams both tarballs down, unpacks their identically named SQLite files
-separately, and unions them with `compact_db.merge_databases`.
+compatibility, downloads both tarballs with the read helper, unpacks their identically named
+SQLite files separately, and unions them with `compact_db.merge_databases`.
 It writes the selection JSON
 beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
 credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.

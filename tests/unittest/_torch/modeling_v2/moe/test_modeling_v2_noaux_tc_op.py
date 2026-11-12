@@ -116,3 +116,30 @@ def test_guard_refuses_topk_past_the_expert_count() -> None:
     with pytest.raises(AssertionError, match="exceeds num_experts"):
         with validating(op):
             op(logits, bias, 1, 1, 17, 1.0)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_config() -> None:
+    torch.manual_seed(12)
+    bias = torch.randn(896, dtype=torch.float32, device="cuda") * 0.1
+    for num_tokens in [1, 8, 64, 65, 512, 2048, 8192]:
+        logits = torch.randn(num_tokens, 896, dtype=torch.float32, device="cuda") * 2.5
+        weights, ids = op(logits, bias, 1, 1, 16, 1.0)
+        ref_weights, ref_ids = op.reference(logits, bias, 1, 1, 16, 1.0)
+        assert torch.equal(ids, ref_ids)
+        torch.testing.assert_close(
+            weights, ref_weights, rtol=torch.finfo(logits.dtype).eps, atol=0.0
+        )
+        assert int((weights != ref_weights).sum()) <= 1 + weights.numel() // 10000
+        assert ids.dtype == torch.int32 and ids.device == logits.device
+        assert weights.is_contiguous() and ids.is_contiguous()
+        assert int(ids.min()) >= 0 and int(ids.max()) < 896
+        assert (torch.sort(ids, dim=-1).values.diff(dim=-1) > 0).all()
+        torch.testing.assert_close(
+            weights.sum(-1),
+            torch.ones(num_tokens, device="cuda"),
+            rtol=16 * torch.finfo(torch.float32).eps,
+            atol=0.0,
+        )

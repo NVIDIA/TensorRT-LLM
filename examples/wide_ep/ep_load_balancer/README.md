@@ -270,3 +270,47 @@ R3 = 26.7 + 26.7 + 10 = 63.4
 ```
 
 The hottest rank is now at 70.0 against a mean of 65, so the imbalance drops from 177% to 7.7%. The three replicas of expert 0 land on three different ranks and share its traffic. This example traces the algorithm on the given input rather than reporting measured performance; for measured results, see the [tech blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#online-ep-load-balancer-1).
+
+
+## Per-Layer Dynamic EP Load Balancer
+
+Offline EPLB keeps one expert placement for the whole run, and online EPLB refreshes `layer_updates_per_iter` layers per iteration from decayed statistics. Per-layer dynamic EPLB instead re-plans every MoE layer on every forward pass, from the routing of that pass:
+
+1. Each rank keeps its own `num_experts / ep_size` experts and has `(num_slots - num_experts) / ep_size` helper slots. By default (`helper_slot_mode: per_layer_resident`) every MoE layer has its own helper slots; with `shared_banks`, all MoE layers alternate between two shared helper banks.
+2. Before a layer's experts run, a GPU scheduler (HALO-Q) exchanges routed-token counts across the EP ranks, picks the hot experts to copy into helper slots, and maps every routed token to a resident or helper slot.
+3. The same kernel then moves the picked expert weights over NVLink on a high-priority auxiliary stream, while the main stream runs other work such as input quantization and, for DeepSeek-V4, the shared experts. By default, an expert that a helper slot already holds from that layer's previous forward pass is not copied again.
+4. The MoE kernel reads a helper slot only after its weights are marked ready.
+
+Expert weights are not staged in host shared memory, so the GDRCopy and shared-memory setup that online EPLB needs does not apply.
+
+An example configuration for a model with 384 routed experts on 8 GPUs:
+
+```bash
+cat > ./config_per_layer_dynamic.yaml <<EOF
+enable_attention_dp: true
+cuda_graph_config: null
+moe_config:
+    backend: MEGAMOE_CUTEDSL
+    load_balancer:
+      mode: per_layer_dynamic
+      num_slots: 416    # 384 experts + 4 helper slots on each of 8 EP ranks
+      auxiliary_sms: 4  # optional; 4 is the default
+      helper_slot_mode: per_layer_resident  # optional; the default
+EOF
+```
+
+Pass it to `trtllm-bench` or `trtllm-serve` with `--config`, as in the examples above. The `load_balancer` section can also be a path to a YAML file with the same fields.
+
+Per-layer dynamic EPLB has the following constraints:
+
+* **Backend**: `MEGAMOE_CUTEDSL` only. `AUTO`, the default, resolves to it; any other explicit backend is rejected.
+* **Models**: an architecture listed in `moe_model_arch_list` (see [`load_balancer`](../README.md#load_balancer)) with NVFP4 MoE weights, as `MEGAMOE_CUTEDSL` requires. The model can have at most 384 routed experts, and the expert count must be divisible by the EP size.
+* **GPUs**: SM100, SM103 or SM107, with all EP ranks in one NVLink domain that supports multicast. The helper slots are CUDA fabric-handle allocations bound to NVLink multicast objects.
+* **Parallelism**: attention DP (`enable_attention_dp: true`) with pure expert parallelism: `moe_expert_parallel_size` equals the number of GPUs, with no MoE tensor parallelism and no pipeline parallelism. The EP size must be even and between 2 and 32, and the MoE smart router (`moe_cluster_size` greater than 1) is not supported. Unlike `standard` mode, an unsupported model, an EP size of 1, or the smart router raises an error instead of silently disabling the load balancer.
+* **CUDA graphs**: not supported. A non-null `cuda_graph_config` is replaced with `null` and a warning is logged, and any `prefill_cuda_graph_backend` other than `DISABLED` is rejected.
+* **Launch queues**: CUDA must be initialized with `CUDA_SCALE_LAUNCH_QUEUES=4x`. The LLM API sets it automatically, in the main process and in every worker, before CUDA is initialized. If the process has already initialized CUDA when the LLM is created, construction fails; export `CUDA_SCALE_LAUNCH_QUEUES=4x` before starting such a process.
+* **`auxiliary_sms`**: the number of SMs of the kernel that runs the HALO-Q scheduler and then the copy, one CTA per SM. It defaults to 4, must be between 1 and 8, and must be lower than the GPU's SM count. Input quantization and, on the SM100 family, DeepSeek-V4's fused shared-expert kernel leave these SMs free, so planning and copying run alongside them.
+* **`helper_slot_mode`**: `per_layer_resident` (the default) gives every MoE layer its own helper slots and skips copying experts that they still hold from the previous forward pass. It costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copies every helper expert in every forward pass.
+* **Speculative decoding**: a one-model draft's MoE layers follow the same rule as the target's: every MoE layer that runs on `MEGAMOE_CUTEDSL` registers as one more per-layer dynamic layer after the target layers, is planned and load-balanced like them, and, with `per_layer_resident`, gets its own helper slots. DSpark drafters shipped inside an NVFP4 target checkpoint, such as `DeepSeek-V4-Pro-nvfp4-DSpark`, do so with NVFP4 draft experts. A draft layer only computes correctly if its checkpoint experts are NVFP4: the `mtp.*` routed experts of the `DeepSeek-V4-Pro-NVFP4` checkpoint are MXFP4, which `MEGAMOE_CUTEDSL` does not serve, so MTP on that checkpoint is not supported with or without this load balancer.
+* **DWDP**: not supported; `dwdp_config` must keep `dwdp_size` at 1.
+* **Fields**: only `mode`, `num_slots`, `auxiliary_sms` and `helper_slot_mode`. `num_slots` is required, must be greater than the expert count, and must be divisible by the EP size. `layer_updates_per_iter` and `initial_global_assignments` are `standard`-only and rejected in this mode.

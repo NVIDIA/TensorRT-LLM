@@ -881,17 +881,17 @@ class CSA2FlashInfer:
         key = (query.shape[0], query.shape[1], width, q.device, scale)
         real_context = metadata.num_contexts > 0
         if real_context:
-            # Whole eager phases have variable Q. Preserve generation warmup
-            # and captured plans, but do not retain every historical prefill.
+            # Whole eager phases have variable Q. Preserve plans that CUDA graphs
+            # warm up or capture, but do not retain every historical eager shape.
             for cache in (self._plans, self._paged_plans):
                 for previous, plan in tuple(cache.items()):
                     if previous != key and previous[1:] == key[1:] and not plan.protected:
                         del cache[previous]
         if shared:
             with torch.cuda.device(q.device):
-                result = self.run_shared(*inputs, protect=not real_context).flatten(1)
+                result = self.run_shared(*inputs, protect=metadata._csa2_graph_reserved).flatten(1)
         else:
-            result = self(*inputs, protect=not real_context).flatten(1)
+            result = self(*inputs, protect=metadata._csa2_graph_reserved).flatten(1)
         if forward_args.output is not None:
             forward_args.output.copy_(result)
             return forward_args.output

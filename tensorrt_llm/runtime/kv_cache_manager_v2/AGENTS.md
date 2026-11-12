@@ -26,7 +26,9 @@ This directory contains only:
   means adding a rebind here and an entry in `__all__`.
 - `_introspection.py` — white-box hooks for tests and accuracy harnesses. Every function
   forwards to the bindings' native `_introspection` submodule; the indirection exists so callers
-  import a stable Python path and get plain Python containers back.
+  import a stable Python path and get plain Python containers back. The one exception is
+  `batch_gpu_coalesced_page_table`, which returns a DLPack view: its callers check the
+  device-array contract and pointer stability, which a host copy would erase.
 
 ## Commands
 

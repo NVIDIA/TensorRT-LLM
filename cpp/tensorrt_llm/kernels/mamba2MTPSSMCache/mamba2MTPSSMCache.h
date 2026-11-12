@@ -35,7 +35,7 @@ enum class Mamba2Dtype : int32_t
 struct Mamba2MTPSSMCacheParams
 {
     // State tensors
-    void* ssm;                 // [batch, nheads, head_dim, ssm_dim]
+    void* ssm;                 // [cache_size, nheads, head_dim, ssm_dim]
     void* intermediate_states; // [batch, cache_steps, nheads, head_dim, ssm_dim]
 
     // Input tensors
@@ -68,6 +68,7 @@ struct Mamba2MTPSSMCacheParams
     int head_dim;
     int ssm_dim;
     int ngroups;
+    int64_t ssm_batch_stride; // Elements between state slots; inner state dimensions are contiguous.
 
     // Data types
     Mamba2Dtype ssm_dtype;
