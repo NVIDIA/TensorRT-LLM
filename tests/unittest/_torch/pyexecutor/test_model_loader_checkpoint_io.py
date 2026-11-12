@@ -627,6 +627,7 @@ def test_model_loader_lets_a_model_read_its_own_checkpoint() -> None:
 
     loader = ModelLoader.__new__(ModelLoader)
     loader._metrics = {}
+    loader._startup_metadata = {"checkpoint_io_policy": "stale"}
     loader._call_load_weights = MagicMock()
     weights_preloaded = loader._materialize_checkpoint_weights(
         _SessionCheckpointLoader(events),
@@ -641,6 +642,8 @@ def test_model_loader_lets_a_model_read_its_own_checkpoint() -> None:
     loader._call_load_weights.assert_not_called()
     assert "weight_population_seconds" in loader.metrics
     assert "checkpoint_preparation_seconds" not in loader.metrics
+    # No checkpoint loader read the files, so no checkpoint IO policy applied.
+    assert loader._startup_metadata["checkpoint_io_policy"] is None
 
 
 @pytest.mark.parametrize("reads_own_checkpoint", [False, True])

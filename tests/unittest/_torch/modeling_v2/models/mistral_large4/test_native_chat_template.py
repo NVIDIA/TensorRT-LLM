@@ -145,28 +145,22 @@ def test_top_level_continue_final_message_rejects_generation_prompt():
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("limit_field", ["max_tokens", "max_completion_tokens"])
-def test_chat_rejects_oversized_output_before_generation(stream, limit_field):
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
+def test_chat_rejects_oversized_output_before_generation(tmp_path, stream, limit_field):
+    from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
-    from tensorrt_llm.serve.openai_server import OpenAIServer
-
-    server = object.__new__(OpenAIServer)
-    server.model = "m"
-    server.allow_request_chat_template = False
-    server.model_config = SimpleNamespace(model_type="mistral_large_4")
-    server.generator = SimpleNamespace(args=SimpleNamespace(max_seq_len=64))
-    app = FastAPI()
-    app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
-    response = TestClient(app).post(
-        "/v1/chat/completions",
-        json={
-            "model": "m",
-            "messages": [{"role": "user", "content": "Hi"}],
-            "stream": stream,
-            limit_field: 999999999,
-        },
-    )
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig(model_name="m"))
+        server.model_config = SimpleNamespace(model_type="mistral_large_4")
+        server.generator.args.max_seq_len = 64
+        response = env.client(server.app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": stream,
+                limit_field: 999999999,
+            },
+        )
     assert response.status_code == 400, response.text
     assert "exceeds the maximum context length of 64 tokens" in response.text
 
@@ -281,13 +275,9 @@ def test_a_response_format_reaches_the_renderer(response_format, passed):
     assert (request.chat_template_kwargs or {}).get("response_format") == expected
 
 
-def test_a_named_tool_choice_on_token_ids_is_a_bad_request(monkeypatch):
-    from unittest.mock import AsyncMock
+def test_a_named_tool_choice_on_token_ids_is_a_bad_request(tmp_path, monkeypatch):
+    from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    from tensorrt_llm.serve.openai_server import OpenAIServer
     from tensorrt_llm.serve.render import chat as render_chat_module
 
     async def render_token_ids(**kwargs):
@@ -299,39 +289,21 @@ def test_a_named_tool_choice_on_token_ids_is_a_bad_request(monkeypatch):
         model_type = "mistral_large_4"
         vocab_size = 1024
 
-    server = object.__new__(OpenAIServer)
-    server.model = "m"
-    server.allow_request_chat_template = False
-    server.model_config = _Config()
-    server.processor = None
-    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=_Config.vocab_size))
-    server.chat_template = None
-    server.tool_parser = "qwen3"
-    server.tool_call_id_type = "random"
-    server.multimodal_server_config = None
-    server.generator = SimpleNamespace(
-        args=SimpleNamespace(
-            gather_generation_logits=False,
-            reasoning_parser=None,
-            backend="pytorch",
-            guided_decoding_backend="xgrammar",
-            num_postprocess_workers=0,
-        ),
-        generate_async=None,
-    )
-    server.await_disconnected = AsyncMock()
-    app = FastAPI()
-    app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
-    response = TestClient(app).post(
-        "/v1/chat/completions",
-        json={
-            "model": "m",
-            "messages": [{"role": "user", "content": "Weather in Paris?"}],
-            "tools": [_WEATHER_TOOL],
-            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
-            "max_tokens": 4,
-        },
-    )
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig(model_name="m", tool_parser="qwen3"))
+        server.model_config = _Config()
+        server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=_Config.vocab_size))
+        server.generator.args.guided_decoding_backend = "xgrammar"
+        response = env.client(server.app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [_WEATHER_TOOL],
+                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+                "max_tokens": 4,
+            },
+        )
     assert response.status_code == 400, response.text
     assert "renders token ids" in response.text
 
