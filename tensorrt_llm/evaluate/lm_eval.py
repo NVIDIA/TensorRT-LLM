@@ -38,7 +38,6 @@ except ImportError:
     TemplateLM = object
 
 from .. import LLM as PyTorchLLM
-from ..checkpoint_format import CheckpointFormat
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
@@ -196,6 +195,11 @@ def _parse_partial_scores_env() -> Optional[int]:
     return value if value > 0 else None
 
 
+def _model_type(llm) -> Optional[str]:
+    """The model type of the config the LLM read from its checkpoint, if any."""
+    return getattr(getattr(llm, "_hf_model_config", None), "model_type", None)
+
+
 # lm-eval caches contexts as strings. Keep native control IDs in a lossless,
 # versioned envelope rather than decoding them to text and encoding again.
 _NATIVE_CHAT_TOKENS_PREFIX = "__trtllm_native_chat_tokens_v1__:"
@@ -217,9 +221,7 @@ class LmEvalWrapper(TemplateLM):
                  partial_scoring_task_dict: Optional[dict] = None):
         super().__init__()
         self.llm = llm
-        self._native_chat_tokens = (getattr(
-            getattr(llm, "args", None), "checkpoint_format",
-            None) == CheckpointFormat.MISTRAL_LARGE_4)
+        self._native_chat_tokens = _model_type(llm) == "mistral_large_4"
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
@@ -664,8 +666,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
     def _get_model_type(self, llm: PyTorchLLM) -> str:
         """Extract model type from the model configuration."""
-        if getattr(llm.args, "checkpoint_format",
-                   None) == CheckpointFormat.MISTRAL_LARGE_4:
+        if _model_type(llm) == "mistral_large_4":
             return "mistral_large_4"
         config_path = os.path.join(llm._hf_model_dir, 'config.json')
 

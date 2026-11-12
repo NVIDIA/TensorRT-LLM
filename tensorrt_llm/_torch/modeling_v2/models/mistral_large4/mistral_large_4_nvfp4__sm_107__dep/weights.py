@@ -323,9 +323,25 @@ def _materialize(entry) -> torch.Tensor:
 SHARD_INDEX = "consolidated.safetensors.index.json"
 
 
+def _checkpoint_shards(checkpoint_dir) -> tuple[Path, dict[str, str]]:
+    """`(directory, key -> shard file)` of a checkpoint directory: its index when it ships
+    one, else the header of each `consolidated*.safetensors`."""
+    directory = Path(checkpoint_dir)
+    index = directory / SHARD_INDEX
+    if index.is_file():
+        return directory, json.loads(index.read_text())["weight_map"]
+    weight_map: dict[str, str] = {}
+    for path in sorted(directory.glob("consolidated*.safetensors")):
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            weight_map.update(dict.fromkeys(handle.keys(), path.name))
+    if not weight_map:
+        raise FileNotFoundError(f"no consolidated*.safetensors in {directory}")
+    return directory, weight_map
+
+
 def _shard_files(core, weights) -> tuple[Path, dict[str, str]] | None:
-    """`(directory, key -> shard file)` of the checkpoint the engine loaded, or None when the
-    sources are not the shard files of one (the directory the engine records on the config
+    """`(directory, key -> shard file)` of the checkpoint a dict of sources was read from, or
+    None when the sources are not the shard files of one (the directory the config records
     lacks the index, or the index does not name every key `weights` holds)."""
     cfg = getattr(core.model_config, "pretrained_config", None)
     root = getattr(cfg, "_name_or_path", None)
@@ -488,7 +504,7 @@ def _check_expert_scalars(scalars: dict[str, torch.Tensor], d) -> None:
 
 def _read_scalars(keys: list[str], weights, shards) -> dict[str, torch.Tensor]:
     """The given per-tensor scalars, off the shard files one file at a time when they are
-    found, otherwise off the engine's dict."""
+    found, otherwise off the given dict."""
     if shards is None:
         return {key: _materialize(weights[key]) for key in keys}
     directory, weight_map = shards
@@ -1067,7 +1083,13 @@ class MistralLarge4DepWeights:
                         keys[_expert_key(i, e, f"{proj}.{s}")] = checked
         return keys
 
-    def load(self, model, weights) -> None:
+    def load_checkpoint(self, model, checkpoint_dir) -> None:
+        """Fill every declared weight from a checkpoint directory, which is what the engine
+        loads: `load` over the directory's keys, every source read from its shard file."""
+        directory, weight_map = _checkpoint_shards(checkpoint_dir)
+        self.load(model, weight_map, shards=(directory, weight_map))
+
+    def load(self, model, weights, shards=None) -> None:
         """Fill every declared weight from the checkpoint: multi-source rows, the shell's whole
         `lm_head`, and coverage asserted in both directions.
 
@@ -1075,8 +1097,8 @@ class MistralLarge4DepWeights:
         included, so a checkpoint that breaks what the forward relies on fails before any
         weight moves. When the checkpoint's own shard files can be found, every source is read
         from them one file at a time, this rank's expert window and the replicated rest only,
-        and each file's cached pages are dropped once its sources are copied. The engine hands
-        every rank a dict that maps every shard file; reading through those mappings would fault
+        and each file's cached pages are dropped once its sources are copied. Mapping every
+        shard file on every rank and reading through the mappings instead would fault
         the expert windows of a node's four ranks -- 539 GiB, the whole expert stack, at 4
         ranks; half of it on each of the two nodes at 8 -- and the replicated rest into that
         node's host memory.
@@ -1118,7 +1140,8 @@ class MistralLarge4DepWeights:
         scalar_keys = _expert_scalar_keys(d)
         for key in (*(k for row in plan for k in _keys(row[1])), *scalar_keys):
             assert key in weights, f"checkpoint key missing: {key}"
-        shards = _shard_files(core, weights)
+        if shards is None:
+            shards = _shard_files(core, weights)
         scalars = _read_scalars(scalar_keys, weights, shards)
         _check_expert_scalars(scalars, d)
 
@@ -1169,7 +1192,7 @@ class MistralLarge4DepWeights:
         not_loaded = collections.Counter(expected.values())
         logger.info(
             f"modeling_v2 weights: {len(consumed)} checkpoint tensors loaded "
-            f"({'streamed per shard file' if shards else 'from the engine dict'}), "
+            f"({'streamed per shard file' if shards else 'from the given dict'}), "
             f"{len(scalars)} expert scalars checked; not loaded: "
             + "; ".join(f"{n} x {reason}" for reason, n in sorted(not_loaded.items()))
         )

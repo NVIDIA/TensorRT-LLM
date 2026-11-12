@@ -50,7 +50,7 @@ Text only: no image, no chat template. Runs with the ranks already in place, on 
 tep4 or on eight over two nodes of four at tep8: pytest under `trtllm-llmapi-launch`, as the
 whole-model accuracy class runs, with the checkpoint under `LLM_MODELS_ROOT` as
 `Mistral-Large-4-1T-A52B-NVFP4` (or `mistral-large-4-nvfp4`) in its Mistral-native format,
-which both engines load with checkpoint_format "mistral_large_4". Skipped where the checkpoint
+which both engines load with checkpoint_format "mistral". Skipped where the checkpoint
 is absent or off sm_103; each world size is skipped below its own ranks (four GPUs at tep4, eight
 ranks at tep8) and inside a launch of another world size. About 25 minutes, two engine loads
 included.
@@ -373,7 +373,7 @@ def _generate(llm: LLM, ids: list[int], params: SamplingParams, memory: _DeviceM
 def _engine(path: Path, name: str, world: int) -> LLM:
     return LLM(
         str(path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         modeling_v2="require",
         env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
         enable_iter_perf_stats=True,

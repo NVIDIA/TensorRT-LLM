@@ -39,6 +39,7 @@ import importlib
 import os
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import click
@@ -302,9 +303,9 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 # ===========================================================================
 
 
-def _make_native_mistral_wrapper(checkpoint_format: str | None) -> LmEvalWrapper:
+def _make_native_mistral_wrapper(model_type: str | None) -> LmEvalWrapper:
     fake_llm = MagicMock()
-    fake_llm.args.checkpoint_format = checkpoint_format
+    fake_llm._hf_model_config = SimpleNamespace(model_type=model_type)
     return LmEvalWrapper(fake_llm)
 
 
@@ -2029,6 +2030,21 @@ def test_native_mistral_eval_continues_a_gen_prefix():
     assert wrapper._render_native_mistral_chat(deferred, []) == expected
 
 
+# The config an LLM reads from a Mistral-Large-4 checkpoint, as far as lm-eval reads it.
+_MISTRAL_LARGE_4_CONFIG = SimpleNamespace(model_type="mistral_large_4")
+
+
+def test_native_mistral_eval_does_not_require_a_synthetic_hf_config():
+    from types import SimpleNamespace
+
+    wrapper = _make_multimodal_wrapper(model_type="mistral_large_4")
+    llm = SimpleNamespace(
+        _hf_model_config=SimpleNamespace(model_type="mistral_large_4"),
+        _hf_model_dir="/no-config-json",
+    )
+    assert wrapper._get_model_type(llm) == "mistral_large_4"
+
+
 @pytest.mark.parametrize("prompt", [None, "[INST]Q[/INST]"])
 def test_dump_inference_results_keeps_token_id_prompts(tmp_path, prompt):
     """A token-id prompt dumps the ids the engine received; a text prompt is re-encoded."""
@@ -2051,3 +2067,185 @@ def test_dump_inference_results_keeps_token_id_prompts(tmp_path, prompt):
     assert record["input_ids"] == ([1, 3, 10, 13, 4] if prompt is None else [7, 8])
     if prompt is not None:
         tokenizer.encode.assert_called_once_with(prompt)
+
+
+@pytest.mark.parametrize(
+    "window,streaming,log_samples", [(0, False, False), (2, False, False), (0, False, True)]
+)
+def test_native_text_chat_keeps_control_ids_through_harness(
+    monkeypatch, window, streaming, log_samples
+):
+    """Real harness contexts must reach generation without text re-encoding.
+
+    With log_samples, each logged sample keeps the native chat context as the
+    str envelope of the token IDs that were generated from.
+    """
+    import json
+
+    from lm_eval.evaluator import evaluate
+
+    from tensorrt_llm.evaluate.lm_eval import _NATIVE_CHAT_TOKENS_PREFIX
+
+    monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, str(window))
+    llm = _canned_llm(_E2E_RESPONSES)
+    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
+    llm.tokenizer.name_or_path = "native-test"
+    llm.tokenizer.chat_template = None
+    llm.tokenizer.encode.side_effect = AssertionError("Native chat must keep token IDs")
+    expected = []
+
+    def render(history, **kwargs):
+        assert kwargs["tokenize"] is True
+        assert kwargs["return_dict"] is False
+        assert kwargs["continue_final_message"] is False
+        ids = [1, 36, 1000 + len(expected), 37, 3, 4]
+        expected.append(ids)
+        return ids
+
+    llm.tokenizer.apply_chat_template.side_effect = render
+    submitted = []
+    original_generate = llm.generate_async
+
+    def generate(prompt, **kwargs):
+        submitted.append(prompt)
+        return original_generate(prompt, **kwargs)
+
+    llm.generate_async = generate
+    wrapper = LmEvalWrapper(llm, streaming=streaming)
+    # Cache serialization must not depend on a string subclass or object identity.
+    original_apply = wrapper.apply_chat_template
+    wrapper.apply_chat_template = lambda *a, **kw: json.loads(json.dumps(original_apply(*a, **kw)))
+    result = evaluate(
+        lm=wrapper,
+        task_dict={"toy_arith": _toy_task()},
+        apply_chat_template=True,
+        bootstrap_iters=0,
+        log_samples=log_samples,
+    )
+    assert result["results"]["toy_arith"]["exact_match,strict-match"] == pytest.approx(0.75)
+    assert submitted == expected
+    assert len(submitted) == 4
+    if log_samples:
+        samples = result["samples"]["toy_arith"]
+        assert len(samples) == 4
+        logged = []
+        for sample in samples:
+            context = sample["arguments"][0][0]
+            assert isinstance(context, str)
+            assert context.startswith(_NATIVE_CHAT_TOKENS_PREFIX)
+            logged.append(json.loads(context[len(_NATIVE_CHAT_TOKENS_PREFIX) :]))
+        assert sorted(logged) == sorted(submitted)
+    llm.tokenizer.encode.assert_not_called()
+
+
+def _real_tekken(source):
+    """A real tekken MistralTokenizer and the chat kwargs its instruct version accepts."""
+    mistral_common = pytest.importorskip("mistral_common")
+    from pathlib import Path
+
+    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
+
+    if source == "bundled":
+        # Instruct v3 has no model settings, so it rejects reasoning_effort.
+        files = sorted((Path(mistral_common.__file__).parent / "data").glob("tekken*.json"))
+        if not files:
+            pytest.skip("this mistral_common ships no tekken tokenizer file")
+        return MistralTokenizer.from_pretrained(str(files[-1])), [{}]
+    checkpoint = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR")
+    if not checkpoint:
+        pytest.skip("MISTRAL_LARGE4_CHECKPOINT_DIR names no Mistral Large 4 checkpoint")
+    return MistralTokenizer.from_pretrained(checkpoint), [
+        {"reasoning_effort": "low"},
+        {"reasoning_effort": "high"},
+    ]
+
+
+@pytest.mark.parametrize("source", ["bundled", "checkpoint"])
+def test_native_text_chat_real_tekken_keeps_control_ids(source):
+    """The envelope carries exactly mistral-common's chat tokens.
+
+    The rendered text cannot stand in for them: tekken encodes control-token
+    strings as plain text, so re-encoding it keeps no control token but BOS.
+    """
+    tokenizer, settings = _real_tekken(source)
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+
+    special = set(tokenizer.all_special_ids)
+    history = [{"role": "user", "content": "What is 2+2?"}]
+    partial = history + [{"role": "assistant", "content": "The answer is"}]
+    llm = MagicMock()
+    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
+    llm.tokenizer = tokenizer
+    contexts = set()
+    for kwargs in settings:
+        wrapper = LmEvalWrapper(llm, chat_template_kwargs=kwargs)
+        context = wrapper.apply_chat_template(history)
+        contexts.add(context)
+        ids = wrapper.tok_encode(context)
+        expected = tokenizer.mistral.encode_chat_completion(
+            ChatCompletionRequest.from_openai(messages=history, **kwargs)
+        ).tokens
+        assert ids == expected
+        assert ids[0] == tokenizer.bos_token_id
+        assert len([token for token in ids if token in special]) >= 3
+
+        text = tokenizer.apply_chat_template(
+            history, tokenize=False, add_generation_prompt=True, **kwargs
+        )
+        # add_special_tokens=True is how the input processor encodes a text prompt.
+        for add_special_tokens in (False, True):
+            reencoded = tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            assert [token for token in reencoded if token in special] == (
+                [tokenizer.bos_token_id] if add_special_tokens else []
+            )
+
+        # A partial assistant turn is continued, not closed.
+        continued = wrapper.tok_encode(
+            wrapper.apply_chat_template(partial, add_generation_prompt=False)
+        )
+        expected = tokenizer.mistral.encode_chat_completion(
+            ChatCompletionRequest.from_openai(
+                messages=partial, continue_final_message=True, **kwargs
+            )
+        ).tokens
+        assert continued == expected
+        piece = tokenizer.tokenizer.encode("The answer is", bos=False, eos=False)
+        assert continued[-len(piece) :] == piece
+        assert tokenizer.eos_token_id not in continued
+    # chat_template_kwargs reach the tokenizer: each reasoning effort renders differently.
+    assert len(contexts) == len(settings)
+
+
+@pytest.mark.parametrize("model_type", ["mistral_large_4", "llama"])
+def test_text_eval_plain_prompts_are_unchanged(model_type):
+    from types import SimpleNamespace
+
+    llm = _canned_llm(["ok"])
+    llm._hf_model_config = SimpleNamespace(model_type=model_type)
+    wrapper = LmEvalWrapper(llm)
+    prompt = "<s>[INST]literal user text[/INST]"
+    assert wrapper._prepare_prompt(prompt) == prompt
+    wrapper.tok_encode(prompt, add_special_tokens=False)
+    llm.tokenizer.encode.assert_called_once_with(prompt, add_special_tokens=False)
+
+
+def test_native_text_chat_encoding_and_continuation():
+    from tensorrt_llm.evaluate.lm_eval import _NATIVE_CHAT_TOKENS_PREFIX
+
+    llm = MagicMock()
+    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
+    llm.tokenizer.apply_chat_template.return_value = [1, 3, 1000, 4, 1001]
+    wrapper = LmEvalWrapper(llm, chat_template_kwargs={"reasoning_effort": "none"})
+    context = wrapper.apply_chat_template(
+        [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "A"}],
+        add_generation_prompt=False,
+    )
+    assert context.startswith(_NATIVE_CHAT_TOKENS_PREFIX)
+    assert wrapper.tok_encode(context) == [1, 3, 1000, 4, 1001]
+    kwargs = llm.tokenizer.apply_chat_template.call_args.kwargs
+    assert kwargs["continue_final_message"] is True
+    assert kwargs["reasoning_effort"] == "none"
+    llm.tokenizer.encode.assert_not_called()
+    llm._hf_model_config = SimpleNamespace(model_type="llama")
+    non_native = LmEvalWrapper(llm)
+    assert non_native._prepare_prompt(context) == context

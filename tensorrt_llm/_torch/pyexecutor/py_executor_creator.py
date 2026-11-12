@@ -635,16 +635,14 @@ def _llguidance_tokenizer(guided_decoding_config: GuidedDecodingConfig,
 
 
 def _llguidance_json_schema_lark(guided_decoding_config: GuidedDecodingConfig,
-                                 tokenizer: Optional[TokenizerBase],
-                                 checkpoint_format: Optional[str]):
-    """Renders the llguidance grammar of a JSON response for Mistral Large 4,
-    whose structured responses may open with a [THINK] section, or None to
-    constrain a JSON response from its first token."""
+                                 tokenizer: Optional[TokenizerBase]):
+    """Renders the llguidance grammar of a JSON response for a tokenizer whose
+    structured responses may open with a reasoning section (Mistral's [THINK]),
+    or None to constrain a JSON response from its first token."""
     if (guided_decoding_config.backend
             != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
-            or checkpoint_format != CheckpointFormat.MISTRAL_LARGE_4):
+            or getattr(tokenizer, "renders_grammars", False) is not True):
         return None
-    assert tokenizer is not None
     return tokenizer.llguidance_json_schema_lark
 
 
@@ -669,8 +667,7 @@ def _load_guided_decoding_tokenizer(llm_args: TorchLlmArgs,
     """
     custom_tokenizer = llm_args.custom_tokenizer
     if (custom_tokenizer is None and llm_args.checkpoint_format
-            in (CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3,
-                CheckpointFormat.MISTRAL_LARGE_4)
+            in (CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3)
             and os.path.isfile(os.path.join(checkpoint_dir, "tekken.json"))):
         custom_tokenizer = "mistral_common"
     if custom_tokenizer:
@@ -1324,8 +1321,7 @@ def _create_py_executor(
                     model_engine.model.vocab_size_padded)
                 kwargs[
                     "llguidance_json_schema_lark"] = _llguidance_json_schema_lark(
-                        guided_decoding_config, tokenizer,
-                        getattr(llm_args, "checkpoint_format", None))
+                        guided_decoding_config, tokenizer)
                 if spec_config is not None:
                     kwargs[
                         "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1

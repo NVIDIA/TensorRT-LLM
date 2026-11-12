@@ -27,7 +27,7 @@ wherever a CPU reaches it:
 
 The delivered 32K configuration (pinned in test_modeling_v2_tp4_engine_config.py) is resolved
 beside it as the contrast. The checkpoint is Mistral-native, as published (params.json,
-tekken.json, consolidated safetensors), loaded with checkpoint_format mistral_large_4 in every
+tekken.json, consolidated safetensors), loaded with checkpoint_format mistral in every
 spelling. It is looked up under ``LLM_MODELS_ROOT`` (as ``Mistral-Large-4-1T-A52B-NVFP4`` or
 ``mistral-large-4-nvfp4``) by its params.json, and the tests are skipped where it is
 absent. A CPU job may still see the node's GPUs: nothing here opens a CUDA context,
@@ -140,7 +140,7 @@ def _options(
     it. The KV cache dtype is left at its default (auto) as the CI class leaves it, unless
     ``kv_dtype`` names one."""
     return dict(
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         **topology,
         max_batch_size=_MAX_BATCH,
         max_num_tokens=_CHUNK,

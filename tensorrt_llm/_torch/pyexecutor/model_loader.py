@@ -987,7 +987,7 @@ def load_model_from_auto_load_format(
     qualification: PostTransformQualificationDecision,
     metrics: dict[str, float],
     startup_metadata: _CheckpointStartupMetadata,
-) -> tuple[BaseWeightMapper, bool]:
+) -> tuple[Optional[BaseWeightMapper], bool]:
     """Load the target and any separate draft checkpoint for ``LoadFormat.AUTO``.
 
     The model is already built and has CUDA memory; post-load hooks run
@@ -995,6 +995,8 @@ def load_model_from_auto_load_format(
 
     Built-in and custom checkpoint loaders, including custom weight loaders,
     read the checkpoint here.
+    A model that defines ``load_checkpoint(checkpoint_dir)`` reads its target
+    checkpoint itself; the checkpoint loader opens none of its files.
 
     Args:
         checkpoint_loader: checkpoint loader of this load
@@ -1011,8 +1013,9 @@ def load_model_from_auto_load_format(
             policy of the target and draft reads is recorded in place
 
     Returns:
-        The target weight mapper, and whether the checkpoint loader wrote
-        the target weights into the model directly (MX P2P).
+        The target weight mapper (None for a model that reads its checkpoint
+        itself), and whether the checkpoint loader wrote the target weights
+        into the model directly (MX P2P).
     """
     # load target weights
     weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
@@ -1026,20 +1029,33 @@ def load_model_from_auto_load_format(
             mx_loading.get_mx_load_weights_kwargs(model_config=model_config,
                                                   llm_args=llm_args,
                                                   qualification=qualification))
-    weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-        model, model_config)
-    startup_metadata["checkpoint_io_policy"] = _load_checkpoint_into_model(
-        checkpoint_loader,
-        weights_checkpoint_dir,
-        model=model,
-        is_draft_model=False,
-        mapping=mapping,
-        weight_mapper=weight_mapper,
-        extra_load_weights_kwargs=target_load_weights_kwargs,
-        metrics=metrics)
-    # Read before the draft load: an MX draft read without MX state resets
-    # this flag.
-    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+    if getattr(type(model), "load_checkpoint", None) is not None:
+        # The model reads its checkpoint's files itself, so the checkpoint
+        # loader opens nothing and no weight mapper applies.
+        weight_mapper = None
+        startup_metadata["checkpoint_io_policy"] = None
+        with timing_metric(
+                ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
+                metrics):
+            model.load_checkpoint(weights_checkpoint_dir)
+            if torch.cuda.is_available():  # CPU guard
+                torch.cuda.synchronize()
+        weights_preloaded = False
+    else:
+        weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+            model, model_config)
+        startup_metadata["checkpoint_io_policy"] = _load_checkpoint_into_model(
+            checkpoint_loader,
+            weights_checkpoint_dir,
+            model=model,
+            is_draft_model=False,
+            mapping=mapping,
+            weight_mapper=weight_mapper,
+            extra_load_weights_kwargs=target_load_weights_kwargs,
+            metrics=metrics)
+        # Read before the draft load: an MX draft read without MX state
+        # resets this flag.
+        weights_preloaded = checkpoint_loader.is_weights_preloaded()
 
     # load separate draft weights
     if spec_config is not None and spec_config.needs_separate_draft_weights:

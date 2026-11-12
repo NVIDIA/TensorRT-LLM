@@ -37,8 +37,8 @@ engine's runtime features, and at eight ranks where the engine reads the node la
 to a modeling_v2 target.
 
 The checkpoint is Mistral-native, as published (params.json, tekken.json, consolidated
-safetensors), and is loaded with checkpoint_format mistral_large_4: the gates' LLM-API options
-state it and the boot gate's command passes --checkpoint_format=mistral_large_4. The checkpoint
+safetensors), and is loaded with checkpoint_format mistral: the gates' LLM-API options
+state it and the boot gate's command passes --checkpoint_format=mistral. The checkpoint
 at tep4 is checked to resolve and route as it did before this target, and at dep4 and at dep8
 to route to it. The checkpoint is looked up under ``LLM_MODELS_ROOT`` (as
 ``Mistral-Large-4-1T-A52B-NVFP4`` or ``mistral-large-4-nvfp4``) by its params.json, and its
@@ -157,7 +157,7 @@ _ENGINES = {4: ("dep4",), 8: ("dep8", "dep8_gate")}
 # format, the dep8 topology flags, the core unit's CUDA-graph capture list, and task.yaml's
 # runtime flags.
 _GATE_ARGV = (
-    "--checkpoint_format=mistral_large_4",
+    "--checkpoint_format=mistral",
     "--max_tokens=64",
     "--tp_size=8",
     "--moe_ep_size=8",
@@ -184,7 +184,7 @@ def _options(topology: dict, tokens: int) -> dict:
     fp8_kv_cache: the fp8_ds_mla pool). Under attention DP max_batch_size and max_num_tokens bind
     each rank."""
     return dict(
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         **topology,
         max_batch_size=16,
         max_num_tokens=tokens,

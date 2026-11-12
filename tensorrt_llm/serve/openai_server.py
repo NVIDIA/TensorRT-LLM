@@ -1028,8 +1028,7 @@ class OpenAIServer(_VideoRoutesMixin):
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
         if checkpoint_format in (CheckpointFormat.MISTRAL,
-                                 CheckpointFormat.MISTRAL_LARGE_3,
-                                 CheckpointFormat.MISTRAL_LARGE_4):
+                                 CheckpointFormat.MISTRAL_LARGE_3):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
             self.processor = None
@@ -1057,7 +1056,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model_config = None
 
         self.chat_template = load_chat_template(chat_template)
-        if checkpoint_format == CheckpointFormat.MISTRAL_LARGE_4 and self.chat_template:
+        if (getattr(self.model_config, "model_type", None) == "mistral_large_4"
+                and self.chat_template):
             logger.warning(
                 "Mistral Large 4 renders chats with mistral-common; ignoring "
                 "the server chat template.")
