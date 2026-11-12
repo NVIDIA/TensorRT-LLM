@@ -238,3 +238,48 @@ def test_fail_unittests_prioritizes_and_deduplicates_in_flight_culprits(
 )
 def test_parallel_config_key_strips_only_ignore_arguments(case: str, expected: str) -> None:
     assert _parallel_config_key(case) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rank1_result", [None, "skip", "empty", "failure", "error", "missing"])
+def test_mpi_profiler_requires_a_passing_report_from_each_rank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank1_result: str | None
+) -> None:
+    """A successful launcher must not hide a skipped, empty or missing rank report."""
+    common_module = types.ModuleType("defs.common")
+    defs_module = types.ModuleType("defs")
+    defs_module.__path__ = []
+    launcher_calls = []
+
+    def launch(venv: object, mpi_cmd: list[str], python_cmd: list[str], **kwargs: object) -> None:
+        """Write scripted per-rank JUnit reports for MPI launcher validation."""
+        launcher_calls.append((mpi_cmd, python_cmd))
+        for rank in range(2):
+            result = rank1_result if rank == 1 else None
+            if result == "missing":
+                continue
+            body = ""
+            if result != "empty":
+                tag = "skipped" if result == "skip" else result
+                outcome = f"<{tag}/>" if tag is not None else ""
+                body = f'<testcase name="test_two_rank_collective_p2p_profiler_smoke">{outcome}</testcase>'
+            (tmp_path / f"results-mpi-profiler-rank{rank}.xml").write_text(
+                f"<testsuites><testsuite>{body}</testsuite></testsuites>", encoding="utf-8"
+            )
+
+    # A retry must not accept a report left by an earlier successful invocation.
+    (tmp_path / "results-mpi-profiler-rank1.xml").write_text(
+        '<testsuites><testsuite><testcase name="old_pass"/></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    common_module.venv_mpi_check_call = launch
+    monkeypatch.setitem(sys.modules, "defs", defs_module)
+    monkeypatch.setitem(sys.modules, "defs.common", common_module)
+    if rank1_result is None:
+        _TEST_UNITTESTS.test_mpi_profiler(str(_REPO_ROOT), object(), str(tmp_path))
+    else:
+        expected = FileNotFoundError if rank1_result == "missing" else AssertionError
+        with pytest.raises(expected):
+            _TEST_UNITTESTS.test_mpi_profiler(str(_REPO_ROOT), object(), str(tmp_path))
+    assert len(launcher_calls) == 1
+    assert launcher_calls[0][0] == ["mpirun", "--allow-run-as-root", "-n", "2"]
