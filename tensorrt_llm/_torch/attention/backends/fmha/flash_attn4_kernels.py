@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashAttention-4 (CuTe DSL) generation kernels on SM90, shared by the FA4 FMHA libraries.
+"""FlashAttention-4 (CuTe DSL) generation kernels on SM90 and SM100, shared by the FA4 FMHA libraries.
 
 ``flash_attn4_generation`` (decode and linear speculative verification) and the shared-prefix
 attention of ``shared_prefix_fa4`` / ``sampling_shared_prefix`` both use:
@@ -53,6 +53,35 @@ FA4_TILE_MN = (64, 128)
 FA4_NUM_THREADS = 256
 """FA4 SM90 tile for generation rows. With GQA packing a row holds ``q_len * heads_per_kv_head``
 query rows, usually far fewer than 128, so a 64-row tile pads less than the default 128-row one."""
+
+FA4_SUPPORTED_SMS = (90, 100)
+"""Compute capabilities (major * 10 + minor) the FA4 libraries run on: Hopper and Blackwell."""
+
+
+@functools.lru_cache(maxsize=8)
+def _fa4_sm(device_index: Optional[int]) -> int:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return major * 10 + minor
+
+
+def fa4_arch_supported(device=None) -> bool:
+    """Whether the GPU is one the FA4 libraries run on (``FA4_SUPPORTED_SMS``)."""
+    if not torch.cuda.is_available():
+        return False
+    index = torch.device(device).index if device is not None else None
+    return _fa4_sm(index) in FA4_SUPPORTED_SMS
+
+
+def fa4_generation_options(device=None) -> dict:
+    """Tile and thread options of the FA4 calls over generation rows.
+
+    SM90 uses the 64-row tile of ``FA4_TILE_MN``. SM100 takes FA4's own defaults (128-row tile,
+    two Q stages, a warp-specialized kernel that sets its own thread count).
+    """
+    index = torch.device(device).index if device is not None else None
+    if _fa4_sm(index) == 90:
+        return dict(tile_mn=FA4_TILE_MN, num_threads=FA4_NUM_THREADS)
+    return {}
 
 
 SPLITS_ENV = "TLLM_FLASH_ATTN4_GENERATION_SPLITS"
@@ -545,11 +574,10 @@ def fa4_paged_generation_split(
     v_pages = pool[:, 1].transpose(1, 2)
     common = dict(
         softmax_scale=sm_scale,
-        tile_mn=FA4_TILE_MN,
-        num_threads=FA4_NUM_THREADS,
         num_splits=1,
         pack_gqa=None,
         return_lse=True,
+        **fa4_generation_options(q.device),
     )
     fwd(q_rep, k_pages, v_pages, seqused_k=split_lens, page_table=split_table, causal=False,
         out=split_out, lse=split_lse, **common)  # fmt: skip
@@ -604,12 +632,11 @@ def fa4_paged_generation(
         page_table=page_table,
         softmax_scale=sm_scale,
         causal=True,
-        tile_mn=FA4_TILE_MN,
-        num_threads=FA4_NUM_THREADS,
         num_splits=1,
         pack_gqa=None,
         out=out.view(rows, q_len, num_heads, head_dim),
         return_lse=False,
+        **fa4_generation_options(q.device),
     )
 
 

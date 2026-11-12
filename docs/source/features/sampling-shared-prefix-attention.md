@@ -21,7 +21,7 @@ This feature is a prototype: its settings and metrics may change.
 
 ## Support
 
-- H100 (SM90) GPUs. Other GPUs run the regular attention.
+- H100 (SM90) and GB200/B200 (SM100) GPUs. Other GPUs run the regular attention.
 - PyTorch backend, KV cache manager V2 (`use_kv_cache_manager_v2: true`), KV cache block
   reuse, bf16 KV cache.
 - Dense MHA/GQA models with head size 64 or 128 and no sliding window, such as Qwen2 and Qwen3.

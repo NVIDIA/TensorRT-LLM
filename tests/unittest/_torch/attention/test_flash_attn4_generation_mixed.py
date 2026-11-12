@@ -27,15 +27,17 @@ from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
     FlashAttn4GenerationFmha,
 )
-from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import fa4_forward
+from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
+    fa4_arch_supported,
+    fa4_forward,
+)
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
-from tensorrt_llm._utils import get_sm_version
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
     pytest.mark.skipif(
-        not torch.cuda.is_available() or get_sm_version() != 90 or fa4_forward() is None,
-        reason="FlashAttention-4 generation path is SM90-only",
+        not fa4_arch_supported() or fa4_forward() is None,
+        reason="FlashAttention-4 generation path needs SM90 or SM100",
     ),
 ]
 
@@ -99,10 +101,7 @@ def spies(monkeypatch):
 def _run(case, monkeypatch, libs):
     # Short cached lengths keep the reference cheap; serve them with FA4 regardless of length.
     monkeypatch.setenv("TLLM_FLASH_ATTN4_GENERATION_MIXED_MIN_KV", "0")
-    if libs is None:
-        monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
-    else:
-        monkeypatch.setenv("TLLM_FMHA_LIBS", libs)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", libs)
     inputs = generate_inputs(case, seed=7)
     golden = run_backend(case, "VANILLA", inputs, kv_dtype=torch.bfloat16, kv_layout="NHD")
     out = run_backend(
@@ -112,8 +111,12 @@ def _run(case, monkeypatch, libs):
     return golden, out, atol, rtol
 
 
-_FA4 = "+flash_attn4_generation"
-_LIBRARY_AND_FA4 = "+sampling_shared_prefix,+flash_attn4_generation"
+# Exact library lists end in ``fallback``: the regular op is then the same on every architecture
+# (the default list serves a mixed batch with the TRTLLM-Gen library on SM100), which is what the
+# spies below watch.
+_REGULAR_ONLY = "fallback"
+_FA4 = "flash_attn4_generation,fallback"
+_LIBRARY_AND_FA4 = "sampling_shared_prefix,flash_attn4_generation,fallback"
 
 
 @pytest.mark.parametrize(
@@ -144,7 +147,7 @@ def test_mixed_batch_without_fa4_keeps_the_regular_op(q_len, spies, monkeypatch)
     """FA4 not enabled: the regular op serves the whole mixed batch, as before. (Multi-token
     rows need speculative-decoding metadata on that op, which this harness does not build.)"""
     case = _case(28, 4, q_len)
-    golden, out, atol, rtol = _run(case, monkeypatch, None)
+    golden, out, atol, rtol = _run(case, monkeypatch, _REGULAR_ONLY)
     assert spies["fa4_rows"] == []
     assert spies["fallback"] == [AttentionInputType.mixed]
     torch.testing.assert_close(out.float(), golden.float(), atol=atol, rtol=rtol)
@@ -159,7 +162,7 @@ def test_mixed_batch_with_ragged_generation_rows_stays_on_the_regular_op(spies, 
 
     monkeypatch.setattr(backend_case, "_assert_cache_contains_new_tokens", lambda *a, **k: None)
     case = _case(28, 4, 1, gen_lens=[1, 1, 1, 1, 1, 2, 7])
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "+flash_attn4_generation")
+    monkeypatch.setenv("TLLM_FMHA_LIBS", _FA4)
     monkeypatch.setenv("TLLM_FLASH_ATTN4_GENERATION_MIXED_MIN_KV", "0")
     inputs = generate_inputs(case, seed=7)
     run_backend(case, "TRTLLM", inputs, kv_dtype=torch.bfloat16, fuse_rope=True, kv_layout="HND")
@@ -176,7 +179,7 @@ def test_mixed_batch_kv_length_gate(min_kv, uses_fa4, spies, monkeypatch):
         monkeypatch.delenv("TLLM_FLASH_ATTN4_GENERATION_MIXED_MIN_KV", raising=False)
     else:
         monkeypatch.setenv("TLLM_FLASH_ATTN4_GENERATION_MIXED_MIN_KV", min_kv)
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "+flash_attn4_generation")
+    monkeypatch.setenv("TLLM_FMHA_LIBS", _FA4)
     inputs = generate_inputs(case, seed=7)
     if uses_fa4:
         golden = run_backend(case, "VANILLA", inputs, kv_dtype=torch.bfloat16, kv_layout="NHD")

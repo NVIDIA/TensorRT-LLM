@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for the opt-in sampling_shared_prefix FMHA library (n-sample requests with a linear draft,
-KV cache manager V2, SM90).
+KV cache manager V2, SM90 or SM100).
 
 The grouping and the cost model run on the host; the planner and the FlashAttention-4 kernels need
-an SM90 GPU and are checked against float64 references; the end-to-end tests run EAGLE-3 n-sampling
+an SM90 or SM100 GPU and are checked against float64 references; the end-to-end tests run EAGLE-3 n-sampling
 with and without the library on Qwen3-8B and on Qwen2.5-7B-Instruct, each with an EAGLE-3 draft
 trained for it, loaded from ``llm_models_root()`` (a model skips when its checkpoints are not staged
 there).
@@ -43,7 +43,7 @@ def _fa4_available():
     return fa4_supported(128, torch.bfloat16)
 
 
-needs_fa4 = pytest.mark.skipif(not _fa4_available(), reason="needs SM90 and FlashAttention-4")
+needs_fa4 = pytest.mark.skipif(not _fa4_available(), reason="needs SM90 or SM100 and FlashAttention-4")
 
 
 @pytest.fixture(autouse=True)
@@ -405,7 +405,7 @@ def test_per_layer_page_tables_are_declined():
 
 
 # --------------------------------------------------------------------------- #
-# Planner (SM90)
+# Planner (SM90, SM100)
 # --------------------------------------------------------------------------- #
 class _Manager(SimpleNamespace):  # weak-referenceable, like the real managers
     pass
@@ -804,7 +804,7 @@ def test_library_cuda_graph_replay_matches_eager_across_steps(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# FlashAttention-4 kernels (SM90)
+# FlashAttention-4 kernels (SM90, SM100)
 # --------------------------------------------------------------------------- #
 def _spec_case(num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, seed,
                overshoot, massive=False):  # fmt: skip
@@ -1176,7 +1176,7 @@ def _eagle3_llm(model, prompts, n, max_tokens, draft_len, block_reuse=True):
     )
 
 
-@pytest.mark.skipif(not _fa4_available(), reason="needs SM90 and FlashAttention-4")
+@pytest.mark.skipif(not _fa4_available(), reason="needs SM90 or SM100 and FlashAttention-4")
 @_eagle3_models("qwen2.5_7b")
 @pytest.mark.threadleak(enabled=False)
 def test_eagle3_n_sampling_with_library_keeps_acceptance_e2e(model):
@@ -1206,7 +1206,7 @@ def test_eagle3_n_sampling_with_library_keeps_acceptance_e2e(model):
     assert abs(on - off) <= 0.05 * off, (on, off)
 
 
-@pytest.mark.skipif(not _fa4_available(), reason="needs SM90 and FlashAttention-4")
+@pytest.mark.skipif(not _fa4_available(), reason="needs SM90 or SM100 and FlashAttention-4")
 @_eagle3_models("qwen3_8b", "qwen2.5_7b")
 @pytest.mark.threadleak(enabled=False)
 def test_eagle3_greedy_n_sampling_matches_fa4_e2e(model):
