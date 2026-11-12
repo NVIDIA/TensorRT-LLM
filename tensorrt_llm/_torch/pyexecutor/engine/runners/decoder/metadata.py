@@ -30,7 +30,7 @@ from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sa
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...metadata import build_attention_metadata
+from ...metadata import build_attention_metadata, metadata_extensions_of
 from .config import DecoderRunnerConfig
 
 if TYPE_CHECKING:
@@ -121,7 +121,7 @@ class DecoderMetadata:
                 self._config.spec_config is not None
                 and self._config.spec_config.spec_dec_mode.use_one_engine()
             ),
-            model_extension_types=self.runtime_hooks.metadata_extensions,
+            model_extension_types=metadata_extensions_of(self.model),
             model_extension_config=self._model_metadata_config(),
         )
         self._arm_msa_policy(kv_cache_manager)

@@ -56,7 +56,6 @@ from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import (
     MTPEagleWorker,
     get_spec_worker,
@@ -5780,8 +5779,9 @@ class DraftModel:
 class ModelingV2Glm52Nvfp4Sm103Tep4(
     DecoderModelForCausalLM[GlmMoeDsaTep4ModelingV2, PretrainedConfig]
 ):
-    # The DSA metadata with the draft loop's one-launch refresh (`spec_worker.py`).
-    runtime_hooks = RuntimeHooks(metadata_extensions=(Glm52Tep4DSAMetadata,))
+    # The DSA metadata of this target, with the draft loop's one-launch `run_draft_step`
+    # (`spec_worker.py`).
+    metadata_extensions = (Glm52Tep4DSAMetadata,)
 
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config

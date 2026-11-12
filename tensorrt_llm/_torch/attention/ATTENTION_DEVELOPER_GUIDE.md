@@ -393,9 +393,10 @@ opt-in and called only by `DraftMetadata` on a draft's extensions:
 refreshes the state derived from the draft's lengths after the draft loop
 changed them; an override calls `super()`. Length-derived state an extension
 computes lazily is invalidated by the extension itself in `prepare()` and
-`refresh_from_draft_lengths()`. A model declares the extensions it needs and
-their creation arguments through `RuntimeHooks.metadata_extensions` /
-`metadata_config` (for example MiniMax-M3's `msa_policy`); its per-step state
+`refresh_from_draft_lengths()`. A model declares the extensions it needs as
+its `metadata_extensions` attribute (a subclass of an engine extension
+replaces it), and their creation arguments through
+`RuntimeHooks.metadata_config` (for example MiniMax-M3's `msa_policy`); its per-step state
 lives in a model extension or on the model, never in a module-level table
 keyed by the metadata. Extensions come from three places:
 

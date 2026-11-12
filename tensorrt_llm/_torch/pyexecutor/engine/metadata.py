@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.extensions import MetadataExtension
 from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata, RecurrentConfig
 from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingConfig
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
-__all__ = ["build_attention_metadata"]
+__all__ = ["build_attention_metadata", "metadata_extensions_of"]
 
 
 def _get_max_num_heads_per_kv(model_config: ModelConfig) -> int:
@@ -48,6 +49,24 @@ def _get_max_num_heads_per_kv(model_config: ModelConfig) -> int:
     if num_attention_heads and num_key_value_heads:
         return num_attention_heads // num_key_value_heads
     return 1
+
+
+def metadata_extensions_of(model: object) -> tuple[type[MetadataExtension], ...]:
+    """The attention-metadata extensions ``model`` requires, or ().
+
+    A model declares them as ``metadata_extensions`` (a class or instance
+    attribute, or a property): a tuple of ``MetadataExtension`` types the
+    engine attaches to the model's attention metadata with its own, a
+    subclass of one of the engine's replacing it.
+    """
+    extensions = tuple(getattr(model, "metadata_extensions", ()))
+    for extension_type in extensions:
+        if not (isinstance(extension_type, type) and issubclass(extension_type, MetadataExtension)):
+            raise TypeError(
+                f"{type(model).__name__}.metadata_extensions must hold MetadataExtension "
+                f"types, got {extension_type!r}"
+            )
+    return extensions
 
 
 def build_attention_metadata(
@@ -77,8 +96,8 @@ def build_attention_metadata(
     ``max_seq_len`` bounds the sequences of no-KV-cache attention; it is given
     to the families whose core takes it. ``model_extension_types`` and
     ``model_extension_config`` are the extensions the model declares and their
-    creation arguments (``RuntimeHooks.metadata_extensions`` /
-    ``metadata_config``), attached with the engine's own.
+    creation arguments (``metadata_extensions_of(model)`` /
+    ``RuntimeHooks.metadata_config``), attached with the engine's own.
     """
     pretrained_config = model_config.pretrained_config
     sparse_attention_config = model_config.sparse_attention_config

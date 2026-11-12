@@ -74,14 +74,8 @@ def make_runtime_hooks(model: "GlmMoeDsaForCausalLM") -> RuntimeHooks:
         # The decode target takes the embedding rows of the prologue's launch from the
         # same object (the core's ``decode_prologue``).
         decode_prologue = model.model.decode_prologue = DecodePrologueHook()
-    metadata_extensions = ()
-    if plan.enabled("draft_loop"):
-        from .kernels.draft_loop.draft_step import GlmTp8DSAMetadata
-
-        metadata_extensions = (GlmTp8DSAMetadata,)
     return RuntimeHooks(
         loop_on_execution_stream=plan.enabled("execution_stream_loop"),
         decode_prologue=decode_prologue,
         executor_events=GlmExecutorEvents(plan),
-        metadata_extensions=metadata_extensions,
     )

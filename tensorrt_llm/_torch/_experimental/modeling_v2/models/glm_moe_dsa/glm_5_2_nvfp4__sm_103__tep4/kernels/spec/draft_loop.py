@@ -396,9 +396,9 @@ def draft_step(
 ) -> torch.Tensor | None:
     """The device side of one metadata update of the draft loop, in one launch.
 
-    `md` is the loop's draft metadata in the fused domain (`spec_worker.step_ineligibility`);
-    every tensor written is the one the DSA extension's built-in draft refresh (with the loop's
-    length edits before it) writes. With
+    `md` is the loop's `DSAtrtllmAttentionMetadata` in the fused domain
+    (`spec_worker.step_ineligibility`); every tensor written is the one the built-in
+    `on_update_kv_lens` (with the loop's length edits before it) writes. With
     `position_ids`, also returns the next step's positions (`position_ids[gather_ids] + 1`
     in `MODE_STEP0`, `position_ids[:B] + 1` in `MODE_ADVANCE`)."""
     kv_mgr = md.kv_cache_manager

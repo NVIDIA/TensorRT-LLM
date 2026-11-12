@@ -205,10 +205,8 @@ class RuntimeHooks:
     # With skip_unchanged_h2d: a changed packed 2-D upload stages only each row's changed column span (a page table that
     # gained a page re-sends a few bytes, not every padded row), so the pack keeps fitting the in-graph window.
     h2d_changed_span: bool = False
-    # Attention-metadata extensions the model's metadata carries, attached at creation (the engine's own choice of
-    # extensions is kept; a subclass of one replaces it), and their creation arguments, each routed by name to the
-    # extension that takes it, as (name, value) pairs.
-    metadata_extensions: Tuple[type, ...] = ()
+    # Creation arguments of the model's attention-metadata extensions (its ``metadata_extensions`` and the engine's),
+    # each routed by name to the extension that takes it, as (name, value) pairs.
     metadata_config: Tuple[Tuple[str, Any], ...] = ()
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
