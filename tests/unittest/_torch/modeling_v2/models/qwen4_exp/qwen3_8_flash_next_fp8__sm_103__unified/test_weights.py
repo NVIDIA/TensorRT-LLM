@@ -76,6 +76,19 @@ def stored(checkpoint, index) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
 
 
 @pytest.fixture(scope="module")
+def id_space(checkpoint, index) -> dict[str, torch.Tensor]:
+    """The n-gram id space's tensors (per-head offsets and vocabulary sizes), read whole."""
+    from safetensors import safe_open
+
+    tensors = {}
+    for key, file in index.items():
+        if key.endswith((".ngram_heads_offsets", ".ngram_heads_vocab_sizes")):
+            with safe_open(str(checkpoint / file), framework="pt") as fh:
+                tensors[key] = fh.get_tensor(key)
+    return tensors
+
+
+@pytest.fixture(scope="module")
 def configs(checkpoint):
     raw = json.loads((checkpoint / "config.json").read_text())
     return Qwen4ExpTextConfig(**raw["text_config"]), Qwen4ExpVisionConfig(**raw["vision_config"])
@@ -406,7 +419,7 @@ _LOAD_RANK = {("tp1", True): 0, ("tp2", True): 1, ("tep4", False): 3, ("dep4", T
     [(member, True) for member in MEMBERS] + [("tep4", False)],
     ids=[f"{member}-mtp" for member in MEMBERS] + ["tep4-no-mtp"],
 )
-def test_member_covers_the_checkpoint(stored, configs, member, mtp, monkeypatch):
+def test_member_covers_the_checkpoint(stored, configs, id_space, member, mtp, monkeypatch):
     """Each tensor is read or predicted unread, never both; each expert's tensors by one rank and
     the rest by every rank; the windows tile the 512 experts; and `load` fills every parameter."""
     everything = set(stored)
@@ -449,10 +462,39 @@ def test_member_covers_the_checkpoint(stored, configs, member, mtp, monkeypatch)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
     model = _stub_model(configs, member, _LOAD_RANK[member, mtp], mtp)
-    WT.MODEL_WEIGHTS.load(model, {key: _HeaderEntry(*spec) for key, spec in stored.items()})
+    WT.MODEL_WEIGHTS.load(model, _header_entries(stored, id_space))
     d = WT.MODEL_WEIGHTS.dims(model.model)
     assert tuple(model.model.w["ple_table"].shape) == (128 * _rows_per_shard(stored, d), 160)
     assert model.lm_head.weight.shape[0] == _lm_head_rows(member, 248320)
+
+
+def _header_entries(stored, id_space) -> dict:
+    """Every checkpoint tensor by its header, but the n-gram id space's, which `load` reads."""
+    return {
+        key: id_space[key] if key in id_space else _HeaderEntry(*spec)
+        for key, spec in stored.items()
+    }
+
+
+@pytest.mark.cpu_only
+def test_load_rejects_a_per_shard_padded_ngram_table(stored, configs, id_space, monkeypatch):
+    """Shards padded one by one hold more padding than one divisor past the id space the
+    per-head offsets and sizes address; `load` raises before it declares the table."""
+    d = _dims(configs, "tp1", 0)
+    rows_per_shard = _rows_per_shard(stored, d)
+    prefix = f"{WT._LM}.layers.{d.ple_layer}.ple.ple_embedding"
+    offsets = id_space[f"{prefix}.ngram_heads_offsets"]
+    vocab = id_space[f"{prefix}.ngram_heads_vocab_sizes"].clone()
+    # The ids of each shard end `pad` rows before it does.
+    pad = -(-d.ngram_vocab_divisor // d.ple_shards)
+    vocab[-1] = d.ple_shards * (rows_per_shard - pad) - int(offsets[-1])
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
+    model = _stub_model(configs, "tp1", 0, True)
+    entries = _header_entries(stored, {**id_space, f"{prefix}.ngram_heads_vocab_sizes": vocab})
+    with pytest.raises(ValueError, match="Shards padded one by one"):
+        WT.MODEL_WEIGHTS.load(model, entries)
+    assert "ple_table" not in model.model.w
 
 
 def _random_bytes(gen, *shape) -> torch.Tensor:
@@ -658,6 +700,61 @@ def test_chunk_broker_times_out_on_a_name_nobody_listens_on():
         squatter.close()
 
 
+@pytest.mark.cpu_only
+def test_chunk_broker_frees_the_name_when_accept_fails(monkeypatch):
+    """An owner whose `accept` fails (EMFILE here) closes its listener: a waiter in its backlog
+    sees the connection reset and owns the key itself at once, instead of waiting out its
+    timeout on a name nobody accepts on."""
+    import errno
+    import socket
+    import threading
+    import time
+    import uuid
+
+    broker = _host_table_module()._broker
+    key = uuid.uuid4().hex
+    gate = threading.Event()
+
+    def failing_accept(self):
+        gate.wait(30)
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(socket.socket, "accept", failing_accept)
+    owner = broker.try_own(key)
+    got = []
+    waiter = threading.Thread(target=lambda: got.append(broker.acquire(key, 60)))
+    waiter.start()
+    time.sleep(0.5)  # the waiter is connected, in the owner's backlog
+    start = time.monotonic()
+    gate.set()
+    waiter.join(30)
+    try:
+        assert got and got[0][0] == broker.OWNER, got
+        assert time.monotonic() - start < 10
+        assert not owner._thread.is_alive()
+    finally:
+        owner.close()
+        for result in got:
+            result[1].close()
+
+
+@pytest.mark.cpu_only
+def test_chunk_broker_reads_a_uid_above_2_31():
+    """`SO_PEERCRED` is `struct ucred` (pid_t, uid_t, gid_t): an LDAP-mapped uid of 2**31 or
+    more reads back unsigned."""
+    import struct
+
+    broker = _host_table_module()._broker
+    uid = 2**31 + 5
+
+    class _Conn:
+        def getsockopt(self, level, option, size):
+            assert size == broker._CRED.size == 12
+            return struct.pack("iII", 4242, uid, 2**31 + 7)
+
+    assert broker._peer_uid(_Conn()) == uid
+
+
 def _fake_shards(rows_per_shard: int, shards: int, cols: int, seed: int) -> tuple:
     g = torch.Generator().manual_seed(seed)
     data = torch.randint(0, 256, (shards * rows_per_shard, cols), generator=g, dtype=torch.uint8)
@@ -671,7 +768,8 @@ def _fake_shards(rows_per_shard: int, shards: int, cols: int, seed: int) -> tupl
 
 def _host_tables(monkeypatch, mode, world, data, keys, weights, rows_per_shard, identity=None):
     """`world` ranks' tables in one process: threads, so `node` ranks wait on each other, and a
-    barrier in place of the server's collective agreement."""
+    barrier in place of the server's collective agreement. `weights` is every rank's checkpoint,
+    or a list of one per rank."""
     import threading
 
     PH = _host_table_module()
@@ -685,7 +783,8 @@ def _host_tables(monkeypatch, mode, world, data, keys, weights, rows_per_shard, 
 
     monkeypatch.setattr(PH, "_all_agree", agree)
     rows, cols = data.shape
-    copy, read = PH.shard_rows(weights, keys, rows_per_shard, WT._read)
+    checkpoints = weights if isinstance(weights, list) else [weights] * world
+    sources = [PH.shard_rows(w, keys, rows_per_shard, WT._read) for w in checkpoints]
     tables = [
         PH.PleHostTable(
             mode,
@@ -701,7 +800,7 @@ def _host_tables(monkeypatch, mode, world, data, keys, weights, rows_per_shard, 
         )  # fmt: skip
         for r in range(world)
     ]
-    threads = [threading.Thread(target=t.fill, args=(copy, read)) for t in tables]
+    threads = [threading.Thread(target=t.fill, args=sources[r]) for r, t in enumerate(tables)]
     for t in threads:
         t.start()
     for t in threads:
@@ -722,7 +821,7 @@ def _vmm_host_numa() -> bool:
 @pytest.mark.parametrize("mode", ["rank", "server", "node", "node-fallback"])
 def test_host_table_modes(mode, monkeypatch):
     """`rank` holds every row, `server` this rank's rows with its window, `node` every row in
-    chunks one rank creates and the other attaches to; `node` without a checkpoint identity runs
+    chunks one rank creates and the other attaches to; `node` without a table identity runs
     `server`. Each holds exactly the checkpoint's bytes, in host memory."""
     import uuid
 
@@ -731,26 +830,214 @@ def test_host_table_modes(mode, monkeypatch):
         pytest.skip("no CUDA VMM host NUMA allocation on this platform")
     rows_per_shard, shards, cols = 40960, 8, 160
     data, keys, weights = _fake_shards(rows_per_shard, shards, cols, seed=5)
-    rows = data.shape[0]
     want = {"rank": PH.RANK, "server": PH.SERVER, "node": PH.NODE, "node-fallback": PH.SERVER}
     requested = PH.NODE if mode.startswith("node") else mode
     identity = uuid.uuid4().hex if mode == "node" else None
     tables = _host_tables(monkeypatch, requested, 2, data, keys, weights, rows_per_shard, identity)
+    _check_tables(tables, data, want[mode])
+    if mode == "node":
+        created = sorted(len(t._segments) for t in tables)
+        assert created == [PH.CHUNKS // 2, PH.CHUNKS // 2], [t.describe() for t in tables]
+    for t in tables:
+        t.close()
+
+
+def _check_tables(tables, data, mode) -> None:
+    """Every rank runs `mode` and holds exactly `data`'s bytes (its rows under `server`), in
+    host memory."""
+    PH = _host_table_module()
+    rows, cols = data.shape
     expected = data.cuda()
     for rank, t in enumerate(tables):
-        assert t.mode == want[mode], (rank, t.mode, t.describe())
+        assert t.mode == mode, (rank, t.mode, t.describe())
         assert t.resident_on_host(), t.describe()
         if t.mode == PH.SERVER:
             lo, hi, base = t.window
-            assert (lo, hi) == PH.owned_rows(rank, 2, rows, cols)
+            assert (lo, hi) == PH.owned_rows(rank, len(tables), rows, cols)
             got = t.table[lo - base : hi - base]
             assert torch.equal(got.view(torch.uint8), expected[lo:hi])
             assert t.needs_sum
         else:
             assert t.window is None and not t.needs_sum
             assert torch.equal(t.table.view(torch.uint8), expected)
-    if mode == "node":
-        created = sorted(len(t._segments) for t in tables)
-        assert created == [PH.CHUNKS // 2, PH.CHUNKS // 2], [t.describe() for t in tables]
-    for t in tables:
-        t.close()
+
+
+def _fallback_warnings(monkeypatch) -> list:
+    """The warnings `ple_host_table` emits from here on, with none emitted yet this process."""
+    PH = _host_table_module()
+    warnings = []
+    monkeypatch.setattr(PH, "_WARNED", set())
+    monkeypatch.setattr(PH.logger, "warning", warnings.append)
+    return warnings
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="host memory the GPU maps")
+def test_host_table_owner_that_cannot_create_a_chunk_hands_it_over(monkeypatch):
+    """A rank whose chunk allocation fails closes the chunk it just owned: the other rank owns
+    it at once instead of waiting out the attach timeout, and both run `server`, with one
+    warning naming the requested mode, the mode that runs and why."""
+    import time
+    import uuid
+
+    PH = _host_table_module()
+    if not _vmm_host_numa():
+        pytest.skip("no CUDA VMM host NUMA allocation on this platform")
+    monkeypatch.setattr(PH, "_ATTACH_TIMEOUT_S", 60.0)
+    warnings = _fallback_warnings(monkeypatch)
+    create, failed = PH._VmmChunks.create, []
+
+    def create_once(self, k):
+        if k == 0 and not failed:
+            failed.append(k)
+            raise RuntimeError("CUDA driver call failed: out of host memory")
+        create(self, k)
+
+    monkeypatch.setattr(PH._VmmChunks, "create", create_once)
+    rows_per_shard, shards, cols = 40960, 8, 160
+    data, keys, weights = _fake_shards(rows_per_shard, shards, cols, seed=7)
+    start = time.monotonic()
+    tables = _host_tables(
+        monkeypatch, PH.NODE, 2, data, keys, weights, rows_per_shard, uuid.uuid4().hex
+    )
+    elapsed = time.monotonic() - start
+    try:
+        assert failed == [0] and "out of host memory" in tables[0]._node_error
+        assert elapsed < 20, f"the other rank waited {elapsed:.0f} s for the failed chunk"
+        _check_tables(tables, data, PH.SERVER)
+        assert len(warnings) == 1, warnings
+        assert f"{PH.PLE_HOST_TABLE_ENV}=node requested, running server" in warnings[0]
+    finally:
+        for t in tables:
+            t.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="host memory the GPU maps")
+def test_host_table_refuses_a_chunk_that_differs_from_its_checkpoint(monkeypatch):
+    """Two ranks whose keys agree but whose checkpoints differ at one row of an attached chunk's
+    sample: the attaching rank raises on it, and both run `server` from their own bytes."""
+    import uuid
+
+    PH = _host_table_module()
+    if not _vmm_host_numa():
+        pytest.skip("no CUDA VMM host NUMA allocation on this platform")
+    warnings = _fallback_warnings(monkeypatch)
+    rows_per_shard, shards, cols = 40960, 8, 160
+    data, keys, weights = _fake_shards(rows_per_shard, shards, cols, seed=9)
+    other = data.clone()
+    row = PH.sample_blocks(0, *data.shape, phase=1)[3][0]
+    other[row] ^= 1
+    other_weights = {
+        k: other[i * rows_per_shard : (i + 1) * rows_per_shard].view(WT.PLE_TABLE_DTYPE)
+        for i, k in enumerate(keys)
+    }
+    tables = _host_tables(
+        monkeypatch,
+        PH.NODE,
+        2,
+        data,
+        keys,
+        [weights, other_weights],
+        rows_per_shard,
+        uuid.uuid4().hex,
+    )
+    try:
+        # Row `row` is rank 0's (chunk 0): each rank's own rows are its checkpoint's.
+        _check_tables(tables, data, PH.SERVER)
+        assert tables[1]._node_error == f"shared chunk 0 differs from the checkpoint at row {row}"
+        assert len(warnings) == 1, warnings
+        assert f"{PH.PLE_HOST_TABLE_ENV}=node requested, running server" in warnings[0]
+    finally:
+        for t in tables:
+            t.close()
+
+
+@pytest.mark.cpu_only
+def test_table_identity_is_the_sampled_rows():
+    """The `node` key is the table's bytes at every chunk's phase-0 sample and nothing about
+    where they were read from; phase 1, the rows an attaching rank compares, is disjoint."""
+    PH = _host_table_module()
+    rows_per_shard, shards, cols = 40960, 8, 160
+    data, keys, _ = _fake_shards(rows_per_shard, shards, cols, seed=11)
+    rows = data.shape[0]
+
+    def identity(table) -> str:
+        parts = {
+            k: table[i * rows_per_shard : (i + 1) * rows_per_shard] for i, k in enumerate(keys)
+        }
+        _, read = PH.shard_rows(parts, keys, rows_per_shard, WT._read)
+        return PH.table_identity(read, rows, cols, "layer 3")
+
+    def sample(phase: int) -> set:
+        return {
+            r
+            for k in range(PH.CHUNKS)
+            for lo, hi in PH.sample_blocks(k, rows, cols, phase=phase)
+            for r in range(lo, hi)
+        }
+
+    key = identity(data)
+    assert identity(data.clone()) == key
+    sampled, checked = sample(0), sample(1)
+    assert sampled and checked and not sampled & checked
+    assert all(0 <= r < rows for r in sampled | checked)
+    changed = data.clone()
+    changed[max(sampled)] ^= 1
+    assert identity(changed) != key
+    # The key hashes its sample only; the attaching rank's check covers this row.
+    changed = data.clone()
+    changed[min(checked)] ^= 1
+    assert identity(changed) == key
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "ids, rows_per_shard, error",
+    [
+        (800, 208, None),
+        (800, 256, "Shards padded one by one"),
+        (800, 200, "not padded to a multiple"),
+        (900, 208, "address 900"),
+    ],
+    ids=["padded-once", "padded-per-shard", "unpadded", "short"],
+)
+def test_ngram_table_height_matches_the_id_space(ids, rows_per_shard, error):
+    """The table's height is the id space its offsets and sizes address, padded to the divisor by
+    less than one divisor; otherwise the declaration raises."""
+    d = SimpleNamespace(
+        ple_layer=3, ple_shards=4, ple_head_dim=4, ngram_heads=2, ple_embed_dim=8,
+        ple_table_dtype=WT.PLE_TABLE_DTYPE, ngram_vocab_divisor=64,
+    )  # fmt: skip
+    prefix = f"{WT._LM}.layers.3.ple.ple_embedding"
+    weights = {
+        key: torch.zeros(rows_per_shard, 4, dtype=torch.uint8).view(WT.PLE_TABLE_DTYPE)
+        for key in WT.ngram_shard_keys(d)
+    }
+    weights[f"{prefix}.ngram_heads_offsets"] = torch.tensor([0, ids // 2])
+    weights[f"{prefix}.ngram_heads_vocab_sizes"] = torch.tensor([ids // 2, ids - ids // 2])
+    core = SimpleNamespace(w={"embed": torch.empty(0)})
+    if error is None:
+        assert WT._declare_ngram_table(core, d, weights) == rows_per_shard
+        assert tuple(core.w["ple_table"].shape) == (4 * rows_per_shard, 4)
+    else:
+        with pytest.raises(ValueError, match=error):
+            WT._declare_ngram_table(core, d, weights)
+
+
+@pytest.mark.cpu_only
+def test_host_table_warns_once_when_server_runs_as_rank(monkeypatch):
+    """`server` under attention DP keeps a copy per rank: one warning per process says so."""
+    PH = _host_table_module()
+    warnings = _fallback_warnings(monkeypatch)
+
+    def private(rows, cols, dtype, device):
+        return torch.empty(rows, cols, dtype=dtype), None
+
+    for _ in range(2):
+        t = PH.PleHostTable(
+            PH.SERVER, 64, 4, WT.PLE_TABLE_DTYPE, torch.device("cuda"),
+            rank=0, world=2, dp=2, private=private,
+        )  # fmt: skip
+        assert t.mode == PH.RANK
+    assert len(warnings) == 1, warnings
+    assert f"{PH.PLE_HOST_TABLE_ENV}=server requested, running rank" in warnings[0]
+    assert "attention DP 2" in warnings[0]

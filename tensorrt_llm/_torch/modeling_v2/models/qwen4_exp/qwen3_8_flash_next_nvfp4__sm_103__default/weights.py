@@ -1573,6 +1573,14 @@ class Qwen4ExpDefaultWeights:
         # The one load-time declaration, before the manifest is built: the table's
         # height comes from the shards, and the manifest addresses it by row range.
         rows_per_shard = _declare_ngram_table(core, d, weights)
+        try:
+            self._fill_declared(model, d, weights, rows_per_shard)
+        except BaseException:
+            _close_ngram_table(core)
+            raise
+
+    def _fill_declared(self, model, d: SimpleNamespace, weights, rows_per_shard: int) -> None:
+        core = model.model
         manifest = self.manifest(d)
         manifest["ple_table"] = ngram_table_sources(d, rows_per_shard)
         consumed: set = set()
@@ -1852,9 +1860,8 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
         mode = getattr(core, "ple_host_mode", _ple_host.RANK)
         identity = None
         if mode == _ple_host.NODE:
-            identity = _ple_host.checkpoint_identity(
-                getattr(core, "checkpoint_dir", None), rows, head_dim, dtype, *keys
-            )
+            _, read = _ple_host.shard_rows(weights, keys, rows_per_shard, _read)
+            identity = _ple_host.table_identity(read, rows, head_dim, dtype, *keys)
         mapping = getattr(core, "mapping", None)
         core._ple_table_host = _ple_host.PleHostTable(
             mode,
@@ -1889,6 +1896,17 @@ def _bind_ngram_table(core) -> None:
     assert core.w["ple_table"].data_ptr() == table.data_ptr(), (
         "wrapping the n-gram table in nn.Parameter moved its storage"
     )
+
+
+def _close_ngram_table(core) -> None:
+    """Release the host-resident n-gram table (in `node`, its chunks and the broker names other
+    processes of the host may wait on); `ple_table` becomes the placeholder."""
+    host = core._ple_table_host
+    if host is None:
+        return
+    host.close()
+    _bind_ngram_table(core)
+    core._ple_table_host = None
 
 
 def _fill_ngram_table(core, d: SimpleNamespace, weights, rows_per_shard: int) -> set:

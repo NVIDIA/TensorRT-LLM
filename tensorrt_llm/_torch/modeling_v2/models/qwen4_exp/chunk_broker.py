@@ -30,7 +30,7 @@ from typing import Callable, Optional
 OWNER = "owner"
 ATTACHED = "attached"
 
-_CRED = struct.Struct("3i")  # struct ucred: pid, uid, gid
+_CRED = struct.Struct("iII")  # struct ucred: pid_t pid, uid_t uid, gid_t gid
 _POLL_SECONDS = 1.0
 
 
@@ -84,6 +84,10 @@ class OwnedSegment:
             try:
                 conn, _ = self._server.accept()
             except OSError:
+                # `close`, or `accept` failing (EMFILE, ENFILE, ENOMEM, ...). Either way the name
+                # is freed with the thread: connected peers already answered keep their answer,
+                # and every other peer sees its connection reset and owns the key itself.
+                self._server.close()
                 return
             answer = threading.Thread(target=self._answer, args=(conn,), daemon=True)
             self._answers = [t for t in self._answers if t.is_alive()] + [answer]
@@ -122,9 +126,9 @@ def acquire(
     key: str, timeout_s: float, log: Callable[[str], None] = print, report_s: float = 60.0
 ) -> tuple:
     """`(OWNER, OwnedSegment)` when no process owns `key`, else `(ATTACHED, fd, meta)` once
-    the owner publishes; an owner that exits or aborts first hands `key` to its waiters.
-    Raises `TimeoutError` when no owner has published within `timeout_s`, and `PermissionError`
-    when a process of another uid holds the name."""
+    the owner publishes; an owner that exits, aborts or stops accepting first hands `key` to its
+    waiters. Raises `TimeoutError` when no owner has published within `timeout_s`, and
+    `PermissionError` when a process of another uid holds the name."""
     name = socket_name(key)
     deadline = time.monotonic() + timeout_s
     next_report = time.monotonic() + report_s
@@ -158,6 +162,9 @@ def acquire(
                     if time.monotonic() >= next_report:
                         log(f"ple host table: waiting for the owner of {key!r} to publish it")
                         next_report = time.monotonic() + report_s
+                except ConnectionResetError:
+                    # The owner closed its listener before accepting this connection.
+                    got = (b"", [], 0, None)
         finally:
             conn.close()
         msg, fds, _, _ = got

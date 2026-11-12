@@ -1042,13 +1042,11 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self.ple_layer = list(cfg.ple_layer_ids)[0] - 1
         self.ngram_size = cfg.ngram_size
         self.ple_dilation = self.ngram_size
-        self.ngram_vocab_divisor = cfg.make_ngram_vocab_size_divisible_by
         eos = cfg.eos_token_id
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
         self.ple_table_dtype = _weights.PLE_TABLE_DTYPE
         # How the table is stored (`ple_host_table`); the storage is `_ple_table_host` after load.
         self.ple_host_mode = _ple_host.host_table_mode()
-        self.checkpoint_dir = getattr(composite_config, "_name_or_path", None)
         self._ple_table_host = None
 
         vcfg = getattr(composite_config, "vision_config", None)
@@ -1252,16 +1250,6 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         # Zero the GDN in-proj alignment rows so the decode GEMM's unread pad columns are finite.
         for i in self.gdn_layers:
             w[f"l{i}_in_proj_w"][sum(self.in_proj_split) :].zero_()
-        # An index past the table's end is a device-side assert that poisons the process.
-        # Rows of the whole table: under `server` storage `ple_table` holds only this rank's.
-        host = self._ple_table_host
-        table_rows = host.rows if host is not None else w["ple_table"].shape[0]
-        used_rows = int(w["ple_offs"][-1]) + int(w["ple_vocab"][-1])
-        assert used_rows <= table_rows, (
-            f"the n-gram table has {table_rows} rows but its per-head offsets and vocabulary "
-            f"sizes address {used_rows}"
-        )
-        assert table_rows % self.ngram_vocab_divisor == 0, (table_rows, self.ngram_vocab_divisor)
         self._cos_sin = self._index_rope_table(self.theta, device)
         # Before the draft layer's views, which read its fused first projections.
         self._fuse_hc_first_projections()
@@ -6904,6 +6892,7 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
         # The opt-in switches, read here so a misspelled value fails before the build; one that
         # would do nothing at this deployment declines rather than being ignored.
         mapping = model_config.mapping
+        _ple_host.host_table_mode()
         if _weights.moe_tpb_requested() and not _weights.moe_tpb_enabled(mapping):
             raise NoTarget(
                 f"{_weights.MOE_TPB_ENV}=rr at {layout}: the block-major MoE decode copy runs at "
