@@ -567,7 +567,7 @@ async def test_subagent_affinity_http_worker_adp_placement(
             observed[role].append(
                 (conversation.conversation_id, scheduling.subagent_affinity_id, rank)
             )
-            return SimpleNamespace(prompt_token_ids=[1, 2, 3])
+            return SimpleNamespace(request_id=1, prompt_token_ids=[1, 2, 3])
 
         server = object.__new__(OpenAIServer)
         server.server_role = role if configured_role else None

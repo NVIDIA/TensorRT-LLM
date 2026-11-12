@@ -359,7 +359,7 @@ class TestOpenAIChatIntegration:
 
         def generate_async(*, inputs, **kwargs):
             rendered["generation"] = kwargs
-            return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+            return SimpleNamespace(request_id=1, prompt_token_ids=[1, 2, 3], finished=True)
 
         server = object.__new__(OpenAIServer)
         server.model = "test-model"

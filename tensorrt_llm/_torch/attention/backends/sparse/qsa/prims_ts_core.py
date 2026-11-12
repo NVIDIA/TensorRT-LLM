@@ -342,7 +342,7 @@ class _PrimsTSSparseCore:
                     block_table,
                     block_topk=block_topk,
                     max_seq_len_kv=max_seq_len_kv,
-                    o_data_type=out_dtype,
+                    out_dtype=out_dtype,
                     qo_indptr=qo_indptr,
                     group_size=group_size,
                     kv_block_size=_KV_BLOCK_SIZE,
@@ -362,11 +362,11 @@ class _PrimsTSSparseCore:
                     device=q.device,
                     workspace_buffer=workspace,
                     group_size=group_size,
-                    use_packed_q=not is_decode,
+                    packed_query=not is_decode,
                     split_kv=split_kv,
-                    q_data_type=q.dtype,
-                    kv_data_type=k_cache.dtype,
-                    o_data_type=out_dtype,
+                    q_dtype=q.dtype,
+                    kv_dtype=k_cache.dtype,
+                    out_dtype=out_dtype,
                 )
                 self._plans[key] = wrapper
             run_out = out.view_as(route_q) if is_decode else out

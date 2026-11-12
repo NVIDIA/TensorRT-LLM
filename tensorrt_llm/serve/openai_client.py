@@ -18,7 +18,6 @@ import errno
 import json
 import os
 import traceback
-import zlib
 from abc import ABC, abstractmethod
 from contextlib import aclosing
 from typing import (
@@ -49,6 +48,7 @@ from tensorrt_llm.serve.disagg_auth import (
     build_subagent_affinity_headers,
     request_requires_internal_disagg_auth,
 )
+from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -314,7 +314,7 @@ class OpenAIHttpClient(OpenAIClient):
             return server
         num_frontends, stride = self._frontend_affinity
         host, _, port = server.rstrip("/").rpartition(":")
-        frontend = zlib.crc32(conversation_id.encode()) % num_frontends
+        frontend = frontend_of_conversation(conversation_id, num_frontends)
         affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
         refused_key = _server_netloc(affinity_server)
         refused_at = self._refused_affinity_ports.get(refused_key)

@@ -543,12 +543,21 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         if target_dtype is None:
             target_dtype = torch.bfloat16
 
-        proj_pattern = re.compile(r"^(.*\.linear_attn\.in_proj_(?:qkv|q|k|v|z|b|a))\.weight$")
+        qcd = getattr(self.config, "quant_config_dict", None) or {}
+        proj_pattern = re.compile(r"^((.*\.linear_attn)\.in_proj_(?:qkv|q|k|v|z|b|a))\.weight$")
         drop_keys = set()
         dequantized = {}
         for name, value in weights.items():
             match = proj_pattern.match(name)
             if match is None:
+                continue
+            # Per-channel FP8 qkv/z stay FP8; _pack_split_projections packs weights and scales.
+            fused_cfg = qcd.get(f"{match.group(2)}.in_proj_qkvz")
+            if (
+                fused_cfg is not None
+                and fused_cfg.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+                and not match.group(1).endswith(("_b", "_a"))
+            ):
                 continue
             scale_name = match.group(1) + ".weight_scale"
             scale = weights.get(scale_name)
@@ -558,6 +567,9 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             if weight.dtype != torch.float8_e4m3fn:
                 continue
             scale = scale[...] if not isinstance(scale, torch.Tensor) else scale
+            # Per-row scales broadcast across columns.
+            if scale.dim() == 1:
+                scale = scale[:, None]
             dequantized[name] = (
                 (weight.to(torch.float32) * scale.to(torch.float32)).to(target_dtype).contiguous()
             )
@@ -861,3 +873,23 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         if is_consumable and not isinstance(processed_weights, ConsumableWeightsDict):
             return ConsumableWeightsDict(processed_weights)
         return processed_weights
+
+
+@register_mapper("HF", "PplxDeciderForDecision")
+class PplxDeciderHfWeightMapper(Qwen3_5MoeHfWeightMapper):
+    """Map the native pplx-decider backbone and readout namespaces."""
+
+    def _normalize_weight_names(self, weights: dict) -> dict:
+        normalized_weights = {}
+        for key, tensor in weights.items():
+            if key == "weight":
+                key = "readout.weight"
+            elif key.startswith("language_model."):
+                key = "model." + key[len("language_model.") :]
+            elif key.startswith("visual."):
+                # The composite checkpoint carries a bare-prefixed vision tower;
+                # it is not part of the text-only decision model. The superclass
+                # drops the "model.visual." form, so skip this one here.
+                continue
+            normalized_weights[key] = tensor
+        return super()._normalize_weight_names(normalized_weights)
