@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
@@ -47,6 +47,18 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
 from .kernels import deterministic_indexer_projection
 from .params import DSAParams
+from .throwaway_topk import (
+    THROWAWAY_MIN_CONTEXT_ENV,
+    THROWAWAY_TOPK_ENV,
+    VALIDATED_NUM_HEADS,
+    PlanCache,
+    ThrowawayPrefillTopK,
+    get_throwaway_prefill_topk,
+    throwaway_topk_min_context,
+    throwaway_topk_requested,
+    throwaway_topk_supported,
+    validate_throwaway_topk_env,
+)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -675,6 +687,11 @@ class IndexerPrefillChunkMetadata:
     token_end: int  # Q token end index in batch
     k_token_start: int  # K token start index in batch
     k_token_end: int  # K token end index in batch
+    # Original tokens of the request that precede this chunk's first Q token. Set only for
+    # single-request chunks, whose K window is [0, k_token_end - k_token_start).
+    kv_prefix_len: Optional[int] = None
+    # Device prefixes for the fused throwaway Top-K, built on first use and reused per layer.
+    throwaway_plans: PlanCache = field(default_factory=dict)
 
 
 def _split_prefill_queries(
@@ -1021,6 +1038,30 @@ class Indexer(nn.Module):
             and self.use_fp4
         )
 
+        # Opt-in fused indexer + Top-K for single-request prefill chunks (see
+        # throwaway_topk.py); built lazily because it needs the KV cache's max length.
+        self._use_throwaway_topk = (
+            throwaway_topk_requested()
+            and is_sm_100f()
+            and throwaway_topk_supported(self.n_heads, self.head_dim)
+        )
+        if throwaway_topk_requested() and not self._use_throwaway_topk:
+            logger.warning_once(
+                f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K needs SM100/SM103 and an "
+                f"indexer with head_dim 128 and {'/'.join(map(str, VALIDATED_NUM_HEADS))} heads "
+                f"(got SM{get_sm_version()}, "
+                f"heads={self.n_heads}, head_dim={self.head_dim}); "
+                "using the unfused indexer + Top-K path",
+                key="throwaway_topk_unsupported",
+            )
+        if self._use_throwaway_topk:
+            validate_throwaway_topk_env()
+        self._throwaway_topk_min_context = (
+            throwaway_topk_min_context() if self._use_throwaway_topk else 0
+        )
+        self._throwaway_topk: Optional[ThrowawayPrefillTopK] = None
+        self._throwaway_topk_failed = False
+
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
@@ -1099,6 +1140,7 @@ class Indexer(nn.Module):
             total_kv_for_req = req_kv_len
             k_token_start = kv_offset_in_extended
             k_token_end = kv_offset_in_extended + total_kv_for_req
+            kv_prefix_len = num_cached + token_start_in_req
 
         else:
             # Multi-request chunk: batch multiple full requests together
@@ -1150,6 +1192,7 @@ class Indexer(nn.Module):
             total_kv_len = sum(req_kv_lens)
             k_token_start = kv_offset_in_extended
             k_token_end = kv_offset_in_extended + total_kv_len
+            kv_prefix_len = None
 
         assert cu_seqlen_ks.shape[0] == num_q_tokens == token_end - token_start, (
             "Indexer.prepare_one_prefill_chunk - cu_seqlen_ks length mismatch: "
@@ -1167,6 +1210,7 @@ class Indexer(nn.Module):
             token_end=token_end,
             k_token_start=k_token_start,
             k_token_end=k_token_end,
+            kv_prefix_len=kv_prefix_len,
         )
 
     @staticmethod
@@ -1661,6 +1705,137 @@ class Indexer(nn.Module):
             row_ends=row_ends,
         )
 
+    def _build_throwaway_topk(
+        self, compress_ratio: int, max_seq_len: int, device: torch.device
+    ) -> bool:
+        """Gets the runner shared by the layers of this configuration; False if unavailable."""
+        self._throwaway_topk = get_throwaway_prefill_topk(
+            n_heads=self.n_heads,
+            index_topk=self.index_topk,
+            compress_ratio=compress_ratio,
+            max_context_length=max_seq_len,
+            device=device,
+            qkv_dtype="mxfp4" if self.use_fp4 else "fp8",
+        )
+        self._throwaway_topk_failed = self._throwaway_topk is None
+        return not self._throwaway_topk_failed
+
+    def prewarm_throwaway_topk(self, max_seq_len: int, device: torch.device) -> bool:
+        """Builds the fused indexer + Top-K runner and compiles its kernels before serving.
+
+        Without this, the first prefill chunk that reaches the min-context gate compiles the
+        kernels inside a live request. Layers of the same configuration share one runner, so
+        only the first call per configuration compiles.
+
+        Args:
+            max_seq_len: Max sequence length of the KV cache manager, as at run time.
+            device: CUDA device the layer runs on.
+
+        Returns:
+            True if the runner is ready; False if the fused path is off or unavailable.
+        """
+        if not self._use_throwaway_topk or self._throwaway_topk_failed:
+            return False
+        if self._throwaway_topk is None and not self._build_throwaway_topk(
+            _effective_compress_ratio_divisor(self.compress_ratio),
+            max_seq_len,
+            device,
+        ):
+            return False
+        return self._throwaway_topk.warmup()
+
+    def _run_throwaway_chunk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        chunk: IndexerPrefillChunkMetadata,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        chunk_k_fp8: torch.Tensor,
+        chunk_k_scale: torch.Tensor,
+        q_begin: int,
+        q_end: int,
+        topk_indices_buffer: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Runs the fused indexer + Top-K on one chunk's query rows when it is eligible.
+
+        Args:
+            metadata: Attention metadata of the current step.
+            chunk: Prefill chunk; only single-request chunks (``kv_prefix_len`` set) qualify.
+            q_fp8: Queries of the whole batch, ``[num_tokens, n_heads, head_dim]`` (FP8), or the
+                packed FP4 bytes in the same dtype container with half the last dimension.
+            weights: Per-head weights of the whole batch, ``[num_tokens, n_heads]``.
+            chunk_k_fp8: Gathered compressed keys of the chunk, ``[num_k, head_dim]`` (FP8) or
+                ``[num_k, head_dim // 2]`` packed FP4 bytes.
+            chunk_k_scale: Per-key scales of ``chunk_k_fp8``.
+            q_begin: First chunk-local query row handled by this rank.
+            q_end: One past the last chunk-local query row handled by this rank.
+            topk_indices_buffer: Output indices of the whole batch, ``[num_tokens, index_topk]``.
+            q_scale: Packed UE8M0 query scales of the whole batch; set only for the FP4 indexer.
+
+        Returns:
+            True if the rows were written; False if the caller must use the unfused path.
+        """
+        if not self._use_throwaway_topk or self._throwaway_topk_failed:
+            return False
+        if chunk.kv_prefix_len is None:
+            logger.info_once(
+                "Throwaway Top-K: prefill chunks that hold several requests use the unfused "
+                "indexer + Top-K path",
+                key="throwaway_topk_multi_request",
+            )
+            return False
+        if chunk.kv_prefix_len + q_end < self._throwaway_topk_min_context:
+            logger.info_once(
+                f"Throwaway Top-K: prefill chunks with less than "
+                f"{self._throwaway_topk_min_context} tokens of context use the unfused indexer + "
+                f"Top-K path, which is faster there (override with {THROWAWAY_MIN_CONTEXT_ENV})",
+                key="throwaway_topk_short_context",
+            )
+            return False
+        compress_ratio = _effective_compress_ratio_divisor(
+            _select_indexer_compress_ratio(metadata.compress_ratios)
+        )
+        if self._throwaway_topk is None:
+            if not self._build_throwaway_topk(
+                compress_ratio, metadata.kv_cache_manager.max_seq_len, q_fp8.device
+            ):
+                return False
+        elif self._throwaway_topk.compress_ratio != compress_ratio:
+            # The runner's ratio sets the causal window of every row; a mismatch would select
+            # from the wrong keys.
+            raise RuntimeError(
+                f"Throwaway Top-K runner was built for compress_ratio "
+                f"{self._throwaway_topk.compress_ratio}, but this step's indexer cache uses "
+                f"{compress_ratio}"
+            )
+        if not self._throwaway_topk.can_run(chunk_k_fp8.shape[0]):
+            logger.info_once(
+                f"Throwaway Top-K: a chunk with {chunk_k_fp8.shape[0]} keys exceeds the staging "
+                f"buffer ({self._throwaway_topk.num_keys} keys); such chunks use the unfused "
+                "indexer + Top-K path",
+                key="throwaway_topk_too_many_keys",
+            )
+            return False
+        g_begin = chunk.token_start + q_begin
+        g_end = chunk.token_start + q_end
+        if not self._throwaway_topk.run_chunk(
+            q_fp8[g_begin:g_end],
+            weights[g_begin:g_end],
+            chunk_k_fp8,
+            chunk_k_scale,
+            topk_indices_buffer[g_begin:g_end],
+            kv_prefix_len=chunk.kv_prefix_len + q_begin,
+            plan_cache=chunk.throwaway_plans,
+            q_scale=None if q_scale is None else q_scale[g_begin:g_end],
+        ):
+            return False
+        logger.info_once(
+            "Throwaway Top-K: using the fused indexer + Top-K for prefill",
+            key="throwaway_topk_fused",
+        )
+        return True
+
     @staticmethod
     def _decode_mxfp4(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """Decode existing FP4 index inputs without introducing FP8 rounding."""
@@ -1906,6 +2081,19 @@ class Indexer(nn.Module):
                     # allocation is the same size and the caching allocator
                     # reuses one block (peak ~= one tile, no extra sync).
                     local_q_len = chunk_q_end - chunk_q_start
+                    if self._run_throwaway_chunk(
+                        metadata,
+                        chunk,
+                        q_fp8,
+                        weights,
+                        chunk_k_fp8,
+                        chunk_k_scale,
+                        chunk_q_start,
+                        chunk_q_end,
+                        topk_indices_buffer,
+                        q_scale=q_scale if self.use_fp4 else None,
+                    ):
+                        local_q_len = 0  # rows are written; the tile loop below is skipped
                     budget = _INDEXER_MQA_LOGITS_ELEM_BUDGET
                     if self.use_fp4 and (
                         self.head_dim != 128 or not q_fp8.is_cuda or get_sm_version() < 100

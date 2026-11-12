@@ -134,6 +134,7 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
             "dsl_kernel_atoms",
             "dsl_kernel_next_n",
             "enable_gvr_topk",
+            "dense_topk_on_device",
             "enable_indexer_skip",
             "enable_ragged_verification",
             "expand_for_dsl",
@@ -538,6 +539,9 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
         self.indexer_quant_block_size = 128
         # Enable indexer skip for short sequences
         self.enable_indexer_skip = False
+        # Build the skip-indexer dense top-k table on the device instead of the host. A model
+        # sets this on the metadata it is given; the default keeps the host build.
+        self.dense_topk_on_device = False
         # Whether skip the indexer for context requests
         self.skip_indexer_for_ctx_reqs = False
         # Whether skip the indexer for generation requests
@@ -2491,7 +2495,12 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
             )
         else:
             self.skip_indexer_for_gen_reqs = False
-        self.prepare_dense_topk_indices(kv_lens)
+        if self.dense_topk_on_device:
+            self.prepare_dense_topk_indices(
+                kv_lens.to(md.seq_lens_cuda.device, non_blocking=True), device=True
+            )
+        else:
+            self.prepare_dense_topk_indices(kv_lens)
 
     def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
         md = self.metadata

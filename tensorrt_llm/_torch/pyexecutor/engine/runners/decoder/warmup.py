@@ -445,6 +445,8 @@ class DecoderWarmup:
         with self._warmup_timer.phase("cute_dsl_indexer_q"):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
+        with self._warmup_timer.phase("throwaway_topk"):
+            self._prewarm_throwaway_topk(kv_cache_manager)
         # Same for the decode kernels a model JIT-compiles on first use and no warmup forward
         # reaches with every variant (e.g. Kimi-K3's attention-residual kernels).
         with self._warmup_timer.phase("model_decode_kernels"):
@@ -783,6 +785,57 @@ class DecoderWarmup:
             self.dist.tp_allgather(1)
         if compiled:
             logger.info(f"indexer-Q CuTe DSL prewarm complete ({compiled}/3 token counts)")
+
+    def _prewarm_throwaway_topk(self, kv_cache_manager) -> None:
+        """Build the opt-in fused DSA indexer + Top-K runner (``TRTLLM_THROWAWAY_TOPK=1``), then
+        barrier.
+
+        The runner JIT-compiles its kernels and allocates its workspace on first use, and no
+        warmup forward has the context to reach the min-context gate that routes a prefill chunk
+        to it, so the first long request would compile inline -- under attention TP on each rank
+        at a different chunk, since every rank gates on its own query rows. Whether a rank enters
+        the barrier depends only on the environment, so the whole group enters together.
+        """
+        from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
+            throwaway_topk_requested,
+        )
+
+        if not throwaway_topk_requested():
+            return
+        from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
+
+        # Under pipeline parallelism the layers of other stages keep their modules but not their
+        # parameters; build runners only for the indexers this rank runs.
+        indexers = [
+            m
+            for m in self.model.modules()
+            if isinstance(m, Indexer)
+            and m._use_throwaway_topk
+            and getattr(getattr(m, "wq_b", None), "weight", None) is not None
+        ]
+        device = torch.device("cuda", torch.cuda.current_device())
+        ready = False
+        start = time.perf_counter()
+        with torch.inference_mode():
+            for indexer in indexers:
+                try:
+                    ready = (
+                        indexer.prewarm_throwaway_topk(kv_cache_manager.max_seq_len, device)
+                        or ready
+                    )
+                except Exception as e:
+                    # A prewarm miss only defers the compile to the first chunk that needs it,
+                    # so it must not fail startup.
+                    logger.warning(f"Throwaway Top-K prewarm skipped. {type(e).__name__}: {e}")
+                    break
+        torch.cuda.synchronize()
+        if self.dist is not None:
+            if self.mapping.cp_size > 1:
+                self.dist.tp_cp_allgather(1)
+            elif self.mapping.tp_size > 1:
+                self.dist.tp_allgather(1)
+        if ready:
+            logger.info(f"Throwaway Top-K prewarm complete ({time.perf_counter() - start:.1f} s)")
 
     def _prewarm_model_decode_kernels(self, kv_cache_manager) -> None:
         """Call ``prewarm_decode_kernels`` on every module of the model that defines it, then
