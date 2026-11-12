@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor import h2d_cache
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
@@ -442,26 +443,26 @@ def _bare_manager() -> MiniMaxM3KVCacheManagerV2:
     return manager
 
 
-def test_block_ids_from_views_is_off_by_default():
-    assert not _bare_manager().block_ids_from_views
-
-
 @pytest.mark.parametrize("seed", range(24))
-def test_block_ids_from_views_matches_the_list_build(seed):
+def test_block_ids_per_seq_matches_the_cache_index_rows(seed):
+    """The view-copied table equals the get_batch_cache_indices rows, zero-padded with BAD_PAGE_INDEX as 0."""
     manager = _bare_manager()
     manager.kv_cache_map = _page_index_views(seed)
     request_ids = list(manager.kv_cache_map)
 
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=False, reuse_pool_views=False)
-    built_from_lists = manager.get_block_ids_per_seq(request_ids)
-    manager.configure_decode_shortcuts(
-        skip_unchanged_block_offsets=False, reuse_pool_views=False, block_ids_from_views=True
-    )
-    copied_from_views = manager.get_block_ids_per_seq(request_ids)
+    table = manager.get_block_ids_per_seq(request_ids)
 
-    assert copied_from_views.dtype == built_from_lists.dtype == torch.int32
-    assert copied_from_views.is_pinned() == built_from_lists.is_pinned()
-    assert torch.equal(copied_from_views, built_from_lists)
+    rows = manager.get_batch_cache_indices(request_ids)
+    width = max((len(row) for row in rows), default=0)
+    expected = torch.zeros((len(rows), width), dtype=torch.int32)
+    for i, row in enumerate(rows):
+        expected[i, : len(row)] = torch.tensor(
+            [0 if v == BAD_PAGE_INDEX else v for v in row], dtype=torch.int32
+        )
+    assert table.dtype == torch.int32
+    if table.numel():  # an empty tensor never reports pinned
+        assert table.is_pinned() == prefer_pinned()
+    assert torch.equal(table, expected)
 
 
 # ---------------------------------------------------------------------------

@@ -18,15 +18,17 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestQueueItem,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    ExecutorRequest,
-    LlmResponse,
-    executor_request_to_llm_request,
-)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, executor_request_to_llm_request
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, WaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
-from tensorrt_llm.bindings.executor import FinishReason, OutputConfig, RequestType, SamplingConfig
+from tensorrt_llm.bindings.executor import (
+    FinishReason,
+    OutputConfig,
+    Request,
+    RequestType,
+    SamplingConfig,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -39,9 +41,9 @@ def _request(
     sequences: int = 1,
     beams: int = 1,
     streaming: bool = False,
-) -> ExecutorRequest:
+) -> Request:
     """Create accepted CTX input with native beam and sequence configuration."""
-    return ExecutorRequest(
+    return Request(
         input_token_ids=[1, 2, 3],
         max_tokens=4,
         client_id=client_id,
@@ -97,9 +99,7 @@ def executor() -> PyExecutor:
     engine._disable_mpi = False
     engine._has_pending_connector_transfers = Mock(return_value=False)
     engine.hang_detector = SimpleNamespace(pause=nullcontext)
-    engine.request_broadcaster = SimpleNamespace(
-        broadcast=lambda requests, **kwargs: (requests, None)
-    )
+    engine.request_broadcaster = SimpleNamespace(broadcast=lambda requests, **kwargs: requests)
     engine.enable_iter_perf_stats = False
     engine.num_fetch_requests = 0
     engine.should_exclude_last_generation_logits = False

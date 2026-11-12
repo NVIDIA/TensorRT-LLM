@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from ..params import SparseMetadataParams, SparseParams
 from .constants import QSA_INDEX_KV_HEADS
 
+QSA_SPARSE_CORE_BACKENDS = ("auto", "triton", "prims_ts")
+QSA_INDEXER_BACKENDS = ("follow", *QSA_SPARSE_CORE_BACKENDS)
+
 
 def _validate_selection_geometry(token_topk: int, compress_ratio: int) -> None:
     if token_topk <= 0:
@@ -41,8 +44,24 @@ class QSASparseParams(SparseParams):
     enable_heuristic_topk: bool = False
     # Reuse one indexer selection across the MTP draft loop.
     mtp_index_share: bool = False
+    # Kernel selection is decided at runtime like the other sparse backends:
+    # PrimTS on SM100/SM103/SM107 except for small decode batches, Triton
+    # otherwise. These fields pin one kernel for tests and A/B measurements;
+    # the LLM API does not expose them.
+    sparse_core_backend: str = "auto"
+    indexer_backend: str = "follow"
 
     def __post_init__(self) -> None:
+        if self.sparse_core_backend not in QSA_SPARSE_CORE_BACKENDS:
+            raise ValueError(
+                f"QSA sparse_core_backend must be one of {QSA_SPARSE_CORE_BACKENDS}, "
+                f"got {self.sparse_core_backend!r}"
+            )
+        if self.indexer_backend not in QSA_INDEXER_BACKENDS:
+            raise ValueError(
+                f"QSA indexer_backend must be one of {QSA_INDEXER_BACKENDS}, "
+                f"got {self.indexer_backend!r}"
+            )
         values = {
             "index_n_heads": self.index_n_heads,
             "index_kv_heads": self.index_kv_heads,

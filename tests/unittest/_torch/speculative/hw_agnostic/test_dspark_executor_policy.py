@@ -16,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
     _decode_dspark_exact_expected_yields,
     _dspark_exact_common_graph_batch_size,
     _dspark_exact_secondary_padding_ready,
+    _dspark_tp_shared_ragged_lens,
     _encode_dspark_exact_expected_yields,
     _validate_dspark_exact_bucket,
 )
@@ -190,6 +191,18 @@ def test_secondary_dummy_is_required_only_for_a_multirow_remainder(
         )
         is expected
     )
+
+
+def test_tp_ranks_take_rank_zero_rows():
+    calls = []
+
+    class _Dist:
+        def tp_cp_broadcast_int64(self, values, root=0):
+            calls.append((list(values), root))
+            return [3, 1, 2]
+
+    assert _dspark_tp_shared_ragged_lens(_Dist(), [2, 2, 2]) == [3, 1, 2]
+    assert calls == [([2, 2, 2], 0)]
 
 
 def test_exact_bucket_must_match_the_selected_graph_key():
@@ -473,3 +486,33 @@ def test_cost_profiler_schedule_replaces_the_policy(monkeypatch):
     select.assert_not_called()
     fit_kwargs = executor.model_engine.fit_ragged_verify_lens.call_args.kwargs
     assert fit_kwargs["exact_shape"] == (4, 12, 1)
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_tp_ranks_fit_rank_zero_verify_lens(monkeypatch, enable_attention_dp):
+    from tensorrt_llm._torch.speculative import dspark_planner
+
+    executor, batch, _worker = _policy_executor()
+    monkeypatch.setattr(dspark_planner, "select_exact_sps_candidate", lambda **_kwargs: 12)
+    broadcasts = []
+
+    def broadcast(values, root=0):
+        broadcasts.append((list(values), root))
+        return [2, 3, 3]
+
+    executor.dist = SimpleNamespace(
+        tp_size=2,
+        mapping=SimpleNamespace(enable_attention_dp=enable_attention_dp),
+        tp_allgather_int64=lambda payload: SimpleNamespace(tolist=lambda: [payload, list(payload)]),
+        tp_cp_broadcast_int64=broadcast,
+    )
+
+    executor._dspark_confidence_draft_len(batch)
+
+    fitted_lens = executor.model_engine.fit_ragged_verify_lens.call_args.args[1]
+    if enable_attention_dp:
+        assert broadcasts == []
+        assert fitted_lens == [3, 2, 3]
+    else:
+        assert broadcasts == [([3, 2, 3], 0)]
+        assert fitted_lens == [2, 3, 3]

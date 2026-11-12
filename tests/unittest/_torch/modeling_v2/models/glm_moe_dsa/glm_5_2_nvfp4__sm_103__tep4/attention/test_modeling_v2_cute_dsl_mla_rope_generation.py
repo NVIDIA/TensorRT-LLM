@@ -137,6 +137,30 @@ class _MlaEnv:
         self.kv_cache_manager.shutdown()
 
 
+#: Index of `sequence_length` in the op's positional call.
+_SEQ_LEN_ARG = 10
+
+
+def _assert_discriminative(args, ref, compiled, from_kb) -> None:
+    """The reference is not degenerate: its roped halves are not all zero, and a call
+    one position off (every sequence one token longer, as a kernel grouping rows by
+    the wrong width would place them) moves more than ten times the roped bytes the
+    gate lets differ. (With `from_kb` the q-base is the 0x7F sentinel, NaN in e4m3.)"""
+    for key in ("quant_q_buffer", "latent_cache"):
+        roped = ref[key][..., KV_LORA_RANK:].float()
+        assert float(roped.abs().amax()) > 0.0, f"{key}: the reference's roped half is zero"
+    shifted = list(args)
+    shifted[_SEQ_LEN_ARG] = args[_SEQ_LEN_ARG] + 1
+    off = op.reference(*shifted, compiled=compiled, q_base_from_kb=from_kb)
+    for key in ("quant_q_buffer", "latent_cache"):
+        rope_bytes = ref[key][..., KV_LORA_RANK:].reshape(-1).view(torch.uint8)
+        moved = off[key][..., KV_LORA_RANK:].reshape(-1).view(torch.uint8) != rope_bytes
+        assert float(moved.float().mean()) > 10 * MAX_INEXACT_FRACTION, (
+            f"{key}: a one-position shift moves only {float(moved.float().mean()):.2e} of the "
+            "roped bytes; the gate could not see it"
+        )
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
@@ -149,6 +173,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert (spec["qk_nope_head_dim"], spec["latent_row_stride"]) == (NOPE, QKVA_WIDTH)
     p, n, layer = spec["predicted_tokens_per_seq"], spec["num_seqs"], spec["layer_idx"]
     cached = spec["cached"]
+    # The K-B GEMM wrote the q-base: the op must leave those bytes (the sentinel) alone.
+    from_kb = bool(spec.get("q_base_from_kb"))
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     dev = torch.cuda.current_device()
 
@@ -186,6 +212,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
             q_pe_token_stride=q_pe.stride(0),
             latent_row_stride=latent.stride(0),
             device_index=dev,
+            predicted_tokens_per_seq=p,
+            q_base_from_kb=from_kb,
         )
         # The target's positional call, argument for argument.
         args = (
@@ -199,9 +227,10 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         )  # fmt: skip
         before = [env.layer(i).clone() for i in range(env.num_layers)]
 
-        op(*args, compiled=compiled)
+        op(*args, compiled=compiled, q_base_from_kb=from_kb)
         torch.cuda.synchronize()
-        ref = op.reference(*args, compiled=compiled)
+        ref = op.reference(*args, compiled=compiled, q_base_from_kb=from_kb)
+        _assert_discriminative(args, ref, compiled, from_kb)
 
         # Read-only inputs come back untouched.
         for got, was in zip((q, qkva, fused_q), inputs):
@@ -247,6 +276,97 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         # reference rounds its double expression once: bit-exact.
         assert torch.equal(bmm1, ref["mla_bmm1_scale"]), (bmm1, ref["mla_bmm1_scale"])
         assert torch.equal(bmm2, ref["mla_bmm2_scale"]), (bmm2, ref["mla_bmm2_scale"])
+    finally:
+        env.shutdown()
+
+
+@pytest.mark.parametrize("p", [1, 2, 4, 6], ids=["draft1", "mtp1", "mtp3", "mtp5"])
+def test_graph_replay_is_bitwise_eager(p) -> None:
+    """The target captures this op in its decode graph, at the full batch of each MTP
+    width (and at MTP3 / MTP5 the MTP layer's 1-token draft steps, width 1). A replay
+    must write the eager call's bytes into the query, scheduler and scale buffers and
+    the pool, and a second replay on new operands copied into the same buffers must
+    write that call's bytes: the runner binds addresses, not values."""
+    n, layer = 32, 0
+    cached = [9 + 27 * i for i in range(n)]
+    env = _MlaEnv(max_batch_size=n, num_layers=1)
+    try:
+        ids = list(range(n))
+        env.kv_cache_manager.add_dummy_requests(ids, token_nums=cached)
+        for rid in ids:
+            for _ in range(p):
+                env.kv_cache_manager.impl.add_token(rid)
+        md = env.prepare_metadata(ids, [p] * n, cached)
+        rows = n * p
+        g = torch.Generator(device="cuda").manual_seed(100 + p)
+        shapes = ((rows, NUM_HEADS, QK_DIM), (rows, QKVA_WIDTH), (rows, NUM_HEADS, HEAD_SIZE))
+        first, second = (
+            [torch.randn(s, generator=g, device="cuda").to(torch.bfloat16) for s in shapes]
+            for _ in range(2)
+        )
+        q, qkva, fused_q = (t.clone() for t in first)
+        q_pe = q.split([NOPE, ROPE], -1)[1]
+        latent = qkva[:, Q_LORA_RANK:]
+        quant_q = torch.zeros((rows, NUM_HEADS, HEAD_SIZE), dtype=torch.uint8, device="cuda")
+        written = (
+            quant_q,
+            torch.zeros(rows + 1, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows + 1, dtype=torch.int32, device="cuda"),
+            torch.zeros(1, dtype=torch.uint32, device="cuda"),
+            torch.zeros(2, dtype=torch.float32, device="cuda"),
+            torch.zeros(1, dtype=torch.float32, device="cuda"),
+        )
+        _, cu_q, cu_kv, counter, bmm1, bmm2 = written
+        compiled = entry.compile(
+            max_blocks_per_seq=int(md.kv_cache_block_offsets.shape[-1]),
+            q_pe_head_stride=q_pe.stride(1),
+            q_pe_token_stride=q_pe.stride(0),
+            latent_row_stride=latent.stride(0),
+            device_index=torch.cuda.current_device(),
+            predicted_tokens_per_seq=p,
+        )
+        args = (
+            fused_q, q_pe, latent, env.rotary_cos_sin, cu_q, cu_kv, counter, bmm1, bmm2,
+            quant_q.view(torch.float8_e4m3fn), md.kv_lens_cuda_runtime, md.kv_lens_runtime,
+            md.prompt_lens_cpu_runtime, 0, md.kv_cache_block_offsets,
+            env.kv_cache_manager.kv_cache_pool_pointers, env.kv_cache_manager.kv_cache_pool_mapping,
+            None, None, None, None, [None, None], p, layer, NUM_HEADS, 1, HEAD_SIZE,
+            entry.TOKENS_PER_BLOCK, MAX_SEQ_LEN, 1, QUANT_MODE_FP8_KV_CACHE, 1.0, Q_LORA_RANK,
+            KV_LORA_RANK, NOPE, ROPE, KV_LORA_RANK, True,
+        )  # fmt: skip
+        pool = env.layer(layer).view(torch.uint8)
+        blank = pool.clone()
+
+        def load(operands) -> None:
+            for dst, src in zip((q, qkva, fused_q), operands):
+                dst.copy_(src)
+            pool.copy_(blank)
+            for t in written:
+                t.zero_()
+
+        def state() -> list:
+            return [t.view(torch.uint8).clone() for t in written] + [pool.clone()]
+
+        eager = []
+        for operands in (first, second):
+            load(operands)
+            op(*args, compiled=compiled)
+            torch.cuda.synchronize()
+            eager.append(state())
+        load(first)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            op(*args, compiled=compiled)
+        for operands, want in zip((first, second), eager):
+            load(operands)
+            graph.replay()
+            torch.cuda.synchronize()
+            got = state()
+            assert all(torch.equal(a, b) for a, b in zip(got, want)), [
+                i for i, (a, b) in enumerate(zip(got, want)) if not torch.equal(a, b)
+            ]
+        # The two operand sets wrote different bytes: the replay did not just keep the first.
+        assert not torch.equal(eager[0][0], eager[1][0])
     finally:
         env.shutdown()
 

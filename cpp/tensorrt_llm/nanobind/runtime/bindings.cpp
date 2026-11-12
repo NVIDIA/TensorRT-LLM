@@ -83,6 +83,8 @@ void initBindings(nb::module_& m)
         .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, nb::arg("tag"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("release_host_backups_with_tag", &tr::CudaVirtualMemoryManager::releaseHostBackupsWithTag, nb::arg("tag"),
             nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tr::CudaEvent>(m, "CudaEvent")

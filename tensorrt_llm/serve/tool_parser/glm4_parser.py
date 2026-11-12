@@ -73,7 +73,11 @@ def parse_argument_text(text: str) -> Optional[List[Tuple[str, str]]]:
 
 
 def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -> Optional[str]:
-    """Get the expected type of a function argument from tool definitions."""
+    """Get the expected type of a function argument from tool definitions.
+
+    A property declared through a local ``$ref`` takes the type of the
+    definition it names in the tool's parameters schema.
+    """
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
         return None
@@ -83,7 +87,7 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -
         properties = {}
     if arg_key not in properties:
         return None
-    return infer_type_from_json_schema(properties[arg_key])
+    return infer_type_from_json_schema(properties[arg_key], tool.function.parameters)
 
 
 def _convert_to_number(value: str) -> Any:
@@ -112,16 +116,18 @@ def _loads_escaped_json(value: str) -> Any:
 
 
 def parse_arguments(value: str, arg_type: Optional[str] = None) -> Any:
-    """Decode an argument's raw text for its schema type, or return the text itself.
+    """Deliver an argument's raw text as the value its schema type calls for.
 
-    With no resolvable type only strict JSON decodes; a declared non-string type
-    also accepts JSON with escaped quotes and Python literals. A result that is
-    not strict JSON (``NaN``, an overflowing ``1e309``, a set) keeps the text.
+    Text the schema types as a string, or gives no type at all (an undeclared
+    tool or key, a property without a type, a ``$ref`` that names no
+    definition), is delivered as written. Any other declared type decodes the
+    text as strict JSON, then as JSON with escaped quotes, then as a Python
+    literal; a result that is not strict JSON (``NaN``, an overflowing
+    ``1e309``, a set) keeps the text, as does text none of them decodes.
     """
-    decoders = [json.loads]
-    if arg_type is not None:
-        decoders += [_loads_escaped_json, ast.literal_eval]
-    for decode in decoders:
+    if arg_type in (None, "string"):
+        return value
+    for decode in (json.loads, _loads_escaped_json, ast.literal_eval):
         try:
             parsed = decode(value)
         except (ValueError, TypeError, SyntaxError, RecursionError):
@@ -138,16 +144,15 @@ def parse_argument_pairs(
 ) -> Dict[str, Any]:
     """Type each raw value by the declared schema; a repeated key keeps its first value.
 
-    A value declared a string is passed through verbatim; any other value goes
-    through ``parse_arguments``.
+    ``parse_arguments`` decides, from the type ``get_argument_type`` finds for
+    the key, whether a value is decoded or delivered as written.
     """
     arguments = {}
     for key, value in pairs:
         if key in arguments:
             logger.debug(f"Tool argument {key!r} repeats; keeping its first value")
             continue
-        arg_type = get_argument_type(func_name, key, tools)
-        arguments[key] = value if arg_type == "string" else parse_arguments(value, arg_type)
+        arguments[key] = parse_arguments(value, get_argument_type(func_name, key, tools))
     return arguments
 
 

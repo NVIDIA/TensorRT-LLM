@@ -1,3 +1,0 @@
-pandas
-numpy<2
-matplotlib

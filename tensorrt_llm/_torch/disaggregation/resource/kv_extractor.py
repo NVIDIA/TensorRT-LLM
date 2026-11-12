@@ -46,7 +46,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -422,10 +422,16 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         # Shared caches are declared by their owner before dependent layers.
         for (model_layer, _attn_type), internal_layer_id in virtual_layer_mapping.items():
             model_layer_by_internal_id.setdefault(int(internal_layer_id), int(model_layer))
+    # A mixed-precision high layer has the head geometry of the local layer it belongs to.
+    local_layer_by_mixed_precision_high_layer = {
+        int(high_layer): int(local_layer)
+        for local_layer, high_layer in manager.mixed_precision_high_layers.items()
+    }
 
     def _kv_heads_for_layer(internal_layer_id: int) -> int:
-        local_layer_id = internal_layer_id
-        if virtual_layer_mapping is not None:
+        if internal_layer_id in local_layer_by_mixed_precision_high_layer:
+            local_layer_id = local_layer_by_mixed_precision_high_layer[internal_layer_id]
+        elif virtual_layer_mapping is not None:
             model_layer = model_layer_by_internal_id.get(internal_layer_id)
             if model_layer is None:
                 raise ValueError(
@@ -438,6 +444,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
                     f"model layer {model_layer} is not local to this rank"
                 )
+        else:
+            # Without a virtual layer mapping, the internal id is the layer offset.
+            local_layer_id = internal_layer_id
         heads = manager.num_kv_heads_per_layer
         if not 0 <= local_layer_id < len(heads):
             raise ValueError(
@@ -466,6 +475,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         base_address=int(pool.base_address),
                         slot_bytes=int(pool.slot_bytes),
                         num_slots=int(pg_desc.num_slots),
+                        # A sparse pool of the GPU tier is host memory mapped into the
+                        # device address space; the pool, not its group, reports that.
+                        memory_type=(
+                            "VRAM" if pool.storage_medium == CacheTier.GPU_MEM else "DRAM"
+                        ),
                     )
                     for pool in pg_desc.pools
                 ]
