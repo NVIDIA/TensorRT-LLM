@@ -10,8 +10,8 @@ vendors:
     - kda_chunked_bt16.py
     - kda_chunked_bt16_small_bh.py
     patch: 3rdparty/vendor_patches/flashinfer-kda-bt16.patch
-    patch_digest: sha256:42e8306de30fef448378066321977aeb7b42c3405dc883f9527e256590a58b46
-    digest: sha256-tree-v1:12eb5c011c3fef1831aeba02691df8e2f5bff323f9da9c58c0f31e80883a9f06
+    patch_digest: sha256:77729d1f7c3d29682d232e6128be8b1bfcb548cdcf54dd16995685d620a6eeea
+    digest: sha256-tree-v1:b5e8540bfd32251213a13d0aec255124a75606eb78cd1a9de5256a0062c9a9a9
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
     branch: trtllm-prims-ts-dev-20261107
