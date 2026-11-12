@@ -18,9 +18,11 @@ import os
 import pickle  # nosec B403
 import threading
 from abc import ABC, abstractmethod
-from enum import IntEnum
+from collections.abc import Generator, Iterable
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from enum import Enum, IntEnum
 from functools import lru_cache, wraps
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Literal, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -34,6 +36,10 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
+from tensorrt_llm._profiler import (MISSING_METADATA, MetadataValue,
+                                    custom_region_enabled,
+                                    record_function_metadata_scope,
+                                    tensor_metadata)
 from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
 from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
                                  mpi_comm, mpi_disabled, mpi_isend,
@@ -49,6 +55,104 @@ try:
     import ray
 except ModuleNotFoundError:
     from tensorrt_llm.executor.ray import stub as ray
+
+_INACTIVE_MPI_SCOPE: AbstractContextManager[None] = nullcontext()
+
+
+def _mpi_metadata_value(value: object) -> MetadataValue:
+    """Normalize direct enum and NumPy scalar fields to Python literals."""
+    if isinstance(value, Enum):
+        value = value.value
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return cast(MetadataValue, value)
+
+
+def _mpi_payload_metadata(payload: object) -> dict[str, MetadataValue]:
+    """Describe payload size and layout without traversing container contents."""
+    fields: dict[str, MetadataValue] = {
+        "mpi.payload.type": type(payload).__name__
+    }
+    if isinstance(payload, torch.Tensor):
+        numel = payload.numel()
+        fields.update(tensor_metadata(payload, "mpi.payload."))
+        fields["mpi.payload.numel"] = numel
+        fields["mpi.payload.bytes"] = numel * payload.element_size()
+    elif isinstance(payload, np.ndarray):
+        fields.update({
+            "mpi.payload.shape": list(payload.shape),
+            "mpi.payload.dtype": str(payload.dtype),
+            "mpi.payload.numel": int(payload.size),
+            "mpi.payload.bytes": int(payload.nbytes),
+        })
+    elif isinstance(payload, memoryview):
+        fields["mpi.payload.bytes"] = payload.nbytes
+    elif isinstance(payload, (bytes, bytearray)):
+        fields["mpi.payload.bytes"] = len(payload)
+    elif isinstance(payload, (str, list, tuple, dict, set)):
+        fields["mpi.payload.length"] = len(payload)
+    return fields
+
+
+@contextmanager
+def record_mpi_function(
+    operation: str,
+    *,
+    communicator: str,
+    group: Callable[[], Iterable[int]],
+    rank: int | Callable[[], int],
+    direction: Literal["send", "recv"] | None = None,
+    payload: object = MISSING_METADATA,
+    **fields: MetadataValue,
+) -> Generator[None, None, None]:
+    """Record shallow MPI metadata through the shared observational scope.
+
+    Args:
+        operation: Wrapped MPI method name, without the ``mpi_`` prefix.
+        communicator: Logical world, TP, PP, or CP communicator label.
+        group: Lazy ordered members in the active parent MPI communicator's rank space.
+        rank: Rank in that same space, or a lazy rank query.
+        direction: Send or receive direction for point-to-point operations.
+        payload: Optional object described without serialization or recursive traversal.
+            Tensors/NumPy arrays of any shape/dtype provide only shape, dtype and byte
+            counts; tensors also provide stride/device. No tensor values are read or
+            copied, including during CUDA capture. Other objects provide type and,
+            for built-in containers, length; byte buffers provide byte size.
+        **fields: Additional direct fields, such as communicator-local root/peer, tag,
+            reduction enum or chunk size. Direct NumPy scalars/enums become literals.
+
+    Yields:
+        None while the operation executes. Group, rank and payload inspection are
+        skipped for disabled/inactive scopes. Metadata/setup/cleanup failures are
+        observational and operation exceptions propagate unchanged.
+    """
+
+    def metadata() -> dict[str, MetadataValue]:
+        """Resolve lazy communicator fields and describe the optional payload."""
+        values: dict[str, MetadataValue] = {
+            "mpi.operation": operation,
+            "mpi.communicator": communicator,
+            "mpi.group": ",".join(str(int(member)) for member in group()),
+            "mpi.kind": "p2p" if direction is not None else "collective",
+            "mpi.rank": _mpi_metadata_value(rank() if callable(rank) else rank),
+        }
+        if direction is not None:
+            values["mpi.direction"] = direction
+        values.update({
+            f"mpi.{name}": _mpi_metadata_value(value)
+            for name, value in fields.items() if value is not None
+        })
+        if payload is not MISSING_METADATA:
+            values.update(_mpi_payload_metadata(payload))
+        return values
+
+    with record_function_metadata_scope(f"trtllm::mpi_{operation}", "mpi",
+                                        metadata):
+        yield
 
 
 class ReduceOp(IntEnum):
@@ -766,6 +870,9 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+        # Comm identity and active parent bind each cached membership to its
+        # rank space; externally supplied/replaced comms are translated once.
+        self._profile_groups: dict[str, tuple[object, object, list[int]]] = {}
 
     def _validate_world_size(self):
         """Validate world size before creating sub-communicators to prevent segfaults."""
@@ -780,48 +887,150 @@ class MPIDist(Distributed):
                     f"(tp_size={self.mapping.tp_size} * pp_size={self.mapping.pp_size} * cp_size={self.mapping.cp_size}), "
                     f"but MPI world size is only {actual_world_size}. ")
 
-    def broadcast(self,
-                  obj,
-                  root=0,
-                  chunk_size: int = 4 * 1024 * 1024,
-                  prefer_cpu=False):
-        # prefer_cpu is a no-op here: MPI object collectives are host-side.
-        comm = mpi_comm()
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+    def _profile_group(
+            self, communicator: Literal["world", "tp", "pp",
+                                        "cp"]) -> list[int]:
+        """Resolve members in the active MPI parent without creating a
+        subgroup.
+        """
+        parent = mpi_comm()
+        if communicator == "world":
+            return list(range(parent.Get_size()))
+        comm = {
+            "tp": self._tp_comm,
+            "pp": self._pp_comm,
+            "cp": self._cp_comm
+        }[communicator]
+        if comm is None:
+            if communicator == "tp":
+                return list(self.mapping.tp_group)
+            if communicator == "pp":
+                return list(self.mapping.pp_group)
+            return list(self.mapping.cp_group)
+        cached = self._profile_groups.get(communicator)
+        if cached is not None and cached[0] is comm and cached[1] is parent:
+            return list(cached[2])
+        group = comm.Get_group()
+        try:
+            parent_group = parent.Get_group()
+            try:
+                members = list(
+                    MPI.Group.Translate_ranks(group, range(comm.Get_size()),
+                                              parent_group))
+                if any(member < 0 for member in members):
+                    raise ValueError(
+                        "MPI subgroup is outside the active parent")
+                self._profile_groups[communicator] = (comm, parent, members)
+                return list(members)
+            finally:
+                parent_group.Free()
+        finally:
+            group.Free()
 
-    def allgather(self, obj):
-        return mpi_allgather(obj)
+    def _record_mpi(self,
+                    operation: str,
+                    communicator: Literal["world", "tp", "pp", "cp"] = "world",
+                    *,
+                    direction: Literal["send", "recv"] | None = None,
+                    payload: object = MISSING_METADATA,
+                    **fields: MetadataValue) -> AbstractContextManager[None]:
+        """Avoid constructing metadata scopes for inactive MPI calls."""
+        if not custom_region_enabled(
+                "mpi") or not torch.autograd._profiler_enabled():
+            return _INACTIVE_MPI_SCOPE
+        return record_mpi_function(
+            operation,
+            communicator=communicator,
+            group=lambda: self._profile_group(communicator),
+            rank=lambda: mpi_comm().Get_rank(),
+            direction=direction,
+            payload=payload,
+            **fields)
+
+    def broadcast(self,
+                  obj: object,
+                  root: int = 0,
+                  chunk_size: int = 4 * 1024 * 1024,
+                  prefer_cpu: bool = False) -> object:
+        # prefer_cpu is a no-op here: MPI object collectives are host-side.
+        with self._record_mpi("broadcast",
+                              payload=obj,
+                              root=root,
+                              chunk_bytes=chunk_size):
+            comm = mpi_comm()
+            return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+
+    def allgather(self, obj: object) -> object:
+        with self._record_mpi("allgather", payload=obj):
+            return mpi_allgather(obj)
 
     @property
     def local_world_size(self):
         return local_mpi_size()
 
-    def barrier(self):
-        mpi_barrier()
+    def barrier(self) -> None:
+        with self._record_mpi("barrier"):
+            mpi_barrier()
 
-    def tp_barrier(self):
-        self.tp_comm.Barrier()
+    def tp_barrier(self) -> None:
+        with self._record_mpi("tp_barrier", "tp"):
+            self.tp_comm.Barrier()
 
-    def isend(self, buf: np.ndarray, dest, tag=0):
+    def isend(self,
+              buf: np.ndarray,
+              dest: int,
+              tag: int = 0) -> MPI.Request | None:
         # non-blocking send numpy buffer
-        return mpi_isend(buf, dest, tag)
+        with self._record_mpi("isend",
+                              direction="send",
+                              payload=buf,
+                              peer=dest,
+                              tag=tag):
+            return mpi_isend(buf, dest, tag)
 
-    def send(self, buf: np.ndarray, dest, tag=0):
+    def send(self, buf: np.ndarray, dest: int, tag: int = 0) -> None:
         # blocking send numpy buffer
-        mpi_send(buf, dest, tag)
+        with self._record_mpi("send",
+                              direction="send",
+                              payload=buf,
+                              peer=dest,
+                              tag=tag):
+            mpi_send(buf, dest, tag)
 
-    def recv(self, buf: np.ndarray, src, tag=0):
+    def recv(self, buf: np.ndarray, src: int, tag: int = 0) -> None:
         # in-place recv numpy buffer
-        return mpi_recv(buf, src, tag)
+        with self._record_mpi("recv",
+                              direction="recv",
+                              payload=buf,
+                              peer=src,
+                              tag=tag):
+            return mpi_recv(buf, src, tag)
 
-    def send_object(self, obj, dest, tag=0):
-        mpi_send_object(obj, dest, tag)
+    def send_object(self, obj: object, dest: int, tag: int = 0) -> None:
+        with self._record_mpi("send_object",
+                              direction="send",
+                              payload=obj,
+                              peer=dest,
+                              tag=tag):
+            mpi_send_object(obj, dest, tag)
 
-    def isend_object(self, obj, dest, tag=0):
-        return mpi_isend_object(obj, dest, tag)
+    def isend_object(self,
+                     obj: object,
+                     dest: int,
+                     tag: int = 0) -> MPI.Request | None:
+        with self._record_mpi("isend_object",
+                              direction="send",
+                              payload=obj,
+                              peer=dest,
+                              tag=tag):
+            return mpi_isend_object(obj, dest, tag)
 
-    def recv_object(self, src, tag=0):
-        return mpi_recv_object(src, tag)
+    def recv_object(self, src: int, tag: int = 0) -> object:
+        with self._record_mpi("recv_object",
+                              direction="recv",
+                              peer=src,
+                              tag=tag):
+            return mpi_recv_object(src, tag)
 
     @property
     def tp_comm(self):
@@ -830,6 +1039,8 @@ class MPIDist(Distributed):
             mapping = self.mapping
             new_group = mpi_comm().group.Incl(mapping.tp_group)
             self._tp_comm = mpi_comm().Create_group(new_group)
+            self._profile_groups["tp"] = (self._tp_comm, mpi_comm(),
+                                          list(self.mapping.tp_group))
         return self._tp_comm
 
     @property
@@ -839,6 +1050,8 @@ class MPIDist(Distributed):
             mapping = self.mapping
             new_group = mpi_comm().group.Incl(mapping.pp_group)
             self._pp_comm = mpi_comm().Create_group(new_group)
+            self._profile_groups["pp"] = (self._pp_comm, mpi_comm(),
+                                          list(self.mapping.pp_group))
         return self._pp_comm
 
     @property
@@ -847,68 +1060,135 @@ class MPIDist(Distributed):
             self._validate_world_size()
             new_group = mpi_comm().group.Incl(self.mapping.cp_group)
             self._cp_comm = mpi_comm().Create_group(new_group)
+            self._profile_groups["cp"] = (self._cp_comm, mpi_comm(),
+                                          list(self.mapping.cp_group))
         return self._cp_comm
 
     def cp_allgather(self,
-                     obj,
+                     obj: object,
                      chunk_size: int = 4 * 1024 * 1024,
                      *,
-                     small_payload: bool = False):
-        comm = self.cp_comm
-        if small_payload:
-            # mpi4py's native object allgather is cheaper for tiny payloads;
-            # callers must guarantee the payload stays small on every rank.
-            return comm.allgather(obj)
-        return safe_allgather(comm, obj, chunk_size=chunk_size)
+                     small_payload: bool = False) -> object:
+        """Gather objects across the CP group using native or chunked transport.
+
+        Args:
+            obj: Local object to gather from each group member.
+            chunk_size: Maximum serialized bytes per chunk.
+            small_payload: Use native allgather when every rank has a small
+                payload.
+
+        Returns:
+            Gathered objects in communicator rank order.
+        """
+        with self._record_mpi("cp_allgather",
+                              "cp",
+                              payload=obj,
+                              chunk_bytes=chunk_size):
+            comm = self.cp_comm
+            if small_payload:
+                # mpi4py's native object allgather is cheaper for tiny payloads;
+                # callers must guarantee the payload stays small on every rank.
+                return comm.allgather(obj)
+            return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def cp_broadcast(self,
-                     obj,
-                     root=0,
+                     obj: object,
+                     root: int = 0,
                      chunk_size: int = 4 * 1024 * 1024,
-                     **kwargs):
-        comm = self.cp_comm
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+                     **kwargs: object) -> object:
+        with self._record_mpi("cp_broadcast",
+                              "cp",
+                              payload=obj,
+                              root=root,
+                              chunk_bytes=chunk_size):
+            comm = self.cp_comm
+            return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
     def tp_allgather(self,
-                     obj,
+                     obj: object,
                      chunk_size: int = 4 * 1024 * 1024,
                      *,
-                     small_payload: bool = False):
-        comm = self.tp_comm
-        if small_payload:
-            return comm.allgather(obj)
-        return safe_allgather(comm, obj, chunk_size=chunk_size)
+                     small_payload: bool = False) -> object:
+        """Gather objects across the TP group using native or chunked transport.
 
-    def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
-        comm = self.tp_comm
-        return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
+        Args:
+            obj: Local object to gather from each group member.
+            chunk_size: Maximum serialized bytes per chunk.
+            small_payload: Use native allgather when every rank has a small
+                payload.
+
+        Returns:
+            Gathered objects in communicator rank order.
+        """
+        with self._record_mpi("tp_allgather",
+                              "tp",
+                              payload=obj,
+                              chunk_bytes=chunk_size):
+            comm = self.tp_comm
+            if small_payload:
+                return comm.allgather(obj)
+            return safe_allgather(comm, obj, chunk_size=chunk_size)
+
+    def tp_gather(self,
+                  obj: object,
+                  root: int = 0,
+                  chunk_size: int = 4 * 1024 * 1024) -> object:
+        with self._record_mpi("tp_gather",
+                              "tp",
+                              payload=obj,
+                              root=root,
+                              chunk_bytes=chunk_size):
+            comm = self.tp_comm
+            return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
     def tp_broadcast(self,
-                     obj,
-                     root=0,
+                     obj: object,
+                     root: int = 0,
                      chunk_size: int = 4 * 1024 * 1024,
-                     **kwargs):
-        comm = self.tp_comm
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+                     **kwargs: object) -> object:
+        with self._record_mpi("tp_broadcast",
+                              "tp",
+                              payload=obj,
+                              root=root,
+                              chunk_bytes=chunk_size):
+            comm = self.tp_comm
+            return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
-    def pp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
-        comm = self.pp_comm
-        return safe_allgather(comm, obj, chunk_size=chunk_size)
+    def pp_allgather(self,
+                     obj: object,
+                     chunk_size: int = 4 * 1024 * 1024) -> object:
+        with self._record_mpi("pp_allgather",
+                              "pp",
+                              payload=obj,
+                              chunk_bytes=chunk_size):
+            comm = self.pp_comm
+            return safe_allgather(comm, obj, chunk_size=chunk_size)
 
-    def pp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
-        comm = self.pp_comm
-        return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
+    def pp_gather(self,
+                  obj: object,
+                  root: int = 0,
+                  chunk_size: int = 4 * 1024 * 1024) -> object:
+        with self._record_mpi("pp_gather",
+                              "pp",
+                              payload=obj,
+                              root=root,
+                              chunk_bytes=chunk_size):
+            comm = self.pp_comm
+            return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
-    def pp_broadcast(self, obj, root=0):
-        return self.pp_comm.bcast(obj, root)
+    def pp_broadcast(self, obj: object, root: int = 0) -> object:
+        with self._record_mpi("pp_broadcast", "pp", payload=obj, root=root):
+            return self.pp_comm.bcast(obj, root)
 
-    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
-        reduce_op = reduce_op_to_mpi(op)
-        return mpi_comm().allreduce(obj, reduce_op)
+    def allreduce(self, obj: object, op: ReduceOp = ReduceOp.SUM) -> object:
+        with self._record_mpi("allreduce", payload=obj, reduce_op=op):
+            reduce_op = reduce_op_to_mpi(op)
+            return mpi_comm().allreduce(obj, reduce_op)
 
-    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
-        reduce_op = reduce_op_to_mpi(op)
-        return self.tp_comm.allreduce(obj, reduce_op)
+    def tp_allreduce(self, obj: object, op: ReduceOp = ReduceOp.SUM) -> object:
+        with self._record_mpi("tp_allreduce", "tp", payload=obj, reduce_op=op):
+            reduce_op = reduce_op_to_mpi(op)
+            return self.tp_comm.allreduce(obj, reduce_op)
 
     @staticmethod
     def _allgather_int64_comm(comm, values: ArrayLike) -> np.ndarray:
@@ -927,10 +1207,12 @@ class MPIDist(Distributed):
         return buf
 
     def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
-        return self._allgather_int64_comm(self.tp_comm, values)
+        with self._record_mpi("tp_allgather_int64", "tp", payload=values):
+            return self._allgather_int64_comm(self.tp_comm, values)
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
-        return self._allgather_int64_comm(self.cp_comm, values)
+        with self._record_mpi("cp_allgather_int64", "cp", payload=values):
+            return self._allgather_int64_comm(self.cp_comm, values)
 
     def broadcast_int64(self,
                         values: ArrayLike,
@@ -938,16 +1220,35 @@ class MPIDist(Distributed):
                         *,
                         prefer_cpu: bool = False) -> np.ndarray:
         # prefer_cpu is a no-op here: MPI buffer collectives are host-side.
-        return self._broadcast_int64_comm(mpi_comm(), values, root)
+        with self._record_mpi("broadcast_int64", payload=values, root=root):
+            return self._broadcast_int64_comm(mpi_comm(), values, root)
 
     def tp_cp_broadcast_int64(self,
                               values: ArrayLike,
                               root: int = 0) -> np.ndarray:
+        """Broadcast a flat int64 buffer through TP and then CP communicators.
+
+        Args:
+            values: Values flattened and converted to an int64 array of shape
+                [N].
+            root: Source rank within each participating communicator.
+
+        Returns:
+            The broadcast int64 array of shape [N].
+        """
         buf = np.asarray(values, dtype=np.int64).reshape(-1)
         if self.tp_size > 1:
-            buf = self._broadcast_int64_comm(self.tp_comm, buf, root)
+            with self._record_mpi("tp_broadcast_int64",
+                                  "tp",
+                                  payload=buf,
+                                  root=root):
+                buf = self._broadcast_int64_comm(self.tp_comm, buf, root)
         if self.cp_size > 1:
-            buf = self._broadcast_int64_comm(self.cp_comm, buf, root)
+            with self._record_mpi("cp_broadcast_int64",
+                                  "cp",
+                                  payload=buf,
+                                  root=root):
+                buf = self._broadcast_int64_comm(self.cp_comm, buf, root)
         return buf
 
 

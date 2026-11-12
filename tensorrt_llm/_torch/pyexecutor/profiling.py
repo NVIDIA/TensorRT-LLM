@@ -70,6 +70,14 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 ITER_LOG_KV_UTIL_REFRESH_ITERS = 16
 
 
+def _profile_trace_path(path: str, start_iter: int, stop_iter: int, multiple_ranges: bool) -> str:
+    """Add iteration boundaries to a rank-specific trace filename when needed."""
+    if not multiple_ranges:
+        return path
+    base, extension = os.path.splitext(path)
+    return f"{base}-iterations-{start_iter}-{stop_iter}{extension}"
+
+
 @functools.cache
 def load_iteration_indexes(env_var: str):
     """Parse an iteration-range environment variable.
@@ -643,6 +651,8 @@ class PyExecutorProfileManager:
             trace_base, trace_ext = os.path.splitext(env_torch_trace_path)
             env_torch_trace_path = f"{trace_base}-rank-{executor.global_rank}{trace_ext}"
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME, None)
+        env_start_iters, _ = load_iteration_indexes(PROFILE_START_STOP_ENV_VAR_NAME)
+        env_multiple_ranges = len(env_start_iters) > 1
         env_enable_torch_trace = bool(env_torch_trace_path and profile_start_stop)
         if env_torch_trace_path and profile_start_stop is None:
             logger.warning(
@@ -660,6 +670,8 @@ class PyExecutorProfileManager:
         torch_profiler = None
         active_torch_trace_path: Optional[str] = None
         active_enable_torch_trace: bool = False
+        active_profile_start_iter = 0
+        active_env_trace = False
         # Make sure ``_profile_enabled`` starts cleared for a fresh
         # executor run (in case the instance is re-entered).
         with executor._profile_state_lock:
@@ -681,6 +693,7 @@ class PyExecutorProfileManager:
         activities_from_names = self._activities_from_names
 
         def profile_step_fn():
+            """Advance capture windows and update per-iteration profiling state."""
             nonlocal it, enabled, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
             nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
@@ -688,6 +701,7 @@ class PyExecutorProfileManager:
             nonlocal kv_util_str, kv_util_iter
             nonlocal torch_profiler, active_torch_trace_path
             nonlocal active_enable_torch_trace
+            nonlocal active_profile_start_iter, active_env_trace
             calibrator.post_step(it)
             if executor.iter_counter in executor.profile_stop_iters and not executor.is_warmup:
                 if not enabled:
@@ -707,11 +721,17 @@ class PyExecutorProfileManager:
                 else:
                     if active_enable_torch_trace and torch_profiler is not None:
                         torch_profiler.stop()
-                        torch_profiler.export_chrome_trace(active_torch_trace_path)
+                        trace_path = _profile_trace_path(
+                            active_torch_trace_path,
+                            active_profile_start_iter,
+                            executor.iter_counter,
+                            active_env_trace and env_multiple_ranges,
+                        )
+                        torch_profiler.export_chrome_trace(trace_path)
                         logger.info(
                             f"Profiling stopped at iteration "
                             f"{executor.iter_counter}, "
-                            f"trace saved to {active_torch_trace_path}"
+                            f"trace saved to {trace_path}"
                         )
                     torch.cuda.cudart().cudaProfilerStop()
                     calibrator.stop()
@@ -731,7 +751,6 @@ class PyExecutorProfileManager:
                         # pending" and reject a legitimate restart.
                         if executor._runtime_profile_pending_stop_iter == executor.iter_counter:
                             executor._runtime_profile_pending_stop_iter = None
-                active_enable_torch_trace = False
 
             # Capture per-loop timing whenever stats or the iter log
             # are enabled. The reading of the OTHER parity's event
@@ -833,6 +852,8 @@ class PyExecutorProfileManager:
                 # from ``start_profile()`` take precedence over the
                 # environment variables.
                 runtime_trace_path = executor._runtime_profile_trace_path
+                active_profile_start_iter = executor.iter_counter
+                active_env_trace = runtime_trace_path is None
                 runtime_cuda_only = executor._runtime_profile_cuda_only
                 runtime_activities = executor._runtime_profile_activities
                 if runtime_trace_path is not None:
@@ -902,11 +923,17 @@ class PyExecutorProfileManager:
                 # Stop on early exit / exception
                 if active_enable_torch_trace and torch_profiler is not None:
                     torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(active_torch_trace_path)
+                    trace_path = _profile_trace_path(
+                        active_torch_trace_path,
+                        active_profile_start_iter,
+                        executor.iter_counter,
+                        active_env_trace and env_multiple_ranges,
+                    )
+                    torch_profiler.export_chrome_trace(trace_path)
                     logger.info(
                         f"Profiling stopped at iteration "
                         f"{executor.iter_counter}, "
-                        f"trace saved to {active_torch_trace_path}"
+                        f"trace saved to {trace_path}"
                     )
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()

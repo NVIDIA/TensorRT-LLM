@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
 set(TRTLLM_NB_MODULE bindings)
 set(TRTLLM_NB_MODULE
     ${TRTLLM_NB_MODULE}
@@ -43,6 +57,46 @@ if(ENABLE_BOLT_COMPATIBLE)
   nanobind_add_module(${TRTLLM_NB_MODULE} NOSTRIP ${SRCS})
 else()
   nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
+endif()
+
+set_property(TARGET ${TRTLLM_NB_MODULE}
+             PROPERTY TRTLLM_NANOBIND_PROFILER_CONSUMER ON)
+if(ENABLE_NANOBIND_PROFILING)
+  if(NOT EXISTS "${nanobind_SOURCE_DIR}/src/trtllm_pytorch_tensor_adapter.h")
+    message(
+      FATAL_ERROR
+        "ENABLE_NANOBIND_PROFILING requires the nanobind profiler patch; apply 3rdparty/patches/nanobind_pytorch_profiler.patch to the nanobind source override"
+    )
+  endif()
+  set(TRTLLM_NB_PROFILING_RUNTIME nanobind-trtllm-profiled-static)
+  nanobind_build_library(${TRTLLM_NB_PROFILING_RUNTIME})
+  # Keep the default runtime unprofiled for other modules, including the
+  # transfer agent.
+  get_target_property(TRTLLM_NB_LINK_LIBRARIES ${TRTLLM_NB_MODULE}
+                      LINK_LIBRARIES)
+  list(FIND TRTLLM_NB_LINK_LIBRARIES "nanobind-static"
+       TRTLLM_NB_DEFAULT_RUNTIME_INDEX)
+  if(TRTLLM_NB_DEFAULT_RUNTIME_INDEX EQUAL -1)
+    message(
+      FATAL_ERROR
+        "ENABLE_NANOBIND_PROFILING requires the bindings module to link nanobind-static; unsupported nanobind runtime"
+    )
+  endif()
+  list(TRANSFORM TRTLLM_NB_LINK_LIBRARIES
+       REPLACE "^nanobind-static$" "${TRTLLM_NB_PROFILING_RUNTIME}")
+  set_property(TARGET ${TRTLLM_NB_MODULE}
+               PROPERTY LINK_LIBRARIES "${TRTLLM_NB_LINK_LIBRARIES}")
+  target_compile_features(${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE cxx_std_20)
+  set_property(TARGET ${TRTLLM_NB_PROFILING_RUNTIME}
+               PROPERTY TRTLLM_NANOBIND_PROFILER_CONSUMER ON)
+  target_include_directories(
+    ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                           ${TORCH_INCLUDE_DIRS})
+  # Reuse the shared core's selector and scope implementation; do not embed a
+  # hidden second copy in the nanobind static library or Python module.
+  target_link_libraries(
+    ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${SHARED_TARGET} ${TORCH_LIBRARIES}
+                                           ${TORCH_PYTHON_LIB})
 endif()
 
 # SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the

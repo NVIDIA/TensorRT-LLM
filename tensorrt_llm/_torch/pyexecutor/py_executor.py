@@ -27,6 +27,9 @@ try:
 except ImportError:
     from cuda import cudart
 
+from tensorrt_llm._profiler import (MetadataValue, custom_region_enabled,
+                                    record_function_metadata_scope,
+                                    record_workflow_scope)
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
@@ -524,6 +527,96 @@ def _distributed_warmup_guard(dist: Distributed,
             else:
                 start_rank_crash_kill_watchdog(world, error_delivered=None)
         raise
+
+
+def _scheduled_context_tokens(requests: list[LlmRequest]) -> int:
+    """Count decoder chunks and encoder rows restored for this forward."""
+    from .ced_replay import encoder_replay_tokens
+    return sum(req.context_chunk_size + encoder_replay_tokens(req)
+               for req in requests)
+
+
+def _forward_workflow_metadata(
+        executor: "PyExecutor",
+        scheduled_requests: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        *,
+        microbatch_id: int | None = None,
+        **_kwargs: object) -> dict[str, MetadataValue]:
+    """Observe host scheduling state before model-engine graph padding."""
+    contexts = scheduled_requests.context_requests
+    generations = scheduled_requests.generation_requests
+    live_contexts = [req for req in contexts if not req.is_dummy]
+    live_generations = [req for req in generations if not req.is_dummy]
+    num_context_tokens = _scheduled_context_tokens(contexts)
+    fields: dict[str, MetadataValue] = {
+        "workflow.phase":
+        _forward_phase_scope_name(num_context_tokens,
+                                  len(generations)).removeprefix("trtllm::"),
+        "workflow.executor.iteration":
+        executor.iter_counter,
+        "workflow.batch.scheduled_context_requests":
+        len(contexts),
+        "workflow.batch.scheduled_generation_requests":
+        len(generations),
+        "workflow.batch.live_context_requests":
+        len(live_contexts),
+        "workflow.batch.live_generation_requests":
+        len(live_generations),
+        "workflow.batch.live_requests":
+        len(live_contexts) + len(live_generations),
+        "workflow.batch.scheduled_context_tokens":
+        num_context_tokens,
+        "workflow.batch.live_context_tokens":
+        _scheduled_context_tokens(live_contexts),
+        "workflow.batch.attention_dp_dummy_requests":
+        sum(
+            bool(req.is_attention_dp_dummy)
+            for req in (*contexts, *generations)),
+        "workflow.batch.cuda_graph_dummy_requests":
+        sum(bool(req.is_cuda_graph_dummy) for req in (*contexts, *generations)),
+        "workflow.batch.generic_dummy_requests":
+        sum(bool(req.is_dummy_request) for req in (*contexts, *generations)),
+    }
+    fields["workflow.executor.is_warmup"] = executor.is_warmup
+    fields["workflow.attention_dp_enabled"] = executor.enable_attention_dp
+    mapping = executor.dist.mapping
+    for name, value in (
+        ("rank", mapping.rank),
+        ("world_size", mapping.world_size),
+        ("tp_rank", mapping.tp_rank),
+        ("tp_size", mapping.tp_size),
+        ("pp_rank", mapping.pp_rank),
+        ("pp_size", mapping.pp_size),
+        ("cp_rank", mapping.cp_rank),
+        ("cp_size", mapping.cp_size),
+        ("moe_ep_rank", mapping.moe_ep_rank),
+        ("moe_ep_size", mapping.moe_ep_size),
+    ):
+        fields[f"workflow.{name}"] = value
+    if microbatch_id is None and mapping.pp_size == 1:
+        microbatch_id = 0
+    if microbatch_id is not None:
+        fields["workflow.executor.microbatch_slot"] = microbatch_id
+    return fields
+
+
+def _forward_phase_scope_name(num_context_tokens: int,
+                              num_generation_requests: int) -> str:
+    """Return the workflow phase from the current scheduled work.
+
+    Args:
+        num_context_tokens: Context tokens in the scheduled chunks, not prompts.
+        num_generation_requests: Scheduled generation-request count.
+
+    Returns:
+        The prefill, decode, or mixed user-scope name. Empty work uses decode.
+    """
+    if num_context_tokens > 0 and num_generation_requests > 0:
+        return "trtllm::mixed"
+    if num_context_tokens > 0:
+        return "trtllm::prefill"
+    return "trtllm::decode"
 
 
 @dataclasses.dataclass
@@ -3848,6 +3941,7 @@ class PyExecutor:
             )
 
     def _executor_loop_pp(self):
+        """Drive pipeline-parallel batches through their microbatch slots."""
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -4014,8 +4108,10 @@ class PyExecutor:
                                 f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
                         ), self._step_scope(scheduled_batch):
                             sample_state = self._forward_step_inter_pp(
-                                scheduled_batch, gpu_forward_start,
-                                gpu_forward_end)
+                                scheduled_batch,
+                                gpu_forward_start,
+                                gpu_forward_end,
+                                microbatch_id=microbatch_id)
                     else:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
@@ -4028,7 +4124,8 @@ class PyExecutor:
                             with self.perf_manager.record_perf_events(
                                     gpu_forward_start, gpu_forward_end):
                                 batch_outputs = self._forward_step(
-                                    scheduled_batch)
+                                    scheduled_batch,
+                                    microbatch_id=microbatch_id)
 
                             if batch_outputs is None:
                                 # _forward_step hit an exception; _handle_errors
@@ -5419,9 +5516,11 @@ class PyExecutor:
         any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
         return all_ranks_fetched and any_rank_terminal_no_fit
 
+    @record_workflow_scope("trtllm::prepare_batch")
     def _prepare_and_schedule_batch(
             self
     ) -> tuple[Optional[ScheduledRequests], Optional[IterationStats]]:
+        """Admit requests, settle transfers, and schedule the next batch."""
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
@@ -6146,7 +6245,7 @@ class PyExecutor:
             scheduled. ``bs`` is the number of extend (context) requests
             and ``toks`` is the total number of context tokens being
             processed this iteration (sum of each request's
-            ``context_chunk_size``).
+            ``context_chunk_size`` plus encoder replay rows).
 
         Exactly one bare ``step[...]`` scope is emitted per iteration, so a
         trace consumer can derive iteration boundaries by counting them.
@@ -6165,12 +6264,11 @@ class PyExecutor:
         """
         num_ctx = scheduled_batch.num_context_requests
         num_gen = scheduled_batch.num_generation_requests
-        if num_ctx == 0:
+        total_toks = _scheduled_context_tokens(scheduled_batch.context_requests)
+        scope_name = _forward_phase_scope_name(total_toks, num_gen)
+        if scope_name == "trtllm::decode":
             label = f"step[DECODE bs={num_gen}]"
         else:
-            total_toks = 0
-            for req in scheduled_batch.context_requests:
-                total_toks += int(getattr(req, "context_chunk_size", 0) or 0)
             label = f"step[EXTEND bs={num_ctx} toks={total_toks}]"
         return f"{label} {phase}" if phase else label
 
@@ -7656,12 +7754,15 @@ class PyExecutor:
                 request.py_batch_idx = None
 
     def _forward_step_inter_pp(self,
-                               scheduled_batch,
-                               gpu_forward_start=None,
-                               gpu_forward_end=None) -> SampleState:
+                               scheduled_batch: ScheduledRequests,
+                               gpu_forward_start: torch.cuda.Event
+                               | None = None,
+                               gpu_forward_end: torch.cuda.Event | None = None,
+                               *,
+                               microbatch_id: int | None = None) -> SampleState:
         with self.perf_manager.record_perf_events(gpu_forward_start,
                                                   gpu_forward_end):
-            self._forward_step(scheduled_batch)
+            self._forward_step(scheduled_batch, microbatch_id=microbatch_id)
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
@@ -8940,7 +9041,9 @@ class PyExecutor:
         return context_requests
 
     @nvtx_range("_schedule")
+    @record_workflow_scope("trtllm::schedule")
     def _schedule(self):
+        """Schedule context, generation, and encoder requests for execution."""
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
@@ -10189,11 +10292,15 @@ class PyExecutor:
                 f"Cross-iter MM encoder prefetch failed; falling back to "
                 f"in-iter encode.\n{traceback.format_exc()}")
 
+    @record_workflow_scope("trtllm::forward",
+                           metadata_factory=_forward_workflow_metadata)
     def _forward_step(
-        self,
-        scheduled_requests: ScheduledRequests,
-        new_tensors_device: Optional[SampleStateTensors] = None
-    ) -> Optional[dict[str, object]]:
+            self,
+            scheduled_requests: ScheduledRequests,
+            new_tensors_device: Optional[SampleStateTensors] = None,
+            *,
+            microbatch_id: int | None = None) -> Optional[dict[str, object]]:
+        """Run a model batch with routing capture and stream ordering."""
         self._maybe_record_hang_diagnostic_phase(
             "forward_call",
             scheduled_requests,
@@ -10220,9 +10327,8 @@ class PyExecutor:
                                                   None), 'tokens_per_block', 0),
                                       shared_capacity=None if cap < 0 else cap)
 
-        from .ced_replay import encoder_replay_tokens
-        num_ctx_tokens = sum(req.context_chunk_size + encoder_replay_tokens(req)
-                             for req in scheduled_requests.context_requests)
+        num_ctx_tokens = _scheduled_context_tokens(
+            scheduled_requests.context_requests)
         adp_dummy_ctx_tokens, adp_dummy_gen_tokens = \
             self._compute_adp_dummy_tokens(scheduled_requests)
         self._iter_adp_dummy_ctx_tokens += adp_dummy_ctx_tokens
@@ -10268,8 +10374,23 @@ class PyExecutor:
                     self._stream_ordering_events[0])
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
-                outputs = forward(scheduled_requests, self.resource_manager,
-                                  new_tensors_device, cache_indirection_buffer)
+                if custom_region_enabled(
+                        "workflow") and torch.autograd._profiler_enabled():
+                    # The enclosing forward scope owns batch metadata; the
+                    # nested phase only marks the measured model interval.
+                    with record_function_metadata_scope(
+                            _forward_phase_scope_name(
+                                num_ctx_tokens,
+                                scheduled_requests.num_generation_requests),
+                            "workflow"):
+                        outputs = forward(scheduled_requests,
+                                          self.resource_manager,
+                                          new_tensors_device,
+                                          cache_indirection_buffer)
+                else:
+                    outputs = forward(scheduled_requests, self.resource_manager,
+                                      new_tensors_device,
+                                      cache_indirection_buffer)
                 if isinstance(outputs, dict):
                     self.runtime_draft_len = outputs.pop(
                         "runtime_draft_len", self.runtime_draft_len)
@@ -10417,8 +10538,10 @@ class PyExecutor:
                                      self.sampler.current_sample_type)
 
     @nvtx_range("_sample_async")
+    @record_workflow_scope("trtllm::sampling")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
+        """Handle model outputs and submit asynchronous token sampling."""
         self._maybe_record_hang_diagnostic_phase("sampling", scheduled_batch)
         try:
             if batch_outputs is not None:
@@ -10479,9 +10602,11 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
+    @record_workflow_scope("trtllm::update_requests")
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
+        """Apply sampled results and route sampling errors to the executor."""
         try:
             self.sampler.update_requests(sample_state, resource_manager)
             self._accumulate_spec_dec_stats(sample_state)
@@ -11392,7 +11517,9 @@ class PyExecutor:
         return first_gen_emit or decoding_iter % self.stream_interval == 0
 
     @nvtx_range("_handle_responses")
+    @record_workflow_scope("trtllm::handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
+        """Publish ready responses and retire completed requests."""
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by the coordinator's context reap (DISAGG_CONTEXT_COMPLETE);
