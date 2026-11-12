@@ -1835,7 +1835,8 @@ class OpenAIServer(_VideoRoutesMixin):
         if self.disagg_cluster_config:
             self.disagg_cluster_storage = create_cluster_storage_client(
                 self.disagg_cluster_config.cluster_uri,
-                self.disagg_cluster_config.cluster_name)
+                self.disagg_cluster_config.cluster_name,
+                **self.disagg_cluster_config.cluster_storage_options())
             self.disagg_cluster_worker = DisaggClusterWorker(
                 self.server_role, self.host, self.port,
                 self.disagg_cluster_config, self.disagg_cluster_storage)
