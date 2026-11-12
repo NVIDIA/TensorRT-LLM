@@ -194,6 +194,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
@@ -334,6 +335,12 @@ _TOPK_DECODE_COLUMNS = (4096, 65536)
 # TRTLLM_MODELING_V2_UNFUSED_GLUE=1 in every rank's environment at launch; off by default.
 # It sets the core's `unfused_glue`, which every site reads.
 _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
+# A generation step's shared expert on the main stream after the routed experts, instead of on
+# the decode target's side stream beside the router, the NVFP4 quantization and the runner.
+# Both orders compute the same bits. The side stream is used only under CUDA-graph capture
+# (`maybe_execute_in_parallel`). Set TRTLLM_MODELING_V2_SERIAL_SHARED_EXPERT=1 in every rank's
+# environment at launch; off by default.
+_SERIAL_SHARED_EXPERT = os.environ.get("TRTLLM_MODELING_V2_SERIAL_SHARED_EXPERT", "0") == "1"
 
 
 def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
@@ -1502,6 +1509,11 @@ class DecodeTarget:
         self._layers = _layer_views(core)
         self._embed = core.w["embed"]
         self._norm0 = core.w["l0_attn_norm"]
+        # The shared expert's side stream (`_mlp`) and the events that fork it from and join it
+        # to the main stream; no stream keeps the shared expert on the main stream.
+        self._shared_stream = None if _SERIAL_SHARED_EXPERT else torch.cuda.Stream()
+        self._shared_fork = torch.cuda.Event()
+        self._shared_join = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1602,26 +1614,36 @@ class DecodeTarget:
     def _mlp(self, o, L):
         """This rank's share of the layer's MLP, a partial sum: the dense SwiGLU slice on the
         dense layer; on a MoE layer every routed expert's width slice plus the shared expert's
-        slice."""
+        slice. Under CUDA-graph capture the MoE layer's shared expert runs on the side stream
+        while the main stream runs the router, the quantization and the routed experts."""
         core = self.core
-        act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
-        shared = self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
+
+        def shared():
+            act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
+            return self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
+
         m = L.moe
         if m is None:
-            return shared
-        logits = cublas_mm(o, m.router, None, torch.float32)
-        ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
-        # One NVFP4 quantization under the layer's static scale serves every expert's slice on
-        # every rank: the width slices' partials sum.
-        xq, xs = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
-        routed = fp4_block_scale_moe_runner(
-            None, None, xq, xs.view(torch.float8_e4m3fn), m.fc1_w, m.fc1_s, None, None, None,
-            None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate, m.out2, core.num_experts,
-            core.topk, None, None, core.moe_inter, core.expert_offset, core.local_experts, None,
-            _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU, topk_weights=weights, topk_ids=ids,
-            tune_max_num_tokens=core.max_num_tokens,
-        )[0]  # fmt: skip
-        return torch.add(routed, shared)
+            return shared()
+
+        def routed():
+            logits = cublas_mm(o, m.router, None, torch.float32)
+            ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
+            # One NVFP4 quantization under the layer's static scale serves every expert's slice
+            # on every rank: the width slices' partials sum.
+            xq, xs = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+            return fp4_block_scale_moe_runner(
+                None, None, xq, xs.view(torch.float8_e4m3fn), m.fc1_w, m.fc1_s, None, None, None,
+                None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate, m.out2, core.num_experts,
+                core.topk, None, None, core.moe_inter, core.expert_offset, core.local_experts,
+                None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU, topk_weights=weights,
+                topk_ids=ids, tune_max_num_tokens=core.max_num_tokens,
+            )[0]  # fmt: skip
+
+        routed_out, shared_out = maybe_execute_in_parallel(
+            routed, shared, self._shared_fork, self._shared_join, self._shared_stream
+        )
+        return torch.add(routed_out, shared_out)
 
     def forward(
         self,
