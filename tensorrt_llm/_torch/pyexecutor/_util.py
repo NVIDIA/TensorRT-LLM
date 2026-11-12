@@ -536,6 +536,35 @@ def get_kv_cache_manager_cls(
         return _non_hybrid_kv_cache_manager_cls(model_config, kv_cache_config)
 
 
+def model_declared_kv_cache_manager_cls(model: object,
+                                        resolved_cls: type) -> type:
+    """The KV cache manager class to build for ``model``'s own KV cache.
+
+    ``resolved_cls`` is the class the engine resolved and validated for the
+    model. A model may declare a subclass of it
+    (``RuntimeHooks.kv_cache_manager_cls``), which is then built instead; any
+    other declared class is rejected.
+    """
+    declared_cls = runtime_hooks_of(model).kv_cache_manager_cls
+    if declared_cls is None:
+        return resolved_cls
+    if not (isinstance(declared_cls, type)
+            and issubclass(declared_cls, resolved_cls)):
+        declared_name = getattr(declared_cls, "__qualname__",
+                                repr(declared_cls))
+        raise ValueError(
+            f"{type(model).__name__} declares the KV cache manager class "
+            f"{declared_name} (RuntimeHooks.kv_cache_manager_cls), which is "
+            f"not a subclass of {resolved_cls.__qualname__}, the class the "
+            "engine resolved for this model and configuration.")
+    logger.info_once(
+        f"Using the model-declared KV cache manager "
+        f"{declared_cls.__qualname__} (a subclass of "
+        f"{resolved_cls.__qualname__})",
+        key=f"model_declared_kv_cache_manager_{declared_cls.__qualname__}")
+    return declared_cls
+
+
 # --- KV cache cost model ------------------------------------------------------
 #
 # KVCacheManager.get_cache_size_per_token may return either an ``int``
@@ -1164,7 +1193,8 @@ class KvCacheCreator:
                 logger.warning(
                     "Block reuse does not work with MTP for hybrid linear models "
                     f"when using non-V2 Mamba cache manager {cls.__name__}")
-        return cls
+        return model_declared_kv_cache_manager_cls(self._model_engine.model,
+                                                   cls)
 
     def _validate_or_fallback_kv_cache_manager_v2(
             self,
@@ -1455,6 +1485,8 @@ class KvCacheCreator:
             draft_tokens_per_block = self._get_draft_tokens_per_block()
             # Resolve draft manager class from draft config — may differ
             # from target (e.g. hybrid target + plain transformer draft).
+            # The target model's RuntimeHooks.kv_cache_manager_cls does not
+            # apply to it.
             draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
                 effective_draft_config,
                 draft_kv_cache_config,
@@ -3050,7 +3082,8 @@ class KvCacheCreator:
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
                 f"draft manager: {draft_kv_config.max_attention_window}")
-        # Get the appropriate KV cache manager class for the draft model
+        # Get the appropriate KV cache manager class for the draft model (the
+        # target model's RuntimeHooks.kv_cache_manager_cls does not apply).
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config,
             draft_kv_config,

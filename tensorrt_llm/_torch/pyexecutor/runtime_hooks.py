@@ -334,6 +334,11 @@ class RuntimeHooks:
     # Replaces the attention-DP KV-balanced admission's window and planner
     # (attention_dp_config.enable_kv_balanced_admission); None keeps the engine's.
     kv_balanced_admission_planner: Optional[KvBalancedAdmissionPlanner] = None
+    # A subclass of the KV cache manager class the engine resolves for the model's own KV cache; the
+    # engine builds this subclass instead (KvCacheCreator rejects a class that is not a subclass). A
+    # separate draft model's KV cache manager is resolved from the draft model and does not use it.
+    # None keeps the resolved class.
+    kv_cache_manager_cls: Optional[type] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:
