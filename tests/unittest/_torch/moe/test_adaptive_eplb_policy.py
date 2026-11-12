@@ -173,14 +173,12 @@ def _check_steps(load: np.ndarray, current: np.ndarray, geometry: ExpertGeometry
         assert _gpus(a, geometry) == _gpus(b, geometry) == _gpus(c, geometry)
 
 
-def test_active_slots_keeps_half_the_free_slots_of_every_gpu():
+def test_first_plan_fills_the_budget_from_the_homes():
+    # The budget keeps half the free slots of every GPU free.
     assert active_slots(ExpertGeometry(num_experts=384, num_slots=512, ep_size=32)) == 448
     assert active_slots(SMALL) == 12
     assert active_slots(ExpertGeometry(num_experts=8, num_slots=20, ep_size=4)) == 16
     assert active_slots(ExpertGeometry(num_experts=8, num_slots=8, ep_size=4)) == 8
-
-
-def test_first_plan_fills_the_budget_from_the_homes():
     rng = np.random.default_rng(7)
     for _ in range(20):
         load = rng.gamma(0.5, 100.0, SMALL.num_experts)

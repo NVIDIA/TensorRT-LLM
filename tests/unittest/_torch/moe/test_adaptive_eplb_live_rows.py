@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """The adaptive EPLB statistics ops count only the ids of the live rows of a live-row word
 (R real of P requests in bits 0-15 / 16-31; tensorrt_llm/_torch/moe/live_rows.py)."""
 
@@ -30,7 +18,7 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import build_route_t
 
 
 @pytest.mark.cpu_only
-def test_the_balancer_hands_both_ops_the_live_row_word():
+def test_the_balancer_hands_both_ops_the_live_row_word(monkeypatch):
     trees = [ast.parse(inspect.getsource(module)) for module in (balancer, policy)]
     calls = [n for tree in trees for n in ast.walk(tree) if isinstance(n, ast.Call)]
     last = {ast.unparse(c.func): ast.unparse(c.args[-1]) for c in calls if c.args}
@@ -40,10 +28,7 @@ def test_the_balancer_hands_both_ops_the_live_row_word():
     assert records and all(
         ast.unparse(c.args[-1]) == "self._live_rows(pending[0])" for c in records
     )
-
-
-@pytest.mark.cpu_only
-def test_the_statistics_take_the_word_only_from_a_kernel_that_reads_it(monkeypatch):
+    # The statistics take the word only from a kernel that reads it.
     word = torch.zeros(1, dtype=torch.int32)
     monkeypatch.setattr(balancer, "current_word", lambda device: word)
     layer = object.__new__(balancer.AdaptiveMoeLayerLoadBalancer)

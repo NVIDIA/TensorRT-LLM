@@ -75,7 +75,7 @@ def test_shares_reach_the_grid_optimum(seed):
     assert _gpu_rows(rows, layout, solved, geometry).max() <= best * (1 + 1e-8)
 
 
-def test_shares_balance_the_gpus_of_a_hot_expert():
+def test_shares_balance_the_gpus_of_a_hot_expert_and_are_deterministic():
     layout = GEOMETRY.home_layout()
     layout[10] = 0  # a copy of expert 0 (home GPU 0) on GPU 1
     rows = np.full(16, 40.0)
@@ -83,9 +83,6 @@ def test_shares_balance_the_gpus_of_a_hot_expert():
     gpu = _gpu_rows(rows, layout, solve_shares(rows, layout, GEOMETRY))
     # GPUs 0 and 1 carry 3000 + 3 x 40 + 4 x 40 rows between them, split evenly.
     assert gpu[0] == pytest.approx(1640.0, rel=1e-8) and gpu[1] == pytest.approx(1640.0, rel=1e-8)
-
-
-def test_shares_are_deterministic_and_leave_inputs_untouched():
     rows, layout = _random_case(np.random.default_rng(7))
     rows_copy, layout_copy = rows.copy(), layout.copy()
     first = solve_shares(rows, layout, GEOMETRY)

@@ -624,8 +624,18 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
         return decision.decider.decide(number)
 
     assert window(0, 6).tables == {}  # GPU 1 is the busiest: the copy would load it further
-    assert window(1, 2).tables == {} and max(seen["gains"][-1].values()) < 0  # loses on window 0
+    assert window(1, 2).tables == {} and seen["gains"][-1] == {}  # loses to home on window 0
     assert sorted(window(2, 2).tables) == [0, 1]  # gains on both windows: installed
+    # Even rows while that install is not live, then expert 6 hot with it live: copying expert 6 to
+    # GPU 0 gains most on this window, but on the previous one the home layout beats it: home.
+    candidate[:] = np.where(np.arange(R * LOCAL) == 4, 6, HOME)
+    window_stats(decision.stats.numpy(), range(E))
+    assert decision.decider.decide(3).tables == {}
+    stats = window_stats(decision.stats.numpy(), range(E))
+    stats[:, 6 : L * E : E], stats[:, L * (E + 1) : L * (E + 2)] = 1600, 2
+    update = decision.decider.decide(4)
+    assert sorted(update.tables) == [0, 1] and update.moved == []
+    assert (decision.decider.layout == HOME).all()
 
 
 def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
@@ -643,6 +653,22 @@ def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
         assert sorted(update.tables) == ([0, 1] if w == 1 else []) and update.moved == []
         assert not update.copy_items and (decider.layout == HOME).all()
         decider.schedule(w, np.array([[10 + 20 * w, 0, 0.0, 0]] * R))
+
+
+def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    decider = FakeDecision(0, copy_ms=0.5).decider
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    requests = L * (E + 2) + rt.FIELDS.index("requests")
+    window_stats(decider.stats)[:, requests] = 40  # GPU 0's experts 0 and 1 are hot: replicas
+    assert decider.decide(0).moved == [0, 1]
+    decider.schedule(0, np.array([[10, 2, 1.0, 0]] * R))
+    # The same rows, installs live, but the batch fell from 80 requests to 4 by the close: one
+    # window ahead at that rate, a replica's weight stream costs more than the rows it takes.
+    window_stats(decider.stats)[:, L * (E + 1) : L * (E + 2)] = 0
+    decider.stats[:, requests] = 2
+    update = decider.decide(1)
+    assert sorted(update.tables) == [0, 1] and update.moved == [] and (decider.layout == HOME).all()
 
 
 def test_decision_process_answers_and_reports_its_failure():

@@ -58,7 +58,7 @@ def _counts(*values: float) -> torch.Tensor:
 
 def test_a_layer_built_outside_the_balancer_registers_nothing():
     """``unbalanced_layer`` hides the balancer while a layer outside it is built, drops that layer's
-    repeat count and restores the balancer, also on error."""
+    repeat count and restores the balancer, also on error. A layer that does not fit is refused."""
     balancer = _balancer()
     with balancer:
         balancer.set_repeated_for_next_layer(3)
@@ -74,10 +74,6 @@ def test_a_layer_built_outside_the_balancer_registers_nothing():
     with pytest.raises(RuntimeError, match="only the current"):
         with balancer.unbalanced_layer():
             pass
-
-
-def test_layers_are_checked_against_the_slots():
-    balancer = _balancer()
     with pytest.raises(ValueError, match="multiple of `ep_size`"):
         balancer.add_layer(6, TOP_K, NUM_SLOTS // EP_SIZE)
     with pytest.raises(ValueError, match="local slots"):
