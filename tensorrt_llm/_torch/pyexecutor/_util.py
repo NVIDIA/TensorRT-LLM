@@ -2234,6 +2234,15 @@ class KvCacheCreator:
                 "share one KV cache manager "
                 f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
             )
+        elif (self._is_disagg and
+              os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in ("1", "auto")):
+            # The request check above only rejects the variable set to 1 with a
+            # drafter that can share; everything else resolves quietly.
+            logger.info(
+                f"TRTLLM_DISAGG_SHARED_DRAFT_KV="
+                f"{os.environ['TRTLLM_DISAGG_SHARED_DRAFT_KV']} resolved to a "
+                f"separate draft KV cache, because {self._dflash_unify_blocker()}."
+            )
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=self._model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,

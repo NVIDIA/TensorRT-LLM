@@ -190,7 +190,9 @@ class PeerRegistrar:
                 "PeerRegistrar: unified draft KV layer count differs "
                 f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
                 "both peers must use the same speculative decoding KV cache layout; "
-                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers."
+                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers, or "
+                "the 'auto' setting resolved differently on the two workers; "
+                "check the shared-draft-KV decision logged at startup."
             )
         # Draft layers carry the target's KV heads per rank, so they move with
         # the target's head mapping only when both sides shard heads alike. A

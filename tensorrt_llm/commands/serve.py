@@ -3057,8 +3057,21 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
     if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
-        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = _shared_draft_kv_default(
-            disagg_cfg.server_configs, blocker)
+        resolved = _shared_draft_kv_default(disagg_cfg.server_configs, blocker)
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = resolved
+        if blocker is not None:
+            reason = blocker
+        elif resolved == "0":
+            reason = ("the configuration lists only context or only generation "
+                      "servers; sharing across separate launches needs the "
+                      "variable set to 1 on both")
+        else:
+            reason = (
+                "the context and generation configurations pass every check; "
+                "each worker logs its own shared-draft-KV decision")
+        logger.info(
+            f"TRTLLM_DISAGG_SHARED_DRAFT_KV unset or 'auto' resolved to "
+            f"'{resolved}': {reason}.")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
