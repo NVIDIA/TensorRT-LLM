@@ -207,7 +207,15 @@ def _fake_files(monkeypatch, files):
         except KeyError as error:
             raise FileNotFoundError(path) from error
 
+    def iterdir(path):
+        prefix = f"{path}/"
+        names = {name[len(prefix) :].split("/", 1)[0] for name in files if name.startswith(prefix)}
+        if not names:
+            raise FileNotFoundError(path)
+        return iter(sorted(path / name for name in names))
+
     monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
 
 
 @pytest.mark.parametrize(
@@ -269,6 +277,39 @@ def _fake_files(monkeypatch, files):
             },
             1000,
             id="usage-never-below-zero",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # The process's own protection does not hide its page cache from it.
+                "/sys/fs/cgroup/jobs/worker/memory.min": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "300\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 200\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+                # The sibling protects all 800 of its page cache.
+                "/sys/fs/cgroup/jobs/sibling/memory.min": "960\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.stat": "active_file 800\n",
+            },
+            380,
+            id="v2-protected-sibling-cache-not-credited",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1500\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1600\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 900\ninactive_file 300\n",
+                "/sys/fs/cgroup/jobs/a/memory.low": "max\n",
+                "/sys/fs/cgroup/jobs/a/memory.stat": "active_file 500\ninactive_file 100\n",
+                "/sys/fs/cgroup/jobs/b/memory.min": "100\n",
+                "/sys/fs/cgroup/jobs/b/memory.low": "50\n",
+                "/sys/fs/cgroup/jobs/b/memory.stat": "inactive_file 300\n",
+                "/sys/fs/cgroup/jobs/c/memory.stat": "inactive_file 300\n",
+            },
+            600,
+            id="v2-protection-up-to-min-low-or-max",
         ),
     ],
 )

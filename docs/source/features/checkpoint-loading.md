@@ -379,6 +379,9 @@ options to speed up weight loading via efficient streaming from storage.
   checkpoints that earlier loads left cached, counts as available, as it does
   for host memory, because the kernel reclaims it before the cgroup runs out
   of memory.
+  On cgroup v2, page cache that another child of a limited cgroup protects with
+  `memory.min` or `memory.low` does not count, because reclaim for that limit
+  keeps it or takes it last.
 - `auto` (default): use `rank_striped_read_ahead` when the load supports it,
   and `native` I/O otherwise.
 
