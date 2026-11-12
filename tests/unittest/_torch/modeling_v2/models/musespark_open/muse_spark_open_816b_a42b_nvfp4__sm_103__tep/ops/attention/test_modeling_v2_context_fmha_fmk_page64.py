@@ -109,7 +109,9 @@ def test_block_index_math_addresses_the_same_keys(cache_page):
                 box = (pid * HKV + kvh) * boxes_per_block + half if pid >= 0 else oob_box
                 first_key = t * TILE_N + 32 * p
                 if first_key >= num_blocks * cache_page:
-                    assert box == oob_box  # a box past the last block is zero-filled by the TMA unit
+                    assert (
+                        box == oob_box
+                    )  # a box past the last block is zero-filled by the TMA unit
                     continue
                 # The pool is [blocks, kv_heads, cache_page, D]; a box is 32 consecutive tokens of
                 # D bytes: its byte offset is box * 32 * D.
