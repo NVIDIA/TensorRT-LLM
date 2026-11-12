@@ -36,6 +36,15 @@ add_tllm_gtest(
 add_tllm_gtest(attentionWorkspaceTest SOURCES attentionWorkspaceTest.cpp
                FULL_STACK LABELS "unit;full-stack;gpu")
 add_tllm_gtest(
+  cublasHandlePoolTest
+  OWNER
+  common
+  SOURCES
+  cublasHandlePoolTest.cpp
+  FULL_STACK
+  LABELS
+  "unit;full-stack;gpu")
+add_tllm_gtest(
   memoryUtilsTest
   OWNER
   common
