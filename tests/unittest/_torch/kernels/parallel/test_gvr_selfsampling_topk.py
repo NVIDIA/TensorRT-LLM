@@ -939,14 +939,53 @@ def test_selfsampling_hopper_clusters_are_coresident() -> None:
     assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 148, 100)[2] == 10
     assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 132, 90)[2] == 5
     # K=2048: 32 rows of 4-CTA clusters do not co-reside on Hopper, so 16-bit rows that no 2-CTA
-    # register cluster holds stream through 2-CTA clusters there; Blackwell keeps its plans
+    # register cluster holds stream through 3-CTA clusters on 132 SMs and 2-CTA ones on the H20;
+    # Blackwell keeps its plans
     for dtype in (torch.bfloat16, torch.float16):
         for n in (65551, 131087, 163775):
-            plan = ss_host._route_16bit(32, n, n, 2048, 132, 90, dtype=dtype)
-            assert (plan["kernel"], plan["cluster"]) == ("clus", 2), (dtype, n, plan)
+            for num_sms, cs in ((132, 3), (78, 2)):
+                plan = ss_host._route_16bit(32, n, n, 2048, num_sms, 90, dtype=dtype)
+                assert (plan["kernel"], plan["cluster"]) == ("clus", cs), (dtype, n, plan)
     for n in (65551, 131087, 163775):
         plan = ss_host._route_16bit(32, n, n, 2048, 148, 100, dtype=torch.bfloat16)
         assert plan["cluster"] == 4, (n, plan)
+
+
+def test_selfsampling_hopper_three_cta_clusters() -> None:
+    """132-SM Hopper parts co-schedule 39 three-CTA clusters but only 30 four-CTA ones, so 31- and
+    32-row batches split a row over three CTAs rather than two where the third rank pays for its
+    sample floor and merge: 16-bit K = 2048 rows, 16-bit K <= 1024 rows above 192K scores and FP32
+    rows whose U=8 chunks deal evenly; FP16 K = 2048 code-radix clusters take three CTAs at 31-39
+    rows. The H20 and Blackwell keep their clusters."""
+    for b in (31, 32):
+        for dtype in (torch.bfloat16, torch.float16):
+            for k, n, cs in (
+                (512, 131075, 2),
+                (512, 262127, 3),
+                (1024, 131075, 2),
+                (1024, 262127, 3),
+                (2048, 65551, 3),
+                (2048, 163775, 3),
+            ):
+                plan = ss_host._route_16bit(b, n, n, k, 132, 90, dtype=dtype)
+                assert (plan["kernel"], plan["cluster"]) == ("clus", cs), (b, dtype, k, n, plan)
+        for k, n, cs in ((1024, 131075, 2), (512, 262127, 3), (1024, 262127, 3)):
+            plan = ss_host.route(b, n, n, k, 132, 90)
+            assert (plan["kernel"], plan["cluster"]) == ("clus", cs), (b, k, n, plan)
+    assert (
+        ss_host._route_16bit(33, 262127, 262127, 1024, 132, 90, dtype=torch.bfloat16)["cluster"]
+        == 2
+    )
+    for b in (31, 39):
+        assert ss_host._code_radix_cluster_plan_fp16(2048, 32783, b, 132, 90)[1:3] == (3, 3), b
+        assert ss_host._code_radix_cluster_plan_fp16(2048, 65551, b, 132, 90)[1:3] == (6, 3), b
+    assert ss_host._code_radix_cluster_plan_fp16(2048, 65551, 40, 132, 90)[2] == 2
+    for num_sms, sm_version, cs in ((78, 90, 2), (148, 100, 4)):
+        plan = ss_host._route_16bit(
+            32, 163775, 163775, 2048, num_sms, sm_version, dtype=torch.bfloat16
+        )
+        assert plan["cluster"] == cs, (num_sms, plan)
+        assert ss_host.route(32, 262127, 262127, 1024, num_sms, sm_version)["cluster"] == cs
 
 
 def test_selfsampling_hopper_bf16_rows_past_coresident_register_clusters() -> None:

@@ -16221,7 +16221,7 @@ def reg_topk(logits, pre_idx, n, out, rd=None):
 gvr_main.
 
 Ctor knobs (compile-time, mirror of the CUDA template params):
-    BLK = 1024, U ∈ {1,2,4,8}, MINB = 1, NBS = 256, CS ∈ {2,4,8}
+    BLK = 1024, U ∈ {1,2,4,8}, MINB = 1, NBS = 256, CS ∈ {2,3,4,8}
     (+ scap/cmp smem-extent knobs: every reachable route has 8192/2048 —
      SCAP/CMP stay LIVE runtime args for all value logic, ABI parity).
 Derived: HB=NBS, STEPC=BLK*U, PFD=min(U,4).
@@ -16386,8 +16386,8 @@ class GvrClusKernel:
     ``dtype`` is Float32, BFloat16 or Float16. 16-bit builds read 16-byte vectors of
     eight elements and require ``hint_free``; ``det`` is FP32-only (the host never
     builds it for 16-bit logits). ``sample_floor`` is the minimum sample count of the
-    varlen ladder of 16-bit builds (FP32: 256). ``envf`` and the ``*_bf16`` knobs act
-    only on BFloat16 with ``det`` off:
+    varlen ladder of 16-bit and 3-CTA builds (other FP32 builds: 256). ``envf`` and the
+    ``*_bf16`` knobs act only on BFloat16 with ``det`` off:
 
     - ``envf`` (varlen only): SMP/TGT/SS2/TGT2 carry the ladder of the envelope
       length ``n``; its sample is loaded before the prologue, and rows of length
@@ -16431,7 +16431,7 @@ class GvrClusKernel:
         self.push_merge_bf16 = (
             bool(push_merge_bf16) and dtype is cutlass.BFloat16 and not self.det and nbs == 256
         )
-        self.sample_floor = 256 if dtype is cutlass.Float32 else int(sample_floor)
+        self.sample_floor = 256 if dtype is cutlass.Float32 and cs != 3 else int(sample_floor)
         self.envf = bool(envf) and dtype is cutlass.BFloat16 and bool(varlen) and not bool(det)
         self.async_refine_bf16 = (
             bool(async_refine_bf16) and dtype is cutlass.BFloat16 and not self.det
@@ -16450,7 +16450,7 @@ class GvrClusKernel:
         if dtype is not cutlass.Float32:
             assert bool(hint_free), "16-bit arm is hint-free"
         assert nbs == 256, "SNB must stay 256"
-        assert u in (1, 2, 4, 8) and cs in (2, 4, 8)
+        assert u in (1, 2, 4, 8) and cs in (2, 3, 4, 8)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel / GvrRegClusKernel): n and the sampling-
         # ladder scalars are re-derived PER ROW in-kernel from a device
@@ -16463,7 +16463,6 @@ class GvrClusKernel:
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
         self.hint_free = bool(hint_free)  # hint-free: gather_hint sites compiled out
-        self.lcs = cs.bit_length() - 1  # log2(CS) for the per-row Q shift
         self.blk = blk
         self.u = u
         self.minb = minb
@@ -18962,8 +18961,8 @@ def get_compiled__clus(
     host route's wave budget (``wave_sms()`` in the host module).
 
     ``dtype`` is the logits tag ('f32', 'bf16' or 'f16'); 16-bit tags need
-    ``hint_free`` and ``det=False``. ``sample_floor`` applies to the 16-bit tags,
-    ``envf`` and the ``*_bf16`` options to 'bf16' only; see GvrClusKernel.
+    ``hint_free`` and ``det=False``. ``sample_floor`` applies to the 16-bit tags and to
+    3-CTA clusters, ``envf`` and the ``*_bf16`` options to 'bf16' only; see GvrClusKernel.
     """
     if det:
         assert dtype == "f32", "deterministic mode is fp32-only"
@@ -18972,7 +18971,7 @@ def get_compiled__clus(
             tuple(tpl),
             scap,
             cmp_,
-            int(sample_floor) if dtype != "f32" else 256,
+            int(sample_floor) if dtype != "f32" or tpl[4] == 3 else 256,
             bool(async_refine_bf16) if dtype == "bf16" else False,
             bool(fused_merge_bf16) if dtype == "bf16" else False,
             options_extra,

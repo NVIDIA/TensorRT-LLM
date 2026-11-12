@@ -228,6 +228,42 @@ def _wide_slab(
     return not (regsel and k == 1024 and n < 131072)
 
 
+def _three_cta_clusters(b: int, num_sms: int, sm_version: int) -> bool:
+    """Whether ``b`` rows whose 4-CTA clusters a Hopper GPU cannot co-schedule take 3-CTA ones.
+
+    The 132-SM parts co-schedule 39 clusters of three CTAs but only 30 of four, so this holds for
+    31-39 rows there. The streaming rungs split rows over four CTAs only in batches of up to 32
+    rows, so their 31- and 32-row batches can split a row over three CTAs rather than two (each
+    rung adds its own row conditions); FP16 K=2048 code-radix clusters just above 32K and 64K
+    scores take three CTAs at 31-39 rows. The H20 keeps its 2-CTA plans.
+    """
+    return (
+        sm_version not in _BLACKWELL_SM_VERSIONS
+        and num_sms not in _HOPPER_BLACKWELL_BANDWIDTH_SMS
+        and not cluster_fits(4, b, num_sms, sm_version)
+        and cluster_fits(3, b, num_sms, sm_version)
+    )
+
+
+def _even_chunk_u(vectors: int, u: int) -> int:
+    """U of a 3-CTA ``clus`` plan over rows of ``vectors`` 4-element vectors.
+
+    ``gvr_clus`` deals a row's chunks of 1024 * U vectors to the cluster ranks in turn, so with
+    three ranks one rank can stream up to 1.5x an even third of a row of three or more chunks.
+    ``u`` halves (down to 1) while the most loaded rank holds more than 5/4 of an even third. The
+    16-bit arms then halve U for their 8-element vectors, which keeps the same chunks.
+    """
+    while u > 1:
+        step = 1024 * u
+        loads = [0, 0, 0]
+        for chunk in range(-(-vectors // step)):
+            loads[chunk % 3] += min(step, vectors - chunk * step)
+        if 12 * max(loads) <= 5 * vectors:
+            break
+        u //= 2
+    return u
+
+
 def route(
     b: int,
     n: int,
@@ -458,6 +494,16 @@ def route(
             p2 = 4
         while p2 > 2 and not cluster_fits(p2, b, num_sms, sm_version):
             p2 >>= 1
+        # FP32 rows take 3-CTA clusters where U=8 chunks split evenly over them: sm_90a spills the
+        # U=4 builds, and the smaller-U builds of the batch-uniform deterministic arm
+        if (
+            p2 == 2
+            and R >= 3
+            and _three_cta_clusters(b, num_sms, sm_version)
+            and ((n >> 2) + 2) // 3 >= 8 * 1024
+            and _even_chunk_u(n >> 2, 8) == 8
+        ):
+            p2 = 3
         R = p2
         useclus = True
 
@@ -517,8 +563,9 @@ def route(
     if useclus:
         if n > SCAP and n4s >= 4:  # QUAD override
             sel = SFAC * n // aim
-            if sel < 256:
-                sel = 256
+            sel_floor = 3072 if R == 3 else 256  # the kernel's 3-CTA sample floor
+            if sel < sel_floor:
+                sel = sel_floor
             if sel > n // 2:
                 sel = n // 2
             quads = sel >> 4
@@ -544,7 +591,9 @@ def route(
         smc = SNB * 8 + (SCAP + 4) * 8 + CMP * 8
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
-        CS = 2 if R == 2 else (4 if R == 4 else 8)
+        if R == 3:
+            U = _even_chunk_u(n4s, U)
+        CS = R if R in (2, 3, 4) else 8
         return {
             "kernel": "clus",
             "tpl": (1024, U, 1, SNB, CS),
@@ -747,7 +796,8 @@ def route_dynamic(
     q_ = (n4s + R - 1) // R
     if fam == "clus" and n > scap and n4s >= 4:
         sel = sfac * n // aim
-        sel = 256 if sel < 256 else sel
+        sel_floor = 3072 if R == 3 else 256
+        sel = sel_floor if sel < sel_floor else sel
         sel = n // 2 if sel > n // 2 else sel
         quads = max(sel >> 4, 1)
         quarter = max(n4s >> 2, 1)
@@ -819,6 +869,16 @@ def route_streaming(
             p2 = 4
         while p2 > 2 and not cluster_fits(p2, b, num_sms, sm_version):
             p2 >>= 1
+        # FP32 rows take 3-CTA clusters where U=8 chunks split evenly over them: sm_90a spills the
+        # U=4 builds, and the smaller-U builds of the batch-uniform deterministic arm
+        if (
+            p2 == 2
+            and R >= 3
+            and _three_cta_clusters(b, num_sms, sm_version)
+            and ((n >> 2) + 2) // 3 >= 8 * 1024
+            and _even_chunk_u(n >> 2, 8) == 8
+        ):
+            p2 = 3
         R = p2
         useclus = True
     big = b * R <= wave
@@ -854,7 +914,7 @@ def route_streaming(
     q_ = (n4s + R - 1) // R
     if useclus:
         if n > scap and n4s >= 4:
-            sel = min(max(sfac * n // aim, 256), n // 2)
+            sel = min(max(sfac * n // aim, 3072 if R == 3 else 256), n // 2)
             quads = min(max(sel >> 4, 1), max(n4s >> 2, 1))
             quarter = max(n4s >> 2, 1)
             ss2 = max(quarter // quads, 1)
@@ -864,7 +924,9 @@ def route_streaming(
         smc = SNB * 8 + (scap + 4) * 8 + cmp_ * 8
         per = q_ >> 10
         u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
-        cs = 2 if R == 2 else (4 if R == 4 else 8)
+        if R == 3:
+            u_ = _even_chunk_u(n4s, u_)
+        cs = R if R in (2, 3, 4) else 8
         return {
             "kernel": "clus",
             "tpl": (1024, u_, 1, SNB, cs),
@@ -1145,6 +1207,9 @@ def _route_table_16bit(
             p2 = 4
         while p2 > 2 and not cluster_fits(p2, b, num_sms, sm_version):
             p2 >>= 1
+        if p2 == 2 and R >= 3 and _three_cta_clusters(b, num_sms, sm_version) and n > 3 * 65536:
+            # rows of more than 192K scores: each of the three ranks still streams 64K or more
+            p2 = 3
         R = p2
         useclus = True
 
@@ -1204,8 +1269,9 @@ def _route_table_16bit(
     if useclus:
         if n > SCAP and n4s >= 4:  # QUAD override
             sel = SFAC * n // aim
-            if sel < 256:
-                sel = 256
+            sel_floor = 3072 if R == 3 else 256  # the kernel's 3-CTA sample floor
+            if sel < sel_floor:
+                sel = sel_floor
             if sel > n // 2:
                 sel = n // 2
             quads = sel >> 4
@@ -1231,7 +1297,9 @@ def _route_table_16bit(
         smc = SNB * 8 + (SCAP + 4) * 8 + CMP * 8
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
-        CS = 2 if R == 2 else (4 if R == 4 else 8)
+        if R == 3:
+            U = _even_chunk_u(n4s, U)
+        CS = R if R in (2, 3, 4) else 8
         return {
             "kernel": "clus",
             "tpl": (1024, U, 1, SNB, CS),
@@ -1392,6 +1460,8 @@ def _clus_plan_bf16(
     q_ = (n4s + R - 1) // R
     per = q_ >> 10
     u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
+    if R == 3:
+        u_ = _even_chunk_u(n4s, u_)
     return {
         "kernel": "clus",
         "tpl": (1024, u_, 1, SNB, R),
@@ -1666,8 +1736,9 @@ def _route_16bit(
             and cluster_fits(2, b, num_sms, sm_version)
         ):
             # Hopper K=2048 rows whose 4-CTA clusters do not co-reside (32 rows) stream through
-            # 2-CTA clusters, which is faster than the split main slab
-            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 2, wave), b, n, k)
+            # 3-CTA clusters where those co-reside, else 2-CTA ones; both beat the split main slab
+            ranks = 3 if _three_cta_clusters(b, num_sms, sm_version) else 2
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, ranks, wave), b, n, k)
     if plan["kernel"] in ("main", "clus"):
         plan = _halve_u_streaming_16bit(plan, b, n, k)
     elif plan["kernel"] == "reg_clus":
@@ -2251,12 +2322,14 @@ def _main_samp_rounds_fp16(n, k, blk, kpt, split, r_const, aim_base, sfac, amin,
     return min(rounds, 4) if rounds >= 2 else 0
 
 
-def _code_radix_cluster_plans_fp16(k: int, n_kernel: int, num_rows: int, num_sms: int):
+def _code_radix_cluster_plans_fp16(
+    k: int, n_kernel: int, num_rows: int, num_sms: int, sm_version: int = 100
+):
     """FP16 cluster code-radix geometries, preferred first.
 
     Each is ``(blk, vpt, cluster_size, candidate_list)``. Only envelopes just above 8K, 16K, 32K,
     64K and 128K, or just below 160K and 256K, have any; the choice depends on K and on how many
-    rows fit the SMs.
+    rows fit the SMs (Hopper rows of 3-CTA clusters: ``_three_cta_clusters``).
     """
     if 8192 < n_kernel <= 8192 + 64 and (
         (k == 512 and num_rows <= 32) or (k == 2048 and num_rows <= 2)
@@ -2281,6 +2354,8 @@ def _code_radix_cluster_plans_fp16(k: int, n_kernel: int, num_rows: int, num_sms
             yield (512, 4, 4, False)
         if k <= 1024 and num_rows * 2 <= num_sms:
             yield (512, 8, 2, True)
+        if k == 2048 and _three_cta_clusters(num_rows, num_sms, sm_version):
+            yield (1024, 3, 3, True)
     if 65536 < n_kernel <= 65536 + 512:
         if num_rows <= 8 or (k == 2048 and num_rows <= 18):
             yield (512, 4, 8, True)
@@ -2288,6 +2363,8 @@ def _code_radix_cluster_plans_fp16(k: int, n_kernel: int, num_rows: int, num_sms
             yield (512, 8, 4, True) if k <= 1024 else (1024, 4, 4, True)
         if num_rows <= 64:
             yield (512, 8, 4, True)
+        if k == 2048 and _three_cta_clusters(num_rows, num_sms, sm_version):
+            yield (1024, 6, 3, True)
         if num_rows * 2 <= num_sms:
             yield (1024, 8, 2, True)
     if 131072 < n_kernel <= 131072 + 512:
@@ -2314,7 +2391,7 @@ def _code_radix_cluster_plan_fp16(
     return next(
         (
             plan
-            for plan in _code_radix_cluster_plans_fp16(k, n_kernel, num_rows, num_sms)
+            for plan in _code_radix_cluster_plans_fp16(k, n_kernel, num_rows, num_sms, sm_version)
             if cluster_fits(plan[2], num_rows, num_sms, sm_version)
         ),
         None,
@@ -3172,11 +3249,15 @@ def _varlen_launcher(
         ):
             # the Hopper 2-CTA fallback of 32-row K=2048 batches samples like the 4-CTA K=2048 rung
             clus_options["sample_floor"] = 3072
+        if int(plan_free["tpl"][4]) == 3:
+            # 3-CTA clusters take the cs != 2 sampling factor with a row split over only three
+            # CTAs; below 3072 samples their first attempt misses K on many rows
+            clus_options["sample_floor"] = 3072
         if dtype is torch.bfloat16:
             clus_options["envf"] = True
         if dtype is torch.bfloat16:
             clus_options["async_refine_bf16"] = True
-        if dtype is torch.bfloat16 and int(plan_free["tpl"][4]) >= 4:
+        if dtype is torch.bfloat16 and int(plan_free["tpl"][4]) >= 3:
             clus_options["fused_merge_bf16"] = True
         if dtype is torch.bfloat16 and k <= 1024:
             clus_options["push_merge_bf16"] = True
