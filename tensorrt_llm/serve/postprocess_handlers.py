@@ -118,6 +118,10 @@ class ChatPostprocArgs(PostprocArgs):
     tool_parser_grammar_constrained: bool = False
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
+    # Per-output flag: the stream already carried that output's finish_reason.
+    # With n > 1 every response lists all outputs, so an output that finished
+    # earlier is listed again by each later response and must be skipped.
+    finish_reason_sent: dict[int, bool] = field(default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
@@ -447,7 +451,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         return data
 
     res: List[str] = []
-    finish_reason_sent = [False] * args.num_choices
+    finish_reason_sent = args.finish_reason_sent
     # num_prompt_tokens stays None until a prompt length is recorded, and only
     # the usage branches below consume it, so offset it only once it exists.
     prompt_tokens = args.num_prompt_tokens
@@ -487,7 +491,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
     for output in rsp.outputs:
         i = output.index
 
-        if finish_reason_sent[i]:
+        if finish_reason_sent.get(i, False):
             continue
 
         has_token_delta = bool(output.token_ids_diff)
@@ -850,6 +854,10 @@ class CompletionPostprocArgs(PostprocArgs):
     # id and created timestamp instead of regenerating them for each chunk.
     stream_response_id: Optional[str] = None
     stream_created: Optional[int] = None
+    # Per-output flag: the stream already carried that output's finish_reason.
+    # With n > 1 every response lists all outputs, so an output that finished
+    # earlier is listed again by each later response and must be skipped.
+    finish_reason_sent: dict[int, bool] = field(default_factory=dict)
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -914,6 +922,10 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         include_continuous_usage = False
 
     for output in rsp.outputs:
+        if args.finish_reason_sent.get(output.index, False):
+            continue
+        if output.finish_reason is not None:
+            args.finish_reason_sent[output.index] = True
         delta_text = output.text_diff
         if args.echo and args.first_iteration:
             delta_text = args.prompt + delta_text
