@@ -315,12 +315,9 @@ class BlockHashMixin:
         """Routing ids from :func:`render_chat_for_length`; never forwarded to a worker.
 
         A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
-        template rejects raises. The tokenizer of a Mistral-native checkpoint has no chat template
-        to estimate a length with, so its requests get no ids either.
+        template rejects raises, except for a Mistral-native checkpoint: mistral-common's
+        rejection also gets no ids, and the worker answers the request.
         """
-        if self._mistral_native:
-            logger.debug("Router cannot render this Mistral-native request; routing on no ids.")
-            return []
         try:
             return render_chat_for_length(
                 request,
@@ -329,6 +326,11 @@ class BlockHashMixin:
             ).token_ids
         except (UnsupportedRenderError, HarmonyConversionError) as error:
             logger.debug(f"Router has no length for the request ({error}); routing on no ids.")
+            return []
+        except ValueError as error:
+            if not self._mistral_native:
+                raise
+            logger.debug(f"Router could not render the request ({error}); routing on no ids.")
             return []
 
     def _render_resources(self, model: str) -> RenderResources:

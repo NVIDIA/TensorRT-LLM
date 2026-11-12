@@ -206,13 +206,13 @@ async def _preprocess(monkeypatch, store_flag):
 
         return list(messages), mm(), {}, None
 
-    async def fake_render(resources, **kwargs):
-        return SimpleNamespace(token_ids=[1, 2, 3], text=None)
+    async def fake_render(resources, mm_coroutines, **kwargs):
+        return SimpleNamespace(token_ids=[1, 2, 3], text=None), await mm_coroutines
 
     resources = SimpleNamespace(extension=SimpleNamespace(serialize_tool=lambda tool: tool))
     monkeypatch.setattr(ru, "parse_chat_messages_coroutines", fake_parse)
     monkeypatch.setattr(ru, "RenderResources", SimpleNamespace(from_parts=lambda **kw: resources))
-    monkeypatch.setattr(ru, "render_conversation", fake_render)
+    monkeypatch.setattr(ru, "render_conversation_with_media", fake_render)
     monkeypatch.setattr(ru, "resolve_top_level_model_type", lambda cfg: "llama")
     monkeypatch.setattr(ru, "add_thinking_budget_logits_processor", lambda *a, **k: None)
     monkeypatch.setattr(

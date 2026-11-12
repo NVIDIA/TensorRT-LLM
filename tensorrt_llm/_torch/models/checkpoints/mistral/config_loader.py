@@ -395,10 +395,11 @@ class MistralConfigLoader(BaseConfigLoader):
         # Native (mistral-format) checkpoints are served through the
         # mistral-common tokenizer/processor, which applies its own chat
         # template. Tag the config with a dedicated serving model_type so the
-        # serving layer resolves the PASSTHROUGH placeholder/chat-template
-        # metadata (registered under "mistral_common" in modeling_mistral.py)
-        # via the normal config path - i.e. resolve_top_level_model_type() -
-        # instead of having to inspect the live input processor.
+        # serving layer resolves the mistral-common renderer and the
+        # placeholder metadata (registered under "mistral_common" in
+        # modeling_mistral.py) via the normal config path - i.e.
+        # resolve_top_level_model_type() - instead of having to inspect the
+        # live input processor.
         model_config.pretrained_config.input_processor_type = "mistral_common"
         model_config.pretrained_config.model_type = "mistral_common"
         model_config._frozen = True

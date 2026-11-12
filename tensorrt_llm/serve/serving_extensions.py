@@ -138,6 +138,16 @@ class ServingExtension:
         """
         return effort
 
+    def render_needs_media(self) -> bool:
+        """Whether the prompt renderer needs the request's media loaded first.
+
+        The default renders the chat template while the media loads. A renderer
+        that tokenizes the media itself (it derives the media token count from
+        the decoded item) is handed the loaded ``mm_data`` instead, and cannot
+        take precomputed multimodal embeddings.
+        """
+        return False
+
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:

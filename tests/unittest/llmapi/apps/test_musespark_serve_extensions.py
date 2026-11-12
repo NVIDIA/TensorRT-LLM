@@ -424,13 +424,13 @@ class TestResponsesRenderedEffort:
     async def render(template: str, monkeypatch):
         """The rendered prompt and the kwargs the render got, for `reasoning.effort="none"`."""
         captured = {}
-        render_conversation = responses_utils.render_conversation
+        render_conversation_with_media = responses_utils.render_conversation_with_media
 
         async def spy(*args, **kwargs):
             captured.update(kwargs)
-            return await render_conversation(*args, **kwargs)
+            return await render_conversation_with_media(*args, **kwargs)
 
-        monkeypatch.setattr(responses_utils, "render_conversation", spy)
+        monkeypatch.setattr(responses_utils, "render_conversation_with_media", spy)
         request = make_responses_request(reasoning={"effort": "none"})
         prompt = await responses_prompt(
             request, byte_level_tokenizer(template), model_type="muse_spark"

@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -104,8 +104,9 @@ def _template_kwargs(
     chat_template_kwargs: Optional[Dict[str, Any]],
     injected_chat_template_kwargs: Any,
     enable_tokenize: bool,
+    mm_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return dict(
+    kwargs = dict(
         model_type=res.model_type or "",
         tokenizer=res.tokenizer,
         processor=res.processor,
@@ -119,6 +120,9 @@ def _template_kwargs(
         injected_chat_template_kwargs=injected_chat_template_kwargs,
         enable_tokenize=enable_tokenize,
     )
+    if mm_data is not None:
+        kwargs["mm_data"] = mm_data
+    return kwargs
 
 
 def tokenize_rendered(
@@ -213,8 +217,13 @@ async def render_conversation(
     add_special_tokens: bool = False,
     truncate_prompt_tokens: Optional[int] = None,
     encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
+    mm_data: Optional[Dict[str, Any]] = None,
 ) -> RenderedPrompt:
-    """Render an already-parsed conversation without blocking the event loop."""
+    """Render an already-parsed conversation without blocking the event loop.
+
+    ``mm_data`` is the loaded media, for a renderer that needs it (see
+    ``ServingExtension.render_needs_media``); others render without it.
+    """
     # A tokenizer-native template tokenizes segment by segment, so control-token strings inside
     # user or tool text stay text. Encoding the finished string would turn them into special
     # tokens, so keep the tokenizer's own ids when nothing is added after the template.
@@ -236,6 +245,7 @@ async def render_conversation(
             chat_template_kwargs=chat_template_kwargs,
             injected_chat_template_kwargs=injected_chat_template_kwargs,
             enable_tokenize=native_ids,
+            mm_data=mm_data,
         )
     )
     if tokenize:
@@ -259,6 +269,32 @@ async def render_conversation(
         truncate_prompt_tokens=truncate_prompt_tokens,
         encode_rendered=encode_rendered,
     )
+
+
+async def render_conversation_with_media(
+    res: RenderResources, mm_coroutines: Awaitable[Tuple[Any, Any]], **render_kwargs: Any
+) -> Tuple[RenderedPrompt, Tuple[Any, Any]]:
+    """Render a parsed conversation and load its media.
+
+    Returns ``(rendered, (mm_data, mm_embeddings))``. Rendering overlaps the media
+    loading, unless the model's renderer needs the loaded media (see
+    ``ServingExtension.render_needs_media``); it then renders afterwards, from the
+    loaded media, which rules out precomputed embeddings. ``render_kwargs`` are
+    those of :func:`render_conversation`.
+    """
+    if not res.extension.render_needs_media():
+        rendered, media = await asyncio.gather(
+            render_conversation(res, **render_kwargs), mm_coroutines
+        )
+        return rendered, media
+    mm_data, mm_embeddings = await mm_coroutines
+    if mm_embeddings:
+        raise ValueError(
+            "This model renders its prompt from the loaded media, so it cannot take "
+            "multimodal embeddings."
+        )
+    rendered = await render_conversation(res, mm_data=mm_data, **render_kwargs)
+    return rendered, (mm_data, mm_embeddings)
 
 
 _MEDIA_PART_MARKERS = ("image", "video", "audio")

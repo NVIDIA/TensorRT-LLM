@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import hashlib
 import json
+from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens
 from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer
@@ -65,6 +67,24 @@ class MistralTokenizer(TransformersTokenizer):
         # tokenizer. Rebuild this class from the transformers wrapper instead;
         # mistral-common pickles the tokenizer by the path of its file.
         return (self.__class__, (self.transformers_tokenizer,))
+
+    @functools.cached_property
+    def encoding_identity(self) -> Optional[dict]:
+        """What turns text, images and chats into ids, for the rendering fingerprint.
+
+        mistral-common reads all of it from the tokenizer file (vocabulary, pattern,
+        control tokens, image and model settings) and renders chats with its own code,
+        so the identity is the file's digest and mistral-common's version. ``None``
+        when the file is not known.
+        """
+        path = getattr(self.tokenizer, "file_path", None)
+        if path is None or not Path(path).is_file():
+            return None
+        return {
+            "kind": "mistral_common",
+            "file_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            "mistral_common": package_version("mistral_common"),
+        }
 
     def _get_special_tokens(self, all_special_ids: list[int]) -> list[str]:
         from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
