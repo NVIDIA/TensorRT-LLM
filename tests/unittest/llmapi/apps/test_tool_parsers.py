@@ -7115,7 +7115,7 @@ class TestChatStreamFinishChunk:
             rsp = SimpleNamespace(outputs=outputs,
                                   cached_tokens=0,
                                   id="test-request",
-                                  _done=last)
+                                  finished=last)
             for line in chat_stream_post_processor(rsp, args):
                 payloads.append(json.loads(line[len("data: "):]))
         return payloads
