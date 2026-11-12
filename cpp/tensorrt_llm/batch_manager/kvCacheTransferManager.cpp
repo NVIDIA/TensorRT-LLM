@@ -29,6 +29,8 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
+#include "tensorrt_llm/batch_manager/kvCacheTransferProfiler.h"
+
 namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 namespace kvc = tensorrt_llm::executor::kv_cache;
@@ -104,6 +106,38 @@ tk::KVCacheIndex::UnderlyingType KVCacheTransferManager::getPendingTransferIndex
     return block->isPrimary() ? blockOffset : blockOffset | tk::KVCacheIndex::kSecondaryPoolFlag;
 }
 
+namespace
+{
+struct PoolTransferSize
+{
+    std::size_t bytes;
+    int tokens;
+    bool partial;
+};
+
+//! Match the copy layout using actual allocation bytes, including sub-byte packed data types.
+PoolTransferSize poolTransferSize(KVCacheBlockPool const& pool, int requestedTokens)
+{
+    if (!pool.primaryPtr || pool.primaryPtr->getSize() == 0)
+    {
+        return {0, 0, false};
+    }
+    auto const& shape = pool.primaryPtr->getShape();
+    auto const numBlocks = static_cast<std::size_t>(shape.d[pool.layerFirstLayout ? 1 : 0]);
+    auto const blockBytes = pool.primaryPtr->getSizeInBytes() / numBlocks;
+    auto const dataType = pool.primaryPtr->getDataType();
+    bool const partial = !pool.layerFirstLayout && requestedTokens > 0 && requestedTokens < pool.tokensPerBlock
+        && dataType != tensorrt_llm::DataType::kINT4 && dataType != tensorrt_llm::DataType::kFP4
+        && !pool.containsBlockScales;
+    auto const tokens = partial ? requestedTokens : pool.tokensPerBlock;
+    return {partial ? blockBytes / static_cast<std::size_t>(pool.tokensPerBlock) * static_cast<std::size_t>(tokens)
+                    : blockBytes,
+        tokens, partial};
+}
+} // namespace
+
+//! Copy KV blocks through the selected memory or file transport, honoring supported partial-copy layouts.
+//! Direct DRAM host/device copies may emit submission metadata; device reuse and file transfers do not.
 void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
@@ -119,6 +153,25 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
         {
             auto const& pool = pools[poolIdx];
+
+            auto const transferSize = poolTransferSize(pool, numTokensToCopy);
+            auto const stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
+            detail::KvCacheTransferScope scope;
+            scope.startHostDeviceCopy(*(src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr),
+                *(dst->isPrimary() ? pool.primaryPtr : pool.secondaryPtr), detail::KvManagerVersion::kV1,
+                transferSize.bytes, stream,
+                [&](auto& metadata)
+                {
+                    metadata.add("kv.pool_index", static_cast<std::int64_t>(poolIdx));
+                    metadata.add("kv.source_block_id", src->getBlockId());
+                    metadata.add("kv.destination_block_id", dst->getBlockId());
+                    metadata.add("kv.source_block_index", src->getMemoryPoolBlockIndex());
+                    metadata.add("kv.destination_block_index", dst->getMemoryPoolBlockIndex());
+                    metadata.add("kv.requested_tokens", numTokensToCopy);
+                    metadata.add("kv.copied_tokens", transferSize.tokens);
+                    metadata.add("kv.tokens_per_block", pool.tokensPerBlock);
+                    metadata.add("kv.num_layers", pool.numLayers);
+                });
 
             // For layer-first layout pools, block data is non-contiguous across layers.
             // Pool shape: {numLayers, numBlocks, kvFactor, blockSize}. For a fixed block
@@ -150,7 +203,6 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 auto* srcBase = static_cast<char*>(srcPool->data()) + srcBlockIdx * rowBytes;
                 auto* dstBase = static_cast<char*>(dstPool->data()) + dstBlockIdx * rowBytes;
 
-                auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
                 TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstBase, dstLayerStrideBytes, srcBase, srcLayerStrideBytes, rowBytes,
                     static_cast<size_t>(pool.numLayers), cudaMemcpyDefault, stream));
                 continue;
@@ -159,41 +211,16 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             auto srcPtr = computeBlockPointer(src, pools, poolIdx);
             auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
 
-            // Does it contain block scales?
-            auto containsBlockScales = pool.containsBlockScales;
-
-            // If no partial tokens or if the dataType is not supported for partial copy, copy entire block.
-            // Note that nvfp4 kv cache SFs use an interleaved layout, so we need to copy the entire block.
-            if (numTokensToCopy <= 0 || srcPtr->getDataType() == tensorrt_llm::DataType::kINT4
-                || srcPtr->getDataType() == tensorrt_llm::DataType::kFP4 || containsBlockScales)
+            if (!transferSize.partial)
             {
-                // For partial copy not implemented with these data types,
-                // just do a full copy.
                 (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
             }
             else
             {
-                int const tokensPerBlock = pool.tokensPerBlock;
-                if (numTokensToCopy >= tokensPerBlock)
-                {
-                    // If requested tokens >= entire block, just do a full copy.
-                    (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
-                }
-                else
-                {
-                    auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
-                    int const numLayers = pool.numLayers;
-                    int const kvFactor = pool.kvFactor;
-                    int const numHeads = pool.numKvHeads;
-                    int const sizePerHead = pool.sizePerHead;
-                    auto shape = srcPtr->getShape();
-
-                    TLLM_CHECK_WITH_INFO(
-                        shape.nbDims == 4, "Expected KVCache block to have 4 dims, got %d", shape.nbDims);
-
-                    tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead,
-                        numTokensToCopy, kvFactor, stream);
-                }
+                auto const shape = srcPtr->getShape();
+                TLLM_CHECK_WITH_INFO(shape.nbDims == 4, "Expected KVCache block to have 4 dims, got %d", shape.nbDims);
+                tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, pool.numLayers, pool.numKvHeads, pool.tokensPerBlock,
+                    pool.sizePerHead, numTokensToCopy, pool.kvFactor, stream);
             }
         }
 
@@ -447,37 +474,7 @@ std::size_t KVCacheTransferManager::computeBlockTransferBytes(
     std::size_t totalBytes = 0;
     for (auto const& pool : pools)
     {
-        if (!pool.primaryPtr || pool.primaryPtr->getSize() == 0)
-        {
-            continue;
-        }
-
-        auto const dataType = pool.primaryPtr->getDataType();
-        auto const numElements = static_cast<std::size_t>(pool.primaryPtr->getSize());
-        if (numElements == 0)
-        {
-            continue; // empty pool contributes 0 bytes; avoids divide-by-zero
-        }
-        auto const bytesPerElement = pool.primaryPtr->getSizeInBytes() / numElements;
-
-        // Mirror the logic in copyBlock: a partial copy only happens when numTokensToCopy > 0,
-        // the data type supports it (not kINT4/kFP4), not block scales, and numTokensToCopy < tokensPerBlock.
-        bool const isPartialCopy = numTokensToCopy > 0 && dataType != tensorrt_llm::DataType::kINT4
-            && dataType != tensorrt_llm::DataType::kFP4 && !pool.containsBlockScales
-            && numTokensToCopy < pool.tokensPerBlock;
-
-        if (isPartialCopy)
-        {
-            // Partial copy transfers: numLayers * kvFactor * numKvHeads * sizePerHead * numTokensToCopy elements
-            totalBytes += static_cast<std::size_t>(pool.numLayers) * pool.kvFactor * pool.numKvHeads * pool.sizePerHead
-                * numTokensToCopy * bytesPerElement;
-        }
-        else
-        {
-            // Full block copy: numLayers * kvFactor * blockSize elements
-            // where blockSize = numKvHeads * sizePerHead * tokensPerBlock
-            totalBytes += static_cast<std::size_t>(pool.numLayers) * pool.kvFactor * pool.blockSize * bytesPerElement;
-        }
+        totalBytes += poolTransferSize(pool, numTokensToCopy).bytes;
     }
     return totalBytes;
 }

@@ -26,12 +26,19 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
 #include <torch/extension.h>
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/cudaArchitectures.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
+#if defined(TORCH_CUDA)
+#include "tensorrt_llm/common/profiler.h"
+#endif
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -77,8 +84,35 @@ using OptVec = std::optional<std::vector<T>>;
 #error "TRTLLM_NB_MODULE must be defined"
 #endif
 
+//! Initialize runtime bindings and report profiler selection diagnostics without requiring a CUDA device.
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
+#if defined(TORCH_CUDA)
+    // Native Logger rank filtering may query CUDA before any device is available.
+    auto const diagnostic = tc::initializeProfilerRegions();
+    if (diagnostic)
+    {
+        std::fprintf(stderr, "TensorRT-LLM profiler warning: %s\n", diagnostic->c_str());
+    }
+    if (char const* selection = std::getenv("TLLM_PROFILE_CUSTOM_REGIONS"); !diagnostic && selection != nullptr
+        && std::string_view{selection}.find_first_not_of(" \t\r\n") != std::string_view::npos)
+    {
+        //! Explain an explicitly selected but unavailable native probe without constructing Logger.
+        auto warnUnavailable = [](tc::ProfilerRegion region, bool available, char const* name, char const* option)
+        {
+            if (!available && tc::customRegionEnabled(region))
+            {
+                std::fprintf(stderr,
+                    "TensorRT-LLM profiler warning: TLLM_PROFILE_CUSTOM_REGIONS selects %s, "
+                    "but this build omits its probes (%s=OFF)\n",
+                    name, option);
+            }
+        };
+        warnUnavailable(tc::ProfilerRegion::kNanobind, TRTLLM_ENABLE_NANOBIND_PROFILING != 0, "nanobind",
+            "ENABLE_NANOBIND_PROFILING");
+        warnUnavailable(tc::ProfilerRegion::kNccl, TRTLLM_ENABLE_NCCL_PROFILING != 0, "nccl", "ENABLE_NCCL_PROFILING");
+    }
+#endif
     m.doc() = "TensorRT LLM Python bindings for C++ runtime";
     nb::set_leak_warnings(false);
 
@@ -172,6 +206,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
     buildInfo.attr("CFT_COUNTED_WRITES") = nb::bool_(static_cast<bool>(TLLM_CFT_HAS_CUDA_13_4_SUPPORT));
+    buildInfo.attr("ENABLE_NCCL_PROFILING") = nb::bool_(TRTLLM_ENABLE_NCCL_PROFILING);
+    buildInfo.attr("ENABLE_NANOBIND_PROFILING") = nb::bool_(TRTLLM_ENABLE_NANOBIND_PROFILING != 0);
 
     auto const toTuple = [](std::vector<int> const& architectures)
     {

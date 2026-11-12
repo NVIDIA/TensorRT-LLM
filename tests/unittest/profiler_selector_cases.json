@@ -1,0 +1,232 @@
+[
+  {
+    "value": null,
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": true
+  },
+  {
+    "value": "",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": true
+  },
+  {
+    "value": " \t\r\n",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": true
+  },
+  {
+    "value": "workflow,moe",
+    "expected": [
+      "workflow",
+      "moe"
+    ],
+    "valid": true
+  },
+  {
+    "value": " workflow , kv ",
+    "expected": [
+      "workflow",
+      "kv"
+    ],
+    "valid": true
+  },
+  {
+    "value": "none",
+    "expected": [],
+    "valid": true
+  },
+  {
+    "value": " none\t",
+    "expected": [],
+    "valid": true
+  },
+  {
+    "value": "workflow,mpi,nccl,nanobind,kv,moe",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind",
+      "kv",
+      "moe"
+    ],
+    "valid": true
+  },
+  {
+    "value": "workflow",
+    "expected": [
+      "workflow"
+    ],
+    "valid": true
+  },
+  {
+    "value": "mpi",
+    "expected": [
+      "mpi"
+    ],
+    "valid": true
+  },
+  {
+    "value": "nccl",
+    "expected": [
+      "nccl"
+    ],
+    "valid": true
+  },
+  {
+    "value": "nanobind",
+    "expected": [
+      "nanobind"
+    ],
+    "valid": true
+  },
+  {
+    "value": "kv",
+    "expected": [
+      "kv"
+    ],
+    "valid": true
+  },
+  {
+    "value": "moe",
+    "expected": [
+      "moe"
+    ],
+    "valid": true
+  },
+  {
+    "value": "workflow,",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": ",workflow",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "workflow,,mpi",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "unknown",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "mpi,mpi",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "none,kv",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "none,none",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "None",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "WORKFLOW",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "workflow;mpi",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": "work flow",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  },
+  {
+    "value": " workflow ",
+    "expected": [
+      "workflow",
+      "mpi",
+      "nccl",
+      "nanobind"
+    ],
+    "valid": false
+  }
+]

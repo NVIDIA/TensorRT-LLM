@@ -162,6 +162,8 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine._maybe_record_hang_diagnostic_phase = Mock()
     engine.async_transfer_manager = SimpleNamespace(requests_in_transfer=lambda: {})
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
     transceiver._fp4_mla_bridge_enabled = True
     transceiver._ever_had_recv_session = False
     transceiver._gen_need_sync = False

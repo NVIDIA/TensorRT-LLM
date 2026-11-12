@@ -28,6 +28,8 @@
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include "tensorrt_llm/batch_manager/kvCacheTransferProfiler.h"
+
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <cmath>
@@ -678,6 +680,8 @@ Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, Slot
     return mLevels.at(level).storage->slotAddress(pgIdx, slotId).at(poolIdx);
 }
 
+//! Submit a nonempty page migration through direct pool copies or the cold-page codec and disk staging.
+//! Host offload/restore probes count hot device pools; encoded storage sizes retain all pools.
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
     PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
@@ -751,6 +755,30 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 
     if (isGpuAccessibleMemory(coldTier))
     {
+        ::tensorrt_llm::batch_manager::detail::KvCacheTransferScope scope;
+        if (coldTier == CacheTier::HOST_MEM)
+        {
+            namespace profiler = ::tensorrt_llm::batch_manager::detail;
+            auto const operation
+                = srcIsHot ? profiler::KvTransferOperation::kOffload : profiler::KvTransferOperation::kOnboard;
+            scope.start(operation,
+                [&](auto& metadata)
+                {
+                    PoolGroupIndex const hotPgIdx = srcIsHot ? srcPgIdx : dstPgIdx;
+                    auto const& hotSizes = slotSize(kHotLevel, hotPgIdx);
+                    size_t devicePageBytes = 0;
+                    for (PoolIndex poolIdx{0}; poolIdx < hotSizes.size(); ++poolIdx)
+                    {
+                        if (poolMedium(kHotLevel, hotPgIdx, poolIdx) == CacheTier::GPU_MEM)
+                        {
+                            devicePageBytes += hotSizes.at(poolIdx);
+                        }
+                    }
+                    // The batch can also include host-resident sparse pools; describe only device traffic.
+                    profiler::addKvTransferMetadata(
+                        metadata, operation, profiler::KvManagerVersion::kV2, devicePageBytes, numPages, stream);
+                });
+        }
         MemAddress const coldBase = mLevels.at(coldLevel).storage->getBaseAddress(coldPgIdx, PoolIndex{0}, SlotId{0});
         bool const submitted = srcIsHot
             ? encodeBatch(reinterpret_cast<void*>(coldBase), pageIndices, numPages, stream)

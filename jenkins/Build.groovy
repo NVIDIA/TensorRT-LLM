@@ -935,7 +935,7 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     }
 }
 
-def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, extra_args="", reconfigure=false)
+def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, extra_args="", reconfigure=false, tarName="")
 {
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -946,6 +946,10 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     // Step 1: cloning tekit source code
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    if (tarName) {
+        sh "mkdir TensorRT-LLM"
+        sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
+    }
     // Step 2: building libs in container
     sh "bash -c 'pip3 show tensorrt || true'"
 
@@ -975,6 +979,11 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
         // Configure the built tree again with identical arguments and rebuild it incrementally,
         // so CMake logic that only breaks once the cache and fetched dependencies exist fails CI.
         sh "bash -c \"${buildCommand} --configure_cmake --skip_building_wheel\""
+    }
+    if (tarName) {
+        sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
+        sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
+        sh "tar -czf ${tarName} TensorRT-LLM/"
     }
 }
 
@@ -1096,18 +1105,19 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         }
     }]}
 
-    if (cpu_arch == X86_64_TRIPLE && !reuseArtifactPath) {
-        def key = "Build With Build Type Debug"
+    if (cpu_arch == X86_64_TRIPLE) {
+        def key = "Build With Profiling Enabled"
+        def tarName = "profiling-TensorRT-LLM.tar.gz"
         parallelJobs += [
         (key): {
             script {
-                trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu), "trt-llm", {
-                    stage(key) {
-                        stage("[${key}] Run") {
-                            echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b Debug --micro_benchmarks", true)
-                        }
-                    }
+                // This test-only artifact must also exist when normal builds are reused.
+                buildOrCache(pipeline, key, null, [(tarName): tarName], LLM_DOCKER_IMAGE, k8s_cpu, {
+                    // Profiling replaces the former full Debug build: release Torch's
+                    // RecordFunction ABI requires NDEBUG; retain symbols with RelWithDebInfo.
+                    buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b RelWithDebInfo --micro_benchmarks -D ENABLE_NANOBIND_PROFILING=ON -D ENABLE_NCCL_PROFILING=ON --extra-make-targets profilerTest", true, tarName)
+                    sh "cd ${LLM_ROOT} && ./cpp/build_RelWithDebInfo/tests/unit_tests/common/profilerTest --gtest_output=xml:profiler-test-results.xml"
+                    sh """python3 -c 'import xml.etree.ElementTree as ET; cases = ET.parse("${LLM_ROOT}/profiler-test-results.xml").findall(".//testcase"); assert len(cases) == 13, "profiling build must run all 13 native cases"; assert all(case.get("status") == "run" and all(case.find(kind) is None for kind in ("skipped", "failure", "error")) for case in cases), "native profiler cases must pass without skips"'"""
                 })
             }
         }]

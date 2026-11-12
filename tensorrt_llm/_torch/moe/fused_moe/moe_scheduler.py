@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._profiler import record_moe_routing
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
@@ -554,6 +555,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
             assert token_selected_experts.shape == token_final_scales.shape
             assert token_selected_experts.dtype == torch.int32
 
+            if prerouted is None:
+                record_moe_routing(moe.layer_idx, moe.num_experts, token_selected_experts)
+
             # Backends disagree on routing-scale precision, so the requirement
             # names the dtype instead of the backend class.
             scales_dtype = moe.backend.input_requirement.routing_scales_dtype
@@ -606,6 +610,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 )
             token_selected_experts = None
             token_final_scales = None
+
+        if prerouted is not None:
+            record_moe_routing(moe.layer_idx, moe.num_experts, prerouted.topk_ids)
 
         # ========== Step 3: EPLB - Update statistics and route ==========
         if moe.layer_load_balancer and token_selected_experts is not None:
@@ -1608,6 +1615,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 dtype=torch.float32,
                 device=device,
             )
+
+        record_moe_routing(moe.layer_idx, moe.num_experts, token_selected_experts)
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
         # Per-layer dynamic EPLB plans from the routes that the layer-wise
