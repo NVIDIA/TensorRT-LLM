@@ -1203,14 +1203,21 @@ def resolve_scheduled_encoder_args(llm_args: TorchLlmArgs) -> TorchLlmArgs:
     drops_compile = llm_args.torch_compile_config == TorchCompileConfig()
     if drops_compile:
         update["torch_compile_config"] = None
+    graph_setting = (
+        "multimodal_config.encoder_cuda_graph"
+        if llm_args.mm_encoder_only
+        else "cuda_graph_config=EncodeCudaGraphConfig(...)"
+    )
     logger.warning(
         f"prefill_cuda_graph_backend={llm_args.prefill_cuda_graph_backend.value!r} is ignored "
         "for non-generation models, which use encoder CUDA graphs "
-        "(cuda_graph_config=EncodeCudaGraphConfig(...)) instead"
+        f"({graph_setting}) instead"
         + (
             "; the default torch_compile_config is dropped with it, so the model runs eagerly."
             if drops_compile
             else "; torch_compile_config still applies, without piecewise CUDA graphs."
+            if llm_args.torch_compile_config is not None
+            else "."
         )
     )
     return llm_args.model_copy(update=update)
