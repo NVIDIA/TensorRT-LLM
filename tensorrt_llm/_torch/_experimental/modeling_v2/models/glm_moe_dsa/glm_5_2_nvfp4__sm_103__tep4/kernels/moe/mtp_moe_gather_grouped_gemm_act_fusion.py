@@ -260,7 +260,6 @@ def host_function(
     num_sms: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
     round_gemm_to_bf16: cutlass.Constexpr[bool] = False,
-    drain_epilogue: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Host-side JIT for gather + grouped BF16 GEMM + SwiGLU.
 
@@ -293,8 +292,6 @@ def host_function(
         round_gemm_to_bf16: Preserve a separate BF16 GEMM output before
             SwiGLU, as used by the production prefill activation kernel.
             False retains the existing fused/decode arithmetic.
-        drain_epilogue: Explicitly finish the final TMA source read before
-            the prefill CTA exits. False preserves the existing decode path.
 
     Note:
         - Grid is (num_tiles_m, ceil(N/tiler_N), 1) — L=1 since A and C are stacked.
@@ -436,7 +433,6 @@ def host_function(
         tile_sched_params,
         DeviceBoundPersistentTileScheduler,
         round_gemm_to_bf16,
-        drain_epilogue,
     ).launch(
         grid=grid,
         block=[threads_per_cta, 1, 1],
@@ -496,7 +492,6 @@ def mtp_moe_gather_grouped_gemm_act_fusion_kernel(
     tile_sched_params: PersistentTileSchedulerParams,
     scheduler_type: cutlass.Constexpr,
     round_gemm_to_bf16: cutlass.Constexpr[bool] = False,
-    drain_epilogue: cutlass.Constexpr[bool] = False,
 ) -> None:
     """GPU device kernel: in-kernel gather + contiguous grouped BF16 GEMM + SwiGLU.
 
@@ -1254,6 +1249,22 @@ def mtp_moe_gather_grouped_gemm_act_fusion_kernel(
             work_tile, sched_full_phase = sched_load_work_tile(
                 s_work_tile, sched_full_mbar_ptr, sched_empty_mbar_ptr, sched_full_phase
             )
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so the
+        # MMA warp's last `num_ab_stage` commit-arrives are awaited here (as cutlass's
+        # PipelineTmaUmma.producer_tail). Nothing orders them against the accumulator commits
+        # the epilogue waits for, and an arrive still in flight at exit lands in the shared
+        # memory of the next CTA on this SM.
+        for _ in cutlass.range_constexpr(num_ab_stage):
+            while not prims.mbarrier_try_wait_parity(
+                ab_empty_mbar_ptr.subview(ab_stage_idx),
+                ab_mbar_empty_phase_bit,
+                time_limit=10_000_000,
+            ):
+                pass
+            ab_stage_idx = ab_stage_idx + 1
+            if ab_stage_idx == num_ab_stage:
+                ab_stage_idx = 0
+                ab_mbar_empty_phase_bit = ab_mbar_empty_phase_bit ^ 1
 
     # =========================================================================
     # MMA warp (warp 8): TMEM alloc and MMA issue. No S2T stage -- that exists in the
@@ -1520,6 +1531,12 @@ def mtp_moe_gather_grouped_gemm_act_fusion_kernel(
             s_work_tile, sched_full_mbar_ptr, sched_empty_mbar_ptr, 0
         )
         acc_stage_idx = 0
+        # The C staging stage alternates across tiles, not only within one. A per-tile
+        # reset put every tile's first store in stage 1, and with one output subtile per
+        # tile the next tile then rewrote that stage while the wait below (`epi_stages - 1`
+        # groups left in flight) still let the previous tile's TMA store read it: that
+        # store published the next tile's values.
+        epi_stage_idx = 0
         while work_tile.is_valid_tile:
             cur_tile_coord = work_tile.tile_idx
             tile_coord_m = cur_tile_coord[0]
@@ -1551,8 +1568,6 @@ def mtp_moe_gather_grouped_gemm_act_fusion_kernel(
 
             # Per-stage TMEM col offset for T2R reads
             base_col_id = tmem_base_col + acc_stage_idx * cols_per_acc_stage
-
-            epi_stage_idx = 0
 
             # Epilogue tiling loop — process pairs: (up_subtile, gate_subtile)
             for pair_idx in cutlass.range(num_output_subtiles):
@@ -1690,15 +1705,13 @@ def mtp_moe_gather_grouped_gemm_act_fusion_kernel(
                 s_work_tile, sched_full_mbar_ptr, sched_empty_mbar_ptr, sched_full_phase
             )
 
-        if cutlass.const_expr(drain_epilogue):
-            # The steady-state wait permits the newest TMA store to remain
-            # pending. Drain its SMEM source read before the CTA can exit;
-            # this is distinct from destination visibility, still supplied
-            # by the caller's ordinary completion/PDL dependency contract.
-            # Only the issuing warp owns these bulk groups. The following
-            # epilogue barrier holds all peer writers until this read drains.
-            if warp_idx == epilog_warp_id[0]:
-                prims.cp_async_bulk_wait_group(0, read=True)
+        # The steady-state wait permits the newest TMA store to remain pending. Drain its
+        # SMEM source read before the CTA can exit (its shared memory then goes to whatever
+        # CTA the SM runs next); destination visibility is still supplied by the caller's
+        # ordinary completion / PDL dependency contract. Only the issuing warp owns these
+        # bulk groups; the epilogue barrier below holds the other warps until it drains.
+        if warp_idx == epilog_warp_id[0]:
+            prims.cp_async_bulk_wait_group(0, read=True)
 
         # Deallocate TMEM after persistent loop — epilogue warps sync
         prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)

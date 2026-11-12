@@ -28,7 +28,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      forced_tool_arguments_end)
-from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+from tensorrt_llm.serve.tool_parser.base_tool_parser import (_MAX_FINISH_PASSES,
+                                                             BaseToolParser)
 from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
                                                        StructureInfo)
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
@@ -42,6 +43,7 @@ from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m3_parser import MiniMaxM3ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
@@ -361,20 +363,62 @@ class TestBaseToolParser:
         assert "test_function" in info.begin
         assert info.trigger == "[TOOL_CALLS]"
 
-    def test_finish_default_noop(self, sample_tools):
-        """The default finalization hook emits nothing and keeps state.
+    def test_finish_keeps_a_buffer_that_cannot_progress(self, sample_tools):
+        """Only part of the start token is buffered: no increment could report anything."""
+        from unittest.mock import patch
 
-        Existing parsers manage ``self._buffer`` incrementally; the
-        end-of-stream hook must not change their behavior.
-        """
         parser = ConcreteToolParser()
-        parser._buffer = '[TOOL_CALLS] {"name":"get_weather"'
+        parser._buffer = "[TOOL_"
 
-        result = parser.finish(sample_tools)
+        with patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger"
+                   ) as mock_logger:
+            result = parser.finish(sample_tools)
 
         assert result.normal_text == ""
         assert result.calls == []
-        assert parser._buffer == '[TOOL_CALLS] {"name":"get_weather"'
+        assert parser._buffer == "[TOOL_"
+        mock_logger.warning_once.assert_not_called()
+
+    def test_finish_warns_when_the_parser_never_converges(self, sample_tools):
+        """Every pass changes the state: finish() stops at the bound and warns once, naming the parser."""
+        from unittest.mock import patch
+
+        class NeverConvergingParser(ConcreteToolParser):
+
+            def __init__(self):
+                super().__init__()
+                self.passes = 0
+
+            def parse_streaming_increment(self, new_text, tools):
+                self.passes += 1
+                self._buffer += "x"
+                return StreamingParseResult()
+
+        parser = NeverConvergingParser()
+
+        with patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger"
+                   ) as mock_logger:
+            parser.finish(sample_tools)
+
+        assert parser.passes == _MAX_FINISH_PASSES
+        assert mock_logger.warning_once.call_count == 1
+        warning = mock_logger.warning_once.call_args
+        assert "NeverConvergingParser" in warning.args[0]
+        # De-duplicated per parser class, so a broken parser cannot log once
+        # per request.
+        assert "NeverConvergingParser" in warning.kwargs["key"]
+
+    def test_finish_reports_the_call_the_last_increment_brought(
+            self, sample_tools):
+        """A whole call arrives in the last increment: finish() reports its arguments too."""
+        parser = ConcreteToolParser()
+        text = '[TOOL_CALLS] {"name": "get_weather", "arguments": {"location": "Paris"}}'
+
+        assert _streamed_calls(parser, [text],
+                               sample_tools) == [("get_weather", {
+                                   "location": "Paris"
+                               })]
+        assert parser.finish(sample_tools).calls == []
 
     def test_extracts_forced_tool_calls_default_false(self):
         """Forced tool_choice extraction is opt-in per parser."""
@@ -384,6 +428,37 @@ class TestBaseToolParser:
 # ============================================================================
 # Qwen3ToolParser Tests
 # ============================================================================
+
+
+def _streamed_calls(parser, increments, tools):
+    """The calls a client assembles from the increments and finish(): (name, arguments).
+
+    A client appends every name delta of a tool index, so a second name for an
+    index fails here instead of replacing the first.
+    """
+    results = [
+        parser.parse_streaming_increment(piece, tools) for piece in increments
+    ]
+    results.append(parser.finish(tools))
+    names, arguments = {}, {}
+    for result in results:
+        for call in result.calls:
+            if call.name:
+                assert call.tool_index not in names, (
+                    f"tool {call.tool_index} named twice: "
+                    f"{names[call.tool_index]!r}, then {call.name!r}")
+                names[call.tool_index] = call.name
+            if call.parameters:
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters)
+    return [(names.get(index), json.loads(arguments.get(index) or "{}"))
+            for index in sorted(names.keys() | arguments.keys())]
+
+
+def _whole_calls(parser, text, tools):
+    """The calls detect_and_parse reads from the whole text: (name, arguments)."""
+    return [(call.name, json.loads(call.parameters or "{}"))
+            for call in parser.detect_and_parse(text, tools).calls]
 
 
 class ToolParserTestCases(NamedTuple):
@@ -439,6 +514,18 @@ class BaseToolParserTestClass:
     @pytest.fixture(scope="class")
     def tool_parser_test_cases(self) -> ToolParserTestCases:
         return self.make_tool_parser_test_cases()
+
+    def test_finish_reports_the_calls_of_a_reply_in_one_increment(
+            self, sample_tools, parser, tool_parser_test_cases):
+        """A reply in one increment: the stream and finish() give its calls.
+
+        The calls are those detect_and_parse reads from the same text.
+        """
+        text = tool_parser_test_cases.detect_and_parse_single_tool[0]
+
+        streamed = _streamed_calls(parser, [text], sample_tools)
+
+        assert streamed == _whole_calls(self.make_parser(), text, sample_tools)
 
     def test_has_tool_call_false(self, parser):
         """Test has_tool_call returns False when no tool call present."""
@@ -8541,3 +8628,100 @@ def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
     assert content == "Checking."
     assert parser_cls().detect_and_parse(text,
                                          sample_tools).normal_text == content
+
+
+@pytest.mark.parametrize("test_class",
+                         [TestQwen3ToolParser, TestGemma4ToolParser])
+def test_finish_reports_every_call_of_a_reply_in_one_increment(
+        sample_tools, test_class):
+    """Several calls in the last increment: finish() delivers all of them.
+
+    The calls are those detect_and_parse reads from the same text.
+    """
+    test = test_class()
+    text = test.make_tool_parser_test_cases().detect_and_parse_multiple_tools[0]
+
+    streamed = _streamed_calls(test.make_parser(), [text], sample_tools)
+
+    assert len(streamed) > 1
+    assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
+
+
+@pytest.mark.parametrize("test_class",
+                         [TestDeepSeekV3Parser, TestDeepSeekV31Parser])
+@pytest.mark.parametrize("last_increment",
+                         ["reply", "both_calls", "second_call_tail"])
+def test_deepseek_streaming_reports_each_call_of_the_last_increment(
+        sample_tools, test_class, last_increment):
+    """Calls that arrive together keep their own names and arguments.
+
+    The last increment brings the whole reply, both calls, or the second call
+    from its separator on. The calls are those detect_and_parse reads from the
+    same text.
+    """
+    test = test_class()
+    text = test.make_tool_parser_test_cases().detect_and_parse_multiple_tools[0]
+    call_begin, sep = "<｜tool▁call▁begin｜>", "<｜tool▁sep｜>"
+    cut = {
+        "reply": 0,
+        "both_calls": text.index(call_begin),
+        "second_call_tail": text.index(sep, text.rindex(call_begin)) + len(sep),
+    }[last_increment]
+    increments = [text[:cut], text[cut:]] if cut else [text]
+
+    streamed = _streamed_calls(test.make_parser(), increments, sample_tools)
+
+    assert len(streamed) > 1
+    assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
+
+
+def _minimax_m2_invoke(name, key, value):
+    """A MiniMax-M2 invocation of ``name`` with one parameter."""
+    return (f'<invoke name="{name}">'
+            f'<parameter name="{key}">{value}</parameter></invoke>')
+
+
+def _minimax_m3_invoke(name, key, value):
+    """A MiniMax-M3 invocation of ``name`` with one parameter."""
+    ns = "]<]minimax[>["
+    return (f'{ns}<invoke name="{name}">'
+            f'{ns}<{key}>{value}{ns}</{key}>{ns}</invoke>')
+
+
+# Per MiniMax format: the parser, the tags that open and close a tool-call
+# block, and the invocation builder.
+_MINIMAX_FORMATS = {
+    "m2": (MiniMaxM2ToolParser, "<minimax:tool_call>", "</minimax:tool_call>",
+           _minimax_m2_invoke),
+    "m3": (MiniMaxM3ToolParser, "]<]minimax[>[<tool_call>",
+           "]<]minimax[>[</tool_call>", _minimax_m3_invoke),
+}
+
+
+@pytest.mark.parametrize("model", ["m2", "m3"])
+@pytest.mark.parametrize(
+    "calls", ["one_call", "two_calls_in_a_block", "a_block_per_call"])
+def test_minimax_streaming_reports_each_call_of_a_reply_in_one_increment(
+        sample_tools, model, calls):
+    """A reply in one increment: the stream and finish() give each call once.
+
+    The calls share one tool-call block or each have their own. They are those
+    detect_and_parse reads from the same text.
+    """
+    parser_cls, opener, closer, invoke = _MINIMAX_FORMATS[model]
+    weather = invoke("get_weather", "location", "NYC")
+    search = invoke("search_web", "query", "AI news")
+
+    def block(*invokes):
+        return opener + "".join(invokes) + closer
+
+    text = "Checking. " + {
+        "one_call": block(weather),
+        "two_calls_in_a_block": block(weather, search),
+        "a_block_per_call": block(weather) + block(search),
+    }[calls]
+
+    streamed = _streamed_calls(parser_cls(), [text], sample_tools)
+
+    assert len(streamed) == (1 if calls == "one_call" else 2)
+    assert streamed == _whole_calls(parser_cls(), text, sample_tools)

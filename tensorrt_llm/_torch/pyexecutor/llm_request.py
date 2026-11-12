@@ -831,6 +831,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
+            watermarking: Optional[bool] = None,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -919,18 +920,19 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
 
-        # Encoder-decoder runtime state. ``py_encoder_output`` holds the
-        # packed encoder hidden states produced by the encoder iteration as
-        # a GPU buffer for cross-attention projection and fallback paths.
-        # ``py_encoder_output_ready_event`` is
-        # recorded on the encoder stream when those hidden states become
-        # available; the scheduler queries it before admitting the request
-        # to a decoder context step. ``py_skip_cross_kv_projection`` controls
-        # whether the decoder's cross-attention projects K/V from
-        # ``encoder_output`` (False on the first context step, the only step
-        # that writes the cross pool) or reads cross-KV without projection
-        # (True on later decoder steps and chunks). All three are unused for
-        # decoder-only models.
+        # Encoder-decoder handoff, set by PyExecutor._scatter_encoder_output
+        # when the encoder output is published:
+        # * py_encoder_output: this request's view of the packed encoder
+        #   output, dropped once the first context step has projected cross-KV
+        #   or when the request terminates.
+        # * py_encoder_output_ready_event: completes when the output is ready;
+        #   schedulers hold the context step until then, and the executor
+        #   drops it when it attaches the output to the execution stream.
+        # * py_skip_cross_kv_projection: False until the first context step
+        #   has written cross-KV, then True for later chunks and decode steps.
+        #   Read only for context requests: by the cross-attention projection,
+        #   the V1 and V2 cross-KV reservation and the CUDA graph key.
+        # All three are unused for decoder-only models.
         self.py_encoder_output: Optional[torch.Tensor] = None
         self.py_encoder_output_ready_event: Optional[torch.cuda.Event] = None
         self.py_skip_cross_kv_projection: bool = False
@@ -943,6 +945,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_logprobs_simple_format = logprobs_simple_format
+        # SamplingParams.watermarking: None/True requests a watermark, False opts out.
+        self.py_watermarking = watermarking
+        # Cached by TorchSampler: the request filters nothing but its temperature.
+        self.py_watermark_neutral: Optional[bool] = None
         # Router Replay: attach routed_experts to this request's output.
         self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
@@ -1368,6 +1374,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode=self.py_logprobs_mode,
             logprobs_simple_format=self.py_logprobs_simple_format,
             return_routed_experts=self.py_return_routed_experts,
+            watermarking=self.py_watermarking,
             embedding_bias=deepcopy(self.py_embedding_bias),
             position_ids=deepcopy(self.py_position_ids),
             guided_decoding_params=deepcopy(self.py_guided_decoding_params),
@@ -1858,6 +1865,7 @@ def executor_request_to_llm_request(
         logprobs_mode=inputs.logprobs_mode,
         logprobs_simple_format=inputs.logprobs_simple_format,
         return_routed_experts=inputs.return_routed_experts,
+        watermarking=inputs.watermarking,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native

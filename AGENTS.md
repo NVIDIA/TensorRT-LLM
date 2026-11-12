@@ -119,6 +119,7 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -250,6 +251,7 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |
+| ModelExpress (MX) checkpoint loading | `docs/source/features/model-express.md` |
 | Disaggregated serving | `docs/source/features/disagg-serving.md` |
 | Speculative decoding | `docs/source/features/speculative-decoding.md` |
 | Quantization | `docs/source/features/quantization.md` |
