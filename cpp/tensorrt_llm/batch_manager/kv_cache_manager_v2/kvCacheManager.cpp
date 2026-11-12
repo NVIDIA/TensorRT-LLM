@@ -883,6 +883,11 @@ CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& r
     return mStorage->getBufferAttr(layerId, role).lifeCycleId;
 }
 
+CacheGroupId KvCacheManager::getRegionGroupId(std::string const& name) const
+{
+    return mLifeCycles.regionLifeCycleId(name);
+}
+
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const
 {
     LifeCycleId numLc = mLifeCycles.size();
