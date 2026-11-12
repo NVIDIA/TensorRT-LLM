@@ -70,6 +70,37 @@ def _scale_code(value: cutlass.Float32, *, loc=None, ip=None):
     )
 
 
+# Weight loads are volatile so they stay ahead of griddepcontrol.wait.
+@dsl_user_op
+def _load_words(address: cutlass.Int64, *, loc=None, ip=None):
+    words = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [address.ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L1::no_allocate.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), words, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _load_byte(address: cutlass.Int64, *, loc=None, ip=None):
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [address.ir_value(loc=loc, ip=ip)],
+            "ld.global.nc.u8 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 class FusedFp8QuantGemv:
     """Each CTA quantizes one K slice and computes a 16x64 output tile.
 
@@ -77,16 +108,58 @@ class FusedFp8QuantGemv:
     scales stay in shared memory. Weight scales use R128c4 with each K128
     exponent replicated over four K32 slots, as in prepare_weight_scale.
     Split-K writes disjoint FP32 partials, followed by one BF16 reduction.
+
+    Each lane streams 2x16 bytes of one weight row per K128 slot: words
+    4q..4q+3 and 16+4q..16+4q+3 for quad q. MMA step s pairs word 4q+s with
+    16+4q+s, a K permutation applied identically to the activation fragment,
+    which therefore reads the same two 16-byte chunks from shared memory. Up to
+    ``prefetch`` slots of weights are issued before the PDL wait.
     """
 
-    def __init__(self, m: int, n: int, k: int, split_k: int, warps: int = 8):
+    def __init__(self, m: int, n: int, k: int, split_k: int, warps: int = 8, prefetch: int = 8):
         self.m, self.n, self.k = m, n, k
         self.split_k = split_k
         self.warps = warps
         self.tile_n = warps * 8
+        self.slots = k // 128 // split_k
+        self.prefetch = min(prefetch, self.slots)
+        self.buffers = max(self.prefetch, 1)
+        # MMA rows 8..15 are constant zero operands when M <= 8.
+        self.rows = 8 if m <= 8 else 16
+
+    def shared_chunk(self, sa, slot, row, chunk):
+        # Odd rows rotate by four 16-byte chunks so the two rows read by each
+        # quarter warp cover all banks.
+        offset = (slot * self.rows + row) * 32 + (chunk + row % 2 * 4) % 8 * 4
+        return cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Int32,
+                (sa.iterator + offset).toint(),
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            ),
+            cute.make_layout((4,)),
+        )
+
+    def load_weights(self, w, ws, weights, scales, buffer, column, group, quad, kb):
+        row = cute.domain_offset((column + group, kb * 32 + quad * 4), w).iterator.toint()
+        low = _load_words(row)
+        high = _load_words(row + 64)
+        for i in range(4):
+            weights[buffer, i] = low[i]
+            weights[buffer, i + 4] = high[i]
+        for i in range(2):
+            nc = column + quad * 2 + i
+            sf_offset = (
+                (nc // 128) * (self.k // 128) * 512
+                + kb * 512
+                + (nc % 32) * 16
+                + (nc % 128 // 32) * 4
+            )
+            scales[buffer, i] = _load_byte(cute.domain_offset((sf_offset,), ws).iterator.toint())
 
     @cute.jit
-    def quantize_tile(self, x, sa, ss, kb, tid):
+    def quantize_tile(self, x, sa, ss, slot, kb, tid):
         # Eight lanes own each complete K128 row; padded MMA rows are zero.
         if tid < 128:
             row = tid // 8
@@ -123,61 +196,84 @@ class FusedFp8QuantGemv:
                 packed = cute.make_rmem_tensor((16,), cutlass.Float8E4M3FN)
                 for i in cutlass.range_constexpr(16):
                     packed[i] = (values[i] * quant).to(cutlass.Float8E4M3FN)
-                packed32 = cute.recast_tensor(packed, cutlass.Int32)
-                for i in cutlass.range_constexpr(4):
-                    sa[row, chunk * 4 + i] = packed32[i]
+                cute.autovec_copy(
+                    cute.recast_tensor(packed, cutlass.Int32),
+                    self.shared_chunk(sa, slot, row, chunk),
+                )
                 if chunk == 0:
-                    ss[row] = dequant
+                    ss[row, slot] = dequant
             else:
-                for i in cutlass.range_constexpr(4):
-                    sa[row, chunk * 4 + i] = cutlass.Int32(0)
+                zeros = cute.make_rmem_tensor((4,), cutlass.Int32)
+                zeros.fill(0)
+                cute.autovec_copy(zeros, self.shared_chunk(sa, slot, row, chunk))
                 if chunk == 0:
-                    ss[row] = cutlass.Float32(1.0)
+                    ss[row, slot] = cutlass.Float32(1.0)
 
     @cute.kernel
     def kernel(self, x: cute.Tensor, w: cute.Tensor, ws: cute.Tensor, y: cute.Tensor):
-        if cutlass.const_expr(TRTLLM_ENABLE_PDL):
-            griddepcontrol_wait()
         tid, _, _ = cute.arch.thread_idx()
         bn, sk, _ = cute.arch.block_idx()
         lane = tid % 32
         warp = tid // 32
         group = lane // 4
         quad = lane % 4
+        slots = self.slots
+        prefetch = self.prefetch
+        buffers = self.buffers
+        column = bn * self.tile_n + warp * 8
+        weights = cute.make_rmem_tensor((buffers, 8), cutlass.Int32)
+        weight_scales = cute.make_rmem_tensor((buffers, 2), cutlass.Int32)
+        # Weights are not written by the preceding kernel, so their HBM latency
+        # overlaps its tail and the activation quantization below.
+        for slot in cutlass.range_constexpr(prefetch):
+            self.load_weights(
+                w, ws, weights, weight_scales, slot, column, group, quad, sk * slots + slot
+            )
+        if cutlass.const_expr(TRTLLM_ENABLE_PDL):
+            griddepcontrol_wait()
         allocator = utils.SmemAllocator()
-        blocks = self.k // 128
-        slots = blocks // self.split_k
         sa = allocator.allocate_tensor(
-            cutlass.Int32, cute.make_layout((16, 32, slots), stride=(36, 1, 576))
+            cutlass.Int32, cute.make_layout((slots * self.rows * 32,)), byte_alignment=16
         )
         ss = allocator.allocate_tensor(
-            cutlass.Float32, cute.make_layout((16, slots), stride=(1, 16))
+            cutlass.Float32, cute.make_layout((self.rows, slots), stride=(1, self.rows))
         )
         total = cute.make_rmem_tensor((4,), cutlass.Float32)
         total.fill(0.0)
         # Assign consecutive warps to different K128 tiles so low-M rows
         # quantize concurrently before the single consumer barrier.
-        for task in range(warp, 4 * slots, self.warps):
+        for task in range(warp, self.rows // 4 * slots, self.warps):
             slot = task % slots
             row_group = task // slots
-            self.quantize_tile(
-                x, sa[None, None, slot], ss[None, slot], sk * slots + slot, row_group * 32 + lane
-            )
+            self.quantize_tile(x, sa, ss, slot, sk * slots + slot, row_group * 32 + lane)
         cute.arch.sync_threads()
-        for slot in range(slots):
+        ar = cute.make_rmem_tensor((4,), cutlass.Int32)
+        ar.fill(0)
+        br = cute.make_rmem_tensor((2,), cutlass.Int32)
+        for slot in cutlass.range_constexpr(slots):
             kb = sk * slots + slot
+            buffer = slot % buffers
+            if cutlass.const_expr(prefetch == 0):
+                self.load_weights(w, ws, weights, weight_scales, 0, column, group, quad, kb)
+            low = cute.make_rmem_tensor((4,), cutlass.Int32)
+            high = cute.make_rmem_tensor((4,), cutlass.Int32)
+            cute.autovec_copy(self.shared_chunk(sa, slot, group, quad), low)
+            cute.autovec_copy(self.shared_chunk(sa, slot, group, quad + 4), high)
+            if cutlass.const_expr(self.rows == 16):
+                low8 = cute.make_rmem_tensor((4,), cutlass.Int32)
+                high8 = cute.make_rmem_tensor((4,), cutlass.Int32)
+                cute.autovec_copy(self.shared_chunk(sa, slot, group + 8, quad), low8)
+                cute.autovec_copy(self.shared_chunk(sa, slot, group + 8, quad + 4), high8)
             accum = cute.make_rmem_tensor((4,), cutlass.Float32)
             accum.fill(0.0)
-            ar = cute.make_rmem_tensor((4,), cutlass.Int32)
-            br = cute.make_rmem_tensor((2,), cutlass.Int32)
-            nr = bn * self.tile_n + warp * 8 + group
             for step in cutlass.range_constexpr(4):
-                ar[0] = sa[group, step * 8 + quad, slot]
-                ar[1] = sa[group + 8, step * 8 + quad, slot]
-                ar[2] = sa[group, step * 8 + quad + 4, slot]
-                ar[3] = sa[group + 8, step * 8 + quad + 4, slot]
-                br[0] = w[nr, kb * 32 + step * 8 + quad]
-                br[1] = w[nr, kb * 32 + step * 8 + quad + 4]
+                ar[0] = low[step]
+                ar[2] = high[step]
+                if cutlass.const_expr(self.rows == 16):
+                    ar[1] = low8[step]
+                    ar[3] = high8[step]
+                br[0] = weights[buffer, step]
+                br[1] = weights[buffer, step + 4]
                 accum.store(
                     mma_sync(
                         cute.recast_tensor(ar, cutlass.Float8E4M3FN),
@@ -185,23 +281,21 @@ class FusedFp8QuantGemv:
                         accum,
                     )
                 )
-            for i in cutlass.range_constexpr(4):
+            for i in cutlass.range_constexpr(self.rows // 4):
                 mr = group + (i // 2) * 8
-                nc = bn * self.tile_n + warp * 8 + quad * 2 + i % 2
-                sf_offset = (
-                    (nc // 128) * blocks * 512 + kb * 512 + (nc % 32) * 16 + (nc % 128 // 32) * 4
-                )
-                combined_exponent = (
-                    _scale_code(ss[mr, slot]) + ws[sf_offset].to(cutlass.Int32) - 254
-                )
+                combined_exponent = _scale_code(ss[mr, slot]) + weight_scales[buffer, i % 2] - 254
                 half_exponent = combined_exponent // 2
                 # Balanced powers avoid overflow in an intermediate scale product.
                 scale_lo = _float_bits((half_exponent + 127) << 23)
                 scale_hi = _float_bits((combined_exponent - half_exponent + 127) << 23)
                 total[i] += (accum[i] * scale_lo) * scale_hi
-        for i in cutlass.range_constexpr(4):
+            if cutlass.const_expr(prefetch > 0 and slot + prefetch < slots):
+                self.load_weights(
+                    w, ws, weights, weight_scales, buffer, column, group, quad, kb + prefetch
+                )
+        for i in cutlass.range_constexpr(self.rows // 4):
             mr = group + (i // 2) * 8
-            nc = bn * self.tile_n + warp * 8 + quad * 2 + i % 2
+            nc = column + quad * 2 + i % 2
             if mr < self.m:
                 if cutlass.const_expr(self.split_k == 1):
                     y[mr, nc] = total[i].to(cutlass.BFloat16)
@@ -218,17 +312,19 @@ class FusedFp8QuantGemv:
         tid, _, _ = cute.arch.thread_idx()
         kb, _, _ = cute.arch.block_idx()
         allocator = utils.SmemAllocator()
-        sa = allocator.allocate_tensor(cutlass.Int32, cute.make_layout((16, 32), stride=(36, 1)))
-        ss = allocator.allocate_tensor(cutlass.Float32, cute.make_layout((16,)))
-        self.quantize_tile(x, sa, ss, kb, tid)
+        sa = allocator.allocate_tensor(
+            cutlass.Int32, cute.make_layout((16 * 32,)), byte_alignment=16
+        )
+        ss = allocator.allocate_tensor(cutlass.Float32, cute.make_layout((16, 1), stride=(1, 16)))
+        self.quantize_tile(x, sa, ss, 0, kb, tid)
         cute.arch.sync_threads()
         row, word = tid // 32, tid % 32
         for group in cutlass.range_constexpr(4):
             mr = row + group * 4
             if mr < self.m:
-                codes[mr, kb * 32 + word] = sa[mr, word]
+                codes[mr, kb * 32 + word] = self.shared_chunk(sa, 0, mr, word // 4)[word % 4]
                 if word == 0:
-                    scales[mr, kb] = _scale_code(ss[mr]).to(cutlass.Uint8)
+                    scales[mr, kb] = _scale_code(ss[mr, 0]).to(cutlass.Uint8)
 
         if cutlass.const_expr(TRTLLM_ENABLE_PDL):
             griddepcontrol_launch_dependents()
@@ -329,6 +425,8 @@ def fused_fp8_quant_gemv(
 
     Weight scale storage is R128c4. Its four K32 scale bytes for every K128
     block must be identical; independent K32 weight scales are unsupported.
+    Weights and weight scales are read before the PDL wait, so they must not be
+    written by the immediately preceding kernel on the stream.
     """
     m, k = input.shape
     n = weight.shape[0]

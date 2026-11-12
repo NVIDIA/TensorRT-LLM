@@ -29,6 +29,8 @@ def _input(m, k, seed):
 
 
 def _weights(n, k, seed):
+    # The fused kernel reads weights before its PDL wait, so tests create them
+    # before the activations instead of directly ahead of the GEMM.
     weight = _input(n, k, seed).contiguous()
     return torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(weight, True)
 
@@ -37,8 +39,8 @@ def _weights(n, k, seed):
 @pytest.mark.parametrize("k", (768, 1024, 1536, 2048, 3072, 6144))
 @pytest.mark.parametrize("seed", (11, 23, 47))
 def test_fused_matches_k128_reference(m, k, seed):
-    x = _input(m, k, seed)
     weight, scale = _weights(128, k, seed + 1)
+    x = _input(m, k, seed)
     from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import fused_fp8_quant_gemv
 
     actual = fused_fp8_quant_gemv(x, weight, scale)
@@ -48,8 +50,8 @@ def test_fused_matches_k128_reference(m, k, seed):
 
 @pytest.mark.parametrize("m,k", ((4, 768), (16, 1536), (4, 6144), (16, 6144)))
 def test_fused_changing_input_graph(m, k):
-    x = _input(m, k, 11)
     weight, scale = _weights(128, k, 23)
+    x = _input(m, k, 11)
     from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import fused_fp8_quant_gemv
 
     for _ in range(3):
@@ -112,10 +114,10 @@ def test_fused_quantization_finite_extremes():
 def test_fused_opposite_scale_exponents():
     # The dequantized operands and their output are finite even though applying
     # the activation scale alone to an unscaled K128 subtotal would overflow.
-    x = torch.full((4, 768), 2.0**118, device="cuda", dtype=torch.bfloat16)
     weight = torch.full((128, 768), 448.0, device="cuda", dtype=torch.float8_e4m3fn)
     logical = torch.full((128, 24), 17, device="cuda", dtype=torch.uint8)
     scale = torch.ops.trtllm.block_scale_interleave(logical)
+    x = torch.full((4, 768), 2.0**118, device="cuda", dtype=torch.bfloat16)
     from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import fused_fp8_quant_gemv
 
     actual = fused_fp8_quant_gemv(x, weight, scale)
@@ -130,8 +132,8 @@ def test_certified_cells(cell, draw, certifying) -> None:  # noqa: F811 — pyte
     certifying(op)
     m, n, k = (cell.spec[name] for name in ("m", "n", "k"))
     seed = cell.seed_base() + 2 * draw
-    x = _input(m, k, seed)
     weight, scale = _weights(n, k, seed + 1)
+    x = _input(m, k, seed)
     actual = op(x, weight, scale)
     expected = op.reference(x, weight, scale)
     assert_within_ulp(actual, expected, element_ulp=4, rms_ulp=2)
@@ -148,8 +150,8 @@ def test_fused_catalog_protection(m):
 
 @pytest.mark.parametrize("n,k", ((1024, 6144), (1536, 6144), (6144, 768), (6144, 1024)))
 def test_fused_catalog_changing_input_graph(n, k):
-    x = _input(4, k, 11).contiguous()
     weight, scale = _weights(n, k, 23)
+    x = _input(4, k, 11).contiguous()
     for _ in range(3):
         op(x, weight, scale)
     graph = torch.cuda.CUDAGraph()
@@ -185,8 +187,8 @@ def test_decode_target_dispatch(tp_size):
 
     target = object.__new__(modeling.DecodeTarget)
     target.core = SimpleNamespace(tp_size=tp_size)
-    x = _input(4, 6144, 11).contiguous()
     weight, scale = _weights(1024, 6144, 23)
+    x = _input(4, 6144, 11).contiguous()
     with Operations() as operations:
         actual = target._linear_fp8(x, weight, scale)
     fused = any("trtllm.cute_dsl_fused_fp8_block_scale_linear" in name for name in operations.seen)
