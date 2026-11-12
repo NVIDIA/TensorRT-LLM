@@ -528,9 +528,9 @@ class _PairObjects:
     else through its team object ``{owner, 2j, 2j + 1}``, which only the owner
     maps and to which it binds a dummy chunk for its own replica. Each object
     spans ``span`` helper sets ``set_bytes`` apart and binds a set when the pool
-    creates it, so the count does not grow with the layers: at EP8 a GPU holds
-    2 pair aliases and 9 team objects, against 15 per layer (915 for 61 layers)
-    with per-layer objects, close to the roughly 960 that a GPU can bind.
+    creates it, so the object count does not grow with the layers: at EP8 a
+    GPU holds 2 pair aliases and 9 team objects.  Each still binds once per
+    helper set (geometry.MAX_PAIR_TEAM_EP).
     """
 
     span: int
@@ -623,16 +623,19 @@ class _SharedSlotPool:
         # EP2's one level is the whole world, an ordinary multicast level.
         self.pair_ladder = len(self.group_sizes) > 1 and self.group_sizes[-1] == 2
         # The balanced copy route lets an owner outside a pair write part of a
-        # pair copy itself, so a ladder then also needs the team objects.
+        # pair copy itself: through team objects up to MAX_PAIR_TEAM_EP, else
+        # with unicast stores through the peer views.
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.geometry import (
             balanced_copy_enabled,
+            pair_team_objects_enabled,
         )
 
         self.balanced_pairs = balanced_copy_enabled(world, helper_count)
+        self.pair_teams = pair_team_objects_enabled(world, helper_count)
         if world < 4:
             pair_members = ()
         elif self.pair_ladder:
-            pair_members = (3,) if self.balanced_pairs else ()
+            pair_members = (3,) if self.pair_teams else ()
         else:
             pair_members = (2, 3)
         self.vmm = _Vmm(device, self.group_sizes + pair_members)
@@ -674,7 +677,7 @@ class _SharedSlotPool:
         self._owner_registry.append(self)
         if world >= 4 and self.large:
             self.pair_objects = self._create_pair_objects(
-                self._pair_span(comm), comm, teams=not self.pair_ladder or self.balanced_pairs
+                self._pair_span(comm), comm, teams=not self.pair_ladder or self.pair_teams
             )
         if not per_layer_sets:
             self.sets = self._create_sets(_HELPER_BANK_COUNT, comm, 0)
@@ -807,8 +810,7 @@ class _SharedSlotPool:
                     # Set i of the pair level sits i * set_bytes into this
                     # rank's pair object; _bind_pair_set binds it.
                     pair_set = (
-                        self.pair_objects.bases[self.rank // 2]
-                        + (first_index + k) * self.set_bytes
+                        self.pair_objects.bases[self.rank // 2] + (first_index + k) * self.set_bytes
                     )
                     level_bases.append(
                         {
@@ -964,7 +966,9 @@ class _SharedSlotPool:
         dummies = (
             {p.name: vmm.create(self.helper_bytes[p.name])[0] for p in self.large} if teams else {}
         )
-        return _PairObjects(span, tuple(bases), tuple(member_handles), tuple(owner_handles), dummies)
+        return _PairObjects(
+            span, tuple(bases), tuple(member_handles), tuple(owner_handles), dummies
+        )
 
     def _bind_pair_set(self, index: int, helper_set: _HelperSet, comm: Any) -> None:
         """Bind helper set ``index`` into every pair and team object this rank
@@ -1129,7 +1133,7 @@ class _SharedSlotPool:
         # large plane into both ranks of pair j; 0 for the record-page planes,
         # which the owner writes per receiver.
         pair_ptrs: Tuple[int, ...] = ()
-        if self.pair_objects is not None and (not self.pair_ladder or self.balanced_pairs):
+        if self.pair_objects is not None and (not self.pair_ladder or self.pair_teams):
             set_offset = layer.helper_set * self.set_bytes
             pair_ptrs = tuple(
                 self.pair_objects.bases[pair]
@@ -1150,8 +1154,10 @@ class _SharedSlotPool:
             aliases_same_backing=True,
             # Large planes map every peer's helper chunk above; small planes
             # live in record pages that every rank maps whole.  A pair ladder
-            # has no pair-level records, so no owner-direct rows.
-            peer_helper_rows_mapped=not self.pair_ladder,
+            # has no pair-level records: it writes peer rows only when a
+            # balanced copy reaches pairs without team objects.
+            peer_helper_rows_mapped=not self.pair_ladder
+            or (self.balanced_pairs and not self.pair_teams),
             pair_destination_ptrs=pair_ptrs,
         )
         return arena, tekit_views, layer, sum(self.home_bytes.values())
