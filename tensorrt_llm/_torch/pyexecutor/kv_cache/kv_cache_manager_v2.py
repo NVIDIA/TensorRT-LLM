@@ -5625,61 +5625,6 @@ class KVCacheManagerV2(BaseResourceManager):
             clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
 
-    def kv_block_budget_applies(self) -> bool:
-        """Whether this manager has the dense, full-attention admission cost model."""
-        return (
-            type(self) is KVCacheManagerV2
-            and self.kv_cache_type in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY)
-            and not self.is_draft
-            and not self.is_disagg
-            and not self.is_estimating_kv_cache
-            and self.mapping.cp_size == 1
-            and not self.kv_compression_manages_history
-            and self.sparse_metadata_batch is None
-            and self.mixed_precision_low_dtype is None
-            and all(window is None for window in self.max_attention_window_vec)
-        )
-
-    def get_request_kv_block_budget(self, request: LlmRequest) -> tuple[int, int] | None:
-        """Return beam-aware demand and permanent GPU capacity in ledger blocks.
-
-        Full prompt blocks are shared; the partial prompt block and generation
-        tail are private to each beam. Count every lifecycle sharing a physical
-        pool, and exclude permanent guard pages without counting live requests
-        against capacity. A busy pool is a scheduling failure, not an admission
-        failure.
-        """
-        if not self.kv_block_budget_applies():
-            return None
-
-        block_size = self._ledger_tokens_per_block
-        shared_blocks, prompt_tail = divmod(request.orig_prompt_len, block_size)
-        private_tokens = (
-            prompt_tail
-            + request.max_new_tokens
-            + self.num_extra_kv_tokens
-            + self._kv_reserve_draft_tokens
-        )
-        required = (
-            shared_blocks
-            + ((private_tokens + block_size - 1) // block_size) * request.py_beam_width
-        )
-
-        slots_per_block: dict[int, int] = defaultdict(int)
-        for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
-            slots_per_block[int(pool_id)] += 1
-        stats = self._get_storage_statistics(GPU_LEVEL)
-        capacity = min(
-            (int(stats[pool_id].total) // count for pool_id, count in slots_per_block.items()),
-            default=0,
-        )
-        reserved_blocks = sum(
-            int(cache.num_blocks)
-            for request_id, cache in self.kv_cache_map.items()
-            if request_id in _RESERVED_REQUEST_IDS
-        )
-        return required, max(0, capacity - reserved_blocks)
-
     def get_request_kv_page_index_budget(self, request: LlmRequest) -> tuple[int, int] | None:
         """Bound absolute per-beam ledger indices independently of physical KV cost.
 
@@ -5695,7 +5640,7 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = (
             request.orig_prompt_len
             + request.max_new_tokens
-            + self.num_extra_kv_tokens
+            + self._kv_alloc_extra_tokens
             + self._kv_reserve_draft_tokens
         )
         required = (capacity + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
@@ -8999,21 +8944,62 @@ class KVCacheManagerV2(BaseResourceManager):
         return 0
 
     def kv_block_budget_applies(self) -> bool:
-        # Only offloaded sparse history has a request-level budget here.
-        return self._host_history_capacity_blocks is not None
+        """Whether this manager reports a host-history or dense GPU admission budget."""
+        return self._host_history_capacity_blocks is not None or (
+            type(self) is KVCacheManagerV2
+            and self.kv_cache_type in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY)
+            and not self.is_draft
+            and not self.is_disagg
+            and not self.is_estimating_kv_cache
+            and self.mapping.cp_size == 1
+            and not self.kv_compression_manages_history
+            and self.sparse_metadata_batch is None
+            and self.mixed_precision_low_dtype is None
+            and all(window is None for window in self.max_attention_window_vec)
+        )
 
-    def get_request_kv_block_budget(self, request: LlmRequest) -> Optional[Tuple[int, int]]:
-        """Return the host history pages ``request`` needs and the most it can be given.
+    def get_request_kv_block_budget(self, request: LlmRequest) -> tuple[int, int] | None:
+        """Return host-history demand, or dense beam-aware GPU demand and capacity.
 
-        With sparse KV cache offload, a request must hold its history through
-        its last output token in the history pool when it runs alone. One that
-        needs more pages than the smallest rank's pool holds would wait forever,
-        so the executor rejects it when it arrives. Returns ``None`` without
-        offload.
+        Sparse offload retains its host-history budget. For dense GPU pools,
+        full prompt blocks are shared; the partial prompt block and generation
+        tail are private to each beam. Count every lifecycle sharing a physical
+        pool, and exclude permanent guard pages without counting live requests
+        against capacity. A busy pool is a scheduling failure, not an admission
+        failure.
         """
-        if self._host_history_capacity_blocks is None:
+        if self._host_history_capacity_blocks is not None:
+            return self._get_host_history_blocks(request), self._host_history_capacity_blocks
+        if not self.kv_block_budget_applies():
             return None
-        return self._get_host_history_blocks(request), self._host_history_capacity_blocks
+
+        block_size = self._ledger_tokens_per_block
+        shared_blocks, prompt_tail = divmod(request.orig_prompt_len, block_size)
+        private_tokens = (
+            prompt_tail
+            + request.max_new_tokens
+            + self._kv_alloc_extra_tokens
+            + self._kv_reserve_draft_tokens
+        )
+        required = (
+            shared_blocks
+            + ((private_tokens + block_size - 1) // block_size) * request.py_beam_width
+        )
+
+        slots_per_block: dict[int, int] = defaultdict(int)
+        for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
+            slots_per_block[int(pool_id)] += 1
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        capacity = min(
+            (int(stats[pool_id].total) // count for pool_id, count in slots_per_block.items()),
+            default=0,
+        )
+        reserved_blocks = sum(
+            int(cache.num_blocks)
+            for request_id, cache in self.kv_cache_map.items()
+            if request_id in _RESERVED_REQUEST_IDS
+        )
+        return required, max(0, capacity - reserved_blocks)
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @classmethod

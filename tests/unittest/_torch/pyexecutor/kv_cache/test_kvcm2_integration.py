@@ -4100,7 +4100,7 @@ def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits(
         else:
             required, capacity = manager.get_request_kv_block_budget(budget_request)
             assert required > capacity
-            with pytest.raises(ValueError, match="exceeds its GPU-primary capacity"):
+            with pytest.raises(ValueError, match="exceeds its capacity"):
                 PyExecutor._validate_request_budget(executor, budget_request)
 
         # Direct callers and configurations outside dense admission still get
@@ -6005,6 +6005,12 @@ def test_page_table_holds_the_decode_step_and_pads_to_four_pages(
 
 def _gen_init_manager(host_capacity_blocks: int | None) -> KVCacheManagerV2:
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELF
+    manager.is_draft = False
+    manager.is_disagg = True
+    manager._ledger_tokens_per_block = 128
+    manager.max_blocks_per_seq = 1024
+    manager._kv_reserve_draft_tokens = 0
     if host_capacity_blocks is not None:
         manager._host_history_reservations = HostHistoryReservations(host_capacity_blocks)
     manager.num_extra_kv_tokens = 0
@@ -6100,6 +6106,9 @@ def _offload_setup_manager(
     history.
     """
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELF
+    manager.is_draft = False
+    manager.is_disagg = True
     tiers = [CacheTier.GPU_MEM, CacheTier.HOST_MEM] if cold_tier else [CacheTier.GPU_MEM]
     manager.impl = SimpleNamespace(cache_tier_list=tiers)
     manager.mapping = SimpleNamespace(

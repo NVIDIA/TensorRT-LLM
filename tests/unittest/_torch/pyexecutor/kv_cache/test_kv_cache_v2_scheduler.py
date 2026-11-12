@@ -113,6 +113,26 @@ def test_dense_v2_admission_counts_shared_pool_lifecycles_and_guard() -> None:
     assert manager.get_request_kv_block_budget(request) == (8, 7)
 
 
+def test_dense_v2_admission_preserves_sparse_host_history_budget() -> None:
+    manager = make_dense_budget_manager()
+    manager._host_history_capacity_blocks = 5
+    manager._get_host_history_blocks = Mock(return_value=6)
+    request = Mock()
+    assert manager.kv_block_budget_applies()
+    assert manager.get_request_kv_block_budget(request) == (6, 5)
+    manager._get_host_history_blocks.assert_called_once_with(request)
+    manager._get_storage_statistics.assert_not_called()
+
+
+def test_dense_v2_admission_counts_shared_draft_allocation_width() -> None:
+    manager = make_dense_budget_manager()
+    manager.max_blocks_per_seq = 8
+    manager._shared_draft_block_width = 2
+    request = SimpleNamespace(orig_prompt_len=255, max_new_tokens=0, py_beam_width=1)
+    assert manager.get_request_kv_block_budget(request) == (9, 8)
+    assert manager.get_request_kv_page_index_budget(request) == (9, 8)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -296,7 +316,7 @@ def test_never_fit_admission_fails_only_long_request_and_short_context_runs(
     assert accepted == executor.active_requests == [short]
     executor._handle_errors.assert_called_once()
     error = executor._handle_errors.call_args
-    assert "exceeds its GPU-primary capacity of 8 blocks" in error.args[0]
+    assert "exceeds its capacity of 8 blocks" in error.args[0]
     assert error.kwargs == {"requests": [long], "charge_budget": False}
 
     manager = make_kv_cache_manager(tokens_per_block=32, has_cache_tier_below_gpu=False)
