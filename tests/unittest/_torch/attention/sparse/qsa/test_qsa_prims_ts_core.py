@@ -568,6 +568,24 @@ def test_metadata_module_probe_reports_mismatch(monkeypatch) -> None:
         prims_ts_core._metadata_module_reason.cache_clear()
 
 
+def test_metadata_module_build_failure_reports_unavailable(monkeypatch) -> None:
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
+
+    def build_and_load():
+        raise OSError("nvcc not found")
+
+    monkeypatch.setattr(
+        fi_metadata, "_get_prims_ts_q_token_kv_block_sparse_metadata_module", build_and_load
+    )
+    prims_ts_core._metadata_module_reason.cache_clear()
+    try:
+        reason = prims_ts_core._metadata_module_reason()
+        assert "unavailable" in reason and "nvcc not found" in reason
+    finally:
+        prims_ts_core._metadata_module_reason.cache_clear()
+
+
 def test_metadata_module_mismatch_falls_back_to_triton(monkeypatch) -> None:
     _requires_prims_ts()
     import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata

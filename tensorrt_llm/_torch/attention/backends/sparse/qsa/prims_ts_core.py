@@ -67,8 +67,12 @@ def _metadata_module_reason() -> str | None:
     from ...prims_ts import q_token_kv_block_sparse_metadata as metadata
 
     try:
+        module = metadata._get_prims_ts_q_token_kv_block_sparse_metadata_module()
+    except Exception as error:
+        return f"the metadata module is unavailable: {error}"
+    try:
         # Zero arguments never launch; TVM-FFI reports the bound arity.
-        metadata._get_prims_ts_q_token_kv_block_sparse_metadata_module().run_fixed()
+        module.run_fixed()
     except (TypeError, RuntimeError) as error:
         arity = re.search(r"Expected (\d+) but got", str(error))
         if arity is None:
