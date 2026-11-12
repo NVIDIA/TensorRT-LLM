@@ -144,21 +144,23 @@ def plan_layout(
     home_layout: np.ndarray,
     current_layout: np.ndarray,
     total_active_slots: int,
+    keep_first: bool = False,
 ) -> Plan:
     """Plan the next layout of one layer from its ``[num_experts]`` rows.
 
     Every expert keeps its home slot, and each further slot up to ``total_active_slots`` goes to the
     expert with the most rows per copy. Replicas go, most rows first, to the least loaded GPU that
     does not hold the expert yet. New replicas only take slots that ``current_layout`` leaves free,
-    and an installed replica that stays on its GPU keeps its slot.
+    and an installed replica that stays on its GPU keeps its slot. With ``keep_first`` the
+    installed replicas an expert still needs stay before any is placed (:func:`_place_replicas`).
     """
     num_experts = geometry.num_experts
     rows = np.asarray(load, dtype=np.float64).tolist()
     homes = np.asarray(home_layout).tolist()
-    home_slot = [slots[0] for slots in _expert_slots_of(homes, num_experts)]
     is_home = [expert >= 0 for expert in homes]
-    proposed = _place_replicas(rows, homes, home_slot, geometry, int(total_active_slots))
     installed = _expert_slots_of(np.asarray(current_layout).tolist(), num_experts)
+    copies = _copies(rows, int(total_active_slots))
+    proposed = _place_replicas(rows, homes, copies, geometry, installed if keep_first else None)
     fitted = _fit_free_slots(installed, proposed, rows, geometry)
     expert_slots = _one_install(installed, fitted, is_home, geometry)
     layout = np.full(geometry.num_slots, -1, dtype=np.int64)
@@ -194,23 +196,44 @@ def _copies(rows: list[float], total: int) -> list[int]:
 
 
 def _place_replicas(
-    rows: list[float], homes: list[int], home_slot: list[int], geometry: ExpertGeometry, total: int
+    rows: list[float],
+    homes: list[int],
+    copies: list[int],
+    geometry: ExpertGeometry,
+    installed: _ExpertSlots | None = None,
 ) -> _ExpertSlots:
-    """Every expert's home slot and its replicas on the free slots of ``homes``."""
-    num_experts = geometry.num_experts
+    """Every expert's home slot and the rest of its ``copies`` on the free slots of ``homes``.
+
+    With ``installed`` (keep-first), an expert first keeps up to ``copies - 1`` of its installed
+    replicas off its home GPU, one per GPU (another balances nothing): one that holds more keeps,
+    most rows per copy first, those on the GPUs with the fewest rows so far, then the lowest slot.
+    """
     ep_size = geometry.ep_size
     local = geometry.local_slots
-    copies = _copies(rows, total)
-    free = [[s for s in range(r * local, (r + 1) * local) if homes[s] < 0] for r in range(ep_size)]
-    limit = [min(local - geometry.local_experts, len(free[r])) for r in range(ep_size)]
+    per_copy = [r / c for r, c in zip(rows, copies)]
+    base = list(homes)
     experts_on_gpu = [
-        {e for e in homes[r * local : (r + 1) * local] if e >= 0} for r in range(ep_size)
+        {e for e in base[r * local : (r + 1) * local] if e >= 0} for r in range(ep_size)
     ]
-    gpu_rows = [
-        math.fsum([rows[e] / copies[e] for e in sorted(experts_on_gpu[r])]) for r in range(ep_size)
+    gpu_rows = [math.fsum([per_copy[e] for e in sorted(experts_on_gpu[r])]) for r in range(ep_size)]
+    home_gpu = {e: s // local for s, e in enumerate(homes) if e >= 0}
+    held = [  # the lowest slot of every GPU but the home one
+        sorted({s // local: s for s in reversed(slots) if s // local != home_gpu[e]}.values())
+        for e, slots in enumerate(installed or ())
     ]
+    order = sorted(range(len(held)), key=lambda e: (len(held[e]) >= copies[e], -per_copy[e], e))
+    for expert in order:
+        for _ in range(min(copies[expert] - 1, len(held[expert]))):
+            slot = min(held[expert], key=lambda s: (gpu_rows[s // local], s))
+            held[expert].remove(slot)
+            base[slot] = expert
+            experts_on_gpu[slot // local].add(expert)
+            gpu_rows[slot // local] += per_copy[expert]
+    slots = [list(kept) for kept in _expert_slots_of(base, geometry.num_experts)]
+    free = [[s for s in range(r * local, (r + 1) * local) if base[s] < 0] for r in range(ep_size)]
+    limit = [min(local - geometry.local_experts, len(free[r])) for r in range(ep_size)]
     replicas = sorted(
-        ((rows[e] / copies[e], e) for e in range(num_experts) for _ in range(copies[e] - 1)),
+        ((per_copy[e], e) for e, kept in enumerate(slots) for _ in range(copies[e] - len(kept))),
         key=lambda item: (-item[0], item[1]),
     )
     placed: list[list[int]] = [[] for _ in range(ep_size)]
@@ -230,7 +253,6 @@ def _place_replicas(
         placed[gpu].append(expert)
         if len(placed[gpu]) < limit[gpu]:
             heapq.heappush(heap, (gpu_rows[gpu], gpu))
-    slots = [[slot] for slot in home_slot]
     for gpu in range(ep_size):
         for expert, slot in zip(placed[gpu], free[gpu]):
             slots[expert].append(slot)
