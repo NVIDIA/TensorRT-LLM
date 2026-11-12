@@ -167,8 +167,9 @@ def fused_strict_accept(
     return accepted, num_accepted
 
 
-# The counts change every step: keep them out of the cache key.
-@triton.jit(do_not_specialize=["num_contexts", "num_ctx_tokens", "batch_size"])
+# The counts change every step, and so does pos_row_stride (the token count) under MRoPE: keep them out of
+# the cache key.
+@triton.jit(do_not_specialize=["pos_row_stride", "num_contexts", "num_ctx_tokens", "batch_size"])
 def _step0_epilogue_kernel(
     seq_lens_ptr,
     num_accepted_ptr,

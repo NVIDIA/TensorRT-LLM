@@ -172,7 +172,7 @@ def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
 
 
 def test_accept_kernels_compile_once_across_batch_splits():
-    """One compiled accept / step-0 kernel serves every batch split."""
+    """One compiled accept / step-0 kernel per position layout serves every batch split."""
     import triton
 
     from tensorrt_llm._torch.speculative import fused_accept
@@ -186,7 +186,7 @@ def test_accept_kernels_compile_once_across_batch_splits():
     def i32(*shape):
         return torch.zeros(shape, dtype=torch.int32, device="cuda")
 
-    def run(num_contexts, num_gens):
+    def run(num_contexts, num_gens, mrope_rows=0):
         b = num_contexts + num_gens
         target = torch.randint(0, 4, (num_contexts + num_gens * (k + 1),), device="cuda")
         draft = torch.randint(0, 4, (num_gens, k), dtype=torch.int32, device="cuda")
@@ -199,7 +199,7 @@ def test_accept_kernels_compile_once_across_batch_splits():
             seq_lens,
             i32(b) + 1,
             hidden,
-            i32(n_tok),
+            i32(mrope_rows, n_tok) if mrope_rows else i32(n_tok),
             i32(b),
             i32(b),
             num_contexts,
@@ -209,7 +209,9 @@ def test_accept_kernels_compile_once_across_batch_splits():
         )
         assert epilogue is not None
 
-    run(3, 2)
+    # 1-D positions and [3, tokens] MRoPE positions (R is a constexpr).
+    for mrope_rows in (0, 3):
+        run(3, 2, mrope_rows)
     compiled = [len(kernel.device_caches[device][0]) for kernel in kernels]
     for num_contexts, num_gens in [
         (1, 0),
@@ -222,5 +224,6 @@ def test_accept_kernels_compile_once_across_batch_splits():
         (1, 130),
         (130, 1),
     ]:
-        run(num_contexts, num_gens)
+        for mrope_rows in (0, 3):
+            run(num_contexts, num_gens, mrope_rows)
     assert [len(kernel.device_caches[device][0]) for kernel in kernels] == compiled
