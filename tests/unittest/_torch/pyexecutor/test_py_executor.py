@@ -3145,6 +3145,7 @@ class _StubADPExecutor:
         max_num_tokens=8192,
         max_seq_len=8192,
         kv_manager_max_seq_len=None,
+        max_beam_width=1,
         is_warmup=False,
         benchmark_req_queues_size=0,
         enable_adp_dummy_fixes=True,
@@ -3164,6 +3165,7 @@ class _StubADPExecutor:
         self.expected_num_active_requests = 1
         self.max_num_active_requests = 8
         self.max_total_draft_tokens = 0
+        self.max_beam_width = max_beam_width
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
@@ -3741,6 +3743,34 @@ def test_pad_dummy_allocation_failure_skips_padding():
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
 
+@pytest.mark.parametrize("enable_adp_dummy_fixes", [True, False], ids=["fixed", "legacy"])
+@pytest.mark.parametrize(
+    ("peer_forward_intent", "is_gen", "beam_width"),
+    [
+        pytest.param(_ADPForwardIntent.GENERATION, True, 4, id="generation"),
+        pytest.param(_ADPForwardIntent.CONTEXT, False, 1, id="context"),
+    ],
+)
+def test_adp_pad_dummy_beam_width_follows_role(
+    enable_adp_dummy_fixes: bool,
+    peer_forward_intent: _ADPForwardIntent,
+    is_gen: bool,
+    beam_width: int,
+) -> None:
+    stub = _StubADPExecutor(
+        max_beam_width=4,
+        enable_adp_dummy_fixes=enable_adp_dummy_fixes,
+        peer_forward_intent=peer_forward_intent,
+    )
+    stub._adp_dummy_is_gen = is_gen
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is is_gen
+    assert stub.add_dummy_calls[0].get("max_beam_width", 1) == beam_width
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -4174,6 +4204,68 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
     # and an owner left empty by cancellation.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
+
+
+@pytest.mark.parametrize(
+    ("max_beam_width", "context_only_cache", "is_gen"),
+    [
+        pytest.param(1, False, True, id="generation"),
+        pytest.param(1, True, False, id="context_only_cache"),
+        pytest.param(4, False, False, id="beam_search"),
+    ],
+)
+def test_pad_empty_batch_dummy_is_one_block_wide(
+    max_beam_width: int, context_only_cache: bool, is_gen: bool
+) -> None:
+    # The rescue dummy always fits in one block: a generation dummy at width
+    # one, or a one-token context dummy where a generation row cannot run or
+    # would need a block per beam.
+    stub, scheduled_batch = _unfittable_rank(max_beam_width=max_beam_width)
+    stub.kv_cache_manager.kda_context_only = context_only_cache
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is is_gen
+    assert stub.add_dummy_calls[0].get("max_beam_width", 1) == 1
+    assert scheduled_batch.batch_size == 1
+    if is_gen:
+        assert len(scheduled_batch.generation_requests) == 1
+    else:
+        assert stub.add_dummy_calls[0]["token_nums"] == [1]
+        assert len(scheduled_batch.context_requests) == 1
+
+
+@pytest.mark.parametrize("free_blocks", [1, 2, 3])
+def test_pad_empty_batch_lands_under_beam_search_with_fewer_free_blocks_than_beams(
+    free_blocks: int,
+) -> None:
+    # A starved beam-search rank has fewer free blocks than beams: a width-W
+    # generation dummy would be refused every iteration and stall the fleet,
+    # so the one-block context dummy has to land instead.
+    stub, scheduled_batch = _unfittable_rank(max_beam_width=4)
+    tokens_per_block = stub.kv_cache_manager.tokens_per_block
+    stub.kv_cache_manager.get_num_available_tokens.side_effect = (
+        lambda token_num_upper_bound, max_num_draft_tokens=0, **_: min(
+            token_num_upper_bound, free_blocks * tokens_per_block - max_num_draft_tokens
+        )
+    )
+    allocate = stub.kv_cache_manager.add_dummy_requests.side_effect
+
+    def _refuse_beams_that_do_not_fit(**kwargs):
+        if kwargs.get("max_beam_width", 1) > free_blocks:
+            return None
+        return allocate(**kwargs)
+
+    stub.kv_cache_manager.add_dummy_requests.side_effect = _refuse_beams_that_do_not_fit
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert len(scheduled_batch.context_requests) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is False
+    assert stub.add_dummy_calls[0]["max_beam_width"] == 1
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
 
 
 def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():

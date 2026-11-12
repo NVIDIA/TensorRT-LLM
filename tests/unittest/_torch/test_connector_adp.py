@@ -100,6 +100,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
         Distributed.tp_cp_allgather_int64, executor.dist
     )
     executor.enable_attention_dp = True
+    executor.max_beam_width = 1
     executor.enable_early_first_token_response = False
     executor.gather_all_responses = False
     executor.kv_connector_manager = None

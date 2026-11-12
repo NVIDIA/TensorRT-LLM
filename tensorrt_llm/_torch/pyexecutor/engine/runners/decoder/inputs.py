@@ -1880,9 +1880,8 @@ class DecoderInputPreparer:
             # *per-iteration* width: py_beam_width is fixed at admission and
             # would be identical across those requests. Dummy requests are
             # excluded -- they carry no user request and are built at their own
-            # width (CUDA-graph padding at the engine width, attention-DP and
-            # warmup dummies at width one), so they would otherwise trip this
-            # on an ordinary padded batch.
+            # width (generation dummies at the engine width, context dummies at
+            # width one), so only real requests are compared.
             real_requests = [req for req in generation_requests if not req.is_dummy]
             iter_widths = {req.get_beam_width_by_iter() for req in real_requests}
             if len(iter_widths) > 1:

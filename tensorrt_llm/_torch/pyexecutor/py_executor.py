@@ -9425,6 +9425,10 @@ class PyExecutor:
         still let the C++ batch allocation fail after a peer rank has
         succeeded. ``draft_reserve`` overrides the draft tokens reserved for
         the dummy; by default they follow the dummy role.
+
+        A beam-search generation dummy can need a block per beam; if they do
+        not fit, ``add_dummy_requests`` returns None and the rank schedules an
+        empty batch that the fleet retries.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
@@ -9597,6 +9601,8 @@ class PyExecutor:
                     token_nums=token_nums,
                     is_gen=self._adp_dummy_is_gen,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    max_beam_width=(self.max_beam_width
+                                    if self._adp_dummy_is_gen else 1),
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -9632,12 +9638,16 @@ class PyExecutor:
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                max_beam_width=(self.max_beam_width
+                                if self._adp_dummy_is_gen else 1),
             )
         except OutOfPagesError:
             dummy_requests = None
         if not dummy_requests:
-            logger.warning("Cannot allocate ADP pad dummy; rank schedules "
-                           "an empty batch and the fleet will retry.")
+            logger.warning_once(
+                "Cannot allocate ADP pad dummy; rank schedules an empty "
+                "batch and the fleet will retry.",
+                key="adp_pad_dummy_alloc_failed")
             return
 
         dummy_request = dummy_requests[0]
@@ -9674,7 +9684,9 @@ class PyExecutor:
         context dummy the pre-schedule path would pick, since this rank is empty
         precisely because it is short of KV cache. A context-only cache cannot
         run a generation row, so there the dummy is a one-token context
-        request. Not reached under pipeline parallelism, which does not call
+        request. Under beam search the dummy is likewise a one-token, width-one
+        context request, so the rescue stays at one block.
+        Not reached under pipeline parallelism, which does not call
         `_prepare_and_schedule_batch`.
         """
         if not self.enable_attention_dp:
@@ -9710,8 +9722,11 @@ class PyExecutor:
             return
         # A context-only cache manager keeps no KDA replay or draft-verification
         # buffers, or no FP4 MLA V scales, so it cannot run a generation row;
-        # pad with a one-token context dummy instead.
-        context_dummy = is_context_only_kv_cache(self.kv_cache_manager)
+        # pad with a one-token context dummy instead. Under beam search a
+        # generation dummy needs a block per beam, which a rank short of KV
+        # cache may never have; the context dummy stays at one block.
+        context_dummy = (is_context_only_kv_cache(self.kv_cache_manager)
+                         or self.max_beam_width > 1)
         token_nums = [1] if context_dummy else None
         if not self._has_adp_dummy_kv_capacity(
                 token_nums, draft_reserve=0 if context_dummy else None):
@@ -9733,6 +9748,8 @@ class PyExecutor:
                 is_gen=not context_dummy,
                 max_num_draft_tokens=(0 if context_dummy else
                                       self.max_total_draft_tokens),
+                # Generation dummies reach here only at beam width one.
+                max_beam_width=1,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
