@@ -3,11 +3,12 @@
 """Runtime of adaptive EPLB: statistics windows, the decision process and installs.
 
 The main thread advances the runtime once per executor step and never waits; a worker thread runs
-the blocking work (the all-gathers, the decision process's messages, the expert copies). Every rank
-decides alike in its own decision process. An install copies new replicas into free slots, and its
-route tables take effect from the call after every rank's copies finished; ranks whose decisions
-differ stop the run before that. The decision process imports this module with only torch, numpy
-and this package available, so import other ``tensorrt_llm`` modules inside functions.
+the blocking work (the requests' progress at a close, the all-gathers, the decision process's
+messages, the expert copies). Every rank decides alike in its own decision process. An install
+copies new replicas into free slots, and its route tables take effect from the call after every
+rank's copies finished; ranks whose decisions differ stop the run before that. The decision process
+imports this module with only torch, numpy and this package available, so import other
+``tensorrt_llm`` modules inside functions.
 """
 
 from __future__ import annotations
@@ -59,8 +60,6 @@ ROWS_PER_EXPERT = 512
 relative standard error of about 1 / sqrt(512) = 4.4 % at any batch size or draft length: a window
 lasts as many forwards as the previous window's rows per forward need to reach it. The first window
 lasts one forward; with fewer rows than that it only measures the rows per forward."""
-REQUESTS_PER_CALL = 64
-"""int: Generation requests whose progress one call reads (about 20 us of main-thread time)."""
 CLOSE_WAIT_S = 30.0
 """float: Seconds a close waits for the worker thread, again after telling it to leave."""
 GATHER_SLICE_S = 1.0
@@ -479,9 +478,8 @@ class AdaptiveRuntime:
         self.window_opened_call = -1
         self.window_forwards = 1
         self.applied_window = np.full(len(layers), -1.0)
-        self.request_totals = np.zeros(3)  # the FIELDS remaining, requests and accepted
         self.wants_request_progress = False
-        self._requests_read = 0
+        self._progress: tuple[int, GenerationProgress] | None = None
         self.last_applied = (-1.0, 0.0, 0.0)
         self.pending_updates: deque[tuple[int, LayoutUpdate]] = deque()
         self._apply_events: deque = deque()
@@ -509,7 +507,6 @@ class AdaptiveRuntime:
         self._host_tables_np = self._host_tables.numpy()  # the host mirror, written row by row
         self._stats_copy_begin = torch.cuda.Event(enable_timing=True)
         self._stats_copy_end = torch.cuda.Event(enable_timing=True)
-        self._pending_stats_copy: torch.cuda.Event | None = None
         self._copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
         self._copy_end = torch.cuda.Event(enable_timing=True, blocking=True)
 
@@ -546,15 +543,13 @@ class AdaptiveRuntime:
         )
 
     def add_request_progress(self, num_requests: int, progress: GenerationProgress) -> None:
-        """Add the progress of up to :data:`REQUESTS_PER_CALL` more of the ``num_requests``
-        generation requests to the window's request totals: ``progress(start, stop)`` gives the
-        tokens the requests ``[start, stop)`` still have to produce, how many of them are requests
-        and the tokens they accept per step."""
-        start = self._requests_read
-        stop = start + REQUESTS_PER_CALL
-        self.request_totals += progress(start, stop)
-        self._requests_read = stop
-        self.wants_request_progress = stop < num_requests
+        """Keep the progress of a step's ``num_requests`` generation requests, asked for by
+        :attr:`wants_request_progress` from the call before a window closes. ``progress(start,
+        stop)`` gives the tokens the requests ``[start, stop)`` still have to produce, how many of
+        them are requests and the tokens they accept per step; the worker thread reads the latest
+        one kept when the window closes."""
+        self._progress = (num_requests, progress)
+        self.wants_request_progress = False
 
     def boundary(self) -> None:
         """Advance windows, decisions, copies and route tables by one call; never waits. After a
@@ -575,7 +570,6 @@ class AdaptiveRuntime:
         self.pending_updates.clear()
         self.worker.inbox.clear()
         self.open_at = self.close_at = None
-        self._pending_stats_copy = None
         self.wants_request_progress = False
         logger.error(
             f"adaptive EPLB stopped after {error!r}; the expert layouts in use stay as they are"
@@ -624,12 +618,8 @@ class AdaptiveRuntime:
             self.window_opened_call = call
         elif call == self.close_at:
             self._close_window()
-        if self._pending_stats_copy is not None and not self.wants_request_progress:
-            copied, self._pending_stats_copy = self._pending_stats_copy, None
-            totals = self.request_totals.copy()
-            window = self.window
-            worker.post(lambda: self._gather_window(copied, totals, window))
-            self.gathers_posted += 1
+        if self.close_at == call + 1:
+            self.wants_request_progress = True
 
     def _event(self, event: str, **data: object) -> None:
         """Log an event of the windows, decisions and installs at debug level: its scalars and
@@ -644,22 +634,23 @@ class AdaptiveRuntime:
         self._storage.zero_()
 
     def _close_window(self) -> None:
-        """Copy the statistics into this rank's window statistics, timing the copies."""
+        """Copy the statistics into this rank's window statistics, timing the copies, and have the
+        worker thread gather them at once."""
         assert not self.pending_updates, "an update must apply before its next window closes"
         self.closed_windows += 1
         self._stats_copy_begin.record()
         self._own_raw.copy_(self._storage, non_blocking=True)
         self._stats_copy_end.record()
-        self._pending_stats_copy = self._stats_copy_end
         self.close_at = None
-        self.wants_request_progress = True
-        self._requests_read = 0
-        self.request_totals[:] = 0
+        progress, window = self._progress, self.window
+        self.worker.post(lambda: self._gather_window(progress, window))
+        self.gathers_posted += 1
 
-    def _gather_window(self, copied: torch.cuda.Event, totals: np.ndarray, window: int) -> tuple:
-        """Worker thread: complete this rank's window statistics, all-gather them and get the
-        decision."""
-        copied.synchronize()
+    def _gather_window(self, progress: tuple | None, window: int) -> tuple:
+        """Worker thread: read the requests' progress, complete this rank's window statistics,
+        all-gather them and get the decision."""
+        totals = (0, 0, 0) if progress is None else progress[1](0, progress[0])
+        self._stats_copy_end.synchronize()
         while self._apply_events and self._apply_events[0][3].query():
             applied, layers, begin, end = self._apply_events.popleft()
             self.last_applied = (float(applied), float(layers), begin.elapsed_time(end))

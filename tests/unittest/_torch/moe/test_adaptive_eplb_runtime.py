@@ -224,13 +224,13 @@ def settle(ranks) -> None:
         assert runtime.worker.failure is None, runtime.worker.failure
 
 
-def run(ranks, clock, calls: int) -> None:
-    """Calls as the executor makes them, each seeing its batch first (no requests here). The
-    clock reaches a call once every boundary ran it: a copy completes at its due call."""
+def run(ranks, clock, calls: int, requests=((), ())) -> None:
+    """Calls as the executor makes them, each seeing its batch (every rank's ``requests``) first.
+    The clock reaches a call once every boundary ran it: a copy completes at its due call."""
     for _ in range(calls):
-        for runtime in ranks:
+        for runtime, batch in zip(ranks, requests):
             if runtime.wants_request_progress:
-                runtime.add_request_progress(*executor_progress([]))
+                runtime.add_request_progress(*executor_progress([request(*i) for i in batch]))
             runtime.boundary()
         clock[0] = ranks[0].call
         settle(ranks)
@@ -320,12 +320,10 @@ def window_inputs(monkeypatch, forwards=(FORWARDS,) * R):
     progress = ([(120, 10, 1), (70, 10, 1), (1, 1, 0, True)], [(75, 15, 2)])
     for runtime, counts, count in zip(ranks, rows, forwards):
         set_statistics(runtime, counts, count)
-    run(ranks, clock, FORWARDS)
-    # The window closed: the gather waits for the requests' progress, read in slices.
+    # The batch of the call that closes the window: the gather reads its progress at once.
+    run(ranks, clock, FORWARDS - 1)
     assert all(runtime.wants_request_progress for runtime in ranks)
-    for runtime, items in zip(ranks, progress):
-        runtime.add_request_progress(*executor_progress([request(*item) for item in items]))
-    run(ranks, clock, 2)
+    run(ranks, clock, 2, progress)
     return seen, rows, decisions, ranks
 
 
@@ -336,9 +334,10 @@ def test_a_window_counts_every_ranks_rows_over_its_own_forwards(host_cuda, monke
     base, _, _, base_ranks = window_inputs(monkeypatch)
     seen, rows, _, ranks = window_inputs(monkeypatch, (FORWARDS, FORWARDS + 1))
     expected = rows[0].astype(np.float64) / FORWARDS + rows[1].astype(np.float64) / (FORWARDS + 1)
-    assert len(seen["load"]) == R * L  # every layer planned on both ranks: not skipped
-    for i, (load, solved) in enumerate(zip(seen["load"], seen["rows"][::2])):  # plan, installed
-        assert np.array_equal(load, expected[i % L]) and np.array_equal(solved, expected[i % L])
+    # Every layer planned and solved (new, installed) on both ranks, whose worker threads decide
+    # at once: their calls interleave.
+    for name, per_layer in (("load", R), ("rows", 2 * R)):
+        assert sorted(map(list, seen[name])) == sorted(map(list, [*expected] * per_layer))
     last = [runtime._event.records[-1] for runtime in (*ranks, base_ranks[0])]
     for key in ("window", "open_call", "solved_call"):
         assert last[0][key] == last[1][key] == last[2][key]
@@ -357,8 +356,8 @@ def test_the_first_window_lasts_one_call_and_sizes_the_next(host_cuda, monkeypat
         assert seen["per_forward"] == [(R * per_rank * E, E)] * R
         for runtime in ranks:
             (first,) = runtime._event.records
-            # It closed at call 1, was gathered at call 2 and decided at call 3.
-            assert (first["open_call"], first["solved_call"], first["tables"]) == (0, 3, [])
+            # It closed and was gathered at call 1 and decided at call 2.
+            assert (first["open_call"], first["solved_call"], first["tables"]) == (0, 2, [])
             assert first["forwards"] == FORWARDS
             assert runtime.close_at - runtime.window_opened_call == FORWARDS
 
@@ -518,10 +517,7 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
     hot = np.tile([400.0, 400.0] + [1.0] * (E - 2), (L, 1)).astype(np.float32)
     for runtime in ranks:
         set_statistics(runtime, hot, FORWARDS)
-    run(ranks, clock, FORWARDS)
-    for runtime in ranks:
-        runtime.add_request_progress(*executor_progress([request(1000, 10, 0) for _ in range(4)]))
-    run(ranks, clock, 12)
+    run(ranks, clock, FORWARDS + 12, [[(1000, 10, 0)] * 4] * R)
     decided = [runtime._event.by_window[1] for runtime in ranks]
     assert all(record["moved"] == [0, 1] for record in decided)
     assert decided[0]["apply_call"] == decided[1]["apply_call"]
@@ -543,7 +539,8 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
         run(ranks, clock, 22)
     sent = [m[1] for m in decisions[0].sent if m[0] == "window"]
     assert sent == list(range(len(sent))) and len(sent) >= 3
-    assert [r["window"] for r in ranks[0]._event.records] == sent
+    pending = [m[1].window for m in ranks[0].worker.inbox if m[0] == "update"]  # read next call
+    assert [r["window"] for r in ranks[0]._event.records] + pending == sent
 
 
 def test_no_boundary_runs_while_a_graph_is_captured(monkeypatch):
@@ -723,14 +720,13 @@ def test_shutdown_completes_an_all_gather_that_only_some_ranks_posted(host_cuda,
     if rank_0_failed:
         decisions[0].script = {}.__getitem__  # the decision of window 0 fails
     ranks = make_ranks(decisions, clock)
-    run(ranks, clock, 2)  # window 0 opens at call 0 and closes at call 1
-    for runtime in ranks:  # call 2 posts the window's all-gather
-        runtime.add_request_progress(*executor_progress([]))
+    run(ranks, clock, 1)  # window 0 opens at call 0
+    for runtime in ranks:  # call 1 closes it and posts its all-gather
         runtime.boundary()
     deadline = time.monotonic() + 30
     while not (ranks[1].worker.inbox and (ranks[0].worker.inbox or ranks[0].worker.failure)):
         assert time.monotonic() < deadline, "window 0 was not decided"
-    for runtime in ranks[0 if rank_0_failed else 1 :]:  # call 3: rank 1 posts the install's
+    for runtime in ranks[0 if rank_0_failed else 1 :]:  # call 2: rank 1 posts the install's
         runtime.boundary()
     votes = [(True, 1), (True, 2)]  # the all-gathers each rank posted
     for rank, runtime in enumerate(ranks):
