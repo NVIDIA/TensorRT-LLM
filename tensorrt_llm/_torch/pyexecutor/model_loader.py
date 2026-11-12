@@ -250,6 +250,14 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_philox_rounds: int = 10) -> None:
     mamba_ssm_cache_dtype = effective_mamba_ssm_cache_dtype(
         config, mamba_ssm_cache_dtype)
+    if (mamba_ssm_cache_dtype == torch.int8
+            and getattr(config, "modeling_v2_target", None) is None):
+        # The built-in recurrent kernels read the pool as values; only a target
+        # that implements the 8-bit row layout may ask for it.
+        raise ValueError(
+            "kv_cache_config.mamba_ssm_cache_dtype='int8' is implemented only by "
+            "modeling_v2 targets that claim this model (set modeling_v2 and check "
+            "that a target fits)")
     validate_kimi_kda_state_dtype(config.pretrained_config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding)

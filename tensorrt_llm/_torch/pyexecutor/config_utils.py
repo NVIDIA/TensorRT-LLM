@@ -299,6 +299,20 @@ def resolve_hf_torch_dtype(config):
     return None
 
 
+def ssm_state_rows(head_dim: int, d_state: int, ssm_dtype) -> int:
+    """Rows of ``d_state`` elements per SSM head in the recurrent-state pool.
+
+    An int8-typed pool (``mamba_ssm_cache_dtype="int8"``, filled by a modeling_v2
+    target with its own quantized rows) stores int16 row codes, two int8 rows per
+    state row, and appends the ``head_dim`` fp32 row scales as
+    ``head_dim * 4 / d_state`` extra int8 rows.
+    """
+    if ssm_dtype == torch.int8:
+        assert (head_dim * 4) % d_state == 0, (head_dim, d_state)
+        return 2 * head_dim + (head_dim * 4) // d_state
+    return head_dim
+
+
 def resolve_ssm_cache_dtype(config):
     """Return the dtype to use for hybrid SSM-style state cache allocations.
 
@@ -612,8 +626,9 @@ class MambaKVCacheParams:
         ssm_dtype = (self.mamba_ssm_cache_dtype
                      if self.mamba_ssm_cache_dtype is not None else self.dtype)
         conv_bytes = conv_dim * (self.conv_kernel - 1) * conv_dtype.itemsize
-        ssm_bytes = (nheads * self.head_dim * self.state_size *
-                     ssm_dtype.itemsize)
+        ssm_bytes = (nheads *
+                     ssm_state_rows(self.head_dim, self.state_size, ssm_dtype) *
+                     self.state_size * ssm_dtype.itemsize)
         state_bytes_per_layer = conv_bytes + ssm_bytes
         return state_bytes_per_layer
 

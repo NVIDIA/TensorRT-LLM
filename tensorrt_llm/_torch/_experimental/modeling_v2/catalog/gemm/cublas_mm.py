@@ -18,7 +18,7 @@ class CublasMm(OpWrapper):
     is -- the targets pass `weight.t()` and no transpose kernel runs.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_120})
 
     # Both targets use this for every dense projection. This entry's test
     # carries their three argument shapes that differ in kind rather than in size: fused
