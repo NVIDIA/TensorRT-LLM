@@ -27,6 +27,8 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
+from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 pytestmark = pytest.mark.cpu_only
 
@@ -234,9 +236,14 @@ def _kv_update_fake(kv_interval: int):
         missed_blocks=4,
         cache_hit_rate=0.0,
     )
-    kv_cache_manager.get_iteration_stats.return_value = {32: "deltas"}
+    delta = KvCacheIterationStats()
+    delta.iter_reused_blocks = 3
+    kv_cache_manager.get_iteration_stats.return_value = {32: delta}
 
     fake = MagicMock()
+    fake._perf_metrics = PerfMetricsCollector()
+    fake.dist.rank = 0
+    fake.global_rank = 0
     fake.max_num_active_requests = 8
     fake.enable_attention_dp = False
     fake.executor_request_queue.get_request_queue_size.return_value = 0
@@ -283,7 +290,10 @@ def test_kv_iteration_stats_follow_construction_iter_not_live_counter():
         # Live counter one ahead, as under the overlap scheduler.
         fake.iter_counter = stats_iter + 1
         fetched[stats_iter] = _update(fake, stats_iter)
-    assert fetched == {0: {32: "deltas"}, 4: {32: "deltas"}, 8: {32: "deltas"}}
+    assert fetched == {
+        iteration: kv_cache_manager.get_iteration_stats.return_value for iteration in (0, 4, 8)
+    }
+    assert fake._perf_metrics.latest_rank["kvCacheIterationStats"]["32"]["iterReusedBlocks"] == 3
     assert kv_cache_manager.get_iteration_stats.call_count == 3
 
 
@@ -291,7 +301,7 @@ def test_kv_iteration_stats_skip_non_interval_records_and_duplicates():
     fake, kv_cache_manager = _kv_update_fake(kv_interval=4)
     fake.iter_counter = 100
     assert _update(fake, 6) is None
-    assert _update(fake, 8) == {32: "deltas"}
+    assert _update(fake, 8) is kv_cache_manager.get_iteration_stats.return_value
     # A second record for the same iteration must not drain the deltas again.
     assert _update(fake, 8) is None
     assert kv_cache_manager.get_iteration_stats.call_count == 1

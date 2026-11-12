@@ -24,7 +24,9 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..logger import logger
-from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
+from ..metrics import MetricNames, RequestEventTiming
+from ..metrics.perf import (FINISH_REASON_LABEL, PerfMetricsCollector,
+                            PerfMetricsRecord)
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
@@ -249,6 +251,7 @@ class GenerationResultBase:
         self._aborted = False
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
+        self.candidate_metric_records: list[PerfMetricsRecord] = []
         self.trace_headers: Optional[dict[str, str]] = None
         # Multi-beam search does not report logprobs incrementally: each response
         # carries the full list, so it is sliced against _last_logprobs_len rather
@@ -809,10 +812,7 @@ class GenerationResultBase:
             return
         metrics_stats = {}
         if output.finish_reason:
-            metrics_stats.update({
-                MetricsCollector.labelname_finish_reason:
-                output.finish_reason
-            })
+            metrics_stats.update({FINISH_REASON_LABEL: output.finish_reason})
         processed_metrics_stat = _process_req_perf_metrics(
             stats, len(output.token_ids))
         if processed_metrics_stat:
@@ -833,10 +833,11 @@ class GenerationResultBase:
             spec_dec_logged = False
             if self.per_pos_drafted is not None and any(
                     d > 0 for d in self.per_pos_drafted):
-                metrics_stats[MetricNames.SPEC_DEC_ACCEPTED_PER_POS] = \
-                    self.per_pos_accepted
-                metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
-                    self.per_pos_drafted
+                metrics_stats[MetricNames.SPEC_DEC_ACCEPTED_PER_POS] = (
+                    list(self.per_pos_accepted)
+                    if self.per_pos_accepted is not None else None)
+                metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = list(
+                    self.per_pos_drafted)
                 spec_dec_logged = True
             if not spec_dec_logged and output.request_perf_metrics is not None:
                 spec_dec = output.request_perf_metrics.speculative_decoding
@@ -900,6 +901,8 @@ class GenerationResultBase:
             if gen_ppl is not None and math.isfinite(gen_ppl):
                 metrics_stats[MetricNames.GENERATION_PERPLEXITY] = gen_ppl
 
+        record = PerfMetricsCollector.collect_request(metrics_stats)
+        self.candidate_metric_records.append(record)
         self.candidate_metrics.append(metrics_stats)
         self.metrics_dict.update(metrics_stats)
 

@@ -4,6 +4,7 @@
 import atexit
 import dataclasses
 import datetime
+import json
 import math
 import os
 import sys
@@ -56,6 +57,7 @@ from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
@@ -102,6 +104,7 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
+from .iteration_stats import IterationStatsRecord
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
@@ -807,6 +810,7 @@ class PyExecutor:
         # ``PyExecutorProfileManager``. ``PyExecutor`` keeps the state
         # fields above on ``self`` for backward-compat introspection;
         # the manager operates on those fields via a weakref.
+        self._perf_metrics = PerfMetricsCollector()
         self._profile_manager = PyExecutorProfileManager(self)
 
         self.model_engine = model_engine
@@ -3271,6 +3275,32 @@ class PyExecutor:
             else:
                 self._latest_kv_iter_stats = None
 
+        rank_metrics = {
+            "rank": self.dist.rank,
+            "globalRank": self.global_rank,
+            "batchIter": stats.iter,
+            "gpuMemUsage": stats.gpu_mem_usage,
+            "cpuMemUsage": stats.cpu_mem_usage,
+            "pinnedMemUsage": stats.pinned_mem_usage,
+        }
+        if kv_cache_manager is not None:
+            rank_metrics["kvCacheStats"] = {
+                "maxNumBlocks": kv_stats.max_num_blocks,
+                "freeNumBlocks": kv_stats.free_num_blocks,
+                "usedNumBlocks": kv_stats.used_num_blocks,
+                "tokensPerBlock": kv_stats.tokens_per_block,
+                "allocTotalBlocks": kv_stats.alloc_total_blocks,
+                "allocNewBlocks": kv_stats.alloc_new_blocks,
+                "reusedBlocks": kv_stats.reused_blocks,
+                "missedBlocks": kv_stats.missed_blocks,
+                "cacheHitRate": kv_stats.cache_hit_rate,
+            }
+            append_kv_cache_iteration_stats(rank_metrics,
+                                            self._latest_kv_iter_stats)
+        rank_record = self._perf_metrics.collect_rank(
+            rank_metrics, capture_iter=self.iter_counter)
+        self._profile_manager.expose_metrics(rank_record)
+
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
 
@@ -3528,7 +3558,9 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           kv_transfer_outcomes: Optional[tuple[int, int,
+                                                                int]] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -3554,6 +3586,7 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
+            kv_transfer_outcomes: Rank-local cumulative request success/error/timeout counts.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
@@ -3580,6 +3613,14 @@ class PyExecutor:
                            or self.dist.pp_size > 1)
         scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
 
+        loop_metrics = None
+        runtime_metrics = getattr(self, "_perf_metrics", None)
+        if (attention_dp_rank is None or attention_dp_rank
+                == self.dist.rank) and runtime_metrics is not None:
+            loop = runtime_metrics.latest_loop
+            if loop is not None:
+                loop_metrics = {"kind": "loop", "per_iter": dict(loop.per_iter)}
+
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
@@ -3597,32 +3638,34 @@ class PyExecutor:
                 local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            if kv_transfer_outcomes is not None:
+                local_dict["kvTransferOutcomes"] = dict(
+                    zip(("success", "error", "timeout"), kv_transfer_outcomes))
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
+            if loop_metrics is not None:
+                local_dict["executorLoop"] = loop_metrics
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
             # desync (reached from per-rank-divergent gates).
             self._pending_iter_stats_dict = local_dict
             return
 
-        # Legacy path: rank-0-only (single-rank or iter stats disabled).
-        # Tuple layout (length is sniffed by _stats_serializer with
-        # len() > N guards so older 4-tuples remain readable):
-        #   [0] stats: IterationStats
-        #   [1] req_stats: Optional[List[RequestStats]]
-        #   [2] kv_iter_stats: Optional[Dict[int, KvCacheIterationStats]]
-        #   [3] attention_dp_rank: Optional[int]
-        #   [4] host_step_time_ms: Optional[float]
-        #   [5] prev_device_step_time_ms: Optional[float]
-        #   [6] scheduler_mode: "overlap" | "non_overlap"
-        #   [7] gpu_forward_time_ms: Optional[float]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
             self.stats.append(
-                (stats, req_stats, kv_iter_stats, attention_dp_rank,
-                 host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                IterationStatsRecord(
+                    iteration_stats=stats,
+                    request_stats=req_stats,
+                    kv_iteration_stats=kv_iter_stats,
+                    attention_dp_rank=attention_dp_rank,
+                    host_step_time_ms=host_step_time_ms,
+                    prev_device_step_time_ms=prev_device_step_time_ms,
+                    scheduler_mode=scheduler_mode,
+                    gpu_forward_time_ms=gpu_forward_time_ms,
+                    kv_transfer_outcomes=kv_transfer_outcomes,
+                    executor_loop=loop_metrics))
 
     def _process_iter_stats(
         self,
@@ -3687,6 +3730,17 @@ class PyExecutor:
             batch_state.scheduled_requests) if (
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
+
+        if req_stats and self.print_log:
+            request_record = self._perf_metrics.collect_iteration({
+                "iter":
+                batch_state.iter_stats.iter,
+                "rank":
+                self.dist.rank,
+                "requestStats":
+                [json.loads(stat.to_json_str()) for stat in req_stats],
+            })
+            self._profile_manager.expose_metrics(request_record)
 
         stats = self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
                                         num_completed_requests,

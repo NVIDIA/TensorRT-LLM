@@ -24,6 +24,7 @@ import threading
 
 from tensorrt_llm._torch.pyexecutor.profiling import PyExecutorProfileManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 
 def _bare_executor():
@@ -45,6 +46,7 @@ def _bare_executor():
     # real PyExecutor.__init__ wires this up; replicate that here for
     # the bare-bones test double so ``executor.start_profile``,
     # ``executor.stop_profile``, etc. delegate correctly.
+    executor._perf_metrics = PerfMetricsCollector()
     executor._profile_manager = PyExecutorProfileManager(executor)
     return executor
 
