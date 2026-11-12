@@ -1563,6 +1563,7 @@ def _prl_core(hq, hk):
     c.index_col = c.qkv_width + c.q_width
     c._cos_sin = M.Qwen4ExpUnifiedModelingV2._index_rope_table(c, c.theta, PRL_DEV)
     c.tp_sum = lambda x: x
+    c._decode_graph_step = True  # the trunk sites run as in a captured decode step
     return c
 
 

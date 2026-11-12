@@ -1124,9 +1124,12 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self._binds = 0
         # Set by `begin_step`, cleared by `forward`.
         self._step_begun = False
-        # Whether the step `begin_step` saw carries context rows: its draft steps after the
-        # first run eagerly on `DecodeTarget`, at any batch size (`DecodeTarget.mtp_forward`).
-        self._context_step = False
+        # Whether the step `begin_step` saw is a generation-only step inside a decode CUDA graph,
+        # which attention-DP ranks agree on (the engine captures only when every rank can). Only
+        # such a step runs `_decode_projection` (`_step_projection`) and, under attention DP, the
+        # decode router (`_routed_experts`); an eager step can run at any batch size and meet
+        # another rank's prefill step.
+        self._decode_graph_step = False
         self._mtp: "_MtpWeights | None" = None
         self._mtp_cos_sin: torch.Tensor | None = None
         # The verify step's side-cache rollback, registered with the spec worker.
@@ -1707,7 +1710,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             target.prepare(attn_metadata, input_ids, position_ids, vision, spec_metadata)
         else:
             assert vision is None, "a generation-only step carries vision rows"
-        self._context_step = attn_metadata.num_contexts > 0
+        self._decode_graph_step = attn_metadata.is_cuda_graph and attn_metadata.num_contexts == 0
         self._step_begun = True
 
     def forward(
@@ -2164,7 +2167,7 @@ def _mtp_front(core, M: _MtpWeights, embed_tokens, input_ids, hidden_states, mm=
     `fc_embedding` of the normalized next-token embedding is added to every stream of
     `fc_hidden` as the trunk site's unit-weight injection; returns `(x, mixed, inject)`. `mm`
     runs dense projections here and in every draft-layer and MoE helper: `cublas_mm` when
-    None, `_decode_projection` from `DecodeTarget` (except after a step's context rows)."""
+    None, `_step_projection` from `DecodeTarget`."""
     mm = mm or cublas_mm
     rows = hidden_states.shape[0]
     assert rows <= M.unit_inject.shape[0], (
@@ -2451,10 +2454,12 @@ def _routed_experts(
     `pad_mask` (`[T, 1]` bool) routes a prefill graph bucket's padding rows to expert -1, so
     they come back zero instead of all landing on the first window's ten lowest experts."""
     mm = mm or cublas_mm
-    if getattr(core, "dp_size", 1) > 1:
-        # Attention DP routes the same gathered rows on every rank, whose steps may pick another
-        # `mm`: `_decode_projection`'s low-M kernels and cuBLAS differ in the last bits, and a
-        # reordered top-k is a different MoE sum. One router kernel on every rank.
+    if mm is _decode_projection and getattr(core, "dp_size", 1) > 1 and not core._decode_graph_step:
+        # Attention DP routes the same gathered rows on every rank, so every rank must compute
+        # their logits with one kernel: `_decode_projection`'s low-M kernels and cuBLAS differ in
+        # the last bits, and a reordered top-k is a different MoE sum. A graphed step is a decode
+        # step on every rank and keeps the decode router; an eager one can meet another rank's
+        # prefill step and takes the prefill router, `cublas_mm`.
         mm = cublas_mm
     rows = x.shape[0]
     if pad_mask is None and mm is _decode_projection and 0 < rows <= _MOE_FRONT_MAX_ROWS:
@@ -2733,11 +2738,20 @@ def _draft_pad_rows(core, all_rank_num_tokens, rows: int) -> _DpPadding | None:
 
 
 def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
-    """Dense bf16 projection for generation-only steps and their draft layer (graph-captured).
+    """Dense bf16 projection for graphed generation-only steps and their draft layer.
 
     `low_m_bf16_mm` picks FlashInfer's low-M PDL kernels (`_DECODE_PROJ_PDL`) where its table
     names the shape, else cuBLAS; they compile on the engine's warmup forward before capture."""
     return low_m_bf16_mm(mat_a, mat_b, _DECODE_PROJ_PDL)
+
+
+def _step_projection(core):
+    """The dense projection of a `DecodeTarget` step: `_decode_projection` in a graphed step
+    (`core._decode_graph_step`), else `cublas_mm`. An eager generation-only step runs at any
+    batch size (under attention DP whenever another rank has context rows), and the FlashInfer
+    kernels compile on the first call at each shape: only captured batch sizes compile before
+    serving."""
+    return _decode_projection if core._decode_graph_step else cublas_mm
 
 
 def _hc_first(core, normed, first, with_inject):
@@ -5797,7 +5811,8 @@ class DecodeTarget:
             sparse,
         ) = qsa
         num_tokens = x.shape[0]
-        proj = _decode_projection(x, L.attn_in)
+        mm = _step_projection(core)
+        proj = mm(x, L.attn_in)
         qkv_view, gate, _ = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
@@ -5881,7 +5896,7 @@ class DecodeTarget:
                 **_CALL_CONSTANTS,
             )
             fused_sigmoid_mul_inplace(out, gate, direct_launch=True)
-        return _tp_partial(core, _decode_projection(out, L.o))
+        return _tp_partial(core, mm(out, L.o))
 
     def _gdn_block(self, x, i, L, si_all, verify, gen_p) -> torch.Tensor:
         """One Gated-DeltaNet layer over a generation-only batch: one GEMM for the four input
@@ -5890,8 +5905,12 @@ class DecodeTarget:
         step (`verify`, `gen_p` rows a sequence) takes `_gdn_verify` instead."""
         core = self.core
         pools = core._bound.pools
+        mm = _step_projection(core)
+        # The fused launch is FlashInfer's warp split-K kernel: graphed steps only, as `mm`.
         tactic = (
-            _gdn_in_proj_conv_tactic(core, x, L, si_all, verify) if verify is not None else None
+            _gdn_in_proj_conv_tactic(core, x, L, si_all, verify)
+            if verify is not None and mm is _decode_projection
+            else None
         )
         mq_out = None
         if tactic is not None:
@@ -5912,7 +5931,7 @@ class DecodeTarget:
             proj = full[:, : sum(core.in_proj_split)]
         else:
             # Its alignment columns, past `sum(in_proj_split)`, are dropped by the view.
-            proj = _decode_projection(x, L.in_proj_dec)[:, : sum(core.in_proj_split)]
+            proj = mm(x, L.in_proj_dec)[:, : sum(core.in_proj_split)]
         if verify is not None:
             mixed_qkv, z, a, b = torch.split(proj, core.in_proj_split, 1)
             num_tokens = x.shape[0]
@@ -5934,7 +5953,7 @@ class DecodeTarget:
             if fold_norm:
                 # The replay returned the normed, gated rows.
                 o = torch.reshape(out, [num_tokens, core.value_dim])
-                return _tp_partial(core, _decode_projection(o, L.out))
+                return _tp_partial(core, mm(o, L.out))
             return self._gdn_epilogue(out, z, L, num_tokens)
         mixed_qkv = torch.split(proj, core.in_proj_split, 1)[0]
         causal_conv1d_update(
@@ -5959,7 +5978,7 @@ class DecodeTarget:
             core.num_k_heads,
             core.head_k_dim,
         )
-        return _tp_partial(core, _decode_projection(o, L.out))
+        return _tp_partial(core, mm(o, L.out))
 
     def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
         """A verify step's gated RMS norm (sigmoid gate, plain weight) and output projection."""
@@ -5974,7 +5993,7 @@ class DecodeTarget:
             direct_launch=True,
         )
         o = torch.reshape(o, [num_tokens, core.value_dim])
-        return _tp_partial(core, _decode_projection(o, L.out))
+        return _tp_partial(core, _step_projection(core)(o, L.out))
 
     def _ple_front(self, input_ids, ple_state, stage) -> tuple:
         """The PLE part that reads no residual: verify staging of both pools (before the n-gram
@@ -6212,7 +6231,7 @@ class DecodeTarget:
                 core, hc, block_out, inject, L.mhc_norm, L.mhc_first, L.mhc_up, True
             )
             routed, gate_logits, shared = _moe_block(
-                core, mixed, L, pad_rows, mm=_decode_projection, defer=True
+                core, mixed, L, pad_rows, mm=_step_projection(core), defer=True
             )
             moe = (routed, inject, shared, gate_logits)
             del routed, gate_logits, shared
@@ -6268,10 +6287,8 @@ class DecodeTarget:
         """One draft step over generation rows only (`p` rows a request on the first step of a
         batch without context, one otherwise), inside the decode graph when the trunk is.
 
-        The steps after the first of a step with context rows (`core._context_step`) run
-        eagerly at any batch size, so their projections take `cublas_mm`: `_decode_projection`'s
-        FlashInfer kernels compile on the first call at each shape, and only captured batch
-        sizes compile before serving.
+        Its projections take `_step_projection`: the steps after the first of a step with
+        context rows, and every step of an eager trunk step, run eagerly at any batch size.
 
         Under IndexShare the draft-extend step captures each request's selection and later steps
         skip the index branch, rebuilding it with `qsa_mtp_reuse_topk`; the index keys they skip
@@ -6310,7 +6327,7 @@ class DecodeTarget:
         logical = md.qsa_logical_positions[:rows]
         block_table = md.qsa_block_table
         tokens_per_block = md.tokens_per_block
-        mm = cublas_mm if core._context_step else _decode_projection
+        mm = _step_projection(core)
 
         x, mixed, inject = _mtp_front(core, M, embed_tokens, input_ids, hidden_states, mm=mm)
         qkv, gate, q_index = _mtp_attention_planes(
