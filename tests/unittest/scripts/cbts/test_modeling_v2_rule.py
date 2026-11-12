@@ -183,15 +183,15 @@ def test_k3_uses_modeling_v2_selection(rule, relative):
 def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative):
     prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl"
     kernel_tests = {
-        f"{prefix}/test_k3_mnnvl_comm.py",
-        f"{prefix}/test_k3_sandwich.py",
+        f"{prefix}/ops/comm/test_k3_mnnvl_comm.py",
+        f"{prefix}/kernels/k3_sandwich/test_k3_sandwich.py",
     }
-    matrix = f"{prefix}/test_modeling_v2_mnnvl_allgather_split_op_matrix.py"
-    norm = f"{prefix}/test_modeling_v2_attn_res_rmsnorm_fwd.py"
+    matrix = f"{prefix}/ops/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py"
+    norm = f"{prefix}/ops/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py"
     native = f"{prefix}/test_modeling_v2_k3_native.py"
-    host = f"{prefix}/test_modeling_v2_kimi_k3_decode_step.py"
+    host = f"{prefix}/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_step.py"
     accuracy = "accuracy/modeling_v2/kimi_k3_vl/target/test_accuracy.py::TestKimiK3::test_gsm8k"
-    # The broad single-GPU entry excludes the flat family directory; its
+    # The broad single-GPU entry excludes the family directory; its
     # single-GPU tests and collective tests have separate stage entries.
     rule.yaml_index.blocks[0].tests.remove(_UNIT)
     rule.yaml_index.blocks[0].tests.extend([f"{_UNIT} --ignore={prefix}", native, accuracy])
@@ -215,26 +215,34 @@ def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative)
 def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
     repo = Path(__file__).resolve().parents[4]
     prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl/"
-    expected = {p.name for p in (repo / "tests" / prefix).glob("test_*.py")}
-    collective_tests = {
-        "test_k3_latent_reduce.py",
-        "test_k3_markov.py",
-        "test_k3_mnnvl_comm.py",
-        "test_k3_moe_front.py",
-        "test_k3_moe_push.py",
-        "test_k3_sandwich.py",
-        "test_k3_spec_accept_sharded.py",
-        "test_modeling_v2_k3_latent_reduce_op_matrix.py",
-        "test_modeling_v2_k3_moe_front_op_matrix.py",
-        "test_modeling_v2_k3_sandwich_oproj_op_matrix.py",
-        "test_modeling_v2_k3_sandwich_plain_op_matrix.py",
-        "test_modeling_v2_k3_sandwich_tail_op_matrix.py",
-        "test_modeling_v2_kimi_k3_decode_comm_op_matrix.py",
-        "test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py",
-        "test_modeling_v2_mnnvl_allgather_split_op_matrix.py",
-        "test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py",
-        "test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py",
+    # The unit tests mirror the family's source tree (and its targets), so they sit in subdirectories.
+    expected = {
+        p.relative_to(repo / "tests" / prefix).as_posix()
+        for p in (repo / "tests" / prefix).rglob("test_*.py")
     }
+    # The 4-GPU tests, by path under the family's unit directory: they run on GB300, every other GPU test on B300.
+    collective_tests = {
+        "kernels/k3_fused_moe/test_k3_fused_moe_push.py",
+        "kernels/k3_fused_moe/test_k3_latent_reduce.py",
+        "kernels/k3_fused_moe/test_k3_moe_front.py",
+        "kernels/k3_markov/test_k3_markov.py",
+        "kernels/k3_sandwich/test_k3_sandwich.py",
+        "kernels/k3_spec_accept/test_k3_spec_accept_sharded.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_push.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp16ep1_op_matrix.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp4ep4_op_matrix.py",
+        "ops/comm/test_k3_mnnvl_comm.py",
+        "ops/comm/test_modeling_v2_k3_latent_reduce_op_matrix.py",
+        "ops/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py",
+        "ops/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py",
+        "ops/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py",
+        "ops/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py",
+        "ops/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py",
+        "ops/comm/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py",
+        "ops/moe/test_modeling_v2_k3_moe_front_op_matrix.py",
+    }
+    assert collective_tests <= expected, collective_tests - expected
     index = YAMLIndex.load(repo / "tests/integration/test_lists/test-db")
     stages = parse_stages_from_groovy(repo / "jenkins/L0_Test.groovy")
     seen = set()
