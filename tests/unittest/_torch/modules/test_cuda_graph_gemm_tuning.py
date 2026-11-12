@@ -34,7 +34,11 @@ class _FakeTunable:
         return self.filename
 
     def set_filename(self, filename, insert_device_ordinal=False):
-        self.filename = filename + ("0" if insert_device_ordinal else "")
+        if insert_device_ordinal:
+            # PyTorch inserts the device ordinal before the extension: gemm.csv -> gemm0.csv.
+            stem, dot, ext = filename.rpartition(".")
+            filename = f"{stem}0.{ext}" if dot else f"{filename}0"
+        self.filename = filename
 
     def enable(self, val=True):
         self.enabled = val
@@ -85,7 +89,7 @@ def test_results_file_used_inside_and_filename_restored(tunable, monkeypatch, tm
     monkeypatch.setenv(CUDA_GRAPH_GEMM_TUNING_FILE_ENV, results)
     before = tunable.state()
     with cuda_graph_gemm_tuning(tune=tune):
-        assert tunable.filename == results + "0"  # one file per device
+        assert tunable.filename == str(tmp_path / "gemm0.csv")  # one file per device
     assert tunable.state() == before
 
 

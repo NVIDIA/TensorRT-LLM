@@ -179,6 +179,24 @@ class TestTierSelection:
         assert sample_type(sampler, [request]) is SampleType.FULL
         assert request.py_fast_path_ok is False
 
+    def test_real_request_with_min_tokens_starts_unjudged_and_is_full(self, sampler):
+        # A real request carries no verdict until the sampler decides, so min_tokens (which bans
+        # EOS until the request is long enough) keeps it off the fast tier from its first step.
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=8,
+            input_tokens=[1, 2, 3],
+            sampling_config=SamplingConfig(
+                SamplingParams(**FAST_PARAMS, min_tokens=4)._get_sampling_config()
+            ),
+            seq_slot=0,
+            is_streaming=False,
+        )
+        assert request.py_fast_path_ok is None
+        assert request.py_min_length
+        assert sample_type(sampler, [request]) is SampleType.FULL
+        assert request.py_fast_path_ok is False
+
     def test_live_request_after_padding_dummy_is_full(self, sampler):
         # Dummies must be a trailing run: the live rows are read back as the
         # leading prefix of the batch.
