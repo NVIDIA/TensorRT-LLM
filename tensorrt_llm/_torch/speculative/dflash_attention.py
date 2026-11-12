@@ -237,9 +237,10 @@ def validate_dflash_trtllm_gen_runtime(
         )
     if folded_block_size is not None:
         get_dflash_folded_decode_chunk_size(folded_block_size, num_heads, num_kv_heads)
+    # Every mask the drafter reports lowers to decode.
     if not dflash_trtllm_supports_page_size(
         tokens_per_block,
-        has_context_attention=has_context_attention,
+        has_context_attention=False,
         has_folded_decode=folded_block_size is not None,
     ):
         supported = sorted(FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK)

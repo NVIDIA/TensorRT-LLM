@@ -27,6 +27,7 @@ from tensorrt_llm._torch.models.modeling_dflash import (
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 from tensorrt_llm._torch.speculative.dflash_attention import (
     DFLASH_FOLDED_DECODE_LOWERING,
+    dflash_trtllm_supports_page_size,
     get_dflash_folded_decode_chunk_size,
     validate_dflash_trtllm_gen_runtime,
 )
@@ -656,20 +657,31 @@ def test_folded_runtime_accepts_large_blocks_by_chunking(
         (256, False, 16, False),
     ],
 )
-def test_runtime_admits_large_pages_only_without_context_or_folded_layers(
+def test_large_pages_only_without_context_or_folded_layers(
     tokens_per_block: int,
     has_context_attention: bool,
     folded_block_size: Optional[int],
     supported: bool,
 ) -> None:
     """Pages of 128+ tokens serve drafters whose layers are all causal or windowed."""
+    with patch("tensorrt_llm._torch.speculative.dflash_attention.get_dflash_trtllm_gen_ops"):
+        assert (
+            dflash_trtllm_supports_page_size(
+                tokens_per_block,
+                has_context_attention=has_context_attention,
+                has_folded_decode=folded_block_size is not None,
+            )
+            == supported
+        )
+    if has_context_attention:
+        # The runtime validator sees a drafter's lowerings, which never use the context kernel.
+        return
     shape = dict(
         dtype=torch.bfloat16,
         num_heads=16,
         num_kv_heads=2,
         head_dim=128,
         tokens_per_block=tokens_per_block,
-        has_context_attention=has_context_attention,
         folded_block_size=folded_block_size,
     )
     with patch("tensorrt_llm._torch.speculative.dflash_attention.get_dflash_trtllm_gen_ops"):
