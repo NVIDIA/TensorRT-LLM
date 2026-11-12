@@ -926,7 +926,7 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready() -> None:
     )
     # Every scheduler wait that times out fails the launch instead of routing home.
     role = _function_body(kernel_source, "RoleResult mapRoutes(")
-    assert role.count('return RoleResult{"') == 3
+    assert role.count('return RoleResult{.reason = "') == 3
     prepare = _function_body(
         kernel_source, "MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch("
     )
@@ -948,7 +948,9 @@ def test_every_scheduler_role_failure_traps_the_launch() -> None:
     a route release that never comes.
     """
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
-    reasons = re.findall(r'return RoleResult\{"([^"]+)", [^}]+\};', kernel_source)
+    reasons = re.findall(
+        r'return RoleResult\{\.reason = "([^"]+)", \.detail = [^}]+\};', kernel_source
+    )
     assert sorted(reasons) == sorted(
         [
             "READY drain timeout",
@@ -968,7 +970,7 @@ def test_every_scheduler_role_failure_traps_the_launch() -> None:
     _assert_in_order(
         role,
         (
-            'return RoleResult{"grid rendezvous timeout", 0};',
+            'return RoleResult{.reason = "grid rendezvous timeout", .detail = 0};',
             "return blockIdx.x == 0 ? planAndPublish(p, epoch) : mapRoutes(p, epoch);",
         ),
     )
@@ -1473,7 +1475,7 @@ def test_kernel_drains_ready_before_the_exchange_within_one_bound() -> None:
             "long long const start = clock64();",
             "missingReady = drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles);",
             "exchangeCycles = elapsed < p.spinCycles ? p.spinCycles - elapsed : 1;",
-            'return RoleResult{"READY drain timeout", missingReady};',
+            'return RoleResult{.reason = "READY drain timeout", .detail = missingReady};',
             "exchange_counts(",
             "epoch, exchangeCycles, p.status)",
         ),

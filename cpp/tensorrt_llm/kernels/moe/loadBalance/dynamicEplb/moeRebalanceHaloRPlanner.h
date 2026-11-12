@@ -290,11 +290,11 @@ TLLM_HALO_R_HOST_DEVICE inline Move decodeWinner(
     if (order < kOrderOpen)
     {
         int const expert = s->exportExpert[order];
-        return Move{expert, expert / home, rows, order, false};
+        return Move{.expert = expert, .owner = expert / home, .rows = rows, .exportIndex = order, .opensExport = false};
     }
     int const owner = order - kOrderOpen;
     int const expert = owner * home + s->hottest[owner * kMaxSendsPerRank + s->sent[owner]];
-    return Move{expert, owner, rows, exports, true};
+    return Move{.expert = expert, .owner = owner, .rows = rows, .exportIndex = exports, .opensExport = true};
 }
 
 //! Greedy moves until no candidate remains; the export and move counts are written back. The winner's rows fit the

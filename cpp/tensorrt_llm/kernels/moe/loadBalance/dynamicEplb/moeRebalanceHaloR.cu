@@ -166,10 +166,12 @@ struct HaloRSelectedRouteSlot
 __device__ void materializeSelectedRoutes(MoeRebalanceHaloRParams const& p, int worker, int workers, Epoch epoch)
 {
     int const home = p.experts / p.ep;
-    HaloRSelectedRouteSlot const slotOf{halo_r::planField(p.plan, halo_r::HaloRPlanField::kOwner),
-        halo_r::planField(p.plan, halo_r::HaloRPlanField::kDestinationMask),
-        halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperLowMask),
-        halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperHighMask), home, home + p.helpers};
+    HaloRSelectedRouteSlot const slotOf{.owners = halo_r::planField(p.plan, halo_r::HaloRPlanField::kOwner),
+        .masks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kDestinationMask),
+        .lowMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperLowMask),
+        .highMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperHighMask),
+        .home = home,
+        .localSlots = home + p.helpers};
     materializeCompactedSelectedRoutes(p.routes, p.outSlots, p.routePrefix, p.routeAux,
         p.status + kHaloRStatusSlotOutsideMask, p.validRouteCount, p.ep, p.experts, worker, workers, epoch, slotOf);
 }
@@ -233,12 +235,12 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     __syncthreads();
     if (missingReady >= 0)
     {
-        return RoleResult{"READY drain timeout", missingReady};
+        return RoleResult{.reason = "READY drain timeout", .detail = missingReady};
     }
     if (!exchange_counts(reinterpret_cast<unsigned long long const*>(p.peerBases), p.partial, shared, p.ep, p.experts,
             p.localRank, static_cast<int>(gridDim.x), epoch, exchangeCycles, p.status))
     {
-        return RoleResult{"count exchange timeout", static_cast<int>(epoch)};
+        return RoleResult{.reason = "count exchange timeout", .detail = static_cast<int>(epoch)};
     }
     for (int expert = threadIdx.x; expert < p.experts; expert += blockDim.x)
     {
@@ -264,8 +266,17 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     }
     if (threadIdx.x < 32)
     {
-        halo_r::PlannerConfig const cfg{p.ep, p.experts, p.helpers, p.sendCount, p.localRank};
-        halo_r::PlannerOutputs const outputs{p.plan, quota, p.outIds, p.outOwners, nullptr, nullptr};
+        halo_r::PlannerConfig const cfg{.ep = p.ep,
+            .experts = p.experts,
+            .helperSlots = p.helpers,
+            .sendCount = p.sendCount,
+            .localRank = p.localRank};
+        halo_r::PlannerOutputs const outputs{.plan = p.plan,
+            .quota = quota,
+            .outIds = p.outIds,
+            .outOwners = p.outOwners,
+            .hotTable = nullptr,
+            .loadAfter = nullptr};
         // checkMoeRebalanceHaloRParams accepted the configuration, so the planner always plans.
         halo_r::planHaloR<DeviceWarp>(histogram, cfg, scratch, outputs, p.residency != nullptr ? resident : nullptr);
     }
@@ -282,7 +293,7 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     {
         store_release_device(p.gridSync + 2, epoch);
     }
-    return RoleResult{nullptr, 0};
+    return RoleResult{.reason = nullptr, .detail = 0};
 }
 
 //! A worker CTA: stable ordinals, the home slot of every unselected route and, once the prefix is published, the slot
@@ -294,24 +305,24 @@ __device__ RoleResult mapRoutes(MoeRebalanceHaloRParams const& p, Epoch epoch)
     if (!stable_worker_ordinal_pass(
             p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, p.spinCycles))
     {
-        return RoleResult{"worker rendezvous timeout", static_cast<int>(epoch)};
+        return RoleResult{.reason = "worker rendezvous timeout", .detail = static_cast<int>(epoch)};
     }
     int* expertLut = worker_expert_lut(p.experts);
     prepare_worker_default_slots(expertLut, p.ep, p.experts, p.helpers);
     __shared__ int planReady;
     if (!wait_for_plan_epoch(p.plan, epoch, p.spinCycles, p.status, &planReady))
     {
-        return RoleResult{"plan wait timeout", static_cast<int>(epoch)};
+        return RoleResult{.reason = "plan wait timeout", .detail = static_cast<int>(epoch)};
     }
     prepare_worker_selected_experts(expertLut, p.plan);
     pre_materialize_and_compact_worker_routes(
         p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, epoch);
     if (!wait_for_plan_epoch(p.gridSync + 2, epoch, p.spinCycles, p.status, &planReady))
     {
-        return RoleResult{"route prefix wait timeout", static_cast<int>(epoch)};
+        return RoleResult{.reason = "route prefix wait timeout", .detail = static_cast<int>(epoch)};
     }
     materializeSelectedRoutes(p, worker, workers, epoch);
-    return RoleResult{nullptr, 0};
+    return RoleResult{.reason = nullptr, .detail = 0};
 }
 
 //! Phase 1. Every return is uniform across the CTA.
@@ -327,7 +338,7 @@ __device__ RoleResult schedulerRole(MoeRebalanceHaloRParams const& p)
     Epoch epoch;
     if (!grid_rendezvous(p.gridSync, static_cast<int>(gridDim.x), p.spinCycles, p.status, &epoch))
     {
-        return RoleResult{"grid rendezvous timeout", 0};
+        return RoleResult{.reason = "grid rendezvous timeout", .detail = 0};
     }
     return blockIdx.x == 0 ? planAndPublish(p, epoch) : mapRoutes(p, epoch);
 }
@@ -345,7 +356,7 @@ struct ReceiverCounts
 //! entries.
 __device__ ReceiverCounts recordResidency(MoeRebalanceHaloRParams const& p)
 {
-    ReceiverCounts counts{0, 0};
+    ReceiverCounts counts{.copies = 0, .skips = 0};
     int const broadcasts = p.plan[1];
     int const* experts = halo_r::planField(p.plan, halo_r::HaloRPlanField::kExpert);
     int const* masks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kDestinationMask);
@@ -484,7 +495,11 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
             && params.destinationTable != nullptr && params.planeBytes != nullptr && params.completedCtas != nullptr
             && params.counters != nullptr && params.readyFlags != nullptr && params.readyFlagMc != nullptr,
         "HALO-R kernel buffers must not be null");
-    halo_r::PlannerConfig const cfg{params.ep, params.experts, params.helpers, params.sendCount, params.localRank};
+    halo_r::PlannerConfig const cfg{.ep = params.ep,
+        .experts = params.experts,
+        .helperSlots = params.helpers,
+        .sendCount = params.sendCount,
+        .localRank = params.localRank};
     TLLM_CHECK_WITH_INFO(params.ep >= kHaloRMinEp && halo_r::validPlannerConfig(cfg),
         "Invalid HALO-R planner configuration: ep=%d experts=%d helpers=%d send_count=%d local_rank=%d", params.ep,
         params.experts, params.helpers, params.sendCount, params.localRank);

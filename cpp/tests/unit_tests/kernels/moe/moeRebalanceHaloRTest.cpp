@@ -141,8 +141,12 @@ PlanResult runPlanner(
     halo_r::PlannerScratch scratch;
     // Stale shared memory must not change the plan.
     std::memset(&scratch, 0xA5, sizeof(scratch));
-    halo_r::PlannerOutputs const outputs{result.plan.data(), result.quota.data(), result.outIds.data(),
-        result.outOwners.data(), result.hotTable.data(), result.loadAfter.data()};
+    halo_r::PlannerOutputs const outputs{.plan = result.plan.data(),
+        .quota = result.quota.data(),
+        .outIds = result.outIds.data(),
+        .outOwners = result.outOwners.data(),
+        .hotTable = result.hotTable.data(),
+        .loadAfter = result.loadAfter.data()};
 
     HostWarp::State state;
     HostWarp::state = &state;
@@ -182,7 +186,7 @@ std::vector<int> workedExampleHistogram()
 
 TEST(MoeRebalanceHaloRPlannerTest, WorkedExampleReplicatesHotExpertToIdleRanks)
 {
-    halo_r::PlannerConfig const cfg{/*ep=*/8, /*experts=*/32, /*helperSlots=*/2, /*sendCount=*/4, /*localRank=*/4};
+    halo_r::PlannerConfig const cfg{.ep = 8, .experts = 32, .helperSlots = 2, .sendCount = 4, .localRank = 4};
     PlanResult const r = runPlanner(workedExampleHistogram(), cfg);
     ASSERT_EQ(r.plan[1], 1);
     EXPECT_EQ(field(r, halo_r::HaloRPlanField::kExpert, 0), 0);
@@ -205,7 +209,7 @@ TEST(MoeRebalanceHaloRPlannerTest, WorkedExampleReplicatesHotExpertToIdleRanks)
 TEST(MoeRebalanceHaloRPlannerTest, PlanIsIdenticalOnEveryRank)
 {
     std::vector<int> const histogram = workedExampleHistogram();
-    halo_r::PlannerConfig cfg{8, 32, 2, 4, 0};
+    halo_r::PlannerConfig cfg{.ep = 8, .experts = 32, .helperSlots = 2, .sendCount = 4, .localRank = 0};
     PlanResult const reference = runPlanner(histogram, cfg);
     for (int rank = 1; rank < cfg.ep; ++rank)
     {
@@ -223,7 +227,7 @@ TEST(MoeRebalanceHaloRPlannerTest, HelperIndexUsesBothMaskBits)
     // Rank 0 is the only rank below the target and receives three experts, in ascending order, into helper slots
     // 0, 1 and 2; slot 2 is encoded in the high mask.
     std::vector<int> const histogram{0, 0, 80, 10, 40, 200, 40, 10, 10, 80, 200, 0, 0, 80, 0, 200};
-    halo_r::PlannerConfig const cfg{4, 16, 4, 4, 0};
+    halo_r::PlannerConfig const cfg{.ep = 4, .experts = 16, .helperSlots = 4, .sendCount = 4, .localRank = 0};
     PlanResult const r = runPlanner(histogram, cfg);
     ASSERT_EQ(r.plan[1], 3);
     int const experts[] = {5, 10, 15};
@@ -247,7 +251,7 @@ TEST(MoeRebalanceHaloRPlannerTest, HelperIndexUsesBothMaskBits)
 
 TEST(MoeRebalanceHaloRPlannerTest, BalancedOrEmptyLoadPlansNothing)
 {
-    halo_r::PlannerConfig const cfg{4, 16, 2, 2, 1};
+    halo_r::PlannerConfig const cfg{.ep = 4, .experts = 16, .helperSlots = 2, .sendCount = 2, .localRank = 1};
     PlanResult const balanced = runPlanner(std::vector<int>(16, 25), cfg);
     EXPECT_EQ(balanced.plan[1], 0);
     EXPECT_EQ(balanced.outIds, (std::vector<int>{-1, -1}));
@@ -268,7 +272,7 @@ TEST(MoeRebalanceHaloRPlannerTest, ReceiversNeverExceedTheirHelperSlots)
     for (int helpers = 1; helpers <= halo_r::kMaxHelperSlots; ++helpers)
     {
         SCOPED_TRACE(helpers);
-        halo_r::PlannerConfig const cfg{/*ep=*/2, /*experts=*/16, helpers, /*sendCount=*/4, /*localRank=*/1};
+        halo_r::PlannerConfig const cfg{.ep = 2, .experts = 16, .helperSlots = helpers, .sendCount = 4, .localRank = 1};
         PlanResult const r = runPlanner(histogram, cfg);
         ASSERT_EQ(r.plan[1], helpers);
         for (int b = 0; b < helpers; ++b)
@@ -296,18 +300,19 @@ TEST(MoeRebalanceHaloRPlannerTest, RejectsConfigurationsOutsideItsLimits)
     // field, more sends than home experts, a local rank outside the EP group and experts that do not divide over the
     // ranks.
     halo_r::PlannerConfig const invalid[] = {
-        {33, 33 * 11, 2, 2, 0},
-        {8, 96, 5, 2, 0},
-        {32, 32 * 12, 2, 5, 0},
-        {8, 32, 2, 5, 0},
-        {8, 96, 2, 2, 8},
-        {8, 97, 2, 2, 0},
+        {.ep = 33, .experts = 33 * 11, .helperSlots = 2, .sendCount = 2, .localRank = 0},
+        {.ep = 8, .experts = 96, .helperSlots = 5, .sendCount = 2, .localRank = 0},
+        {.ep = 32, .experts = 32 * 12, .helperSlots = 2, .sendCount = 5, .localRank = 0},
+        {.ep = 8, .experts = 32, .helperSlots = 2, .sendCount = 5, .localRank = 0},
+        {.ep = 8, .experts = 96, .helperSlots = 2, .sendCount = 2, .localRank = 8},
+        {.ep = 8, .experts = 97, .helperSlots = 2, .sendCount = 2, .localRank = 0},
     };
     for (auto const& cfg : invalid)
     {
         EXPECT_FALSE(halo_r::validPlannerConfig(cfg));
     }
-    EXPECT_TRUE(halo_r::validPlannerConfig({32, 384, 4, 4, 31}));
+    EXPECT_TRUE(
+        halo_r::validPlannerConfig({.ep = 32, .experts = 384, .helperSlots = 4, .sendCount = 4, .localRank = 31}));
 }
 
 TEST(MoeRebalanceHaloRSlotTest, SelectedRoutesGoToOwnerOrHelperSlot)
@@ -493,7 +498,11 @@ TEST(MoeRebalanceHaloRPlannerTest, ResidentExpertsKeepTheirSlotsAndNothingElseCh
             continue;
         }
         int const helpers = 1 + static_cast<int>(rng() % halo_r::kMaxHelperSlots);
-        halo_r::PlannerConfig cfg{ep, ep * home, helpers, 4, static_cast<int>(rng() % ep)};
+        halo_r::PlannerConfig cfg{.ep = ep,
+            .experts = ep * home,
+            .helperSlots = helpers,
+            .sendCount = 4,
+            .localRank = static_cast<int>(rng() % ep)};
         std::vector<int> const histogram = randomHistogram(rng, cfg.experts);
         PlanResult const ascending = runPlanner(histogram, cfg);
 

@@ -1717,9 +1717,12 @@ __device__ void materialize_worker_hot_routes(int const* routes, int* output, in
     Epoch epoch)
 {
     int const home = experts / ep;
-    HaloQSelectedRouteSlot const slotOf{plan + 2 + kPlanGroupBegin * kMaxBroadcasts,
-        plan + 2 + kPlanGroupSize * kMaxBroadcasts, plan + 2 + kPlanOwner * kMaxBroadcasts,
-        plan + 2 + kPlanHelper * kMaxBroadcasts, home, home + helpers};
+    HaloQSelectedRouteSlot const slotOf{.p_begin = plan + 2 + kPlanGroupBegin * kMaxBroadcasts,
+        .p_size = plan + 2 + kPlanGroupSize * kMaxBroadcasts,
+        .p_owner = plan + 2 + kPlanOwner * kMaxBroadcasts,
+        .p_helper = plan + 2 + kPlanHelper * kMaxBroadcasts,
+        .home = home,
+        .local_slots = home + helpers};
     materializeCompactedSelectedRoutes(
         routes, output, route_prefix, route_aux, status + 5, route_count, ep, experts, worker, workers, epoch, slotOf);
 }
