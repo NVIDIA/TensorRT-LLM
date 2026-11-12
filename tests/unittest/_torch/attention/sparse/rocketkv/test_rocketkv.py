@@ -1042,12 +1042,16 @@ def test_vanilla_kt_rows_follow_the_kt_block_table(kt_tokens_per_block):
         positions = torch.arange(
             past_seen_tokens // page_size, math.ceil(seq_len / page_size), device=device
         )
-        expected = attn._single_request_update_kt_cache(
+        attn._single_request_update_kt_cache(
             k, single_block_cache, single_block_table, seq_len, positions, is_generation
         )
-        actual = attn._single_request_update_kt_cache(
+        attn._single_request_update_kt_cache(
             k, paged_cache, paged_table, seq_len, positions, is_generation
         )
+        expected = attn._single_request_read_kt_cache(
+            single_block_cache, single_block_table, seq_len
+        )
+        actual = attn._single_request_read_kt_cache(paged_cache, paged_table, seq_len)
         assert actual.shape == (1, math.ceil(seq_len / page_size), *kt_row_shape)
         assert torch.equal(actual, expected)
 
