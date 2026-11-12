@@ -113,6 +113,7 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+    enable_kv_pool_rebalance: bool = False
 
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -2247,6 +2248,22 @@ def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
         _shutdown_transfer_worker_setup(healthy)
 
 
+def _single_vram_pool_page_table(tpb, kind):
+    """A one-layer-group page table whose only pool view is backed by GPU memory.
+
+    The sender reads each pool view's physical pool to group writes by memory type.
+    """
+    return SimpleNamespace(
+        tokens_per_block=tpb,
+        layer_groups={
+            0: SimpleNamespace(
+                kind=kind, pool_group_idx=0, pool_views=[SimpleNamespace(pool_idx=0)]
+            )
+        },
+        pool_groups=[SimpleNamespace(pools=[SimpleNamespace(memory_type="VRAM")])],
+    )
+
+
 def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, prompt_len, tpb):
     """Run Sender._build_kv_write_meta for one Helix receiver; return (src, dst) block pairs.
 
@@ -2266,9 +2283,7 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
 
     class _BlockExtractor:
         def __init__(self, kind):
-            self.page_table = SimpleNamespace(
-                tokens_per_block=tpb, layer_groups={0: SimpleNamespace(kind=kind)}
-            )
+            self.page_table = _single_vram_pool_page_table(tpb, kind)
 
         def extract(self, block_ids, layer_group, pool_idx):
             return np.asarray(block_ids, dtype=np.int64)
@@ -2308,6 +2323,7 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
         block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
         dst_start_token=None,
         slice_id=0,
+        kv_result_report_token=b"",
     )
     meta = transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2369,9 +2385,7 @@ def _helix_ring_write_meta(
     class _PtrExtractor:
         def __init__(self, base):
             self.base = base
-            self.page_table = SimpleNamespace(
-                tokens_per_block=tpb, layer_groups={0: SimpleNamespace(kind=CacheKind.PAGED)}
-            )
+            self.page_table = _single_vram_pool_page_table(tpb, CacheKind.PAGED)
 
         def extract(self, block_ids, layer_group, pool_idx):
             ptrs = self.base + np.asarray(block_ids, dtype=np.int64) * 1_000_000
@@ -2405,6 +2419,7 @@ def _helix_ring_write_meta(
         block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
         dst_start_token=None,
         slice_id=0,
+        kv_result_report_token=b"",
     )
     return transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2508,7 +2523,13 @@ def test_failed_write_build_reports_failure_to_the_receiver():
         slice_id=0,
     )
     task._unique_rid = 42
-    info = SimpleNamespace(instance_name="gen", instance_rank=5, unique_rid=42, slice_id=0)
+    info = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=5,
+        unique_rid=42,
+        slice_id=0,
+        kv_result_report_token=b"",
+    )
 
     with pytest.raises(ValueError, match="size mismatch"):
         sender._dispatch_task_to_peer(task, info)

@@ -29,6 +29,7 @@ __all__ = [
     "MLASparseHooks",
     "get_sparse_attention_hooks",
     "get_sparse_mla_hooks",
+    "has_sparse_mla_hooks",
     "prepare_sparse_runtime_params",
     "register_attention_sparse_hooks",
     "register_mla_sparse_hooks",
@@ -166,6 +167,11 @@ def register_attention_sparse_hooks(algorithm: str, hooks: type[AttentionSparseH
     if algorithm in _ATTENTION_HOOKS:
         raise ValueError(f"Attention sparse hooks are already registered for {algorithm!r}")
     _ATTENTION_HOOKS[algorithm] = hooks
+
+
+def has_sparse_mla_hooks(algorithm: Optional[str]) -> bool:
+    """Whether an algorithm selects an MLA adapter rather than the dense path."""
+    return algorithm in _MLA_HOOKS or algorithm in _MLA_HOOK_MODULE_PATHS
 
 
 def _get_sparse_mla_hooks_for_algorithm(

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -30,6 +31,9 @@ from .backends.interface import PositionalEmbeddingParams
 from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
                                               fused_qkv_rope_gate_fp8_append,
                                               fused_sigmoid_mul_inplace)
+
+_QKV_ROPE_TILING_ENABLED = os.environ.get("TRTLLM_ENABLE_QKV_ROPE_TILING",
+                                          "0") == "1"
 
 
 # Move out from this class
@@ -340,6 +344,7 @@ class QKNormRoPEAttention(Attention):
             self.head_dim,
             self._get_qk_norm_rotary_dim(),
             mrope_section,
+            enable_tiling=_QKV_ROPE_TILING_ENABLED,
         )
         return qkv, None, None, gate, None
 

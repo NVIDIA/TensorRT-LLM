@@ -45,6 +45,12 @@ void mhcHcHeadApplyLaunch(float const* mixes, float const* sqrsum, __nv_bfloat16
 void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x, float const* post_mix,
     float const* comb_mix, __nv_bfloat16* out, int B, int hidden_size, cudaStream_t stream);
 
+//! Split count the TF32 MMA fused-HC launchers (mhcFusedHcLaunch / mhcFusedHcAllInOneLaunch) run with for a
+//! requested `numKSplits` (<= 0 selects the built-in heuristic). The mhc_fused_hc op checks the per-split
+//! workspaces against it. The Python runner mirrors it in `_fused_hc_mma_k_splits` (mhc_cuda.py), sizes the
+//! workspaces with that copy and passes the resolved count, so the two ladders must change together.
+int mhcFusedHcMmaKSplits(int M, int numKSplits, bool allInOne);
+
 // Single-launch fused hyper-connection boundary op (SM100 only).
 //
 // Produces (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur) in two
@@ -52,13 +58,18 @@ void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x,
 // that emits D, sqr_sum, and residual_cur, and (2) big-fuse postlogue that
 // consumes those to emit post_mix_cur, comb_mix_cur, layer_input_cur.
 //
-// Workspace tensors are caller-allocated and zeroed by this launcher:
-//   y_acc_workspace: fp32 [M, 24]
-//   r_acc_workspace: fp32 [M]
+// Workspace tensors are caller-allocated, one partial per split
+// (ks = mhcFusedHcMmaKSplits(M, num_k_splits, false)); no pre-zeroing:
+//   y_acc_workspace: fp32 [ks, M, 24]
+//   r_acc_workspace: fp32 [ks, M]
+// The big-fuse step sums the splits in a fixed order (split order for up to
+// 16 splits; for other split counts, warp-strided with the stride set by the
+// BigFuse block size), so the outputs do not depend on how the split CTAs
+// were scheduled.
 //
 // Shape constraints (B200/B300 / sm_100a):
 //   hc_mult == 4
-//   hidden_size in {4096, 7168} for SM100/tcgen05 MMA fused-HC paths.
+//   hidden_size in {4096, 5120, 7168} for SM100/tcgen05 MMA fused-HC paths.
 // FMA fused-HC paths use runtime hidden_size but still require hidden_size % 64 == 0.
 // Passing num_k_splits == 0 or bigfuse_block_size == 0 falls back to the
 // internal heuristics.
@@ -104,20 +115,24 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 // Single-kernel all-in-one fused hyper-connection boundary launcher (TF32 tcgen05 path).
 //
 // Wraps fused_allinone_tf32_pmap_gemm_atomic_impl: pmap + TF32 GEMM + bigfuse
-// are all fused into ONE kernel launch.  Phase 3 uses an atomic done-counter
-// to elect the last-home CTA per m-block, which then executes the bigfuse
-// epilogue inline (no second kernel, no launch-latency stall).  Preferred for
+// are all fused into ONE kernel launch.  Phase 3 is a per-m-block barrier on
+// an atomic done-counter; the split CTAs of that m-block then sum the split
+// partials in split order and execute the bigfuse epilogue inline on their
+// token slice (no second kernel, no launch-latency stall).  Preferred for
 // mid/large M where the extra kernel launch overhead of the 2-kernel path is
-// visible (see design_doc_fused_hc.md).
+// visible.
 //
-// Workspace tensors are caller-allocated and zeroed by this launcher:
-//   y_acc_workspace: fp32 [M, 24]
-//   r_acc_workspace: fp32 [M]
+// Workspace tensors are caller-allocated, one partial per split
+// (ks = mhcFusedHcMmaKSplits(M, num_k_splits, true)); the launcher zeroes only
+// the done counters:
+//   y_acc_workspace: fp32 [ks, M, 24]
+//   r_acc_workspace: fp32 [ks, M]
 //   done_counter_workspace: int32 [ceil(M / 64)]
+// Phase 4 sums the splits in split order (deterministic).
 //
 // Shape constraints (B200/B300 / sm_100a):
 //   hc_mult == 4
-//   hidden_size in {4096, 7168} for SM100/tcgen05 MMA fused-HC paths.
+//   hidden_size in {4096, 5120, 7168} for SM100/tcgen05 MMA fused-HC paths.
 // FMA fused-HC paths use runtime hidden_size but still require hidden_size % 64 == 0.
 // Passing num_k_splits == 0 falls back to internal heuristics.
 // `norm_weight` (optional, bf16 [hidden_size]) enables fused next-layer RMSNorm
@@ -136,9 +151,11 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (FMA path).
 //
 // Wraps fused_pmap_gemm_fma_allinone<TN, KS, TM>: pmap + fp32 FMA GEMM +
-// bigfuse are all fused into ONE kernel launch.  Uses the same atomic
-// last-home election pattern as the TF32 all-in-one path.  Preferred for
-// small-M (M <= 32) where the TF32 tcgen05 path cannot saturate the MMA pipe.
+// bigfuse are all fused into ONE kernel launch.  The CTAs of a token batch
+// write their partials into y_acc / r_acc (atomicAdd when KS == 2) and count
+// an atomic done counter; the last one to arrive runs the bigfuse epilogue.
+// Preferred for small-M (M <= 32) where the TF32 tcgen05 path cannot
+// saturate the MMA pipe.
 //
 // Supported tactics; see pickFhcFmaAllInOne for the exact table:
 //   tile_n ∈ {1, 2, 3, 4, 6, 8, 12, 24}

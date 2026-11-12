@@ -420,6 +420,27 @@ class GenAdmissionWaitingQueue(WaitingQueue):
             self._order = self._build_order()[::-1]
         return self._order[-1]
 
+    @property
+    def target_s(self) -> Optional[float]:
+        """The ``auto`` policy's TTFT target X once it is set, else None."""
+        return self.adaptive.X if self.adaptive is not None else None
+
+    def num_at_risk(self, slack_s: float) -> int:
+        """Waiting requests with at most ``slack_s`` to spare against X (late
+        ones included) if the next pop is one of them, else 0 (GEN slot
+        preemption)."""
+        ada, now = self.adaptive, self._now
+        if ada is None or ada.X is None or now is None or not self:
+            return 0
+
+        def at_risk(entry) -> bool:
+            orig, _, _, keyed, _ = entry
+            return keyed and ada.X - (now - orig + ada.s2f_s) <= slack_s
+
+        if not at_risk(self._next()[0]):
+            return 0
+        return sum(1 for e in self._entries if e[1] not in self._popped and at_risk(e))
+
     def mark_admitted(self, items: Iterable) -> None:
         now = self._now
         for item in items:

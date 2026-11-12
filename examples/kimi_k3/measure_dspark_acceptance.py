@@ -15,9 +15,9 @@ drafter and reports the weights-drop-day figures of merit:
   fires both in one submission),
 - confidence-vs-acceptance calibration table, for calibrating the DSpark
   confidence_threshold and Sequential Temperature Scaling. Rows are only
-  collected when the confidence provider
-  (``dspark_confidence``) is in the tree and the drafter ships a
-  confidence head; otherwise "confidence_calibration" is null. For
+  collected when a confidence provider is attached to the accept-stats
+  recorder and the drafter ships a confidence head (no provider is wired
+  by default); otherwise "confidence_calibration" is null. For
   UNBIASED calibration leave --confidence-threshold unset (0): trimmed
   positions are forced rejects.
 
@@ -167,8 +167,8 @@ def build_llm(args: argparse.Namespace) -> tuple[LLM, bool]:
             speculative_model=args.drafter,
         )
         if args.confidence_threshold is not None:
-            # Shipped by the DSpark confidence-scheduled verification MR;
-            # feature-detect so this harness also runs on trees without it
+            # Optional config field: feature-detect so this harness also runs
+            # on trees without confidence-scheduled verification support
             # (where only threshold-off calibration-free measurement works).
             if "confidence_threshold" not in DFlashDecodingConfig.model_fields:
                 raise SystemExit(

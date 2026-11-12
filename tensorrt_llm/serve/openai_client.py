@@ -18,7 +18,6 @@ import errno
 import json
 import os
 import traceback
-import zlib
 from abc import ABC, abstractmethod
 from contextlib import aclosing
 from typing import (
@@ -49,6 +48,7 @@ from tensorrt_llm.serve.disagg_auth import (
     build_subagent_affinity_headers,
     request_requires_internal_disagg_auth,
 )
+from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -232,6 +232,13 @@ class OpenAIClient(ABC):
         ...
 
 
+def _server_base_url(server: str) -> str:
+    """Return the base URL of a router server entry, with or without a scheme."""
+    if server.startswith(("http://", "https://")):
+        return server.rstrip("/")
+    return f"http://{server}".rstrip("/")
+
+
 class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
@@ -302,7 +309,7 @@ class OpenAIHttpClient(OpenAIClient):
             return server
         num_frontends, stride = self._frontend_affinity
         host, _, port = server.rpartition(":")
-        frontend = zlib.crc32(conversation_id.encode()) % num_frontends
+        frontend = frontend_of_conversation(conversation_id, num_frontends)
         affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
         refused_at = self._refused_affinity_ports.get(affinity_server)
         if refused_at is not None:
@@ -328,8 +335,7 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        server_url = server if server.startswith("http") else f"http://{server}"
-        url = f"{server_url.rstrip('/')}/{endpoint}"
+        url = f"{_server_base_url(server)}/{endpoint}"
         # A count-tokens body carries the whole conversation, so it is as large
         # as a chat body and encoding it costs the orchestrator's event loop the
         # same way -- hence the same msgpack transport as _send_request. The
@@ -355,8 +361,7 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        server_url = server if server.startswith("http") else f"http://{server}"
-        url = f"{server_url.rstrip('/')}/{endpoint}"
+        url = f"{_server_base_url(server)}/{endpoint}"
         async with self._session.get(url) as response:
             if response.status >= 400:
                 error_body = await response.text()
@@ -399,9 +404,9 @@ class OpenAIHttpClient(OpenAIClient):
             if pinned_dp is not None:
                 req_id = pinned_dp.disagg_request_id
         url_server = self._url_server(server, request)
-        url = f"http://{url_server}/{endpoint}"
+        url = f"{_server_base_url(url_server)}/{endpoint}"
         # The routed server's shared port, used if the affinity port refuses.
-        fallback_url = f"http://{server}/{endpoint}" if url_server != server else None
+        fallback_url = f"{_server_base_url(server)}/{endpoint}" if url_server != server else None
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None
@@ -821,11 +826,7 @@ class OpenAIHttpClient(OpenAIClient):
     ) -> Tuple[List[str], List[str]]:
         async def check_server_ready(server: str) -> bool:
             try:
-                url = (
-                    f"{server}/health"
-                    if server.startswith("http://")
-                    else f"http://{server}/health"
-                )
+                url = f"{_server_base_url(server)}/health"
                 async with session.get(url) as response:
                     return response.status == 200
             except Exception:
