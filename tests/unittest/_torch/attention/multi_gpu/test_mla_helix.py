@@ -643,18 +643,10 @@ def _v_up_builder(kv_b_weight, kv_b_scale, *, num_heads, cp_size, cp_rank, nope,
     return module
 
 
-@pytest.mark.parametrize("obsolete_flag", [None, "0", "1"])
 @pytest.mark.parametrize("cp_rank", [0, 1])
-def test_helix_v_up_weight_from_fp8_kv_b(
-    cp_rank: int, obsolete_flag: str | None, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int) -> None:
     """MLA dequantizes every tp-local head's V weight from the loaded FP8 kv_b_proj; this rank's
     dequantized V chunk becomes a view of it."""
-    # K3 leaves loaded FP8 block scales for the MLA post-load walk to bind.
-    if obsolete_flag is None:
-        monkeypatch.delenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", raising=False)
-    else:
-        monkeypatch.setenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", obsolete_flag)
     h, n, v, k, cp = 4, 128, 128, 256, 2
     generator = torch.Generator().manual_seed(cp_rank)
     weight = (torch.randn(h * (n + v), k, generator=generator) * 64).to(torch.float8_e4m3fn)
@@ -679,15 +671,7 @@ def test_helix_v_up_weight_from_fp8_kv_b(
     )
 
 
-@pytest.mark.parametrize("obsolete_flag", [None, "0", "1"])
-def test_helix_v_up_weight_views_bf16_kv_b(
-    obsolete_flag: str | None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The common MLA binding owns the BF16 K3 layout as well.
-    if obsolete_flag is None:
-        monkeypatch.delenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", raising=False)
-    else:
-        monkeypatch.setenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", obsolete_flag)
+def test_helix_v_up_weight_views_bf16_kv_b() -> None:
     h, n, v, k = 4, 64, 128, 256
     weight = torch.randn(h * (n + v), k, dtype=torch.bfloat16)
     module = _v_up_builder(weight, None, num_heads=h, cp_size=2, cp_rank=0, nope=n, v=v, k=k)

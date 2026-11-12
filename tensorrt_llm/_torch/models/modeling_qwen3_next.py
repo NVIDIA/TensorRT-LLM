@@ -46,6 +46,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduceParams, allgather)
 from ..distributed.ops import MNNVLAllReduce
@@ -931,6 +932,8 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
 
 class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
 
+    linear_attn_cls = Qwen3NextGatedDeltaNet
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3NextConfig],
@@ -939,7 +942,7 @@ class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
         shared_gate_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        self.linear_attn = Qwen3NextGatedDeltaNet(
+        self.linear_attn = self.linear_attn_cls(
             model_config,
             aux_stream,
             layer_idx,
@@ -993,6 +996,8 @@ class Qwen3NextAttention(Qwen3Attention):
 
 class Qwen3NextFullAttentionDecoderLayer(_Qwen3NextDecoderLayerBase):
 
+    attention_mask = PredefinedAttentionMask.CAUSAL
+
     def __init__(self,
                  model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int,
@@ -1012,6 +1017,7 @@ class Qwen3NextFullAttentionDecoderLayer(_Qwen3NextDecoderLayerBase):
 
     def mixer_forward(self, position_ids, hidden_states, attn_metadata,
                       spec_metadata, lora_params, all_reduce_params, **kwargs):
+        kwargs.setdefault("attention_mask", self.attention_mask)
         return self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1280,6 +1286,8 @@ ALL_DECODER_LAYER_TYPES = {
 
 class Qwen3NextModel(DecoderModel):
 
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
         super().__init__(model_config)
         config = self.model_config
@@ -1331,10 +1339,10 @@ class Qwen3NextModel(DecoderModel):
         shared_gate_stream = self.aux_stream_dict.get(
             AuxStreamType.MoeSharedGate)
         self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[layer_types[layer_idx]](model_config,
-                                                            layer_idx,
-                                                            self.aux_stream,
-                                                            shared_gate_stream)
+            self.decoder_layer_types[layer_types[layer_idx]](model_config,
+                                                             layer_idx,
+                                                             self.aux_stream,
+                                                             shared_gate_stream)
             for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
         self.num_hidden_layers = pretrained_config.num_hidden_layers

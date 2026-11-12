@@ -2082,8 +2082,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/serving_extensions.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/defs/model_express/",
-        "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
-        "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300_efa_multi_nodes.yml",
@@ -2092,21 +2090,12 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/scripts/perf-sanity/disaggregated/b300_qwen3_0.6b_efa_functional.yaml",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
-        "tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_gpus.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/unittest/_torch/multi_gpu/",
@@ -2159,28 +2148,33 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
         return ""
     }
+    // Any prefix or suffix can match a file (OR); all changed files must match the group.
     def groupFileMap = [
         "Docs": [
-            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
-            "docs/",
+            prefixes: ["docs/"],
+            suffixes: [".md"],
         ],
         "PyTorch": [
-            "tensorrt_llm/_torch/",
-            "tensorrt_llm/scaffolding/",
-            "tests/unittest/_torch/",
-            "tests/unittest/scaffolding/",
-            "tests/unittest/llmapi/test_llm_pytorch.py",
-            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-            "tests/integration/defs/disaggregated/",
-            "examples/disaggregated",
-            "examples/pytorch/",
-            "examples/scaffolding/",
-            "docs/",
+            prefixes: [
+                "tensorrt_llm/_torch/",
+                "tensorrt_llm/scaffolding/",
+                "tests/unittest/_torch/",
+                "tests/unittest/scaffolding/",
+                "tests/unittest/llmapi/test_llm_pytorch.py",
+                "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+                "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+                "tests/integration/defs/disaggregated/",
+                "examples/disaggregated",
+                "examples/pytorch/",
+                "examples/scaffolding/",
+                "docs/",
+            ],
         ],
         "Triton": [
-            "tests/integration/defs/triton_server/",
-            "triton_backend/",
+            prefixes: [
+                "tests/integration/defs/triton_server/",
+                "triton_backend/",
+            ],
         ],
     ]
 
@@ -2190,13 +2184,10 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     }
 
     for (group in groupFileMap.keySet()) {
-        def groupPrefixes = groupFileMap[group]
+        def groupRules = groupFileMap[group]
         def matchesGroup = { file ->
-            // Any *.md file, anywhere in the repo, counts as Docs-only.
-            if (group == "Docs" && file.endsWith(".md")) {
-                return true
-            }
-            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            return groupRules.prefixes?.any { prefix -> file.startsWith(prefix) } ||
+                groupRules.suffixes?.any { suffix -> file.endsWith(suffix) }
         }
         def allFilesInGroup = changedFileList.every(matchesGroup)
 

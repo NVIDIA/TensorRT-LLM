@@ -246,10 +246,8 @@ def test_decode_layers_are_not_held_to_context_kernel_head_sizes(head_dim: int) 
         dtype=torch.bfloat16, num_heads=16, num_kv_heads=2, head_dim=head_dim, tokens_per_block=32
     )
     with patch("tensorrt_llm._torch.speculative.dflash_attention.get_dflash_trtllm_gen_ops"):
-        validate_dflash_trtllm_gen_runtime(**shape, has_context_attention=False)
-        validate_dflash_trtllm_gen_runtime(**shape, has_context_attention=False)
-        with pytest.raises(RuntimeError, match="head dimension"):
-            validate_dflash_trtllm_gen_runtime(**shape, has_context_attention=True)
+        validate_dflash_trtllm_gen_runtime(**shape)
+        validate_dflash_trtllm_gen_runtime(**shape, folded_block_size=4)
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +634,6 @@ def test_folded_runtime_accepts_large_blocks_by_chunking(
             num_kv_heads=kv_heads,
             head_dim=128,
             tokens_per_block=32,
-            has_context_attention=False,
             folded_block_size=block,
         )
     chunk = get_dflash_folded_decode_chunk_size(block, heads, kv_heads)

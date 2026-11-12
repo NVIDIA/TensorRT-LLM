@@ -1596,7 +1596,6 @@ class DFlashWorker(SpecWorkerBase):
                     num_kv_heads=nkv,
                     head_dim=hd,
                     tokens_per_block=page_size,
-                    has_context_attention=False,
                     folded_block_size=(
                         self._compute_block_size
                         if DFLASH_FOLDED_DECODE_LOWERING in lowerings

@@ -342,7 +342,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # Decode-step shortcuts a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
     skip_unchanged_block_offsets = False
     reuse_pool_views = False
-    block_ids_from_views = False
 
     _main_kv_mapper_kind = MapperKind.HND
     _main_kv_view_layout = "NHD"
@@ -611,32 +610,44 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
-        if self.layer_specs is not None:
-            # Explicit layer specs carry K/V and scales; index-K is this manager's extra buffer.
-            if data_role == Role.INDEX_KEY:
-                if int(self.pp_layers[int(local_layer_idx)]) not in self.sparse_layer_ids:
-                    return 0
-                index_dtype = self._torch_dtype_for_index_cache()
-                return self.sparse_index_dim * torch.tensor([], dtype=index_dtype).element_size()
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        if self.dtype != DataType.NVFP4:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
-        if global_layer_idx in self.sparse_layer_ids:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        has_index_k = global_layer_idx in self.sparse_layer_ids
+        if data_role == Role.INDEX_KEY:
+            return self._index_k_bytes_per_token() if has_index_k else 0
 
-        if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
-            return 0
-        if data_role == Role.ALL:
-            kv_factor = self.kv_factor
-        elif data_role in (Role.KEY, Role.VALUE):
-            kv_factor = 1
+        if self.layer_specs is not None or self.dtype != DataType.NVFP4 or has_index_k:
+            # Explicit layer specs carry K/V and scales; index-K is this manager's extra buffer.
+            cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         else:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        return (
-            kv_factor
-            * self.num_kv_heads_per_layer[int(local_layer_idx)]
-            * self.head_dim_per_layer[int(local_layer_idx)]
+            # NVFP4 dense-target / shared-Eagle FP8 cache calculation.
+            if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+                return 0
+            if data_role == Role.ALL:
+                kv_factor = self.kv_factor
+            elif data_role in (Role.KEY, Role.VALUE):
+                kv_factor = 1
+            else:
+                return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+            cache_bytes = (
+                kv_factor
+                * self.num_kv_heads_per_layer[int(local_layer_idx)]
+                * self.head_dim_per_layer[int(local_layer_idx)]
+            )
+
+        if data_role == Role.ALL and has_index_k:
+            cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
+        return cache_bytes
+
+    def get_cache_bytes_per_token(self) -> int:
+        """Bytes per token across the local layers, the sparse layers' index-K included.
+
+        The base sums the K/V roles only; the per-sparse-layer ``Role.INDEX_KEY``
+        buffers live in the same tiers, so the cache-created event's block count
+        divides each tier quota by this total. Layer specs carry no index-K either.
+        """
+        return super().get_cache_bytes_per_token() + sum(
+            self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
+            for local_layer_idx in range(self.num_local_layers)
         )
 
     @classmethod
@@ -993,19 +1004,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             raise NotImplementedError("MiniMax-M3 does not relocate accepted draft tokens.")
         super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
 
-    def _extra_buffers_per_layer(self, *, tokens_per_block):
+    def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
 
-        ``size`` is bytes per **block**: ``1 * sparse_index_dim *
-        elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_base_config`` iterates local ids, so keying
+        ``size`` is bytes per **block**: :meth:`_index_k_bytes_per_token`
+        times ``tokens_per_block``, the same per-token size
+        :meth:`get_layer_bytes_per_token` reports. Keyed by **local** layer
+        id — the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.
         """
-        torch_dtype = self._torch_dtype_for_index_cache()
-        elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
-        bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
-        size_per_block = bytes_per_token * tokens_per_block
+        size_per_block = self._index_k_bytes_per_token() * tokens_per_block
         return {
             self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
             for layer_id in self.sparse_layer_ids
@@ -1036,6 +1045,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         page_upper = self.impl.get_page_index_upper_bound(any_layer_offset, Role.KEY)
         kv_factor = 1 if self.kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         return int((page_upper // kv_factor) * self.tokens_per_block)
+
+    def _index_k_bytes_per_token(self) -> int:
+        """Bytes of one token's index-K row on a sparse layer."""
+        index_dtype = self._torch_dtype_for_index_cache()
+        return self.sparse_index_dim * torch.empty(0, dtype=index_dtype).element_size()
 
     def _torch_dtype_for_index_cache(self) -> torch.dtype:
         """Return the independently configured index-cache storage dtype."""
@@ -1194,7 +1208,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self,
         skip_unchanged_block_offsets: bool,
         reuse_pool_views: bool,
-        block_ids_from_views: bool = False,
     ) -> None:
         """Turn on the decode-step shortcuts a model opted into.
 
@@ -1202,14 +1215,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         whose inputs equal the previous copy's into the same destination.
         ``reuse_pool_views``: hand out one pool view per geometry instead of
         re-wrapping the pool memory on every attention call.
-        ``block_ids_from_views``: fill :meth:`get_block_ids_per_seq` rows from the
-        page-index views directly (see there).
         """
         self.skip_unchanged_block_offsets = skip_unchanged_block_offsets
         self.reuse_pool_views = reuse_pool_views
-        self.block_ids_from_views = block_ids_from_views
-        if block_ids_from_views:
-            logger.info("[M3 host] block-id tables filled from page-index views")
 
     def _pool_view(
         self,
@@ -1466,32 +1474,21 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         The rows are written through a numpy view of a single zero-filled,
         pinned result, so the attention metadata builders ship it to the device
-        in one asynchronous copy.
-
-        With ``block_ids_from_views`` each row is slice-copied from the request's
-        page-index view (an int32 array) rather than built as a Python list of the
-        whole padded row first; the table is the same.
+        in one asynchronous copy. Each row is slice-copied from the request's
+        pool-0 page-index view (an int32 array), the same row
+        :meth:`get_batch_cache_indices` returns: the view spans the whole
+        ``max_seq_len`` capacity, so building it as a Python list would cost
+        host time on every decode step in proportion to ``max_seq_len``, not
+        to the live context.
         """
-        if self.block_ids_from_views:
-            views = [self.kv_cache_map[req_id].get_base_page_indices(0) for req_id in request_ids]
-            max_blocks = max((len(view) for view in views), default=0)
-            padded_tensor = torch.zeros(
-                (len(views), max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            rows = padded_tensor.numpy()
-            for row, view in zip(rows, views):
-                row[: len(view)] = view
-            rows[rows == BAD_PAGE_INDEX] = 0
-            return padded_tensor
-        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-        batch = len(block_ids_per_seq)
-        max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
+        views = [self.kv_cache_map[req_id].get_base_page_indices(0) for req_id in request_ids]
+        max_blocks = max((len(view) for view in views), default=0)
         padded_tensor = torch.zeros(
-            (batch, max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
+            (len(views), max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
         )
         rows = padded_tensor.numpy()
-        for row, block_ids in zip(rows, block_ids_per_seq):
-            row[: len(block_ids)] = block_ids
+        for row, view in zip(rows, views):
+            row[: len(view)] = view
         # BAD_PAGE_INDEX marks padding, which this tensor reports as 0.
         rows[rows == BAD_PAGE_INDEX] = 0
         return padded_tensor

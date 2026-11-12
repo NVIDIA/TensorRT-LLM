@@ -214,7 +214,6 @@ def validate_dflash_trtllm_gen_runtime(
     num_kv_heads: int,
     head_dim: int,
     tokens_per_block: int,
-    has_context_attention: bool,
     folded_block_size: Optional[int] = None,
 ) -> None:
     """Fail before cache allocation when DFlash's kernel shape is unsupported."""
@@ -249,8 +248,4 @@ def validate_dflash_trtllm_gen_runtime(
             f"{tokens_per_block}; supported sizes are {supported}, plus powers of two "
             f">= {_TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS} when every draft layer is causal "
             "or windowed."
-        )
-    if has_context_attention and head_dim in FlashInferTrtllmGenFmha.UNSUPPORTED_HEAD_SIZES_CONTEXT:
-        raise RuntimeError(
-            f"DFlash TRTLLM context attention does not support head dimension {head_dim}."
         )
