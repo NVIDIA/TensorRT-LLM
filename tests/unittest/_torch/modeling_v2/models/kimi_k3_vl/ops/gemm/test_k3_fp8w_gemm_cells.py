@@ -3,7 +3,7 @@
 """The single-GPU FP8-weight GEMM entries of the K3 default target over their certified cells:
 ``k3_fp8w_lowm_gemm.CELLS``, ``k3_fp8w_mid_gemm.CELLS``, ``k3_fp8w_lowm_mxfp8_gemm.CELLS`` and
 ``k3_latent_down_fp4.CELLS``, each driven through ``validating`` and checked against the entry's
-own ``reference``. (``k3_mxfp8_gemm.CELLS`` run in ``core/test_core_mxfp8_gemm.py``, on SM107.)
+own ``reference``. (``k3_mxfp8_gemm.CELLS`` run in ``ops/gemm/test_core_mxfp8_gemm.py``, on SM107.)
 
 The weights are random E4M3 codes with power-of-two 128 x 128 block scales, and the activation rows
 have a different magnitude per 32-column group, so every UE8M0 exponent path is exercised.

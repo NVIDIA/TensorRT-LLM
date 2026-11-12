@@ -28,23 +28,23 @@ outputs).
 For ``layers.py`` an MNNVL instance also answers ``mnnvl_allreduce`` (itself), ``mapping``,
 ``dtype``, ``symm_mem_allreduce`` (None) and ``get_required_workspace_size``.
 
-Pushed MNNVL all-reduce, private to the Kimi K3 Rubin package.
+Pushed MNNVL all-reduce, private to the Kimi K3 package.
 
 A producer kernel may store its BF16 output straight into the Lamport buffers of the MNNVL
-all-reduce that follows it (the K3 low-M FP8 GEMM's push epilogue, ``kernels/k3_lamport_ar.py``).
-:func:`lamport_push_target` hands the buffers to the producer and :func:`finish_lamport_push`
-completes the all-reduce, bitwise like the C++ kernel the call replaces.
+all-reduce that follows it (the K3 low-M FP8 GEMM's push epilogue,
+``kernels/k3r_comm/k3_lamport_ar.py``). :func:`lamport_push_target` hands the buffers to the
+producer and :func:`finish_lamport_push` completes the all-reduce, bitwise like the C++ kernel the
+call stands in for.
 
-This is the push API of the Rubin agentic branch (``189fe67b81``, ``distributed/ops.py``:
-``LamportPushTarget``/``LamportPending`` and the ``AllReduce`` /
-``MNNVLAllReduce`` methods ``lamport_push_target``, ``lamport_push_tensor`` and
-``finish_lamport_push``), as free functions that take the all-reduce: ``layers.TpAllReduce``
-(or main's ``AllReduce``), read through ``mnnvl_allreduce`` (the MNNVL transport: its ``mapping``,
-``dtype`` and ``get_required_workspace_size``) and ``symm_mem_allreduce``. They work on the shared
-MNNVL workspace of ``get_or_scale_allreduce_mnnvl_workspace`` (same dict keys and the same 9-word
-``buffer_flags`` layout).
+The push API (``LamportPushTarget`` / ``LamportPending``, ``lamport_push_target``,
+``lamport_push_tensor`` and ``finish_lamport_push``) is a set of free functions that take the
+all-reduce: ``layers.TpAllReduce`` (or main's ``AllReduce``), read through ``mnnvl_allreduce`` (the
+MNNVL transport: its ``mapping``, ``dtype`` and ``get_required_workspace_size``) and
+``symm_mem_allreduce``. They work on the shared MNNVL workspace of
+``get_or_scale_allreduce_mnnvl_workspace`` (same dict keys and the same 9-word ``buffer_flags``
+layout as main's ``MNNVLAllReduce``).
 
-Differences from the branch, all forced by main:
+Constraints from main's all-reduce:
 
 * The C++ one-/two-shot switch is ``distributed.ops._MNNVL_ONE_SHOT_THRESHOLD_BYTES``
   (``TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES``): the pushed call must reproduce the kernel main's
@@ -343,10 +343,9 @@ def mnnvl_lamport_push_target(
     hidden_dim: int,
     one_shot: Optional[bool] = None,
 ) -> Optional[LamportPushTarget]:
-    """``MNNVLAllReduce.lamport_push_target`` of the branch: a target for a plain all-reduce of
-    BF16 ``[num_tokens, hidden_dim]`` on the workspace of ``mnnvl`` (an all-reduce's MNNVL
-    transport, ``mnnvl_allreduce``), or None. ``one_shot`` forces the transport instead of the
-    size rule."""
+    """A push target for a plain all-reduce of BF16 ``[num_tokens, hidden_dim]`` on the workspace of
+    ``mnnvl`` (an all-reduce's MNNVL transport, ``mnnvl_allreduce``), or None. ``one_shot`` forces
+    the transport instead of the size rule."""
     from ...kernels.k3r_comm import k3_lamport_ar
 
     world = mnnvl.mapping.tp_size
@@ -404,7 +403,8 @@ def mnnvl_workspace_mpi_comm(workspace: Dict[str, object]):
 def _mnnvl_finish(
     target: LamportPushTarget, deferred: bool = False
 ) -> Union[torch.Tensor, LamportPending]:
-    """``MNNVLAllReduce.finish_lamport_push`` of the branch."""
+    """Finish the all-reduce of a pushed ``target`` on its MNNVL workspace (a tensor, or with
+    ``deferred`` a ``LamportPending``)."""
 
     from .k3_lamport_finish import k3_lamport_finish
 
@@ -466,7 +466,7 @@ def lamport_push_target(
 def lamport_push_tensor(allreduce: Any, target: LamportPushTarget, x: torch.Tensor) -> None:
     """Push the contiguous BF16 ``[num_tokens, hidden_dim]`` tensor ``x`` into ``target`` (a copy
     kernel), for a producer without the push epilogue."""
-    del allreduce  # the target carries its workspace; kept for the branch's call shape
+    del allreduce  # the target carries its workspace; kept for the all-reduce-first call shape
 
     from .k3_lamport_push import k3_lamport_push
 
@@ -481,7 +481,7 @@ def finish_lamport_push(
 ) -> Union[torch.Tensor, LamportPending]:
     """The all-reduce result of a target the producer has pushed: a tensor, or with ``deferred``
     (where ``target.deferred``) a ``LamportPending`` that the next kernel finishes."""
-    del allreduce  # the target carries its workspace; kept for the branch's call shape
+    del allreduce  # the target carries its workspace; kept for the all-reduce-first call shape
     if not target.pushed:
         raise RuntimeError("the producer did not push this all-reduce")
     return _mnnvl_finish(target, deferred and target.deferred)

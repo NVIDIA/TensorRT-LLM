@@ -282,7 +282,7 @@ def kda_decode_mtp_2cta_kernel(
 ):
     """See the module docstring. Grid ``(HV, N, 1)``, one (head, request) tile per CTA.
 
-    ``EARLY_TRIGGER`` (c240, with ``PDL``): release the dependent grid right after
+    ``EARLY_TRIGGER`` (with ``PDL``): release the dependent grid right after
     ``griddepcontrol.wait`` (as ``kda_mtp_decode_v2`` does with ``PDL``), for a dependent that only
     streams weights before its own wait (the mid-M o_proj GEMM with the all-reduce push).
 

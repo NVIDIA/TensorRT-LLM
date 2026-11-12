@@ -16,7 +16,7 @@
 RMSNorm site kernel and the split-K GEMM push epilogue are bitwise the C++ MNNVL fused
 all-reduce of the same partials, with C++ calls interleaved on the workspace and under CUDA-graph
 replay; the owner-multicast embedding site is bitwise the vocab-sharded lookup + all-reduce. The
-Lamport slots come from the Kimi K3 package's pushed all-reduce (``k3_rubin/comm/lamport.py``)."""
+Lamport slots come from the Kimi K3 package's pushed all-reduce (``ops/comm/sm107_allreduce.py``)."""
 
 import os
 import pickle

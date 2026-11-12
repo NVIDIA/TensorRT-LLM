@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The K3 MLA drafter's RMSNorm + RoPE entries (``ops/spec/k3_dspark_*``) write bitwise what
-the launches they replace write: the ``TLLM_DSPARK_TAIL_V2`` kernels against the
+the separate launches write: the ``dspark_tail_v2`` kernels against the
 per-layer / separate launches, and the row-strided ``k3_dspark_rmsnorm_rope`` against main's
 ``cute_dsl_dspark_rmsnorm_rope`` on a contiguous copy."""
 

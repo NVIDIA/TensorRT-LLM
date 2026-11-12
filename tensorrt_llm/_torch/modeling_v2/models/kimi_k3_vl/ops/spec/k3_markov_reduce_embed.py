@@ -20,8 +20,9 @@ class K3MarkovReduceEmbed(OpWrapper):
     outside ``[0, vocab)``. Returns None."""
 
     ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
-    # helix8 c240 runs 20 requests, more than the one-launch chains take: its draft block (6
-    # positions, Markov rank 256) goes through the multi-launch chain over 8 ranks x 10 splits.
+    # The helix8 batch-20 recipe runs 20 requests, more than the one-launch chains take: its draft
+    # block (6 positions, Markov rank 256) goes through the multi-launch chain over 8 ranks x 10
+    # splits.
     CELLS = (
         Cell(
             why="helix8 c240, step 0: the anchors, two of them outside the vocab (zero rows)",

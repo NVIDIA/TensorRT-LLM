@@ -594,7 +594,7 @@ class K3AttnResFastKernel:
         # bf16(y + bf16(slot sum)), the BF16 add of a column-parallel projection's output y
         # (all-gathered) and the all-reduced partials (the K3 column-parallel MoE tail).
         self.finish_ag = finish_ag
-        # c240: the MXFP8 scales in the mid-M GEMM's tcgen05 atom layout (one 128-row block)
+        # The MXFP8 scales in the mid-M GEMM's tcgen05 atom layout (one 128-row block)
         # instead of row-major [M, 224] (see ``mx_atom`` of run_k3_attn_res).
         self.mx_atom = mx_atom and mxfp8
         if add_mode not in (ADD_NONE, ADD_PREFIX, ADD_MOE) or cluster not in (1, 2, 4, 8):
@@ -1279,7 +1279,7 @@ def run_k3_attn_res(
             still running writes (weights, and for the KDA verify kernel the layer's state pool,
             conv windows and replay rows of the previous step) and write no global memory
             before it. The results are the same bits.
-        mx_atom: (c240, with ``mxfp8_out``, M <= 128) ``xs`` is ``uint8 [(7168 / 128) * 512]``
+        mx_atom: (with ``mxfp8_out``, M <= 128) ``xs`` is ``uint8 [(7168 / 128) * 512]``
             in the scale layout of the mid-M FP8 GEMM (``k3_fp8w_lowm_gemm.run_mid_prequantized``
             with one 128-row scale block): the same exponents, so that GEMM on ``(xq, xs)`` is
             bitwise its quantization kernel + GEMM on ``output``. Atom rows past M are not

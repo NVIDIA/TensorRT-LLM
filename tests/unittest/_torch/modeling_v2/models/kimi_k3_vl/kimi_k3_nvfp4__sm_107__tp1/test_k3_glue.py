@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The kimi_k3_nvfp4__sm_107__tp1 decoder glue against main's helpers it replaced: bitwise.
+"""The kimi_k3_nvfp4__sm_107__tp1 decoder glue against main's helpers: bitwise.
 
 * ``_Fp8BlockScaleWeightReadLinear.from_linear`` on a ``core.Fp8BlockScaleLinear`` (loaded, or
   loaded and prepared; one rank or a COLUMN / ROW shard) gives the projection built from the codes

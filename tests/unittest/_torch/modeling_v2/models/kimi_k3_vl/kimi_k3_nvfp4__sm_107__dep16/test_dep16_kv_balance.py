@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""kimi_k3_nvfp4__sm_107__dep16: the KV-balanced admission planner decides as the c383 reference does.
+"""kimi_k3_nvfp4__sm_107__dep16: the KV-balanced admission planner decides as the reference planner does.
 
-The oracle is the reference planner (084745cde4 ``pyexecutor/scheduler/adp_kv_balance.py``, run by the
-c383 GEN servers with window 32 and 64 wait rounds), copied below without change but for the queue, which is
-a list of ``(id, tokens)`` here. The target's planner runs inside the engine's ``DefaultADPRouter``, which
-keeps the window, the wait-round count and the queue; both are driven with the same synthetic loads and
-must admit the same requests to the same ranks, round after round.
+The oracle is the standalone reference planner below (window 32 and 64 wait rounds, as the dep16 generation
+recipe runs it), whose queue is a list of ``(id, tokens)``. The target's planner runs inside the engine's
+``DefaultADPRouter``, which keeps the window, the wait-round count and the queue; both are driven with the
+same synthetic loads and must admit the same requests to the same ranks, round after round.
 """
 
 from __future__ import annotations
@@ -152,7 +151,7 @@ def test_plan_matches_the_reference_on_synthetic_loads():
         assert planner.plan(**load) == want, load
         engine_differs += plan_kv_balanced_admission(**load) != want
     # The engine's own planner decides differently on these loads: the declaration is what makes
-    # the c383 GEN servers admit as the reference did.
+    # the dep16 generation servers admit as the reference planner does.
     assert engine_differs > 0
 
 

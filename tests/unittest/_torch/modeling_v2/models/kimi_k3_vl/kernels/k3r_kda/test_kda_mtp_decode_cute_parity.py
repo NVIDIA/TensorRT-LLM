@@ -16,8 +16,7 @@
 
 References:
 
-1. A pure-torch fp32 CPU golden (vendored from the kernel drop's
-   ``cpu_reference`` self-check).
+1. A pure-torch fp32 CPU golden (``cpu_reference``).
 2. An FLA sequential reference built from the exact op sequence
    ``K3KDALinearAttention.forward_verify`` uses in-tree: per-step fp32 causal
    conv + SiLU followed by ``fla.ops.kda.fused_recurrent_kda`` with
@@ -31,8 +30,8 @@ verify path computes — i.e. it is a drop-in replacement.
 Round-2 tests exercise the kernel's replay mode (``num_accepted_tokens``
 mixed per request), chained from round-1 CPU-golden outputs. H=8 (K3
 state-TP4) and H=6 (TP16) are the production per-rank head counts outside
-the drop's benchmark-tuned set {2, 12, 32}; the vendored v_row hoist fix
-makes them compile, and this test validates them numerically.
+the tuned set {2, 12, 32}; this test validates that they compile and compute
+correctly.
 
 Requires: 1 GPU (sm100/sm103/sm107), fla-core, nvidia-cutlass-dsl,
 cuda-bindings. Skips cleanly otherwise.
@@ -66,7 +65,7 @@ pytestmark = [
     pytest.mark.skipif(not _HAVE_DEPS, reason=f"deps: {_DEP_ERR}"),
 ]
 
-# (N, H): the drop's benchmark-tuned shapes plus K3's production per-rank
+# (N, H): the tuned shapes plus K3's production per-rank
 # head counts (96 KDA heads: 12 at TP8, 8 at state-TP 12, 6 at TP16).
 SHAPES = [
     (128, 2),
@@ -83,7 +82,7 @@ def _silu(x):
 
 
 def make_conv_data(B, H, K=128, V=128, M=2, W=4, lower_bound=-5.0, scale=None, seed=2025):
-    """Random inputs + caches in the op's layout contract (from the drop)."""
+    """Random inputs + caches in the op's layout contract."""
     torch.manual_seed(seed)
     scale = K**-0.5 if scale is None else scale
     device = "cuda"
@@ -154,7 +153,7 @@ def make_conv_data(B, H, K=128, V=128, M=2, W=4, lower_bound=-5.0, scale=None, s
 
 
 def cpu_reference(data):
-    """fp32 pure-torch golden with replay semantics (from the drop)."""
+    """fp32 pure-torch golden with replay semantics."""
     B, H, K, V, M, W = (data["B"], data["H"], data["K"], data["V"], data["M"], data["W"])
     T = data["T"]
     lower_bound = data["lower_bound"]
@@ -573,8 +572,7 @@ def test_round1_zero_accepted(B, H):
 )
 def test_round2_replay(B, H, M):
     """Replay round: mixed num_accepted per request, chained from a CPU-
-    golden round 1. Validates the kernel's cache-replay state math (the
-    path the drop's own self-check never exercised). ``M=7`` covers the
+    golden round 1. Validates the kernel's cache-replay state math. ``M=7`` covers the
     production MTP7 verify (T_loop up to 15) at the TEP8 shape."""
     data = make_conv_data(B, H, M=M, seed=7)
     T = data["T"]

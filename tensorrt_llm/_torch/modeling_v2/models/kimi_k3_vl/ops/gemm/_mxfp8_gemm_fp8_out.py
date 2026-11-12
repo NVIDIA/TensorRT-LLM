@@ -493,11 +493,11 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             # runtime arguments, so the compiled artifact is independent
             # of ALL problem shapes: cache tactic-only, matching the
             # Blackwell NVFP4 and SM107 BF16 runners. Keying on
-            # sf_m // 128 previously caused one spurious ~1.3s
+            # sf_m // 128 would cause one spurious ~1.3s
             # cute.compile per NEW ceil(M/128) bucket per GEMM family at
             # serving time (multi-second iteration stalls with variable
             # ISL, amplified across attention-DP ranks via MoE A2A
-            # spin-waits); keying on n/k/sf_n/sf_k/c_ld multiplied cold
+            # spin-waits); keying on n/k/sf_n/sf_k/c_ld would multiply cold
             # autotuning compiles across weight families sharing a
             # tactic. Per-shape tactic validity is still enforced by
             # can_implement at tactic-selection time.

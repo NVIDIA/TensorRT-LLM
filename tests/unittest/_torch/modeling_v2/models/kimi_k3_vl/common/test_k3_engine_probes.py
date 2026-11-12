@@ -225,11 +225,10 @@ def test_router_precision_and_megamoe_follow_the_target():
 
 
 def test_private_persistent_grids_take_the_shared_sm_reserve(monkeypatch):
-    """``TRTLLM_DWDP_PREFETCH_GATHER`` with ``TRTLLM_K3_ATTN_RES_SM_RESERVE`` (tp1 context): the
-    DWDP gather's resident SMs reach persistent grids through ``cute_dsl_utils.sm_reserve()``
-    (``DwdpManager`` sets it before the model is built). The KDA prefill grid sizes itself by it
-    and the persistent attention-residual op of every target's glue takes it as its
-    ``sm_reserve`` argument."""
+    """``TRTLLM_DWDP_PREFETCH_GATHER`` (tp1 context): the DWDP gather's resident SMs reach
+    persistent grids through ``cute_dsl_utils.sm_reserve()`` (``DwdpManager`` sets it before the
+    model is built). The KDA prefill grid sizes itself by it and the persistent attention-residual
+    op of every target's glue takes it as its ``sm_reserve`` argument."""
     import torch
 
     from tensorrt_llm._torch import cute_dsl_utils
@@ -400,9 +399,7 @@ def test_dspark_latent_cache_helix_mapping():
 
 @pytest.mark.parametrize("glue", _ROUTED_GLUES)
 def test_router_picks_the_routing_kernel(glue):
-    """The routing each forward hands the routed experts (``K3MoERuntime._router``), as in
-    084745cde4 (``k3_rubin/text_model.py``: ``_tail_route`` where ``_route_tail_target`` set a
-    target, else the routing method's ``noaux_tc_op`` and the backend's ``moe_sort``): the CuTe
+    """The routing each forward hands the routed experts (``K3MoERuntime._router``): the CuTe
     routing tail where a target is set, with its ``moe_sort`` tables where they are of the experts
     asked for; else ``noaux_tc_op`` (the experts then run ``moe_sort``). dep16 always routes with
     ``noaux_tc_op`` (its own test)."""
@@ -448,10 +445,9 @@ _ROUTED_LOCAL = {"tp1": 896, "helix8_moeep8": 112, "helix8_moetp2ep4": 224}
 
 @pytest.mark.parametrize("target", sorted(_ROUTED_LOCAL))
 def test_route_tail_serves_the_reference_sizes(monkeypatch, target):
-    """Which forwards route with ``k3_route_tail`` (``K3MoERuntime._route_tail_target``), as
-    084745cde4 ``k3_rubin/text_model.py`` ``_route_tail_target``: the routed experts not
-    attention-DP, 1 to 2048 tokens, up to 256 on one cluster and above that where the multi-CTA
-    sort fits this rank's experts. Every other forward routes with ``noaux_tc_op`` and the
+    """Which forwards route with ``k3_route_tail`` (``K3MoERuntime._route_tail_target``): the routed
+    experts not attention-DP, 1 to 2048 tokens, up to 256 on one cluster and above that where the
+    multi-CTA sort fits this rank's experts. Every other forward routes with ``noaux_tc_op`` and the
     experts' ``moe_sort``. So tp1 (896 local experts) routes 1..256 tokens with the tail and more
     with ``noaux_tc_op`` + ``moe_sort``; the helix8 targets use the tail up to the sort's limit."""
     import torch
@@ -484,9 +480,9 @@ def test_route_tail_serves_the_reference_sizes(monkeypatch, target):
 
 def test_dspark_split_plan_planner():
     """The DSpark drafter's split-KV plan (generation) runs the planner kernel of
-    ``kernels/spec/mla_split_plan.py`` at the drafter's piece cost (``_launch_mla_split_plan``) on the
-    CuTe DSL MLA decode runner's geometry (``_mla_split_plan_geometry``): the kernel takes the
-    piece cost as an argument, and the runner exposes what the geometry reads."""
+    ``kernels/k3r_spec/mla_split_plan.py`` at the drafter's piece cost (``_launch_mla_split_plan``)
+    on the CuTe DSL MLA decode runner's geometry (``_mla_split_plan_geometry``): the kernel takes
+    the piece cost as an argument, and the runner exposes what the geometry reads."""
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
     drafter = _k3_module("dspark.drafter")

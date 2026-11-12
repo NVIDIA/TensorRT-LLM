@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pushed MNNVL all-reduce of the Kimi K3 package (``kernels/k3_lamport_ar.py``, the low-M GEMM
+"""Pushed MNNVL all-reduce of the Kimi K3 package (``kernels/k3r_comm/k3_lamport_ar.py``, the low-M GEMM
 push epilogue and the ``layers.py`` API on main's ``AllReduce``): bitwise equal to the C++
 MNNVL all-reduce, with pushed and C++ calls interleaved on one workspace.
 

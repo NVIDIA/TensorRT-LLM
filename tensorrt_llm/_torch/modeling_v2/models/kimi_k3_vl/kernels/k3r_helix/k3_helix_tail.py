@@ -750,7 +750,7 @@ class K3HelixTailKernel:
         self.has_mask = has_mask
         self.use_pdl = use_pdl
         self.mx_out = mx_out
-        # c240: the MXFP8 scales in the mid-M FP8 GEMM's layout (one 128-row block of tcgen05 atoms)
+        # The MXFP8 scales in the mid-M FP8 GEMM's layout (one 128-row block of tcgen05 atoms)
         # instead of row-major (see ``mx_atom`` of k3_helix_tail).
         self.mx_atom = mx_atom and mx_out
         self.debug = debug
@@ -1717,7 +1717,7 @@ def k3_helix_tail(
             the CTA's last tile).
         loopback: Send to this rank's own buffer, as source ``d``, the values of rank ``d``'s heads
             (single-GPU model tests).
-        mx_atom: (c240, with ``mx_out``, ``T <= 128``) ``xs`` is ``uint8 [(H / P * 128 / 128) *
+        mx_atom: (with ``mx_out``, ``T <= 128``) ``xs`` is ``uint8 [(H / P * 128 / 128) *
             512]`` in the mid-M FP8 GEMM's scale layout (``k3_fp8w_lowm_gemm.run_mid_prequantized``
             with one 128-row block); the same exponents.
         ull2: The ``features.ull2_mla_tail`` sender path (:class:`K3HelixTailKernel`); always

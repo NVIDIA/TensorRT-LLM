@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """What the engine reads off the tp1 target (every recipe's context servers), and the values its
-folded code runs.
+code runs.
 
 The engine reads the runtime hooks and the drafter's declarations off the outermost model; the
 DSpark shell reads the DSpark path and the context-KV-only flag off the text model. Each test pins
@@ -131,8 +131,8 @@ def test_drafter_declarations_reach_the_engine():
 
 
 def test_folded_values_match_the_constants_record():
-    """``constants.py`` stays as the record of what the glue was folded from; the folded code
-    runs the same values."""
+    """``CONSTANTS`` records the optimizations the target's code is built for; the code runs the
+    same values."""
     modeling = _tp1("modeling")
     record = _tp1("modeling").CONSTANTS
     assert modeling.ModelingV2KimiK3Nvfp4Sm107Tp1.K3_CONSTANTS is record

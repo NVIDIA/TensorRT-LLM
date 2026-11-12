@@ -4,10 +4,11 @@
 
 The FP4 MLA backend (``attention/backends/fp4_mla``) owns the cache layout, the generation cache
 update (KV append, HP ring, FP4 query rows) and the step metadata buffers; this module runs the
-attention over them with K3's packed CuTe DSL decode kernel (``kernels/fp4_mla_mufu16``), whose
-task plan and split reduction are ``kernels/fp4_mla_packed_reduce``. The kernel stores partials
-by plan slot, so the plan it reads is its own: written into its own workspace with its own key,
-never the backend's (whose cache update writes the backend's plan for the backend's decode).
+attention over them with K3's packed CuTe DSL decode kernel
+(``kernels/k3r_fp4_mla/fp4_mla_mufu16``), whose task plan and split reduction are
+``kernels/k3r_fp4_mla/fp4_mla_packed_reduce``. The kernel stores partials by plan slot, so the
+plan it reads is its own: written into its own workspace with its own key, never the backend's
+(whose cache update writes the backend's plan for the backend's decode).
 
 Per step, the first call that needs it writes the generation lengths (shared with the backend:
 whichever runs first writes them, the other finds them current) fused with this plan, then the
@@ -287,8 +288,8 @@ def backend_plan_geometry(
     of a step: it hands this geometry to the backend's ``_fp4_mla_uniform_generation_lengths``, which
     writes the backend's plan fused with the generation lengths. The backend's own geometry
     (``packed_plan._fp4_mla_packed_plan_geometry``) picks its split count from the batch shape
-    (``TRTLLM_FP4_MLA_SPLIT_KV`` overrides it); the reference recipes planned the K3 generation
-    servers with 8 (= :data:`_SPLITS`), so this is that function with the count fixed. Everything
+    (``TRTLLM_FP4_MLA_SPLIT_KV`` overrides it); the K3 generation servers plan with 8
+    (= :data:`_SPLITS`), so this is that function with the count fixed. Everything
     else (task-length cap, the backend kernel's KV profile, the plan workspace and the plan key) is
     the backend's, so the backend's step state reads the result as its own.
     """

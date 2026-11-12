@@ -8,8 +8,8 @@ to the output dtype. One program covers ``BLOCK_SIZE`` columns of one row. With
 ``LAUNCH_WITH_PDL`` it waits on the producer before its first load and releases its dependents
 after its store.
 
-The kernel source is the one ``trtllm::situ_and_mul`` launches (``_torch/modules/situ.py``), the
-SiTU of the reference Kimi K3 SM107 runs; ``test_k3r_situ.py`` pins it.
+The kernel source is the one ``trtllm::situ_and_mul`` launches (``_torch/modules/situ.py``);
+``test_k3r_situ.py`` pins it.
 """
 
 import triton  # type: ignore[import]

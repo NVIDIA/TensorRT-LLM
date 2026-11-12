@@ -94,7 +94,7 @@ from .primitives import DRAFT_FP8_KV_SCALE, DraftArSites, HelixDraftShard, to_dr
 class K3DSparkPath:
     """The kernels a target's drafter and worker run: constants of the target, not switches.
 
-    The reference recipes: the context server (tp1) runs neither; dep16 runs ``spec_tail_fusion``;
+    Per SM107 target: the context server (tp1) runs neither; dep16 runs ``spec_tail_fusion``;
     helix8 runs both.
     """
 
@@ -517,7 +517,7 @@ def build_dspark_mla_yarn_rope(
 
     ``duplicate_data=True`` though only the first half is read as a complex
     pair: the util's two modes disagree by 1 ulp on 6 of 8224 entries, and the
-    duplicated one is what every measured drafter run used.
+    duplicated one is the table the drafter is validated with.
 
     Returns ``(cos, sin)``, both ``[max_position_embeddings, dim]`` fp32, with
     the frequency half duplicated so ``rotate_half`` applies.
@@ -1036,7 +1036,7 @@ class _DSparkHeadMixin:
         # consumers treat None as "head absent".
         self.markov_w1 = None  # [vocab, rank] (nn.Embedding weight layout)
         self.markov_w2 = None  # [vocab, rank] (nn.Linear(rank->vocab) weight)
-        self.confidence_proj_weight = None  # loaded, unused (follow-up MR)
+        self.confidence_proj_weight = None  # loaded, unused
         self.confidence_proj_bias = None
 
         if self._dspark_markov_rank > 0 and self._dspark_markov_head_type != "vanilla":

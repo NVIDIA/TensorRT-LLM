@@ -19,8 +19,8 @@ class K3MarkovAddLocalArgmax(OpWrapper):
     ``layout.buffer``, other ranks' columns zeroed when ``zero_width > 0``. Returns None."""
 
     ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
-    # The multi-launch chain of helix8 c240 (20 requests, a 6-position block, 20480-column
-    # shards): the step's logits are a strided view of the block logits.
+    # The multi-launch chain of the helix8 batch-20 recipe (20 requests, a 6-position block,
+    # 20480-column shards): the step's logits are a strided view of the block logits.
     CELLS = (
         Cell(
             why="helix8 c240, rank 0, step 0: 20 requests, 10 splits of 2048 columns",

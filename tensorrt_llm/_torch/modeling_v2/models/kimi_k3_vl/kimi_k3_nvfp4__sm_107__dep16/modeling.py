@@ -3,9 +3,8 @@
 """Kimi K3 NVFP4 on Rubin (SM107), dep16: the target class and its model.
 
 Serves generation with attention DP over 16 ranks (tp 16), the routed experts over EP16 on
-MEGAMOE_CUTEDSL: the c383 recipe's generation servers. The target's constants
-(``constants.py``) are folded into this directory's code; ``CONSTANTS`` stays as the record of
-the values (and is what ``K3_CONSTANTS`` declares).
+MEGAMOE_CUTEDSL. ``CONSTANTS`` records the optimizations this code is built for (and is what
+``K3_CONSTANTS`` declares).
 
 The checkpoint is the vision-language model's; this target is text only. It builds no vision
 tower (its checkpoint tensors are never read, ``weights.py``) and refuses multimodal input. The
@@ -14,11 +13,11 @@ text model ``KimiK3DefaultForCausalLM``:
 * 93 decoder layers (``KimiK3DefaultDecoderLayer``): 69 KDA (Kimi Delta Attention, linear
   attention) layers and 24 MLA (absorbed MQA, NoPE) layers, per the 1-indexed
   ``linear_attn_config.kda_layers`` / ``full_attn_layers`` schedule.
-* Layer 0 has a dense SiTU MLP; layers 1..92 the latent MoE of ``moe_runtime.py``: 896 routed
+* Layer 0 has a dense SiTU MLP; layers 1..92 the latent MoE (``K3MoERuntime``): 896 routed
   experts at top-16 (sigmoid + ``e_score_correction_bias`` routing, FP32 router GEMM), 2 shared
   experts, and the latent down / norm / up projections around the routed experts. The MoE layer
   hands its residual update to the next layer's pre-attention mix up to 64 tokens.
-* Attention residuals (``attn_res.py``): before ``input_layernorm``, before
+* Attention residuals (``_apply_attn_res``): before ``input_layernorm``, before
   ``post_attention_layernorm`` and at the model output each token mixes a bank of earlier
   sublayer outputs (the K3 PDL kernels up to 64 tokens); a snapshot is appended whenever
   ``layer_idx % attn_res_block_size == 0``.
@@ -43,8 +42,9 @@ request's KDA state and attends over its cached MLA prefix. KV cache block reuse
 
 Engine settings the recipe carries, not this class: the model loader applies model defaults of the
 checkpoint's built-in class before a Modeling V2 target is routed, so a target cannot set
-``llm_args``. The c383 GEN recipe turns ``attention_dp_config.enable_kv_balanced_admission`` on,
-which runs this target's planner (``kv_balance.py``).
+``llm_args``. The dep16 generation recipe turns
+``attention_dp_config.enable_kv_balanced_admission`` on, which runs this target's planner
+(``K3Dep16KvBalancedAdmission``).
 
 Checkpoint loading is in ``weights.py``.
 """
@@ -178,9 +178,9 @@ class K3Sm107Constants:
     """What one Kimi K3 SM107 target runs. A field is a fixed property of the target."""
 
     # The speculative decode step's head in one kernel (``RuntimeHooks.decode_prologue``) and the
-    # token embedding as a vectorized row copy (formerly TLLM_SPEC_HEAD_FUSION).
+    # token embedding as a vectorized row copy.
     spec_head_fusion: bool
-    # MoE (moe_runtime.py, fp8_weight_read.py, modeling.py).
+    # MoE (``K3MoERuntime``, ``_Fp8BlockScaleWeightReadLinear``).
     fuse_moe_residual: bool
     fp8w_lowm_gemm: bool
     ld_fused: bool
@@ -201,16 +201,16 @@ class K3Sm107Constants:
     # loading).
     fp8_weight_read_moe_mlp: bool
     latent_ar_own_ws: bool
-    # Attention residual (attn_res.py, kernels/k3r_attn_res).
+    # Attention residual (``_apply_attn_res`` and its fused forms, kernels/k3r_attn_res).
     attn_res_pdl: bool
     attn_res_pdl_max_m: int
     attn_res_mxfp8: bool
     attn_res_early_trigger: bool
-    # KDA (kda.py).
+    # KDA (``K3KDALinearAttention``).
     kda_prepad_prefill: bool
     kda_fused_conv_prefill: bool
     kda_l2_prefetch: bool
-    # MLA and its FP4 generation decode (mla.py, ops/attention/_fp4_mla_decode.py).
+    # MLA and its FP4 generation decode (``K3MLAAttention``, ops/attention/_fp4_mla_decode.py).
     mla_q_norm_pdl: bool
     fp4_mla_page_plan: bool
     fp4_mla_reduce_pdl: bool
@@ -1219,7 +1219,7 @@ def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> Non
 
 
 # The K3 PDL kernels: up to ``_PDL_MAX_M`` tokens, the fused attn_res(+add)
-# +RMSNorm runs as the k3_attn_res_norm entry (kernels/k3_attn_res.py):
+# +RMSNorm runs as the k3_attn_res_norm entry (kernels/k3r_attn_res/k3_attn_res.py):
 # a CTA cluster per token that loads the weights and snapshot rows and reduces their statistics
 # before griddepcontrol.wait, i.e. under the kernel in front of it. It takes precedence over the
 # persistent topology at those token counts. The updated prefix sum is bit-identical; the
@@ -4073,9 +4073,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     before the native MXFP8 GEMM, which runs with K3's fine-grained low-M tuning
     buckets. That dispatch is ``layers.fp8_block_scale_gemm``.
 
-    The Rubin agentic kernels sit in front of that dispatch: the K3 low-M GEMM
-    (``kernels/k3_fp8w_lowm_gemm.py``) owns the low-M rows (per-shape, per-architecture limit,
-    see ``k3_fp8w_lowm_gemm.max_m_for``), so the generic low-M GEMM
+    The family's K3 kernels sit in front of that dispatch: the K3 low-M GEMM
+    (``kernels/k3r_gemm/k3_fp8w_lowm_gemm.py``) owns the low-M rows (per-shape, per-architecture
+    limit, see ``k3_fp8w_lowm_gemm.max_m_for``), so the generic low-M GEMM
     (``trtllm::fp8_block_scale_low_m_gemm``) is not prepared. On SM107 the KDA MTP verify's
     o_proj may take the core's MXFP8 output (:meth:`forward_prequantized`).
     """
@@ -4613,7 +4613,7 @@ class K3MoERuntime(nn.Module):
 
         # Routing scores stay fp32: the gate GEMM of the upcast operands. The bf16-input min-latency
         # GEMM's different reduction order flips borderline top-16 picks (GSM8K 96.7 -> 96.1/96.4,
-        # 3-run bisect on 62b20dd868), and its bs1-latency win is irrelevant at DEP batch sizes.
+        # three runs), and its bs1-latency win is irrelevant at DEP batch sizes.
         self.gate = K3MoEGate(cfg)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
@@ -5509,7 +5509,7 @@ class ModelingV2KimiK3Nvfp4Sm107Dep16(KimiK3DefaultWeights, PreTrainedModel):
     ``KimiK3DefaultWeights`` mixin's (``weights.py``).
     """
 
-    # The values this target's code is folded from (``constants.py``).
+    # The optimizations this target's code is built for (a record: the code reads none of it).
     K3_CONSTANTS: ClassVar[K3Sm107Constants] = CONSTANTS
 
     _LANG_PREFIX = "language_model."
@@ -5628,7 +5628,7 @@ class ModelingV2KimiK3Nvfp4Sm107Dep16(KimiK3DefaultWeights, PreTrainedModel):
     def runtime_hooks(self) -> RuntimeHooks:
         """The text model's step-loop hooks (the engine reads them off the outer model), 4 GiB of
         device memory left outside the PyTorch memory cap, and the KV-balanced admission planner
-        the c383 GEN servers run (window 32, the KV load closest to the mean)."""
+        of the dep16 generation recipe (window 32, the KV load closest to the mean)."""
         return replace(
             self.llm.runtime_hooks or DEFAULT_RUNTIME_HOOKS,
             torch_mem_safety_margin=4 * 1024**3,

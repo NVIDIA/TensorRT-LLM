@@ -3,7 +3,7 @@
 """Kimi K3 NVFP4 on Rubin (SM107), helix8_moeep8: the target class.
 
 Serves generation over Helix CP8 (tp 1, no attention DP), the routed experts split MoE EP8 on
-CUTEDSL_FC12: the c24 and c75 recipes.
+CUTEDSL_FC12.
 
 The model below is this target's copy of the helix8 targets' SM107 glue
 (``KimiK3Sm107ForConditionalGeneration``), built for these constants (``CONSTANTS``).
@@ -27,10 +27,10 @@ text model ``KimiK3DefaultForCausalLM``:
 * 93 decoder layers (``KimiK3DefaultDecoderLayer``): 69 KDA (Kimi Delta Attention, linear
   attention) layers and 24 MLA (absorbed MQA, NoPE) layers, per the 1-indexed
   ``linear_attn_config.kda_layers`` / ``full_attn_layers`` schedule.
-* Layer 0 has a dense SiTU MLP; layers 1..92 the latent MoE of ``moe_runtime.py``: 896 routed
+* Layer 0 has a dense SiTU MLP; layers 1..92 the latent MoE (``K3MoERuntime``): 896 routed
   experts at top-16 (sigmoid + ``e_score_correction_bias`` routing), 2 shared experts, and the
   latent down / norm / up projections around the routed experts.
-* Attention residuals (``attn_res.py``): before ``input_layernorm``, before
+* Attention residuals (``_apply_attn_res``): before ``input_layernorm``, before
   ``post_attention_layernorm`` and at the model output each token mixes a bank of earlier
   sublayer outputs; a snapshot is appended whenever ``layer_idx % attn_res_block_size == 0``.
 
@@ -207,9 +207,9 @@ class K3Sm107Constants:
     """What one Kimi K3 SM107 target runs. A field is a fixed property of the target."""
 
     # The speculative decode step's head in one kernel (``RuntimeHooks.decode_prologue``) and the
-    # token embedding as a vectorized row copy (formerly TLLM_SPEC_HEAD_FUSION).
+    # token embedding as a vectorized row copy.
     spec_head_fusion: bool
-    # MoE (moe_runtime.py, fp8_weight_read.py, modeling.py).
+    # MoE (``K3MoERuntime``, ``_Fp8BlockScaleWeightReadLinear``).
     fuse_moe_residual: bool
     fp8w_lowm_gemm: bool
     ld_fused: bool
@@ -230,16 +230,16 @@ class K3Sm107Constants:
     # loading).
     fp8_weight_read_moe_mlp: bool
     latent_ar_own_ws: bool
-    # Attention residual (attn_res.py, kernels/k3r_attn_res).
+    # Attention residual (``_apply_attn_res`` and its fused forms, kernels/k3r_attn_res).
     attn_res_pdl: bool
     attn_res_pdl_max_m: int
     attn_res_mxfp8: bool
     attn_res_early_trigger: bool
-    # KDA (kda.py).
+    # KDA (``K3KDALinearAttention``).
     kda_prepad_prefill: bool
     kda_fused_conv_prefill: bool
     kda_l2_prefetch: bool
-    # MLA and its FP4 generation decode (mla.py, ops/attention/_fp4_mla_decode.py).
+    # MLA and its FP4 generation decode (``K3MLAAttention``, ops/attention/_fp4_mla_decode.py).
     mla_q_norm_pdl: bool
     fp4_mla_page_plan: bool
     fp4_mla_reduce_pdl: bool
@@ -410,7 +410,7 @@ def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> Non
 
 
 # The K3 PDL kernels: up to ``_K3_ATTN_RES_PDL_MAX_M`` tokens, the fused attn_res(+add)
-# +RMSNorm runs as the k3_attn_res_norm entry (kernels/k3_attn_res.py):
+# +RMSNorm runs as the k3_attn_res_norm entry (kernels/k3r_attn_res/k3_attn_res.py):
 # a CTA cluster per token that loads the weights and snapshot rows and reduces their statistics
 # before griddepcontrol.wait, i.e. under the kernel in front of it. It takes precedence over the
 # persistent topology at those token counts. The updated prefix sum is bit-identical; the
@@ -3163,7 +3163,7 @@ class K3HelixTail:
             mx_out: Optional ``(gate, xq, xs)``: also store the MXFP8 form of
                 ``bf16(out * gate)``, o_proj's gated operand (see ``k3_helix_tail``).
             timestamps: Optional int64 phase stamps (microbenchmarks, see ``k3_helix_tail``).
-            mx_atom: (c240) ``xs`` in the mid-M GEMM's scale layout (see ``k3_helix_tail``).
+            mx_atom: ``xs`` in the mid-M GEMM's scale layout (see ``k3_helix_tail``).
 
         Returns:
             The combined BF16 ``[T, H / P * 128]`` output of this rank's heads.
@@ -4770,8 +4770,8 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     buckets. That dispatch is ``layers.fp8_block_scale_gemm`` (its generic low-M GEMM is not
     prepared here).
 
-    The Rubin agentic kernels sit in front of that dispatch: the K3 low-M GEMM
-    (``kernels/k3_fp8w_lowm_gemm.py``) with its gated, sigmoid, MXFP8-input and
+    The family's K3 kernels sit in front of that dispatch: the K3 low-M GEMM
+    (``kernels/k3r_gemm/k3_fp8w_lowm_gemm.py``) with its gated, sigmoid, MXFP8-input and
     all-reduce-push variants owns the low-M rows (per-shape, per-architecture limit, see
     ``k3_fp8w_lowm_gemm.max_m_for``). It reads a DeepGEMM-packed scale: ``weight_scale`` on
     SM100/SM103, ``lowm_weight_scale`` (repacked from the MXFP8 scale) on SM107.
@@ -5023,9 +5023,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         return push if tactic is not None else None
 
     def mid_push_pdl_ready(self, num_rows: int) -> bool:
-        """``TRTLLM_K3_KDA_MX_PDL``: whether :meth:`forward_prequantized` on the producer's
-        ``[num_rows, in_features]`` R128c4 operand will push with the mid-M GEMM (the conditions
-        of :meth:`_mid_prequantized_push_tactic` that do not depend on the tensors), which reads
+        """Whether :meth:`forward_prequantized` on the producer's ``[num_rows, in_features]``
+        R128c4 operand will push with the mid-M GEMM (the conditions of
+        :meth:`_mid_prequantized_push_tactic` that do not depend on the tensors), which reads
         nothing the producer writes before its ``griddepcontrol.wait``: the producer may then
         release it early."""
         push = self.next_ar_push
@@ -5176,7 +5176,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         return self.mid_operand_tactic(num_rows) is not None
 
     def mid_operand_tactic(self, num_rows: int):
-        """c240: the mid-M tactic :meth:`forward` runs on ``num_rows`` BF16 rows (SM107, above the
+        """The mid-M tactic :meth:`forward` runs on ``num_rows`` BF16 rows (SM107, above the
         low-M cut-over, up to the per-shape gate) when it has one 128-row scale block, else None.
         A producer may then store the rows' MXFP8 form in that GEMM's layout
         (``mid_prequant_plan``) for :meth:`forward_mxfp8` / :meth:`forward_mid_mxfp8`."""
@@ -5199,11 +5199,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     def forward_mid_mxfp8(
         self, x: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor
     ) -> torch.Tensor:
-        """``TRTLLM_K3_MID_OPROJ_PC`` (c240): :meth:`forward` on rows whose MXFP8 form a producer
-        stored with the scales in the mid-M GEMM's layout (``xs`` 1-D, see
-        :meth:`mid_operand_tactic`; ``x`` only gives the output shape): the mid-M GEMM without
-        its quantization kernel, with the all-reduce push epilogue where :attr:`next_ar_push`
-        takes it. Bitwise :meth:`forward` on the rows the producer quantized."""
+        """:meth:`forward` on rows whose MXFP8 form a producer stored with the scales in the mid-M
+        GEMM's layout (``xs`` 1-D, see :meth:`mid_operand_tactic`; ``x`` only gives the output
+        shape): the mid-M GEMM without its quantization kernel, with the all-reduce push epilogue
+        where :attr:`next_ar_push` takes it. Bitwise :meth:`forward` on the rows the producer
+        quantized."""
 
         m = xq.shape[0]
         tactic = self.mid_operand_tactic(m)
@@ -6828,7 +6828,7 @@ _K3_SHARED_STREAM_PRIORITY = 0
 # would score lower here with nothing raised (K3 + RadixArk: AR 71.4% -> 66.9% the other way).
 
 
-# The constants the helix8 targets declare (their ``constants.py``), which this code is built for.
+# The constants the helix8 targets declare, which this code is built for.
 HELIX8_CONSTANTS = K3Sm107Constants(
     spec_head_fusion=True,
     fuse_moe_residual=True,
@@ -7701,7 +7701,7 @@ class ModelingV2KimiK3Nvfp4Sm107Helix8Moeep8(KimiK3Sm107ForConditionalGeneration
     @property
     def runtime_hooks(self) -> RuntimeHooks:
         """The family's hooks; the recurrent-state indices and the dummy-request mask are uploaded
-        with one kernel when they change, as the reference's helix8 GEN servers run."""
+        with one kernel when they change."""
         hooks = super().runtime_hooks
         return replace(
             hooks,

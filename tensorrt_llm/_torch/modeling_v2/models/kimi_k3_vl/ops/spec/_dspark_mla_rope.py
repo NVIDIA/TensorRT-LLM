@@ -20,7 +20,7 @@
   in place instead of staging them in a contiguous copy. Main's op is compiled for compact
   rows.
 * :func:`dspark_mla_ctx_norm_rope` / :func:`dspark_mla_block_rope` (the ``dspark_tail_v2`` constant):
-  the fused context-latent and block kernels of ``kernels/dspark_mla_rope.py``; bitwise the
+  the fused context-latent and block kernels of ``kernels/k3r_spec/dspark_mla_rope.py``; bitwise the
   per-layer launches they replace.
 
 Every operand is detached before the DLPack export, which refuses tensors that require grad

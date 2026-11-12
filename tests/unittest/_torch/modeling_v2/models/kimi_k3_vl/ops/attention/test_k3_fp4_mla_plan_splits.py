@@ -4,8 +4,8 @@
 
 The first FP4 MLA kernel of a generation step (``kernels/k3r_fp4_mla/fp4_mla_kv_append``) writes the
 backend's packed split plan fused with the generation lengths. K3's packed decode always runs 8 task slots
-per request (``ops/attention/_fp4_mla_decode._SPLITS``), and the reference recipes' generation servers
-planned with 8 as well (``TRTLLM_FP4_MLA_SPLIT_KV=8``). The KV update takes the plan geometry from the
+per request (``ops/attention/_fp4_mla_decode._SPLITS``), the backend's plan with
+``TRTLLM_FP4_MLA_SPLIT_KV=8``. The KV update takes the plan geometry from the
 family (``_fp4_mla_decode.backend_plan_geometry``): the backend's geometry with the count fixed, so no
 environment variable decides it and the backend's ``packed_plan`` stays as it is. Host side, with the kernel
 modules stubbed.
@@ -76,7 +76,7 @@ _SHAPES = [(1, 96, 8), (2, 96, 8), (4, 96, 8), (16, 96, 8), (1, 6, 6), (8, 6, 6)
 @pytest.mark.parametrize("is_cuda_graph", [True, False])
 @pytest.mark.parametrize("env", [None, "auto", "3"])
 def test_family_geometry_is_the_backend_geometry_planned_with_8(monkeypatch, env, is_cuda_graph):
-    """Under any environment the family's geometry equals the backend's with the reference recipes'
+    """Under any environment the family's geometry equals the backend's with
     ``TRTLLM_FP4_MLA_SPLIT_KV=8``: same splits, task-length cap, KV profile, capacity, plan buffer and key."""
     packed_plan, decode = _modules(monkeypatch)
     for shape in _SHAPES:

@@ -28,11 +28,11 @@ Supported:
   - chunk_size=64
 
 ``kda_prefill`` updates selected recurrent-state pool rows in place. Intermediate matrices
-remain private runner workspace. It runs the private kernels in ``kernels/kda`` and is not a
+remain private runner workspace. It runs the private kernels in ``kernels/k3r_kda`` and is not a
 registered torch op (main's ``custom_ops`` registers a different ``trtllm::kda_prefill``,
 FlashInfer BT16 on raw Q/K/V); the model calls it through the ``ops/ssm/kda_prefill`` entry.
-``kernels/kda/_kda_kernels.py`` imports that entry (and through it this module) on first use; importing
-it raises ``ImportError`` without CuTe DSL or FlashInfer.
+``kernels/k3r_kda/_kda_kernels.py`` imports that entry (and through it this module) on first use;
+importing it raises ``ImportError`` without CuTe DSL or FlashInfer.
 """
 
 import time

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 Rubin FP8 split-K context FMHA (k3_rubin/kernels/k3_context_fmha*.py).
+"""Kimi K3 Rubin FP8 split-K context FMHA (kernels/k3r_mla_ctx/k3_context_fmha*.py).
 
 The old-O TMA stage regression of the kernel (with an artificially delayed correction warp),
 and the ``k3_context_fmha`` entry through ``run_k3_split_k_context_partition`` against an

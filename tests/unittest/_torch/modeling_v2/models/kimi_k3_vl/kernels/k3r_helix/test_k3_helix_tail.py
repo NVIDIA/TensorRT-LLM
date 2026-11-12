@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kimi-K3 fused Helix tail (``k3_rubin/kernels/k3_helix_tail``) on one GPU (``P = 1``, a local
+"""Kimi-K3 fused Helix tail (``kernels/k3r_helix/k3_helix_tail``) on one GPU (``P = 1``, a local
 receive buffer).
 
 The fold is bitwise the packed split reduction of K3's FP4 MLA decode (latent rows and statistics,

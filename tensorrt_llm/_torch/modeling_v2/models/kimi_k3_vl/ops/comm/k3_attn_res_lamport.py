@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 decode attention-residual mix + RMSNorm whose addend is a pushed MNNVL Lamport
-all-reduce that the kernel finishes itself (CuTe DSL, ``kernels/k3_attn_res.py``)."""
+all-reduce that the kernel finishes itself (CuTe DSL, ``kernels/k3r_attn_res/k3_attn_res.py``)."""
 
 from __future__ import annotations
 

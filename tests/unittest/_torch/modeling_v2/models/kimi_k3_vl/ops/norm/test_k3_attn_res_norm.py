@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test of the k3_attn_res_norm entry (``kernels/k3_attn_res.py``, one GPU).
+"""GPU test of the k3_attn_res_norm entry (``kernels/k3r_attn_res/k3_attn_res.py``, one GPU).
 
 Every cell of ``k3_attn_res_norm.CELLS`` runs under ``validating``: the updated prefix sum bit for bit
 against the reference's FP32 adds rounded to BF16, the normed output against the reference (the family

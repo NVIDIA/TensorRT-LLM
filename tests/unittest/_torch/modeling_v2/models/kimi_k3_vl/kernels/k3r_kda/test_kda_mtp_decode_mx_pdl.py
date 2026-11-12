@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MXFP8-output KDA verify as a PDL launch with the early trigger (``TRTLLM_K3_KDA_MX_PDL``).
+"""MXFP8-output KDA verify as a PDL launch with the early trigger (``mxfp8_pdl_early_trigger``).
 
-The c240 o_proj push runs the MXFP8-output verify on the two-CTAs-per-SM kernel as a PDL launch
-that releases its dependent right after ``griddepcontrol.wait``. Scheduling only: the E4M3
-values, the UE8M0 scales and every mutated buffer (recurrent state, conv windows, replay caches)
-must equal those of the plain launch over two chained verify rounds with mixed per-slot accepted
-counts, eagerly and under CUDA graph replay.
+The o_proj push with the mid-M GEMM runs the MXFP8-output verify on the two-CTAs-per-SM kernel as a
+PDL launch that releases its dependent right after ``griddepcontrol.wait``. Scheduling only: the
+E4M3 values, the UE8M0 scales and every mutated buffer (recurrent state, conv windows, replay
+caches) must equal those of the plain launch over two chained verify rounds with mixed per-slot
+accepted counts, eagerly and under CUDA graph replay.
 
 Inputs follow the runtime contract: packed token layout (strided QKVG section views), bf16 state
 pool (V-first, strided per-layer slice), bf16 conv / k / v / beta replay caches, fp32 gate cache,
@@ -161,7 +161,7 @@ def _scale_bytes(scales, rows, heads):
 
 @pytest.mark.parametrize("H,N,num_spec", [(12, 16, 5), (12, 12, 7), (12, 4, 7)])
 def test_mxfp8_pdl_early_trigger_bitwise(H, N, num_spec, monkeypatch):
-    """c240 TRTLLM_K3_KDA_MX_PDL: the MXFP8-output verify as a PDL launch with the early trigger
+    """The MXFP8-output verify as a PDL launch with the early trigger
     (two-CTA kernel) gives the plain launch's E4M3 values, scales and mutated buffers."""
     monkeypatch.setattr(kda_ops, "_mxfp8_two_cta_enabled", lambda device: True)
     inp = _make_inputs(N, H, num_spec, seed=3 * N + H, zero_state=False)

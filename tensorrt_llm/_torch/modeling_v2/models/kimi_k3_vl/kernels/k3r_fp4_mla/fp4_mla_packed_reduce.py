@@ -1850,9 +1850,9 @@ def reduce_packed_splits(
 class DeferredPackedReduce:
     """Context in which the first :func:`reduce_packed_splits` call records its arguments in
     :attr:`args` instead of launching, for a consumer that folds the split partials itself (the
-    Kimi-K3 Helix tail, ``mla.py``). The partials, row state and plan stay
-    valid until the next decode on the stream overwrites them; :meth:`run` launches the recorded
-    reduction for a consumer that cannot fold them after all.
+    Kimi-K3 Helix tail, ``K3HelixTail`` of the helix8 targets' ``modeling.py``). The partials, row
+    state and plan stay valid until the next decode on the stream overwrites them; :meth:`run`
+    launches the recorded reduction for a consumer that cannot fold them after all.
     """
 
     _stack: list["DeferredPackedReduce"] = []

@@ -4,8 +4,8 @@
 
 The kernel is main's CuTe DSL persistent dense block-scaled GEMM (``CuteDSLMXFP8RubinLinear``,
 compiled-kernel cache shared with it) with K3's fine-grained low-M tuning buckets
-(``CuteDSLKimiK3MXFP8RubinLinear``). Its autotuner candidates are those of K3's projections in
-the agentic recipes:
+(``CuteDSLKimiK3MXFP8RubinLinear``). Its autotuner candidates are those K3's projections
+run with:
 
 * no 1-CTA b-reuse tile (``mma_tiler_m, mma_inst_m == 256, 128``);
 * prefetch only on the unswapped 2-CTA b-reuse tile (``512, 256``);

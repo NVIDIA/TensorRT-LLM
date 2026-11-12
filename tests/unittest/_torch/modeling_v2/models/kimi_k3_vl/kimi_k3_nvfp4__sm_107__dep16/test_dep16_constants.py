@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""kimi_k3_nvfp4__sm_107__dep16: its constants are 084745cde4's ``dep16`` profile with the
-speculative decode head fusion on, it reads no environment
-variable, and its class declares no model defaults (the recipe carries the engine settings)."""
+"""kimi_k3_nvfp4__sm_107__dep16: its constants are the dep16 generation profile, it reads no
+environment variable, and its class declares no model defaults (the recipe carries the engine
+settings)."""
 
 from __future__ import annotations
 

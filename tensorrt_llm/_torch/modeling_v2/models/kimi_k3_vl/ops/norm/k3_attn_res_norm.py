@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 decode attention-residual mix + RMSNorm, optionally after the residual add, in one PDL
-kernel (CuTe DSL, ``kernels/k3_attn_res.py``)."""
+kernel (CuTe DSL, ``kernels/k3r_attn_res/k3_attn_res.py``)."""
 
 from __future__ import annotations
 

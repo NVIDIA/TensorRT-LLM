@@ -15,7 +15,7 @@
 """CuTe DSL host launcher of the Kimi K3 KDA multi-token speculative verify.
 
 ``kda_mtp_decode_impl`` launches the source-integrated ``kda_decode_mtp_kernel`` (see
-``kernels/kda/kda_mtp_decode.py``) and its v2 / two-CTA forms; the model calls it through
+``kernels/k3r_kda/kda_mtp_decode.py``) and its v2 / two-CTA forms; the model calls it through
 the ``ops/ssm/kda_mtp_decode`` entry. One launch fuses, per generation
 request: replay of previously-accepted draft tokens from the ``kg/v/beta``
 caches, causal conv + SiLU, Q/K L2 norm, beta sigmoid, lower-bound gate, and
@@ -31,44 +31,43 @@ many of those pending drafts the sampler accepted) and the kernel replays
 them before the new tokens. No host-side promotion of KDA SSM/conv state is
 required or allowed.
 
-Productization deltas vs the drop's host wrapper (``reference.py``):
+Host-side contract:
 
 * ``zero_accepted_hint`` / ``regular_metadata_hint`` are explicit caller
-  arguments. The drop derived them by *reading the device tensors*
-  (``torch.count_nonzero(...).item()`` / ``torch.equal``) behind
-  ``id()``-keyed caches — a host-device sync per novel tensor object plus a
-  stale-cache hazard on id reuse. Callers that statically know the pattern
+  arguments, not derived by *reading the device tensors*
+  (``torch.count_nonzero(...).item()`` / ``torch.equal``): that is a
+  host-device sync per call, and caching it by ``id()`` a stale-cache
+  hazard on id reuse. Callers that statically know the pattern
   (benchmarks, the first verify round after prefill) may pass the hints;
   the runtime default (``False``/``False``) is always correct and never
   syncs.
 * The compile cache is keyed purely by dtype/shape/stride layouts and
   constexpr flags — no ``id()`` or ``data_ptr`` keys.
-* Bias / ``pad_slot_id`` arguments (unsupported by the specialized kernel,
-  previously validated-then-rejected) are dropped from the signature. Gated
-  output norm and MXFP8 quantization are optional packed-layout epilogues.
+* There are no bias / ``pad_slot_id`` arguments (the specialized kernel
+  supports neither). Gated output norm and MXFP8 quantization are optional
+  packed-layout epilogues.
 
 Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 ``HV == H``, one V pass (TILE_V=128, 512 threads). ``num_spec`` is a
 compile-time constant per cache allocation; every shape compiles the same
-kernel structure (the drop's benchmark-only setmaxreg / register-weight
-specializations were retired with the latency restructuring).
+kernel structure (no setmaxreg / register-weight specializations).
 
 Kernel selection: calls on the runtime contract (packed token rows, fused gated
 RMSNorm with a bf16 output, 3xTF32 recurrence, vector-aligned operands) run
 ``kda_decode_mtp_v2_kernel`` (``kda_mtp_decode_v2.py``: the same arithmetic in
 the same order, bitwise identical results, shorter critical path) unless
-``TRTLLM_K3_KDA_MTP_V2=0``. On SM107 the same contract with the MXFP8 output runs
+``_MTP_V2`` is off (tests). On SM107 the same contract with the MXFP8 output runs
 ``kda_decode_mtp_2cta_kernel`` with its MXFP8 epilogue (one CTA per (head, request)
 tile, two CTAs per SM, bitwise identical results). Every other variant runs
 ``kda_decode_mtp_kernel``, which on SM107 uses its compact two-CTAs-per-SM layout on
 multi-wave grids with at most three drafts.
 
-The launcher runs the private kernels in ``kernels/kda`` and is not a registered torch op (main's
-``custom_ops`` registers its own ``trtllm::kda_mtp_decode`` / ``kda_mtp_decode_fp8`` over main's
-kernel, with the replay-only commit the cache manager uses). It reads and writes the replay caches
-and the slot-indexed accepted counts main's KDA cache manager allocates, in main's layout. The
-switches above are read per call. ``kernels/kda/_kda_kernels.py`` imports the entry (and through it this
-module) on first use; importing it raises ``ImportError`` without CuTe DSL.
+The launcher runs the private kernels in ``kernels/k3r_kda`` and is not a registered torch op
+(main's ``custom_ops`` registers its own ``trtllm::kda_mtp_decode`` / ``kda_mtp_decode_fp8`` over
+main's kernel, with the replay-only commit the cache manager uses). It reads and writes the replay
+caches and the slot-indexed accepted counts main's KDA cache manager allocates, in main's layout.
+The switches above are read per call. ``kernels/k3r_kda/_kda_kernels.py`` imports the entry (and
+through it this module) on first use; importing it raises ``ImportError`` without CuTe DSL.
 """
 
 import contextlib
@@ -1256,9 +1255,9 @@ def _try_flatten_args(
 # artifact even when their launch grid and token-buffer extents differ.
 _compiled_cache = {}
 
-# c240 (TRTLLM_K3_KDA_MX_PDL, set by the KDA mixer around one verify call through
-# :func:`mxfp8_pdl_early_trigger`): an MXFP8-output verify launched with ``use_pdl`` runs the
-# two-CTA kernel as a PDL launch that releases its dependent right after griddepcontrol.wait.
+# Set around one verify call by :func:`mxfp8_pdl_early_trigger`: an MXFP8-output verify launched
+# with ``use_pdl`` runs the two-CTA kernel as a PDL launch that releases its dependent right after
+# griddepcontrol.wait.
 MXFP8_PDL_EARLY_TRIGGER = False
 
 
@@ -1475,9 +1474,9 @@ def kda_mtp_decode_impl(
         V=V_dim,
     )
     pool_size = h0_arg.shape[0]
-    # The restructured kernel keeps the conv weights in smem and prefetches
-    # the recurrent state before precompute; the drop's setmaxreg and
-    # register-weight specializations no longer apply to any shape.
+    # The kernel keeps the conv weights in smem and prefetches the
+    # recurrent state before precompute; the setmaxreg and register-weight
+    # specializations apply to no shape.
     use_setmaxreg = False
     use_reg_q_weights = False
     use_regular_metadata = bool(regular_metadata_hint)
@@ -1488,7 +1487,7 @@ def kda_mtp_decode_impl(
     # same result).
     use_zero_accepted = bool(zero_accepted_hint) and num_spec == 2
     # stage_timing is unused (PROFILE_STAGES=False); pass `out` as the
-    # placeholder tensor argument like the drop's runner does. The alias is
+    # placeholder tensor argument. The alias is
     # only valid while profiling stays off: with PROFILE_STAGES=True the
     # kernel writes int64 stage deltas through this tensor, corrupting the
     # bf16 output. Enabling profiling requires a dedicated int64 buffer of
@@ -1527,7 +1526,7 @@ def kda_mtp_decode_impl(
     # (the same arithmetic, see kda_mtp_decode_2cta.py), one CTA per tile at every grid size. Two
     # of its tiles share an SM on multi-wave grids; on SM107 a tile alone on an SM also finishes
     # sooner than in kda_decode_mtp_kernel, with or without its cluster pair.
-    # c240 (mxfp8_pdl_early_trigger): the MXFP8 two-CTA kernel also as a PDL launch that releases
+    # Under mxfp8_pdl_early_trigger: the MXFP8 two-CTA kernel also as a PDL launch that releases
     # its dependent right after its griddepcontrol.wait, for a consumer that only streams weights
     # before its own wait (the mid-M o_proj GEMM with the all-reduce push).
     mx_pdl = bool(quantize_output and use_pdl and MXFP8_PDL_EARLY_TRIGGER)
