@@ -206,7 +206,7 @@ Agentic coding sessions resend their whole conversation with every request. In t
 | [`serve_config_agentx_max_throughput.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/examples/musespark_open/serve_config_agentx_max_throughput.yaml) | 48 | 26,169 | 24.1 / 64.6 | 1.3 / 2.7 |
 | [`serve_config_agentx_balanced.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/examples/musespark_open/serve_config_agentx_balanced.yaml) | 24 | 19,306 | 41.9 / 108.6 | 0.9 / 2.2 |
 
-Use the max-throughput configuration to serve the most sessions per node, and the balanced one when each session should get its first token and its output sooner. Launch either one in place of the recommended settings above:
+Use the max-throughput configuration to serve the most sessions per node, and the balanced one when each session should get its first token and its output sooner; [Choosing the Concurrency](#choosing-the-concurrency) shows how the two points were picked. Launch either one in place of the recommended settings above:
 
 ```bash
 MODEL=/path/to/musespark-open-checkpoint
@@ -227,26 +227,35 @@ Startup takes about 6 to 10 minutes, most of it spent capturing CUDA graphs for 
 Compared with the recommended settings above:
 
 * **Full context.** `max_seq_len: 1048576`, the model's context window.
-* **KV-cache reuse tuned for long sessions** (KV cache manager v2). Blocks become reusable after every prefill chunk rather than at the end of the prompt (`block_reuse_config.policy: all_reusable`); under cache pressure, the sliding-window blocks that end each prompt are kept longest (`swa_endpoint_rewind_tokens: 1024`); and the GPU KV pool is split at a fixed ratio between the sliding-window and the full-attention layers (`pool_ratio`).
-* **A host-memory KV tier.** `host_cache_size` gives each GPU 160 GiB of host memory for KV blocks evicted from GPU memory, so a session that comes back copies its context back instead of recomputing it. The node needs 640 GiB of host memory for this tier in addition to the server processes: in the measured runs, host memory use peaked at about 820 GiB of 950 GiB. Lower `host_cache_size` on hosts with less.
+* **KV-cache reuse tuned for long sessions** (KV cache manager v2). Blocks become reusable after every prefill chunk rather than at the end of the prompt (`block_reuse_config.policy: all_reusable`); under cache pressure, the sliding-window blocks that end each prompt are kept longest (`swa_endpoint_rewind_tokens: 1024`); and the GPU KV pool is split at a fixed ratio between the sliding-window and the full-attention layers (`pool_ratio: [0.25, 0.75]`, sliding-window layers first).
+* **A host-memory KV tier.** `host_cache_size` gives each GPU 160 GiB of host memory for KV blocks evicted from GPU memory, so a session that comes back copies its context back instead of recomputing it. The node needs 640 GiB of host memory for this tier in addition to the server processes: in the measured runs, host memory use peaked at about 820 GiB of 950 GiB, so everything besides the tier took about 180 GiB. On a host with a different amount of memory, start from a `host_cache_size` per GPU of (host memory - 300 GiB) / 4, in bytes: on the 950 GiB host this gives about the measured 160 GiB and leaves about 120 GiB free at peak.
 * **Prefill CUDA graphs** (`prefill_cuda_graph_backend: breakable` with `prefill_capture_num_tokens`) and the `MAX_UTILIZATION` capacity-scheduler policy.
 * **Serving-side settings:** `num_postprocess_workers: 8`, `stream_interval: 20` and `enable_tokenization_cache: true`. Postprocess workers apply to `trtllm-serve`; with the LLM API (for example `trtllm-eval`), leave `num_postprocess_workers` unset, or the outputs come back without text.
+* **Iteration statistics.** `enable_iter_perf_stats: true` with `iter_perf_stats_interval: 40` records batch, KV-cache and prefix-reuse counters every 40th step and serves them as JSON at `/metrics`. The measured runs had them on; remove both lines if nothing reads `/metrics`.
 * **Text only.** `disable_mm_encoder: true` skips loading the vision and audio towers, which leaves more GPU memory for the KV cache; image, video and audio requests are rejected. Remove the line to serve multimodal requests.
 * **No speculative decoding.** On this branch, the DFlash2 drafter keeps a dense context buffer for every batch slot, sized for `max_seq_len`: about 5 GiB per GPU per slot at 1M tokens, which does not fit next to these batch sizes.
 
-Raising concurrency past 48 sessions buys little. In 20-minute runs with these settings (the hour-long results below are the reference), 56 and 64 sessions added 2 % and 5 % throughput, while the p90 time to first token rose from 2.9 s to 8.8 s and 11.0 s:
+With the same engine settings, minus the serving-side ones that `trtllm-eval` does not take, GSM8K scores 94.47 with the max-throughput configuration and 95.22 with the balanced one.
+
+### Choosing the Concurrency
+
+The two configurations are points of a sweep from 16 to 64 concurrent sessions, in 20-minute runs with these settings (the hour-long results below are the reference):
+
+* **Max-throughput: 48 sessions**, the knee of the sweep. 56 and 64 sessions added 2 % and 5 % throughput, while the p90 time to first token rose from 2.9 s to 8.8 s and 11.0 s.
+* **Balanced: 24 sessions**, the highest-throughput point whose p90 output speed per session is at least 100 tokens/s. aiperf takes its percentiles over requests, so at p90, one request in ten streams at least that fast. For a different target, pick the point from the output-speed rows below.
 
 | Concurrent sessions (= `max_batch_size`) | 16 | 24 | 32 | 40 | 48 | 56 | 64 |
 |---|---|---|---|---|---|---|---|
 | Total throughput (tokens/s/GPU) | 13,415 | 16,188 | 22,108 | 24,486 | 27,639 | 28,185 | 29,084 |
 | Output speed per session (tokens/s, p50) | 53.4 | 34.3 | 30.2 | 27.4 | 25.1 | 21.4 | 18.4 |
+| Output speed per session (tokens/s, p90) | 152.6 | 103.7 | 83.1 | 72.1 | 70.6 | 69.1 | 68.4 |
 | TTFT p90 (s) | 1.6 | 2.9 | 6.6 | 2.6 | 2.9 | 8.8 | 11.0 |
 
-With the same engine settings, minus the serving-side ones that `trtllm-eval` does not take, GSM8K scores 94.47 with the max-throughput configuration and 95.22 with the balanced one.
+The sweep points are repeatable: second runs at 24 and 32 sessions replayed nearly the same requests and came within about 2 % of the first runs in throughput and output speed, and within 0.3 s in p90 time to first token (6.6 s again at 32 sessions). Each concurrency replays a different subset of the traces, so tail latency need not rise steadily with concurrency, as the 32-session point shows. The hour-long runs below cover more of the traces (at 24 sessions, 2,239 requests with a median input of about 100,000 tokens, against 834 requests and 79,000 tokens in the sweep), which is why their results differ from the sweep's.
 
 ### Measuring with AgentX
 
-The numbers come from the AgentX scenario of SemiAnalysis's [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) (aiperf 0.12.0), which replays the public dataset [`semianalysisai/cc-traces-weka-062126`](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126) (Apache-2.0): 393 Claude Code sessions with their sub-agents, recorded as each request's input and output length and its prefix overlap with earlier requests. To measure a server the same way:
+The numbers come from the AgentX scenario of SemiAnalysis's [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) (aiperf 0.12.0), which replays the public dataset [`semianalysisai/cc-traces-weka-062126`](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126) (Apache-2.0): 393 Claude Code sessions with their sub-agents, recorded as each request's input and output length and its prefix overlap with earlier requests. The pinned harness commit installs as the `aiperf` package, version 0.12.0, so it needs no separate aiperf install; give it its own virtual environment, since it replaces any other `aiperf`. To measure a server the same way:
 
 ```bash
 pip install "git+https://github.com/SemiAnalysisAI/agentx-harness.git@104c7c8086666385fbf3962911b55f68bf08a04a"

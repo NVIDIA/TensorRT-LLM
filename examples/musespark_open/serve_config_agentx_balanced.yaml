@@ -47,8 +47,8 @@ kv_cache_config:
     # plus this many tokens) and evict the other sliding-window blocks first.
     swa_endpoint_rewind_tokens: 1024
   tokens_per_block: 32
-  # Fixed split of the GPU KV pool across the two KV layer groups (one per attention window:
-  # the 2,048-token sliding window and the full context).
+  # Fixed split of the GPU KV pool across the two KV layer groups, in layer-group ID order:
+  # [sliding-window group (2,048-token window), full-attention group].
   pool_ratio: [0.25, 0.75]
   free_gpu_memory_fraction: 0.8
   # Host-memory KV tier per GPU: 160 GiB, 640 GiB per node. Blocks evicted from GPU
