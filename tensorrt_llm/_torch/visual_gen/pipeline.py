@@ -3,8 +3,10 @@
 
 import contextlib
 import itertools
+import math
 import os
 import time
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -13,6 +15,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Set,
     Tuple,
@@ -22,7 +25,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from pydantic import Field
+from pydantic import ConfigDict, Field, model_validator
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.nccl_window_graph import release_nccl_window_graph_owner
@@ -103,10 +106,199 @@ class RefSlotSpec(StrictBaseModel):
     roles: List[RoleSpec] = Field(description="Accepted roles + counts for this modality.")
 
 
+# ------------------------------------------------------------------ session declarations
+# What a pipeline declares for one session: the inputs it takes while running, the
+# streams it writes and how the session ends. Pickled to the client in its
+# ``public()`` form, so the callables never leave the worker.
+
+
+class SessionInputSpec(StrictBaseModel):
+    """One named input the pipeline accepts during a session.
+
+    A ``queued`` input supplies one value per advance and the worker waits for it;
+    a ``live`` input is a state value the worker reads at each advance and never
+    waits for. A queued input holds at most ``queue_depth`` values; a live one the
+    current value plus the snapshot of the advance in flight. ``validator`` runs
+    on rank 0 before admission and raises ``ValueError`` for a bad value; it is
+    what bounds a value's shape and size. ``default`` is the value a live input
+    holds until its first submit; a live input must declare one, and a declared
+    default, ``None`` included, passes the validator like a submitted value.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str
+    policy: Literal["queued", "live"] = "queued"
+    validator: Optional[Callable[[Any], None]] = None
+    default: Any = None
+    queue_depth: int = Field(default=8, ge=1)
+
+    @model_validator(mode="after")
+    def _check_default(self) -> "SessionInputSpec":
+        declared = "default" in self.model_fields_set
+        if self.policy == "live" and not declared:
+            raise ValueError(
+                f"live input {self.name!r} needs a default: the first advance reads it "
+                "before any submit"
+            )
+        if not declared:
+            return self
+        if self.validator is not None:
+            try:
+                self.validator(self.default)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"input {self.name!r}: the default is refused: {e}") from e
+        return self
+
+
+class SessionStreamSpec(StrictBaseModel):
+    """One named output stream the pipeline produces.
+
+    ``max_shape`` is the largest tensor one result may carry for this stream; the
+    slot pool sizes its buffers from it. ``axis`` is the dimension counted by a
+    result's ``position`` (frames, samples or predictions). ``placement`` is where
+    the slot buffer lives: shared page-locked host memory or device memory.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    name: str
+    kind: str
+    dtype: torch.dtype
+    max_shape: Tuple[int, ...]
+    axis: int = 1
+    rate: Optional[float] = None
+    placement: Literal["host", "device"] = "host"
+
+    @model_validator(mode="after")
+    def _check_geometry(self) -> "SessionStreamSpec":
+        if not self.max_shape or any(d <= 0 for d in self.max_shape):
+            raise ValueError(f"stream {self.name!r}: max_shape must be non-empty and positive")
+        if not 0 <= self.axis < len(self.max_shape):
+            raise ValueError(f"stream {self.name!r}: axis {self.axis} outside max_shape")
+        return self
+
+    @property
+    def max_bytes(self) -> int:
+        return math.prod(self.max_shape) * self.dtype.itemsize
+
+
+class SessionCapabilities(StrictBaseModel):
+    """What a pipeline declares for one session request.
+
+    ``length`` is the number of advances of a finite session, ``None`` when the
+    session is open-ended. ``lockstep`` marks an interactive session: exactly one
+    queued input and one media result per advance, which enables ``advance(value)``
+    on the client.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    inputs: Tuple[SessionInputSpec, ...] = ()
+    streams: Tuple[SessionStreamSpec, ...]
+    initial_result: bool = False
+    length: Optional[int] = None
+    lockstep: bool = False
+
+    @model_validator(mode="after")
+    def _check_declarations(self) -> "SessionCapabilities":
+        names = [s.name for s in self.inputs]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate input names: {names}")
+        stream_names = [s.name for s in self.streams]
+        if len(set(stream_names)) != len(stream_names):
+            raise ValueError(f"duplicate stream names: {stream_names}")
+        if not self.streams:
+            raise ValueError("a session must declare at least one stream")
+        if self.lockstep and len(self.queue_inputs) != 1:
+            raise ValueError("a lockstep session has exactly one queued input")
+        return self
+
+    @property
+    def queue_inputs(self) -> Tuple[SessionInputSpec, ...]:
+        return tuple(s for s in self.inputs if s.policy == "queued")
+
+    @property
+    def live_inputs(self) -> Tuple[SessionInputSpec, ...]:
+        return tuple(s for s in self.inputs if s.policy == "live")
+
+    @property
+    def max_result_bytes(self) -> int:
+        return sum(s.max_bytes for s in self.streams)
+
+    def input(self, name: str) -> SessionInputSpec:
+        for spec in self.inputs:
+            if spec.name == name:
+                return spec
+        raise ValueError(f"unknown input {name!r}; declared: {[s.name for s in self.inputs]}")
+
+    def stream(self, name: str) -> SessionStreamSpec:
+        for spec in self.streams:
+            if spec.name == name:
+                return spec
+        raise ValueError(f"unknown stream {name!r}; declared: {[s.name for s in self.streams]}")
+
+    def public(self) -> Dict[str, Any]:
+        """The picklable, callable-free form sent to the client."""
+        return {
+            "inputs": [
+                {
+                    "name": s.name,
+                    "policy": s.policy,
+                    "default": s.default,
+                    "queue_depth": s.queue_depth,
+                }
+                for s in self.inputs
+            ],
+            "streams": [
+                {
+                    "name": s.name,
+                    "kind": s.kind,
+                    "dtype": str(s.dtype),
+                    "max_shape": tuple(s.max_shape),
+                    "axis": s.axis,
+                    "rate": s.rate,
+                    "placement": s.placement,
+                }
+                for s in self.streams
+            ],
+            "initial_result": self.initial_result,
+            "length": self.length,
+            "lockstep": self.lockstep,
+        }
+
+
+@dataclass
+class AdvanceOutcome:
+    """The return type of ``advance`` and ``open_session``.
+
+    The pipeline ran one unit of work on the session's state and wrote its
+    streams into the slot it was given; this reports what it wrote, when that
+    work is complete, and whether the session is over.
+    """
+
+    # The views written, by stream name: each one obtained from the slot's
+    # ``view`` and filled. Their shapes and dtypes become the result's. Empty
+    # when nothing was written (a rank with no slot, or a final empty advance).
+    written: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+    # Recorded behind this rank's work for the call, its state updates and every
+    # write into the slot. None only when all of it had completed on return.
+    # Every rank returns one, slot or no slot.
+    event: Optional[torch.cuda.Event] = None
+    # The session ends after this result; the executor appends the terminal.
+    done: bool = False
+
+
+# ------------------------------------------------------------------ end session declarations
+
+
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionPipelineConfig
+    from .executor import DiffusionRequest
     from .sleep import SleepRestoreMode
+    from .slot_pool import DeliverySlot
 
 
 class BasePipeline(nn.Module):
@@ -444,7 +636,7 @@ class BasePipeline(nn.Module):
         """
         return {}
 
-    def prepare_request(self, req: Any) -> None:
+    def prepare_request(self, req: "DiffusionRequest") -> None:
         """Prepare model-specific inputs before warmup bookkeeping.
 
         Subclasses may mutate internal request state and resolve request
@@ -464,8 +656,70 @@ class BasePipeline(nn.Module):
         """
         return None
 
-    def infer(self, req: Any):
+    def infer(self, req: "DiffusionRequest"):
         raise NotImplementedError
+
+    # ------------------------------------------------------------------ sessions
+    #
+    # A pipeline that can keep its model state alive between calls opts in by
+    # overriding the five methods below and returning True from
+    # ``supports_sessions``. The executor owns delivery slots, advance indices,
+    # stream cursors, ordering and the terminal result; the pipeline owns its
+    # caches, decoder history, random state and device events and never sees
+    # queues, sockets or consumers. ``open_session``, ``advance`` and
+    # ``close_session`` run under ``torch.inference_mode()``, like ``infer``.
+
+    @property
+    def supports_sessions(self) -> bool:
+        return False
+
+    def session_capabilities(self, req: "DiffusionRequest") -> SessionCapabilities:
+        """Inputs, streams, geometry, length and profile for a session opened with
+        ``req``. These determine admission, the slot pool and what the client may
+        call. Raises ``ValueError`` when the request cannot be served as a session."""
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
+
+    def open_session(
+        self, req: "DiffusionRequest", initial_slot: Optional["DeliverySlot"]
+    ) -> Tuple[object, AdvanceOutcome]:
+        """All expensive and allocating work for a session: prompt encode,
+        conditioning, cache open, graph warmup, whole-clip denoise if that is the
+        model. Returns the session state, an object of the pipeline's choosing that
+        the executor only holds and hands back, and the initial outcome.
+        ``initial_slot`` is the executor's reserved slot when the capabilities
+        declare an initial result, else ``None``; the outcome's ``written`` holds
+        the views put into it and its ``event`` covers this rank's work, state and
+        slot alike, so a rank given no slot still returns one. If opening fails,
+        release partial allocations and raise.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
+
+    # A submitted value has no type narrower than Any at this boundary: it is
+    # whatever this pipeline's own validator accepts (a tensor, an array, a list of
+    # rows), and only the pipeline knows which. The executor carries it as object.
+    def validate_input(self, state: object, name: str, value: Any) -> None:
+        """Schema check on rank 0 before a value is enqueued or broadcast. Raises
+        ``ValueError`` for a bad value. Must not change state. The default accepts
+        anything the input's ``validator`` accepted."""
+        del state, name, value
+
+    def advance(
+        self, state: object, inputs: Dict[str, Any], slot: "DeliverySlot"
+    ) -> AdvanceOutcome:
+        """One unit of work. ``inputs`` holds one value per queued input and the
+        current value of every live input. Write each produced stream into
+        ``slot[name].view(shape, dtype)`` and return those views in ``written``.
+        Return a CUDA event recorded behind this rank's state updates and its
+        last write (``None`` when all of it has completed on return) and ``done``;
+        a rank given no slot still returns the event for its state work. Advances
+        never overlap; a non-final advance must write at least one stream."""
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
+
+    def close_session(self, state: object) -> None:
+        """Release session state after work and transfers finish. Prompt-derived
+        data may stay cached inside the pipeline so reopening with the same prompt
+        skips the encode."""
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def _init_transformer(self) -> None:
         raise NotImplementedError

@@ -389,6 +389,33 @@ class VAEConfig(StrictBaseModel):
     )
 
 
+class SessionConfig(StrictBaseModel):
+    """Engine settings for streaming sessions (``VisualGen.open_session``)."""
+
+    delivery_slots: int = Field(
+        2,
+        ge=1,
+        status="prototype",
+        description=(
+            "Delivery slots per session: results the worker may hold for the client "
+            "at once, each sized for the pipeline's largest result. 2 lets the worker "
+            "produce the next result while the client uses the current one; more lets "
+            "it run further ahead when inputs are already available."
+        ),
+    )
+    idle_timeout: Optional[float] = Field(
+        None,
+        gt=0,
+        status="prototype",
+        description=(
+            "Seconds a session may wait for the client (no submit, no result request, "
+            "no slot return) while only the client can make progress, before the "
+            "executor closes it with a terminal error and frees the model instance. "
+            "None disables the timeout."
+        ),
+    )
+
+
 class ParallelConfig(StrictBaseModel):
     """Configuration for distributed parallelism across DiT-shaped models.
 
@@ -928,6 +955,11 @@ class VisualGenArgs(StrictBaseModel):
         status="prototype",
     )
     cache_config: Optional[CacheConfig] = Field(None, status="prototype")
+    session_config: SessionConfig = Field(
+        default_factory=SessionConfig,
+        status="prototype",
+        description="Streaming session settings: delivery slots per session and the idle timeout.",
+    )
     runtime_lora_config: Optional[RuntimeLoRAConfig] = Field(
         None,
         status="prototype",
