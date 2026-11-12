@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from tensorrt_llm._torch.configs.beam import BeamConfig
 from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
 from tensorrt_llm._torch.configs.cosmos3_edge import (
     Cosmos3EdgeConfig,
@@ -143,6 +144,7 @@ _register_custom_configs_with_transformers()
 del _register_custom_configs_with_transformers
 
 __all__ = [
+    "BeamConfig",
     "Cosmos3Config",
     "Cosmos3EdgeConfig",
     "Cosmos3EdgeProjectorConfig",

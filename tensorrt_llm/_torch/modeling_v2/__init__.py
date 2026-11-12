@@ -32,6 +32,11 @@ cycle. Reach it through ``TorchLlmArgs.modeling_v2``; import it from outside
 ``tensorrt_llm`` at your own risk. ``_torch/pyexecutor/model_loader.py`` and
 ``_torch/models/modeling_auto.py`` import this package and ``_router_index``
 whatever the mode; a target is imported only when routing returns it.
+
+A target served by plain ``trtllm-serve`` or ``LLM()`` names its checkpoint
+format, tokenizer and reasoning parser through the shared registries
+(``_torch/models/checkpoints``, ``tokenizer`` / ``custom_tokenizer`` import
+paths and ``llmapi/reasoning_parser.py``), like any other model.
 """
 
 from ._router_index import (

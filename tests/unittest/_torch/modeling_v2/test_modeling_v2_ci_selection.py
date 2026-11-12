@@ -242,7 +242,7 @@ def test_accuracy_directories_are_targets(repo: Path = _REPO):
 
 # Families that ship directly constructed components without a registered model.
 # An exemption is invalid as soon as routing or registry imports are introduced.
-_COMPONENT_ONLY_FAMILIES: set[str] = {"beam"}
+_COMPONENT_ONLY_FAMILIES: set[str] = set()
 
 
 def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):

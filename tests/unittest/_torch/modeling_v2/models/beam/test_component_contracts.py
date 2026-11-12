@@ -257,7 +257,8 @@ def test_components_do_not_import_full_model_internals():
     target = family / "full_model_nvfp4__sm_103__tp4"
     target_module = f"{beam.__name__}.{target.name}"
     for source in family.rglob("*.py"):
-        if source.is_relative_to(target):
+        # The family router selects and imports targets; component helpers must not.
+        if source.is_relative_to(target) or source == family / "routing.py":
             continue
         package = ".".join((beam.__name__, *source.parent.relative_to(family).parts))
         for node in ast.walk(ast.parse(source.read_text())):

@@ -7857,6 +7857,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-2": ["auto:gb300-x4", "l0_gb300", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-3": ["auto:gb300-x4", "l0_gb300", 3, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-BeamAccuracy-OnDemand-1": ["auto:gb300-x4", "qa_gb300_beam_baseline_gsm8k_first100", 1, 1, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],

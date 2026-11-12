@@ -39,12 +39,6 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
-try:
-    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
-except ModuleNotFoundError as exc:
-    if exc.name != "tensorrt_llm._torch.models.modeling_beam":
-        raise
-    builtin_beam = None  # The standard-serving implementation is a separate PR.
 __extra_import_path__ = [
     ".",
     "~/tests/integration/defs",
@@ -53,6 +47,7 @@ __extra_import_path__ = [
 ]
 
 import _beam_component_support as support  # noqa: E402
+import _beam_reference as reference_beam
 import _moe_reference as reference  # noqa: E402
 from _beam_component_support import (  # noqa: E402
     assert_all_pass,
@@ -373,20 +368,18 @@ def loggable(calls: list[dict]) -> list[dict]:
     return support.loggable(calls, ("op", "depth", "shapes", "expert_id", *_RECORDED_KWARGS))
 
 
-def builtin_beam_forbidden():
-    """The built-in Beam modeling must not run while the component does."""
-    if builtin_beam is None:
-        return support.builtin_forbidden([])
+def reference_beam_forbidden():
+    """The reference Beam modeling must not run while the component does."""
     return support.builtin_forbidden(
         [
-            (builtin_beam.BeamMoE, "forward"),
-            (builtin_beam.BeamMoE, "combine"),
-            (builtin_beam.BeamRouter, "forward"),
-            (builtin_beam.BeamRouter, "route"),
-            (builtin_beam.BeamSwiGLU, "forward"),
-            (builtin_beam.BeamRMSNorm, "forward"),
-            (builtin_beam.BeamAttention, "forward"),
-            (builtin_beam.BeamDecoderLayer, "forward"),
+            (reference_beam.BeamMoE, "forward"),
+            (reference_beam.BeamMoE, "combine"),
+            (reference_beam.BeamRouter, "forward"),
+            (reference_beam.BeamRouter, "route"),
+            (reference_beam.BeamSwiGLU, "forward"),
+            (reference_beam.BeamRMSNorm, "forward"),
+            (reference_beam.BeamAttention, "forward"),
+            (reference_beam.BeamDecoderLayer, "forward"),
         ]
     )
 
@@ -407,16 +400,15 @@ def test_moe_constructs_alone() -> None:
         raise AssertionError(f"{type(self).__name__} constructed")
 
     with pytest.MonkeyPatch.context() as mp:
-        if builtin_beam is not None:
-            for cls in (
-                builtin_beam.BeamForCausalLM,
-                builtin_beam.BeamModel,
-                builtin_beam.BeamDecoderLayer,
-                builtin_beam.BeamMoE,
-                builtin_beam.BeamRouter,
-                builtin_beam.BeamSwiGLU,
-            ):
-                mp.setattr(cls, "__init__", refuse)
+        for cls in (
+            reference_beam.BeamForCausalLM,
+            reference_beam.BeamModel,
+            reference_beam.BeamDecoderLayer,
+            reference_beam.BeamMoE,
+            reference_beam.BeamRouter,
+            reference_beam.BeamSwiGLU,
+        ):
+            mp.setattr(cls, "__init__", refuse)
         moe = BeamMoeBf16Sm103Tp1(moe_config(), LAYER_IDX, device="cuda")
     assert isinstance(moe.gate, BeamMoeRouterBf16Sm103Tp1)
     assert len(moe.experts) == 256
@@ -630,11 +622,11 @@ def test_forward_runs_the_component_path(record_property, ieee_fp32) -> None:
     """One case: the router op once, then BeamDispatchCombine, inside which every selected
     expert -- ascending, once each -- receives exactly its tokens' rows in token order and
     runs its own three projections and SwiGLU; every op's guard admits its arguments and no
-    built-in Beam module runs."""
+    reference Beam module runs."""
     seed, length = 17, 17
     moe = loaded_moe(seed)
     x = case_input(seed, length)
-    with builtin_beam_forbidden(), validating(*OPS), recording(*OPS, experts=True) as calls:
+    with reference_beam_forbidden(), validating(*OPS), recording(*OPS, experts=True) as calls:
         out = moe(x)
         torch.cuda.synchronize()
     record_property(

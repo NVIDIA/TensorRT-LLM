@@ -1,19 +1,56 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Beam components with ModelingV2
+# Beam serving with ModelingV2
 
-This directory contains Beam family operators and a directly constructed 52-layer
-NVFP4-expert component. It does not register an engine target: `LLM()` and
-`trtllm-serve` cannot select these components through ModelingV2. Component users
-construct `BeamFullModelNvfp4Sm103Tp4` from `full_model_nvfp4__sm_103__tp4/model.py`
-and provide the checkpoint configuration, rank mapping and device; the component's
-`load()` method loads the caller-provided checkpoint before execution. The tests
-below exercise the component APIs and their input contracts.
+This directory contains the 52-layer Beam target and its family operators. It runs
+through the native PyTorch executor using `LLM()` or `trtllm-serve` with
+`modeling_v2: require`, which refuses unsupported configurations instead of falling
+back to a built-in model. Ordinary decoding uses the native TorchSampler.
+
+## Launch the baseline
+
+Supply a compatible checkpoint containing its original configuration, tokenizer,
+chat template and indexed safetensors weights. Use a TensorRT-LLM build matching
+this checkout on four GB300 GPUs. Create `beam-baseline.yaml`:
+
+```yaml
+modeling_v2: require
+checkpoint_format: beam_nvfp4
+custom_tokenizer: tensorrt_llm._torch.models.checkpoints.beam.tokenizer.BeamFastTokenizer
+reasoning_parser: beam_harmony_text
+tensor_parallel_size: 4
+max_batch_size: 1
+max_num_tokens: 8192
+cuda_graph_config: null
+disable_overlap_scheduler: true
+kv_cache_config:
+  dtype: auto
+  tokens_per_block: 32
+```
+
+```bash
+trtllm-serve /path/to/checkpoint --config beam-baseline.yaml
+```
+
+`checkpoint_format: beam_nvfp4` constructs `BeamNvfp4CheckpointLoader` through the
+shared checkpoint registry. The default HF weight-loading path is not supported.
+The same settings can be supplied to `LLM()`; advanced callers may pass an explicit
+`BeamNvfp4CheckpointLoader` through `checkpoint_loader`. BF16 KV takes no scale
+file. The baseline supports native KV-cache estimation; it does not require
+`TRTLLM_SKIP_KV_CACHE_ESTIMATION=1`.
+
+See the [deployment guide](../../../../../../docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md)
+for input staging and the named `TestModelingV2BeamFullModelNvfp4Sm103Tp4` accuracy
+gate. That gate uses the public evaluator's pinned first 100 GSM8K questions with
+a 45-minute test cap and is listed in QA's scheduled functional suite, not automatic
+L0. Defining or scheduling a gate is not evidence that it passed. The
+[public evaluator](../../../../../../examples/llm-api/gsm8k_eval/README.md) also
+supports manual endpoint evaluation and resuming incomplete runs.
 
 ## Configuration and limits
 
-| Setting | Component configuration |
+| Setting | Serving configuration |
 |---|---|
 | Hardware and layout | Four GB300 GPUs (SM103), attention TP4, MoE TP4/EP1, PP1 |
 | Parameters | Packed NVFP4 experts; BF16 dense tensors; FP32 router projection and selection |
