@@ -465,13 +465,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # MTP-Eagle heads under plain TP are vocab-sharded: register the
         # group's argmax-pair exchange (draft_argmax.py) here so its workspace
-        # exists before any CUDA-graph capture.
+        # exists before any CUDA-graph capture. Groups without MNNVL, or with
+        # an explicit non-MNNVL strategy, keep the allgather producer.
         if (draft_argmax_exchange_enabled() and self.is_mtp_eagle
                 and mapping is not None and mapping.tp_size > 1
                 and not mapping.enable_attention_dp
                 and model_config is not None):
-            self._draft_argmax_by_mapping[mapping] = DraftArgmaxExchange(
-                mapping, model_config.allreduce_strategy)
+            exchange = DraftArgmaxExchange(mapping,
+                                           model_config.allreduce_strategy)
+            if exchange.uses_mnnvl:
+                self._draft_argmax_by_mapping[mapping] = exchange
 
         # SA enhancer (common to both modes)
         self.sa_enhancer: Optional[SADraftEnhancer] = None

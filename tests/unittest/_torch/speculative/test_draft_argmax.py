@@ -14,15 +14,18 @@
 # limitations under the License.
 """``speculative/draft_argmax.py``: the TP exchange of the MTP draft argmax pairs.
 
-CPU: ``MNNVLAllReduce.max_one_shot_tokens`` against the one-shot threshold at TP 2..64.
+CPU: ``MNNVLAllReduce.max_one_shot_tokens`` against the one-shot threshold at TP 2..64; the
+``Eagle3OneModelWorker`` registration predicate; ``AUTO`` / ``UB`` requesting MNNVL.
 
 Single GPU: the Triton (index, max) pack kernel against the ``torch.max`` producer bitwise
-(bf16 / fp16 / fp32, ties, all -inf rows, NaN, strided rows, CUDA-graph replay).
+(bf16 / fp16 / fp32, ties, all -inf rows, NaN, strided rows, CUDA-graph replay); the staging
+buffer allocated by the first forward whichever branch it takes.
 
 Two GPUs (``mpi_pool_executor``, ``gpu2``): ``DraftArgmaxExchange`` against the allgather
-producer under the NCCL, AUTO and (on MNNVL hardware) MNNVL strategies in one worker
-invocation, eager and under CUDA-graph replay, the fallback above ``max_rows``, and the tagged
-MNNVL workspace living next to the model's default one.
+producer under NCCL (the allgather producer runs), single-node AUTO (pack + MNNVL all-reduce
+on MNNVL hardware, the allgather producer elsewhere) and, on MNNVL hardware, MNNVL, eager and
+under CUDA-graph replay, the fallback above ``max_rows``, and the tagged MNNVL workspace
+living next to the model's default one.
 """
 
 import gc
@@ -31,6 +34,7 @@ import pickle
 import platform
 import sys
 import traceback
+from types import SimpleNamespace
 
 import cloudpickle
 import pytest
@@ -43,10 +47,13 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES, MNNVLAllReduce
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm._torch.speculative import eagle3
 from tensorrt_llm._torch.speculative.draft_argmax import (
+    DRAFT_ARGMAX_ALLREDUCE_ENV,
     ROW_WIDTH,
     WORKSPACE_TAG,
     DraftArgmaxExchange,
+    draft_argmax_exchange_enabled,
     gather_argmax_pairs_allgather,
     local_argmax_pack,
     local_argmax_pairs,
@@ -128,6 +135,98 @@ def test_max_one_shot_tokens_matches_the_one_shot_threshold(tp_size):
 
 
 # --------------------------------------------------------------------------
+# CPU-only: which workers register an exchange, and the UB strategy.
+
+
+class _StubExchange:
+    """Stands in for DraftArgmaxExchange in the registration tests."""
+
+    uses_mnnvl = True
+
+    def __init__(self, mapping, strategy):
+        self.mapping = mapping
+        self.strategy = strategy
+
+
+def _build_worker(
+    monkeypatch, *, env="1", mtp_eagle=True, tp_size=2, attention_dp=False, with_config=True
+):
+    if env is None:
+        monkeypatch.delenv(DRAFT_ARGMAX_ALLREDUCE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(DRAFT_ARGMAX_ALLREDUCE_ENV, env)
+    draft_argmax_exchange_enabled.cache_clear()
+    monkeypatch.setattr(eagle3, "DraftArgmaxExchange", _StubExchange)
+    spec_config = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(is_mtp_eagle_one_model=lambda: mtp_eagle),
+        sa_config=None,
+        use_dynamic_tree=False,
+        _use_shared_kv_cache=False,
+    )
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=0, enable_attention_dp=attention_dp)
+    model_config = (
+        SimpleNamespace(allreduce_strategy=AllReduceStrategy.AUTO) if with_config else None
+    )
+    return eagle3.Eagle3OneModelWorker(spec_config, mapping, model_config), mapping
+
+
+@pytest.fixture
+def _restore_gate_cache():
+    yield
+    draft_argmax_exchange_enabled.cache_clear()
+
+
+@pytest.mark.parametrize("env", [None, "1"])
+def test_worker_registers_exchange_for_mtp_eagle_plain_tp(monkeypatch, _restore_gate_cache, env):
+    worker, mapping = _build_worker(monkeypatch, env=env)
+    exchange = worker._draft_argmax_by_mapping[mapping]
+    assert isinstance(exchange, _StubExchange)
+    assert exchange.mapping is mapping and exchange.strategy == AllReduceStrategy.AUTO
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    [
+        {"env": "0"},
+        {"mtp_eagle": False},
+        {"tp_size": 1},
+        {"attention_dp": True},
+        {"with_config": False},
+    ],
+    ids=["gate_off", "eagle3_head", "tp1", "attention_dp", "no_model_config"],
+)
+def test_worker_skips_exchange_when_not_eligible(monkeypatch, _restore_gate_cache, excluded):
+    worker, _ = _build_worker(monkeypatch, **excluded)
+    assert worker._draft_argmax_by_mapping == {}
+
+
+def test_worker_skips_exchange_without_mnnvl(monkeypatch, _restore_gate_cache):
+    monkeypatch.setattr(_StubExchange, "uses_mnnvl", False)
+    worker, _ = _build_worker(monkeypatch)
+    assert worker._draft_argmax_by_mapping == {}
+
+
+@pytest.mark.parametrize(
+    "model_strategy,expected",
+    [
+        # AUTO keeps a single-node group off MNNVL; the exchange asks for it.
+        (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL),
+        # UB only works inside the torch.compile residual-RMSNorm pattern pass,
+        # never for the exchange's eager, unfused SUM.
+        (AllReduceStrategy.UB, AllReduceStrategy.MNNVL),
+        (AllReduceStrategy.MNNVL, AllReduceStrategy.MNNVL),
+        (AllReduceStrategy.NCCL, AllReduceStrategy.NCCL),
+        (AllReduceStrategy.ONESHOT, AllReduceStrategy.ONESHOT),
+    ],
+)
+def test_exchange_strategy_follows_model_strategy(model_strategy, expected):
+    module = DraftArgmaxExchange(
+        Mapping(world_size=1, tp_size=1, rank=0), model_strategy, max_rows=4
+    )
+    assert module.allreduce.strategy == expected
+
+
+# --------------------------------------------------------------------------
 # Single GPU: the pack kernel vs torch.max.
 
 
@@ -172,21 +271,59 @@ _MNNVL_TEST_ENV = "TLLM_TEST_MNNVL"
 _TEST_MAX_ROWS = 16
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_exchange_built_under_meta_init_allocates_staging_on_first_use():
+class _IdentityMnnvl:
+    """Single-rank stand-in for the MNNVL all-reduce: the SUM over one rank."""
+
+    def __call__(self, input, all_reduce_params):
+        return input.clone()
+
+
+def _meta_built_exchange(mapping):
     """The worker constructs the exchange inside the model constructor, i.e. under
     MetaInitMode, where torch.empty ignores the requested device; the staging
     buffer must therefore not be allocated at construction (a meta tensor would
     reach the pack kernel with data_ptr 0)."""
-    mapping = Mapping(world_size=1, tp_size=1, rank=0)
     with MetaInitMode():
         module = DraftArgmaxExchange(mapping, AllReduceStrategy.AUTO, max_rows=4)
-    assert module._staging is None
-    staging = module._staging_rows(2)
-    assert staging.device.type == "cuda" and not staging.is_meta and staging.data_ptr() != 0
-    assert staging.shape == (2, ROW_WIDTH) and module._staging.shape == (4, ROW_WIDTH)
-    logits = _make_logits(2, 77, torch.bfloat16, seed=3)
-    out = module(logits)  # tp 1: the all-reduce is the identity, the pairs come back as packed
+    assert module._staging is None and not module.uses_mnnvl  # tp 1: no MNNVL
+    module.allreduce.mnnvl_allreduce = _IdentityMnnvl()
+    assert module.uses_mnnvl
+    return module
+
+
+def _assert_real_staging(module):
+    staging = module._staging
+    assert staging is not None and staging.device.type == "cuda" and not staging.is_meta
+    assert staging.data_ptr() != 0 and staging.shape == (4, ROW_WIDTH)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("first_rows", [2, 5], ids=["pack_first", "fallback_first"])
+def test_exchange_built_under_meta_init_allocates_staging_on_first_forward(first_rows):
+    """The first forward allocates the staging buffer whichever branch it takes, so
+    an eager warm-up that only hits the fallback (rows > max_rows) still allocates
+    it before any CUDA-graph capture."""
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    module = _meta_built_exchange(mapping)
+    first = _make_logits(first_rows, 77, torch.bfloat16, seed=3)
+    out = module(first)
+    _assert_real_staging(module)
+    assert torch.equal(_bits(out), _bits(gather_argmax_pairs_allgather(first, mapping)))
+    staging_ptr = module._staging.data_ptr()
+    logits = _make_logits(2, 77, torch.bfloat16, seed=4)
+    out = module(logits)  # tp 1: the pairs come back as packed
+    assert module._staging.data_ptr() == staging_ptr
+    assert torch.equal(_bits(out), _bits(gather_argmax_pairs_allgather(logits, mapping)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_exchange_without_mnnvl_runs_the_allgather_producer():
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    module = DraftArgmaxExchange(mapping, AllReduceStrategy.AUTO, max_rows=4)
+    assert not module.uses_mnnvl
+    logits = _make_logits(2, 77, torch.bfloat16, seed=5)
+    out = module(logits)
+    assert module._staging is None  # never needed without MNNVL
     assert torch.equal(_bits(out), _bits(gather_argmax_pairs_allgather(logits, mapping)))
 
 
@@ -205,7 +342,9 @@ def _check_gathered(out, ref):
     assert torch.equal(_draft_tokens(out), _draft_tokens(ref))
 
 
-def _check_exchange_matches_allgather(mapping: Mapping, strategy: AllReduceStrategy) -> None:
+def _check_exchange_matches_allgather(
+    mapping: Mapping, strategy: AllReduceStrategy, expect_mnnvl: bool
+) -> None:
     rank, world = mapping.tp_rank, mapping.tp_size
     # Built the way the engine builds it: inside the model constructor, under
     # MetaInitMode (every torch.empty lands on the meta device there).
@@ -214,13 +353,12 @@ def _check_exchange_matches_allgather(mapping: Mapping, strategy: AllReduceStrat
     assert module.max_rows == _TEST_MAX_ROWS
     assert module._staging is None  # allocated by the first forward, outside the mode
     workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
-    if strategy == AllReduceStrategy.MNNVL:
-        # The MNNVL arm must really run the MNNVL kernels, on the tagged workspace only.
+    assert module.uses_mnnvl == expect_mnnvl
+    if expect_mnnvl:
+        # The MNNVL arms must really run the MNNVL kernels, on the tagged workspace only.
         mnnvl = module.allreduce.mnnvl_allreduce
-        assert mnnvl is not None and mnnvl.workspace_key == (mapping, WORKSPACE_TAG)
+        assert mnnvl.workspace_key == (mapping, WORKSPACE_TAG)
         assert (mapping, WORKSPACE_TAG) in workspaces and mapping not in workspaces
-    elif strategy == AllReduceStrategy.NCCL:
-        assert module.allreduce.mnnvl_allreduce is None
 
     for rows in (1, 3, _TEST_MAX_ROWS):
         for vocab in (19360, 77):
@@ -251,6 +389,8 @@ def _check_exchange_matches_allgather(mapping: Mapping, strategy: AllReduceStrat
         graph.replay()
         torch.cuda.synchronize()
         _check_gathered(graph_out, gather_argmax_pairs_allgather(new, mapping))
+    # Off MNNVL the exchange never stages: it is the allgather producer.
+    assert (module._staging is not None) == expect_mnnvl
 
 
 def _check_tagged_workspace_is_separate(mapping: Mapping) -> None:
@@ -330,11 +470,20 @@ def _run_on_rank(world: int, check, *args, test_mnnvl: bool = False) -> None:
 
 
 def _exchange_worker(world: int) -> bool:
-    for strategy in (AllReduceStrategy.NCCL, AllReduceStrategy.AUTO):
-        _run_on_rank(world, _check_exchange_matches_allgather, strategy)
+    # NCCL never uses MNNVL: the exchange runs the allgather producer (never
+    # the custom one-shot kernels). AUTO asks for MNNVL on its own workspace,
+    # so it gets it on this single node exactly when the hardware supports it.
+    _run_on_rank(world, _check_exchange_matches_allgather, AllReduceStrategy.NCCL, False)
+    _run_on_rank(
+        world, _check_exchange_matches_allgather, AllReduceStrategy.AUTO, _mnnvl_available()
+    )
     if _mnnvl_available():
         _run_on_rank(
-            world, _check_exchange_matches_allgather, AllReduceStrategy.MNNVL, test_mnnvl=True
+            world,
+            _check_exchange_matches_allgather,
+            AllReduceStrategy.MNNVL,
+            True,
+            test_mnnvl=True,
         )
     return True
 

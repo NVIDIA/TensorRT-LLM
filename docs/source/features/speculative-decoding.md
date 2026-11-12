@@ -121,6 +121,8 @@ llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 
 MTP can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
+Under plain tensor parallelism (no attention DP), each draft step exchanges the per-rank argmax of the vocab-sharded draft head. On MNNVL-capable systems (for example GB200 / GB300, single- or multi-node) with `allreduce_strategy` set to `AUTO` (the default) or `MNNVL`, this exchange uses a single fused MNNVL all-reduce on its own workspace instead of an allgather; the draft tokens are identical, and the model's other all-reduces are unaffected. Set `TRTLLM_MTP_DRAFT_ARGMAX_ALLREDUCE=0` to use the allgather.
+
 ### PARD
 
 PARD (PARallel Draft) is a target-independent speculative decoding method that predicts all draft tokens in a single forward pass using mask tokens. Unlike MTP or EAGLE 3 which generate drafts one token at a time, PARD produces K draft tokens in parallel.

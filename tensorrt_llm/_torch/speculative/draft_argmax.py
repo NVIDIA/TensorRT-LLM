@@ -22,10 +22,14 @@ rank-major pairs:
 
 * ``gather_argmax_pairs_allgather``: the original one, ``torch.max`` pairs + an NCCL allgather.
 * ``DraftArgmaxExchange``: ``local_argmax_pack`` (one Triton launch) writes each row's pair into
-  this rank's two slots of a ``[rows, ROW_WIDTH]`` fp32 row, zeros elsewhere, and the generic
-  ``AllReduce`` module SUMs the rows. Every slot has exactly one non-zero contributor, so the
-  SUM equals the allgather exactly under any strategy (x + 0 == x in fp32); the strategy
-  follows the model's ``allreduce_strategy``. Same tie-break (lowest index) and NaN rule (NaN
+  this rank's two slots of a ``[rows, ROW_WIDTH]`` fp32 row, zeros elsewhere, and the MNNVL
+  all-reduce SUMs the rows on its own tagged workspace. Every slot has exactly one non-zero
+  contributor, so the SUM equals the allgather exactly (x + 0 == x in fp32). Under the model's
+  ``AUTO`` (or ``UB``) ``allreduce_strategy`` the exchange requests MNNVL for its own workspace,
+  so it runs on any group whose hardware supports MNNVL, single-node included, without moving
+  the model's all-reduces off ``AUTO``'s choice; under ``MNNVL`` likewise. Groups without MNNVL
+  and every other explicit strategy keep the original producer. Same tie-break (lowest index)
+  and NaN rule (NaN
   wins, lowest NaN index) as ``torch.max``, bf16 widened bit-exactly in-kernel, so the packed
   pair is bit-identical to the original producer's. Two value-vs-bit corners of the SUM: a NaN
   max comes back canonicalised and a -0.0 max as +0.0; the consumer compares values, so the
@@ -33,8 +37,10 @@ rank-major pairs:
 
 Lamport one-shot allreduce kernels clear the previous launch's payload with the current
 launch's threads, so a tiny exchange sharing the model's workspace pays for clearing the model
-payload; the tagged workspace isolates it. Today only the MNNVL registry is tagged; the custom
-one-shot workspace is a follow-up.
+payload; the tagged workspace isolates it. Only the MNNVL registry is tagged. The custom
+one-shot kernels must not run the exchange on the model's workspace: they record the clear
+size in elements of the launching dtype, so a bf16 launch after the fp32 exchange would clear
+only half of the exchange's bytes. Hence MNNVL only, until the custom workspace is tagged.
 
 Gate: ``TRTLLM_MTP_DRAFT_ARGMAX_ALLREDUCE`` (unset / "1" = on, "0" = original producer), read
 once and cached so the choice is fixed before any CUDA-graph capture.
@@ -53,7 +59,7 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..distributed.ops import AllReduce, MNNVLAllReduce, allgather
+from ..distributed.ops import AllReduce, AllReduceParams, MNNVLAllReduce, allgather
 
 DRAFT_ARGMAX_ALLREDUCE_ENV = "TRTLLM_MTP_DRAFT_ARGMAX_ALLREDUCE"
 
@@ -195,11 +201,12 @@ def local_argmax_pack(
 class DraftArgmaxExchange(nn.Module):
     """Gathered ``[rows, 2 * tp_size]`` fp32 rank-major (index, value) pairs of one TP group.
 
-    ``forward(logits)`` packs + SUM-allreduces up to ``max_rows`` rows and otherwise runs
-    ``gather_argmax_pairs_allgather``; both feed ``_get_draft_tokens_from_gathered``. Build it
-    at worker construction: the all-reduce workspaces must exist before any CUDA-graph capture,
-    and the MNNVL workspace split is collective over the group. Only the staging buffer is
-    allocated lazily (see ``__init__``): construction may run under ``MetaInitMode``.
+    ``forward(logits)`` packs + MNNVL SUM-allreduces up to ``max_rows`` rows and otherwise
+    (more rows, or no MNNVL all-reduce for the group) runs ``gather_argmax_pairs_allgather``;
+    both feed ``_get_draft_tokens_from_gathered``. Build it at worker construction: the
+    all-reduce workspaces must exist before any CUDA-graph capture, and the MNNVL workspace
+    split is collective over the group. Only the staging buffer is allocated lazily (see
+    ``__init__``): construction may run under ``MetaInitMode``.
     """
 
     def __init__(
@@ -219,6 +226,14 @@ class DraftArgmaxExchange(nn.Module):
         self._slot = 2 * mapping.tp_rank
         self._idx_offset_factor = mapping.tp_rank  # idx_offset = tp_rank * vocab_per_rank
         self._out_cols = 2 * tp_size
+        if strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.UB):
+            # AUTO opts into MNNVL only for multi-node groups, to keep the
+            # model's all-reduces on the custom kernels within a node. The
+            # exchange runs on its own tagged workspace, so it asks for MNNVL
+            # explicitly and also gets it on a single node. UB runs only
+            # inside the torch.compile residual-RMSNorm pattern pass on
+            # userbuffers-registered inputs, never for this eager, unfused SUM.
+            strategy = AllReduceStrategy.MNNVL
         self.allreduce = AllReduce(
             mapping,
             strategy=strategy,
@@ -238,18 +253,30 @@ class DraftArgmaxExchange(nn.Module):
         # tensor (data_ptr 0). The first forward is the eager warm-up, before
         # any CUDA-graph capture.
         self._staging: Optional[torch.Tensor] = None
+        self._allreduce_params = AllReduceParams()
 
-    def _staging_rows(self, rows: int) -> torch.Tensor:
-        if self._staging is None:
+    @property
+    def uses_mnnvl(self) -> bool:
+        """Whether forward runs the pack + MNNVL all-reduce (else the allgather producer)."""
+        return self.allreduce.mnnvl_allreduce is not None
+
+    def _ensure_staging(self, device: torch.device) -> None:
+        if self._staging is None and self.uses_mnnvl:
             self._staging = torch.empty(
-                (self.max_rows, ROW_WIDTH), dtype=torch.float32, device="cuda"
+                (self.max_rows, ROW_WIDTH), dtype=torch.float32, device=device
             )
-        return self._staging[:rows]
 
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        # Before the branch, so the eager warm-up allocates it whichever branch
+        # it takes, never a later CUDA-graph capture.
+        self._ensure_staging(logits.device)
         rows = logits.shape[0]
-        if not 0 < rows <= self.max_rows:
+        if not self.uses_mnnvl or not 0 < rows <= self.max_rows:
             return gather_argmax_pairs_allgather(logits, self.mapping)
-        staging = self._staging_rows(rows)
+        staging = self._staging[:rows]
         local_argmax_pack(logits, self._idx_offset_factor * logits.shape[1], staging, self._slot)
-        return self.allreduce(staging)[:, : self._out_cols]
+        # Called directly, not through AllReduce.forward: an unfused MNNVL
+        # all-reduce always returns its output, so the exchange never falls
+        # through to the custom one-shot kernels on the model's workspace.
+        out = self.allreduce.mnnvl_allreduce(staging, all_reduce_params=self._allreduce_params)
+        return out[:, : self._out_cols]
