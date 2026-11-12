@@ -12,23 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Persistent warp-specialized GVR top-K decode for tall K = 2048 batches (Hopper).
+"""Persistent warp-specialized GVR top-K decode for tall K = 512 / 1024 / 2048 batches (Hopper).
 
-The host routes decode batches of 128 rows or more with long rows here on 132-SM Hopper parts
+The host routes tall decode batches with long rows here on 132-SM Hopper parts
 (``gvr_topk_decode_self_sampling_host._tallws_gate``). Each of the ``grid_of(rows, SMs)`` CTAs
 owns the rows ``blockIdx.x + i * gridDim.x``, so one CTA streams its next row while it selects
 the current one; CTAs never wait on each other. A CTA has 576 threads in three roles:
 
-* warp 0, the producer: one lane streams the CTA's rows into a ring of 4 x 32 KB shared-memory
-  stages with 1-D ``cp.async.bulk`` copies under an L2 evict_first policy. A stage's ``full``
-  mbarrier counts its transaction bytes, its ``empty`` mbarrier one arrive per consumer warp, and
-  the ring state runs on across rows. Rows stream back to front: their survivors cluster at the
-  row end (recent tokens), so the emit-heavy chunks arrive while the ring is still filling.
+* warp 0, the producer: one lane streams the CTA's rows into a ring of 32 KB shared-memory
+  stages (four; three for FP32 at K <= 1024, whose sample buffer is larger) with 1-D
+  ``cp.async.bulk`` copies under an L2 evict_first policy. A stage's ``full`` mbarrier counts its
+  transaction bytes, its ``empty`` mbarrier one arrive per consumer warp, and the ring state runs
+  on across rows. Rows stream back to front: their survivors cluster at the row end (recent
+  tokens), so the emit-heavy chunks arrive while the ring is still filling.
 * warp 1, the planner: one row ahead of the consumers it gathers the row's strided 16-B samples
   (the sampling ladder of ``GvrMainKernel``), builds a 256-bin sample histogram, derives the
   rungs (threshold T, histogram cut HIC, retry rung t5, the sampled K-th code tkc) and the first
   attempt's window, and publishes them through two mbarrier-guarded slots. Row 0's first gathers
-  leave before the producer's first ring loads (named barrier ``BAR_EI``).
+  leave before the producer's first ring loads (named barrier ``BAR_EI``), and the consumers wait
+  for row 0's slot on the named barrier ``BAR_S0``, which the planner passes once it published it.
 * warps 2-17, 512 consumers: per row they classify every stage against the window, stage each
   survivor's {value, index} and count it in the window histogram, and verify that the window
   holds K scores; a short window retries at the next rung straight from global memory while the
@@ -37,8 +39,8 @@ the current one; CTAs never wait on each other. A CTA has 576 threads in three r
   row out with 16-B stores. Every CTA-wide barrier of that path is the named barrier
   ``BAR_CONS`` over the consumers.
 
-Window bins: BF16 one 16-bit code per bin over 256 bins, FP16 one code per bin over 2,048 bins
-anchored 1,023 codes below the sampled K-th, FP32 256 linear bins.
+Window bins: at K = 2048 BF16 one 16-bit code per bin over 256 bins and FP16 one code per bin
+over 2,048 bins anchored 1,023 codes below the sampled K-th; FP32 and K <= 1024 256 linear bins.
 """
 
 import cutlass
@@ -77,27 +79,26 @@ from .gvr_topk_decode_self_sampling import (
     widen_f16_hi,
 )
 
-WS_K = 2048  # the top-K the engine serves
+WS_KS = (512, 1024, 2048)  # the top-K values the engine serves
 WS_NCT = 512  # consumer threads (the BLK = 512 selection)
 WS_NCW = WS_NCT // 32  # consumer warps: the arrive count of a ring stage's empty mbarrier
 WS_SCPB = 8192  # survivor staging slots ({value bits, idx}, 8 B); the ladder clamps aim to SCPB / 2
 WS_CMPB = 1024  # crossing-bin candidate slots (s_ck64)
-WS_RING = (4, 32768)  # ring stages, bytes per stage (one stream chunk per stage)
-# sampling ladder (aim_base, sfac, sd_en): aim 2K, sample factor 64, and rows of 2K < n <= SCPB
-# scores sampled as well
-WS_LADDER = (2 * WS_K, 64, 1)
+WS_STAGE_BYTES = 32768  # bytes per ring stage (one stream chunk per stage)
+# Sampling ladder per K (aim_base, sfac, sd_en): aim 2K with sample factor 64 (32 at K = 512);
+# at K = 2048 rows of 2K < n <= SCPB scores are sampled as well.
+WS_LADDER = {512: (1024, 32, 0), 1024: (2048, 64, 0), 2048: (4096, 64, 1)}
+# The ladder's largest sample set (samples of 8 scores) over rows of up to 262,144 scores: the
+# planner's sample buffer holds it, so such rows gather in one round; longer rows gather in rounds.
+_WS_MAX_SAMPLES = {512: 853, 1024: 1043, 2048: 512}
 NB_PLAN = 256  # planner sample-histogram bins
 BAR_CONS = 1  # consumer named barrier (512 threads); barrier 0 is the CTA prologue only
+BAR_S0 = 2  # planner warp + consumers: the planner published row 0's slot
 BAR_EI = 3  # producer + planner warps: row 0's sample gathers leave before the first ring loads
 WS_SMEM_MAX = 227 * 1024  # opt-in dynamic shared memory per block
 _PRODUCER_WARP = 0
 _PLANNER_WARP = 1
 _CONSUMER_WARP0 = 2
-
-# Per logits dtype tag: (one-code dense bins, FP16 window width in units of 512 bins, planner
-# sample buffer bytes). The buffer holds the ladder's largest sample set (511 samples of 8 scores)
-# of rows up to 262,144 scores, so they gather in one round; longer rows gather in rounds.
-_WS_DTYPE = {"f32": (False, 1, 16384), "bf16": (True, 1, 8192), "f16": (True, 4, 8192)}
 
 # s_lad slot words (per row, written by the planner, read by the consumers)
 L_N, L_NROW, L_SHORT, L_T, L_HIC, L_TKC, L_T5, L_TF, L_SC, L_ANCH = range(10)
@@ -229,22 +230,24 @@ def _scan_cross_w_cons(s_hist, s_ws, target, ctid, s_res, nb: cutlass.Constexpr)
 
 
 class GvrTallWsKernel(GvrMainKernel):
-    """Persistent warp-specialized top-K decode for tall K = 2048 batches (see the module docstring).
+    """Persistent warp-specialized top-K decode for tall batches (see the module docstring).
 
     Args:
         dtype: cutlass.Float32, cutlass.BFloat16 or cutlass.Float16 logits.
-        k: the top-K; 2048.
+        k: the top-K; 512, 1024 or 2048.
         next_n: rows per request. Row ``r`` holds ``n = (kv_lens[r // next_n] - next_n +
             r % next_n + 1) >> cr_shift`` scores, clamped to ``[0, npad]``.
         cr_shift: log2 of the KV compression ratio (0 or 2).
     """
 
     def __init__(
-        self, dtype=cutlass.BFloat16, k: int = WS_K, next_n: int = 1, cr_shift: int = 0
+        self, dtype=cutlass.BFloat16, k: int = 2048, next_n: int = 1, cr_shift: int = 0
     ) -> None:
-        assert k == WS_K, f"the tall-batch engine serves K = {WS_K}"
-        tag = "f32" if dtype is cutlass.Float32 else "bf16" if dtype is cutlass.BFloat16 else "f16"
-        dense, wide, sb_bytes = _WS_DTYPE[tag]
+        assert k in WS_KS, f"the tall-batch engine serves K in {WS_KS}"
+        fp32 = dtype is cutlass.Float32
+        # 16-bit K = 2048 windows hold one code per bin (FP16: 4 x 512 bins); the others are linear
+        dense = k == 2048 and not fp32
+        wide = 4 if dense and dtype is cutlass.Float16 else 1
         super().__init__(
             512,
             2,
@@ -257,7 +260,7 @@ class GvrTallWsKernel(GvrMainKernel):
             cr_shift=cr_shift,
             r_const=1,
             hint_free=True,
-            warp_rank=True,
+            warp_rank=k == 2048,
             staged_k=0,
             dtype=dtype,
             dense=dense,
@@ -279,11 +282,14 @@ class GvrTallWsKernel(GvrMainKernel):
         self.ve = 16 // self.eb  # elements per 16-B vector
         self.lve = self.ve.bit_length() - 1
         self.samp_bytes = 8 * self.eb  # one sample = 8 elements
-        self.ring_stages, self.stage_bytes = WS_RING
+        # the larger FP32 sample buffers of K <= 1024 leave room for three stages
+        self.ring_stages = 3 if fp32 and k <= 1024 else 4
+        self.stage_bytes = WS_STAGE_BYTES
         self.chv = self.stage_bytes // 16  # vectors per stage
         self.vpt = self.chv // WS_NCT  # vectors per consumer thread and stage
         assert self.vpt * self.ve <= 32, "one Int32 survivor mask per thread and stage"
-        self.sb_bytes = sb_bytes
+        # the sample buffer, rounded up to 1 KB
+        self.sb_bytes = -(-_WS_MAX_SAMPLES[self.kk] * self.samp_bytes // 1024) * 1024
         self.spr = self.sb_bytes // self.samp_bytes  # samples per gather round
         self.smem_bytes = self._smem_plan()
         assert self.smem_bytes <= WS_SMEM_MAX, f"dynamic smem {self.smem_bytes} B > {WS_SMEM_MAX} B"
@@ -1105,9 +1111,9 @@ class GvrTallWsKernel(GvrMainKernel):
         out_row,
     ):
         """Emit the row's top-K indices into ``out_row``: bins above the crossing bin B whole,
-        then the crossing bin refined (warp-ballot rank, quadratic rank or radix narrowing);
-        rows without a valid window (degen) narrow over the staged survivors (A) or over the
-        whole row from global memory (B)."""
+        then the crossing bin refined (warp-ballot rank at K = 2048, quadratic rank or radix
+        narrowing); rows without a valid window (degen) narrow over the staged survivors (A) or
+        over the whole row from global memory (B)."""
         BLK = WS_NCT
         NBS = self.nbs
         NBD = self.nbd
@@ -1214,8 +1220,9 @@ class GvrTallWsKernel(GvrMainKernel):
                 _bar_cons()  # ---- barrier (emit done) ----
                 if mc <= Int32(QUADC_CLUS__main):
                     warp_quad = Int32(0)
-                    if mc <= Int32(32):
-                        warp_quad = Int32(1)
+                    if cutlass.const_expr(self.warp_rank):
+                        if mc <= Int32(32):
+                            warp_quad = Int32(1)
                     if warp_quad != Int32(0):
                         rank_lane = lane
                         rank_i = ctid >> Int32(5)
@@ -1795,6 +1802,9 @@ class GvrTallWsKernel(GvrMainKernel):
                     s_lad[lb + Int32(L_ANCH)] = anch0
                     cute.arch.mbarrier_arrive(thr_full + slot)
                 cute.arch.sync_warp()
+                if i == Int32(0):
+                    # row 0's slot is published: release the consumers waiting on BAR_S0
+                    cute.arch.barrier_arrive(barrier_id=BAR_S0, number_of_threads=WS_NCT + 32)
 
         # ================================ consumers ================================
         if warp >= Int32(_CONSUMER_WARP0):
@@ -1810,6 +1820,10 @@ class GvrTallWsKernel(GvrMainKernel):
                 row = bid + i * gdim
                 slot = i & Int32(1)
                 use = i >> Int32(1)
+                if i == Int32(0):
+                    # row 0's thresholds take the planner several microseconds: wait for them on a
+                    # hardware barrier rather than in the mbarrier retry loop
+                    cute.arch.barrier(barrier_id=BAR_S0, number_of_threads=WS_NCT + 32)
                 cute.arch.mbarrier_wait(thr_full + slot, use & Int32(1))
                 lb = slot * Int32(LADW)
                 n = s_lad[lb + Int32(L_N)]
@@ -1937,8 +1951,9 @@ def get_compiled__tallws(dtype: str, k: int, next_n: int = 1, cr_shift: int = 0)
 
     Call: ``fn(logits [rows, npad], out [rows, K] int32, kv_lens [rows // next_n] int32, grid,
     npad, rows, aim_base, sfac, sd_en)`` with ``grid = grid_of(rows, SMs)`` and
-    ``(aim_base, sfac, sd_en) = WS_LADDER``; ``npad`` is a multiple of the 16-B vector and the
-    logits and out bases are 16-B aligned.
+    ``(aim_base, sfac, sd_en) = WS_LADDER[K]``; ``npad`` is a multiple of the 16-B vector and the
+    logits and out bases are 16-B aligned. The build depends on nothing else: the ring, sample
+    buffer, window bins and crossing-bin rank follow from (dtype, K).
     """
     key = (dtype, int(k), int(next_n), int(cr_shift))
     hit = _TALLWS_CACHE.get(key)
@@ -1965,3 +1980,6 @@ def get_compiled__tallws(dtype: str, k: int, next_n: int = 1, cr_shift: int = 0)
     )
     _TALLWS_CACHE[key] = compiled
     return compiled
+
+
+__all__ = ["WS_KS", "WS_LADDER", "GvrTallWsKernel", "get_compiled__tallws", "grid_of"]

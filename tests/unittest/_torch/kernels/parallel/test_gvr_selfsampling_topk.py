@@ -1087,6 +1087,7 @@ def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch)
     that read their survivors from registers, which keep the 256-thread slab below 128K.
     Blackwell keeps its plans."""
     _record_compile_requests(monkeypatch)
+    _without_tall_ws(monkeypatch)  # it serves some 132-SM K <= 1024 shapes below
 
     def aim(rows, n, k, num_sms, sm_version, dtype):
         launcher = _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
@@ -1177,6 +1178,7 @@ def test_selfsampling_hopper_fp16_wide_slabs_issue_samples_first(monkeypatch) ->
     loads before the row prologue (env_first) up to 48M scores per batch, the bound of p2.
     Blackwell keeps its rungs: 256-thread slabs, and 512-thread slabs of rows of 128K scores."""
     requests = _record_compile_requests(monkeypatch)
+    _without_tall_ws(monkeypatch)  # it serves some 132-SM K <= 1024 shapes below
 
     def env_first(rows, n, k, num_sms, sm_version):
         monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
@@ -1372,12 +1374,15 @@ def test_selfsampling_hopper_multiwave_lookahead_exact(
 
 
 def test_selfsampling_hopper_tall_batches_run_ws_engine(monkeypatch) -> None:
-    """132-SM Hopper parts run K = 2048 decode batches of 128 rows or more whose rows hold at least
-    32,768 FP32 or 65,536 16-bit scores (the envelope clamped to the row stride) on the persistent
-    tall-batch engine: one launch of ceil(rows / ceil(rows / 132)) CTAs with the K = 2048 sampling
-    ladder, for 16-bit rows only when that fills 128 CTAs. Smaller batches, shorter rows, other K,
-    deterministic mode, the H20 and Blackwell keep their plans; the FP32 warmup launches the engine
-    once for all its row counts."""
+    """132-SM Hopper parts run tall decode batches on the persistent tall-batch engine: one launch
+    of G = ceil(rows / R) CTAs of R = ceil(rows / 132) rows with the sampling ladder of K. A band
+    of R, G and row length n (the envelope clamped to the row stride) admits it: at K = 2048 FP32
+    rows of 32,768 scores on 64 CTAs or more and 16-bit rows of 65,536 on 128; below K = 2048, on
+    128 CTAs or, with three or more rows per CTA, on 110: FP32 K = 1024 rows of 24,576, FP32 K = 512
+    rows of 24,576 to 196,607 with two or more rows per CTA, and 16-bit rows of 98,304 with two or
+    more rows per CTA or of 49,152 with four or more. Other K, deterministic mode, the H20 and
+    Blackwell keep their plans; the FP32 warmup launches the engine once for all its row counts and
+    the 16-bit warmup every requested row count."""
     requests = _record_compile_requests(monkeypatch)
 
     def launcher(rows, n, k, dtype, num_sms=132, sm_version=90, npad=None, det=False, next_n=1):
@@ -1389,43 +1394,80 @@ def test_selfsampling_hopper_tall_batches_run_ws_engine(monkeypatch) -> None:
             rows, npad, k, n, next_n, 4, num_sms, sm_version, dtype=dtype, device_index=0, det=det
         )
 
-    for dtype, n_min in ((torch.float32, 32768), (torch.bfloat16, 65536), (torch.float16, 65536)):
-        for rows, grid in (
-            (128, 128),
-            (133, 67),
-            (254, 127),
-            (255, 128),
-            (264, 132),
-            (300, 100),
-            (1024, 128),
-        ):
-            for n in (n_min, 65551, 163775):
-                lc = launcher(rows, n, 2048, dtype)
-                if dtype is not torch.float32 and grid < 128:
-                    assert lc[0] != "tallws", (dtype, rows, n, lc[0])
-                    assert all(name != "get_compiled__tallws" for name, _ in requests)
-                    continue
-                assert lc[0] == "tallws", (dtype, rows, n, lc[0])
-                assert lc[2] == (grid, (n + 63) // 64 * 64, rows, 4096, 64, 1), (rows, n, lc[2])
-                assert requests == [("get_compiled__tallws", {"next_n": 1, "cr_shift": 2})]
-        assert launcher(256, 65551, 2048, dtype, next_n=2)[0] == "tallws"
-        assert requests == [("get_compiled__tallws", {"next_n": 2, "cr_shift": 2})]
-        for args in (
-            (127, 65551, 2048, dtype),
-            (128, n_min - 1, 2048, dtype),
-            (128, 131075, 1024, dtype),
-            (512, 65539, 512, dtype),
-            (512, 65551, 2048, dtype, 148, 100),
-            (512, 65551, 2048, dtype, 148, 103),
-            (512, 65551, 2048, dtype, 160, 103),
-            (512, 65551, 2048, dtype, 78, 90),
-        ):
-            assert launcher(*args)[0] != "tallws", args
-            assert all(name != "get_compiled__tallws" for name, _ in requests), args
+    ladder = {512: (1024, 32, 0), 1024: (2048, 64, 0), 2048: (4096, 64, 1)}
+    fp32, low = (torch.float32,), (torch.bfloat16, torch.float16)
+    # (dtypes, K, rows, n, routed) at every edge of the bands: n, the FP32 K = 512 bound, R (1 up
+    # to 132 rows, 2 from 133, 3 from 265, 4 from 397) and G (110 from 328 rows at R = 3 and from
+    # 437 at R = 4, 128 from 255 rows at R = 2 and from 382 at R = 3)
+    cases = [
+        (fp32, 2048, 64, 32768, True),
+        (fp32, 2048, 127, 32768, True),
+        (fp32, 2048, 133, 32768, True),
+        (fp32, 2048, 300, 32768, True),
+        (fp32, 2048, 1024, 163775, True),
+        (fp32, 2048, 128, 32767, False),
+        (fp32, 2048, 63, 262127, False),
+        (low, 2048, 128, 65536, True),
+        (low, 2048, 255, 65536, True),
+        (low, 2048, 382, 65536, True),
+        (low, 2048, 1024, 163775, True),
+        (low, 2048, 128, 65535, False),
+        (low, 2048, 127, 262127, False),
+        (low, 2048, 254, 262127, False),
+        (low, 2048, 381, 262127, False),
+        (fp32, 1024, 128, 24576, True),
+        (fp32, 1024, 255, 24576, True),
+        (fp32, 1024, 328, 24576, True),
+        (fp32, 1024, 1024, 262127, True),
+        (fp32, 1024, 127, 262127, False),
+        (fp32, 1024, 254, 262127, False),
+        (fp32, 1024, 327, 262127, False),
+        (fp32, 1024, 1024, 24575, False),
+        (fp32, 512, 255, 24576, True),
+        (fp32, 512, 437, 196607, True),
+        (fp32, 512, 1024, 196607, True),
+        (fp32, 512, 128, 65538, False),
+        (fp32, 512, 254, 65538, False),
+        (fp32, 512, 436, 65538, False),
+        (fp32, 512, 1024, 196608, False),
+        (fp32, 512, 255, 24575, False),
+    ]
+    for k in (512, 1024):
+        cases += [
+            (low, k, 255, 98304, True),
+            (low, k, 328, 98304, True),
+            (low, k, 396, 98304, True),
+            (low, k, 437, 49152, True),
+            (low, k, 1024, 262127, True),
+            (low, k, 128, 262127, False),
+            (low, k, 254, 262127, False),
+            (low, k, 255, 98303, False),
+            (low, k, 327, 262127, False),
+            (low, k, 396, 98303, False),
+            (low, k, 436, 262127, False),
+            (low, k, 437, 49151, False),
+        ]
+    for dtypes, k, rows, n, routed in cases:
+        for dtype in dtypes:
+            lc = launcher(rows, n, k, dtype)
+            assert (lc[0] == "tallws") is routed, (dtype, k, rows, n, lc[0])
+            if not routed:
+                assert all(name != "get_compiled__tallws" for name, _ in requests)
+                continue
+            npad, grid = (n + 63) // 64 * 64, -(-rows // -(-rows // 132))
+            assert lc[2] == (grid, npad, rows, *ladder[k]), (dtype, k, rows, n, lc[2])
+            assert requests == [("get_compiled__tallws", {"next_n": 1, "cr_shift": 2})]
+            assert launcher(rows, n, k, dtype, next_n=2)[0] == "tallws"
+            assert requests == [("get_compiled__tallws", {"next_n": 2, "cr_shift": 2})]
+            for profile in ((148, 100), (148, 103), (160, 103), (78, 90)):
+                assert launcher(rows, n, k, dtype, *profile)[0] != "tallws", (dtype, k, profile)
+                assert all(name != "get_compiled__tallws" for name, _ in requests)
+            if dtype is torch.float32:
+                assert launcher(rows, n, k, dtype, det=True)[0] != "tallws", (k, rows, n)
     # the row stride bounds the envelope
     assert launcher(512, 65551, 2048, torch.float32, npad=40000)[0] == "tallws"
     assert launcher(512, 65551, 2048, torch.bfloat16, npad=40000)[0] != "tallws"
-    assert launcher(512, 65551, 2048, torch.float32, det=True)[0] != "tallws"
+    assert launcher(1024, 262127, 512, torch.float32, npad=196544)[0] == "tallws"
 
     # FP32 warmup launches one row count per engine: the first one the tall-batch engine serves
     profile = ss_host._pack_device_profile(132, 90)
@@ -1437,48 +1479,67 @@ def test_selfsampling_hopper_tall_batches_run_ws_engine(monkeypatch) -> None:
     )
     for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
         monkeypatch.setattr(ss_host, cache, {})
-    ss_host.warmup_varlen(2048, 65551, num_rows_list=(64, 300), row_stride=65600)
-    assert [rows for rows in launched if rows >= 128] == [128], launched
-    for rows in (64, 300):
-        family = ss_host._VARLEN_CACHE[(rows, 65600, 2048, 65551, 1, 1, profile)][0]
-        assert (family == "tallws") is (rows >= 128), (rows, family)
+    for k, first in ((2048, 64), (512, 255)):
+        launched.clear()
+        ss_host.warmup_varlen(k, 65551, num_rows_list=(64, 264), row_stride=65600)
+        assert [rows for rows in launched if rows >= first] == [first], (k, launched)
+        for rows in (64, 264):
+            family = ss_host._VARLEN_CACHE[(rows, 65600, k, 65551, 1, 1, profile)][0]
+            assert (family == "tallws") is (rows >= first), (k, rows, family)
+    # the 16-bit warmup launches every requested row count
+    launched.clear()
+    ss_host.warmup_varlen(
+        1024, 65551, num_rows_list=(437, 512), row_stride=65600, dtype=torch.bfloat16
+    )
+    assert launched == [437, 512], launched
 
 
 @pytest.mark.parametrize(
-    "dtype,rows,ncols,next_n",
+    "dtype,top_k,rows,ncols,next_n",
     [
-        pytest.param(torch.float32, 400, 40000, 1, id="f32_r4"),
-        pytest.param(torch.bfloat16, 264, 65551, 2, id="bf16_mtp2"),
-        pytest.param(torch.float16, 396, 65551, 1, id="f16_r3"),
+        pytest.param(torch.float32, 2048, 400, 40000, 1, id="f32_r4"),
+        pytest.param(torch.float32, 2048, 96, 40000, 1, id="f32_g96"),
+        pytest.param(torch.bfloat16, 2048, 264, 65551, 2, id="bf16_mtp2"),
+        pytest.param(torch.float16, 2048, 396, 65551, 1, id="f16_r3"),
+        pytest.param(torch.float32, 1024, 330, 40000, 1, id="f32_k1024_r3"),
+        pytest.param(torch.float32, 512, 264, 40000, 2, id="f32_k512_mtp2"),
+        pytest.param(torch.bfloat16, 1024, 441, 65551, 1, id="bf16_k1024_r4_uneven"),
+        pytest.param(torch.float16, 512, 264, 100000, 2, id="f16_k512_mtp2"),
+        pytest.param(torch.float32, 1024, 128, 300007, 1, id="f32_k1024_long"),
+        pytest.param(torch.float16, 512, 257, 300007, 1, id="f16_k512_long_uneven"),
+        pytest.param(torch.bfloat16, 2048, 128, 300007, 1, id="bf16_long"),
     ],
 )
 def test_selfsampling_hopper_tall_ws_exact(
-    monkeypatch, dtype: torch.dtype, rows: int, ncols: int, next_n: int
+    monkeypatch, dtype: torch.dtype, top_k: int, rows: int, ncols: int, next_n: int
 ) -> None:
     """The tall-batch engine, with the 132-SM Hopper profile forced so any SM90 or SM100 GPU runs
-    it (its CTAs never wait on each other), is exact on mixed rows: random, ties, constant, more
-    than K +inf, a -inf half, sparse high scores, high scores on exactly the sampled positions
-    (the first windows then hold fewer than K scores and the row retries down to the floor), and a
-    tie class at the sampled threshold (more survivors than staging slots, so the selection
-    re-reads the row), under per-request windows (full, shortened, sampled and unsampled rows below
-    the staging capacity, the short path, empty). Several rows per CTA carry the ring across rows.
-    A warmed (16-bit) or once-launched (FP32) batch captures into a CUDA graph and replays exactly
-    on new rows and lengths."""
+    it (its CTAs never wait on each other), is exact at K = 512, 1024 and 2048 on mixed rows:
+    random, ties, constant, more than K +inf, a -inf half, sparse high scores, high scores on
+    exactly the sampled positions (the first windows then hold fewer than K scores and the row
+    retries down to the floor), and a tie class at the sampled threshold (more survivors than
+    staging slots, so the selection re-reads the row), under per-request windows (full, shortened,
+    sampled and unsampled rows below the staging capacity, the short path, empty). Several rows
+    per CTA carry the ring across rows, also when the rows do not split evenly over the CTAs, and
+    rows of more than 262,144 scores gather their samples in several rounds. A warmed (16-bit) or
+    once-launched (FP32) batch captures into a CUDA graph and replays exactly on new rows and
+    lengths."""
     profile = ss_host._pack_device_profile(132, 90)
     monkeypatch.setattr(ss_host, "_device_profile_key", lambda device: profile)
     for name in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
         monkeypatch.setattr(ss_host, name, {})
     for name in ("_VARLEN_WARMUP_DONE", "_VARLEN_WARMUP_DONE_BF16", "_VARLEN_WARMUP_DONE_FP16"):
         monkeypatch.setattr(ss_host, name, set())
-    top_k = 2048
     stride = (ncols + 63) // 64 * 64
     arena = torch.empty((rows, stride), dtype=dtype, device=_DEV)
     logits = arena[:, :ncols]
     kv_lens = torch.empty((rows // next_n,), dtype=torch.int32, device=_DEV)
     indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    # the sampling ladder of these rows reads 8 scores every 512 (K = 2048, aim 4096, factor 64)
-    sampled = torch.arange(ncols // 512, device=_DEV)[:, None] * 512 + torch.arange(8, device=_DEV)
-    sampled = sampled.flatten()
+    # the sampling ladder of these rows reads 8 scores every 512 (K = 2048: aim 4096, factor 64)
+    # or every 256 (K = 1024: aim 2048, factor 64; K = 512: aim 1024, factor 32)
+    step = 512 if top_k == 2048 else 256
+    sampled = torch.arange(ncols // step, device=_DEV)[:, None] * step
+    sampled = (sampled + torch.arange(8, device=_DEV)).flatten()
 
     def fill(seed: int) -> list[int]:
         generator = torch.Generator(device=_DEV).manual_seed(seed)
@@ -3194,15 +3255,11 @@ def _routes_as_picked() -> bool:
 
 def _picked_family(family: str, rows: int, n: int, top_k: int, dtype: torch.dtype) -> str:
     """The family a fixed test shape picked for ``family`` runs on this GPU: 132-SM Hopper parts
-    run K = 2048 batches of 128 rows or more whose rows hold at least 32,768 FP32 or 65,536 16-bit
-    scores on the tall-batch engine, 16-bit ones when they fill 128 of its CTAs."""
+    run the tall batches the tall-batch engine takes (its routing test checks the bands)."""
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    tall = (
-        (props.major * 10 + props.minor, props.multi_processor_count) == (90, 132)
-        and top_k == 2048
-        and rows >= 128
-        and n >= (32768 if dtype is torch.float32 else 65536)
-        and (dtype is torch.float32 or ss_host._tallws().grid_of(rows, 132) >= 128)
+    sm_version = props.major * 10 + props.minor
+    tall = ss_host._tallws_gate(
+        rows, n, top_k, props.multi_processor_count, sm_version, dtype, False
     )
     return "tallws" if tall else family
 

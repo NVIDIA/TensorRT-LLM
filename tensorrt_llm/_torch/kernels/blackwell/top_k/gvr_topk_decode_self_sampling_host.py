@@ -72,8 +72,7 @@ _tallws_mod = None
 
 
 def _tallws():
-    """Lazy import of the tall-batch engine module (reached only by the 132-SM Hopper batches
-    ``_tallws_gate`` considers)."""
+    """Lazy import of the tall-batch engine module (reached only by the batches it serves)."""
     global _tallws_mod
     if _tallws_mod is None:
         from . import gvr_topk_decode_tall_ws as _m
@@ -259,20 +258,22 @@ def _three_cta_clusters(b: int, num_sms: int, sm_version: int) -> bool:
     )
 
 
-# Tall K = 2048 decode batches on the 132-SM Hopper parts (H100 / H200 SXM) run the persistent
-# warp-specialized engine of ``gvr_topk_decode_tall_ws``: one CTA per SM streams its next row
-# through a TMA ring while it selects the current one, which the one-row-per-CTA plans leave
-# serial. It takes batches of 128 rows or more whose rows hold at least 32,768 FP32 or 65,536
-# 16-bit scores. Shorter rows keep their plans, which beat it at some batch sizes (FP32 rows
-# below 32K scores, BF16 rows of 48K scores on H200). A 16-bit batch must also fill 128 CTAs:
-# rows just past a multiple of the SM count leave the engine fewer CTAs (rows 133-254 run two
-# per CTA on 67-127), whose slower stream costs 16-bit rows up to 1.24x, while FP32 rows stay
-# within 2 % there.
+# Tall decode batches on the 132-SM Hopper parts (H100 / H200 SXM) run the persistent
+# warp-specialized engine of ``gvr_topk_decode_tall_ws``, which streams a CTA's next row while it
+# selects the current one. A launch of R = ceil(rows / SMs) rows per CTA on G = ceil(rows / R) CTAs
+# runs it when a band (min R, min G, min n, n bound) of its (K, logits element bytes) admits it, n
+# being the envelope clamped to the row stride. Fewer CTAs stream slower than the one-row plans'
+# waves, and 16-bit rows stage so many survivors per streamed byte that they gain only on longer
+# rows or with more rows per CTA.
 _TALLWS_PROFILE = (132, 90)
-_TALLWS_K = 2048
-_TALLWS_MIN_ROWS = 128
-_TALLWS_MIN_N = {torch.float32: 32768, torch.bfloat16: 65536, torch.float16: 65536}
-_TALLWS_MIN_CTAS_16BIT = 128
+_TALLWS_BANDS = {
+    (2048, 4): ((1, 64, 32768, math.inf),),
+    (2048, 2): ((1, 128, 65536, math.inf),),
+    (1024, 4): ((1, 128, 24576, math.inf), (3, 110, 24576, math.inf)),
+    (1024, 2): ((2, 128, 98304, math.inf), (3, 110, 98304, math.inf), (4, 110, 49152, math.inf)),
+    (512, 4): ((2, 128, 24576, 196608), (3, 110, 24576, 196608)),
+    (512, 2): ((2, 128, 98304, math.inf), (3, 110, 98304, math.inf), (4, 110, 49152, math.inf)),
+}
 
 
 def _tallws_gate(
@@ -286,15 +287,12 @@ def _tallws_gate(
 ) -> bool:
     """Whether a varlen decode launch runs the tall-batch engine (``n_kernel``: the launch
     envelope clamped to the row stride)."""
-    if not (
-        (num_sms, sm_version) == _TALLWS_PROFILE
-        and k == _TALLWS_K
-        and not det
-        and num_rows >= _TALLWS_MIN_ROWS
-        and n_kernel >= _TALLWS_MIN_N[dtype]
-    ):
+    if (num_sms, sm_version) != _TALLWS_PROFILE or det or num_rows < 1:
         return False
-    return dtype is torch.float32 or _tallws().grid_of(num_rows, num_sms) >= _TALLWS_MIN_CTAS_16BIT
+    per_cta = -(-num_rows // num_sms)
+    grid = -(-num_rows // per_cta)
+    bands = _TALLWS_BANDS.get((k, 4 if dtype is torch.float32 else 2), ())
+    return any(per_cta >= r and grid >= g and lo <= n_kernel < hi for r, g, lo, hi in bands)
 
 
 def _even_chunk_u(vectors: int, u: int) -> int:
@@ -2488,14 +2486,15 @@ def _tallws_launcher(
 ) -> tuple:
     """Tall-batch engine launcher in the main-family ABI ``fn(logits, pre_idx, out, ws, *pre,
     kv_lens, *tail)`` with ``pre`` = (grid, npad, rows, aim_base, sfac, sd_en): one persistent
-    launch of ``grid_of(rows, num_sms)`` CTAs, which reads neither the hints nor the workspace."""
+    launch of ``grid_of(rows, num_sms)`` CTAs with the sampling ladder of K, which reads neither
+    the hints nor the workspace."""
     tall = _tallws()
     fn = tall.get_compiled__tallws(_DTYPE_TAG[dtype], k, next_n=next_n, cr_shift=cr_shift)
 
     def launch(logits, pre_idx, out, workspace, grid, npad_, rows, aim_base, sfac, sd_en, kv_lens):
         fn(logits, out, kv_lens, grid, npad_, rows, aim_base, sfac, sd_en)
 
-    pre = (tall.grid_of(num_rows, num_sms), npad, num_rows, *tall.WS_LADDER)
+    pre = (tall.grid_of(num_rows, num_sms), npad, num_rows, *tall.WS_LADDER[k])
     return ("tallws", launch, pre, ())
 
 
