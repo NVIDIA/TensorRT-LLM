@@ -2672,8 +2672,8 @@ class PyExecutor:
             self._memory_monitor_token = None
             gpu_memory_providers.end_executor(memory_monitor_token)
             gpu_memory_tagging.forget_startup_of(memory_monitor_token)
-        # Stops only a stack recording the monitor itself started.
-        gpu_memory_stacks.stop_stack_recording()
+            # Stops only a stack recording the monitor itself started.
+            gpu_memory_stacks.stop_stack_recording()
         encoder_launch_executor = getattr(self, "encoder_launch_executor", None)
         if encoder_launch_executor is not None:
             encoder_launch_executor.shutdown(wait=True)
