@@ -16,7 +16,9 @@
 
 Rank 0 answers report requests and, in the memory monitor's full mode,
 gathers the other ranks' reports over its own communicator; without full
-mode the other ranks are listed as not gathered. Either way the executor
+mode the other ranks are listed as not gathered. Full mode is requested
+either through ``TLLM_MEM_MONITOR`` or through ``memory_monitor_config``,
+which has to reach every worker. Either way the executor
 shuts down promptly afterwards: a rank's report listener must not keep it in
 MPI.
 """
@@ -28,26 +30,33 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, MemoryMonitorConfig, SamplingParams
 
 _MODEL_PATH = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
 _SHUTDOWN_BOUND_S = 60.0
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
-@pytest.mark.parametrize("full_mode", [True, False], ids=["full", "default"])
-def test_every_rank_has_an_entry_and_shutdown_is_prompt(monkeypatch, full_mode):
+@pytest.mark.parametrize(
+    "requested_by", ["env", "config", None], ids=["full_env", "full_config", "default"]
+)
+def test_every_rank_has_an_entry_and_shutdown_is_prompt(monkeypatch, requested_by):
+    full_mode = requested_by is not None
     # Read by the MPI workers, which inherit TLLM* variables.
-    if full_mode:
+    if requested_by == "env":
         monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
     else:
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+    extra = {}
+    if requested_by == "config":
+        extra["memory_monitor_config"] = MemoryMonitorConfig(mode="full")
     llm = LLM(
         model=_MODEL_PATH,
         tensor_parallel_size=2,
         max_batch_size=4,
         max_seq_len=256,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.2),
+        **extra,
     )
     try:
         llm.generate(["Hello"], SamplingParams(max_tokens=4))

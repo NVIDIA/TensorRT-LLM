@@ -966,7 +966,7 @@ class BaseWorker(GenerationExecutor):
         """Explain where GPU memory is going, as readable reports.
 
         Built by the GPU memory monitor (``tensorrt_llm._torch.memory.monitor``)
-        in every ``TLLM_MEM_MONITOR`` mode. This worker's own report comes
+        in every monitor mode, including ``off``. This worker's own report comes
         first. Under the MPI executor only rank 0 is asked; it adds the other
         ranks' reports in the monitor's full mode, and otherwise one line per
         rank saying they were not gathered. A report that could not be built

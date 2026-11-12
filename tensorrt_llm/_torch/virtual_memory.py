@@ -16,6 +16,7 @@ from tensorrt_llm.bindings.internal.runtime import (
 
 from .memory.monitor.pools import (mark_materialized, mark_released,
                                    register_pool)
+from .memory.monitor.triggers import notify_error
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
@@ -160,11 +161,18 @@ def materialize_with_tag(*tags: str) -> int:
     """
     manager = get_virtual_memory_manager()
     materialized_blobs = 0
-    for tag in tags:
-        # A failing materialize rolls its tag back to released, so a tag is
-        # marked backed only once its own call has succeeded.
-        materialized_blobs += manager.materialize_with_tag(tag)
-        mark_materialized((tag, ))
+    try:
+        for tag in tags:
+            # A failing materialize rolls its tag back to released, so a tag
+            # is marked backed only once its own call has succeeded.
+            materialized_blobs += manager.materialize_with_tag(tag)
+            mark_materialized((tag, ))
+    except Exception as exc:
+        # Materializing allocates outside PyTorch, so no allocator hook sees
+        # a failure; every caller (the sleep/wakeup listener and
+        # BaseWorker.wakeup) reaches the memory monitor through here.
+        notify_error(str(exc))
+        raise
     return materialized_blobs
 
 

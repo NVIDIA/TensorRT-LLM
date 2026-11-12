@@ -912,6 +912,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor._kv_connector_failed = False
     executor.dist = SimpleNamespace(pp_size=1)
     executor._shutdown_sleep_wakeup_listeners = lambda: events.append("listener_shutdown")
+    executor._release_memory_monitor = lambda: None
     executor.encoder_launch_executor = None
     executor.worker_started = True
     executor.resource_manager = SimpleNamespace(

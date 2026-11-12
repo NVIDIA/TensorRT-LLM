@@ -21,7 +21,6 @@ case that matters most -- a region must record what it saw even when the
 code inside it raises.
 """
 
-import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -153,44 +152,3 @@ def test_kv_transfer_buffers_are_named(fake_memory, monkeypatch):
             max_num_tokens=8,
         )
     assert [r.residual_taken for r in _region("KV cache transfer buffers")] == [128 * MB]
-
-
-@pytest.mark.cpu_only
-def test_sleep_listener_reports_a_failed_wakeup(monkeypatch):
-    """Rematerializing on wakeup allocates outside PyTorch; its OOM is caught
-    by the listener thread, not by ``_handle_errors``."""
-    from tensorrt_llm._torch import virtual_memory
-    from tensorrt_llm._torch.pyexecutor import py_executor as mod
-
-    def materialize(*_):
-        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
-
-    reported = []
-    monkeypatch.setattr(virtual_memory, "materialize_with_tag", materialize)
-    monkeypatch.setattr(mod.gpu_memory_triggers, "notify_error", reported.append)
-    monkeypatch.setattr(mod, "set_thread_local_mpi_comm", lambda *_: None)
-    monkeypatch.setattr(mod, "CUASSERT", lambda *_: None)
-    monkeypatch.setattr(mod, "cudart", SimpleNamespace(cudaSetDevice=lambda *_: None))
-    monkeypatch.setattr(torch.cuda, "set_device", lambda *_: None)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
-
-    messages = [
-        {"action": mod._SleepWakeupAction.WAKEUP, "tags": ["model"]},
-        {"action": mod._SleepWakeupAction.SHUTDOWN},
-    ]
-    acks = []
-    comm = SimpleNamespace(recv=lambda **_: messages.pop(0), send=lambda ack, **_: acks.append(ack))
-    executor = mod.PyExecutor.__new__(mod.PyExecutor)
-    executor.device_id = 0
-    executor.dist = SimpleNamespace(rank=1)
-    executor._sleep_wakeup_comm = comm
-    executor.control_request_barrier = threading.Event()
-    executor.control_request_barrier.set()
-    executor.control_action_done = threading.Event()
-    executor._active_control_id = None
-    executor._run_mnnvl_checkpoint_resources = Mock()
-
-    executor._sleep_wakeup_listener_loop()
-
-    assert acks[0]["status"] == "error"
-    assert len(reported) == 1 and "out of memory" in reported[0]

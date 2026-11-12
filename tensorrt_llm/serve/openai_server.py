@@ -1451,10 +1451,15 @@ class OpenAIServer(_VideoRoutesMixin):
         A report exposes process IDs, other processes' device usage and, in
         stack mode, source paths, and each request makes every rank build a
         report next to its executor loop. The route therefore takes the
-        runtime-control authentication, like ``/memory_status``, and exists
-        only when ``TLLM_MEM_MONITOR=1`` and the runtime-control endpoints
-        are enabled. The frontend is rank 0 and serves every rank's report,
-        so ``TLLM_MEM_MONITOR_RANKS`` does not decide whether it exists.
+        runtime-control request signing, like ``/memory_status``, and exists
+        only when the monitor's full mode is requested (by
+        ``memory_monitor_config.mode`` or ``TLLM_MEM_MONITOR``) and a
+        runtime-control key is set. Sleep mode is not needed. The key is the
+        server's ``runtime_control_api_key`` or, failing that,
+        ``TRTLLM_RUNTIME_CONTROL_API_KEY``. With several frontends the route
+        is not served, since each frontend keeps its own replay cache. The
+        frontend is rank 0 and serves every rank's report, so
+        ``TLLM_MEM_MONITOR_RANKS`` does not decide whether it exists.
         """
         from tensorrt_llm._torch.memory.monitor import (configure,
                                                         full_mode_requested)
@@ -1463,12 +1468,20 @@ class OpenAIServer(_VideoRoutesMixin):
         configure(getattr(args, "memory_monitor_config", None))
         if not full_mode_requested():
             return
-        if not self._enable_runtime_control_endpoints:
+        api_key = (self._runtime_control_api_key
+                   or os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY"))
+        if not api_key:
             logger.info(
-                "GET /memory_report is not served: it requires the runtime "
-                "control endpoints and their API key. LLM.get_memory_report() "
-                "returns the same reports.")
+                "GET /memory_report is not served: set "
+                "TRTLLM_RUNTIME_CONTROL_API_KEY to serve it with signed "
+                "requests. LLM.get_memory_report() returns the same reports.")
             return
+        if getattr(args, "num_serve_frontends", 1) > 1:
+            logger.info(
+                "GET /memory_report is not served with num_serve_frontends > "
+                "1: request signing keeps its replay cache per frontend.")
+            return
+        self._runtime_control_api_key = api_key
         self.app.add_api_route(
             "/memory_report",
             self.memory_report,
@@ -3835,7 +3848,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                 "message": str(error)
                             }})
 
-    async def _call_runtime_memory_method(self, method: str, *args) -> object:
+    async def _call_runtime_memory_method(self, method: str, *args:
+                                          object) -> object:
         operation = getattr(self.generator, method)
         if isinstance(self.generator, AsyncLLM):
             return await operation(*args)

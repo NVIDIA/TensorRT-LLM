@@ -75,7 +75,6 @@ from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..memory import monitor as gpu_memory_monitor
 from ..memory.monitor import providers as gpu_memory_providers
-from ..memory.monitor import stacks as gpu_memory_stacks
 from ..memory.monitor import tagging as gpu_memory_tagging
 from ..memory.monitor import triggers as gpu_memory_triggers
 from ..memory.monitor.ranks import RankReporter
@@ -1615,7 +1614,7 @@ class PyExecutor:
         self._sleep_wakeup_listener_thread: Optional[threading.Thread] = None
         # Gathers GPU memory reports from every rank for rank 0; set up in
         # start_worker() in the monitor's full mode when ranks span MPI.
-        self._memory_report_ranks: Optional[RankReporter] = None
+        self._rank_reporter: Optional[RankReporter] = None
         # Whether this executor armed the monitor's OOM reporting, which
         # shutdown() then releases. Set by the executor's creator.
         self._oom_reporter_armed = False
@@ -1974,6 +1973,7 @@ class PyExecutor:
 
     def _event_loop_wrapper(self) -> None:
         crashed = False
+        watchdog = None
         self._event_loop_completed = False
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
@@ -2004,6 +2004,16 @@ class PyExecutor:
                 # A callback can fail outside the synchronized start/poll gates.
                 # Mark retention before cleanup wakes shutdown callers.
                 self._kv_connector_failed = True
+            if crashed:
+                # Armed BEFORE the error is logged and before cleanup: an
+                # ERROR log builds the memory report when the error is an
+                # OOM, and cleanup can block without bound on a send handle
+                # wedged by the crash. A kill placed after either could be
+                # delayed or never fire.
+                watchdog = start_rank_crash_kill_watchdog(
+                    self.dist.world_size,
+                    error_delivered=self._event_loop_error_delivered,
+                )
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -2026,13 +2036,6 @@ class PyExecutor:
             # enforces, not this one.
             raise
         finally:
-            # Armed BEFORE cleanup: cleanup can block without bound on a
-            # send handle wedged by the crash, and a kill placed only after
-            # it would never fire.
-            watchdog = start_rank_crash_kill_watchdog(
-                self.dist.world_size,
-                error_delivered=self._event_loop_error_delivered,
-            ) if crashed else None
             try:
                 node_server = getattr(self, "_openengine_node_server", None)
                 if node_server is not None:
@@ -2205,7 +2208,7 @@ class PyExecutor:
                     gather_reports = mpi_comm().bcast(
                         gpu_memory_monitor.full_mode_requested(), root=0)
                     if gather_reports:
-                        self._memory_report_ranks = RankReporter(
+                        self._rank_reporter = RankReporter(
                             mpi_comm().Dup(), self.dist.rank,
                             self.dist.world_size, self.device_id)
                 if self.dist.pp_size > 1 and not self._disable_mpi:
@@ -2268,18 +2271,37 @@ class PyExecutor:
         saying so; with Ray every worker answers for itself and this is
         empty.
         """
-        memory_report_ranks = getattr(self, "_memory_report_ranks", None)
-        if memory_report_ranks is not None:
-            return memory_report_ranks.gather()
-        dist = getattr(self, "dist", None)
-        if (dist is None or dist.world_size <= 1 or dist.rank != 0
-                or getattr(self, "_disable_mpi", True)):
+        if self._rank_reporter is not None:
+            return self._rank_reporter.gather()
+        dist = self.dist
+        if dist.world_size <= 1 or dist.rank != 0 or self._disable_mpi:
             return []
         return [
             f"rank {rank}: not gathered; run with memory_monitor_config.mode='full' "
             "(or TLLM_MEM_MONITOR=1) to get every rank's report"
             for rank in range(1, dist.world_size)
         ]
+
+    def _release_memory_monitor(self) -> None:
+        """Stop this executor's part of the GPU memory monitor.
+
+        Each step clears its attribute before it runs, so a retried shutdown
+        does not repeat it. Like the rest of shutdown, it reads attributes
+        with defaults, so it also works on an executor built without
+        ``__init__``.
+        """
+        rank_reporter = getattr(self, "_rank_reporter", None)
+        self._rank_reporter = None
+        if rank_reporter is not None:
+            rank_reporter.stop()
+        token = getattr(self, "_memory_monitor_token", None)
+        if getattr(self, "_oom_reporter_armed", False):
+            self._oom_reporter_armed = False
+            gpu_memory_triggers.release_oom_reporter(owner=token)
+        self._memory_monitor_token = None
+        if token is not None:
+            gpu_memory_providers.end_executor(token)
+            gpu_memory_tagging.forget_startup_of(token)
 
     def _shutdown_sleep_wakeup_listeners(self) -> None:
         """Signal sleep/wakeup listener threads to exit and drain bounded ACKs."""
@@ -2550,7 +2572,7 @@ class PyExecutor:
         self.hang_detector = None
         self._sleep_wakeup_comm = None
         self._sleep_wakeup_listener_thread = None
-        self._memory_report_ranks = None
+        self._rank_reporter = None
         self.request_broadcaster = None
         self._disagg_coordinator = None
         self._disagg_pp_termination_handler = None
@@ -2661,19 +2683,7 @@ class PyExecutor:
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
         self._shutdown_sleep_wakeup_listeners()
-        memory_report_ranks = getattr(self, "_memory_report_ranks", None)
-        if memory_report_ranks is not None:
-            memory_report_ranks.stop()
-        if getattr(self, "_oom_reporter_armed", False):
-            self._oom_reporter_armed = False
-            gpu_memory_triggers.release_oom_reporter()
-        memory_monitor_token = getattr(self, "_memory_monitor_token", None)
-        if memory_monitor_token is not None:
-            self._memory_monitor_token = None
-            gpu_memory_providers.end_executor(memory_monitor_token)
-            gpu_memory_tagging.forget_startup_of(memory_monitor_token)
-            # Stops only a stack recording the monitor itself started.
-            gpu_memory_stacks.stop_stack_recording()
+        self._release_memory_monitor()
         encoder_launch_executor = getattr(self, "encoder_launch_executor", None)
         if encoder_launch_executor is not None:
             encoder_launch_executor.shutdown(wait=True)
@@ -4508,12 +4518,6 @@ class PyExecutor:
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
                                  f"{exc}\n{traceback.format_exc()}")
                     logger.error(f"Sleep/wakeup listener: {error_msg}")
-                    # Rematerializing on wakeup allocates outside PyTorch, and
-                    # this handler, not _handle_errors, catches its failure.
-                    # The ERROR above reaches the monitor only when the log
-                    # level lets ERROR through; this call does regardless,
-                    # and the monitor's rate limit keeps it to one report.
-                    gpu_memory_triggers.notify_error(str(exc))
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.
@@ -10749,11 +10753,6 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        # An out-of-memory error that reaches here escaped its caller, so the
-        # memory monitor reports it, whether PyTorch or native code (cuBLAS,
-        # NCCL, C++ pools) failed to allocate. A no-op with
-        # TLLM_MEM_MONITOR=0 or when the error is unrelated.
-        gpu_memory_triggers.notify_error(error_msg)
         connector = getattr(self, "kv_connector_manager", None)
         if self.enable_attention_dp and connector is not None:
             pending = connector.get_pending_transfer_requests()
@@ -10975,7 +10974,16 @@ class PyExecutor:
                 # Only a novel rank-local fatal raises to force local teardown;
                 # a synchronized fatal has already published in lockstep and
                 # tears down every rank together via is_shutdown.
+                # _event_loop_wrapper arms the crash watchdog and then logs
+                # this error, which reports it if it is an out-of-memory error.
                 raise self._fatal_error
+
+        # Built only now, after the error responses are out: a report takes
+        # time, and the clients must not wait for it. An out-of-memory error
+        # that reaches here escaped its caller, whether PyTorch or native
+        # code (cuBLAS, NCCL, C++ pools) failed to allocate. A no-op when the
+        # monitor is off or the error is unrelated.
+        gpu_memory_triggers.notify_error(error_msg)
 
     def _terminate_request(self, request: LlmRequest) -> None:
         if self.disagg.defer_gen_termination(request) is True:

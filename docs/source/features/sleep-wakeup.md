@@ -212,6 +212,10 @@ POST /resume_memory
 GET  /memory_status
 ```
 
+The [GPU memory monitor's](memory-monitor.md#asking-for-a-report)
+`GET /memory_report` uses the same request signing, and needs only the key, not
+sleep mode.
+
 The POST body is optional. An omitted body or `{}` selects the defaults
 described in the Python API. To select specific resources, send
 `{"tags":["model","model_weights"]}`.

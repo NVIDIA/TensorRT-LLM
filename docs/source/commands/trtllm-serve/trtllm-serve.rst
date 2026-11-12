@@ -23,7 +23,7 @@ The server also supports the following endpoints:
 - ``/start_profile`` (prototype)
 - ``/stop_profile`` (prototype)
 - ``/v1/chat/completions/render`` and ``/v1/completions/render`` (prototype, enabled with ``TRTLLM_ENABLE_RENDER_ENDPOINTS=1``)
-- ``/memory_report`` (prototype, enabled with ``TLLM_MEM_MONITOR=1`` together with the runtime-control endpoints, and authenticated like them; returns every rank's GPU memory report, see :doc:`../../features/memory-monitor`)
+- ``/memory_report`` (prototype; served in the memory monitor's full mode, ``TLLM_MEM_MONITOR=1`` or ``memory_monitor_config.mode: full``, when ``TRTLLM_RUNTIME_CONTROL_API_KEY`` is set, with requests signed like the runtime-control endpoints and without needing sleep mode; returns every rank's GPU memory report, see :doc:`../../features/memory-monitor` and :doc:`../../features/sleep-wakeup`)
 
 The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below. The render endpoints return the prompt token ids that the server would use for a request, without running the model; see :doc:`render-endpoints`.
 

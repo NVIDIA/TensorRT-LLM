@@ -20,12 +20,16 @@ connection (``PER_FRONTEND_SAFE`` below, with the reason). A new route in
 neither set fails here, so its author has to decide.
 """
 
+import os
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from fastapi import FastAPI
 from starlette.routing import Match
 
+from tensorrt_llm._torch.memory.monitor import configure
+from tensorrt_llm.llmapi.llm_args import MemoryMonitorConfig
 from tensorrt_llm.serve.multi_frontend import FORWARDED_ROUTES
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -53,6 +57,8 @@ PER_FRONTEND_SAFE = {
     ("POST", "/resume_memory"): "never served by attached frontends",
     ("POST", "/update_weights"): "never served by attached frontends",
     ("GET", "/memory_status"): "never served by attached frontends",
+    # Served only with num_serve_frontends=1: signing keeps a per-frontend replay cache.
+    ("GET", "/memory_report"): "never served by attached frontends",
     ("GET", "/openapi.json"): "generated, identical everywhere",
     ("GET", "/docs"): "static page",
     ("GET", "/docs/oauth2-redirect"): "static page",
@@ -66,14 +72,25 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     server.app = FastAPI()
     server.generator = SimpleNamespace(
         _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
+        # Full mode with a key registers GET /memory_report.
+        args=SimpleNamespace(
+            return_perf_metrics=False,
+            memory_monitor_config=MemoryMonitorConfig(mode="full"),
+        ),
     )
     server.use_harmony = False
     # Mutually exclusive in practice; both on to enumerate every route.
     server._enable_rl_control_endpoints = True
     server._enable_runtime_control_endpoints = True
+    server._runtime_control_api_key = "route-gate-key"
     server.resource_governor = None
-    server.register_routes()
+    # The configuration decides, whatever TLLM_MEM_MONITOR the caller has.
+    with mock.patch.dict(os.environ):
+        os.environ.pop("TLLM_MEM_MONITOR", None)
+        try:
+            server.register_routes()
+        finally:
+            configure(None)
     return sorted(
         (method, route.path)
         for route in server.app.routes

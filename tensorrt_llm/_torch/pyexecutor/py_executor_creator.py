@@ -259,7 +259,7 @@ class _ExecutorMemoryMonitor:
 
         try:
             # Tag what the step allocates so the memory monitor can name its
-            # owner; a no-op unless TLLM_MEM_MONITOR=1.
+            # owner; a no-op unless the monitor is in full mode.
             with gpu_memory_tagging.tag(current_stage.value):
                 yield
         except Exception as e:
@@ -1631,7 +1631,10 @@ def create_py_executor(
     # executor releases it at shutdown; reports describe its device.
     py_executor._memory_monitor_token = monitor_token
     py_executor._oom_reporter_armed = gpu_memory_triggers.install_oom_reporter(
-        device=getattr(py_executor, "device_id", None))
+        device=getattr(py_executor, "device_id", None),
+        owner=monitor_token,
+        world_size=getattr(getattr(llm_args, "parallel_config", None),
+                           "world_size", None))
     if py_executor._oom_reporter_armed:
         # Classify the pools startup created now rather than inside the first
         # report, which may run on the executor thread during an OOM.
