@@ -63,6 +63,7 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.usage import usage_lib
 from test_common.serve.fakes import (
     FakeAsyncLLM,
+    FakeCheckpointExecutor,
     FakeEncodeOnlyLLM,
     FakeLLM,
     FakeLlmArgs,
@@ -208,8 +209,13 @@ class ServeTestEnv:
             encode_only=config.role is ServerRole.EMBEDDING,
             reasoning_parser=config.reasoning_parser,
             num_postprocess_workers=config.num_postprocess_workers,
+            env_overrides={"TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE": "1"}
+            if config.checkpoint
+            else None,
         )
         executor = FakeExecutor(resource_governor_queue=object() if config.governor_queue else None)
+        if config.checkpoint:
+            executor = FakeCheckpointExecutor()
         if config.role is ServerRole.VISUAL_GEN:
             # Lazy import: only VisualGen tests pay the visual_gen import cost,
             # and importing it is what lets _is_visual_gen_instance say yes.
@@ -310,7 +316,7 @@ class ServeTestEnv:
             ):
                 pool = getattr(server, pool_name, None)
                 if pool is not None:
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    pool.shutdown(wait=True, cancel_futures=True)
         self._servers.clear()
 
 

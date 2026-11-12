@@ -5,6 +5,7 @@
 
 import threading
 import time
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -13,7 +14,11 @@ from mpi4py import MPI
 from mpi4py.util import pkl5
 
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
-from tensorrt_llm._torch.pyexecutor.checkpoint import NativeCheckpoint, _checkpoint_configuration
+from tensorrt_llm._torch.pyexecutor.checkpoint import (
+    NativeCheckpoint,
+    _checkpoint_configuration,
+    _CheckpointTag,
+)
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestAdmissionState,
@@ -25,6 +30,7 @@ from tensorrt_llm.executor.checkpoint import (
     CheckpointContext,
     CheckpointProfile,
     CheckpointStep,
+    RankCheckpointEvidence,
     checkpoint_digest,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
@@ -43,6 +49,27 @@ def test_pending_pickle_sends_retire_only_after_completion() -> None:
     checkpoint._retire_sends()
     assert checkpoint._pending_sends == []
     assert pending.test.call_count == 2
+
+
+@pytest.mark.parametrize("completes", [True, False])
+def test_shutdown_waits_for_pickle_sends(native_control, completes: bool) -> None:
+    """Complete pickle sends or retain their ownership when the close budget expires."""
+    pending = MagicMock(spec=pkl5.Request)
+    pending.test.return_value = (False, None)
+    if completes:
+        pending.test.side_effect = [(False, None), (True, None)]
+    native_control._pending_sends = [pending]
+    if completes:
+        native_control.close(timeout=0.1)
+        assert native_control._pending_sends == []
+        assert pending.test.call_count == 2
+    else:
+        with pytest.raises(TimeoutError, match="sends are still active"):
+            native_control.close(timeout=0.001)
+        assert native_control._pending_sends == [pending]
+    assert (
+        native_control.engine.executor_request_queue.admission_state is RequestAdmissionState.FAILED
+    )
 
 
 def test_rank_capacity_is_distinct_from_shared_configuration() -> None:
@@ -321,6 +348,7 @@ def native_control(protected_engine):
     checkpoint._stop = threading.Event()
     checkpoint._command_lock = threading.Lock()
     checkpoint._listener = None
+    checkpoint._receive_stopped = False
     checkpoint._parked = MagicMock()
     checkpoint._comm = None
     checkpoint._peers_closed = False
@@ -423,6 +451,7 @@ def test_shutdown_waits_for_peer_release(native_control, acknowledged) -> None:
     checkpoint.engine.dist.world_size = 2
     comm = MagicMock()
     comm.Iprobe.return_value = acknowledged
+    comm.isend.return_value.test.return_value = (True, None)
     checkpoint._comm = comm
     parked = checkpoint._parked
     if acknowledged:
@@ -488,24 +517,225 @@ def test_failed_group_does_not_dispatch_late_prepare(native_control) -> None:
     checkpoint._comm.isend.assert_not_called()
 
 
-def test_peer_listener_releases_park_before_shutdown_ack(native_control, monkeypatch) -> None:
-    from tensorrt_llm._torch.pyexecutor.checkpoint import _CLOSE_ACK_TAG, _CLOSE_TAG
-
+@pytest.mark.parametrize("local_close", [False, True])
+def test_peer_listener_releases_park_before_shutdown_ack(
+    native_control, monkeypatch, local_close: bool
+) -> None:
     checkpoint = native_control
     checkpoint.engine.device_id = 0
+    checkpoint.engine.dist.rank = 1
     comm = MagicMock()
-    comm.Iprobe.side_effect = lambda source, tag: tag == _CLOSE_TAG
+    comm.Iprobe.return_value = False
+
+    def receive(*, source, tag, status):
+        assert source == MPI.ANY_SOURCE and tag == MPI.ANY_TAG
+        status.Set_source(0)
+        status.Set_tag(_CheckpointTag.CLOSE)
+        return 1.0
+
+    comm.recv.side_effect = receive
     checkpoint._comm = comm
     parked = checkpoint._parked
     events = []
     parked.__exit__.side_effect = lambda *args: events.append("release")
-    comm.isend.side_effect = lambda *args, **kwargs: events.append("ack")
+    pending = MagicMock(spec=pkl5.Request)
+    pending.test.return_value = (True, None)
+
+    def send_ack(*args, **kwargs):
+        events.append("ack")
+        return pending
+
+    comm.isend.side_effect = send_ack
     monkeypatch.setattr("torch.cuda.set_device", lambda device: None)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.checkpoint.set_thread_local_mpi_comm", lambda comm: None
     )
     checkpoint._listen()
+    if local_close:
+        # The receive loop has ended, but thread-local cleanup can still be running.
+        checkpoint._listener = MagicMock(spec=threading.Thread)
+        checkpoint._listener.is_alive.side_effect = [True, False]
+        checkpoint.close(timeout=1)
+        checkpoint._listener.join.assert_called_once()
     assert events == ["release", "ack"]
-    comm.isend.assert_called_once_with(True, dest=0, tag=_CLOSE_ACK_TAG)
+    comm.isend.assert_called_once_with(True, dest=0, tag=_CheckpointTag.CLOSE_ACK)
+    comm.Iprobe.assert_called_once_with(source=1, tag=_CheckpointTag.CLOSE)
+    pending.test.assert_called_once()
+    assert checkpoint._pending_sends == []
     assert checkpoint._stop.is_set()
+    assert checkpoint.engine.executor_request_queue.admission_state is RequestAdmissionState.FAILED
+
+
+@pytest.mark.parametrize("leader_close", ["absent", "before_local", "after_local"])
+def test_local_peer_close_wakes_blocking_listener(
+    native_control, monkeypatch, leader_close: str
+) -> None:
+    """Retire local shutdown and acknowledge a queued leader close in either order."""
+    checkpoint = native_control
+    checkpoint.engine.dist.rank = 1
+    checkpoint.engine.device_id = 0
+    inbox = Queue()
+    waiting = threading.Event()
+    sent = []
+    comm = MagicMock()
+
+    def receive(*, source, tag, status=None):
+        waiting.set()
+        sender, received_tag, message = inbox.get(timeout=2)
+        if status is not None:
+            status.Set_source(sender)
+            status.Set_tag(received_tag)
+        else:
+            assert (sender, received_tag) == (source, tag)
+        return message
+
+    def send(message, *, dest, tag):
+        if dest == 1:
+            if leader_close == "before_local":
+                inbox.put((0, _CheckpointTag.CLOSE, 1.0))
+            inbox.put((1, tag, message))
+            if leader_close == "after_local":
+                inbox.put((0, _CheckpointTag.CLOSE, 1.0))
+        else:
+            assert dest == 0 and tag == _CheckpointTag.CLOSE_ACK
+        pending = MagicMock(spec=pkl5.Request)
+        pending.test.return_value = (True, None)
+        sent.append(pending)
+        return pending
+
+    comm.recv.side_effect = receive
+    comm.isend.side_effect = send
+    comm.Iprobe.side_effect = lambda **kwargs: not inbox.empty()
+    checkpoint._comm = comm
+    monkeypatch.setattr("torch.cuda.set_device", lambda device: None)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.checkpoint.set_thread_local_mpi_comm", lambda comm: None
+    )
+    checkpoint.start()
+    try:
+        assert waiting.wait(1)
+        checkpoint.close(timeout=1)
+        assert not checkpoint._listener.is_alive()
+        assert checkpoint._parked is None
+        assert inbox.empty()
+        assert comm.isend.call_args_list[0].kwargs == dict(dest=1, tag=_CheckpointTag.CLOSE)
+        assert 0 < comm.isend.call_args_list[0].args[0] <= 1
+        assert comm.isend.call_count == (1 if leader_close == "absent" else 2)
+        if leader_close != "absent":
+            assert comm.isend.call_args_list[1].kwargs == dict(dest=0, tag=_CheckpointTag.CLOSE_ACK)
+        assert checkpoint._pending_sends == []
+        for pending in sent:
+            pending.test.assert_called_once()
+    finally:
+        if checkpoint._listener.is_alive():
+            inbox.put((1, _CheckpointTag.CLOSE, 1.0))
+        checkpoint._listener.join(timeout=2)
+
+
+@pytest.fixture
+def activation_group(native_control, monkeypatch):
+    """Drive production group coordination and rank transitions over a fake MPI boundary."""
+    checkpoint = native_control
+    checkpoint.engine.dist.world_size = 2
+    checkpoint.engine.device_id = 0
+    checkpoint.profile = CheckpointProfile(
+        profile_digest="a" * 64, cohort_digest="b" * 64, ranks=[0, 1]
+    )
+    checkpoint._baseline = {"storage": "unchanged"}
+    checkpoint._phase = CheckpointStep.ACTIVATION_PREPARE
+    context = CheckpointContext(
+        protocol_version=1,
+        operation_id="activate",
+        session_id="source",
+        session_kind="source",
+        template_id="template",
+        profile_digest="a" * 64,
+        cohort_digest="b" * 64,
+        expected_state_version=3,
+        time_budget_seconds=1,
+    )
+    reply = dict(
+        operation_id=context.operation_id,
+        step="activation_commit",
+        error=None,
+        evidence=RankCheckpointEvidence(
+            rank=1,
+            session_id=context.session_id,
+            profile_digest=context.profile_digest,
+            cohort_digest=context.cohort_digest,
+            checks=["activation_committed"],
+            state_digest="c" * 64,
+        ).model_dump(),
+    )
+    checkpoint._comm = MagicMock()
+    checkpoint._comm.Iprobe.return_value = True
+    checkpoint._comm.isend.return_value.test.return_value = (True, None)
+    checkpoint._comm.recv.return_value = reply
+    monkeypatch.setattr("torch.cuda.set_device", lambda device: None)
+    return checkpoint, context, reply
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing",
+        "error",
+        "session",
+        "profile",
+        "cohort",
+        "checks",
+        "rank",
+        "digest",
+    ],
+)
+def test_group_commit_keeps_leader_closed_on_bad_peer_evidence(activation_group, failure) -> None:
+    checkpoint, context, reply = activation_group
+    parked = checkpoint._parked
+    if failure == "missing":
+        checkpoint._comm.Iprobe.return_value = False
+    elif failure == "error":
+        reply["error"] = "peer failed"
+    else:
+        field, value = {
+            "session": ("session_id", "stale"),
+            "profile": ("profile_digest", "d" * 64),
+            "cohort": ("cohort_digest", "d" * 64),
+            "checks": ("checks", ["runtime_valid"]),
+            "rank": ("rank", 0),
+            "digest": ("state_digest", ""),
+        }[failure]
+        reply["evidence"][field] = value
+    with pytest.raises((RuntimeError, TimeoutError)):
+        checkpoint.group_step("activation_commit", context.model_dump(), 0.03)
+    parked.__exit__.assert_not_called()
+    assert checkpoint.engine.executor_request_queue.admission_state is RequestAdmissionState.FAILED
+    assert checkpoint._phase == CheckpointStep.ACTIVATION_PREPARE
+
+
+def test_group_commit_ignores_stale_ack_and_retries_once(activation_group) -> None:
+    checkpoint, context, reply = activation_group
+    parked = checkpoint._parked
+    responses = iter([{**reply, "operation_id": "old"}, reply, reply])
+
+    def receive(**kwargs):
+        response = next(responses)
+        if not checkpoint._completed:
+            assert checkpoint.engine.executor_request_queue.checkpoint_admission_closed()
+            parked.__exit__.assert_not_called()
+        return response
+
+    checkpoint._comm.recv.side_effect = receive
+    first = checkpoint.group_step("activation_commit", context.model_dump(), 1)
+    assert sorted(item["rank"] for item in first) == [0, 1]
+    assert not checkpoint.engine.executor_request_queue.checkpoint_admission_closed()
+    assert checkpoint.group_step("activation_commit", context.model_dump(), 1) == first
+    parked.__exit__.assert_called_once()
+
+
+def test_group_rejects_conflicting_retry(activation_group) -> None:
+    checkpoint, context, _ = activation_group
+    checkpoint.group_step("activation_commit", context.model_dump(), 1)
+    changed = context.model_copy(update={"template_id": "different"})
+    with pytest.raises(RuntimeError, match="Conflicting"):
+        checkpoint.group_step("activation_commit", changed.model_dump(), 1)
     assert checkpoint.engine.executor_request_queue.admission_state is RequestAdmissionState.FAILED

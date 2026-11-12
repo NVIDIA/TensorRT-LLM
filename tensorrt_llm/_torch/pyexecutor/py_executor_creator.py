@@ -1518,10 +1518,10 @@ def _create_py_executor(
         from tensorrt_llm.grpc.openengine.node import initialize_node_discovery
         initialize_node_discovery(py_executor)
     try:
-        from tensorrt_llm.executor.checkpoint import CHECKPOINT_ENABLE_ENV
+        from tensorrt_llm.executor.checkpoint import checkpoint_enabled
 
         from .checkpoint import NativeCheckpoint
-        if (llm_args.env_overrides or {}).get(CHECKPOINT_ENABLE_ENV) == "1":
+        if checkpoint_enabled(llm_args.env_overrides):
             py_executor.checkpoint = NativeCheckpoint(py_executor)
         with _startup_timer.phase("executor_start_worker",
                                   metrics=creation_metrics,

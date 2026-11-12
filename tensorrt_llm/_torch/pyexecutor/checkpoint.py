@@ -10,9 +10,11 @@ import threading
 import time
 from contextlib import AbstractContextManager
 from dataclasses import fields
+from enum import IntEnum
 from typing import TYPE_CHECKING
 
 import torch
+from mpi4py import MPI
 
 from tensorrt_llm._utils import mpi_comm, set_thread_local_mpi_comm
 from tensorrt_llm.executor.checkpoint import (
@@ -23,6 +25,7 @@ from tensorrt_llm.executor.checkpoint import (
     CheckpointStep,
     RankCheckpointEvidence,
     checkpoint_digest,
+    validate_checkpoint_evidence,
 )
 from tensorrt_llm.logger import logger
 
@@ -33,10 +36,18 @@ if TYPE_CHECKING:
 
 # Each architecture requires the profile checks documented in checkpoint-lifecycle.md.
 _SUPPORTED_MODEL_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
-_ACTION_TAG = 0
-_ACK_TAG = 1
-_CLOSE_TAG = 2
-_CLOSE_ACK_TAG = 3
+
+
+class _CheckpointTag(IntEnum):
+    ACTION = 0
+    ACK = 1
+    CLOSE = 2
+    CLOSE_ACK = 3
+
+
+_ACK_POLL_SECONDS = 0.01
+_CLOSE_TIMEOUT_SECONDS = 5.0
+_MAX_RANK_HISTORY = 256
 
 
 def _checkpoint_configuration(args: "TorchLlmArgs") -> tuple[dict, dict]:
@@ -72,7 +83,7 @@ def _checkpoint_configuration(args: "TorchLlmArgs") -> tuple[dict, dict]:
             "special_tokens": native.special_tokens_map,
             "chat_template": native.chat_template,
         }
-    shared = args.model_dump(mode="json", exclude={"_mpi_session", "env_overrides", "tokenizer"})
+    shared = args.model_dump(mode="json", exclude={"env_overrides", "tokenizer"})
     shared["tokenizer"] = tokenizer_identity
     local = {"max_gpu_total_bytes": shared["kv_cache_config"].pop("max_gpu_total_bytes")}
     return shared, local
@@ -103,6 +114,7 @@ class NativeCheckpoint:
         self._command_lock = threading.Lock()
         self._stop = threading.Event()
         self._listener: threading.Thread | None = None
+        self._receive_stopped = False
         self._failed = False
         self._phase: CheckpointStep | None = None
         self._validation_replays = 0
@@ -261,26 +273,37 @@ class NativeCheckpoint:
         set_thread_local_mpi_comm(self._comm)
         try:
             torch.cuda.set_device(self.engine.device_id)
-            while not self._stop.is_set():
-                if self._comm.Iprobe(source=0, tag=_CLOSE_TAG):
-                    self._comm.recv(source=0, tag=_CLOSE_TAG)
+            while True:
+                status = MPI.Status()
+                message = self._comm.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status)
+                source, tag = status.Get_source(), status.Get_tag()
+                if tag == _CheckpointTag.CLOSE and source in (0, self.engine.dist.rank):
                     with self._command_lock:
+                        self._receive_stopped = True
+                        deadline = time.monotonic() + message
                         self.fail_closed()
                         self._release_checkpoint_control()
-                        self._pending_sends.append(
-                            self._comm.isend(True, dest=0, tag=_CLOSE_ACK_TAG)
+                        # Retire a concurrent local/leader close before this receive exits.
+                        other_source = self.engine.dist.rank if source == 0 else 0
+                        other_close = self._comm.Iprobe(
+                            source=other_source, tag=_CheckpointTag.CLOSE
                         )
+                        if other_close:
+                            self._comm.recv(source=other_source, tag=_CheckpointTag.CLOSE)
+                        if source == 0 or other_close:
+                            self._pending_sends.append(
+                                self._comm.isend(True, dest=0, tag=_CheckpointTag.CLOSE_ACK)
+                            )
                         self._stop.set()
+                        self._wait_for_sends(deadline)
                     break
-                if not self._comm.Iprobe(source=0, tag=_ACTION_TAG):
-                    self._stop.wait(0.01)
-                    continue
-                message = self._comm.recv(source=0, tag=_ACTION_TAG)
+                if source != 0 or tag != _CheckpointTag.ACTION:
+                    raise RuntimeError("Unexpected checkpoint control message.")
                 with self._command_lock:
-                    if self._stop.is_set():
-                        break
                     reply = self._run_message(message)
-                    self._pending_sends.append(self._comm.isend(reply, dest=0, tag=_ACK_TAG))
+                    self._pending_sends.append(
+                        self._comm.isend(reply, dest=0, tag=_CheckpointTag.ACK)
+                    )
                     self._retire_sends()
         except Exception:
             # This thread owns native park contexts; release only after its command stops.
@@ -288,11 +311,34 @@ class NativeCheckpoint:
             self._release_checkpoint_control()
             logger.exception("Checkpoint listener failed; host cleanup is required.")
         finally:
+            with self._command_lock:
+                self._receive_stopped = True
             set_thread_local_mpi_comm(None)
 
     def _retire_sends(self) -> None:
         """Retain pending MPI sends until the transport proves completion."""
         self._pending_sends = [request for request in self._pending_sends if not request.test()[0]]
+
+    def _wait_for_sends(self, deadline: float) -> None:
+        """Complete owned sends without blocking indefinitely during shutdown.
+
+        Call with the command lock held, or after the listener has retired.
+        Requests remain owned on timeout; the caller must not release resources.
+
+        Args:
+            deadline: Local monotonic shutdown deadline.
+
+        Raises:
+            TimeoutError: If any MPI send remains incomplete at the deadline.
+        """
+        while self._pending_sends:
+            self._retire_sends()
+            if not self._pending_sends:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Checkpoint sends are still active; host cleanup is required.")
+            time.sleep(min(_ACK_POLL_SECONDS, remaining))
 
     def _remaining(self, deadline: float) -> float:
         """Reject work outside the original local command budget.
@@ -361,32 +407,34 @@ class NativeCheckpoint:
             }
             # Commit the leader last: only rank zero accepts public requests.
             for rank in self.profile.ranks[1:]:
-                self._pending_sends.append(self._comm.isend(message, dest=rank, tag=_ACTION_TAG))
+                self._pending_sends.append(
+                    self._comm.isend(message, dest=rank, tag=_CheckpointTag.ACTION)
+                )
             replies = []
             if action != CheckpointStep.ACTIVATION_COMMIT:
                 replies.append(self._run_message(message))
             for rank in self.profile.ranks[1:]:
                 while True:
                     self._remaining(deadline)
-                    if self._comm.Iprobe(source=rank, tag=_ACK_TAG):
-                        reply = self._comm.recv(source=rank, tag=_ACK_TAG)
+                    if self._comm.Iprobe(source=rank, tag=_CheckpointTag.ACK):
+                        reply = self._comm.recv(source=rank, tag=_CheckpointTag.ACK)
                         if (
                             reply.get("operation_id") == parsed.operation_id
                             and reply.get("step") == action.value
                         ):
                             replies.append(reply)
                             break
-                    time.sleep(0.01)
+                    time.sleep(_ACK_POLL_SECONDS)
             expected = (
                 self.profile.ranks[1:]
                 if action == CheckpointStep.ACTIVATION_COMMIT
                 else self.profile.ranks
             )
-            self._validate_replies(replies, parsed, expected)
+            self._validate_replies(replies, parsed, expected, action)
             if action == CheckpointStep.ACTIVATION_COMMIT:
                 self._remaining(deadline)
                 replies.append(self._run_message(message))
-                self._validate_replies(replies, parsed, self.profile.ranks)
+                self._validate_replies(replies, parsed, self.profile.ranks, action)
             self._retire_sends()
             return [reply["evidence"] for reply in replies]
         except Exception:
@@ -397,7 +445,11 @@ class NativeCheckpoint:
             self._command_lock.release()
 
     def _validate_replies(
-        self, replies: list[dict], context: CheckpointContext, ranks: list[int]
+        self,
+        replies: list[dict],
+        context: CheckpointContext,
+        ranks: list[int],
+        step: CheckpointStep,
     ) -> None:
         """Validate participant identities before the leader commits admission.
 
@@ -405,6 +457,7 @@ class NativeCheckpoint:
             replies: Native acknowledgements received for this step.
             context: Current operation identity.
             ranks: Exact required participants at this point.
+            step: Expected action and its required checks.
 
         Raises:
             RuntimeError: If an acknowledgement is missing, stale or failed.
@@ -412,15 +465,7 @@ class NativeCheckpoint:
         if any(reply.get("error") is not None for reply in replies):
             raise RuntimeError(f"Checkpoint participant failed: {replies}")
         evidence = [RankCheckpointEvidence.model_validate(reply["evidence"]) for reply in replies]
-        if sorted(item.rank for item in evidence) != sorted(ranks) or any(
-            item.session_id != context.session_id
-            or item.profile_digest != context.profile_digest
-            or item.cohort_digest != context.cohort_digest
-            or not item.checks
-            or not item.state_digest
-            for item in evidence
-        ):
-            raise RuntimeError("Checkpoint received incomplete or stale participant evidence.")
+        validate_checkpoint_evidence(step, context, evidence, ranks)
 
     def _run_message(self, message: dict) -> dict:
         """Execute an identity-bound step once; cache its terminal acknowledgement.
@@ -455,7 +500,7 @@ class NativeCheckpoint:
         reply = {"operation_id": context.operation_id, "step": step.value, "error": None}
         try:
             torch.cuda.set_device(self.engine.device_id)
-            if len(self._completed) >= 256:
+            if len(self._completed) >= _MAX_RANK_HISTORY:
                 raise RuntimeError("Checkpoint rank history is full.")
             deadline = time.monotonic() + min(
                 message["remaining_seconds"], context.time_budget_seconds
@@ -704,8 +749,6 @@ class NativeCheckpoint:
                 self.fail_closed()
                 self._release_checkpoint_control()
                 checks = ["progression_stopped", "public_admission_closed", "host_cleanup_required"]
-            else:
-                raise ValueError("Unsupported checkpoint rank action.")
         self._phase = step
         return RankCheckpointEvidence(
             rank=self.engine.dist.rank,
@@ -721,7 +764,7 @@ class NativeCheckpoint:
         self._failed = True
         self.engine.executor_request_queue.fail_checkpoint()
 
-    def close(self, timeout: float = 5.0) -> None:
+    def close(self, timeout: float = _CLOSE_TIMEOUT_SECONDS) -> None:
         """Retire commands before engine shutdown can release their resources.
 
         Args:
@@ -739,16 +782,36 @@ class NativeCheckpoint:
         try:
             if self._comm is not None and self.engine.dist.rank == 0 and not self._peers_closed:
                 for rank in range(1, self.engine.dist.world_size):
-                    self._pending_sends.append(self._comm.isend(None, dest=rank, tag=_CLOSE_TAG))
+                    self._pending_sends.append(
+                        self._comm.isend(
+                            max(0.0, deadline - time.monotonic()),
+                            dest=rank,
+                            tag=_CheckpointTag.CLOSE,
+                        )
+                    )
                 for rank in range(1, self.engine.dist.world_size):
-                    while not self._comm.Iprobe(source=rank, tag=_CLOSE_ACK_TAG):
+                    while not self._comm.Iprobe(source=rank, tag=_CheckpointTag.CLOSE_ACK):
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
                                 "Checkpoint peer shutdown is unconfirmed; host cleanup is required."
                             )
-                        time.sleep(0.01)
-                    self._comm.recv(source=rank, tag=_CLOSE_ACK_TAG)
+                        time.sleep(_ACK_POLL_SECONDS)
+                    self._comm.recv(source=rank, tag=_CheckpointTag.CLOSE_ACK)
                 self._peers_closed = True
+            elif (
+                self._comm is not None
+                and self._listener is not None
+                and self._listener.is_alive()
+                and not self._receive_stopped
+            ):
+                # Wake a peer's blocking receive even during local-only shutdown.
+                self._pending_sends.append(
+                    self._comm.isend(
+                        max(0.0, deadline - time.monotonic()),
+                        dest=self.engine.dist.rank,
+                        tag=_CheckpointTag.CLOSE,
+                    )
+                )
             self._release_checkpoint_control()
         finally:
             self._command_lock.release()
@@ -756,5 +819,6 @@ class NativeCheckpoint:
             self._listener.join(timeout=max(0.0, deadline - time.monotonic()))
             if self._listener.is_alive():
                 raise TimeoutError("Checkpoint listener is still active; host cleanup is required.")
+        self._wait_for_sends(deadline)
         # MPI owns the duplicated communicator through process teardown. Do not
         # collectively free it while another rank can still be in failure cleanup.

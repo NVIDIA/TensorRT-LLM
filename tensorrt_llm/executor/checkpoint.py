@@ -10,16 +10,21 @@ client-supplied readiness flags.
 
 import hashlib
 import json
+import os
 import secrets
 import threading
 import time
 from enum import Enum
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import Field, NonNegativeInt
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
+from tensorrt_llm.sampling_params import SamplingParams
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 CHECKPOINT_ENABLE_ENV = "TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE"
 CHECKPOINT_REQUIRED_ENV = {
@@ -27,6 +32,81 @@ CHECKPOINT_REQUIRED_ENV = {
     "TRTLLM_PROXY_BATCH_REQUESTS": "0",
     "TRTLLM_GPU_KEEPALIVE": "0",
 }
+_MAX_OPERATION_HISTORY = 128
+
+
+def checkpoint_enabled(env_overrides: dict[str, str] | None) -> bool:
+    """Read the private per-engine opt-in, never the inherited process environment.
+
+    Args:
+        env_overrides: Explicit engine overrides; raw CLI scalar values are normalized
+            like the LLM-args environment validator.
+
+    Returns:
+        Whether this engine explicitly enables native checkpoint controls.
+    """
+    return str((env_overrides or {}).get(CHECKPOINT_ENABLE_ENV, "0")) == "1"
+
+
+def checkpoint_probe_sampling_params(num_tokens: int) -> SamplingParams:
+    """Build identical sampling settings for reference and private probe generation.
+
+    Pass the result to LLM.generate for references. Internal submitters must apply
+    LLM's generation-config defaults before constructing a GenerationRequest.
+
+    Args:
+        num_tokens: Reference completion length, from 2 through 64.
+
+    Returns:
+        Fresh deterministic probe settings.
+
+    Raises:
+        ValueError: If the completion length is unsupported.
+    """
+    if not 2 <= num_tokens <= 64:
+        raise ValueError("Checkpoint probes require 2 through 64 output tokens.")
+    return SamplingParams(
+        temperature=0, max_tokens=num_tokens, ignore_eos=True, end_id=-1, pad_id=0
+    )
+
+
+def validate_checkpoint_config(args: "TorchLlmArgs") -> None:
+    """Reject unsupported requested settings before loading or warming a model.
+
+    This preflight does not replace native checks on resolved resource owners.
+
+    Args:
+        args: Validated per-engine arguments, before model initialization.
+
+    Raises:
+        ValueError: If requested settings are outside the supported profile.
+    """
+    required = {
+        "tensor_parallel_size": args.tensor_parallel_size in (1, 2),
+        "pipeline_parallel_size": args.pipeline_parallel_size == 1,
+        "context_parallel_size": args.context_parallel_size == 1,
+        "enable_attention_dp": not args.enable_attention_dp,
+        "num_serve_frontends": args.num_serve_frontends == 1,
+        "num_postprocess_workers": args.num_postprocess_workers == 0,
+        "enable_resource_governor": not args.enable_resource_governor,
+        "orchestrator_type": args.orchestrator_type is None,
+        "allreduce_strategy": args.allreduce_strategy == "NCCL",
+        "torch_compile_config": args.torch_compile_config is None,
+        "guided_decoding_backend": args.guided_decoding_backend is None,
+        "gather_generation_logits": not args.gather_generation_logits,
+        "kv_cache_config.use_kv_cache_manager_v2": args.kv_cache_config.use_kv_cache_manager_v2,
+        "kv_cache_config.enable_block_reuse": not args.kv_cache_config.enable_block_reuse,
+        "kv_cache_config.host_cache_size": args.kv_cache_config.host_cache_size == 0,
+        "kv_cache_config.disk_cache_size": not args.kv_cache_config.disk_cache_size,
+        "TLLM_WORKER_USE_SINGLE_PROCESS": os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS") != "1",
+    }
+    invalid = [name for name, supported in required.items() if not supported]
+    if invalid:
+        raise ValueError(
+            "Unsupported checkpoint settings: "
+            + ", ".join(invalid)
+            + ". See the resident checkpoint profile requirements."
+        )
 
 
 class CheckpointContext(StrictBaseModel):
@@ -259,7 +339,7 @@ class CheckpointStatus(StrictBaseModel):
     )
     readiness: CheckpointReadiness = Field(description="Independent, current readiness facts.")
     operation: CheckpointResult | None = Field(
-        default=None, description="Requested or most recent operation result."
+        default=None, description="Most recent operation result."
     )
 
 
@@ -317,6 +397,65 @@ def checkpoint_digest(value: object) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def validate_checkpoint_evidence(
+    step: CheckpointStep,
+    context: CheckpointContext,
+    results: list[RankCheckpointEvidence],
+    ranks: list[int],
+) -> None:
+    """Require exactly one current, complete acknowledgement per expected rank.
+
+    The native coordinator calls this before committing the leader. The frontend
+    also checks evidence after transport, including terminal abort results.
+
+    Args:
+        step: Native step whose checks must have completed.
+        context: Current operation identity.
+        results: Participant evidence received from the engine.
+        ranks: Exact participant set required at this boundary.
+
+    Raises:
+        RuntimeError: If participants, identities or required checks disagree.
+    """
+    required = {
+        CheckpointStep.PREPARE: {"admission_closed", "scheduler_drained", "no_external_exposure"},
+        CheckpointStep.RESTORE: {
+            "fresh_restore_session",
+            "memory_present",
+            "resident_state_matches",
+        },
+        CheckpointStep.VALIDATION_START: {"private_validation_only", "public_admission_closed"},
+        CheckpointStep.VALIDATION_END: {
+            "validation_retired",
+            "scheduler_drained",
+            "warmed_graph_replayed",
+            "resident_state_matches",
+        },
+        CheckpointStep.ACTIVATION_PREPARE: {
+            "activation_prepared",
+            "runtime_valid",
+            "public_admission_closed",
+        },
+        CheckpointStep.ACTIVATION_COMMIT: {"activation_committed"},
+        CheckpointStep.ABORT: {
+            "progression_stopped",
+            "public_admission_closed",
+            "host_cleanup_required",
+        },
+    }[step]
+    if sorted(result.rank for result in results) != sorted(ranks):
+        raise RuntimeError("Missing, duplicate, or unexpected checkpoint rank acknowledgement.")
+    if any(
+        result.session_id != context.session_id
+        or result.profile_digest != context.profile_digest
+        or result.cohort_digest != context.cohort_digest
+        or not required.issubset(result.checks)
+        or not result.state_digest
+        for result in results
+    ):
+        raise RuntimeError("Stale or incomplete checkpoint evidence.")
+
+
 class CheckpointLifecycle:
     """Serialize lifecycle mutations and retain retry identity across capture.
 
@@ -347,6 +486,7 @@ class CheckpointLifecycle:
         self._deadline: float | None = None
         self._lock = threading.Lock()
         self._operations: dict[str, tuple[str, CheckpointResult]] = {}
+        # An abort can be the latest operation while an earlier mutation still runs.
         self._active_operation: str | None = None
         self._last_operation: str | None = None
         self._abort_operation_id: str | None = None
@@ -367,22 +507,14 @@ class CheckpointLifecycle:
         with self._lock:
             return self._readiness.admission_open and not self._readiness_expired()
 
-    def get_lifecycle_status(self, operation_id: str | None = None) -> CheckpointStatus:
+    def get_lifecycle_status(self) -> CheckpointStatus:
         """Read a detached status snapshot without changing engine state.
-
-        Args:
-            operation_id: Optional exact operation; unknown IDs are rejected.
 
         Returns:
             Current readiness and an immutable copy of the operation result.
-
-        Raises:
-            ValueError: If an explicitly requested operation is unknown.
         """
         with self._lock:
-            selected = operation_id or self._last_operation
-            if selected is not None and selected not in self._operations:
-                raise ValueError("Unknown checkpoint operation.")
+            selected = self._last_operation
             readiness = self._readiness.model_copy(deep=True)
             if self._readiness_expired():
                 readiness = CheckpointReadiness()
@@ -429,14 +561,12 @@ class CheckpointLifecycle:
         """
         fingerprint = checkpoint_digest([name, request.model_dump(mode="json")])
         with self._lock:
-            previous = self._operations.get(context.operation_id)
+            previous = self._retry_result(context.operation_id, fingerprint)
             if previous is not None:
-                if previous[0] != fingerprint:
-                    raise ValueError("Operation ID was reused with different arguments.")
-                return previous[1].model_copy(deep=True), False
+                return previous, False
             if self._stage in (CheckpointStage.FAILED, CheckpointStage.ABORTED):
                 raise RuntimeError("Checkpoint attempt is terminal; progression is not permitted.")
-            if len(self._operations) >= 128:
+            if len(self._operations) >= _MAX_OPERATION_HISTORY:
                 raise RuntimeError("Checkpoint operation history is full; use a fresh worker.")
             if self._active_operation is not None or self._stage not in expected:
                 raise ValueError("Conflicting checkpoint lifecycle transition.")
@@ -472,7 +602,7 @@ class CheckpointLifecycle:
             deadline = now + context.time_budget_seconds
             if name not in ("prepare_capture", "validate_runtime") and self._deadline is not None:
                 deadline = min(deadline, self._deadline)
-            if deadline <= now and name != "abort_operation":
+            if deadline <= now:
                 raise TimeoutError("Checkpoint attempt budget expired.")
             if name == "validate_runtime":
                 self._restore_session_id = context.session_id
@@ -496,6 +626,15 @@ class CheckpointLifecycle:
             )
             self._operations[context.operation_id] = (fingerprint, result)
             return result.model_copy(deep=True), True
+
+    def _retry_result(self, operation_id: str, fingerprint: str) -> CheckpointResult | None:
+        """Read an exact retry while the caller holds the lifecycle lock."""
+        previous = self._operations.get(operation_id)
+        if previous is None:
+            return None
+        if previous[0] != fingerprint:
+            raise ValueError("Operation ID was reused with different arguments.")
+        return previous[1].model_copy(deep=True)
 
     def _remaining(self) -> float:
         """Read the original attempt budget; no retry extends it.
@@ -546,41 +685,7 @@ class CheckpointLifecycle:
             raise
         results = self._backend.step(step, context, remaining, token, source_session_id)
         self._remaining()
-        if sorted(result.rank for result in results) != sorted(self._profile.ranks):
-            raise RuntimeError("Missing, duplicate, or unexpected checkpoint rank acknowledgement.")
-        for result in results:
-            required = {
-                CheckpointStep.PREPARE: {
-                    "admission_closed",
-                    "scheduler_drained",
-                    "no_external_exposure",
-                },
-                CheckpointStep.RESTORE: {
-                    "fresh_restore_session",
-                    "memory_present",
-                    "resident_state_matches",
-                },
-                CheckpointStep.VALIDATION_START: {
-                    "private_validation_only",
-                    "public_admission_closed",
-                },
-                CheckpointStep.VALIDATION_END: {
-                    "validation_retired",
-                    "scheduler_drained",
-                    "warmed_graph_replayed",
-                },
-                CheckpointStep.ACTIVATION_PREPARE: {"activation_prepared", "runtime_valid"},
-                CheckpointStep.ACTIVATION_COMMIT: {"activation_committed"},
-                CheckpointStep.ABORT: {"progression_stopped", "host_cleanup_required"},
-            }[step]
-            if (
-                result.session_id != context.session_id
-                or result.profile_digest != context.profile_digest
-                or result.cohort_digest != context.cohort_digest
-                or not required.issubset(result.checks)
-                or not result.state_digest
-            ):
-                raise RuntimeError("Stale or incomplete checkpoint evidence.")
+        validate_checkpoint_evidence(step, context, results, self._profile.ranks)
         return results
 
     def _finish(
@@ -727,12 +832,12 @@ class CheckpointLifecycle:
         context = request.context
         host = request.host_restore
         with self._lock:
-            previous = self._operations.get(context.operation_id)
+            previous = self._retry_result(
+                context.operation_id,
+                checkpoint_digest(["activate", request.model_dump(mode="json")]),
+            )
             if previous is not None:
-                fingerprint = checkpoint_digest(["activate", request.model_dump(mode="json")])
-                if previous[0] != fingerprint:
-                    raise ValueError("Operation ID was reused with different arguments.")
-                return previous[1].model_copy(deep=True)
+                return previous
             if self._stage in (CheckpointStage.FAILED, CheckpointStage.ABORTED):
                 raise RuntimeError("Checkpoint attempt is terminal; progression is not permitted.")
             if request.readiness_id != self._readiness_id:
@@ -773,11 +878,9 @@ class CheckpointLifecycle:
         fingerprint = checkpoint_digest(["abort_operation", request.model_dump(mode="json")])
         deadline = time.monotonic() + context.time_budget_seconds
         with self._lock:
-            previous = self._operations.get(context.operation_id)
+            previous = self._retry_result(context.operation_id, fingerprint)
             if previous is not None:
-                if previous[0] != fingerprint:
-                    raise ValueError("Operation ID was reused with different arguments.")
-                return previous[1].model_copy(deep=True)
+                return previous
             if self._stage in (
                 CheckpointStage.RUNNING,
                 CheckpointStage.SERVING,
@@ -798,7 +901,7 @@ class CheckpointLifecycle:
                 or context.expected_state_version != self._state_version
             ):
                 raise ValueError("Abort does not identify the current checkpoint attempt.")
-            if len(self._operations) >= 128:
+            if len(self._operations) >= _MAX_OPERATION_HISTORY:
                 raise RuntimeError("Checkpoint operation history is full.")
             self._cancelled.set()
             self._readiness = CheckpointReadiness()
@@ -828,18 +931,9 @@ class CheckpointLifecycle:
             if remaining <= 0:
                 raise TimeoutError("Abort budget expired; host cleanup is required.")
             ranks = self._backend.step(CheckpointStep.ABORT, context, remaining)
-            if (
-                time.monotonic() >= deadline
-                or sorted(item.rank for item in ranks) != sorted(self._profile.ranks)
-                or any(
-                    item.session_id != context.session_id
-                    or item.profile_digest != context.profile_digest
-                    or item.cohort_digest != context.cohort_digest
-                    or "progression_stopped" not in item.checks
-                    for item in ranks
-                )
-            ):
-                raise RuntimeError("Abort lacks complete, current participant evidence.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Abort budget expired; host cleanup is required.")
+            validate_checkpoint_evidence(CheckpointStep.ABORT, context, ranks, self._profile.ranks)
         except Exception as exc:
             error = str(exc) or type(exc).__name__
         with self._lock:

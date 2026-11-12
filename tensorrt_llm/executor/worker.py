@@ -132,10 +132,8 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         return [getattr(self, method)(*args, **(kwargs or {}))]
 
     def start_thread(self, thread: ManagedThread):
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-        if not (self.engine.can_enqueue_requests() or
-                (isinstance(self.engine, PyExecutor)
-                 and self.engine.checkpoint is not None and self.rank == 0)):
+        if not (self.engine.can_enqueue_requests()
+                or self._is_checkpoint_leader()):
             return
         if thread.is_alive():
             return

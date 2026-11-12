@@ -18,7 +18,7 @@ import threading
 
 import pytest
 
-from tensorrt_llm.executor.base_worker import AwaitResponseHelper
+from tensorrt_llm.executor.base_worker import AwaitResponseHelper, BaseWorker
 from tensorrt_llm.executor.utils import ErrorResponse, RequestError
 from tensorrt_llm.executor.worker import GenerationExecutorWorker
 
@@ -108,11 +108,15 @@ class _ThreadStub:
 class _StartThreadWorkerStub:
     """Minimal stand-in for the worker start_thread() binds to.
 
-    It only reads self.engine, so a plain object avoids an uninitialized
+    A plain object with the real checkpoint predicates avoids an uninitialized
     GenerationExecutorWorker whose destructor would raise at collection time.
     """
 
+    _is_checkpoint_leader = BaseWorker._is_checkpoint_leader
+    _native_checkpoint = BaseWorker._native_checkpoint
+
     def __init__(self, event_loop_error=None, can_enqueue=True):
+        self.rank = 0
         self.engine = _EngineStub(event_loop_error=event_loop_error)
         self.engine.can_enqueue_requests = lambda: can_enqueue
 

@@ -8,8 +8,9 @@ import os
 import threading
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import create_autospec, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import click
 import pytest
@@ -30,10 +31,12 @@ from tensorrt_llm.executor.checkpoint import (
     GenerationValidation,
     PrepareCaptureRequest,
     RankCheckpointEvidence,
+    checkpoint_probe_sampling_params,
 )
 from tensorrt_llm.executor.rpc.rpc_common import RPCCancelled
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.serve.checkpoint import CheckpointIngress, ExecutorCheckpointBackend
+from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.runtime_control_auth import build_runtime_control_auth_headers
 
 pytestmark = pytest.mark.cpu_only
@@ -284,15 +287,36 @@ def test_checkpoint_cli_does_not_require_sleep_config(monkeypatch, enabled) -> N
     assert overrides.get("TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE") == ("1" if enabled else None)
     for key in profile_env:
         assert overrides.get(key) == ("0" if enabled else None)
-        assert os.environ[key] == ("0" if enabled else "1")
+        assert os.environ[key] == "1"  # LLM._process_env_overrides is the only writer.
     assert launch.call_args.kwargs["enable_checkpoint_mode"] == enabled
     assert not launch.call_args.kwargs["enable_runtime_control_endpoints"]
 
 
+def test_checkpoint_cli_rejects_private_opt_in_without_frontend_flag(tmp_path: Path) -> None:
+    """Reject native-only opt-in from the supported YAML configuration path."""
+    config = tmp_path / "checkpoint.yaml"
+    config.write_text(json.dumps({"env_overrides": {"TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE": "1"}}))
+    with (
+        patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
+        patch("tensorrt_llm.commands.serve.device_count", return_value=1),
+        patch("tensorrt_llm.commands.serve.launch_server") as launch,
+    ):
+        with pytest.raises(click.UsageError, match="require --enable_checkpoint_mode"):
+            serve_main(
+                args=["dummy/model", "--config", str(config)],
+                standalone_mode=False,
+            )
+    launch.assert_not_called()
+
+
 def test_admission_does_not_copy_operation_evidence(checkpoint_server) -> None:
     """Ordinary traffic and readiness probes do not build the full status response."""
-    client, lifecycle, _, _ = checkpoint_server
-    with patch.object(lifecycle, "get_lifecycle_status", side_effect=AssertionError("status copy")):
+    client, lifecycle, _, server = checkpoint_server
+    # The leak guard runs before fixture teardown; retire this test's input worker first.
+    with (
+        server._input_proc_executor,
+        patch.object(lifecycle, "get_lifecycle_status", side_effect=AssertionError("status copy")),
+    ):
         assert (
             client.post("/v1/completions", json={"model": "fake-model", "prompt": "hi"}).status_code
             == 200
@@ -510,6 +534,51 @@ def test_closed_admission_preserves_error_envelope(checkpoint_server, path) -> N
         assert payload["object"] == "error" and payload["code"] == 503
     assert client.get("/version").status_code == 200
     assert client.get("/v1/models").status_code == 200
+
+
+def test_passive_routes_are_owned_by_server(checkpoint_server) -> None:
+    client, lifecycle, _, server = checkpoint_server
+    lifecycle._cancelled.set()
+    server.energy_monitor = SimpleNamespace(get_current_energy=lambda: 42)
+    assert client.get("/energy_metrics").json()["total_energy_j"] == 42
+    assert client.get("/server_info").status_code == 503
+    assert client.post("/version").status_code == 503
+    # A classified mount passes through, but similarly named generation paths do not.
+    assert client.get("/prometheus/metrics/subpath").status_code == 404
+    assert client.get("/prometheus/metrics-other").status_code == 503
+    assert server.checkpoint_ingress.active == 0
+
+
+def test_server_rejects_native_opt_in_without_http_controls(tmp_path) -> None:
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig())
+        server.generator.args.env_overrides = {"TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE": "1"}
+        with pytest.raises(ValueError, match="opt-in must match"):
+            OpenAIServer(
+                generator=server.generator,
+                model="dummy",
+                tool_parser=None,
+                server_role=None,
+                metadata_server_cfg=None,
+            )
+
+
+def test_private_probe_uses_shared_sampling_and_llm_defaults() -> None:
+    llm = MagicMock(spec=LLM)
+    prepared = checkpoint_probe_sampling_params(2)
+    llm._prepare_sampling_params.return_value = prepared
+    result = MagicMock()
+    result.outputs = [SimpleNamespace(token_ids=[11, 12])]
+    llm._executor = SimpleNamespace(submit=MagicMock(return_value=result))
+    validation = GenerationValidation(prompt_token_ids=[1], expected_token_ids=[11, 12])
+    assert ExecutorCheckpointBackend(llm).generate(validation, "permit", 1) == [11, 12]
+    llm._prepare_sampling_params.assert_called_once()
+    supplied = llm._prepare_sampling_params.call_args.args[0]
+    assert supplied.max_tokens == 2 and supplied.temperature == 0
+    assert supplied.ignore_eos and supplied.end_id == -1 and supplied.pad_id == 0
+    request = llm._executor.submit.call_args.args[0]
+    assert request.sampling_params is prepared
+    assert request._checkpoint_validation_token == "permit"
 
 
 @pytest.mark.parametrize(

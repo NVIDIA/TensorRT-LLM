@@ -8,7 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 This prototype separates execution-state restoration from serving readiness.
 A host checkpoint tool restores the process and device state. TensorRT-LLM must
 still validate its resources and participant state before it accepts requests.
-The engine operations do not implement a host checkpoint or restore driver.
+The engine operations do not implement a host checkpoint or restore driver,
+such as [NVIDIA Dynamo Snapshot](https://github.com/ai-dynamo/snapshot).
 
 ## Scope
 
@@ -27,7 +28,7 @@ prototype. A production relocation contract must replace this fixed-cohort guard
 not simply treat a matching restored hostname as proof.
 
 This is a resident capture path. It does not call sleep, release weights or
-release KV backing. It does not require GMS. Native memory release/resume cannot
+release KV backing. It does not require GPU Memory Service (GMS). Native memory release/resume cannot
 clear the independent checkpoint admission gate.
 
 ## Enable
@@ -48,7 +49,16 @@ TRTLLM_GPU_KEEPALIVE=0
 
 Native lifecycle opt-in is scoped to the engine's `env_overrides` mapping, not
 an inherited `TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE` value from an earlier LLM.
-The CLI supplies this private opt-in. It does not enable sleep or a host driver.
+The CLI supplies this private transport through existing LLM args, not a public
+configuration field. Exporting this variable alone does not enable a worker.
+The HTTP server requires matching native and frontend opt-in, HMAC authentication
+and one frontend. The CLI rejects a native opt-in without `--enable_checkpoint_mode`.
+Embedded engine tests can set the mapping explicitly, but must provide their own
+lifecycle controller. The opt-in does not enable sleep or a host driver.
+Only `LLM._process_env_overrides` writes the process environment; the CLI warns
+about conflicting values before handing it the overrides. Config preflight runs
+before model load and names unsupported settings. Native checks still verify
+resolved resources after warmup.
 Loaded standard fast tokenizers have a content-based profile identity. Custom
 tokenizer wrappers, runtime checkpoint loaders and custom logits/postprocessing
 hooks are outside this first profile and are rejected.
@@ -134,10 +144,12 @@ Generation must match reference tokens and replay a warmed graph on each rank.
 The engine then retires the probe and checks retained storage again.
 Before `prepare_capture`, select the probe's prompt token IDs and generate its
 reference with the same model and resolved profile. Choose a reference length
-`N` from 2 through 64 and use the same sampling settings as private validation:
+`N` from 2 through 64 and use the shared helper for reference generation:
 
 ```python
-SamplingParams(temperature=0, max_tokens=N, ignore_eos=True, end_id=-1, pad_id=0)
+from tensorrt_llm.executor.checkpoint import checkpoint_probe_sampling_params
+
+reference = llm.generate([prompt_token_ids], checkpoint_probe_sampling_params(N))
 ```
 
 Store the exact generated token IDs as `expected_token_ids`, and reuse the same
@@ -171,12 +183,13 @@ A proven pre-dispatch failure does not by itself invalidate the native runtime.
 Returning to service requires an explicit, qualified controller action; it is
 never an automatic timeout fallback.
 
-The current implementation distinguishes two failure paths:
+The current implementation distinguishes these failure paths:
 
 | Failure boundary | Current behavior |
 | --- | --- |
 | Preparation budget expires before the backend runs, or HTTP drain/budget expires before native RPC dispatch | Record `status: failed` and `native_prepare_not_dispatched: true`. Keep HTTP admission closed. Do not send native revocation solely for this failure. Without a concurrent abort, `cleanup_status` remains `not_requested`. |
 | Native dispatch started, its outcome is uncertain, or later validation fails | Record failure, request native fail-closed handling and require host cleanup evidence. An RPC timeout does not prove that native work stopped. |
+| A later frontend validation fails after the ranks parked, such as a probe token mismatch | Native revocation reaches rank zero. Peers retain their scheduler parks until explicit `abort_operation` or shutdown. Admission stays closed; a failed result does not prove peer retirement. |
 
 The pre-dispatch classification is made before native revocation. It requires
 the synchronous prepare caller to have ended without dispatch; no queued native
@@ -204,8 +217,11 @@ Stale commands cannot advance the lifecycle.
 Abort does not resume the source. It does not prove
 host cleanup, DMA retirement or safe memory reuse. The external supervisor
 must remain outside the worker job's effective failure/abort scope.
-Rank zero requests peer park release and waits for acknowledgements before local
-scheduler shutdown. If a native command or listener does not retire during shutdown, TensorRT-LLM
+The peer control listener uses a blocking receive. Rank-zero shutdown sends an
+explicit close command; local peer shutdown also wakes the listener. Rank zero
+requests peer park release and waits for acknowledgements before local
+scheduler shutdown. Both sides wait for pending MPI sends within the shutdown
+budget. If a native command, listener or send does not retire during shutdown, TensorRT-LLM
 retains engine resources and reports a shutdown timeout. The external supervisor
 must terminate the entire worker job before retrying startup. Do not continue
 resource teardown while a checkpoint command can still access those resources.
@@ -218,9 +234,14 @@ Use `/health` for liveness and `/ready` for traffic readiness. Do not use `/heal
 as evidence that restore validation or activation completed. Generation paths,
 including `/health_generate`, return 503 while admission is closed.
 OpenAI and Anthropic generation routes keep their respective error envelopes.
-Passive `/version`, `/v1/models`, `/metrics` and `/prometheus/metrics` reads remain
-available. Other routes, including `/energy_metrics` and `/server_info`, remain
-gated; this prototype does not classify all handlers as safe passive reads.
+Checkpoint admission is the innermost server middleware, inside arrival-time and
+optional performance instrumentation. Rejected requests still pass through the
+existing instrumentation without entering generation.
+The server classifies passive GET/HEAD paths: `/version`, `/v1/models`, `/metrics`,
+`/memory_status`, `/energy_metrics` and the `/prometheus/metrics` mount remain
+reachable. Their own health or availability checks still apply. `/server_info`
+remains gated because it can issue synchronous executor RPCs and read live KV
+capacity; it is not a purely local metadata read.
 Runtime `/start_profile` and `/stop_profile` controls and Message Batch creation
 are rejected for the entire checkpoint-mode lifetime, including before prepare.
 Background batches require a separate lifetime/admission contract. Profiling
@@ -228,22 +249,17 @@ cannot start through an unauthenticated route and bypass the capture boundary.
 Already accepted HTTP responses, including streams, must finish before capture
 safety is returned. Their preprocessing and generation drain before the native
 queue closes. Keep the controller connection and capture boundary under
-the host tool's application contract; this PR does not implement socket handling.
+the host tool's application contract; these engine controls do not implement socket handling.
 
-## Acceptance And Remaining Dependencies
+## Limitations
 
-| Requirement | Implementation or remaining gate |
-| --- | --- |
-| Persistent serving gate independent of memory readiness | HTTP ingress and native request queue |
-| All affected ranks, bounded drain, exact retries and fresh restore identity | Fixed MPI cohort protocol and operation journal |
-| Private generation with final graph storage retained | Native resident inventory, replay hook and normal executor submit |
-| Unsupported external exposure | Explicit rejection, not an idle-queue inference |
-| Compact capture and extended KV metadata reconstruction | Separate native memory/KV integration; not implemented here |
-| Transfer-bearing and disaggregated profiles | Require lifecycle evidence for publication closure, transfer retirement and peer reconstruction; not implemented here |
-| Production host contract and process restore qualification | External driver binding, fresh authority/secrets, socket/transport treatment and actual restore tests remain required |
-| Multi-node, Ray, topology changes and repeated capture after activation | Not implemented by this first fixed-cohort prototype |
-
-The native TP1/TP2 test sends a simulated host notification without destroying
-or restoring the process. It tests engine lifecycle behavior, not Snapshot
-compatibility, startup speedup, credential rotation or clone safety. Do not use
-that result to claim end-to-end checkpoint/restore qualification.
+- Engine controls alone do not capture or restore a process. An external driver
+  must validate real process restore, current controller authority, credentials
+  and communication state. Simulated host notifications do not qualify Snapshot
+  compatibility, startup speedup or clone safety.
+- Compact capture, extended KV reconstruction, KV transfers and disaggregated
+  serving are not supported. An idle queue does not prove transfer retirement.
+- Multi-node, Ray, topology changes and repeated capture after activation are
+  outside the fixed-cohort profile.
+- In-place recovery after a failed preparation is not supported. Stop and
+  replace the worker; do not reopen admission from a timeout alone.
