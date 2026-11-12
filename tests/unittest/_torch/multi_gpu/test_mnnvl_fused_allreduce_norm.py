@@ -70,14 +70,14 @@ def _check(got, ref, tag, rtol=2e-2):
     )
 
 
-def _mnnvl(tp):
+def _mnnvl(tp, hidden=H):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     os.environ["TLLM_TEST_MNNVL"] = "1"
     MPI.COMM_WORLD.barrier()
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
-    ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max(ROWS), hidden_size=H)
-    assert MnnvlAllReduceNorm.is_supported(mapping, torch.bfloat16, H)
+    ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max(ROWS), hidden_size=hidden)
+    assert MnnvlAllReduceNorm.is_supported(mapping, torch.bfloat16, hidden)
     assert ar.fused_norm is not None, "CuTe DSL kernels not built"
     return ar, rank
 
@@ -121,34 +121,140 @@ def _norm_cases(tp):
         _check(norm, ref_norm, ("norm with fp8", m))
         # E4M3 holds 3 mantissa bits: half an ulp is 6.25 % relative.
         _check(fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("fp8", m), rtol=7e-2)
-    # More rows than two CTAs per SM: the two-shot kernel takes several tokens per CTA.
-    m = 2 * torch.cuda.get_device_properties(rank).multi_processor_count + 8
+    # Exercise two and 14 tokens per CTA, including a partially filled final CTA. From 15 tokens an SM holds
+    # one of these CTAs instead of two, and the dispatch declines.
+    wave = 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    assert not ar.fused_norm.supports_rows(14 * wave + 1)
+    for m in (wave + 8, 13 * wave + 1):
+        assert ar.fused_norm.supports_rows(m), m
+        xs = [_rand((m, H), 100 * m + r) for r in range(tp)]
+        residual = _rand((m, H), 7 * m)
+        ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, norm_weight)
+        norm, res = ar.fused_norm(residual, norm_weight, EPS, x=xs[rank])
+        _check(norm, ref_norm, ("kernel norm", m))
+        _check(res, ref_res, ("kernel residual", m))
+
+
+@pytest.mark.parametrize(("hidden", "tokens_per_cta"), [(2048, 28), (4096, 28), (8192, 14)])
+def test_mnnvl_fused_allreduce_norm_compiled_shared_memory(
+    hidden: int, tokens_per_cta: int
+) -> None:
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.memory import get_kernel_smem_size
+
+    from tensorrt_llm._torch.cute_dsl_utils import graph_safe_cute_tensor
+    from tensorrt_llm._torch.distributed.mnnvl_fused_allreduce import _example_operands, _rows
+    from tensorrt_llm._torch.kernels.blackwell.mnnvl_allreduce_norm import MnnvlAllReduceNormKernel
+
+    kernel = MnnvlAllReduceNormKernel(
+        hidden=hidden,
+        norm_eps=EPS,
+        nranks=2,
+        ctas=1,
+        use_pdl=False,
+        se_fold=False,
+        norm_out=True,
+        quant=False,
+        tpc=tokens_per_cta,
+    )
+
+    @cute.kernel
+    def store_size(output: cute.Tensor, size: cutlass.Int64) -> None:
+        output[0] = size
+
+    @cute.jit
+    def shared_memory_size(
+        execute: cutlass.Boolean,
+        x: cute.Tensor,
+        gate: cute.Tensor,
+        weight: cute.Tensor,
+        scale: cute.Tensor,
+        quant: cute.Tensor,
+        table: cute.Tensor,
+        output: cute.Tensor,
+        stream: cuda.CUstream,
+    ) -> None:
+        # Trace the real kernel without executing a collective on the dummy workspace.
+        if execute:
+            kernel(
+                x,
+                x,
+                x,
+                gate,
+                x,
+                weight,
+                scale,
+                x,
+                x,
+                quant,
+                table,
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int32(0),
+                stream,
+            )
+        store_size(output, cutlass.Int64(get_kernel_smem_size(kernel.kernel_mt))).launch(
+            grid=[1, 1, 1], block=[1, 1, 1], stream=stream
+        )
+
+    x, gate, weight, scale, quant, table = _example_operands(hidden, 2)
+    output = torch.empty((1,), dtype=torch.int64, device="cuda")
+    args = (
+        cutlass.Boolean(False),
+        _rows(x),
+        _rows(gate),
+        graph_safe_cute_tensor(weight),
+        graph_safe_cute_tensor(scale),
+        _rows(quant),
+        graph_safe_cute_tensor(table),
+        graph_safe_cute_tensor(output),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    cute.compile(shared_memory_size, *args)(*args)
+    assert output.item() == kernel.mt_smem_bytes(hidden, tokens_per_cta)
+
+
+def _large_hidden_norm_cases(tp: int) -> None:
+    hidden = 8192
+    ar, rank = _mnnvl(tp, hidden)
+    wave = 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    m = 13 * wave + 1
     assert ar.fused_norm.supports_rows(m), m
-    xs = [_rand((m, H), 100 * m + r) for r in range(tp)]
-    residual = _rand((m, H), 7 * m)
+    norm_weight = _rand((hidden,), 1, 0.1) + 1
+    xs = [_rand((m, hidden), 100 * m + r) for r in range(tp)]
+    residual = _rand((m, hidden), 7 * m)
     ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, norm_weight)
     norm, res = ar.fused_norm(residual, norm_weight, EPS, x=xs[rank])
-    _check(norm, ref_norm, ("kernel norm", m))
-    _check(res, ref_res, ("kernel residual", m))
+    _check(norm, ref_norm, ("large hidden norm", m))
+    _check(res, ref_res, ("large hidden residual", m))
 
 
-def _moe_fold_cases(tp, top_k=10):
-    ar, rank = _mnnvl(tp)
-    norm_weight = _rand((H,), 2, 0.1) + 1
-    for m in ROWS:
-        assert ar.supports_moe_fold(m, H), m
+def _moe_fold_cases(
+    tp: int,
+    top_k: int = 10,
+    hidden: int = H,
+    rows: tuple[int, ...] = ROWS,
+    quantize: bool = False,
+) -> None:
+    ar, rank = _mnnvl(tp, hidden)
+    norm_weight = _rand((hidden,), 2, 0.1) + 1
+    for m in rows:
+        assert ar.supports_moe_fold(m, hidden), m
         routed, finalized, args = [], [], None
         for r in range(tp):
             s = 1000 * m + 10 * r
-            # FC2 rows of the permuted (token, k) pairs plus padding rows, with a stride past H.
-            fc2 = _rand((m * top_k + 16, H + 64), s)[:, :H]
+            # FC2 rows of the permuted (token, k) pairs plus padding rows, with a padded stride.
+            fc2 = _rand((m * top_k + 16, hidden + 64), s)[:, :hidden]
             g = torch.Generator(device="cuda").manual_seed(s + 1)
             perm = torch.randperm(m * top_k + 16, generator=g, device="cuda")[: m * top_k]
             perm = perm.view(m, top_k).to(torch.int32)
             topw = torch.softmax(_rand((m, top_k), s + 2, dtype=torch.float32), -1).to(
                 torch.bfloat16
             )
-            shared = _rand((m, H), s + 3)
+            shared = _rand((m, hidden), s + 3)
             gate = _rand((m, 1), s + 4)
             fin = (fc2.float()[perm.long()] * topw.float().unsqueeze(-1)).sum(1)
             routed.append(fin + torch.sigmoid(gate.float()) * shared.float())
@@ -156,7 +262,7 @@ def _moe_fold_cases(tp, top_k=10):
             finalized.append(fin_bf16.float() + torch.sigmoid(gate.float()) * shared.float())
             if r == rank:
                 args = (fc2, topw, perm, shared, gate, fin_bf16)
-        residual = _rand((m, H), 9 * m)
+        residual = _rand((m, hidden), 9 * m)
         ref_norm, ref_res = _ref_norm(sum(routed), residual, norm_weight)
         fc2, topw, perm, shared, gate, fin_bf16 = args
         params = MoEAllReduceParams(
@@ -172,6 +278,18 @@ def _moe_fold_cases(tp, top_k=10):
         norm, res = ar(fc2, all_reduce_params=params)
         _check(norm, ref_norm, ("moe fold norm", m))
         _check(res, ref_res, ("moe fold residual", m))
+        if quantize:
+            params.fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+            params.scale = torch.tensor([0.05], dtype=torch.float32, device="cuda")
+            norm, fp8, res = ar(fc2, all_reduce_params=params)
+            _check(norm, ref_norm, ("moe fold norm with fp8", m))
+            _check(res, ref_res, ("moe fold residual with fp8", m))
+            _check(
+                fp8.float() * params.scale,
+                ref_norm.clamp(-448 * 0.05, 448 * 0.05),
+                ("moe fold fp8", m),
+                rtol=7e-2,
+            )
         # A finalized routed output: only the shared-expert combine is folded.
         ref_norm, ref_res = _ref_norm(sum(finalized), residual, norm_weight)
         params = MoEAllReduceParams(
@@ -185,6 +303,11 @@ def _moe_fold_cases(tp, top_k=10):
         norm, res = ar(fin_bf16, all_reduce_params=params)
         _check(norm, ref_norm, ("finalized fold norm", m))
         _check(res, ref_res, ("finalized fold residual", m))
+
+
+def _large_moe_fold_cases(tp: int) -> None:
+    wave = 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    _moe_fold_cases(tp, hidden=8192, rows=(13 * wave + 1,), quantize=True)
 
 
 def _gemm_norm_cases(tp, k=1024):
@@ -273,7 +396,9 @@ def _opt_in_cases(tp):
 
 CASES = {
     "norm": _norm_cases,
+    "large_hidden_norm": _large_hidden_norm_cases,
     "moe_fold": _moe_fold_cases,
+    "large_moe_fold": _large_moe_fold_cases,
     "gemm_norm": _gemm_norm_cases,
     "meta_init": _meta_init_cases,
     "opt_in": _opt_in_cases,

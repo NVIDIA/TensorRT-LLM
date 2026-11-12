@@ -93,10 +93,40 @@ def test_certified_cells(cell) -> None:
         out = op(*args, compiled=compiled)
     for a, s in zip(args[:3], snap):
         assert torch.equal(a, s), "an input tensor was mutated"
-    _compare(out, op.reference(*args, compiled=compiled))
+    ref = op.reference(*args, compiled=compiled)
+    # Not degenerate: every query row resolves rows, and they are pool rows of many pages.
+    assert bool((ref >= 0).any(dim=1).all()), "a query row of the reference resolves no row"
+    assert int(torch.unique(ref[ref >= 0] // BLOCK).numel()) > 1
+    _compare(out, ref)
     assert bool((out[args[2] < 0] == -1).all())
     if spec.get("pad_block_table"):
         assert bool((out[args[2] >= 0] == -1).any()), "the cell drove no unresolvable position"
+
+
+@pytest.mark.parametrize("p", [2, 4, 6], ids=["mtp1", "mtp3", "mtp5"])
+def test_graph_replay_is_bitwise_eager(p) -> None:
+    """The target captures this op in its decode graph at each MTP width's full batch: a
+    replay must write the eager call's rows, and a second replay on a new selection copied
+    into the same buffer must write that selection's rows."""
+    spec = dict(
+        topk=2048, pool_layers=79, seq_rows=[p] * 32, kv_lens=[p + 251 * i for i in range(32)]
+    )
+    spec["max_blocks"] = 512
+    req, table, tok, bs, stride = _build(spec, seed=50 + p)
+    new_tok = _build(spec, seed=60 + p)[2]
+    compiled = _compiled(2048, 512)
+    eager = [op(req, table, t, bs, stride, compiled=compiled) for t in (tok, new_tok)]
+    original = tok.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(req, table, tok, bs, stride, compiled=compiled)
+    for selection, want in zip((original, new_tok), eager):
+        tok.copy_(selection)
+        out.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, want)
+    assert not torch.equal(eager[0], eager[1])
 
 
 @pytest.mark.parametrize("layer", [0, 1, 40, 78])
