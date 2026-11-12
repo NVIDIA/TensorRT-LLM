@@ -26,9 +26,9 @@ MTP layer to DWDP as a repeated layer; the constructor does not see DWDP.
 (tensor-parallel or expert-parallel MoE, attention DP), without pipeline or context parallelism.
 
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower: the
-weight mapper's audit allowlists the ``model.visual.*`` namespace. Routing sends it only deployments that serve the
-checkpoint text only (``disable_mm_encoder``), and a request that carries multimodal input is refused at admission
-(``validate_multimodal_request_data``).
+weight mapper's audit allowlists the ``model.visual.*`` namespace. A request that carries multimodal input is
+refused at admission (``validate_multimodal_request_data``), so a deployment that keeps the multimodal encoder
+serves text requests and fails image and video requests alone.
 """
 
 from __future__ import annotations

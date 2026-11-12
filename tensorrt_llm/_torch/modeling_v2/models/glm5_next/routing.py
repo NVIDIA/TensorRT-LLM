@@ -19,10 +19,10 @@ speculative decoding runs:
 
 The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
-targets are text only: they load no vision tower, so ``route`` takes a
-deployment only when it serves the checkpoint text only
-(``disable_mm_encoder``). With the multimodal encoder enabled, the built-in
-model serves the image and video input.
+targets are text only: they load no vision tower, and each refuses a request
+that carries image or video input at admission
+(``validate_multimodal_request_data``). ``route`` therefore takes a deployment
+whether or not it disables the multimodal encoder.
 """
 
 from __future__ import annotations
@@ -190,12 +190,6 @@ def route(
     if not single_stage:
         raise NoTarget(
             f"{deployment}; the glm5_next targets run without pipeline or context parallelism"
-        )
-    # Requests that carry image or video input need the vision tower, which the targets do not build.
-    if not llm_args.disable_mm_encoder:
-        raise NoTarget(
-            f"{deployment}, multimodal encoder enabled; the glm5_next targets serve the checkpoint text "
-            "only, with disable_mm_encoder"
         )
 
     if not _fused_refused(model_config, llm_args, spec_config):
