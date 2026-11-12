@@ -397,6 +397,121 @@ def test_ultra_nvfp4_does_not_route_to_dep16():
     _refused(config, r"MIXED_PRECISION")
 
 
+# --- BF16 dep32: attention DP over eight GB200 trays ------------------------------
+
+_ULTRA_BF16_DEP32_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_bf16__sm_100__dep32.modeling."
+    "ModelingV2Nemotron3UltraBf16Sm100Dep32"
+)
+# Eight GB200 trays of four: the disaggregated context tier at DEP32 (its generation tiers at
+# dep16 route on their own mappings).
+_DEP32 = dict(_DEP16, world_size=32, tp_size=32, moe_ep_size=32)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_bf16_dep32_matches(mode):
+    """Attention DP over 32 ranks with the experts in thirty-two windows selects dep32."""
+    config = _model_config(_ultra_bf16_config(), **_DEP32)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_DEP32_TARGET
+
+
+def test_ultra_bf16_dep16_and_dep32_each_take_their_own_mapping():
+    """A disaggregated deployment's context engine at DEP32 and generation engine at DEP16 are
+    two LLM instances; each routes on its own mapping."""
+    ctx = _model_config(_ultra_bf16_config(), **_DEP32)
+    gen = _model_config(_ultra_bf16_config(), **_DEP16)
+    assert _qualified(modeling_v2_resolve(ctx, _llm_args("require"))) == _ULTRA_BF16_DEP32_TARGET
+    assert _qualified(modeling_v2_resolve(gen, _llm_args("require"))) == _ULTRA_BF16_DEP16_TARGET
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("backend", ["AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"])
+def test_ultra_bf16_dep32_takes_its_moe_backends(backend, mode):
+    """dep16's backends: every request runs in the engine's MoE layer."""
+    config = replace(_model_config(_ultra_bf16_config(), **_DEP32), moe_backend_requested=backend)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_DEP32_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, missed",
+    [
+        # 32 ranks of tensor-parallel attention: a layout no target was built for
+        (dict(_DEP32, enable_attention_dp=False), "attention_dp=False"),
+        # the experts in sixteen windows split two ways
+        (dict(_DEP32, moe_ep_size=16, moe_tp_size=2), "moe_ep=16"),
+        # attention DP over 24 ranks: 512 experts do not tile, and no target was built for it
+        (dict(_DEP32, world_size=24, tp_size=24, moe_ep_size=24), "world_size=24"),
+        # one 32-GPU node: only GB200 trays of four were measured
+        (dict(_DEP32, gpus_per_node=32), "inside one node"),
+        # a vocab-parallel lm_head under attention DP
+        (dict(_DEP32, enable_lm_head_tp_in_adp=True), "enable_lm_head_tp_in_adp"),
+    ],
+    ids=["tp32", "moe-ep16-tp2", "dep24", "single-node", "lm-head-tp"],
+)
+def test_ultra_bf16_dep32_near_misses_do_not_match(mapping_kwargs, missed):
+    config = _model_config(_ultra_bf16_config(), **mapping_kwargs)
+    _refused(config, missed)
+
+
+@pytest.mark.parametrize(
+    "llm_kwargs, missed",
+    [
+        # dep16's: the bf16 KV cache and the fp32 state only
+        (dict(kv_cache_config=_kv(dtype="fp8")), "KV cache"),
+        (dict(kv_cache_config=_kv(mamba_ssm_cache_dtype="float16")), "recurrent-state"),
+        (dict(kv_cache_config=_kv(enable_block_reuse=True)), "enable_block_reuse"),
+        (dict(moe_config=MoeConfig(load_balancer={"num_slots": 512})), "EPLB"),
+        (dict(prefill_cuda_graph_backend="piecewise"), "piecewise"),
+    ],
+    ids=["fp8-kv", "fp16-state", "block-reuse", "eplb", "piecewise"],
+)
+def test_ultra_bf16_dep32_refuses_engine_choices_it_never_ran(llm_kwargs, missed):
+    config = _model_config(_ultra_bf16_config(), **_DEP32)
+    _refused(config, missed, **llm_kwargs)
+
+
+def test_ultra_bf16_dep32_block_reuse_is_opt_in_with_its_own_switch(monkeypatch):
+    """dep32 admits block reuse only when its own switch asks for it; dep16's switch does not
+    turn it on for dep32, nor dep32's for dep16."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.routing import (
+        BF16_DEP16_BLOCK_REUSE_ENV,
+        BF16_DEP32_BLOCK_REUSE_ENV,
+    )
+
+    assert BF16_DEP32_BLOCK_REUSE_ENV != BF16_DEP16_BLOCK_REUSE_ENV
+    # trtllm-llmapi-launch drops MV2_, SLURM_, UCX_ and OMPI_ variables before the ranks start.
+    assert not BF16_DEP32_BLOCK_REUSE_ENV.startswith(("MV2_", "SLURM_", "UCX_", "OMPI_"))
+    reuse = dict(kv_cache_config=_kv(enable_block_reuse=True))
+    dep32 = _model_config(_ultra_bf16_config(), **_DEP32)
+    dep16 = _model_config(_ultra_bf16_config(), **_DEP16)
+    monkeypatch.delenv(BF16_DEP32_BLOCK_REUSE_ENV, raising=False)
+    monkeypatch.setenv(BF16_DEP16_BLOCK_REUSE_ENV, "1")
+    _refused(dep32, BF16_DEP32_BLOCK_REUSE_ENV, **reuse)
+    monkeypatch.delenv(BF16_DEP16_BLOCK_REUSE_ENV)
+    monkeypatch.setenv(BF16_DEP32_BLOCK_REUSE_ENV, "1")
+    resolved = modeling_v2_resolve(dep32, _llm_args("require", **reuse))
+    assert _qualified(resolved) == _ULTRA_BF16_DEP32_TARGET
+    _refused(dep16, BF16_DEP16_BLOCK_REUSE_ENV, **reuse)
+    _refused(_model_config(_ultra_bf16_config(), **_TEP8), "enable_block_reuse", **reuse)
+
+
+@pytest.mark.parametrize("backend", ["CUTEDSL", "DEEPGEMM", "MEGAMOE_DEEPGEMM", "TRITON"])
+def test_ultra_bf16_dep32_refuses_another_moe_backend(backend):
+    config = replace(_model_config(_ultra_bf16_config(), **_DEP32), moe_backend_requested=backend)
+    _refused(config, "moe_config.backend")
+
+
+def test_ultra_bf16_dep32_with_speculative_decoding_does_not_match():
+    config = _model_config(_ultra_bf16_config(), spec_config=_NGRAM, **_DEP32)
+    _refused(config, "speculative decoding")
+
+
+def test_ultra_nvfp4_does_not_route_to_dep32():
+    """The NVFP4 release on 32 sm_100 ranks with attention DP falls back."""
+    config = _model_config(_ultra_config(), **_DEP32)
+    _refused(config, r"MIXED_PRECISION")
+
+
 # --- NVFP4 on sm_107 -------------------------------------------------------------
 
 _ULTRA_NVFP4_TEP4_TARGET = (

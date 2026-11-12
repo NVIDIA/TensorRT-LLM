@@ -57,6 +57,11 @@ _BF16_TP8EP2 = (8, False, 4, 2)
 # windows. The layout of the disaggregated serving tiers (context and generation), measured
 # there with the built-in implementation.
 _BF16_DEP16 = (16, True, 1, 16)
+# 32 ranks (eight trays): the same attention data parallel, the routed experts in thirty-two
+# 16-expert windows. Every non-expert shape a rank runs is dep16's; only the expert window
+# differs, which is a weight layout, hence its own target. The disaggregated context tier's
+# layout when it runs at DEP32 beside generation tiers at dep16. Not yet gated (GSM8K pending).
+_BF16_DEP32 = (32, True, 1, 32)
 
 # Block reuse on dep16, opt-in and not gated yet: the disaggregated context tier reuses each
 # conversation's prefix, its Mamba state restored from the prompt-end snapshots the cache
@@ -64,6 +69,14 @@ _BF16_DEP16 = (16, True, 1, 16)
 # snapshots in the state pools; the target's prefill seeds the scan and the conv window from
 # the slot wherever `has_initial_states` says so, as Modeling V1's Mamba2 mixer does.
 BF16_DEP16_BLOCK_REUSE_ENV = "TRTLLM_NEMOTRON_ULTRA_DEP16_BLOCK_REUSE"
+# The same opt-in for dep32, with its own switch: a context tier at DEP32 and generation tiers at
+# dep16 decide reuse independently.
+BF16_DEP32_BLOCK_REUSE_ENV = "TRTLLM_NEMOTRON_ULTRA_DEP32_BLOCK_REUSE"
+# The layouts that run block reuse when asked for, and the switch that asks.
+_BF16_BLOCK_REUSE_ENVS = {
+    _BF16_DEP16: ("dep16", BF16_DEP16_BLOCK_REUSE_ENV),
+    _BF16_DEP32: ("dep32", BF16_DEP32_BLOCK_REUSE_ENV),
+}
 
 # The KV cache algorithms each BF16 layout was gated with (None: the checkpoint's bf16).
 _BF16_KV_ALGOS = {
@@ -71,18 +84,20 @@ _BF16_KV_ALGOS = {
     # tp8ep2 also binds an fp8-e4m3 pool at unit kv scales (`kv_cache_config.dtype: fp8`).
     _BF16_TP8EP2: (None, QuantAlgo.FP8),
     _BF16_DEP16: (None,),
+    _BF16_DEP32: (None,),
 }
 
 # The MoE backends each BF16 layout stands for. On tep8 and tp8ep2, AUTO and CUTLASS run the
 # target's own expert path (fused_moe); tep8 also runs its routed experts in the engine's MoE
 # layer when MEGAMOE_CUTEDSL (CuTe DSL MegaMoE, BF16 Relu2 leaf) or TRTLLM (FlashInfer's
-# TRTLLM-Gen BF16 MoE) is asked for by name. dep16 runs every request in the engine's MoE layer,
-# whose exchange between ranks it needs: AUTO and CUTLASS on the CUTLASS leaf. A request the leaf
-# declines fails at construction.
+# TRTLLM-Gen BF16 MoE) is asked for by name. dep16 and dep32 run every request in the engine's MoE
+# layer, whose exchange between ranks they need: AUTO and CUTLASS on the CUTLASS leaf. A request
+# the leaf declines fails at construction.
 _BF16_MOE_BACKENDS = {
     _BF16_TEP8: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"}),
     _BF16_TP8EP2: frozenset({"AUTO", "CUTLASS"}),
     _BF16_DEP16: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"}),
+    _BF16_DEP32: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"}),
 }
 # Why a layout refuses a backend another BF16 layout takes, by backend.
 _BF16_MOE_REFUSALS = {
@@ -237,14 +252,17 @@ def route(
             "experts expert-parallel over the 8 ranks (tep8: moe_ep 8) or in two expert-parallel "
             "windows of four tensor-parallel ranks (tp8ep2: moe_ep 2, moe_tp 4), and on 16 ranks "
             "with attention data parallel and the routed experts expert-parallel over them "
-            "(dep16: attention_dp, moe_ep 16)"
+            "(dep16: attention_dp, moe_ep 16), and the same on 32 ranks (dep32: attention_dp, "
+            "moe_ep 32)"
         )
     # Only GB200 trays (4 GPUs each, in one NVLink domain) were measured: two for tp8, four
-    # for dep16. An 8-GPU node runs the intra-node collectives nobody has gated.
+    # for dep16 (eight for dep32, not gated yet). An 8-GPU node runs the intra-node collectives
+    # nobody has gated.
     if not nvfp4 and not mapping.is_multi_node():
         raise NoTarget(
             f"parallel layout {split} inside one node of {mapping.gpus_per_node} GPUs; the "
-            "BF16 targets are gated on GB200 trays of four (two for tp8, four for dep16)"
+            "BF16 targets are gated on GB200 trays of four (two for tp8, four for dep16, eight "
+            "for dep32)"
         )
 
     # The engine choices.
@@ -265,12 +283,14 @@ def route(
             f"use_kv_cache_manager_v2={kv_cache_config.use_kv_cache_manager_v2}; the targets "
             "read the hybrid recurrent-state pools of KV cache manager V2"
         )
-    dep16 = not nvfp4 and layout == _BF16_DEP16
+    reuse_opt_in = None if nvfp4 else _BF16_BLOCK_REUSE_ENVS.get(layout)
     if kv_cache_config.enable_block_reuse and not (
-        dep16 and os.environ.get(BF16_DEP16_BLOCK_REUSE_ENV, "0") == "1"
+        reuse_opt_in is not None and os.environ.get(reuse_opt_in[1], "0") == "1"
     ):
         hint = (
-            f"; dep16 runs it, not gated yet, with {BF16_DEP16_BLOCK_REUSE_ENV}=1" if dep16 else ""
+            f"; {reuse_opt_in[0]} runs it, not gated yet, with {reuse_opt_in[1]}=1"
+            if reuse_opt_in is not None
+            else ""
         )
         raise NoTarget(
             "enable_block_reuse=True: the targets were gated with block reuse off and implement "
@@ -349,6 +369,14 @@ def route(
         )
 
         return ModelingV2Nemotron3UltraBf16Sm100Dep16
+
+    # Nemotron-3 Ultra 550B-A55B BF16 on 32 sm_100 GPUs, dep32.
+    if layout == _BF16_DEP32:
+        from .nemotron3_ultra_bf16__sm_100__dep32.modeling import (
+            ModelingV2Nemotron3UltraBf16Sm100Dep32,
+        )
+
+        return ModelingV2Nemotron3UltraBf16Sm100Dep32
 
     # Nemotron-3 Ultra 550B-A55B BF16 on 8 sm_100 GPUs, tep8.
     if layout == _BF16_TEP8:
