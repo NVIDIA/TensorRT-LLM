@@ -178,7 +178,9 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
         ),
         model_key=resolve_model_key(workflow.task_data),
         accuracy_test=accuracy_test_path(
-            workflow.task_data["trtllm_repo_path"], workflow._preflight.family
+            workflow.task_data["trtllm_repo_path"],
+            workflow._preflight.family,
+            Path(workflow._preflight.target_rel).name,
         ),
         commit_policy=CommitPolicy.from_task(workflow.task_data, workspace=workflow.workspace),
     )

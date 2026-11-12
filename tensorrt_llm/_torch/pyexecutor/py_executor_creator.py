@@ -54,7 +54,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
                     instantiate_sampler, is_disagg_enabled, is_mla)
-from .config_utils import (is_hybrid_linear, is_minimax_m3,
+from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -67,6 +67,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -660,6 +661,12 @@ def _create_py_executor(
     kv_connector_config = llm_args.kv_connector_config
 
     scheduler_config = llm_args.scheduler_config
+    # Reserve paused-request headroom only when startup prerequisites allow it.
+    headroom_reason = gen_preemption.unsupported_headroom_reason(
+        scheduler_config.gen_preemption, llm_args)
+    if headroom_reason:
+        logger.warning(
+            f"[gen_preempt] GEN slot preemption disabled: {headroom_reason}")
 
     # Since peft_cache_config may be subject to change, avoid these changes propagate back
     # to llm_args.peft_cache_config
@@ -811,6 +818,13 @@ def _create_py_executor(
             "generation servers; aggregated serving with Helix is not "
             "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
             "development only).")
+    if (is_decode_only(llm_args.sparse_attention_config)
+            and not is_disagg_enabled(cache_transceiver_config)):
+        raise NotImplementedError(
+            "Sparse KV cache offload runs only on disaggregated generation "
+            "servers: it admits one input token per request per step, so it "
+            "cannot serve context requests. Set cache_transceiver_config, or "
+            "disable sparse_attention_config.enable_kv_cache_offload.")
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -1121,6 +1135,7 @@ def _create_py_executor(
                                      ctx_chunk_config)
 
     guided_decoder: Optional[GuidedDecoder] = None
+    capturable_guided_decoder: Optional[CapturableGuidedDecoder] = None
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
@@ -1142,8 +1157,10 @@ def _create_py_executor(
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
                     # CapturableGuidedDecoder is applicable to one-model speculative decoding.
+                    capturable_guided_decoder = CapturableGuidedDecoder(
+                        **kwargs)
                     success = model_engine.set_guided_decoder(
-                        CapturableGuidedDecoder(**kwargs))
+                        capturable_guided_decoder)
                     if not success:
                         raise ValueError(
                             f"Failed to set guided decoder for speculative decoding mode: {spec_config.spec_dec_mode.name}."
@@ -1311,6 +1328,14 @@ def _create_py_executor(
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
 
+        if not skip_est and is_decode_only(sparse_attention_config):
+            # The estimation dry run prefills dummy prompts, which a
+            # decode-only worker cannot execute. Size the KV cache from free
+            # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
+            logger.info("KV cache size estimation is not supported for a "
+                        "decode-only worker, disable it.")
+            skip_est = True
+
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
             mapping=mapping,
@@ -1328,6 +1353,8 @@ def _create_py_executor(
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
             draft_config=draft_config,
+            gen_preemption_headroom=getattr(model_engine,
+                                            "gen_preemption_headroom", 0),
             skip_est=skip_est,
             is_disagg=is_disagg,
         )
@@ -1402,6 +1429,7 @@ def _create_py_executor(
             sampler=sampler,
             drafter=drafter,
             guided_decoder=guided_decoder,
+            capturable_guided_decoder=capturable_guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
