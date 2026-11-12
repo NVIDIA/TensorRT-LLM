@@ -66,7 +66,7 @@ class RemoteCall:
                      need_response: bool = True):
         """Asynchronous remote call that returns a coroutine."""
         return self._prepare_and_call(timeout, need_response, "async",
-                                      "_call_async")
+                                      "_call_async_threadsafe")
 
     def remote_future(self,
                       timeout: Optional[float] = None,
@@ -449,6 +449,42 @@ class RPCClient:
             logger.error(f"Failed to start response reader eagerly: {e}")
             self._reader_task = None
             raise
+
+    async def _call_async_threadsafe(self, method_name, *args, **kwargs):
+        """Run a unary RPC on the ZeroMQ socket's owning event loop."""
+        caller_loop = asyncio.get_running_loop()
+        if caller_loop is self._loop:
+            return await self._call_async(method_name, *args, **kwargs)
+
+        rpc_params = kwargs.get("__rpc_params", RPCParams())
+        timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
+        deadline = None if timeout is None else caller_loop.time() + timeout
+        with self._call_lock:
+            if self._closed or self._server_stopped:
+                raise RPCCancelled("RPC client closed")
+            future = asyncio.run_coroutine_threadsafe(
+                self._call_async(method_name, *args, **kwargs), self._loop)
+        result = asyncio.wrap_future(future)
+        try:
+            while not result.done():
+                wait_timeout = _CLOSE_CHECK_INTERVAL_SECONDS
+                if deadline is not None:
+                    wait_timeout = min(wait_timeout,
+                                       max(0.0, deadline - caller_loop.time()))
+                await asyncio.wait((result, ), timeout=wait_timeout)
+                if (not result.done() and deadline is not None
+                        and caller_loop.time() >= deadline):
+                    raise RPCTimeout(
+                        f"Request '{method_name}' timed out after {timeout}s")
+                if self._closed and not self._loop.is_running():
+                    if not result.done():
+                        raise RPCCancelled("RPC client closed")
+            return await result
+        finally:
+            result.cancel()
+            future.cancel()
+            if not result.cancelled():
+                result.exception()
 
     async def _call_async(self, method_name, *args, **kwargs):
         """Async version of RPC call.
