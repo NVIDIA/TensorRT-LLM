@@ -21,14 +21,15 @@ import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterator, List, Optional,
-                    Sequence, Tuple, TypeVar)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, Iterator, List,
+                    Optional, Sequence, Tuple, TypeVar)
 
 import filelock
 import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
@@ -55,7 +56,8 @@ from tensorrt_llm.models.quant_config_utils import \
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo, is_modelopt_quant_config,
-    read_modelopt_quant_config, warn_if_inline_diverges)
+    read_modelopt_quant_config, reject_checkpoint_nvfp4_plus,
+    warn_if_inline_diverges)
 from tensorrt_llm.quantization.utils.fp4_utils import (
     NVFP4_SF_VEC_SIZE, W4A16_NVFP4_LINEAR_SF_VEC_SIZES,
     nvfp4_scaling_vector_size)
@@ -528,7 +530,7 @@ class ModelConfig(Generic[TConfig]):
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
             "Qwen2ForRewardModel", "LlamaForTextEmbedding",
-            "Qwen3ForTextEmbedding"
+            "PplxDeciderForDecision", "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
@@ -574,6 +576,11 @@ class ModelConfig(Generic[TConfig]):
         """
         if moe_backend.upper() != "AUTO":
             return moe_backend
+
+        # NVFP4_PLUS, which OVERRIDE_QUANT_ALGO selects for MXFP4 experts, runs
+        # on the CuteDSL grouped GEMM only.
+        if ModelConfig.override_quant_algo() == QuantAlgo.NVFP4_PLUS:
+            return "CUTEDSL"
 
         if architecture in _KIMI_K3_ARCHITECTURES:
             return "TRTLLM"
@@ -711,7 +718,7 @@ class ModelConfig(Generic[TConfig]):
                         kv_quant_rhs :=
                         quant_config.kv_cache_quant_algo) is not None:
                 if kv_quant_lhs != kv_quant_rhs:
-                    raise RuntimeError(
+                    raise ModelLoadError(
                         f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
                         f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
                     )
@@ -725,6 +732,8 @@ class ModelConfig(Generic[TConfig]):
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
+                reject_checkpoint_nvfp4_plus(layer_cfg['quant_algo'],
+                                             f"Quantized layer {layer}")
                 config.quant_algo = QuantAlgo(
                     canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
@@ -750,8 +759,27 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def require_nvfp4_plus_moe_backend(
+            moe_backend: Optional[str],
+            backend_setting: str = "moe_config.backend") -> None:
+        """Reject an explicit MoE backend that cannot run NVFP4_PLUS experts.
+
+        Only the CuteDSL grouped GEMM implements NVFP4_PLUS, and AUTO resolves
+        to it under the override (``resolve_moe_backend``).
+        """
+        if moe_backend is None or str(moe_backend).upper() in ("AUTO",
+                                                               "CUTEDSL"):
+            return
+        raise ValueError(
+            "OVERRIDE_QUANT_ALGO=NVFP4_PLUS runs MXFP4 experts on the CuteDSL "
+            f"MoE only, but {backend_setting} is {moe_backend}; set "
+            f"{backend_setting}: CUTEDSL or leave it AUTO.")
+
+    @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
         quant_algo = ModelConfig.override_quant_algo()
+        if quant_algo == QuantAlgo.NVFP4_PLUS:
+            ModelConfig.require_nvfp4_plus_moe_backend(moe_backend)
         if quant_algo is None and not is_dynamic_quant:
             if get_sm_version() >= 100:
                 if moe_backend == 'TRITON':
@@ -800,7 +828,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
         # MXFP4 checkpoints.
@@ -818,7 +846,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
 
@@ -1004,11 +1032,174 @@ class ModelConfig(Generic[TConfig]):
         return layer_quant_config
 
     @staticmethod
-    def _set_minimax_m3_layer_quant_config(pretrained_config,
-                                           layer_quant_config):
-        """Normalize the Minimax M3 MIXED_PRECISION per-layer quant config.
+    def _get_minimax_m3_mxfp8_moe_quant_config(
+            hf_quant_config: Dict[str, Any]) -> Optional[QuantConfig]:
+        """Return the routed-expert recipe declared next to an MXFP8 recipe.
 
-        Two fix-ups are applied:
+        The compressed-tensors NVFP4 MoE packaging of the MiniMax M3
+        architecture keeps ``quant_method: mxfp8`` for the base layers and
+        declares the routed experts beside it (``moe_quant_algo: NVFP4``,
+        ``moe_quant_format: nvfp4-pack-quantized``, ``group_size: 16``).
+        Returns None when no separate expert recipe is declared; raises for a
+        declared combination TensorRT-LLM cannot load.
+        """
+        moe_quant_algo = hf_quant_config.get("moe_quant_algo")
+        moe_quant_format = hf_quant_config.get("moe_quant_format")
+        if moe_quant_algo is None and moe_quant_format is None:
+            return None
+        group_size = hf_quant_config.get("group_size")
+        if (moe_quant_algo, moe_quant_format,
+                group_size) != ("NVFP4", "nvfp4-pack-quantized",
+                                NVFP4_SF_VEC_SIZE):
+            raise ValueError(
+                "Unsupported routed-expert packaging in an MXFP8 checkpoint: "
+                f"moe_quant_algo={moe_quant_algo!r}, moe_quant_format="
+                f"{moe_quant_format!r}, group_size={group_size!r}. Supported: "
+                "moe_quant_algo='NVFP4', moe_quant_format="
+                f"'nvfp4-pack-quantized', group_size={NVFP4_SF_VEC_SIZE}.")
+        return QuantConfig(quant_algo=QuantAlgo.NVFP4,
+                           group_size=NVFP4_SF_VEC_SIZE)
+
+    @staticmethod
+    def _build_minimax_m3_mxfp8_moe_quant_config(
+        pretrained_config: Any, quant_config: QuantConfig
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
+        """Expand MXFP8 base + NVFP4 routed experts into MIXED_PRECISION.
+
+        Used for the compressed-tensors NVFP4 MoE packaging, which has no
+        per-layer map. Every quantized text linear gets an explicit MXFP8
+        entry, because an unmatched module would inherit the global
+        MIXED_PRECISION config and load unquantized; the routed experts of
+        each MoE layer get the coarse NVFP4 entry
+        ``MiniMaxM3MoE._get_experts_quant_config`` reads. Modules listed in
+        ``ignored_layers`` get no entry, and those names lose their
+        ``language_model.`` prefix so they match the TensorRT-LLM module tree.
+
+        Returns ``(quant_config, layer_quant_config)``; a checkpoint without the
+        expert recipe is returned unchanged with no per-layer map.
+        """
+        # Local imports: both modules import model_config at load time.
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import \
+            get_sparse_layer_ids
+        from tensorrt_llm._torch.models.modeling_minimaxm3 import (
+            get_moe_layer_ids, get_text_config)
+        hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                  None)
+        if (quant_config is None or quant_config.quant_algo != QuantAlgo.MXFP8
+                or not isinstance(hf_quant_config, dict)):
+            return quant_config, None
+        experts_quant_config = ModelConfig._get_minimax_m3_mxfp8_moe_quant_config(
+            hf_quant_config)
+        if experts_quant_config is None:
+            return quant_config, None
+
+        text_config = get_text_config(pretrained_config)
+        num_layers = int(text_config.num_hidden_layers)
+        _, moe_layer_ids = get_moe_layer_ids(text_config)
+        _, sparse_layer_ids = get_sparse_layer_ids(text_config)
+        has_shared_experts = int(
+            getattr(text_config, "n_shared_experts", 0) or 0) > 0
+
+        lm_prefix = "language_model."
+        exclude_modules = None
+        if quant_config.exclude_modules is not None:
+            exclude_modules = list(
+                dict.fromkeys(
+                    m[len(lm_prefix):] if m.startswith(lm_prefix) else m
+                    for m in quant_config.exclude_modules))
+        mixed_quant_config = QuantConfig(
+            quant_algo=QuantAlgo.MIXED_PRECISION,
+            kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
+            group_size=quant_config.group_size,
+            exclude_modules=exclude_modules)
+        base_quant_config = QuantConfig(
+            quant_algo=QuantAlgo.MXFP8,
+            kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
+            group_size=quant_config.group_size)
+        experts_quant_config.kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+        excluded = mixed_quant_config.is_module_excluded_from_quantization
+        # The per-layer map covers only the decoder layers, so an untied head
+        # must be excluded: a quantized head would load without its scales.
+        if not getattr(text_config, "tie_word_embeddings",
+                       False) and not excluded("lm_head"):
+            raise ValueError(
+                "The MiniMax M3 NVFP4 routed-expert packaging must exclude "
+                "lm_head from quantization (list it in ignored_layers).")
+
+        layer_quant_config = {}
+        for layer_idx in range(num_layers):
+            prefix = f"model.layers.{layer_idx}"
+            entries = {
+                f"{prefix}.self_attn.{proj}": base_quant_config
+                for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
+            }
+            if layer_idx in sparse_layer_ids:
+                entries.update({
+                    f"{prefix}.self_attn.{proj}": base_quant_config
+                    for proj in ("index_q_proj", "index_k_proj")
+                })
+            if layer_idx in moe_layer_ids:
+                if has_shared_experts:
+                    entries.update({
+                        f"{prefix}.block_sparse_moe.shared_experts.{proj}":
+                        base_quant_config
+                        for proj in ("gate_proj", "up_proj", "down_proj")
+                    })
+                entries[
+                    f"{prefix}.block_sparse_moe.experts"] = experts_quant_config
+            else:
+                entries.update({
+                    f"{prefix}.mlp.{proj}": base_quant_config
+                    for proj in ("gate_proj", "up_proj", "down_proj")
+                })
+            # Fused projections load as one module, so their members must
+            # agree on whether they are quantized.
+            ModelConfig._check_fused_exclusions([
+                f"{prefix}.self_attn.{proj}"
+                for proj in ("q_proj", "k_proj", "v_proj")
+            ], excluded)
+            for parent in ("block_sparse_moe.shared_experts", "mlp"):
+                names = [
+                    f"{prefix}.{parent}.{proj}"
+                    for proj in ("gate_proj", "up_proj")
+                ]
+                if names[0] in entries:
+                    ModelConfig._check_fused_exclusions(names, excluded)
+            layer_quant_config.update({
+                name: config
+                for name, config in entries.items() if not excluded(name)
+            })
+
+        logger.info(
+            "Detected the compressed-tensors NVFP4 MoE packaging of MiniMax M3: "
+            "MXFP8 base linears with NVFP4 routed experts "
+            f"({len(layer_quant_config)} per-layer quant entries).")
+        return mixed_quant_config, layer_quant_config
+
+    @staticmethod
+    def _check_fused_exclusions(names: List[str],
+                                excluded: Callable[[str], bool]) -> None:
+        """Reject an ignore list that excludes only part of a fused module."""
+        flags = [excluded(name) for name in names]
+        if any(flags) and not all(flags):
+            raise ValueError(
+                "The MiniMax M3 NVFP4 routed-expert packaging must exclude all "
+                f"or none of the fused projections {names}.")
+
+    @staticmethod
+    def _set_minimax_m3_layer_quant_config(
+        pretrained_config: Any, quant_config: QuantConfig,
+        layer_quant_config: Optional[Dict[str, QuantConfig]]
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
+        """Normalize the Minimax M3 MIXED_PRECISION quant configs.
+
+        Returns ``(quant_config, layer_quant_config)``. A checkpoint without a
+        per-layer map goes through
+        ``_build_minimax_m3_mxfp8_moe_quant_config``, which builds one for the
+        compressed-tensors NVFP4 MoE packaging and leaves uniform MXFP8 or BF16
+        checkpoints unchanged.
+
+        For a per-layer map (ModelOpt MIXED_PRECISION), two fix-ups are applied:
 
         1. Strip the ``language_model.`` prefix from every per-layer key.
            The M3 VL checkpoint stores keys like
@@ -1028,13 +1219,11 @@ class ModelConfig(Generic[TConfig]):
            entry per MoE layer so ``MiniMaxM3MoE._get_experts_quant_config`` can
            select the NVFP4 backend for the routed experts (the fine-grained
            per-linear NVFP4 expert keys can't be used directly).
-
-        Does nothing when there is no per-layer config (e.g. the uniform MXFP8
-        or a BF16 checkpoint).
         """
         from tensorrt_llm.models.modeling_utils import QuantAlgo
         if layer_quant_config is None:
-            return layer_quant_config
+            return ModelConfig._build_minimax_m3_mxfp8_moe_quant_config(
+                pretrained_config, quant_config)
 
         # (1) Strip the ``language_model.`` prefix so exact-match per-layer
         # quant assignment works for standalone base Linears.
@@ -1051,7 +1240,7 @@ class ModelConfig(Generic[TConfig]):
             and v.quant_algo == QuantAlgo.NVFP4
             for k, v in layer_quant_config.items())
         if not has_nvfp4_experts:
-            return layer_quant_config
+            return quant_config, layer_quant_config
 
         experts_quant_config = QuantConfig()
         experts_quant_config.quant_algo = QuantAlgo.NVFP4
@@ -1076,14 +1265,16 @@ class ModelConfig(Generic[TConfig]):
         logger.info(
             "Detected Minimax M3 NVFP4 routed MoE checkpoint; using NVFP4 "
             "for routed experts.")
-        return layer_quant_config
+        return quant_config, layer_quant_config
 
     @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        exclude_modules = set()
+        # Keyed by module name in checkpoint order; a set would order the
+        # names by string hash, which varies between processes.
+        exclude_modules: dict[str, None] = {}
         has_mxfp4 = False
         is_dynamic_quant = False
         with open(dtypes_json_file) as f:
@@ -1092,7 +1283,7 @@ class ModelConfig(Generic[TConfig]):
                 if layer.endswith("weight"):
                     if dtype == "BF16" or dtype == "FP16":
                         names = layer.split(".")
-                        exclude_modules.add('.'.join(names[:-1]))
+                        exclude_modules.setdefault('.'.join(names[:-1]))
                     elif dtype == "MXFP4":
                         # This is the path for the fp8 checkpoint which requires dynamic quantization.
                         is_dynamic_quant = True
@@ -1120,6 +1311,9 @@ class ModelConfig(Generic[TConfig]):
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,
             "W4A8_MXFP4_FP8": QuantAlgo.W4A8_MXFP4_FP8,
+            # MXFP4 weights with E8M0 scales converted to UE5M3 at load, and
+            # E2M1 activations with UE5M3 block scales (Rubin SM107 only).
+            "NVFP4_PLUS": QuantAlgo.NVFP4_PLUS,
         }
         if new_algo is not None:
             if new_algo.upper() in supported_algos:
@@ -1247,8 +1441,15 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
                         use_gvr_emission = sparse_attention_config.use_gvr_emission
+                        gvr_deterministic_topk = sparse_attention_config.gvr_deterministic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
+                        offload_kwargs = {
+                            'enable_kv_cache_offload':
+                            sparse_attention_config.enable_kv_cache_offload,
+                            'kv_cache_offload_config':
+                            sparse_attention_config.kv_cache_offload_config,
+                        }
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -1262,8 +1463,10 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = False
                         use_self_sampling_topk = True
                         use_gvr_emission = False
+                        gvr_deterministic_topk = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
+                        offload_kwargs = {}
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -1280,9 +1483,11 @@ class ModelConfig(Generic[TConfig]):
                             enable_heuristic_topk=enable_heuristic_topk,
                             use_self_sampling_topk=use_self_sampling_topk,
                             use_gvr_emission=use_gvr_emission,
+                            gvr_deterministic_topk=gvr_deterministic_topk,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
-                            index_share_for_mtp_iteration)
+                            index_share_for_mtp_iteration,
+                            **offload_kwargs)
                 elif pretrained_config.architectures[
                         0] in _DEEPSEEK_V41_ARCHITECTURES:
                     sparse_config = kwargs.get('sparse_attention_config')
@@ -1379,13 +1584,16 @@ class ModelConfig(Generic[TConfig]):
                             compress_ratios = list(compress_ratios) + [1] * (
                                 total_layers - len(compress_ratios))
 
-                    indexer_k_dtype = indexer_config.pop('indexer_k_dtype')
+                    resolved_sparse_config = (
+                        sparse_attention_config.model_dump()
+                        if sparse_attention_config is not None else {})
+                    resolved_sparse_config.update(
+                        compress_ratios=compress_ratios,
+                        window_size=window_size,
+                        **indexer_config)
                     kwargs[
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
-                            compress_ratios=compress_ratios,
-                            window_size=window_size,
-                            indexer_k_dtype=indexer_k_dtype,
-                            **indexer_config)
+                            **resolved_sparse_config)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -1571,9 +1779,8 @@ class ModelConfig(Generic[TConfig]):
                 require_layout=require_deepseek_v4_routed_moe_layout)
 
         if architecture in _MINIMAX_M3_ARCHITECTURES:
-            layer_quant_config = cls._set_minimax_m3_layer_quant_config(
-                pretrained_config, layer_quant_config)
-
+            quant_config, layer_quant_config = cls._set_minimax_m3_layer_quant_config(
+                pretrained_config, quant_config, layer_quant_config)
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
                            quant_config_dict=layer_quant_config,

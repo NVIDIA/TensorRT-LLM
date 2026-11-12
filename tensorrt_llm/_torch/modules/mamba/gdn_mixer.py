@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 import os
 import weakref
 from typing import NamedTuple, Optional
@@ -35,11 +36,21 @@ from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...speculative import SpecMetadata
-from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
-from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+from ...utils import (
+    EventType,
+    Fp8PerTokenQuantizedTensor,
+    get_model_extra_attrs,
+    is_gdn_replay_enabled,
+    is_torch_compiling,
+)
+from ..linear import FP8QDQLinearMethod, FP8RowwiseLinearMethod, Linear, TensorParallelMode
 from ..low_m_gemm import low_m_gemm_dispatcher
 from ..low_m_mma_gemm import conv_supported, low_m_mma_gemm, warp_mma_supported
 from ..multi_stream_utils import maybe_execute_in_parallel_deferred_join
+from ..rms_norm_fp8_per_token import (
+    rms_norm_gated_fp8_per_token,
+    rms_norm_gated_fp8_per_token_eligible,
+)
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
 from .fuse_elementwise_ops import (
@@ -77,8 +88,8 @@ class FusedVerifyPlan(NamedTuple):
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
 # to force the vendored Triton chunk_gated_delta_rule everywhere. FlashInfer
-# ships the GDN prefill kernel for Hopper (SM90), datacenter Blackwell
-# (SM100/SM103) and consumer Blackwell (SM120/SM121); on other archs it aborts
+# ships the GDN prefill kernel for Hopper (SM90), the SM100 family
+# (SM100/SM103/SM107) and consumer Blackwell (SM120/SM121); on other archs it aborts
 # at launch, so we fall back to Triton there. Resolution is deferred to first call
 # (and cached) so importing this module never initializes CUDA.
 def _use_flashinfer_gdn_prefill() -> bool:
@@ -87,6 +98,22 @@ def _use_flashinfer_gdn_prefill() -> bool:
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
         and is_flashinfer_gdn_prefill_supported_arch()
     )
+
+
+# Upper bound for each of the two persistent FlashInfer prefill state buffers.
+# Only prefill requests stage their states there, and a batch with more prefill
+# requests than fit runs in sequence groups, so this scratch does not grow with
+# max_num_sequences and take memory from the KV cache. A Qwen3.5-122B-A10B state
+# at TP4 is 16 heads x 128 x 128 x fp32 = 1 MiB, so 32 prefill requests fit;
+# only batches of many short prompts with a large max_num_tokens hold more.
+_PREFILL_STATE_WORKSPACE_BYTES = 32 * 2**20
+
+
+def _prefill_cu_seqlens_cpu(seq_lens: torch.Tensor, num_prefills: int) -> torch.Tensor:
+    """Host copy of the prefill offsets in ``Mamba2Metadata.query_start_loc``."""
+    cu_seqlens = torch.zeros(num_prefills + 1, dtype=torch.int64)
+    cu_seqlens[1:] = torch.cumsum(seq_lens[:num_prefills], dim=0)
+    return cu_seqlens
 
 
 @functools.lru_cache(maxsize=1)
@@ -101,11 +128,16 @@ def _resolve_chunk_gated_delta_rule():
 
 @torch.compiler.disable
 def chunk_gated_delta_rule(
-    *args, state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None, **kwargs
+    *args,
+    state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
+    **kwargs,
 ):
     """Dispatch prefill, omitting unused FlashInfer-only workspace arguments."""
     if state_workspace is not None:
         kwargs["state_workspace"] = state_workspace
+        if cu_seqlens_cpu is not None:
+            kwargs["cu_seqlens_cpu"] = cu_seqlens_cpu
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
 
 
@@ -539,6 +571,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
         self.aux_stream = aux_stream
+        self._out_proj_fp8_per_token = False
 
         self.fused_verify = (
             fused_verify
@@ -556,6 +589,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def cache_derived_state(self) -> None:
         """Attach downstream static quantization state after loading weights."""
         self.norm.fp8_scale = None
+        # The gated norm emits per-token FP8 directly for an FP8 rowwise out_proj.
+        self._out_proj_fp8_per_token = isinstance(
+            self.out_proj.quant_method, FP8RowwiseLinearMethod
+        )
         if isinstance(self.out_proj.quant_method, FP8QDQLinearMethod):
             scale = self.out_proj.quant_method.get_static_input_scale(self.out_proj)
             # detach() strips the Parameter wrapper so nn.Module.__setattr__
@@ -639,7 +676,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def _compute_tokenwise_inputs(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | Fp8PerTokenQuantizedTensor,
         h_fp8: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.cuda.Event]]:
         """Project to (mixed_qkv, z, a, b, ba_ready).
@@ -661,8 +698,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             def _compute_projected_states_qkvz():
                 return self.in_proj_qkvz(qkvz_input)
 
+            # The unquantized in_proj_ba reads the BF16 copy of a pre-quantized input.
+            hidden_states_ba = hidden_states
+            if isinstance(hidden_states, Fp8PerTokenQuantizedTensor):
+                hidden_states_ba = hidden_states.unquantized_hidden_states
+
             def _compute_projected_states_ba():
-                return self.in_proj_ba(hidden_states)
+                return self.in_proj_ba(hidden_states_ba)
 
             projected_states_qkvz, projected_states_ba, ba_ready = (
                 maybe_execute_in_parallel_deferred_join(
@@ -701,8 +743,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # output whose (heads, head_dim) block is contiguous per token; the
         # gated norm reads it through its token stride instead of packing a
         # copy.
+        attn_out = attn_out.reshape(-1, self.head_v_dim)
+        if self._out_proj_fp8_per_token and (rms_norm_gated_fp8_per_token_eligible(attn_out, z)):
+            fp8_out, scale = rms_norm_gated_fp8_per_token(
+                attn_out, z, self.norm.weight, self.norm.eps
+            )
+            return self.out_proj(
+                Fp8PerTokenQuantizedTensor(fp8_out, scale), all_reduce_params=all_reduce_params
+            )
         attn_out = rms_norm_gated_token_major(
-            attn_out.reshape(-1, self.head_v_dim),
+            attn_out,
             z,
             self.norm.weight,
             self.norm.eps,
@@ -1228,10 +1278,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         state_indices_d = kwargs["state_indices_d"]
         num_prefill = kwargs["num_prefill"]
         num_decodes = kwargs["num_decodes"]
+        state_workspace = kwargs.get("state_workspace")
+        cu_seqlens_cpu = kwargs.get("cu_seqlens_cpu")
+        # Decode requests run the recurrent decode kernel when prefill stages its
+        # states through the workspace, so the workspace holds only prefill requests.
         split_decode = (
             num_decode_tokens > 0
             and not is_target_verify
-            and os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+            and (state_workspace is not None or os.getenv("FORCE_DETERMINISTIC", "0") == "1")
         )
         inforward_split = kwargs.get("inforward_split")
 
@@ -1409,7 +1463,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     head_first=False,
                     use_qk_l2norm_in_kernel=False,
                     output=output_p,
-                    state_workspace=kwargs.get("state_workspace"),
+                    state_workspace=state_workspace,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
                 )
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
@@ -1542,7 +1597,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             output=output[:, :num_prefill_tokens]
             if split_decode and output is not None
             else output,
-            state_workspace=kwargs.get("state_workspace"),
+            state_workspace=state_workspace,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
         if split_decode:
@@ -1567,18 +1623,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def _get_prefill_state_workspace(
         self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Reserve maximum state scratch on first use and reuse it across layers."""
+        """Reserve bounded state scratch on first use and reuse it across layers."""
         # Blackwell uses indexed pool I/O directly, without state scratch.
         if not _use_flashinfer_gdn_prefill() or is_sm_100f():
             return None
         key = (ssm_states.device, ssm_states.shape[1:])
-        # First use during warmup reserves the configured maximum, not the current batch.
+        # First use during warmup reserves the configured capacity, not the current batch.
         # Sequential layers share this persistent input/output scratch.
         workspaces = self.model_config.extra_attrs.setdefault("gdn_state_workspaces", {})
         workspace = workspaces.get(key)
+        state_bytes = math.prod(ssm_states.shape[1:]) * torch.float32.itemsize
         capacity = min(
             attn_metadata.max_num_sequences or attn_metadata.max_num_requests,
             attn_metadata.max_num_tokens,
+            max(1, _PREFILL_STATE_WORKSPACE_BYTES // state_bytes),
         )
         if workspace is None or workspace[0].shape[0] < capacity:
             state_in = torch.empty(
@@ -1771,6 +1829,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 attn_metadata.kv_cache_manager.inforward_snapshot_stage_views(self.layer_idx)
             )
         if num_prefills > 0:
+            state_workspace = self._get_prefill_state_workspace(attn_metadata, ssm_states)
+            if state_workspace is not None and num_prefills > state_workspace[0].shape[0]:
+                kwargs["cu_seqlens_cpu"] = _prefill_cu_seqlens_cpu(
+                    attn_metadata.seq_lens, num_prefills
+                )
             attn_out = self.forward_extend(
                 conv_states,
                 ssm_states,
@@ -1779,7 +1842,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 intermediate_ssm_states=intermediate_ssm_states,
                 is_target_verify=is_target_verify,
                 output=output,
-                state_workspace=self._get_prefill_state_workspace(attn_metadata, ssm_states),
+                state_workspace=state_workspace,
                 **kwargs,
             )
         else:

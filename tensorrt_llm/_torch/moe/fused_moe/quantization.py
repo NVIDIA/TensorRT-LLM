@@ -39,8 +39,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
-    float4_e2m1x2, float4_sf_dtype,
-    get_reorder_rows_for_gated_act_gemm_row_indices,
+    NVFP4_PLUS_SF_VEC_SIZE, NVFP4_SF_VEC_SIZE, e8m0_to_ue5m3, float4_e2m1x2,
+    float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
     nvfp4_scaling_vector_size)
 from tensorrt_llm.quantization.utils.fp8_utils import (
@@ -61,6 +61,11 @@ FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_K = 0
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_MN = 1
 TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K = 2
+# The NVFP4 AWQ loader keeps one pre_quant_scale per MoE layer, so the experts of
+# a layer must agree on it within this tolerance. DWDP setup, where each rank
+# loads its own experts, holds the ranks' copies to the same tolerance.
+PRE_QUANT_SCALE_RTOL = 1e-5
+PRE_QUANT_SCALE_ATOL = 1e-8
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -3008,6 +3013,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                               local_shared_w2_scale_tensors,
                                               module.tmp_shared_weight_scale_2)
 
+    # Whether the checkpoint carries the NVFP4 global scales (weight_scale_2
+    # and input_scale).
+    checkpoint_has_global_scales = True
+
     # Whether this backend's kernel consumes the gate and up global weight
     # scales as two separate scalars. trtllm-gen does
     # (``output1_scale_gate_scalar`` for the gate half,
@@ -3118,7 +3127,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 (all_w3[i], w3_reference, "w3.pre_quant_scale"),
                 (all_w1[i], w1_reference, "w1.pre_quant_scale")
             ]:
-                if not torch.allclose(scale, ref, rtol=1e-5, atol=1e-8):
+                if not torch.allclose(scale,
+                                      ref,
+                                      rtol=PRE_QUANT_SCALE_RTOL,
+                                      atol=PRE_QUANT_SCALE_ATOL):
                     max_diff = (scale - ref).abs().max()
                     msg = (
                         f"MoE pre_quant_scale: expert {expert_ids[i]} {name} "
@@ -3134,7 +3146,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # loader, ``fc31_act_scale.device`` for ``load_quant_scales``, which
         # keys its own staging off this same parameter -- and
         # ``_ensure_fc31_act_scale`` is the one place that chooses the device.
-        fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+        fc31_checkpoint_scale = torch.max(w3_reference, w1_reference)
+        # The cast below drops the dtype the checkpoint stores the scale in;
+        # DWDP setup compares the ranks' copies by it.
+        module.fc31_act_scale_checkpoint_dtype = fc31_checkpoint_scale.dtype
+        fc31_pre_quant_scale = fc31_checkpoint_scale.to(
             dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 
@@ -3205,12 +3221,19 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Step 4: Finalize shared weight alphas if needed
         if hasattr(module, 'tmp_shared_weight_scale_2'):
-            num_shared = len(module.tmp_shared_weight_scale_2)
-            shared_fc31_alpha = torch.empty(
+            # One entry per host-staged expert. A checkpoint without global
+            # scales (an MXFP4 checkpoint served as NVFP4_PLUS) has no
+            # weight_scale_2 entries and keeps alphas of 1.
+            if self.checkpoint_has_global_scales:
+                num_shared = len(module.tmp_shared_weight_scale_2)
+            else:
+                num_shared = len(
+                    module.layer_load_balancer.get_load_expert_ids())
+            shared_fc31_alpha = torch.ones(
                 (num_shared, ) + module.fc31_alpha.data.shape[1:],
                 dtype=module.fc31_alpha.data.dtype,
                 device='cpu')
-            shared_fc2_alpha = torch.empty(
+            shared_fc2_alpha = torch.ones(
                 (num_shared, ) + module.fc2_alpha.data.shape[1:],
                 dtype=module.fc2_alpha.data.dtype,
                 device='cpu')
@@ -3273,6 +3296,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
     block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+    # Values sharing one block scale along K.
+    scaling_vector_size = NVFP4_SF_VEC_SIZE
     NVFP4_ROW_ALIGNMENT = 128
     NVFP4_COL_ALIGNMENT = 4
 
@@ -3336,9 +3361,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         self.block_scales_vec_size = torch.iinfo(
             self.block_scales_dtype).bits // 8
 
-        super().create_weights(module, self.weight_dtype, weight_vec_size,
+        super().create_weights(module,
+                               self.weight_dtype,
+                               weight_vec_size,
                                self.block_scales_dtype,
-                               self.block_scales_vec_size)
+                               self.block_scales_vec_size,
+                               scaling_vector_size=self.scaling_vector_size)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -3852,14 +3880,16 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         """Interleave FC1 scales for GEMM1 + SwiGLU fusion (CuteDsl-specific)."""
         n = module.intermediate_size_per_partition * 2
         k = module.hidden_size
+        sf_vec_size = module.scaling_vector_size
         w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
-        w3_w1_weight_scale_unswizzled = unswizzle_sf(
-            w3_w1_weight_scale, n, k).view(n, k // module.scaling_vector_size)
+        w3_w1_weight_scale_unswizzled = unswizzle_sf(w3_w1_weight_scale, n, k,
+                                                     sf_vec_size).view(
+                                                         n, k // sf_vec_size)
         w3_w1_weight_scale_unswizzled_interleaved = self._interleave_fc1_rows(
             w3_w1_weight_scale_unswizzled)
         w3_w1_weight_scale_interleaved = swizzle_sf(
-            w3_w1_weight_scale_unswizzled_interleaved, n,
-            k).view(n, k // module.scaling_vector_size)
+            w3_w1_weight_scale_unswizzled_interleaved, n, k,
+            sf_vec_size).view(n, k // sf_vec_size)
         dst_w3_w1_weight_scale.copy_(
             w3_w1_weight_scale_interleaved.view(dst_w3_w1_weight_scale.dtype))
 
@@ -3910,6 +3940,55 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             self._interleave_w3_w1_weight(module.w3_w1_weight.data[expert_idx])
             self._interleave_w3_w1_weight_scale_cute_dsl(
                 module, module.w3_w1_weight_scale.data[expert_idx])
+
+
+class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
+    """NVFP4_PLUS: E2M1 weights with one UE5M3 scale per 32 values, no global scale.
+
+    Loads MXFP4 checkpoints. The E2M1 payload is kept as is, and every E8M0
+    block scale becomes the UE5M3 code of the same power of two. Such a
+    checkpoint has no ``weight_scale_2`` or ``input_scale``, so the NVFP4 flow
+    leaves the per-expert alphas and the activation global scales at 1.
+    """
+
+    scaling_vector_size = NVFP4_PLUS_SF_VEC_SIZE
+    checkpoint_has_global_scales = False
+    # Scales an MXFP4 checkpoint never has. The kernels apply no global scale
+    # and no AWQ pre-quant scale, so serving a checkpoint with them would
+    # silently drop them.
+    unsupported_scale_suffixes = ("input_scale", "weight_scale_2",
+                                  "pre_quant_scale")
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
+        unsupported = sorted(key for key in weights
+                             if key.endswith(self.unsupported_scale_suffixes))
+        if unsupported:
+            raise ValueError(
+                "NVFP4_PLUS loads MXFP4 checkpoints, which have no "
+                "input_scale, weight_scale_2 or pre_quant_scale, but this "
+                f"checkpoint has {', '.join(unsupported[:3])}"
+                f"{' ...' if len(unsupported) > 3 else ''}")
+        super().load_quant_scales(module, weights)
+
+    def load_expert_w3_w1_weight_scale_nvfp4(
+            self,
+            module: torch.nn.Module,
+            w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor,
+            expert_idx: int = -1) -> None:
+        super().load_expert_w3_w1_weight_scale_nvfp4(
+            module,
+            None if w1_weight_scale is None else e8m0_to_ue5m3(w1_weight_scale),
+            None if w3_weight_scale is None else e8m0_to_ue5m3(w3_weight_scale),
+            dst_w3_w1_weight_scale,
+            expert_idx=expert_idx)
+
+    def load_expert_w2_weight_scale_nvfp4(
+            self, module: torch.nn.Module, w2_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor) -> None:
+        super().load_expert_w2_weight_scale_nvfp4(
+            module, e8m0_to_ue5m3(w2_weight_scale), dst_w2_weight_scale)
 
 
 class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
@@ -7611,6 +7690,7 @@ def _import_deep_gemm():
     missing = [
         name for name in (
             "fp8_fp4_mega_moe",
+            "get_block_m_for_mega_moe",
             "get_symm_buffer_for_mega_moe",
             "transform_sf_into_required_layout",
             "transform_weights_for_mega_moe",

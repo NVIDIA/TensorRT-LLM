@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware
 
 ## Introduction
@@ -145,6 +150,14 @@ The MTP draft length is configurable through `speculative_config.max_draft_len`;
 | High throughput with MTP3 | [`qwen3.8-ep32-static544-mtp3.yaml`](../../../examples/configs/curated/eplb/qwen3.8-ep32-static544-mtp3.yaml) |
 
 Each file assigns expert IDs to 544 global slots for every MoE layer. Repeated expert IDs create replicas of heavily routed experts. `layer_updates_per_iter: 0` keeps the assignment static. The no-MTP map covers the 92 target-model layers, while the MTP3 map also includes the MTP layer. These placements are specific to Qwen3.8-2.4T-A95B, EP32, the selected MTP mode, and the benchmark traffic distribution. Generate a new placement when any of those inputs changes. See the [EPLB example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer) for collecting routing statistics and generating a placement file.
+
+### Experimental QKV Preprocessing Tiling
+
+`TRTLLM_ENABLE_QKV_ROPE_TILING=1` enables experimental eight-token tiling for fused Q/K normalization, rotary embedding, and gate extraction. It is disabled by default. Set the environment variable before starting `trtllm-serve` or importing TensorRT LLM in Python.
+
+Tiling applies to preprocessing batches with at least 256 tokens, at least 3,072 token/head pairs across Q/K/V (using local head counts after tensor parallelism), and `(head dimension, rotary dimension)` of `(128, 128)` or `(256, 64)`. Other workloads use the single-token path. Performance has been measured on B200 and Rubin; other GPU architectures can opt in, but their performance has not been established by those measurements.
+
+Tiling can change Q/K rounding. Changing batch size across a dispatch boundary can therefore change cached K values and generated tokens. Leave the flag unset when batch-invariant results are required.
 
 ### Launch the TensorRT LLM Server
 

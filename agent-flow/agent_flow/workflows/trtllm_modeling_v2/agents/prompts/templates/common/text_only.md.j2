@@ -1,0 +1,10 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Scope: text only
+
+This checkpoint is multimodal; **this target is the language model only.** The vision tower is out of scope — do not port it, do not write a catalog entry for it, and do not treat its absence as a gap to close.
+
+Two consequences that are easy to get wrong:
+
+- **The weight loader must ignore the vision tensors rather than fail on them.** They are present in the checkpoint and always will be. A loader that asserts every tensor was consumed will fail on a correct target.
+- **Gate it with text-only prompts.** An image prompt against a text-only target is a wrong question, and the error it raises is not a defect.

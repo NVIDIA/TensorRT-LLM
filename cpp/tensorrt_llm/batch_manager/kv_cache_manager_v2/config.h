@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <cmath>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -141,6 +142,10 @@ enum class ReusePolicy
     //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
     //! These pages may be evicted independently without removing the REQUIRED prefix.
     OPTIONAL = 2,
+    //! REQUIRED for sink blocks, OPTIONAL for the sliding window: sinks constrain the prefix match and are
+    //! claimed with it; the window is selected at resume, and ReuseGroupStatus::complete describes it.
+    //! Attention layers only.
+    SINK_REQUIRED_ONLY = 3,
 };
 
 // ---------------------------------------------------------------------------
@@ -241,6 +246,13 @@ struct BufferConfig
 // ---------------------------------------------------------------------------
 struct SparseCacheConfig
 {
+    //! The 32-bit probe word packs a cache slot beside a unit ordinal. Both fields
+    //! reserve their all-ones value, so the largest ordinal is two below 2^18.
+    static constexpr uint32_t kProbeSlotBits = 14;
+    static constexpr int32_t kMaxUnitOrdinal = static_cast<int32_t>((1U << (32 - kProbeSlotBits)) - 2U);
+    //! Maximum cache entries per selection supported by the sparse resolve probe.
+    static constexpr int32_t kMaxCacheEntries = static_cast<int32_t>((1U << kProbeSlotBits) - 2U);
+
     //! Selection width: units a sparse-attention step selects for this layer.
     int numSelectedBlocks;
 
@@ -366,6 +378,10 @@ struct SsmLayerConfig
             if (buf.isSparse)
             {
                 throw std::invalid_argument("Sparse buffers are only supported for attention layers");
+            }
+            if (buf.effectiveReusePolicy(reusePolicy) == ReusePolicy::SINK_REQUIRED_ONLY)
+            {
+                throw std::invalid_argument("SINK_REQUIRED_ONLY is only supported for attention layers");
             }
             buf.validate();
         }

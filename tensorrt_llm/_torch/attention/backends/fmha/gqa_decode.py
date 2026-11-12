@@ -422,6 +422,9 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         attn = self.attn
         if num_tokens <= 0 or torch.compiler.is_compiling() or attn.head_dim % 16 != 0:
             return None
+        if metadata.get_mixed_precision_kv_view(attn.layer_idx) is not None:
+            # A mixed-precision layer appends into its staging copy, swapped in after this plan.
+            return None
         quant_mode = QuantMode(attn.quant_mode)
         if not quant_mode.has_fp8_kv_cache() or quant_mode.has_fp4_kv_cache():
             return None

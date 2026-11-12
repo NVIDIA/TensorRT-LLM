@@ -195,6 +195,7 @@ class _Generation:
     """A finished generation, as far as the routes read one before post-processing."""
 
     prompt_token_ids = [1, 2, 3]
+    request_id = 1
     finished = True
     error = None
 
@@ -476,6 +477,44 @@ def test_a_template_gets_developer_as_system_only_where_it_lacks_the_role(templa
 
     assert tokenizer.roles == [[role, "user"]]
     # The caller's messages are left as they are.
+    assert conversation[0]["role"] == "developer"
+
+
+@pytest.mark.parametrize("selection", ["processor", "explicit", "named"])
+@pytest.mark.parametrize("supports_developer", [False, True])
+def test_developer_fallback_uses_the_same_source_as_dispatch_analysis(
+    selection, supports_developer
+):
+    active = _glm_shaped(developer_branch=supports_developer)
+    tokenizer = _JinjaTokenizer(_glm_shaped(developer_branch=not supports_developer))
+    processor = None
+    chat_template = None
+    if selection == "processor":
+        processor = SimpleNamespace(chat_template=active)
+    elif selection == "explicit":
+        chat_template = active
+    else:
+        tokenizer.chat_template = {"default": tokenizer.chat_template, "selected": active}
+        chat_template = "selected"
+    render_args = dict(
+        tokenizer=tokenizer,
+        processor=processor,
+        chat_template=chat_template,
+        model_type="developer-role-test-model",
+    )
+    assert inputs_utils.rendered_hf_chat_template_source(**render_args) == active
+    conversation = [{"role": "developer", "content": BRIEF}, {"role": "user", "content": QUESTION}]
+
+    prompt = apply_chat_template(
+        **render_args,
+        conversation=conversation,
+        add_generation_prompt=True,
+        mm_placeholder_counts=[{}, {}],
+    )
+
+    role = "developer" if supports_developer else "system"
+    assert tokenizer.prompts() == [[(role, BRIEF), ("user", QUESTION)]]
+    assert prompt == f"[gMASK]<sop><|{role}|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
     assert conversation[0]["role"] == "developer"
 
 

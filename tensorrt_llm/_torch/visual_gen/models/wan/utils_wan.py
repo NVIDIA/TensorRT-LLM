@@ -46,7 +46,7 @@ def _pertoken_adaln_arch_ok(device: torch.device) -> bool:
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
     try:
-        return torch.cuda.get_device_capability(device) == (10, 0)
+        return torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
     except RuntimeError:
         return False
 

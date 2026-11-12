@@ -419,6 +419,9 @@ class MultimodalModelMixin:
       `get_multimodal_item_partitions`. Undeclared models retain legacy stacked/packed inference.
     """
 
+    supports_vision_gpu_normalize: ClassVar[bool] = False
+    """Whether the model accepts processor-described raw vision pixels."""
+
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 
@@ -721,12 +724,16 @@ class MultimodalModelMixin:
     def get_language_model_extra_forward_kwargs(
         self,
         *,
+        attn_metadata: Any,
         raw_input_ids: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         mm_inputs: PreparedLlmInputs,
         **forward_kwargs: Any,
     ) -> dict[str, Any]:
-        """Return model-specific arguments for the inner language-model forward."""
+        """Return model-specific arguments for the inner language-model forward.
+
+        The attention metadata identifies context and generation requests in this batch.
+        """
         return {}
 
     def get_language_model_forward_kwargs(
@@ -751,6 +758,7 @@ class MultimodalModelMixin:
         }
         llm_kwargs.update(
             self.get_language_model_extra_forward_kwargs(
+                attn_metadata=attn_metadata,
                 raw_input_ids=raw_input_ids,
                 position_ids=position_ids,
                 mm_inputs=mm_inputs,

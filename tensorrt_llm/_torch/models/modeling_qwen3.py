@@ -364,7 +364,8 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         # packed [total_tokens, hidden] tensor; take each sequence's final token.
         # Normalize in fp32 (matching sentence-transformers / the HF reference)
         # then cast back, so the unit-norm is precise even for bf16/fp16 weights.
-        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        end_indices = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         pooled = hidden_states[end_indices]
         normalized = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)
         return normalized.to(pooled.dtype)

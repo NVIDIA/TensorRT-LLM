@@ -59,6 +59,9 @@ namespace kernels::causal_conv1d
 
 struct ConvParamsBase
 {
+    // Strides in elements. A conv-state pool can hold more than 2^32 elements, so the kernels
+    // form a slot's offset (slot index times the batch stride) in 64 bits; the strides
+    // themselves fit in 32 bits, which the op checks for the conv-state batch strides.
     using index_t = uint32_t;
 
     int batch, dim, seqlen, width;
