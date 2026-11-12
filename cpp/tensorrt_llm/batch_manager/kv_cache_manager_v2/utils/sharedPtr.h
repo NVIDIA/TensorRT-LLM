@@ -153,9 +153,10 @@ struct InplaceControlBlock final : ControlBlockBase
         return ::operator new(size, align);
     }
 
-    static void operator delete(void* ptr, size_t size, std::align_val_t align) noexcept
+    // The global sized forms need -fsized-deallocation, which clang before 19 leaves off.
+    static void operator delete(void* ptr, size_t, std::align_val_t align) noexcept
     {
-        ::operator delete(ptr, size, align);
+        ::operator delete(ptr, align);
     }
 };
 
