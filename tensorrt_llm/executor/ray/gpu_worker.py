@@ -15,6 +15,7 @@
 import gc
 import importlib
 import os
+import traceback
 from functools import wraps
 from pathlib import Path
 from queue import Queue
@@ -349,7 +350,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             if mutation_started:
                 self.engine.fail_sleep_wakeup_transition()
             self.engine.abort_sleep_transition()
-            logger.exception("Encountered an error in sleep")
+            logger.error("Encountered an error in sleep:\n"
+                         f"{traceback.format_exc()}")
             raise
         try:
             self.engine.complete_sleep_transition()
@@ -383,7 +385,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             if mutation_started:
                 self.engine.fail_sleep_wakeup_transition()
             self.engine.abort_wakeup_transition()
-            logger.exception("Encountered an error in wakeup")
+            logger.error("Encountered an error in wakeup:\n"
+                         f"{traceback.format_exc()}")
             raise
         try:
             self.engine.complete_wakeup_transition()

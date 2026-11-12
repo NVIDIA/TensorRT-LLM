@@ -367,7 +367,7 @@ class TestLoggerAPI:
 
 
 def test_no_exc_info_passed_to_trtllm_logger():
-    """The TRT-LLM logger takes no exc_info: passing it raises TypeError."""
+    """The TRT-LLM logger takes no exc_info and has no exception(): either raises inside the except block."""
     import ast
     import pathlib
     import re
@@ -379,19 +379,27 @@ def test_no_exc_info_passed_to_trtllm_logger():
     offenders = []
     for path in root.rglob("*.py"):
         source = path.read_text(encoding="utf-8", errors="replace")
-        if "exc_info" not in source or "logger" not in source:
+        if "logger" not in source or (
+            "exc_info" not in source and "logger.exception" not in source
+        ):
             continue
-        # A module whose `logger` is a stdlib logger may pass exc_info to it.
-        if re.search(r"^\s*logger\s*=\s*logging\.getLogger", source, re.MULTILINE):
+        # A module that binds `logger` to a stdlib logger at top level (not as an import fallback) may use
+        # exc_info and exception() with it.
+        if re.search(r"^logger\s*=\s*logging\.getLogger", source, re.MULTILINE):
             continue
         for node in ast.walk(ast.parse(source)):
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr in methods
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "logger"
-                and any(kw.arg == "exc_info" for kw in node.keywords)
+                and (
+                    node.func.attr == "exception"
+                    or (
+                        node.func.attr in methods
+                        and any(kw.arg == "exc_info" for kw in node.keywords)
+                    )
+                )
             ):
                 offenders.append(f"{path.relative_to(root)}:{node.lineno}")
-    assert not offenders, f"exc_info passed to the TRT-LLM logger: {offenders}"
+    assert not offenders, f"stdlib-only logging call on the TRT-LLM logger: {offenders}"
