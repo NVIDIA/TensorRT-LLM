@@ -103,7 +103,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
 
         Required: the model's KV-cache dtype (BF16, or FP8 after ``set_kv_cache_fp8``),
         ``head_dim`` 128, 2 kv heads per rank on every layer, logical layers 0..51 in local
-        slots 0..51, the sliding window on sliding layers and the whole sequence on
+        slots 0..51, sufficient retention for sliding layers and the whole sequence on
         full-attention layers. A manager that also owns the drafter's layers (one manager for
         the target and draft KV) holds exactly those draft layers after the target's, as
         layers 52.. in slots 52..; the drafter checks their own geometry. Reads host-side
@@ -140,7 +140,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             raise ValueError(f"the KV cache manager states {len(windows)} attention windows")
         for layer, window in enumerate(windows[:NUM_LAYERS]):
             if self.schedule.is_sliding(layer):
-                ok = window is not None and int(window) == self.window
+                ok = window is None or int(window) >= min(self.window, manager.max_seq_len)
             else:
                 ok = window is None or int(window) >= manager.max_seq_len
             if not ok:
