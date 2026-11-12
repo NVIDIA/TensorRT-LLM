@@ -29,6 +29,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
@@ -94,6 +95,7 @@ def _mbar_init_tx(mbar, nbytes, *, loc=None, ip=None):
 
 @dsl_user_op
 def _mbar_wait0(mbar, *, loc=None, ip=None):
+    """Wait (CTA scope) for phase 0 of an mbarrier that this CTA's own bulk copies complete."""
     _asm(
         T.i32(),
         [cutlass.Int32(mbar)],
@@ -254,8 +256,9 @@ class _First2:
         sBar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((2,)), byte_alignment=8)
         rbar = cutlass.Int32(sBar.iterator.toint())
         wbar = rbar + 8  # the weight rows' bulk copies
+        rbar_ptr = sBar.iterator  # pointer form for the cluster-scope wait below
         # This CTA receives rows [me * RPO, me * RPO + RPO) of the cluster's partials from all CL
-        # CTAs, by st.async on `rbar` (no cluster barrier, no fence, after the pushes).
+        # CTAs, by st.async on `rbar` (no cluster barrier after the pushes).
         rows_me = cutlass.max(cutlass.min(cutlass.Int32(RPO), rows - me * RPO), cutlass.Int32(0))
         if tidx == 0:
             _mbar_init_tx(rbar, rows_me * (CL * (NC + 1) * 4))
@@ -457,7 +460,18 @@ class _First2:
                         v = sSsr[rr]
                     dst = red_addr + ((me * RPO + rl) * rld + nn) * 4
                     _st_async_f32(_mapa(dst, o), v, _mapa(rbar, o))
-        _mbar_wait0(rbar)
+        # The cluster's partials for this rank's rows have landed: the peers pushed them by
+        # st.async, whose complete-tx releases at cluster scope, so a relaxed cluster-scope wait
+        # followed by an acquire fence restricted to shared::cluster is the ISA's acquire pattern
+        # for it (and, unlike .acquire.cluster on the wait, costs no L1 invalidate).
+        while not prims.mbarrier_try_wait_parity(
+            rbar_ptr,
+            0,
+            scope=prims.MBarrierScope.CLUSTER,
+            order=prims.MemOrder.RELAXED,
+        ):
+            pass
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
         # 5. Rank `me` finishes rows (2 me, 2 me + 1): rstd per stream, the logits, low / injection.
         for it in cutlass.range_constexpr(-(-(RPO * NC) // THREADS)):
