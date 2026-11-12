@@ -4676,13 +4676,9 @@ def applyStageResourceRequests(pipeline, Map podConfig, String stageName)
     def pod = pipeline.readYaml(text: podConfig.yaml)
     def container = pod.spec.containers.find { it.name == "trt-llm" }
     def requests = [cpu: "${resources.cpu_m}m".toString(), memory: "${resources.memory_mi}Mi".toString()]
-    def limits = [
-        cpu: "${(resources.cpu_m * 14 + 9).intdiv(10)}m".toString(),
-        memory: "${(resources.memory_mi * 14 + 9).intdiv(10)}Mi".toString(),
-    ]
     container.resources.requests.putAll(requests)
-    container.resources.limits.putAll(limits)
-    pipeline.echo "[Stage resources] ${stageName}: requests=${requests}, limits=${limits}."
+    container.resources.limits.putAll(requests)
+    pipeline.echo "[Stage resources] ${stageName}: requests=${requests}, limits=${requests}."
     return podConfig + [yaml: pipeline.writeYaml(returnText: true, data: pod)]
 }
 
@@ -4999,6 +4995,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
             apiVersion: v1
             kind: Pod
             spec:
+                qosClass: Guaranteed
                 affinity:
                     nodeAffinity:
                         requiredDuringSchedulingIgnoredDuringExecution:

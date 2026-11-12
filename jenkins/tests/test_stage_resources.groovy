@@ -107,16 +107,22 @@ configJson = goodConfig
 
 def testContainer = { pod -> pod.spec.containers.find { it.name == 'trt-llm' } }
 def expectedRequests = [cpu: '1001m', memory: '10241Mi']
-def expectedLimits = [cpu: '1402m', memory: '14338Mi']
 [['cpu', 'amd64', 1, false], ['a10', 'amd64', 1, false],
  ['dgx-h100-x4', 'amd64', 4, true], ['gb10x', 'arm64', 1, false]].each { type, arch, gpus, mx ->
     def original = script.createKubernetesPodConfig('test-image', type, arch, gpus, mx)
     def originalYaml = original.yaml
+    assert originalYaml.count('qosClass: Guaranteed') == 1
     def expected = yaml.load(original.yaml)
     testContainer(expected).resources.requests.putAll(expectedRequests)
-    testContainer(expected).resources.limits.putAll(expectedLimits)
+    testContainer(expected).resources.limits.putAll(expectedRequests)
     def updated = script.applyStageResourceRequests(pipeline, original, 'test-stage')
-    assert yaml.load(updated.yaml) == expected
+    def updatedPod = yaml.load(updated.yaml)
+    assert updatedPod == expected
+    assert updatedPod.spec.containers.every { container ->
+        ['cpu', 'memory'].every { resource ->
+            container.resources.requests[resource] == container.resources.limits[resource]
+        }
+    }
     assert original.yaml == originalYaml
     assert updated.findAll { it.key != 'yaml' } == original.findAll { it.key != 'yaml' }
     assert script.applyStageResourceRequests(pipeline, original, 'unconfigured-stage').is(original)
@@ -136,7 +142,7 @@ utils.launchKubernetesPodWithPlacement = { p, config, container, context, body -
     launches.clear()
     script.runKubernetesPodWithInfraRetry(options, pipeline, gpuConfig, 'trt-llm', 'test-stage', { tag, isFinal, ctx -> })
     assert launches.size() == 1
-    assert testContainer(yaml.load(launches[0].yaml)).resources.limits.cpu == '1402m'
+    assert testContainer(yaml.load(launches[0].yaml)).resources.limits.cpu == '1001m'
 }
 variables.testFilter.debug = true
 launches.clear()
