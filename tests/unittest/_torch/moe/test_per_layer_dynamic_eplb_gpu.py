@@ -19,8 +19,9 @@ the hot experts, copies their weights into helper slots with an in-switch
 multicast and remaps the routes, and MegaMoE computes on the remapped slots.
 Three quarters of the tokens pick the experts of one rank, so the plan must
 use helper slots.  Three forwards cover a fresh plan, the same plan again with
-its helpers already resident, and a different plan.  After each forward every
-rank checks
+its helpers already resident, and a different plan.  A second case removes the
+pair team objects, so an owner outside a rank pair writes its share of the
+copy with unicast stores, as at EP16.  After each forward every rank checks
 
 - the output against the NVFP4 reference MoE;
 - every route: a home slot must be the expert's own, and a helper slot must
@@ -198,8 +199,12 @@ def _check_routes(layer, records, world_size):
     return errors
 
 
-def _run_rank(world_size):
+def _run_rank(world_size: int, team_objects: bool) -> tuple[int, list[str], bool]:
     """Run the forwards on this rank and return its errors and shutdown result."""
+    if not team_objects:
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler import geometry
+
+        geometry.MAX_PAIR_TEAM_EP = 2
     rank = mpi_rank()
     _init_process_group(rank, world_size)
     # The test utilities create weights and scales on the default device.
@@ -305,14 +310,15 @@ def _run_forwards(rank, world_size):
 
 
 @pytest.mark.threadleak(enabled=False)  # the MPIPoolExecutor manager thread outlives the test
-def test_per_layer_dynamic_eplb_megamoe_cutedsl():
+@pytest.mark.parametrize("team_objects", [True, False], ids=["pair_teams", "pair_unicast"])
+def test_per_layer_dynamic_eplb_megamoe_cutedsl(team_objects: bool) -> None:
     reason = _skip_reason()
     if reason:
         pytest.skip(reason)
     with MPIPoolExecutor(
         initializer=_init_worker, initargs=(sys.path,), max_workers=EP_SIZE
     ) as executor:
-        results = list(executor.map(_run_rank, [EP_SIZE] * EP_SIZE))
+        results = list(executor.map(_run_rank, [EP_SIZE] * EP_SIZE, [team_objects] * EP_SIZE))
     for rank, errors, shut_down in sorted(results):
         assert not errors, f"rank {rank}: " + "; ".join(errors)
         assert shut_down, f"rank {rank}: per-layer dynamic EPLB did not shut down"

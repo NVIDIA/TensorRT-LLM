@@ -663,10 +663,11 @@ namespace megamoe_gpu_plan_detail
 {
 /* ROUTE_BALANCED. The issuers of a copy are its owner, when it is a member of
  * the destination group or the group is a pair it can reach through its team
- * object, and the members other than the owner. An owner slice reads local
- * memory and costs 100; a member pulls its slices from the owner and they cost
- * tma_source_load_percent. Integer water-filling levels the issuers' loads,
- * copy by copy in placement order, then kBalancedPasses times more with each
+ * object or with unicast stores, and the members other than the owner. An owner
+ * slice reads local memory and costs 100, or 200 when the owner writes it to
+ * both ranks of a pair with unicast stores; a member pulls its slices from the
+ * owner and they cost tma_source_load_percent. Integer water-filling levels the
+ * issuers' loads, copy by copy in placement order, then kBalancedPasses times more with each
  * copy taken out and put back (2 passes: within 1.3% of 3 at EP8 on real
  * layers, for three quarters of the device time). Every rank computes the same
  * split. */
@@ -674,13 +675,15 @@ static constexpr int kBalancedMaxCopies = 96;
 static constexpr int kBalancedMaxIssuers = 17; // a group of 16 plus an owner outside it
 static constexpr int kBalancedPasses = 2;
 static constexpr uint32_t kBalancedOwnerCost = 100;
+static constexpr uint32_t kBalancedUnicastOwnerCost = 2 * kBalancedOwnerCost;
 
 struct BalancedCopy
 {
     int expert, level, begin, size, owner, helper;
-    int owner_issues; // 1: issuer 0 is the owner
-    int inside;       // the owner is a member of the destination group
+    int owner_issues;    // 1: issuer 0 is the owner
+    int inside;          // the owner is a member of the destination group
     uint32_t slices, owner_cap;
+    uint32_t owner_cost; // per owner slice: 100, or 200 for unicast stores into both ranks of a pair
     uint32_t take[kBalancedMaxIssuers];
 };
 
@@ -698,7 +701,7 @@ static MEGAMOE_GP_HD inline int balanced_rank(BalancedCopy const& b, int k)
 }
 
 /* Every rank's load, their sum and a finish one slice past any load stay below
- * 2^32: a copy adds at most slices * 199 over all of its issuers. */
+ * 2^32: a copy adds at most slices * 200 over all of its issuers. */
 static MEGAMOE_GP_HD inline bool balanced_loads_fit(int count, uint64_t slices)
 {
     return slices <= UINT32_MAX && (uint64_t) (count > 0 ? count : 1) * slices * 200U <= UINT32_MAX;
@@ -726,10 +729,11 @@ static __device__ __forceinline__ int balanced_issuer_of(BalancedCopy const& b, 
 }
 
 /* Puts each copy b onto the loads at the lowest finish level, in closed form and in
- * exact integers. Weighted by w = 100 * pull_cost / cost (pull_cost for an owner
- * issuer, 100 for a member), the level of an active set is floor((slices * 100 *
- * pull_cost + sum w * load) / sum w); issuers at or above it leave the set. An
- * owner whose share passes its cap is fixed at the cap, and the members level the
+ * exact integers. Weighted by w = owner_cost * pull_cost / cost (pull_cost for an
+ * owner issuer, owner_cost for a member), the level of an active set is
+ * floor((slices * owner_cost * pull_cost + sum w * load) / sum w); issuers at or
+ * above it leave the set. An owner whose share passes its cap is fixed at the
+ * cap, and the members level the
  * rest. Each active issuer takes floor((level - load) / cost), which never
  * exceeds the slices; each remaining slice goes to the issuer that would finish
  * it first (the earlier issuer on a tie).
@@ -747,7 +751,8 @@ static __device__ __forceinline__ void balanced_split_warp(
             int const issuers = balanced_issuers(b);
             bool const is = lane < issuers;
             bool const own = b.owner_issues && lane == 0;
-            uint32_t const cost = own ? kBalancedOwnerCost : pull_cost;
+            uint32_t const owner_cost = b.owner_cost;
+            uint32_t const cost = own ? owner_cost : pull_cost;
             uint32_t const cap = own ? b.owner_cap : UINT32_MAX;
             int const rank = is ? balanced_rank(b, lane) : 0;
             uint32_t l = is ? load[rank] : 0;
@@ -766,9 +771,9 @@ static __device__ __forceinline__ void balanced_split_warp(
                     uint32_t const l0 = __shfl_sync(all_lanes, l, 0);
                     bool const own_active = b.owner_issues && (active & 1);
                     uint32_t const count = __popc(active) - (own_active ? 1 : 0);
-                    uint64_t const num = (uint64_t) remaining * kBalancedOwnerCost * pull_cost
-                        + (uint64_t) kBalancedOwnerCost * members + (own_active ? (uint64_t) pull_cost * l0 : 0);
-                    uint64_t const den = (uint64_t) kBalancedOwnerCost * count + (own_active ? pull_cost : 0);
+                    uint64_t const num = (uint64_t) remaining * owner_cost * pull_cost + (uint64_t) owner_cost * members
+                        + (own_active ? (uint64_t) pull_cost * l0 : 0);
+                    uint64_t const den = (uint64_t) owner_cost * count + (own_active ? pull_cost : 0);
                     level = balanced_div(num, den);
                     uint32_t const keep = __ballot_sync(all_lanes, act && l < level);
                     if (keep == active || !keep)
@@ -777,7 +782,7 @@ static __device__ __forceinline__ void balanced_split_warp(
                 }
                 uint32_t const l0 = __shfl_sync(all_lanes, l, 0);
                 if (round || fixed || !b.owner_issues || b.owner_cap == UINT32_MAX || !(active & 1) || level <= l0
-                    || balanced_div(level - l0, kBalancedOwnerCost) <= b.owner_cap)
+                    || balanced_div(level - l0, owner_cost) <= b.owner_cap)
                     break;
                 fixed = true;
                 remaining -= b.owner_cap;
@@ -818,9 +823,11 @@ static __device__ __forceinline__ void balanced_split_warp(
  * one warp of the fused copy kernel: every lane calls it and gets the same
  * return value. A copy's virtual stream lists the planes its owner can write
  * through a team object first (pair_dst_table entries that are not zero), so an
- * owner's block, which always starts at slice 0, stays inside them; members
- * write every plane through the level's address in dst_table. Copies that the
- * resident table shows complete on every member are skipped. Lanes read the placement records, the issuers
+ * owner's block, which always starts at slice 0, stays inside them; without team
+ * objects (no pair_dst_table) an owner outside a pair writes its block of every
+ * plane to each rank of the pair through uc_dst_table, one range per rank;
+ * members write every plane through the level's address in dst_table. Copies
+ * that the resident table shows complete on every member are skipped. Lanes read the placement records, the issuers
  * of a large copy and the planes of a descriptor at once. scratch holds the
  * records and one load word per rank: megamoe_tma_balanced_scratch_bytes(). */
 static constexpr __host__ __device__ size_t megamoe_tma_balanced_scratch_bytes()
@@ -863,6 +870,8 @@ static __device__ inline int megamoe_tma_build_balanced_plan_warp(MegamoeTmaGpuP
     bool const team = plane_lane && g.pair_dst_table && g.pair_dst_table[lane] != 0;
     uint64_t const bytes = plane_lane ? g.plane_bytes[lane] : 0;
     uint32_t const team_mask = __ballot_sync(all_lanes, team);
+    // Without team objects an owner outside a pair writes both of its ranks with unicast stores.
+    bool const unicast_pairs = !g.pair_dst_table && g.uc_dst_table;
     uint32_t const below = (1u << lane) - 1;
     int const team_planes = __popc(team_mask);
     uint32_t const plane_mask = g.planes >= 32 ? all_lanes : (1u << g.planes) - 1;
@@ -925,9 +934,11 @@ static __device__ inline int megamoe_tma_build_balanced_plan_warp(MegamoeTmaGpuP
             b.owner = owner;
             b.helper = helper;
             b.inside = owner >= begin && owner < begin + size;
-            b.owner_issues = b.inside || (size == 2 && team_planes);
+            b.owner_issues = b.inside || (size == 2 && (team_planes || unicast_pairs));
             b.slices = (uint32_t) slices64;
-            b.owner_cap = b.inside ? UINT32_MAX : (uint32_t) (team_bytes / MEGAMOE_TMA_COPY_SLICE_BYTES);
+            b.owner_cap
+                = b.inside || unicast_pairs ? UINT32_MAX : (uint32_t) (team_bytes / MEGAMOE_TMA_COPY_SLICE_BYTES);
+            b.owner_cost = b.inside || !unicast_pairs ? kBalancedOwnerCost : kBalancedUnicastOwnerCost;
         }
         n += __popc(kept);
     }
@@ -949,51 +960,58 @@ static __device__ inline int megamoe_tma_build_balanced_plan_warp(MegamoeTmaGpuP
             continue;
         uint32_t const first = __reduce_add_sync(all_lanes, lane < me ? t : 0);
         bool const owner = b.owner_issues && me == 0;
-        bool const via_team = owner && !b.inside;
+        bool const outside = owner && !b.inside;
+        bool const via_team = outside && !unicast_pairs;
         int const used = via_team ? team_planes : g.planes;
         uint64_t const cursor = via_team ? team_bytes : total_bytes;
-        bool bad = segs + used > max_segments || nranges >= max_ranges
-            || first + take > (cursor + MEGAMOE_TMA_COPY_SLICE_BYTES - 1) / MEGAMOE_TMA_COPY_SLICE_BYTES;
-        if (plane_lane && position < used && !bad)
+        // An owner writing a pair with unicast stores issues its block once per rank of the pair.
+        int const writes = outside && unicast_pairs ? 2 : 1;
+        for (int w = 0; w < writes && !error; ++w)
         {
-            uint64_t const src = g.src_table[(size_t) b.expert * g.planes + lane];
-            uint64_t const dst = via_team
-                ? g.pair_dst_table[((size_t) (b.begin / 2) * slots + b.helper) * g.planes + lane]
-                : g.dst_table[((size_t) b.level * slots + b.helper) * g.planes + lane];
-            bool const fault = !src || !dst || !bytes || (src & 3) || (dst & 3) || (bytes & 3)
-                || bytes > UINT64_MAX - vbegin || bytes > UINT64_MAX - src || bytes > UINT64_MAX - dst;
-            if (!fault)
+            bool bad = segs + used > max_segments || nranges >= max_ranges
+                || first + take > (cursor + MEGAMOE_TMA_COPY_SLICE_BYTES - 1) / MEGAMOE_TMA_COPY_SLICE_BYTES;
+            if (plane_lane && position < used && !bad)
             {
-                MegamoeTmaCopySegment& s = segments[segs + position];
-                s.src = src;
-                s.dst = dst;
-                s.bytes = bytes;
-                s.virtual_begin = vbegin;
+                uint64_t const src = g.src_table[(size_t) b.expert * g.planes + lane];
+                uint64_t const dst = writes == 2
+                    ? g.uc_dst_table[((size_t) (b.begin + w) * slots + b.helper) * g.planes + lane]
+                    : via_team ? g.pair_dst_table[((size_t) (b.begin / 2) * slots + b.helper) * g.planes + lane]
+                               : g.dst_table[((size_t) b.level * slots + b.helper) * g.planes + lane];
+                bool const fault = !src || !dst || !bytes || (src & 3) || (dst & 3) || (bytes & 3)
+                    || bytes > UINT64_MAX - vbegin || bytes > UINT64_MAX - src || bytes > UINT64_MAX - dst;
+                if (!fault)
+                {
+                    MegamoeTmaCopySegment& s = segments[segs + position];
+                    s.src = src;
+                    s.dst = dst;
+                    s.bytes = bytes;
+                    s.virtual_begin = vbegin;
+                }
+                bad = fault;
             }
-            bad = fault;
+            if (__any_sync(all_lanes, bad))
+            {
+                error = 3;
+                break;
+            }
+            if (lane == 0)
+            {
+                MegamoeTmaCopyRange& r = ranges[nranges];
+                r.segment_begin = segs;
+                r.segment_count = used;
+                r.bytes = cursor;
+                r.first_slice = first;
+                r.slice_stride = 1;
+                r.slice_count = take;
+                r.prefix_end = prefix + take;
+                r.slice_divisor = 1;
+                r.slice_reciprocal = 0;
+                r.flags = writes == 2 ? MEGAMOE_TMA_COPY_RANGE_UNICAST : 0;
+            }
+            segs += used;
+            ++nranges;
+            prefix += take;
         }
-        if (__any_sync(all_lanes, bad))
-        {
-            error = 3;
-            break;
-        }
-        if (lane == 0)
-        {
-            MegamoeTmaCopyRange& r = ranges[nranges];
-            r.segment_begin = segs;
-            r.segment_count = used;
-            r.bytes = cursor;
-            r.first_slice = first;
-            r.slice_stride = 1;
-            r.slice_count = take;
-            r.prefix_end = prefix + take;
-            r.slice_divisor = 1;
-            r.slice_reciprocal = 0;
-            r.flags = 0;
-        }
-        segs += used;
-        ++nranges;
-        prefix += take;
         owned += owner;
         pulled += !owner;
     }

@@ -11,6 +11,7 @@ __all__ = [
     "MIN_GROUP_SIZE",
     "balanced_copy_enabled",
     "hierarchy_group_sizes",
+    "pair_team_objects_enabled",
 ]
 
 MIN_EP = 2
@@ -20,6 +21,11 @@ MIN_GROUP_SIZE = 4
 #: HALO-Q's pair records are an ordinary multicast level (the copy ABI holds
 #: at most four levels).
 MAX_PAIR_LADDER_EP = 16
+#: Largest world whose balanced copy reaches rank pairs through team objects
+#: ``{owner, 2j, 2j + 1}``.  A GPU binds every multicast object it joins once
+#: per helper set and fails near 960 binds: with a helper set per layer, EP8
+#: takes 15 binds per layer (915 at 61 layers), EP16 would take 29.
+MAX_PAIR_TEAM_EP = 8
 #: moeRebalanceTmaGpuPlanBuilder.cuh kBalancedMaxCopies: a layer holds at most
 #: world * helper_count / 2 copies, each on two or more ranks.
 _BALANCED_MAX_COPIES = 96
@@ -54,8 +60,8 @@ def hierarchy_group_sizes(world: int) -> tuple[int, ...]:
 def balanced_copy_enabled(world: int, helper_count: int) -> bool:
     """Whether the copy splits every HALO-Q copy between its owner and its
     destination members (route bit 8).  It needs a ladder that ends in rank
-    pairs, the pair team objects (EP >= 4) and room for a layer's copies in the
-    builder; the arena (team objects) and the copy configuration both ask here.
+    pairs, EP >= 4 and room for a layer's copies in the builder; the arena and
+    the copy configuration both ask here.
     """
     sizes = hierarchy_group_sizes(world)
     return (
@@ -64,3 +70,10 @@ def balanced_copy_enabled(world: int, helper_count: int) -> bool:
         and sizes[-1] == 2
         and world * helper_count <= 2 * _BALANCED_MAX_COPIES
     )
+
+
+def pair_team_objects_enabled(world: int, helper_count: int) -> bool:
+    """Whether an owner outside a rank pair writes its share of a balanced copy
+    through a team object (one multicast), else with unicast stores into each
+    rank of the pair."""
+    return balanced_copy_enabled(world, helper_count) and world <= MAX_PAIR_TEAM_EP
