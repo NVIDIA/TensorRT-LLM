@@ -156,8 +156,14 @@ replaces its default web-search instruction.
 |---|---|
 | Invalid request body or unsupported `priority` | 400 |
 | Instruction and query alone exceed the model or batch token limit | 400 |
+| Document count exceeds a positive `--max_queue_size` | 400 |
 | Request queue full | 429 |
 | Model does not return one scalar per pair | 500 |
+
+Requests exceeding a positive `--max_queue_size` document count are rejected
+before tokenization. Split these into smaller requests; retrying the same
+oversized request will not help. This limit applies to all submitted documents,
+even when `top_n` requests fewer results.
 
 Over-long documents are truncated to fit the smaller of the model's sequence
 limit and the batch token limit, while preserving the instruction, query, and

@@ -1619,6 +1619,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     "server.",
                     status_code=HTTPStatus.BAD_REQUEST)
 
+            if (self._encode_max_queue_size > 0
+                    and len(request.documents) > self._encode_max_queue_size):
+                return self.create_error_response(
+                    f"Number of documents ({len(request.documents)}) exceeds "
+                    f"max_queue_size ({self._encode_max_queue_size}). "
+                    "Split the documents into smaller requests.",
+                    status_code=HTTPStatus.BAD_REQUEST)
+
             documents = [
                 doc if isinstance(doc, str) else doc.text
                 for doc in request.documents

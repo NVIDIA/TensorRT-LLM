@@ -18,6 +18,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm.serve.openai_protocol import RerankDocument, RerankRequest, RerankV2Request
 from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -76,12 +77,53 @@ class FakeBatcher:
 def _server(logits, *, max_seq_len=4096, max_num_tokens=4096):
     server = OpenAIServer.__new__(OpenAIServer)
     server.model = "served-reranker"
+    server._encode_max_queue_size = 2048
     server.tokenizer = CharacterTokenizer()
     server.encode_batcher = FakeBatcher(logits)
     server._input_proc_executor = None
     encoder_executor = SimpleNamespace(max_seq_len=max_seq_len, max_num_tokens=max_num_tokens)
     server.generator = SimpleNamespace(_encoder_executor=encoder_executor)
     return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_type", [RerankRequest, RerankV2Request])
+async def test_document_count_rejected_before_tokenization(tmp_path, request_type):
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig())
+        server._encode_max_queue_size = 2
+        server.tokenizer = Mock()
+        server.encode_batcher = Mock()
+        request = request_type(
+            model="reranker", query="query" * 1000, documents=[""] * 3, top_n=1
+        )
+
+        response = await server._rerank(request)
+
+        assert response.status_code == 400
+        assert "max_queue_size (2)" in response.body.decode()
+        assert not server.tokenizer.mock_calls
+        assert not server.encode_batcher.mock_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_type", [RerankRequest, RerankV2Request])
+@pytest.mark.parametrize("queue_limit", [2, 0])
+async def test_document_count_at_limit_or_unbounded(tmp_path, request_type, queue_limit):
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig())
+        server._encode_max_queue_size = queue_limit
+        server.tokenizer = CharacterTokenizer()
+        server.encode_batcher = FakeBatcher([0.0, 1.0])
+        server.generator._encoder_executor = SimpleNamespace(
+            max_seq_len=4096, max_num_tokens=4096
+        )
+        request = request_type(model="reranker", query="query", documents=["a", "b"])
+
+        response = await server._rerank(request)
+
+        assert response.status_code == 200
+        assert len(server.encode_batcher.inputs) == 2
 
 
 def test_official_prompt_with_default_and_custom_instruction():
