@@ -38,9 +38,6 @@ from .base import PRInputs, Rule, RuleResult
 # pre-merge test stages CBTS selects. Do not widen this to `.github/`: workflow
 # changes can alter CI execution and must keep falling back.
 OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (
-    # Temporary PR #21982 selection probe; revert before merging.
-    "jenkins/L0_MergeRequest.groovy",
-    "jenkins/L0_Test.groovy",
     ".github/CODEOWNERS",
     "LICENSE",
     ".pre-commit-config.yaml",
