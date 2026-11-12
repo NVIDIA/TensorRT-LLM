@@ -7596,7 +7596,7 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module) -> None:
         # GEMM1 ScaleC stores FC1 input scale / FC2 input scale; ScaleGate
         # stores the raw FC1 dequant scale, also used to quantize the input.
         fc31_input_dequant = nn.Parameter(torch.empty(
@@ -7629,7 +7629,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         dst_fc31_input_scale.copy_(w1_input_scale)
         dst_fc2_input_scale.copy_(w2_input_scale)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
@@ -7685,11 +7685,10 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         )
         if params.alpha is not None:
             module.act_alpha.data.copy_(params.alpha)
-        for name, value in (("act_beta", params.beta), ("act_clamp",
-                                                        params.clamp)):
+        for target, value in ((module.act_beta, params.beta), (module.act_clamp,
+                                                               params.clamp)):
             if value is not None:
-                getattr(module,
-                        name).data.copy_(value / module.fc31_input_gate_dequant)
+                target.data.copy_(value / module.fc31_input_gate_dequant)
 
 
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):

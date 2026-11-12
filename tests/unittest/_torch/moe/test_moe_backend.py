@@ -7086,20 +7086,25 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
             if gptoss
             else DEFAULT_MOE_ACTIVATION
         )
-        install_activation_params(owner)
+        device = "meta" if meta_init else "cpu"
+        install_activation_params(owner, device=device)
+        with torch.device(device):
+            owner.create_weights()
+        if meta_init:
+            owner.to_empty(device="cpu")
         return owner
 
     def create_weight_storage(
-        self: MXFP4WeightTRTLLMGenFusedMoEMethod, module: torch.nn.Module
+        self: MXFP4WeightTRTLLMGenFusedMoEMethod, target_module: torch.nn.Module
     ) -> None:
-        module.register_parameter("w3_w1_weight", torch.nn.Parameter(torch.zeros(2, 4, 2)))
-        module.register_parameter("w2_weight", torch.nn.Parameter(torch.zeros(2, 2, 2)))
-        module.register_buffer("w3_w1_bias", torch.zeros(2, 4) if bias else None)
-        module.register_buffer("w2_bias", torch.zeros(2, 2) if bias else None)
+        target_module.register_parameter("w3_w1_weight", torch.nn.Parameter(torch.zeros(2, 4, 2)))
+        target_module.register_parameter("w2_weight", torch.nn.Parameter(torch.zeros(2, 2, 2)))
+        target_module.register_buffer("w3_w1_bias", torch.zeros(2, 4) if bias else None)
+        target_module.register_buffer("w2_bias", torch.zeros(2, 2) if bias else None)
 
     def load_experts(
-        module: torch.nn.Module,
-        weights: dict[str, torch.Tensor],
+        target_module: torch.nn.Module,
+        checkpoint_weights: dict[str, torch.Tensor],
         mode: MoEWeightLoadingMode,
         expert_ids: list[int],
         w31: torch.Tensor,
@@ -7109,8 +7114,8 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
     ) -> None:
         if bias:
             assert b31 is not None and b2 is not None
-            b31.copy_(weights["fc1_bias"])
-            b2.copy_(weights["fc2_bias"])
+            b31.copy_(checkpoint_weights["fc1_bias"])
+            b2.copy_(checkpoint_weights["fc2_bias"])
 
     # Weight packing is orthogonal to the scale contract and requires CUDA.
     monkeypatch.setattr(MXFP4WeightTRTLLMGenFusedMoEMethod, "create_weights", create_weight_storage)
@@ -7121,11 +7126,7 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
         FusedMoEMethodBase.cache_derived_state,
     )
     monkeypatch.setattr(method, "load_expert_weights_to_dst", load_experts)
-    with torch.device("meta" if meta_init else "cpu"):
-        module = create_module()
-        module.create_weights()
-    if meta_init:
-        module.to_empty(device="cpu")
+    module = create_module()
 
     raw_beta = torch.tensor([1.0, 2.0])
     raw_clamp = torch.tensor([7.0, 9.0])
@@ -7164,11 +7165,7 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
         assert not hasattr(module, "_act_clamp_unscaled")
 
         # Runtime weights omit the non-persistent activation configuration.
-        with torch.device("meta" if meta_init else "cpu"):
-            restored = create_module()
-            restored.create_weights()
-        if meta_init:
-            restored.to_empty(device="cpu")
+        restored = create_module()
         restored.load_state_dict(module.state_dict())
         # A receiver can rebuild derived state without loading checkpoint weights.
         restored.cache_derived_state()
