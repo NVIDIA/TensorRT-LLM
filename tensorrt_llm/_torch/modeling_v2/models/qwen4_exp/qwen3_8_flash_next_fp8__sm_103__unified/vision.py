@@ -149,6 +149,12 @@ DEVICE_PATHS = (
 #: The position-ids axes of the mRoPE layout a media request carries.
 _POSITION_AXES = 3
 
+#: The `multimodal_data` key of a chunked request's last tower call that later chunks still read:
+#: `(first placeholder row, rows)`. The executor hands every chunk the request's own
+#: `py_multimodal_data` dict, so the entry lives on the request; the chunk that consumes its last
+#: row drops it, and the executor's post-prefill and termination release clears the dict.
+_TOWER_ROWS_KEY = "qwen4_exp_tower_rows"
+
 
 class _VisionBlockWeights(NamedTuple):
     """One vision block's weights (`.t()` GEMM views); its LayerNorms have biases."""
@@ -423,7 +429,8 @@ def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
     The shell calls it: the inherited `DecoderModelForCausalLM.forward` drops `multimodal_params`,
     which covers a subset of the context requests (never zip it positionally).
     `multimodal_runtime` counts rows over a request's media together, in prompt order; a chunk
-    runs the tower on only the frames that hold its rows (`_tower_rows`)."""
+    runs the tower on only the frames that hold its rows (`_tower_rows`), once per frame across
+    the request's chunks (`_chunk_rows`)."""
     mm_params = kwargs.get("multimodal_params") or []
     if not mm_params:
         return None
@@ -447,18 +454,19 @@ def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
         items = _items_in_prompt_order(params, data)
         merge_unit = tower.merge * tower.merge
         total = sum(t * h * w for _, _, (t, h, w) in items) // merge_unit
-        start, count = 0, total
-        if runtime is not None:
-            # Chunked prefill or reused prefix: only this chunk's slice.
-            start = int(runtime.num_cached_mm_tokens)
-            count = int(runtime.num_mm_tokens_in_chunk)
-            assert int(runtime.total_embeds_in_request) == total, (
-                f"the executor counted {runtime.total_embeds_in_request} placeholder rows for "
-                f"this request and its grids describe {total}; the two are derived from the "
-                "same grids and a disagreement means the merger's row count is wrong"
-            )
-            assert 0 <= start <= start + count <= total, (start, count, total)
-        rows.append(_tower_rows(tower, items, start, count))
+        if runtime is None:
+            rows.append(_tower_rows(tower, items, 0, total)[1])
+            continue
+        # Chunked prefill or reused prefix: only this chunk's slice.
+        start = int(runtime.num_cached_mm_tokens)
+        count = int(runtime.num_mm_tokens_in_chunk)
+        assert int(runtime.total_embeds_in_request) == total, (
+            f"the executor counted {runtime.total_embeds_in_request} placeholder rows for "
+            f"this request and its grids describe {total}; the two are derived from the "
+            "same grids and a disagreement means the merger's row count is wrong"
+        )
+        assert 0 <= start <= start + count <= total, (start, count, total)
+        rows.append(_chunk_rows(tower, data, items, start, count))
     if not rows:
         return None
     vision = rows[0] if len(rows) == 1 else torch.cat(rows, 0)
@@ -523,13 +531,16 @@ def _items_in_prompt_order(params, data: dict) -> list[tuple[torch.Tensor, int, 
     ]
 
 
-def _tower_rows(tower: VisionTower, items: list, start: int, count: int) -> torch.Tensor:
-    """Placeholder rows `[start, start + count)` of one request's `items` (prompt order).
+def _tower_rows(
+    tower: VisionTower, items: list, start: int, count: int
+) -> tuple[int, torch.Tensor]:
+    """`(first row, rows)`: one tower call over the frames of one request's `items` (prompt
+    order) that hold its placeholder rows `[start, start + count)`, from the first of those
+    frames' first row on.
 
-    One tower call over only the frames that hold them: a frame's rows depend on its own patches
-    alone (attention is per frame, every other op per row), so a chunk of a long video does not
-    rerun the request's other frames. A frame a chunk boundary cuts runs in both chunks. Adjacent
-    frames of one pixel tensor stay one view; items of two modalities are copied into one tensor."""
+    A frame's rows depend on its own patches alone (attention is per frame, every other op per
+    row), so a chunk of a long video does not run the request's other frames. Adjacent frames of
+    one pixel tensor stay one view; items of two modalities are copied into one tensor."""
     merge_unit = tower.merge * tower.merge
     end = start + count
     spans: list[list] = []  # [pixel_values, first patch row, end patch row]
@@ -553,8 +564,34 @@ def _tower_rows(tower: VisionTower, items: list, start: int, count: int) -> torc
         row += frames * frame_rows
     assert first_row is not None, (start, count, row)
     parts = [pixel_values[lo:hi] for pixel_values, lo, hi in spans]
-    out = tower(parts[0] if len(parts) == 1 else torch.cat(parts, 0), torch.tensor(grid))
-    return out[start - first_row : end - first_row]
+    pixels = parts[0] if len(parts) == 1 else torch.cat(parts, 0)
+    return first_row, tower(pixels, torch.tensor(grid))
+
+
+def _chunk_rows(tower: VisionTower, data: dict, items: list, start: int, count: int):
+    """Placeholder rows `[start, start + count)` of one chunk of a request's prefill.
+
+    Rows the request's previous tower call already produced (`_TOWER_ROWS_KEY` in `data`, the
+    request's `multimodal_data`) are read from it; the tower runs only on the frames holding the
+    rest. So an image or frame that several chunks cut runs once: an 8192-row image under
+    2048-token chunks runs in its first chunk and keeps its `[8192, out_hidden_size]` rows (40 MiB
+    at 2560 bf16) until the chunk with its last row. The rows are bitwise the one-pass rows."""
+    end = start + count
+    kept = data.pop(_TOWER_ROWS_KEY, None)
+    parts = []
+    if kept is not None:
+        first, out = kept
+        if first <= start < first + out.shape[0]:
+            take = min(end, first + out.shape[0])
+            parts.append(out[start - first : take - first])
+            start = take
+    if start < end:
+        kept = _tower_rows(tower, items, start, end - start)
+        first, out = kept
+        parts.append(out[start - first : end - first])
+    if kept is not None and end < kept[0] + kept[1].shape[0]:
+        data[_TOWER_ROWS_KEY] = kept
+    return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
 
 def validate_request(tower, request) -> None:
