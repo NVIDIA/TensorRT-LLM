@@ -387,10 +387,13 @@ holds these regions, each padded to 16 bytes:
 Rows whose width is not a power of two (448 = 256 + 128 + 64) are loaded as
 power-of-two pieces and rotated by one full `N x N` matrix: one TurboQuant
 instance per vector. Rows wider than 512 (the 576-value MLA latent) hold
-several instances (`mse`: 256 + 256 + 64; `prod`: 512 + 64), because decoding
+several instances (`mse`: 256 + 256 + 64; `prod`: 512 + 64; fractional bits
+keep their two halves, 288 + 288, as the instances), because decoding
 accumulates every output value of an instance in tensor memory (512 fp32
 columns, shared with the staged operand); each instance decodes in its own
-launch over its own chunks of the code planes. All buffers of a
+launch over its own chunks of the code planes. A single 512-value `mse` instance
+accumulates its output columns in two blocks of 256 on SM100-family GPUs, so that
+128-row tiles fit tensor memory; the second block reads the codes again. All buffers of a
 lifecycle with the same geometry and dtype share one kernel launch, driven by
 a device table of hot base addresses, Slot strides and cold offsets; buffers
 stored unchanged share one copy launch. Kernels are compiled in `configure()`
