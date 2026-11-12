@@ -18,8 +18,10 @@
 # that runs the tests. Every PROGRESS_INTERVAL seconds it prepares a checkpoint with
 # progress_snapshot.sh, after copying a Slurm batch job's latest results back with
 # progress_collect_slurm.sh, and uploads it to each target that lacks its content. Once
-# PROGRESS_DONE_FILE exists, it takes the final snapshot, uploads it, and exits. It always exits 0:
-# every failure is logged, and none fails the step.
+# PROGRESS_DONE_FILE exists, it takes the final snapshot, uploads it, and exits. A step that cannot
+# create that file sends the watcher USR1 instead, to the same effect, so that the step never waits
+# for a watcher that cannot learn that the tests have ended. It always exits 0: every failure is
+# logged, and none fails the step.
 #
 # The credentials come from a netrc that the pipeline writes for this watcher alone. The watcher
 # reads it into memory and removes it before anything else, and the step starts the tests only once
@@ -34,7 +36,8 @@
 #   CHECKPOINT_NETRC_FILE  the netrc, alone in its directory, with an entry for each target's host;
 #                          without it, the watcher prepares its snapshots but uploads none
 #   CHECKPOINT_TARGETS     space-separated <location>=<upload URL> pairs, in upload order
-#   PROGRESS_DONE_FILE     once this file exists, the watcher takes the final snapshot and exits
+#   PROGRESS_DONE_FILE     once this file exists, or once USR1 arrives, the watcher takes the final
+#                          snapshot and exits
 #   PROGRESS_INTERVAL      seconds between checkpoints
 #   LABEL_PREFIX           log label of a checkpoint, e.g. "checkpoint" or "rerun2 checkpoint"
 #   FINAL_LABEL            log label of the final snapshot, e.g. "run1 final snapshot"
@@ -62,6 +65,16 @@ set +x
 
 log() {
     echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: $*"
+}
+
+# --- The end of the tests: PROGRESS_DONE_FILE, or USR1 from a step that cannot create it ---
+# The trap is set before anything else, since USR1 ends a process that does not trap it. bash runs
+# a trap only once the command under way returns, so the signal cuts no checkpoint short.
+tests_ended=0
+trap 'tests_ended=1' USR1
+
+tests_done() {
+    [ "$tests_ended" = 1 ] || [ -e "$PROGRESS_DONE_FILE" ]
 }
 
 # --- Credentials: read the netrc into a variable that is not exported, then remove it ---
@@ -230,22 +243,25 @@ end_checkpoint() {
     fi
 }
 
-while [ ! -e "$PROGRESS_DONE_FILE" ]; do
-    # Check for the done file every 5 seconds, so that the step does not wait out a whole interval
-    # once the tests end.
+while ! tests_done; do
+    # Check for the end of the tests every 5 seconds, so that the step does not wait out a whole
+    # interval once they end.
     remaining=$interval
-    while [ "$remaining" -gt 0 ] && [ ! -e "$PROGRESS_DONE_FILE" ]; do
+    while [ "$remaining" -gt 0 ] && ! tests_done; do
         nap=5
         [ "$remaining" -lt "$nap" ] && nap=$remaining
         sleep "$nap"
         remaining=$((remaining - nap))
     done
-    [ -e "$PROGRESS_DONE_FILE" ] && break
+    tests_done && break
     if begin_checkpoint; then
         take_checkpoint
         end_checkpoint
     fi
 done
+if [ ! -e "$PROGRESS_DONE_FILE" ]; then
+    log "the step signalled the end of the tests without the done file"
+fi
 take_checkpoint final
 log "watcher exiting"
 exit 0
