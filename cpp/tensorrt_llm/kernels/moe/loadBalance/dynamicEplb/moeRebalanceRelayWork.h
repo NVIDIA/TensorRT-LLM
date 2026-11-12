@@ -38,7 +38,7 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-namespace halo_r
+namespace haloR
 {
 
 //! One relay slice: one bulk copy into one shared-memory slot.
@@ -150,7 +150,7 @@ TLLM_HALO_R_HOST_DEVICE inline int relayLocateItem(int const* prefix, int entrie
     return lo;
 }
 
-} // namespace halo_r
+} // namespace haloR
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

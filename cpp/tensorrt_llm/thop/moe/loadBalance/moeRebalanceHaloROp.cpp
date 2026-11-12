@@ -44,16 +44,16 @@ namespace
 //! Every launch publishes this READY generation; the kernel drains the READY row before each exchange instead.
 constexpr std::uint64_t kReadyGeneration = 1;
 //! Plan words of the shared per-layer dynamic EPLB layout and its per-field entry count.
-constexpr std::int64_t kPlanWords = kernels::halo_r::kPlanWords;
-constexpr std::int64_t kPlanFieldStride = kernels::halo_r::kPlanFieldStride;
+constexpr std::int64_t kPlanWords = kernels::haloR::kPlanWords;
+constexpr std::int64_t kPlanFieldStride = kernels::haloR::kPlanFieldStride;
 
-using moe_rebalance_op::checkCudaResult;
-using moe_rebalance_op::checkedInt;
+using moeRebalanceOp::checkCudaResult;
+using moeRebalanceOp::checkedInt;
 
 void checkCudaTensor(torch::Tensor const& tensor, c10::Device const& device, c10::ScalarType dtype,
     std::int64_t minElements, char const* name)
 {
-    moe_rebalance_op::checkCudaTensor(tensor, device, dtype, minElements, name, "the plan's CUDA device");
+    moeRebalanceOp::checkCudaTensor(tensor, device, dtype, minElements, name, "the plan's CUDA device");
 }
 
 template <typename T>
@@ -104,12 +104,12 @@ public:
         int const topk = checkedInt(topkValue, "topk");
         int const routeCapacity = checkedInt(routeCapacityValue, "route_capacity");
         int const ctas = checkedInt(ctasValue, "ctas");
-        TORCH_CHECK(ep >= kernels::kHaloRMinEp && ep <= kernels::halo_r::kMaxRanks, "ep must be in [",
-            kernels::kHaloRMinEp, ", ", kernels::halo_r::kMaxRanks, "]");
+        TORCH_CHECK(ep >= kernels::kHaloRMinEp && ep <= kernels::haloR::kMaxRanks, "ep must be in [",
+            kernels::kHaloRMinEp, ", ", kernels::haloR::kMaxRanks, "]");
         TORCH_CHECK(experts > 0 && experts <= kPlanFieldStride && experts % ep == 0,
             "experts must be positive, no greater than ", kPlanFieldStride, ", and divisible by ep");
-        TORCH_CHECK(helpers >= 1 && helpers <= kernels::halo_r::kMaxHelperSlots, "helpers must be in [1, ",
-            kernels::halo_r::kMaxHelperSlots, "]");
+        TORCH_CHECK(helpers >= 1 && helpers <= kernels::haloR::kMaxHelperSlots, "helpers must be in [1, ",
+            kernels::haloR::kMaxHelperSlots, "]");
         TORCH_CHECK(ctas >= kernels::kHaloRMinCtas && ctas <= kernels::kHaloRMaxCtas, "ctas must be in [",
             kernels::kHaloRMinCtas, ", ", kernels::kHaloRMaxCtas, "]");
         TORCH_CHECK(topk > 0 && routeCapacity > 0 && routeCapacity % topk == 0,

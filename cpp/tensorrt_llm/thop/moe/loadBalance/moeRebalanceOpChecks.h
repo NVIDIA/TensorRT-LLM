@@ -31,7 +31,7 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
-namespace moe_rebalance_op
+namespace moeRebalanceOp
 {
 
 //! Checks that `tensor` is a contiguous CUDA tensor of `dtype` on `device` with at least `minElements` elements.
@@ -58,7 +58,7 @@ inline int checkedInt(std::int64_t value, char const* name)
     return static_cast<int>(value);
 }
 
-} // namespace moe_rebalance_op
+} // namespace moeRebalanceOp
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END

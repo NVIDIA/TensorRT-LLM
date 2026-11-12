@@ -39,7 +39,7 @@ void checkMoeRebalanceHaloQParams(MoeRebalanceHaloQParams const&)
 TRTLLM_NAMESPACE_END
 #endif
 
-#ifdef TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_HALO_R
+#if defined(TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_HALO_R)
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels

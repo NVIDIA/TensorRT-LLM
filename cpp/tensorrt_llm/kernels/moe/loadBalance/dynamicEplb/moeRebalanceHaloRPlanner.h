@@ -42,7 +42,7 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-namespace halo_r
+namespace haloR
 {
 
 //! Ranks are lanes of one warp and rank sets are 32-bit masks.
@@ -576,7 +576,7 @@ TLLM_HALO_R_HOST_DEVICE inline void planHaloR(int const* histogram, PlannerConfi
     Warp::sync();
 }
 
-} // namespace halo_r
+} // namespace haloR
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

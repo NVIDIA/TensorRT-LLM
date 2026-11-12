@@ -29,7 +29,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-//! Supported geometry of the HALO-R kernel: EP sizes from kHaloRMinEp (the planner covers up to halo_r::kMaxRanks),
+//! Supported geometry of the HALO-R kernel: EP sizes from kHaloRMinEp (the planner covers up to haloR::kMaxRanks),
 //! and from kHaloRMinCtas CTAs (CTA 0 plans while the others map routes) to kHaloRMaxCtas.
 constexpr int kHaloRMinEp = 2;
 constexpr int kHaloRMinCtas = 2;
@@ -91,7 +91,7 @@ struct MoeRebalanceHaloRParams
     int* partial;                     //!< [ctas * experts] per-CTA histograms.
     int* routeAux;                    //!< Worker rendezvous, per-worker totals and selected-route indices.
     int* gridSync;                    //!< [4] grid rendezvous words and the route-prefix publication epoch.
-    int* plan;                        //!< [halo_r::kPlanWords] the layer's plan; word 0 is its publication epoch.
+    int* plan;                        //!< [haloR::kPlanWords] the layer's plan; word 0 is its publication epoch.
     int* routePrefix;                 //!< [384 * (ep + 1)] per-broadcast destination prefix of this rank's routes.
     unsigned long long* routeCounter; //!< Each CTA adds 1; the consumer waits for `ctas`, then resets it.
     std::uint64_t const* sourceTable; //!< [experts * planes] address of each expert's plane in its owner's home

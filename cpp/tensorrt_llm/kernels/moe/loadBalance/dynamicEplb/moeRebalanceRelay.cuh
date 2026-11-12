@@ -62,13 +62,13 @@ constexpr unsigned kRelayAwaitBackoffNs = 32;
 struct RelayWork
 {
     int entries;
-    int broadcast[halo_r::kMaxHaloRBroadcasts];
-    unsigned need[halo_r::kMaxHaloRBroadcasts]; //!< The broadcast's need set N_b, the receivers it stores into.
-    int prefix[halo_r::kMaxHaloRBroadcasts + 1];
-    int destinations[halo_r::kMaxHaloRBroadcasts];
-    int index[halo_r::kMaxHaloRBroadcasts];
+    int broadcast[haloR::kMaxHaloRBroadcasts];
+    unsigned need[haloR::kMaxHaloRBroadcasts]; //!< The broadcast's need set N_b, the receivers it stores into.
+    int prefix[haloR::kMaxHaloRBroadcasts + 1];
+    int destinations[haloR::kMaxHaloRBroadcasts];
+    int index[haloR::kMaxHaloRBroadcasts];
     long long slices;
-    unsigned long long planeBytes[halo_r::kRelayMaxPlanes];
+    unsigned long long planeBytes[haloR::kRelayMaxPlanes];
 };
 
 constexpr unsigned kRelayWorkBytes = static_cast<unsigned>((sizeof(RelayWork) + 127) & ~std::size_t{127});
@@ -80,7 +80,7 @@ struct RelaySlotControl
     unsigned pad;
 };
 
-constexpr unsigned kRelaySlotBytes = static_cast<unsigned>(halo_r::kRelaySliceBytes + sizeof(RelaySlotControl));
+constexpr unsigned kRelaySlotBytes = static_cast<unsigned>(haloR::kRelaySliceBytes + sizeof(RelaySlotControl));
 
 __device__ __forceinline__ void relayLoad(
     unsigned char* buffer, RelaySlotControl* slot, std::uint64_t source, unsigned bytes)
@@ -142,9 +142,8 @@ __device__ __forceinline__ std::uint64_t relayDestination(
 {
     int const home = p.experts / p.ep;
     int const row = home
-        + halo_r::helperIndex(
-            static_cast<unsigned>(halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperLowMask)[b]),
-            static_cast<unsigned>(halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperHighMask)[b]), destination);
+        + haloR::helperIndex(static_cast<unsigned>(haloR::planField(p.plan, haloR::HaloRPlanField::kHelperLowMask)[b]),
+            static_cast<unsigned>(haloR::planField(p.plan, haloR::HaloRPlanField::kHelperHighMask)[b]), destination);
     return p.destinationTable[static_cast<std::size_t>(destination) * p.planes + plane]
         + static_cast<std::uint64_t>(row) * work.planeBytes[plane] + offset;
 }
@@ -157,20 +156,20 @@ __device__ void prepareRelayWork(MoeRebalanceHaloRParams const& p, RelayWork* wo
     {
         work->planeBytes[plane] = p.planeBytes[plane];
     }
-    work->slices = halo_r::relayBundleSlices(work->planeBytes, p.planes);
+    work->slices = haloR::relayBundleSlices(work->planeBytes, p.planes);
     work->prefix[0] = 0;
     int const broadcasts = p.plan[1];
-    int const* experts = halo_r::planField(p.plan, halo_r::HaloRPlanField::kExpert);
-    int const* masks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kDestinationMask);
-    int const* lowMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperLowMask);
-    int const* highMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperHighMask);
+    int const* experts = haloR::planField(p.plan, haloR::HaloRPlanField::kExpert);
+    int const* masks = haloR::planField(p.plan, haloR::HaloRPlanField::kDestinationMask);
+    int const* lowMasks = haloR::planField(p.plan, haloR::HaloRPlanField::kHelperLowMask);
+    int const* highMasks = haloR::planField(p.plan, haloR::HaloRPlanField::kHelperHighMask);
     int entries = 0;
-    for (int b = 0; b < broadcasts && b < halo_r::kMaxHaloRBroadcasts; ++b)
+    for (int b = 0; b < broadcasts && b < haloR::kMaxHaloRBroadcasts; ++b)
     {
-        unsigned const need = halo_r::relayNeedMask(static_cast<unsigned>(masks[b]), static_cast<unsigned>(lowMasks[b]),
+        unsigned const need = haloR::relayNeedMask(static_cast<unsigned>(masks[b]), static_cast<unsigned>(lowMasks[b]),
             static_cast<unsigned>(highMasks[b]), experts[b], p.residency, p.helpers);
         int destinations = 0;
-        int const index = halo_r::relayDestinationIndex(need, p.localRank, &destinations);
+        int const index = haloR::relayDestinationIndex(need, p.localRank, &destinations);
         if (index < 0)
         {
             continue;
@@ -180,7 +179,7 @@ __device__ void prepareRelayWork(MoeRebalanceHaloRParams const& p, RelayWork* wo
         work->destinations[entries] = destinations;
         work->index[entries] = index;
         work->prefix[entries + 1]
-            = work->prefix[entries] + static_cast<int>(halo_r::relaySliceCount(work->slices, destinations, index));
+            = work->prefix[entries] + static_cast<int>(haloR::relaySliceCount(work->slices, destinations, index));
         ++entries;
     }
     work->entries = entries;
@@ -221,7 +220,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
     }
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
-    int const* experts = halo_r::planField(p.plan, halo_r::HaloRPlanField::kExpert);
+    int const* experts = haloR::planField(p.plan, haloR::HaloRPlanField::kExpert);
     long long const total = work.prefix[work.entries];
     long long const stride = static_cast<long long>(gridDim.x) * issuers;
     long long const first = static_cast<long long>(blockIdx.x) * issuers + warp;
@@ -236,12 +235,12 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
     auto load = [&](long long n, int s)
     {
         long long k;
-        int const entry = halo_r::relayLocateItem(work.prefix, work.entries, first + n * stride, &k);
-        long long const slice = halo_r::relaySliceOf(k, work.destinations[entry], work.index[entry]);
+        int const entry = haloR::relayLocateItem(work.prefix, work.entries, first + n * stride, &k);
+        long long const slice = haloR::relaySliceOf(k, work.destinations[entry], work.index[entry]);
         int plane = 0;
         unsigned long long offset = 0;
         unsigned long long bytes = 0;
-        halo_r::relayLocateSlice(work.planeBytes, p.planes, slice, &plane, &offset, &bytes);
+        haloR::relayLocateSlice(work.planeBytes, p.planes, slice, &plane, &offset, &bytes);
         int const b = work.broadcast[entry];
         unsigned const mask = work.need[entry];
         std::uint64_t const source = p.sourceTable[static_cast<std::size_t>(experts[b]) * p.planes + plane] + offset;
@@ -261,7 +260,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
         bulkOf[s] = aligned;
         if (aligned)
         {
-            relayLoad(buffer + static_cast<std::size_t>(s) * halo_r::kRelaySliceBytes, &control[s], source,
+            relayLoad(buffer + static_cast<std::size_t>(s) * haloR::kRelaySliceBytes, &control[s], source,
                 static_cast<unsigned>(bytes));
         }
     };
@@ -282,7 +281,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
                 if ((mask >> d) & 1U)
                 {
                     relayStore(relayDestination(p, work, b, d, planeOf[s], offsetOf[s]),
-                        buffer + static_cast<std::size_t>(s) * halo_r::kRelaySliceBytes, bytesOf[s]);
+                        buffer + static_cast<std::size_t>(s) * haloR::kRelaySliceBytes, bytesOf[s]);
                 }
             }
             cp_async_bulk_commit_group();
@@ -337,7 +336,7 @@ __device__ void relayCopy(MoeRebalanceHaloRParams const& p)
     int const slots = warp < issuers ? (fitting < kRelaySlotsPerIssuer ? fitting : kRelaySlotsPerIssuer) : 0;
     unsigned char* buffer = relayShared + kRelayWorkBytes + static_cast<std::size_t>(warp) * perWarpBytes;
     auto* control
-        = reinterpret_cast<RelaySlotControl*>(buffer + static_cast<std::size_t>(slots) * halo_r::kRelaySliceBytes);
+        = reinterpret_cast<RelaySlotControl*>(buffer + static_cast<std::size_t>(slots) * haloR::kRelaySliceBytes);
     // The other warps only join the barrier.
     if (lane == 0 && slots > 0)
     {

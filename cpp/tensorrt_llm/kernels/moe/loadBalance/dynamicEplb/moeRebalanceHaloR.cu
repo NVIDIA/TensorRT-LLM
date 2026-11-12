@@ -68,10 +68,10 @@ constexpr int kFusedThreads = 512;
 constexpr int kFusedWarps = kFusedThreads / 32;
 constexpr unsigned kFullWarpMask = 0xffffffffU;
 
-static_assert(halo_r::kPlanFieldStride == kMaxBroadcasts, "HALO-R uses the shared plan field stride");
-static_assert(static_cast<int>(halo_r::HaloRPlanField::kExpert) == kPlanExpert,
+static_assert(haloR::kPlanFieldStride == kMaxBroadcasts, "HALO-R uses the shared plan field stride");
+static_assert(static_cast<int>(haloR::HaloRPlanField::kExpert) == kPlanExpert,
     "the shared worker passes read the selected experts from plan field 0");
-static_assert(halo_r::kMaxRanks == kMaxEp, "the planner covers every supported EP size");
+static_assert(haloR::kMaxRanks == kMaxEp, "the planner covers every supported EP size");
 
 struct DeviceWarp
 {
@@ -143,7 +143,7 @@ __device__ int firstFailedStatus(int const* status)
     return -1;
 }
 
-//! HALO-R's slot of a selected route (halo_r::selectedRouteSlot): the owner's home slot, or the receiver's own helper
+//! HALO-R's slot of a selected route (haloR::selectedRouteSlot): the owner's home slot, or the receiver's own helper
 //! slot.
 struct HaloRSelectedRouteSlot
 {
@@ -156,7 +156,7 @@ struct HaloRSelectedRouteSlot
 
     __device__ __forceinline__ bool operator()(int b, int expert, int destination, int& slot) const
     {
-        slot = halo_r::selectedRouteSlot(expert, destination, owners[b], static_cast<unsigned>(masks[b]),
+        slot = haloR::selectedRouteSlot(expert, destination, owners[b], static_cast<unsigned>(masks[b]),
             static_cast<unsigned>(lowMasks[b]), static_cast<unsigned>(highMasks[b]), home, localSlots);
         return slot >= 0;
     }
@@ -166,10 +166,10 @@ struct HaloRSelectedRouteSlot
 __device__ void materializeSelectedRoutes(MoeRebalanceHaloRParams const& p, int worker, int workers, Epoch epoch)
 {
     int const home = p.experts / p.ep;
-    HaloRSelectedRouteSlot const slotOf{.owners = halo_r::planField(p.plan, halo_r::HaloRPlanField::kOwner),
-        .masks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kDestinationMask),
-        .lowMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperLowMask),
-        .highMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperHighMask),
+    HaloRSelectedRouteSlot const slotOf{.owners = haloR::planField(p.plan, haloR::HaloRPlanField::kOwner),
+        .masks = haloR::planField(p.plan, haloR::HaloRPlanField::kDestinationMask),
+        .lowMasks = haloR::planField(p.plan, haloR::HaloRPlanField::kHelperLowMask),
+        .highMasks = haloR::planField(p.plan, haloR::HaloRPlanField::kHelperHighMask),
         .home = home,
         .localSlots = home + p.helpers};
     materializeCompactedSelectedRoutes(p.routes, p.outSlots, p.routePrefix, p.routeAux,
@@ -221,7 +221,7 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     int* counts = shared;
     int* histogram = counts + p.ep * p.experts;
     int* quota = histogram + p.experts;
-    auto* scratch = reinterpret_cast<halo_r::PlannerScratch*>(quota + halo_r::kMaxHaloRBroadcasts * p.ep);
+    auto* scratch = reinterpret_cast<haloR::PlannerScratch*>(quota + haloR::kMaxHaloRBroadcasts * p.ep);
     __shared__ int missingReady;
     __shared__ unsigned long long exchangeCycles;
 
@@ -255,7 +255,7 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
 
     // The residency table, which the previous launch of the layer updated before its READY, keeps a resident helper
     // expert in its slot.
-    __shared__ int resident[halo_r::kMaxRanks * halo_r::kMaxHelperSlots];
+    __shared__ int resident[haloR::kMaxRanks * haloR::kMaxHelperSlots];
     if (p.residency != nullptr)
     {
         for (int entry = threadIdx.x; entry < p.ep * p.helpers; entry += blockDim.x)
@@ -266,19 +266,19 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     }
     if (threadIdx.x < 32)
     {
-        halo_r::PlannerConfig const cfg{.ep = p.ep,
+        haloR::PlannerConfig const cfg{.ep = p.ep,
             .experts = p.experts,
             .helperSlots = p.helpers,
             .sendCount = p.sendCount,
             .localRank = p.localRank};
-        halo_r::PlannerOutputs const outputs{.plan = p.plan,
+        haloR::PlannerOutputs const outputs{.plan = p.plan,
             .quota = quota,
             .outIds = p.outIds,
             .outOwners = p.outOwners,
             .hotTable = nullptr,
             .loadAfter = nullptr};
         // checkMoeRebalanceHaloRParams accepted the configuration, so the planner always plans.
-        halo_r::planHaloR<DeviceWarp>(histogram, cfg, scratch, outputs, p.residency != nullptr ? resident : nullptr);
+        haloR::planHaloR<DeviceWarp>(histogram, cfg, scratch, outputs, p.residency != nullptr ? resident : nullptr);
     }
     __syncthreads();
     int const broadcasts = p.plan[1];
@@ -358,16 +358,16 @@ __device__ ReceiverCounts recordResidency(MoeRebalanceHaloRParams const& p)
 {
     ReceiverCounts counts{.copies = 0, .skips = 0};
     int const broadcasts = p.plan[1];
-    int const* experts = halo_r::planField(p.plan, halo_r::HaloRPlanField::kExpert);
-    int const* masks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kDestinationMask);
-    int const* lowMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperLowMask);
-    int const* highMasks = halo_r::planField(p.plan, halo_r::HaloRPlanField::kHelperHighMask);
+    int const* experts = haloR::planField(p.plan, haloR::HaloRPlanField::kExpert);
+    int const* masks = haloR::planField(p.plan, haloR::HaloRPlanField::kDestinationMask);
+    int const* lowMasks = haloR::planField(p.plan, haloR::HaloRPlanField::kHelperLowMask);
+    int const* highMasks = haloR::planField(p.plan, haloR::HaloRPlanField::kHelperHighMask);
     for (int b = threadIdx.x; b < broadcasts; b += blockDim.x)
     {
         unsigned const mask = static_cast<unsigned>(masks[b]);
         unsigned const low = static_cast<unsigned>(lowMasks[b]);
         unsigned const high = static_cast<unsigned>(highMasks[b]);
-        unsigned const need = halo_r::relayNeedMask(mask, low, high, experts[b], p.residency, p.helpers);
+        unsigned const need = haloR::relayNeedMask(mask, low, high, experts[b], p.residency, p.helpers);
         counts.copies += static_cast<unsigned long long>(__popc(need));
         counts.skips += static_cast<unsigned long long>(__popc(mask & ~need));
         if (p.residency == nullptr)
@@ -378,7 +378,7 @@ __device__ ReceiverCounts recordResidency(MoeRebalanceHaloRParams const& p)
         {
             if ((mask >> d) & 1U)
             {
-                p.residency[d * p.helpers + halo_r::helperIndex(low, high, d)] = experts[b];
+                p.residency[d * p.helpers + haloR::helperIndex(low, high, d)] = experts[b];
             }
         }
     }
@@ -472,7 +472,7 @@ std::size_t schedulerSharedBytes(int ep, int experts)
 {
     std::size_t const workerInts = static_cast<std::size_t>(kFusedWarps) * (experts + 1) + experts;
     std::size_t const plannerInts = static_cast<std::size_t>(ep) * experts + experts
-        + static_cast<std::size_t>(halo_r::kMaxHaloRBroadcasts) * ep + sizeof(halo_r::PlannerScratch) / sizeof(int);
+        + static_cast<std::size_t>(haloR::kMaxHaloRBroadcasts) * ep + sizeof(haloR::PlannerScratch) / sizeof(int);
     return std::max(workerInts, plannerInts) * sizeof(int);
 }
 
@@ -495,12 +495,12 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
             && params.destinationTable != nullptr && params.planeBytes != nullptr && params.completedCtas != nullptr
             && params.counters != nullptr && params.readyFlags != nullptr && params.readyFlagMc != nullptr,
         "HALO-R kernel buffers must not be null");
-    halo_r::PlannerConfig const cfg{.ep = params.ep,
+    haloR::PlannerConfig const cfg{.ep = params.ep,
         .experts = params.experts,
         .helperSlots = params.helpers,
         .sendCount = params.sendCount,
         .localRank = params.localRank};
-    TLLM_CHECK_WITH_INFO(params.ep >= kHaloRMinEp && halo_r::validPlannerConfig(cfg),
+    TLLM_CHECK_WITH_INFO(params.ep >= kHaloRMinEp && haloR::validPlannerConfig(cfg),
         "Invalid HALO-R planner configuration: ep=%d experts=%d helpers=%d send_count=%d local_rank=%d", params.ep,
         params.experts, params.helpers, params.sendCount, params.localRank);
     TLLM_CHECK_WITH_INFO(params.routeCapacity > 0 && params.routeCapacity <= INT_MAX / params.ep,
@@ -508,11 +508,11 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
     // A candidate key stores its rows above the order byte. A step moves at most the receiver's room below the
     // balanced target, ceil(total / ep), and each rank routes at most routeCapacity rows, so rows never exceed
     // routeCapacity.
-    TLLM_CHECK_WITH_INFO(static_cast<long long>(params.routeCapacity) < halo_r::kMaxCandidateRows,
+    TLLM_CHECK_WITH_INFO(static_cast<long long>(params.routeCapacity) < haloR::kMaxCandidateRows,
         "HALO-R route capacity %d (max_num_tokens x top_k per rank) overflows the planner's candidate keys",
         params.routeCapacity);
-    TLLM_CHECK_WITH_INFO(params.planes >= 1 && params.planes <= halo_r::kRelayMaxPlanes,
-        "HALO-R relay supports 1 to %d weight planes, got %d", halo_r::kRelayMaxPlanes, params.planes);
+    TLLM_CHECK_WITH_INFO(params.planes >= 1 && params.planes <= haloR::kRelayMaxPlanes,
+        "HALO-R relay supports 1 to %d weight planes, got %d", haloR::kRelayMaxPlanes, params.planes);
     TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(params.readyFlags) % sizeof(std::uint64_t) == 0
             && reinterpret_cast<std::uintptr_t>(params.readyFlagMc) % sizeof(std::uint64_t) == 0
             && reinterpret_cast<std::uintptr_t>(params.routeCounter) % sizeof(std::uint64_t) == 0,

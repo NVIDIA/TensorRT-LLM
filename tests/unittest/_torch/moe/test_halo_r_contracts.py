@@ -1057,9 +1057,9 @@ def test_kernel_skips_resident_receivers_and_records_residency_before_ready() ->
     _assert_in_order(
         prepare,
         (
-            "halo_r::relayNeedMask(",
+            "haloR::relayNeedMask(",
             "p.residency, p.helpers);",
-            "halo_r::relayDestinationIndex(need, p.localRank, &destinations);",
+            "haloR::relayDestinationIndex(need, p.localRank, &destinations);",
             "work->need[entries] = need;",
         ),
     )
@@ -1071,10 +1071,10 @@ def test_kernel_skips_resident_receivers_and_records_residency_before_ready() ->
     _assert_in_order(
         record,
         (
-            "halo_r::relayNeedMask(mask, low, high, experts[b], p.residency, p.helpers);",
+            "haloR::relayNeedMask(mask, low, high, experts[b], p.residency, p.helpers);",
             "counts.copies += ",
             "counts.skips += ",
-            "p.residency[d * p.helpers + halo_r::helperIndex(low, high, d)] = experts[b];",
+            "p.residency[d * p.helpers + haloR::helperIndex(low, high, d)] = experts[b];",
         ),
     )
     complete = _function_body(kernel_source, "void completeLaunch(")
@@ -1399,7 +1399,7 @@ def test_planner_reads_the_residency_table_from_shared_memory() -> None:
     _assert_in_order(
         publish,
         (
-            "__shared__ int resident[halo_r::kMaxRanks * halo_r::kMaxHelperSlots];",
+            "__shared__ int resident[haloR::kMaxRanks * haloR::kMaxHelperSlots];",
             "resident[entry] = p.residency[entry];",
             "p.residency != nullptr ? resident : nullptr",
         ),

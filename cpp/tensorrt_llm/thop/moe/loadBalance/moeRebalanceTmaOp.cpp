@@ -44,7 +44,7 @@ void checkTmaResult(int error, char const* operation)
     TORCH_CHECK(error == 0, operation, " failed: ", megamoe_tma_copy_error_string(error), " (", error, ")");
 }
 
-using moe_rebalance_op::checkCudaResult;
+using moeRebalanceOp::checkCudaResult;
 
 int checkedInt(int64_t value, char const* name)
 {

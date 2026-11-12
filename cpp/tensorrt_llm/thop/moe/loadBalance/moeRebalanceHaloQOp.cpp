@@ -31,12 +31,12 @@ namespace torch_ext
 namespace
 {
 
-using moe_rebalance_op::checkedInt;
+using moeRebalanceOp::checkedInt;
 
 void checkCudaTensor(torch::Tensor const& tensor, c10::Device const& device, c10::ScalarType dtype,
     std::int64_t minElements, char const* name)
 {
-    moe_rebalance_op::checkCudaTensor(tensor, device, dtype, minElements, name, "the routes CUDA device");
+    moeRebalanceOp::checkCudaTensor(tensor, device, dtype, minElements, name, "the routes CUDA device");
 }
 
 } // namespace

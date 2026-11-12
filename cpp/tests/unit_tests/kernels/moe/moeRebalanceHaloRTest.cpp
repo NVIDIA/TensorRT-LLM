@@ -31,7 +31,7 @@
 #include <thread>
 #include <vector>
 
-namespace halo_r = tensorrt_llm::kernels::halo_r;
+namespace haloR = tensorrt_llm::kernels::haloR;
 
 namespace
 {
@@ -129,19 +129,19 @@ struct PlanResult
 };
 
 PlanResult runPlanner(
-    std::vector<int> const& histogram, halo_r::PlannerConfig const& cfg, std::vector<int> const* resident = nullptr)
+    std::vector<int> const& histogram, haloR::PlannerConfig const& cfg, std::vector<int> const* resident = nullptr)
 {
     PlanResult result;
-    result.plan.assign(halo_r::kPlanWords, -7);
-    result.quota.assign(halo_r::kMaxHaloRBroadcasts * cfg.ep, -7);
+    result.plan.assign(haloR::kPlanWords, -7);
+    result.quota.assign(haloR::kMaxHaloRBroadcasts * cfg.ep, -7);
     result.outIds.assign(cfg.helperSlots > 0 ? cfg.helperSlots : 1, -7);
     result.outOwners.assign(result.outIds.size(), -7);
-    result.hotTable.assign(static_cast<std::size_t>(cfg.ep > 0 ? cfg.ep : 1) * halo_r::kMaxHelperSlots, -7);
+    result.hotTable.assign(static_cast<std::size_t>(cfg.ep > 0 ? cfg.ep : 1) * haloR::kMaxHelperSlots, -7);
     result.loadAfter.assign(cfg.ep > 0 ? cfg.ep : 1, -7);
-    halo_r::PlannerScratch scratch;
+    haloR::PlannerScratch scratch;
     // Stale shared memory must not change the plan.
     std::memset(&scratch, 0xA5, sizeof(scratch));
-    halo_r::PlannerOutputs const outputs{.plan = result.plan.data(),
+    haloR::PlannerOutputs const outputs{.plan = result.plan.data(),
         .quota = result.quota.data(),
         .outIds = result.outIds.data(),
         .outOwners = result.outOwners.data(),
@@ -157,7 +157,7 @@ PlanResult runPlanner(
             [&, lane]
             {
                 HostWarp::laneId = lane;
-                halo_r::planHaloR<HostWarp>(
+                haloR::planHaloR<HostWarp>(
                     histogram.data(), cfg, &scratch, outputs, resident != nullptr ? resident->data() : nullptr);
             });
     }
@@ -169,9 +169,9 @@ PlanResult runPlanner(
     return result;
 }
 
-int field(PlanResult const& r, halo_r::HaloRPlanField f, int b)
+int field(PlanResult const& r, haloR::HaloRPlanField f, int b)
 {
-    return halo_r::planField(r.plan.data(), f)[b];
+    return haloR::planField(r.plan.data(), f)[b];
 }
 
 //! Eight ranks of four experts. Rank 0 holds the hot expert 0 (300 of its 400 routes); ranks 1, 4 and 5 are idle and
@@ -186,30 +186,30 @@ std::vector<int> workedExampleHistogram()
 
 TEST(MoeRebalanceHaloRPlannerTest, WorkedExampleReplicatesHotExpertToIdleRanks)
 {
-    halo_r::PlannerConfig const cfg{.ep = 8, .experts = 32, .helperSlots = 2, .sendCount = 4, .localRank = 4};
+    haloR::PlannerConfig const cfg{.ep = 8, .experts = 32, .helperSlots = 2, .sendCount = 4, .localRank = 4};
     PlanResult const r = runPlanner(workedExampleHistogram(), cfg);
     ASSERT_EQ(r.plan[1], 1);
-    EXPECT_EQ(field(r, halo_r::HaloRPlanField::kExpert, 0), 0);
-    EXPECT_EQ(field(r, halo_r::HaloRPlanField::kOwner, 0), 0);
-    EXPECT_EQ(field(r, halo_r::HaloRPlanField::kDestinationMask, 0), (1 << 1) | (1 << 4) | (1 << 5));
-    EXPECT_EQ(field(r, halo_r::HaloRPlanField::kHelperLowMask, 0), 0);
-    EXPECT_EQ(field(r, halo_r::HaloRPlanField::kHelperHighMask, 0), 0);
-    EXPECT_EQ(field(r, halo_r::HaloRPlanField::kRows, 0), 300);
+    EXPECT_EQ(field(r, haloR::HaloRPlanField::kExpert, 0), 0);
+    EXPECT_EQ(field(r, haloR::HaloRPlanField::kOwner, 0), 0);
+    EXPECT_EQ(field(r, haloR::HaloRPlanField::kDestinationMask, 0), (1 << 1) | (1 << 4) | (1 << 5));
+    EXPECT_EQ(field(r, haloR::HaloRPlanField::kHelperLowMask, 0), 0);
+    EXPECT_EQ(field(r, haloR::HaloRPlanField::kHelperHighMask, 0), 0);
+    EXPECT_EQ(field(r, haloR::HaloRPlanField::kRows, 0), 300);
     std::vector<int> const quota(r.quota.begin(), r.quota.begin() + cfg.ep);
     EXPECT_EQ(quota, (std::vector<int>{0, 100, 0, 0, 100, 100, 0, 0}));
     EXPECT_EQ(r.loadAfter, (std::vector<int>(cfg.ep, 100)));
     EXPECT_EQ(r.outIds, (std::vector<int>{0, -1}));
     EXPECT_EQ(r.outOwners, (std::vector<int>{0, -1}));
-    for (int b = 1; b < halo_r::kPlanFieldStride; ++b)
+    for (int b = 1; b < haloR::kPlanFieldStride; ++b)
     {
-        ASSERT_EQ(field(r, halo_r::HaloRPlanField::kExpert, b), 0) << "unused plan entries must be zero";
+        ASSERT_EQ(field(r, haloR::HaloRPlanField::kExpert, b), 0) << "unused plan entries must be zero";
     }
 }
 
 TEST(MoeRebalanceHaloRPlannerTest, PlanIsIdenticalOnEveryRank)
 {
     std::vector<int> const histogram = workedExampleHistogram();
-    halo_r::PlannerConfig cfg{.ep = 8, .experts = 32, .helperSlots = 2, .sendCount = 4, .localRank = 0};
+    haloR::PlannerConfig cfg{.ep = 8, .experts = 32, .helperSlots = 2, .sendCount = 4, .localRank = 0};
     PlanResult const reference = runPlanner(histogram, cfg);
     for (int rank = 1; rank < cfg.ep; ++rank)
     {
@@ -227,19 +227,19 @@ TEST(MoeRebalanceHaloRPlannerTest, HelperIndexUsesBothMaskBits)
     // Rank 0 is the only rank below the target and receives three experts, in ascending order, into helper slots
     // 0, 1 and 2; slot 2 is encoded in the high mask.
     std::vector<int> const histogram{0, 0, 80, 10, 40, 200, 40, 10, 10, 80, 200, 0, 0, 80, 0, 200};
-    halo_r::PlannerConfig const cfg{.ep = 4, .experts = 16, .helperSlots = 4, .sendCount = 4, .localRank = 0};
+    haloR::PlannerConfig const cfg{.ep = 4, .experts = 16, .helperSlots = 4, .sendCount = 4, .localRank = 0};
     PlanResult const r = runPlanner(histogram, cfg);
     ASSERT_EQ(r.plan[1], 3);
     int const experts[] = {5, 10, 15};
     int const rows[] = {52, 52, 42};
     for (int b = 0; b < 3; ++b)
     {
-        EXPECT_EQ(field(r, halo_r::HaloRPlanField::kExpert, b), experts[b]);
-        EXPECT_EQ(field(r, halo_r::HaloRPlanField::kOwner, b), experts[b] / 4);
-        EXPECT_EQ(field(r, halo_r::HaloRPlanField::kDestinationMask, b), 1);
-        EXPECT_EQ(field(r, halo_r::HaloRPlanField::kRows, b), rows[b]);
-        EXPECT_EQ(halo_r::helperIndex(static_cast<unsigned>(field(r, halo_r::HaloRPlanField::kHelperLowMask, b)),
-                      static_cast<unsigned>(field(r, halo_r::HaloRPlanField::kHelperHighMask, b)), 0),
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kExpert, b), experts[b]);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kOwner, b), experts[b] / 4);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kDestinationMask, b), 1);
+        EXPECT_EQ(field(r, haloR::HaloRPlanField::kRows, b), rows[b]);
+        EXPECT_EQ(haloR::helperIndex(static_cast<unsigned>(field(r, haloR::HaloRPlanField::kHelperLowMask, b)),
+                      static_cast<unsigned>(field(r, haloR::HaloRPlanField::kHelperHighMask, b)), 0),
             b);
         EXPECT_EQ(r.quota[b * cfg.ep + 0], rows[b]);
         EXPECT_EQ(r.quota[b * cfg.ep + experts[b] / 4], histogram[experts[b]] - rows[b]);
@@ -251,7 +251,7 @@ TEST(MoeRebalanceHaloRPlannerTest, HelperIndexUsesBothMaskBits)
 
 TEST(MoeRebalanceHaloRPlannerTest, BalancedOrEmptyLoadPlansNothing)
 {
-    halo_r::PlannerConfig const cfg{.ep = 4, .experts = 16, .helperSlots = 2, .sendCount = 2, .localRank = 1};
+    haloR::PlannerConfig const cfg{.ep = 4, .experts = 16, .helperSlots = 2, .sendCount = 2, .localRank = 1};
     PlanResult const balanced = runPlanner(std::vector<int>(16, 25), cfg);
     EXPECT_EQ(balanced.plan[1], 0);
     EXPECT_EQ(balanced.outIds, (std::vector<int>{-1, -1}));
@@ -269,20 +269,20 @@ TEST(MoeRebalanceHaloRPlannerTest, ReceiversNeverExceedTheirHelperSlots)
     {
         histogram[expert] = 100;
     }
-    for (int helpers = 1; helpers <= halo_r::kMaxHelperSlots; ++helpers)
+    for (int helpers = 1; helpers <= haloR::kMaxHelperSlots; ++helpers)
     {
         SCOPED_TRACE(helpers);
-        halo_r::PlannerConfig const cfg{.ep = 2, .experts = 16, .helperSlots = helpers, .sendCount = 4, .localRank = 1};
+        haloR::PlannerConfig const cfg{.ep = 2, .experts = 16, .helperSlots = helpers, .sendCount = 4, .localRank = 1};
         PlanResult const r = runPlanner(histogram, cfg);
         ASSERT_EQ(r.plan[1], helpers);
         for (int b = 0; b < helpers; ++b)
         {
-            EXPECT_EQ(field(r, halo_r::HaloRPlanField::kExpert, b), b);
-            EXPECT_EQ(field(r, halo_r::HaloRPlanField::kOwner, b), 0);
-            EXPECT_EQ(field(r, halo_r::HaloRPlanField::kDestinationMask, b), 0b10);
-            EXPECT_EQ(field(r, halo_r::HaloRPlanField::kRows, b), 100);
-            EXPECT_EQ(halo_r::helperIndex(static_cast<unsigned>(field(r, halo_r::HaloRPlanField::kHelperLowMask, b)),
-                          static_cast<unsigned>(field(r, halo_r::HaloRPlanField::kHelperHighMask, b)), 1),
+            EXPECT_EQ(field(r, haloR::HaloRPlanField::kExpert, b), b);
+            EXPECT_EQ(field(r, haloR::HaloRPlanField::kOwner, b), 0);
+            EXPECT_EQ(field(r, haloR::HaloRPlanField::kDestinationMask, b), 0b10);
+            EXPECT_EQ(field(r, haloR::HaloRPlanField::kRows, b), 100);
+            EXPECT_EQ(haloR::helperIndex(static_cast<unsigned>(field(r, haloR::HaloRPlanField::kHelperLowMask, b)),
+                          static_cast<unsigned>(field(r, haloR::HaloRPlanField::kHelperHighMask, b)), 1),
                 b);
             EXPECT_EQ(r.quota[b * cfg.ep + 0], 0);
             EXPECT_EQ(r.quota[b * cfg.ep + 1], 100);
@@ -299,7 +299,7 @@ TEST(MoeRebalanceHaloRPlannerTest, RejectsConfigurationsOutsideItsLimits)
     // ep above one warp (within the 384-expert cap), a helper index wider than two bits, more exports than the order
     // field, more sends than home experts, a local rank outside the EP group and experts that do not divide over the
     // ranks.
-    halo_r::PlannerConfig const invalid[] = {
+    haloR::PlannerConfig const invalid[] = {
         {.ep = 33, .experts = 33 * 11, .helperSlots = 2, .sendCount = 2, .localRank = 0},
         {.ep = 8, .experts = 96, .helperSlots = 5, .sendCount = 2, .localRank = 0},
         {.ep = 32, .experts = 32 * 12, .helperSlots = 2, .sendCount = 5, .localRank = 0},
@@ -309,10 +309,10 @@ TEST(MoeRebalanceHaloRPlannerTest, RejectsConfigurationsOutsideItsLimits)
     };
     for (auto const& cfg : invalid)
     {
-        EXPECT_FALSE(halo_r::validPlannerConfig(cfg));
+        EXPECT_FALSE(haloR::validPlannerConfig(cfg));
     }
     EXPECT_TRUE(
-        halo_r::validPlannerConfig({.ep = 32, .experts = 384, .helperSlots = 4, .sendCount = 4, .localRank = 31}));
+        haloR::validPlannerConfig({.ep = 32, .experts = 384, .helperSlots = 4, .sendCount = 4, .localRank = 31}));
 }
 
 TEST(MoeRebalanceHaloRSlotTest, SelectedRoutesGoToOwnerOrHelperSlot)
@@ -322,11 +322,11 @@ TEST(MoeRebalanceHaloRSlotTest, SelectedRoutesGoToOwnerOrHelperSlot)
     unsigned const mask = (1U << 1) | (1U << 3);
     unsigned const low = 1U << 3;
     // The owner keeps its home slot; receivers use home + helper index; any other rank is rejected.
-    EXPECT_EQ(halo_r::selectedRouteSlot(9, 2, 2, mask, low, 0, home, localSlots), 2 * localSlots + 1);
-    EXPECT_EQ(halo_r::selectedRouteSlot(9, 1, 2, mask, low, 0, home, localSlots), 1 * localSlots + home);
-    EXPECT_EQ(halo_r::selectedRouteSlot(9, 3, 2, mask, low, 0, home, localSlots), 3 * localSlots + home + 1);
-    EXPECT_EQ(halo_r::selectedRouteSlot(9, 0, 2, mask, low, 0, home, localSlots), -1);
-    EXPECT_EQ(halo_r::helperIndex(1U << 5, 1U << 5, 5), 3);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 2, 2, mask, low, 0, home, localSlots), 2 * localSlots + 1);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 1, 2, mask, low, 0, home, localSlots), 1 * localSlots + home);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 3, 2, mask, low, 0, home, localSlots), 3 * localSlots + home + 1);
+    EXPECT_EQ(haloR::selectedRouteSlot(9, 0, 2, mask, low, 0, home, localSlots), -1);
+    EXPECT_EQ(haloR::helperIndex(1U << 5, 1U << 5, 5), 3);
 }
 
 TEST(MoeRebalanceHaloRSlotTest, OwnerRoutesKeepTheirResidentSlot)
@@ -340,34 +340,34 @@ TEST(MoeRebalanceHaloRSlotTest, OwnerRoutesKeepTheirResidentSlot)
     for (int expert = 0; expert < 16; ++expert)
     {
         int const owner = expert / home;
-        EXPECT_EQ(halo_r::selectedRouteSlot(expert, owner, owner, 0U, 0U, 0U, home, localSlots), resident[expert]);
-        EXPECT_EQ(halo_r::selectedRouteSlot(expert, owner, owner, mask & ~(1U << owner), 1U << 3, 0U, home, localSlots),
+        EXPECT_EQ(haloR::selectedRouteSlot(expert, owner, owner, 0U, 0U, 0U, home, localSlots), resident[expert]);
+        EXPECT_EQ(haloR::selectedRouteSlot(expert, owner, owner, mask & ~(1U << owner), 1U << 3, 0U, home, localSlots),
             resident[expert]);
     }
 }
 
 TEST(MoeRebalanceRelayWorkTest, DestinationsPartitionEverySlice)
 {
-    unsigned long long const planeBytes[] = {3 * halo_r::kRelaySliceBytes + 100, 4, halo_r::kRelaySliceBytes};
+    unsigned long long const planeBytes[] = {3 * haloR::kRelaySliceBytes + 100, 4, haloR::kRelaySliceBytes};
     int const planes = 3;
-    long long const slices = halo_r::relayBundleSlices(planeBytes, planes);
+    long long const slices = haloR::relayBundleSlices(planeBytes, planes);
     ASSERT_EQ(slices, 4 + 1 + 1);
     unsigned const mask = (1U << 2) | (1U << 7) | (1U << 30);
     std::vector<int> copies(slices, 0);
     for (int rank = 0; rank < 32; ++rank)
     {
         int destinations = 0;
-        int const index = halo_r::relayDestinationIndex(mask, rank, &destinations);
+        int const index = haloR::relayDestinationIndex(mask, rank, &destinations);
         EXPECT_EQ(destinations, 3);
         if (index < 0)
         {
-            EXPECT_EQ(halo_r::relaySliceCount(slices, destinations, index), 0);
+            EXPECT_EQ(haloR::relaySliceCount(slices, destinations, index), 0);
             continue;
         }
-        long long const count = halo_r::relaySliceCount(slices, destinations, index);
+        long long const count = haloR::relaySliceCount(slices, destinations, index);
         for (long long k = 0; k < count; ++k)
         {
-            ++copies[halo_r::relaySliceOf(k, destinations, index)];
+            ++copies[haloR::relaySliceOf(k, destinations, index)];
         }
     }
     for (int count : copies)
@@ -377,28 +377,28 @@ TEST(MoeRebalanceRelayWorkTest, DestinationsPartitionEverySlice)
     int plane = -1;
     unsigned long long offset = 0;
     unsigned long long bytes = 0;
-    ASSERT_TRUE(halo_r::relayLocateSlice(planeBytes, planes, 3, &plane, &offset, &bytes));
+    ASSERT_TRUE(haloR::relayLocateSlice(planeBytes, planes, 3, &plane, &offset, &bytes));
     EXPECT_EQ(plane, 0);
-    EXPECT_EQ(offset, 3 * halo_r::kRelaySliceBytes);
+    EXPECT_EQ(offset, 3 * haloR::kRelaySliceBytes);
     EXPECT_EQ(bytes, 100U);
-    ASSERT_TRUE(halo_r::relayLocateSlice(planeBytes, planes, 4, &plane, &offset, &bytes));
+    ASSERT_TRUE(haloR::relayLocateSlice(planeBytes, planes, 4, &plane, &offset, &bytes));
     EXPECT_EQ(plane, 1);
     EXPECT_EQ(bytes, 4U);
-    EXPECT_FALSE(halo_r::relayLocateSlice(planeBytes, planes, slices, &plane, &offset, &bytes));
+    EXPECT_FALSE(haloR::relayLocateSlice(planeBytes, planes, slices, &plane, &offset, &bytes));
 }
 
 TEST(MoeRebalanceRelayWorkTest, ItemsMapBackToTheirBroadcast)
 {
     int const prefix[] = {0, 5, 5, 12};
     long long k = -1;
-    EXPECT_EQ(halo_r::relayLocateItem(prefix, 3, 0, &k), 0);
+    EXPECT_EQ(haloR::relayLocateItem(prefix, 3, 0, &k), 0);
     EXPECT_EQ(k, 0);
-    EXPECT_EQ(halo_r::relayLocateItem(prefix, 3, 4, &k), 0);
+    EXPECT_EQ(haloR::relayLocateItem(prefix, 3, 4, &k), 0);
     EXPECT_EQ(k, 4);
     // Entry 1 has no items; item 5 belongs to entry 2.
-    EXPECT_EQ(halo_r::relayLocateItem(prefix, 3, 5, &k), 2);
+    EXPECT_EQ(haloR::relayLocateItem(prefix, 3, 5, &k), 2);
     EXPECT_EQ(k, 0);
-    EXPECT_EQ(halo_r::relayLocateItem(prefix, 3, 11, &k), 2);
+    EXPECT_EQ(haloR::relayLocateItem(prefix, 3, 11, &k), 2);
     EXPECT_EQ(k, 6);
 }
 
@@ -411,18 +411,18 @@ TEST(MoeRebalanceRelayWorkTest, NeedSetsDropReceiversWhoseSlotHoldsTheExpert)
     // [rank][slot]: rank 1 holds 9 in slot 1 (its slot), rank 2 holds 9 in slot 1 (not its slot 0), rank 5 holds 4 in
     // slot 1, rank 6 holds 9 in slot 0 (its slot). Ranks 0 and 3 hold 9 but receive nothing.
     std::vector<int> const table{9, -1, -1, 9, -1, 9, 9, -1, -1, -1, -1, 4, 9, -1, -1, -1};
-    EXPECT_EQ(halo_r::relayNeedMask(mask, low, 0U, 9, table.data(), helpers), (1U << 2) | (1U << 5));
+    EXPECT_EQ(haloR::relayNeedMask(mask, low, 0U, 9, table.data(), helpers), (1U << 2) | (1U << 5));
     // A table that holds the expert nowhere needs every receiver, and one that holds it in every receiver's slot needs
     // none.
     std::vector<int> const unknown(16, -1);
-    EXPECT_EQ(halo_r::relayNeedMask(mask, low, 0U, 9, unknown.data(), helpers), mask);
+    EXPECT_EQ(haloR::relayNeedMask(mask, low, 0U, 9, unknown.data(), helpers), mask);
     std::vector<int> const resident{-1, -1, -1, 9, 9, -1, -1, -1, -1, -1, -1, 9, 9, -1, -1, -1};
-    EXPECT_EQ(halo_r::relayNeedMask(mask, low, 0U, 9, resident.data(), helpers), 0U);
+    EXPECT_EQ(haloR::relayNeedMask(mask, low, 0U, 9, resident.data(), helpers), 0U);
     // The high mask selects slots 2 and 3: rank 1 holds 9 in slot 3.
     std::vector<int> const wide{-1, -1, -1, -1, -1, -1, -1, 9};
-    EXPECT_EQ(halo_r::relayNeedMask(0b11U, 0b10U, 0b10U, 9, wide.data(), 4), 0b01U);
+    EXPECT_EQ(haloR::relayNeedMask(0b11U, 0b10U, 0b10U, 9, wide.data(), 4), 0b01U);
     // Without a residency table every receiver needs the copy.
-    EXPECT_EQ(halo_r::relayNeedMask(0b1010U, 0U, 0U, 5, nullptr, 2), 0b1010U);
+    EXPECT_EQ(haloR::relayNeedMask(0b1010U, 0U, 0U, 5, nullptr, 2), 0b1010U);
 }
 
 TEST(MoeRebalanceRelayWorkTest, NeedSetsSplitEverySliceOverTheReceiversThatNeedIt)
@@ -439,9 +439,9 @@ TEST(MoeRebalanceRelayWorkTest, NeedSetsSplitEverySliceOverTheReceiversThatNeedI
         for (int rank = 0; rank < ep; ++rank)
         {
             int destinations = 0;
-            int const index = halo_r::relayDestinationIndex(need, rank, &destinations);
+            int const index = haloR::relayDestinationIndex(need, rank, &destinations);
             ASSERT_EQ(destinations, members);
-            long long const count = halo_r::relaySliceCount(slices, destinations, index);
+            long long const count = haloR::relaySliceCount(slices, destinations, index);
             if (!((need >> rank) & 1U))
             {
                 ASSERT_EQ(index, -1);
@@ -449,7 +449,7 @@ TEST(MoeRebalanceRelayWorkTest, NeedSetsSplitEverySliceOverTheReceiversThatNeedI
             }
             for (long long k = 0; k < count; ++k)
             {
-                ++pulls[halo_r::relaySliceOf(k, destinations, index)];
+                ++pulls[haloR::relaySliceOf(k, destinations, index)];
             }
         }
         for (long long slice = 0; slice < slices; ++slice)
@@ -477,7 +477,7 @@ std::vector<int> randomHistogram(std::mt19937& rng, int experts)
     return histogram;
 }
 
-std::vector<int> hotRow(PlanResult const& r, halo_r::PlannerConfig const& cfg, int rank)
+std::vector<int> hotRow(PlanResult const& r, haloR::PlannerConfig const& cfg, int rank)
 {
     auto const begin = r.hotTable.begin() + rank * cfg.helperSlots;
     return std::vector<int>(begin, begin + cfg.helperSlots);
@@ -493,12 +493,12 @@ TEST(MoeRebalanceHaloRPlannerTest, ResidentExpertsKeepTheirSlotsAndNothingElseCh
     {
         int const ep = 2 * (1 + static_cast<int>(rng() % 16));
         int const home = 4 + static_cast<int>(rng() % 9);
-        if (ep * home > halo_r::kPlanFieldStride)
+        if (ep * home > haloR::kPlanFieldStride)
         {
             continue;
         }
-        int const helpers = 1 + static_cast<int>(rng() % halo_r::kMaxHelperSlots);
-        halo_r::PlannerConfig cfg{.ep = ep,
+        int const helpers = 1 + static_cast<int>(rng() % haloR::kMaxHelperSlots);
+        haloR::PlannerConfig cfg{.ep = ep,
             .experts = ep * home,
             .helperSlots = helpers,
             .sendCount = 4,
@@ -530,13 +530,12 @@ TEST(MoeRebalanceHaloRPlannerTest, ResidentExpertsKeepTheirSlotsAndNothingElseCh
         PlanResult const r = runPlanner(histogram, cfg, &table);
         // Moves, rows, quotas and load are unchanged; only the helper slot bits may move.
         ASSERT_EQ(r.plan[1], ascending.plan[1]);
-        for (auto field : {halo_r::HaloRPlanField::kExpert, halo_r::HaloRPlanField::kOwner,
-                 halo_r::HaloRPlanField::kDestinationMask, halo_r::HaloRPlanField::kRows})
+        for (auto field : {haloR::HaloRPlanField::kExpert, haloR::HaloRPlanField::kOwner,
+                 haloR::HaloRPlanField::kDestinationMask, haloR::HaloRPlanField::kRows})
         {
-            for (int b = 0; b < halo_r::kPlanFieldStride; ++b)
+            for (int b = 0; b < haloR::kPlanFieldStride; ++b)
             {
-                ASSERT_EQ(
-                    halo_r::planField(r.plan.data(), field)[b], halo_r::planField(ascending.plan.data(), field)[b]);
+                ASSERT_EQ(haloR::planField(r.plan.data(), field)[b], haloR::planField(ascending.plan.data(), field)[b]);
             }
         }
         ASSERT_EQ(r.quota, ascending.quota);
@@ -572,15 +571,15 @@ TEST(MoeRebalanceHaloRPlannerTest, ResidentExpertsKeepTheirSlotsAndNothingElseCh
         // The plan's helper bits agree with the table of slots.
         for (int b = 0; b < r.plan[1]; ++b)
         {
-            unsigned const mask = static_cast<unsigned>(field(r, halo_r::HaloRPlanField::kDestinationMask, b));
+            unsigned const mask = static_cast<unsigned>(field(r, haloR::HaloRPlanField::kDestinationMask, b));
             for (int d = 0; d < ep; ++d)
             {
                 if ((mask >> d) & 1U)
                 {
-                    int const slot = halo_r::helperIndex(
-                        static_cast<unsigned>(field(r, halo_r::HaloRPlanField::kHelperLowMask, b)),
-                        static_cast<unsigned>(field(r, halo_r::HaloRPlanField::kHelperHighMask, b)), d);
-                    ASSERT_EQ(r.hotTable[d * helpers + slot], field(r, halo_r::HaloRPlanField::kExpert, b));
+                    int const slot
+                        = haloR::helperIndex(static_cast<unsigned>(field(r, haloR::HaloRPlanField::kHelperLowMask, b)),
+                            static_cast<unsigned>(field(r, haloR::HaloRPlanField::kHelperHighMask, b)), d);
+                    ASSERT_EQ(r.hotTable[d * helpers + slot], field(r, haloR::HaloRPlanField::kExpert, b));
                 }
             }
         }
