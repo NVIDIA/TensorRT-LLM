@@ -5662,27 +5662,10 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
     }
 }
 
-def launchTestJobs(pipeline, testFilter, globalVars)
+// Kept out of launchTestJobs: its CPS method must stay under the JVM's 64 KB limit.
+def getX86TestConfigs()
 {
-    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
-    // IMPORTANT: Stage Configuration Syntax Requirement
-    //
-    // The test_to_stage_mapping.py script expects stage definitions in the following format:
-    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count]
-    //
-    // Where:
-    // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
-    // - platform: Hardware platform identifier (e.g., "a10", "h100-cr")
-    // - yaml_file: Test database YAML filename without .yml extension (e.g., "l0_a10")
-    // - splitId: Current split number (1-based)
-    // - split_count: Total number of splits
-    // - gpu_count: Number of GPUs required (optional, defaults to 1)
-    //
-    // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
-    // mapping between test names and Jenkins stage names. Any changes to this syntax
-    // may break the mapping functionality.
-
-    x86TestConfigs = [
+    def x86TestConfigs = [
         "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
@@ -5737,25 +5720,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GR100-PyTorch-Post-Merge-1": ["gr100-ts1", "l0_gr100", 1, 1],
     ]
 
-    x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
-    parallelJobs = x86TestConfigs.collectEntries{key, values ->
-        def dockerImage = key.contains("GR100-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
-        [key, [createKubernetesPodConfig(dockerImage, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
-        def config = VANILLA_CONFIG
-        if (key.contains("single-device")) {
-            config = SINGLE_DEVICE_CONFIG
-        }
-        if (key.contains("llvm")) {
-            config = LLVM_CONFIG
-        }
-        if (key.contains("GR100")) {
-            config = RUBIN_BRINGUP_CUDA13_4_CONFIG
-        }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
-    }]]}
-    fullSet = parallelJobs.keySet()
+    return x86TestConfigs
+}
 
-    x86SlurmTestConfigs = [
+// Kept out of launchTestJobs: its CPS method must stay under the JVM's 64 KB limit.
+def getX86SlurmTestConfigs()
+{
+    def x86SlurmTestConfigs = [
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
         "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 6],
         "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 6],
@@ -5849,46 +5820,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         16,
         2
     )
-    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
-    fullSet += x86SlurmTestConfigs.keySet()
+    return x86SlurmTestConfigs
+}
 
-    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(X86_64_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
-        // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
-        // dispatcher pod (when retry is enabled — see opts below) and is
-        // threaded into runLLMTestlistOnSlurm so a future re-enable of outer
-        // pod retry composes a unique postTag instead of colliding with the
-        // dead pod's recorded upload. With singleAttempt:true (default for
-        // SLURM stages) the outer retry is off and attemptTag is always "".
-        def config = VANILLA_CONFIG
-        if (key.contains("single-device")) {
-            config = SINGLE_DEVICE_CONFIG
-        }
-        if (key.contains("llvm")) {
-            config = LLVM_CONFIG
-        }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, false, retryContext?.infraRetryMax)
-    }, [singleAttempt: true, slurmDispatcher: true]]]}
-    // SLURM dispatcher pods run their own inner retry loop
-    // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
-    // K8s pod retry (singleAttempt:true) here caps total attempts at
-    // SLURM_INFRA_RETRY_MAX+1 instead of (SLURM_INFRA_RETRY_MAX+1) *
-    // (K8S_INFRA_RETRY_MAX+1). Each SLURM attempt that hits the partition
-    // walltime burns ~4h, so nesting the two layers cost up to ~36h per stage
-    // on consistently-timing-out tests before this cap.
-
-    parallelJobs += parallelSlurmJobs
-
-    // SBSA machines from the Blossom machine pool
-    SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
-        "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
-        // DGX Spark is also named as GB10 Grace Blackwell Superchip.
-        "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
-    ]
-    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
-    fullSet += SBSATestConfigs.keySet()
-
-    SBSASlurmTestConfigs = [
+// Kept out of launchTestJobs: its CPS method must stay under the JVM's 64 KB limit.
+def getSBSASlurmTestConfigs()
+{
+    def SBSASlurmTestConfigs = [
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
         // useClusterDurations=true: record actual test times so each cluster builds its own
         // .test_durations_<clusterName> baseline for load-balanced sharding.
@@ -5919,10 +5857,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
     ]
-    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
-    fullSet += SBSASlurmTestConfigs.keySet()
+    return SBSASlurmTestConfigs
+}
 
-    multiNodesSBSAConfigs = [
+// Kept out of launchTestJobs: its CPS method must stay under the JVM's 64 KB limit.
+def getMultiNodesSBSAConfigs()
+{
+    def multiNodesSBSAConfigs = [
         // Each testcase uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
         "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
@@ -6145,6 +6086,93 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
+    return multiNodesSBSAConfigs
+}
+
+def launchTestJobs(pipeline, testFilter, globalVars)
+{
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    // IMPORTANT: Stage Configuration Syntax Requirement
+    //
+    // The test_to_stage_mapping.py script expects stage definitions in the following format:
+    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count]
+    //
+    // Where:
+    // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
+    // - platform: Hardware platform identifier (e.g., "a10", "h100-cr")
+    // - yaml_file: Test database YAML filename without .yml extension (e.g., "l0_a10")
+    // - splitId: Current split number (1-based)
+    // - split_count: Total number of splits
+    // - gpu_count: Number of GPUs required (optional, defaults to 1)
+    //
+    // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
+    // mapping between test names and Jenkins stage names. Any changes to this syntax
+    // may break the mapping functionality.
+
+    x86TestConfigs = getX86TestConfigs()
+    x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
+    parallelJobs = x86TestConfigs.collectEntries{key, values ->
+        def dockerImage = key.contains("GR100-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
+        [key, [createKubernetesPodConfig(dockerImage, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
+        def config = VANILLA_CONFIG
+        if (key.contains("single-device")) {
+            config = SINGLE_DEVICE_CONFIG
+        }
+        if (key.contains("llvm")) {
+            config = LLVM_CONFIG
+        }
+        if (key.contains("GR100")) {
+            config = RUBIN_BRINGUP_CUDA13_4_CONFIG
+        }
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
+    }]]}
+    fullSet = parallelJobs.keySet()
+
+    x86SlurmTestConfigs = getX86SlurmTestConfigs()
+    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
+    fullSet += x86SlurmTestConfigs.keySet()
+
+    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(X86_64_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
+        // dispatcher pod (when retry is enabled — see opts below) and is
+        // threaded into runLLMTestlistOnSlurm so a future re-enable of outer
+        // pod retry composes a unique postTag instead of colliding with the
+        // dead pod's recorded upload. With singleAttempt:true (default for
+        // SLURM stages) the outer retry is off and attemptTag is always "".
+        def config = VANILLA_CONFIG
+        if (key.contains("single-device")) {
+            config = SINGLE_DEVICE_CONFIG
+        }
+        if (key.contains("llvm")) {
+            config = LLVM_CONFIG
+        }
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, false, retryContext?.infraRetryMax)
+    }, [singleAttempt: true, slurmDispatcher: true]]]}
+    // SLURM dispatcher pods run their own inner retry loop
+    // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
+    // K8s pod retry (singleAttempt:true) here caps total attempts at
+    // SLURM_INFRA_RETRY_MAX+1 instead of (SLURM_INFRA_RETRY_MAX+1) *
+    // (K8S_INFRA_RETRY_MAX+1). Each SLURM attempt that hits the partition
+    // walltime burns ~4h, so nesting the two layers cost up to ~36h per stage
+    // on consistently-timing-out tests before this cap.
+
+    parallelJobs += parallelSlurmJobs
+
+    // SBSA machines from the Blossom machine pool
+    SBSATestConfigs = [
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
+        "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
+        // DGX Spark is also named as GB10 Grace Blackwell Superchip.
+        "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
+    ]
+    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
+    fullSet += SBSATestConfigs.keySet()
+
+    SBSASlurmTestConfigs = getSBSASlurmTestConfigs()
+    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
+    fullSet += SBSASlurmTestConfigs.keySet()
+
+    multiNodesSBSAConfigs = getMultiNodesSBSAConfigs()
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 

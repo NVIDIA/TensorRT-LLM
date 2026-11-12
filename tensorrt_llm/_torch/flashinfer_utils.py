@@ -23,7 +23,14 @@ if platform.system() != "Windows":
     try:
         import flashinfer
         logger.info(f"flashinfer is available: {flashinfer.__version__}")
-        major, minor = torch.cuda.get_device_capability()
+        try:
+            major, minor = torch.cuda.get_device_capability()
+        except RuntimeError as error:
+            # The build-stage type check runs on a CPU node with the stub
+            # libcuda: skip the arch-list override there, re-raise the rest.
+            if "CUDA driver is a stub library" not in str(error):
+                raise
+            major, minor = 0, 0
         sm_version = major * 10 + minor
         IS_FLASHINFER_AVAILABLE = True
         if sm_version >= 100 and sm_version < 110 and sm_version not in [

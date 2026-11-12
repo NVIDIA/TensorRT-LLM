@@ -1061,7 +1061,12 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "MiniMaxAI/MiniMax-M2"
-    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
+    # Look the model up without raising: a class-body ValueError breaks the
+    # collection of every test in this file when the model is not in LLM_MODELS_ROOT.
+    try:
+        MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
+    except ValueError:
+        MODEL_PATH = None
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
@@ -1090,6 +1095,8 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     def test_finegrained_fp8(self):
+        if self.MODEL_PATH is None:
+            pytest.skip(f"{self.MODEL_NAME} not found in LLM_MODELS_ROOT")
         kwargs = self.get_default_kwargs()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
