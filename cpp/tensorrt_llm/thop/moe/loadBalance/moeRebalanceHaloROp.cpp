@@ -320,7 +320,7 @@ private:
     {
         requireBound();
         TORCH_CHECK(mPoison == cudaSuccess, "HALO-R context is poisoned by an earlier CUDA error (",
-            cudaGetErrorString(mPoison), "); a quiesced group rebuild is required");
+            cudaGetErrorString(mPoison), "); this layer cannot launch again, restart the process");
     }
 
     void poisonOnError(cudaError_t error, char const* operation)

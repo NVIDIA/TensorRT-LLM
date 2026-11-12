@@ -1305,7 +1305,7 @@ def _case_graphs_failed_capture(layers: _Layers) -> list:
 
     The abort path then releases the plan eagerly on the stream that was
     capturing. That must not wait for the captured kernel, which never runs,
-    and the group must refuse its next launch until it is rebuilt.
+    and the group must refuse every later launch.
     """
     rank = layers.rank
     group = layers.groups[0]
@@ -1349,7 +1349,7 @@ def _case_graphs_failed_capture(layers: _Layers) -> list:
             group.plan(routes, defer_wait=True)
         failures.append(f"rank {rank}: the group launched again after its capture failed")
     except RuntimeError as error:
-        if "rebuild" not in str(error):
+        if "restart the process" not in str(error):
             failures.append(f"rank {rank}: unexpected error {error}")
     return failures
 

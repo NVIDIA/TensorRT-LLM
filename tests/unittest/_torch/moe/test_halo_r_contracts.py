@@ -462,7 +462,7 @@ def test_a_capture_that_ends_within_a_layer_call_skips_its_waits_and_aborts(
     group.wait_for_routes()
     group.finish()
     assert not any(entry[0] in ("route_wait", "join") for entry in trace)
-    with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
+    with pytest.raises(RuntimeError, match="cannot launch again, restart the process"):
         group.plan_schedule(_Routes(4))
 
 
@@ -685,7 +685,7 @@ def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(monkeypatch) -> 
         lambda: endpoint.mark_collective_reuse_safe(env.group.lease, 1),
         lambda: endpoint.bind_generation_reuse_authority(env.group.lease),
     ):
-        with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
+        with pytest.raises(RuntimeError, match="cannot launch again, restart the process"):
             call()
     # Teardown still releases the native context.
     env.group.close()
@@ -1390,8 +1390,8 @@ def test_weight_reload_without_residency_is_free(monkeypatch) -> None:
     env.state.fail_submit = True
     with pytest.raises(RuntimeError, match="launch failed"):
         env.group.plan_schedule(_Routes(8))
-    # An aborted group is rebuilt, not reset.
-    with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
+    # An aborted group is never reset; only a new process runs the layer again.
+    with pytest.raises(RuntimeError, match="cannot launch again, restart the process"):
         env.group.forget_helper_residency()
 
 

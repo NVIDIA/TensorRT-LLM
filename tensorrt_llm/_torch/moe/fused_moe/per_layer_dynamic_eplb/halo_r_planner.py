@@ -330,7 +330,9 @@ class HaloRRelayEndpoint(LiveBankLease):
 
     def _require_operational(self) -> None:
         if self._handoff_aborted or self.ctx is None:
-            raise RuntimeError("HALO-R relay handoff aborted; quiesced group rebuild required")
+            raise RuntimeError(
+                "HALO-R relay handoff aborted; this layer cannot launch again, restart the process"
+            )
 
     def _require_bindable(self) -> None:
         self._require_operational()
@@ -661,8 +663,7 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
 
         If a failure ended the capture of this layer call, the captured
         kernel never runs: COPY holds nothing to join, the route wait was
-        skipped, and the endpoint is aborted, so the group must be rebuilt
-        before its next launch.
+        skipped, and the endpoint is aborted, so it cannot launch again.
         """
         capture_ended = self.broadcaster.launch_capture_ended()
         super().finish(completion_event)
