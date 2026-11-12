@@ -205,69 +205,6 @@ def _get_video_sampling_duration(metadata: dict[str, Any], n_decoded: int) -> fl
     return n_decoded / source_fps if source_fps else source_duration or n_decoded / 24
 
 
-def _decide_do_sample_frames(
-    video_datas: Optional[List[Any]],
-    mm_processor_kwargs: Dict[str, Any],
-) -> bool:
-    """Determine whether decoded videos need frame sampling.
-
-      1. If `mm_processor_kwargs.do_sample_frames` is explicitly set
-         (True or False), honor it.
-      2. If the caller supplies no frame target (`num_frames` / `fps`),
-         keep IO-sampled frames with source indices; otherwise sample
-         according to HF's class default.
-      3. Otherwise, compare the requested frame count with the decoded count.
-         Nonpositive targets impose no limit. When both targets are supplied,
-         use the smaller count, as VideoIO does.
-         The adapter calls this function for one video at a time.
-
-    The input adapter applies this decision separately to each video before
-    calling HF with its batch-wide sampling switch disabled.
-    """
-    if "do_sample_frames" in mm_processor_kwargs:
-        return bool(mm_processor_kwargs["do_sample_frames"])
-
-    if not video_datas:
-        return False
-
-    user_num_frames = mm_processor_kwargs.get("num_frames")
-    user_fps = mm_processor_kwargs.get("fps")
-    has_num_frames = user_num_frames is not None
-    has_fps = user_fps is not None
-
-    if not has_num_frames and not has_fps:
-        return any(
-            getattr(vd, "is_sampled", None) is False
-            or (
-                getattr(vd, "is_sampled", None) is None
-                and (
-                    (vd.metadata or {}).get("frames_indices") is None
-                    # A decoded prefix can also be a clip truncated by a failed frame.
-                    or list(vd.metadata["frames_indices"]) == list(range(len(vd.frames)))
-                )
-            )
-            for vd in video_datas
-        )
-
-    for vd in video_datas:
-        n_decoded = len(vd.frames)
-        duration = _get_video_sampling_duration(vd.metadata or {}, n_decoded)
-        if user_num_frames is not None and user_fps is not None:
-            n_target = n_decoded
-            if user_num_frames > 0:
-                n_target = min(n_target, user_num_frames)
-            if user_fps > 0:
-                n_target = min(n_target, math.floor(duration * user_fps))
-            n_target = max(1, n_target)
-        elif has_num_frames:
-            n_target = min(user_num_frames, n_decoded) if user_num_frames > 0 else n_decoded
-        else:  # has_fps
-            n_target = math.floor(duration * user_fps) if user_fps > 0 else n_decoded
-        if n_target != n_decoded:
-            return True
-    return False
-
-
 class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     """Qwen3-VL input processor.
 
@@ -393,6 +330,76 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             second_per_grid_ts,
         )
 
+    def _prepare_video(
+        self, video_data: VideoData, video_kwargs: dict[str, Any]
+    ) -> tuple[Sequence[Image.Image | torch.Tensor | np.ndarray] | np.ndarray, dict[str, Any]]:
+        """Sample decoded frames while retaining their source timeline."""
+        metadata = dict(video_data.metadata or {})
+        frames = video_data.frames
+        n_decoded = len(frames)
+        source_indices = metadata.get("frames_indices")
+        if source_indices is None:
+            source_indices = list(range(n_decoded))
+        if len(source_indices) != n_decoded:
+            raise ValueError("video frames_indices must match the decoded frame count")
+        if metadata.get("total_num_frames") is None:
+            metadata["total_num_frames"] = (
+                round(metadata["duration"] * metadata["fps"])
+                if metadata.get("duration") and metadata.get("fps")
+                else max(source_indices) + 1
+            )
+
+        video_processor = self.processor.video_processor
+        num_frames = video_kwargs.get("num_frames", video_processor.num_frames)
+        fps = video_kwargs.get("fps", video_processor.fps)
+        if "num_frames" in video_kwargs and "fps" not in video_kwargs:
+            fps = None
+        duration = _get_video_sampling_duration(metadata, n_decoded)
+        if num_frames is not None and fps is not None:
+            target_count = n_decoded
+            if num_frames > 0:
+                target_count = min(target_count, num_frames)
+            if fps > 0:
+                target_count = min(target_count, math.floor(duration * fps))
+            num_frames, fps = max(1, target_count), None
+        elif (num_frames is not None and num_frames <= 0) or (fps is not None and fps <= 0):
+            num_frames, fps = n_decoded, None
+        elif num_frames is not None:
+            # HF's frame-count path can otherwise repeat decoded positions.
+            num_frames = min(num_frames, n_decoded)
+        target_count = (
+            num_frames
+            if num_frames is not None
+            else (math.floor(duration * fps) if fps is not None else n_decoded)
+        )
+
+        has_request_target = any(video_kwargs.get(key) is not None for key in ("num_frames", "fps"))
+        if "do_sample_frames" in video_kwargs:
+            do_sample_frames = bool(video_kwargs["do_sample_frames"])
+        elif video_processor.do_sample_frames is False:
+            do_sample_frames = False
+        elif not has_request_target and n_decoded > video_processor.max_frames:
+            # Non-prefix indices can also result from dropped frames. Apply
+            # HF's default cap without truncating the source timeline.
+            do_sample_frames = True
+        elif num_frames is not None or video_kwargs.get("fps") is not None:
+            do_sample_frames = target_count != n_decoded
+        else:
+            is_sampled = getattr(video_data, "is_sampled", None)
+            do_sample_frames = is_sampled is False or (
+                is_sampled is None and list(source_indices) == list(range(n_decoded))
+            )
+
+        if do_sample_frames:
+            sampling_metadata = VideoMetadata(total_num_frames=n_decoded, fps=n_decoded / duration)
+            selected = video_processor.sample_frames(
+                metadata=sampling_metadata, num_frames=num_frames, fps=fps
+            )
+            frames = [video_data.frames[i] for i in selected]
+            source_indices = [source_indices[i] for i in selected]
+        metadata["frames_indices"] = list(source_indices)
+        return frames, metadata
+
     def _preprocess(
         self,
         text: Dict[str, Any],
@@ -438,81 +445,13 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         proc_kwargs["images_kwargs"].setdefault("do_rescale", do_rescale)
         video_kwargs.setdefault("do_rescale", do_rescale)
 
-        # Sample in decoded-frame coordinates, then map the selected indices
-        # back to the source timeline. HF otherwise overwrites frames_indices
-        # with decoded offsets and uses them as source timestamps.
-        video_metadata: Optional[List[Dict[str, Any]]] = None
         if video_datas:
-            video_processor = self.processor.video_processor
-            sampling_kwargs = dict(video_kwargs)
-            if video_processor.do_sample_frames is False:
-                sampling_kwargs.setdefault("do_sample_frames", False)
-            num_frames = video_kwargs.get("num_frames", video_processor.num_frames)
-            fps = video_kwargs.get("fps", video_processor.fps)
-            if "num_frames" in video_kwargs and "fps" not in video_kwargs:
-                fps = None
             videos = []
             video_metadata = []
-            for vd in video_datas:
-                m = dict(vd.metadata or {})
-                n_decoded = len(vd.frames)
-                source_indices = m.get("frames_indices")
-                if source_indices is None:
-                    source_indices = list(range(n_decoded))
-                if len(source_indices) != n_decoded:
-                    raise ValueError("video frames_indices must match the decoded frame count")
-                if m.get("total_num_frames") is None:
-                    m["total_num_frames"] = (
-                        round(m["duration"] * m["fps"])
-                        if m.get("duration") and m.get("fps")
-                        else max(source_indices) + 1
-                    )
-                frames = vd.frames
-                duration = _get_video_sampling_duration(m, n_decoded)
-                per_video_kwargs = dict(sampling_kwargs)
-                # Non-prefix indices can also result from dropped frames. Do
-                # not preserve oversized inputs by default; use HF sampling
-                # below so selected pixels still map to source timestamps.
-                if (
-                    per_video_kwargs.get("num_frames") is None
-                    and per_video_kwargs.get("fps") is None
-                    and n_decoded > video_processor.max_frames
-                ):
-                    per_video_kwargs.setdefault("do_sample_frames", True)
-                sample_num_frames, sample_fps = num_frames, fps
-                if num_frames is not None and fps is not None:
-                    sample_num_frames = n_decoded
-                    if num_frames > 0:
-                        sample_num_frames = min(sample_num_frames, num_frames)
-                    if fps > 0:
-                        sample_num_frames = min(sample_num_frames, math.floor(duration * fps))
-                    sample_num_frames = max(1, sample_num_frames)
-                    sample_fps = None
-                    per_video_kwargs["num_frames"] = sample_num_frames
-                    per_video_kwargs.pop("fps", None)
-                elif (num_frames is not None and num_frames <= 0) or (fps is not None and fps <= 0):
-                    sample_num_frames, sample_fps = n_decoded, None
-                    per_video_kwargs["num_frames"] = n_decoded
-                    per_video_kwargs.pop("fps", None)
-                elif num_frames is not None:
-                    # HF's explicit frame-count path does not cap at the
-                    # available frames and would repeat decoded positions.
-                    sample_num_frames = min(num_frames, n_decoded)
-                    per_video_kwargs["num_frames"] = sample_num_frames
-                if _decide_do_sample_frames([vd], per_video_kwargs):
-                    sampling_metadata = VideoMetadata(
-                        total_num_frames=n_decoded, fps=n_decoded / duration
-                    )
-                    selected = self.processor.video_processor.sample_frames(
-                        metadata=sampling_metadata,
-                        num_frames=sample_num_frames,
-                        fps=sample_fps,
-                    )
-                    frames = [vd.frames[i] for i in selected]
-                    source_indices = [source_indices[i] for i in selected]
-                m["frames_indices"] = list(source_indices)
+            for video_data in video_datas:
+                frames, metadata = self._prepare_video(video_data, video_kwargs)
                 videos.append(frames)
-                video_metadata.append(m)
+                video_metadata.append(metadata)
             # All videos have already been sampled independently, so a mixed
             # batch cannot pull IO-sampled videos through HF's scalar switch.
             video_kwargs["do_sample_frames"] = False
