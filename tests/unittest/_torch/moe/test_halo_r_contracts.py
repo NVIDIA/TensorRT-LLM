@@ -1566,7 +1566,7 @@ def test_python_limits_match_the_native_ones() -> None:
     assert halo_r_planner.HALO_R_MAX_EP == _cxx_constant(planner, "kMaxRanks")
     assert halo_r_planner.HALO_R_MAX_HELPER_SLOTS == _cxx_constant(planner, "kMaxHelperSlots")
     assert halo_r_planner.HALO_R_MAX_EXPORTS == _cxx_constant(planner, "kMaxHaloRBroadcasts")
-    assert halo_r_planner.HALO_R_PREFIX_STRIDE == _cxx_constant(planner, "kPlanFieldStride")
+    assert halo_r_planner.HALO_R_MAX_EXPERTS == _cxx_constant(planner, "kPlanFieldStride")
     assert halo_r_planner.HALO_R_SEND_COUNT <= _cxx_constant(planner, "kMaxSendsPerRank")
     assert halo_r_planner.HALO_R_RELAY_SLICE_BYTES == _cxx_constant(relay, "kRelaySliceBytes")
     assert halo_r_planner.HALO_R_MAX_PLANES == _cxx_constant(relay, "kRelayMaxPlanes")

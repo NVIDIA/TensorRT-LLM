@@ -348,12 +348,14 @@ def test_one_capability_map_covers_every_planner() -> None:
     }
     # HALO-Q's copy stores through multicast; only HALO-R can be captured, and
     # only HALO-R restricts the config's geometry beyond the shared checks.
-    multicast = {name: spec.helper_multicast for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()}
+    multicast = {
+        name: spec.needs_helper_multicast for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()
+    }
     assert multicast == {"halo_q": True, "halo_r": False}
     capturable = [
         name
         for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()
-        if spec.breakable_prefill_cuda_graphs
+        if spec.supports_breakable_prefill_cuda_graphs
     ]
     assert capturable == ["halo_r"]
     config_checks = {
@@ -384,7 +386,7 @@ def test_real_halo_r_config_builds_the_halo_r_group_through_the_factory(monkeypa
         assert isinstance(manager, PerLayerDynamicMoeLoadBalancer)
         # The unset auxiliary_sms resolves to HALO-R's default; its helper sets get no multicast.
         assert (manager.planner, manager.auxiliary_sms) == ("halo_r", 16)
-        assert not manager.planner_spec.helper_multicast
+        assert not manager.planner_spec.needs_helper_multicast
         layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
         _allocate_arena(layer, monkeypatch, _Arena())
         layer.bind_backend(_Backend())

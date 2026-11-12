@@ -29,9 +29,9 @@ class PerLayerDynamicPlanner:
         build_group: Builds one layer's scheduler group from its manager's
             resources; every planner's builder takes the keywords of
             ``build_rebalance_slot_scheduler_group``.
-        helper_multicast: Whether its copy stores through NVLink multicast
+        needs_helper_multicast: Whether its copy stores through NVLink multicast
             objects bound to the helper sets.
-        breakable_prefill_cuda_graphs: Whether breakable prefill CUDA graphs
+        supports_breakable_prefill_cuda_graphs: Whether breakable prefill CUDA graphs
             can capture its layer calls.
         validate_config: Rejects a ``num_slots``, expert count and EP size
             that the planner cannot plan, or ``None`` when every geometry the
@@ -40,21 +40,21 @@ class PerLayerDynamicPlanner:
     """
 
     build_group: Callable[..., RebalanceSlotSchedulerGroup]
-    helper_multicast: bool
-    breakable_prefill_cuda_graphs: bool
+    needs_helper_multicast: bool
+    supports_breakable_prefill_cuda_graphs: bool
     validate_config: Optional[Callable[..., None]] = None
 
 
 PER_LAYER_DYNAMIC_PLANNERS: dict[str, PerLayerDynamicPlanner] = {
     "halo_q": PerLayerDynamicPlanner(
         build_group=build_rebalance_slot_scheduler_group,
-        helper_multicast=True,
-        breakable_prefill_cuda_graphs=False,
+        needs_helper_multicast=True,
+        supports_breakable_prefill_cuda_graphs=False,
     ),
     "halo_r": PerLayerDynamicPlanner(
         build_group=build_halo_r_slot_scheduler_group,
-        helper_multicast=False,
-        breakable_prefill_cuda_graphs=True,
+        needs_helper_multicast=False,
+        supports_breakable_prefill_cuda_graphs=True,
         validate_config=validate_halo_r_config,
     ),
 }

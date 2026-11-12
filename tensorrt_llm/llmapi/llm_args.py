@@ -8327,14 +8327,14 @@ class TorchLlmArgs(BaseLlmArgs):
                 PER_LAYER_DYNAMIC_PLANNERS
             planner = PER_LAYER_DYNAMIC_PLANNERS[getattr(
                 load_balancer, "planner", "halo_q")]
-            capturable = (planner.breakable_prefill_cuda_graphs
+            capturable = (planner.supports_breakable_prefill_cuda_graphs
                           and self.prefill_cuda_graph_backend
                           == PrefillCudaGraphBackend.BREAKABLE)
             if not capturable:
                 capturable_planners = " or ".join(
                     f"planner='{name}'"
                     for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()
-                    if spec.breakable_prefill_cuda_graphs)
+                    if spec.supports_breakable_prefill_cuda_graphs)
                 raise ValueError(
                     "per-layer dynamic EPLB does not support prefill CUDA "
                     f"graphs except with {capturable_planners} and "

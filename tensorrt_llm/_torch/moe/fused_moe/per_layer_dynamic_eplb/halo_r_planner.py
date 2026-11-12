@@ -72,8 +72,8 @@ HALO_R_MAX_EP = 32
 HALO_R_MAX_EXPORTS = 128
 #: CTA 0 plans while the other CTAs map routes.
 HALO_R_MIN_AUXILIARY_SMS = 2
-#: Per-broadcast route prefixes use the shared 384-entry field stride.
-HALO_R_PREFIX_STRIDE = 384
+#: HALO-R plans at most this many experts: the field stride of the plan layout it shares with HALO-Q.
+HALO_R_MAX_EXPERTS = 384
 #: The relay copy accepts at most this many weight planes.
 HALO_R_MAX_PLANES = 8
 #: The relay splits a weight plane into slices of this size.
@@ -108,9 +108,9 @@ def validate_halo_r_geometry(
             f"HALO-R exports at most {HALO_R_MAX_EXPORTS} experts; "
             f"{ep_size} ranks x {HALO_R_SEND_COUNT} exceed it"
         )
-    if ep_size * home_experts > HALO_R_PREFIX_STRIDE:
+    if ep_size * home_experts > HALO_R_MAX_EXPERTS:
         raise ValueError(
-            f"HALO-R supports at most {HALO_R_PREFIX_STRIDE} experts; got {ep_size * home_experts}"
+            f"HALO-R supports at most {HALO_R_MAX_EXPERTS} experts; got {ep_size * home_experts}"
         )
     if auxiliary_sms < HALO_R_MIN_AUXILIARY_SMS:
         raise ValueError(
@@ -211,7 +211,7 @@ class HaloRRelayEndpoint(LiveBankLease):
 
         self._driver = driver
         # The bound of each breakable bucket's first eager launch; see submit_fused.
-        self._in_breakable_cuda_graph = is_in_breakable_cuda_graph
+        self._is_in_breakable_cuda_graph = is_in_breakable_cuda_graph
         self._first_run_spin_cycles = int(first_run_spin_cycles)
         self._breakable_token_counts: set[int] = set()
         self.device = int(scheduler.device.index)
@@ -360,7 +360,7 @@ class HaloRRelayEndpoint(LiveBankLease):
             first_run = (
                 not self._launch_captured
                 and rows not in self._breakable_token_counts
-                and self._in_breakable_cuda_graph()
+                and self._is_in_breakable_cuda_graph()
             )
             if first_run:
                 spin_cycles = max(int(spin_cycles), self._first_run_spin_cycles)

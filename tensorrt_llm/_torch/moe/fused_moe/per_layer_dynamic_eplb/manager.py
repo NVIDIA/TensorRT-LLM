@@ -183,7 +183,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         provider = SharedSlotArenaProvider(
             self,
             per_layer_helper_sets=self.helper_residency,
-            helper_multicast=self.planner_spec.helper_multicast,
+            helper_multicast=self.planner_spec.needs_helper_multicast,
         )
         self._arena_providers.append(provider)
         return provider
