@@ -424,7 +424,9 @@ use FP8 on Rubin SM107 with TP=1 or attention DP, and BF16 otherwise. Set
 bf16 to use dequantized BF16 draft weights. An explicit fp8 selection
 requires TP=1 or attention DP; unsupported tensor-parallel mappings are
 rejected during initialization. Non-Rubin FP8 is opt-in and requires workload
-accuracy and acceptance-length validation.
+accuracy and acceptance-length validation. The variable applies only to
+DeepSeek-V4 drafters: DeepSeek-V4.1 DSpark always uses BF16 projections and
+rejects fp8.
 
 ### Packed FP4 MLA wave planning
 
