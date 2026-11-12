@@ -436,8 +436,8 @@ def should_skip_trtllm(
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
-        # Keep the NVFP4 seq=8 skips tracked by https://nvbugs/5979443,
-        # except for the restored single-GPU Relu2 seq=8 case below.
+        # Keep unvalidated NVFP4 seq=8 configurations skipped, except for
+        # the restored single-GPU Relu2 case below.
         is_restored_relu2_seq8_case = (
             model_config == MoeModelConfig(60, 4, 2048, 1408)
             and dtype == torch.bfloat16
