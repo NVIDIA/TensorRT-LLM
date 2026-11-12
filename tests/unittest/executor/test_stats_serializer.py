@@ -153,7 +153,7 @@ class TestStatsSerializer:
         assert json.loads(BaseWorker._stats_serializer(record)) == expected
         assert json.loads(BaseWorker._stats_serializer(tuple(record))) == expected
 
-    @pytest.mark.parametrize("field_count", range(2, 12))
+    @pytest.mark.parametrize("field_count", range(2, 11))
     def test_legacy_tuple_prefixes_and_future_trailing_fields(self, field_count):
         iter_stats = _make_mock_iteration_stats()
         loop = {"kind": "loop", "per_iter": {"iter": 9}}

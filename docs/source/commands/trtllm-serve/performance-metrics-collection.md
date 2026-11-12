@@ -58,6 +58,31 @@ collection/timing settings. The existing device-step profiler timing policy is
 preserved. CPU and
 end-to-end overhead of this refactor have not been benchmarked.
 
+## Transport cost and KV utilization semantics
+
+Worker serialization parses native JSON into a dictionary, partitions it into
+owned immutable categories, and encodes the existing JSON transport shape. The
+consumer still parses that JSON. Parsing the native JSON and encoding/decoding the
+wire payload were already required; partitioning, recursive freezing and mapping
+adaptation add CPU work. The worker's freeze runs on the transport thread. Source
+snapshot freezing and loop-record construction also run on the executor thread.
+
+The pending overhead benchmark must cover both source collection and transport:
+compare baseline and refactored CPU time/allocations per record and transport
+throughput with request diagnostics disabled/enabled, varying request counts,
+KV snapshot sizes and rank counts. Separately compare logger-only, Prometheus-only
+and combined outputs in an inference workload. No measured overhead claim is
+made before those checks run.
+
+KV utilization prefers an explicit `usedNumBlocks` value, including measured zero.
+For basic snapshots without that field, it uses `maxNumBlocks - freeNumBlocks`.
+Missing or non-positive capacity produces unavailable utilization (`N/A` in the
+iteration log). This preserves the logger-only free-block calculation and its
+zero-capacity `N/A` behavior. Prometheus retains its existing requirement for
+explicit used blocks and positive capacity; it does not infer a utilization series
+from a free-only snapshot. Reclaimable cached prefixes can remain in available
+blocks, so utilization alone does not measure conversation-cache retention.
+
 ## Create a Grafana dashboard
 
 The [Grafana setup example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/grafana)
