@@ -59,6 +59,27 @@ def _model_config(*, kv_heads, head_dim, kv_quant_algo=None):
     )
 
 
+class _V1LikeManager:
+    """A non-V2 manager: predates the appended-draft layer specs."""
+
+
+def _mla_model_config(*, kv_quant_algo=None):
+    """An MLA target: one K-only head per rank holding the latent."""
+    pretrained = SimpleNamespace(
+        num_hidden_layers=2,
+        num_attention_heads=32,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        hidden_size=8192,
+        torch_dtype=torch.bfloat16,
+    )
+    quant_mode = QuantMode.from_quant_algo(kv_cache_quant_algo=kv_quant_algo)
+    return SimpleNamespace(
+        pretrained_config=pretrained,
+        quant_config=SimpleNamespace(quant_mode=quant_mode),
+    )
+
+
 def _creator(*, is_disagg, target, draft, tp_size=1, draft_windows=None):
     creator = object.__new__(KvCacheCreator)
     creator._speculative_config = SimpleNamespace(
@@ -187,6 +208,39 @@ def test_fp8_target_with_bf16_draft_unifies(is_disagg: bool) -> None:
     assert creator._should_unify_dflash_kv_cache()
     specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
     assert [spec.dtype for spec in specs] == [DataType.FP8] * 2 + [DataType.BF16] * 2
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_non_v2_target_manager_keeps_separate_cache(is_disagg: bool) -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+    creator._kv_cache_manager_cls = _V1LikeManager
+
+    assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("target_is_mla", [True, False])
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_mismatched_draft_k_only_keeps_separate_cache(is_disagg: bool, target_is_mla: bool) -> None:
+    """A drafter's K-only flag never unifies, aggregated or disaggregated.
+
+    Unlike the head-count and dtype mismatches, aggregated serving has no
+    transfer step: the drafter's layers would land in the target's pool, whose
+    storage holds one of the two shapes (a K-only Kimi K3 target with its GQA
+    DSpark drafter), so both the mismatch directions keep a separate draft KV
+    cache instead of failing the appended-layer validation at construction.
+    """
+    gqa = _model_config(kv_heads=1, head_dim=128)
+    if target_is_mla:
+        target, draft = _mla_model_config(), gqa
+    else:
+        target, draft = gqa, _mla_model_config()
+
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+
+    assert not creator._should_unify_dflash_kv_cache()
 
 
 def test_layout_compares_rank_local_heads():

@@ -2382,10 +2382,14 @@ class KvCacheCreator:
     def _unified_target_manager_cls_supported(self) -> bool:
         """Whether the target's manager class can hold the drafter's layers.
 
-        Hybrid managers describe their own target layers and append the
-        drafter's after them when they opt in.
+        Managers outside the V2 family predate the appended-draft storage and
+        keep the separate-draft-cache fallback; hybrid managers describe
+        their own target layers and append the drafter's after them when they
+        opt in.
         """
-        return self._kv_cache_manager_cls.accepts_appended_draft_layers()
+        cls = self._kv_cache_manager_cls
+        return (issubclass(cls, KVCacheManagerV2)
+                and cls.accepts_appended_draft_layers())
 
     def _unified_drafter_block_width(self) -> int:
         """Use the loaded checkpoint's slot convention for sizing and allocation."""
@@ -2478,6 +2482,18 @@ class KvCacheCreator:
                 "target and draft KV cache; keeping a separate draft KV cache.",
                 key="dflash_per_layer_kv_heads_fallback")
             return "the target or drafter has variable per-layer KV geometry"
+        # Draft layers live in the target manager's storage: a K-only target
+        # cannot hold a drafter's K and V, or the other way around.
+        if target_layout[3] != draft_layout[3]:
+            reason = ("the target stores a "
+                      f"{'K-only' if target_layout[3] else 'K and V'} KV cache "
+                      "while the drafter stores a "
+                      f"{'K-only' if draft_layout[3] else 'K and V'} one")
+            logger.info_once(
+                f"{self._unified_drafter_name()}: {reason}; keeping a separate "
+                "draft KV cache.",
+                key="dflash_k_only_mismatch_fallback")
+            return reason
         # The drafter's shared context block table indexes all its layers
         # through one lifecycle; mixed windows need the separate manager.
         draft_windows = _resolve_v2_max_attention_window_vec(
