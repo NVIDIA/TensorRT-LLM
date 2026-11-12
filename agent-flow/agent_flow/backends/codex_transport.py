@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Codex SDK transport and per-session tool dispatch.
 
 The SDK's public turn streams omit account notifications and descendant turns.
@@ -10,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -140,9 +144,14 @@ class CodexTransport:
 
     def _server_request(self, method: str, params: dict | None) -> dict:
         if method.endswith("/requestApproval"):
+            logging.getLogger(__name__).warning(
+                "Codex requested %s, but this backend has no interactive approval handler; "
+                "request declined. Configure the native CLI permissions before launching.",
+                method,
+            )
             if method == "item/permissions/requestApproval":
-                return {"permissions": (params or {}).get("permissions", {}), "scope": "turn"}
-            return {"decision": "accept"}
+                return {"permissions": {}, "scope": "turn"}
+            return {"decision": "decline"}
         if method != "item/tool/call":
             # Interactive input belongs to the shared ask_human tool. Do not
             # invent an answer to other kinds of server-initiated requests.

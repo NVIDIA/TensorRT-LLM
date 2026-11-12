@@ -210,8 +210,12 @@ def test_can_queue_gathers_only_the_batch_size():
     """Votes on the batch size alone, over TP x CP; one empty rank vetoes the forward."""
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = True
+    executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
     executor.dist = SimpleNamespace(
-        cp_size=1, tp_rank=0, tp_cp_allgather_int64=Mock(return_value=np.array([[2], [0]]))
+        tp_size=2,
+        cp_size=1,
+        tp_rank=0,
+        tp_cp_allgather_int64=Mock(return_value=np.array([[2], [0]])),
     )
 
     can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
@@ -226,9 +230,13 @@ def test_can_queue_this_rank_is_shared_by_the_cp_peers_of_a_dp_rank(batch_size):
     vote fails for both, and both defer the previous batch together."""
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = True
+    executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
     # tp1 x cp2: rows are this DP rank's two CP ranks.
     executor.dist = SimpleNamespace(
-        cp_size=2, tp_rank=0, tp_cp_allgather_int64=Mock(return_value=np.array([[1], [0]]))
+        tp_size=1,
+        cp_size=2,
+        tp_rank=0,
+        tp_cp_allgather_int64=Mock(return_value=np.array([[1], [0]])),
     )
 
     can_queue, this_rank = PyExecutor._can_queue(

@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -31,6 +32,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -141,6 +143,9 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
         mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority);
+    // The context the storage above lives in; teardown pushes it on threads that have none.
+    cuCheck(cuCtxGetCurrent(&mCudaContext));
+    TLLM_CHECK_WITH_INFO(mCudaContext != nullptr, "KVCacheManagerV2 requires a current CUDA context");
 
     _computeSparseCacheShape();
 
@@ -158,6 +163,60 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
+    if (mShutDown)
+    {
+        return;
+    }
+    // Finalized rather than shut down, on a thread that may have no CUDA context. shutdown()
+    // makes every driver call of the teardown, so the scope only has to cover it: after
+    // shutdown() no member destructor touches the driver.
+    CudaContextScope const context(mCudaContext);
+    if (!context.usable())
+    {
+        // The context or the driver is already gone, so nothing of this manager can be released.
+        // Its storage and tree are handed to allocations that are never freed, which keeps their
+        // destructors -- and the driver calls in them -- from running at all. That is deliberately
+        // not a poisoning: no structure is left half-torn, and the managers that follow in this
+        // process stay usable. The leaked objects still refer to mLifeCycles, which is destroyed
+        // with the rest of the manager; the reference dangles but is unreachable, since no code
+        // holds the leaked pointers and no destructor or method of theirs runs again.
+        //
+        // A deinitialized driver means the process is exiting: a leak at that point costs nothing
+        // and is only worth a warning. Any other failure is a live process without its context.
+        char const* errorName = nullptr;
+        cuGetErrorName(context.error(), &errorName);
+        if (context.error() == CUDA_ERROR_DEINITIALIZED)
+        {
+            TLLM_LOG_WARNING(
+                "KVCacheManagerV2 is being finalized after the CUDA driver was deinitialized; its memory is left "
+                "to the exiting process. Call shutdown() before interpreter exit to release it explicitly.");
+        }
+        else
+        {
+            TLLM_LOG_ERROR(
+                "KVCacheManagerV2 is being finalized without a usable CUDA context (%s (%d)); its memory is leaked. "
+                "Call shutdown() from the thread that drives the manager.",
+                errorName != nullptr ? errorName : "unknown CUDA driver error", static_cast<int>(context.error()));
+        }
+        auto* const tree = new (std::nothrow) std::shared_ptr<BlockRadixTree>(std::move(mRadixTree));
+        auto* const storage = new (std::nothrow) std::shared_ptr<StorageManager>(std::move(mStorage));
+        if (tree == nullptr || storage == nullptr)
+        {
+            // A failed nothrow allocation leaves its argument unmoved, so that member is destroyed
+            // below after all; its destructor then fails for want of a context and poisons KVCM2.
+            TLLM_LOG_ERROR(
+                "KVCacheManagerV2 could not even leak its memory (allocation failed); its destructors "
+                "run without a CUDA context and may poison KVCacheManagerV2.");
+        }
+        return;
+    }
+    if (context.pushed())
+    {
+        TLLM_LOG_WARNING(
+            "KVCacheManagerV2 is being finalized without shutdown() on a thread that does not have its CUDA context "
+            "current; call shutdown() from the thread that drives the manager. Tearing it down with its own "
+            "context.");
+    }
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
 }
 
@@ -190,7 +249,7 @@ void KvCacheManager::_computeSparseCacheShape()
 
         // Layers of one life cycle must currently declare the same sparse_cache. The arena
         // is per life cycle and its metadata is one stride: a selection's rows are found at
-        // `residentOrdinal + slot * entriesPerSelection`, so a single entry count serves
+        // `entry + slot * entriesPerSelection`, so a single entry count serves
         // them all, and cellsPerBuffer follows from maxCachedUnits and unitsPerPage alike.
         // See SPARSE_ATTENTION_DESIGN.md.
         auto& shape = mSparseCacheShape[lcId];
@@ -423,8 +482,11 @@ void KvCacheManager::shutdown()
     // The latch is read under the lock because it is normally set by a thread holding it: a read
     // taken before blocking would only say the cache was intact before this call started waiting.
     auto const apiLock = lockExclusive();
-    if (Poison::poisoned())
+    if (Poison::poisoned() || mShutDown)
     {
+        // Recorded on the poisoned path too: nothing will be released later either way, and the
+        // destructor should not then report a missing shutdown() to a caller who made it.
+        mShutDown = true;
         return;
     }
     _checkNoLivingKvCaches("shutdown()");
@@ -442,6 +504,7 @@ void KvCacheManager::shutdown()
     }
 
     mStorage->destroy();
+    mShutDown = true;
 }
 
 void KvCacheManager::clearReusableBlocks()
@@ -818,6 +881,11 @@ LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
 {
     return mStorage->getBufferAttr(layerId, role).lifeCycleId;
+}
+
+CacheGroupId KvCacheManager::getRegionGroupId(std::string const& name) const
+{
+    return mLifeCycles.regionLifeCycleId(name);
 }
 
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const

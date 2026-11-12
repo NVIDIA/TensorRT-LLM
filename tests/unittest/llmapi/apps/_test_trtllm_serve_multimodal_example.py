@@ -14,13 +14,12 @@
 # limitations under the License.
 
 import os
-import subprocess
 import tempfile
 
 import pytest
 import yaml
 
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = [".."]
 from test_llm import get_model_path
@@ -86,11 +85,4 @@ def test_trtllm_serve_examples(exe: str, script: str, model_name: str,
     client_script = os.path.join(example_root, script)
     custom_env = os.environ.copy()
     custom_env["AIPERF_TOKENIZER_PATH"] = get_model_path(model_name)
-    # CalledProcessError will be raised if any errors occur
-    subprocess.run([exe, client_script],
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   text=True,
-                   check=True,
-                   env=custom_env,
-                   timeout=600)
+    run_command_with_output([exe, client_script], env=custom_env, timeout=600)

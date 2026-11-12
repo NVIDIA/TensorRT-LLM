@@ -25,6 +25,8 @@ class ResultEvent:
     is_error: bool = False
     errors: list[str] = field(default_factory=list)
     permission_denials: list[Any] = field(default_factory=list)
+    # The backend's id of the session the turn ran in, when it has one.
+    session_id: str | None = None
 
 
 BackendEvent = (
@@ -109,5 +111,12 @@ class Backend(ABC):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
+        """Open a session; with ``fork_from``, a copy of that earlier session.
+
+        A forked session starts with the earlier session's history and gets
+        its own id; the earlier session is left as it was. Backends that
+        cannot fork raise :class:`NotImplementedError` for ``fork_from``.
+        """
         yield

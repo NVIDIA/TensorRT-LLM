@@ -13,20 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
 import time
 from pathlib import Path
 
 import pytest
+import torch
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import SchedulerOutput
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
     EncodeCudaGraphConfig,
     KvCacheConfig,
+    RequestError,
     RequestOutput,
     SamplingParams,
     SchedulerConfig,
@@ -1095,3 +1100,175 @@ def test_t5_pytorch_block_reuse_is_disabled_for_v2(
         assert (
             list(response.outputs[0].token_ids) == _EXPECTED_OUTPUT_TOKEN_IDS_BY_MODEL["t5-small"]
         )
+
+
+@pytest.mark.parametrize(
+    "use_kv_cache_manager_v2,use_python_scheduler",
+    [(True, False), (False, True), (False, False)],
+    ids=["kv-v2", "kv-v1-python-scheduler", "kv-v1-cpp-scheduler"],
+)
+def test_t5_encoder_input_above_max_num_tokens_fails_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    use_kv_cache_manager_v2: bool,
+    use_python_scheduler: bool,
+) -> None:
+    """An encoder input longer than max_num_tokens fails only its own request."""
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+
+    model_path = _get_t5_model_path("t5-small")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    source_ids = tokenizer.encode(" ".join([_SOURCE_TEXT] * 8), add_special_tokens=False)
+    assert len(source_ids) > _MAX_SEQUENCE_LENGTH
+    longest_ids = source_ids[: _MAX_SEQUENCE_LENGTH - 1] + [tokenizer.eos_token_id]
+    too_long_ids = source_ids[:_MAX_SEQUENCE_LENGTH] + [tokenizer.eos_token_id]
+    sampling_params = _sampling_params(num_beams=1, num_return_sequences=1)
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        cuda_graph_config=None,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+        ),
+        max_batch_size=1,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=use_python_scheduler),
+    ) as llm:
+        with pytest.raises(
+            RequestError,
+            match=(
+                rf"encoder tokens \({len(too_long_ids)}\) exceeds the limit value "
+                rf"\({_MAX_SEQUENCE_LENGTH}\) of one encoder iteration "
+                rf"\(max_num_tokens={_MAX_SEQUENCE_LENGTH},"
+            ),
+        ):
+            llm.generate(too_long_ids, sampling_params=sampling_params, use_tqdm=False)
+
+        # The executor keeps serving: the longest encoder input that fits, then
+        # the reference prompt with its exact greedy output.
+        _assert_t5_response(
+            llm.generate(longest_ids, sampling_params=sampling_params, use_tqdm=False),
+            num_return_sequences=1,
+        )
+        response = llm.generate(_SOURCE_TEXT, sampling_params=sampling_params, use_tqdm=False)
+        assert (
+            list(response.outputs[0].token_ids) == _EXPECTED_OUTPUT_TOKEN_IDS_BY_MODEL["t5-small"]
+        )
+
+
+# More than 16 requests with equal sort keys, which the V1 C++ micro-batch
+# scheduler's unstable sort returns out of arrival order.
+_ARRIVAL_ORDER_REQUESTS = 20
+# How long the first scheduling iteration waits for the other requests to be queued.
+_SUBMIT_TIMEOUT_S = 60
+
+
+@pytest.mark.parametrize(
+    "use_kv_cache_manager_v2,use_python_scheduler",
+    [(True, False), (False, True), (False, False)],
+    ids=["kv-v2", "kv-v1-python-scheduler", "kv-v1-cpp-scheduler"],
+)
+def test_t5_encoder_steps_take_requests_in_arrival_order(
+    monkeypatch: pytest.MonkeyPatch,
+    use_kv_cache_manager_v2: bool,
+    use_python_scheduler: bool,
+) -> None:
+    """Encoder steps within encoder_max_num_tokens run the requests in arrival order.
+
+    Requests alternate between two source texts of different lengths, and
+    encoder_max_num_tokens is their summed length, so one encoder step holds two
+    consecutive requests. max_num_tokens and max_batch_size let the scheduler
+    offer every request's encoder work in one iteration. Each iteration that
+    offers encoder requests runs one encoder step with the two oldest, and every
+    request translates exactly.
+    """
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_t5_model_path("t5-small")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    source_ids = [tokenizer.encode(text) for text in _MIXED_ENCODER_SOURCE_TEXTS]
+    assert len(source_ids[0]) != len(source_ids[1])
+    expected_token_ids = _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS[("t5-small", 1)]
+    sampling_params = _sampling_params(num_beams=1, num_return_sequences=1)
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        cuda_graph_config=None,
+        disable_overlap_scheduler=True,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        encoder_max_num_tokens=len(source_ids[0]) + len(source_ids[1]),
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            enable_block_reuse=False,
+            max_tokens=2 * _ARRIVAL_ORDER_REQUESTS * _MAX_SEQUENCE_LENGTH,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+        ),
+        max_batch_size=_ARRIVAL_ORDER_REQUESTS,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_ARRIVAL_ORDER_REQUESTS * _MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=use_python_scheduler),
+    ) as llm:
+        executor = llm._executor.engine
+        schedule_request = executor.scheduler.schedule_request
+        forward_encoder = executor.model_engine.forward_encoder
+        offered_encoder_batch_sizes: list[int] = []
+        encoder_steps: list[list[int]] = []
+        all_submitted = threading.Event()
+        # Whether each scheduling iteration saw every request queued in time.
+        submit_waits: list[bool] = []
+
+        def recording_schedule_request(*args: object, **kwargs: object) -> SchedulerOutput:
+            """Hold the first scheduling iteration, then record what the scheduler offered."""
+            # The first iteration waits until every request is queued, so that
+            # the next request fetch takes all the others at once.
+            submit_waits.append(all_submitted.wait(timeout=_SUBMIT_TIMEOUT_S))
+            scheduler_output = schedule_request(*args, **kwargs)
+            offered_encoder_batch_sizes.append(len(scheduler_output.encoder_requests))
+            return scheduler_output
+
+        def recording_forward_encoder(
+            encoder_requests: list[LlmRequest], *args: object, **kwargs: object
+        ) -> tuple[torch.Tensor, list[int]]:
+            """Record which requests the encoder step runs, in its order."""
+            encoder_steps.append([request.py_client_id for request in encoder_requests])
+            return forward_encoder(encoder_requests, *args, **kwargs)
+
+        monkeypatch.setattr(executor.scheduler, "schedule_request", recording_schedule_request)
+        monkeypatch.setattr(executor.model_engine, "forward_encoder", recording_forward_encoder)
+        try:
+            responses = [
+                llm.generate_async(source_ids[i % 2], sampling_params=sampling_params)
+                for i in range(_ARRIVAL_ORDER_REQUESTS)
+            ]
+        finally:
+            all_submitted.set()
+        for i, response in enumerate(responses):
+            assert list(response.result().outputs[0].token_ids) == expected_token_ids[i % 2][0]
+
+    assert all(submit_waits), f"the requests were not all queued within {_SUBMIT_TIMEOUT_S} s"
+    assert max(offered_encoder_batch_sizes) > 16
+    assert [len(step) for step in encoder_steps] == [
+        min(num_offered, 2) for num_offered in offered_encoder_batch_sizes if num_offered
+    ]
+    assert [client_id for step in encoder_steps for client_id in step] == [
+        response.request_id for response in responses
+    ]
