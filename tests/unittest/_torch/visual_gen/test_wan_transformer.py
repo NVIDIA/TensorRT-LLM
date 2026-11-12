@@ -18,8 +18,12 @@ Run one:
     pytest tests/unittest/_torch/visual_gen/test_wan_transformer.py -v -s -k i2v
 """
 
+# MPI bootstrap must be disabled before importing TensorRT-LLM.
+# ruff: noqa: E402
+
 import os
 
+_PREVIOUS_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
@@ -44,7 +48,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
     yield
-    os.environ.pop("TLLM_DISABLE_MPI", None)
+    if _PREVIOUS_TLLM_DISABLE_MPI is None:
+        os.environ.pop("TLLM_DISABLE_MPI", None)
+    else:
+        os.environ["TLLM_DISABLE_MPI"] = _PREVIOUS_TLLM_DISABLE_MPI
 
 
 @pytest.fixture(autouse=True)

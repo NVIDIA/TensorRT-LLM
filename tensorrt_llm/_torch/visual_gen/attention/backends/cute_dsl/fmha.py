@@ -700,13 +700,20 @@ class CuTeDSLAttention(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         alpha: float = 0.7,
-    ):
+        with_lse: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Smooth-Smooth technique:
         Performs SmoothQuant-like handling for Qk, leveraging the additional fact that
         K - K_mean doesn't affect attention result.
         """
         k = k.unflatten(2, (-1, 1))  # (B, S, H_K, 1, D)
         q = q.unflatten(2, (k.shape[2], -1))  # (B, S, H_K, H_R, D)
+        k_mean = k.mean(dim=(0, 1, 3), keepdim=True)
+        lse_correction = None
+        if with_lse:
+            # Centering K removes a query-dependent constant from this block's
+            # logits. Restore it before LSE-weighted merges across K/V shards.
+            lse_correction = (q.float() * k_mean.float()).sum(dim=-1).flatten(2, 3) * self.scale
         q_max = (
             q.abs().amax(dim=(0, 1, 3), keepdim=True).float().clamp_min(1e-4)
         )  # (1, 1, H_K, 1, D)
@@ -716,9 +723,9 @@ class CuTeDSLAttention(AttentionBackend):
         s = (q_max.pow(alpha) / k_max.pow(1 - alpha)).clamp(1e-4, 1e4)
         q = q * s.reciprocal().bfloat16()
         # Per-channel shift commutes with the per-channel smooth scale `s`.
-        k = k - k.mean(dim=(0, 1, 3), keepdim=True)
+        k = k - k_mean
         k = k * s.bfloat16()
-        return q.flatten(2, 3), k.flatten(2, 3)
+        return q.flatten(2, 3), k.flatten(2, 3), lse_correction
 
     def _prepare_inputs(
         self,
@@ -726,7 +733,8 @@ class CuTeDSLAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: PredefinedAttentionMask,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, torch.dtype]:
+        with_lse: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, torch.dtype, torch.Tensor | None]:
         """Cast inputs to CuTeDSL-compatible dtype and resolve causal flag."""
         if _cute_dsl_import_error is not None:
             raise ImportError(
@@ -749,9 +757,10 @@ class CuTeDSLAttention(AttentionBackend):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
+        lse_correction = None
         if smooth_qk:
-            q, k = self._smooth_qk(q, k)
-        return q, k, v, is_causal, origin_dtype
+            q, k, lse_correction = self._smooth_qk(q, k, with_lse=with_lse)
+        return q, k, v, is_causal, origin_dtype, lse_correction
 
     # cute_dsl_fmha_fwd is already @torch.compiler.disable'd, so torch.compile may still fuse
     # preceding linear/norm with the V quantization below.
@@ -879,7 +888,10 @@ class CuTeDSLAttention(AttentionBackend):
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
         """
-        output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
+        q, k, v, is_causal, origin_dtype, _ = self._prepare_inputs(q, k, v, attention_mask)
+        output, _ = self._fwd(q, k, v, is_causal, **kwargs)
+        if output.dtype != origin_dtype:
+            output = output.to(origin_dtype)
         return output
 
     def forward_with_lse(
@@ -899,12 +911,17 @@ class CuTeDSLAttention(AttentionBackend):
                     always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
-        q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
+        q, k, v, is_causal, origin_dtype, lse_correction = self._prepare_inputs(
+            q, k, v, attention_mask, with_lse=True
+        )
         output, lse = self._fwd(q, k, v, is_causal, **kwargs)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
         # The kernel reports log2 LSE; parallel softmax merges require natural-log LSE.
-        return output, lse.transpose(1, 2) * math.log(2.0)
+        lse = lse.transpose(1, 2) * math.log(2.0)
+        if lse_correction is not None:
+            lse = lse + lse_correction.transpose(1, 2)
+        return output, lse
 
     @classmethod
     def support_lse(cls) -> bool:

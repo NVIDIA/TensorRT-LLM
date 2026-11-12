@@ -153,6 +153,35 @@ def test_linear_steps_require_load_time_quantization(config: dict[str, object]) 
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize(
+    "algo,valid",
+    [
+        ("FP8", True),
+        ("FP8_BLOCK_SCALES", True),
+        ("FP8_PER_CHANNEL_PER_TOKEN", True),
+        ("NVFP4", True),
+        ("W4A16_AWQ", False),
+        ("W4A8_AWQ", False),
+        ("W8A8_SQ_PER_CHANNEL", False),
+    ],
+)
+def test_linear_ignored_steps_supported_quant_algorithms(
+    algo: str, valid: bool, typed: bool
+) -> None:
+    config = {"quant_algo": algo, "ignored_steps": [0]}
+    if valid:
+        quant = DiffusionQuantConfig(**config) if typed else config
+        VisualGenArgs(quant_config=quant)
+    else:
+        with pytest.raises(ValidationError, match="requires load-time quantization"):
+            quant = DiffusionQuantConfig(**config) if typed else config
+            VisualGenArgs(quant_config=quant)
+        with pytest.raises(ValidationError, match="requires load-time quantization"):
+            DiffusionPipelineConfig.load_diffusion_quant_config(config)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("attention_only", [False, True])
 def test_ignored_steps_reject_diffusion_caching(attention_only: bool) -> None:
     config = (

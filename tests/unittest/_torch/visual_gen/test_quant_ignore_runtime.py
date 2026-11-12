@@ -135,6 +135,8 @@ def test_quant_ignore_state_is_cleared(exit_mode: str) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("execution_mode", ["compile", "cuda_graph"])
 def test_execution_mode_preserves_quantization_routes(execution_mode: str) -> None:
+    from torch._dynamo.testing import CompileCounterWithBackend
+
     from tensorrt_llm._utils import get_sm_version
 
     if get_sm_version() not in (100, 103):
@@ -170,7 +172,12 @@ def test_execution_mode_preserves_quantization_routes(execution_mode: str) -> No
             },
         )
         with torch.inference_mode(), observe_quantization_paths(model, device_only=True) as trace:
-            execute = torch.compile(model) if execution_mode == "compile" else runner.wrap(model)
+            compile_counter = CompileCounterWithBackend("inductor")
+            execute = (
+                torch.compile(model, backend=compile_counter)
+                if execution_mode == "compile"
+                else runner.wrap(model)
+            )
             # Compile/capture every phase before resetting counters. Subsequent calls exercise replay.
             for linear, attention in phases:
                 state["linear_quant_ignored"] = linear
@@ -187,6 +194,8 @@ def test_execution_mode_preserves_quantization_routes(execution_mode: str) -> No
                     assert counts[offset + int(quant_ignored)] == 0, counts
             if execution_mode == "cuda_graph":
                 assert len(runner.graphs) == 4
+            else:
+                assert compile_counter.frame_count > 0, "The forward path was not compiled"
     finally:
         runner.clear()
         torch._dynamo.reset()

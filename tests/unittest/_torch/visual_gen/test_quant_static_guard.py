@@ -9,6 +9,8 @@ checkpoint through a static recipe silently corrupts the weights (scales stay
 at their default or uninitialized values), so the loader must raise instead.
 """
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 
@@ -100,6 +102,52 @@ class TestStaticQuantGuard:
         weight_dict = _bf16_weights()
         loader.load_linear_weights(module, "proj_out", [weight_dict])
         assert module.loaded == [weight_dict]
+
+    @pytest.mark.parametrize("quant_algo", [QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4])
+    @pytest.mark.parametrize("quantized", [False, True])
+    def test_module_quant_config_controls_loading_despite_checkpoint_alias(
+        self, monkeypatch, quant_algo, quantized
+    ):
+        """A final module recipe takes precedence over an excluded checkpoint short name."""
+        loader = _make_loader(quant_algo, dynamic_weight_quant=True, exclude_modules=["proj_out"])
+        module = _StubLinear()
+        module.quant_config = QuantConfig(
+            quant_algo=quant_algo if quantized else None, group_size=128
+        )
+        source = torch.randn(128, 256, dtype=torch.bfloat16)
+        monkeypatch.setattr(torch.Tensor, "cuda", lambda value: value)
+        if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            quantizer_name = "quantize_fp8_blockwise"
+            tensors = (source.to(torch.float8_e4m3fn), torch.ones(1, 2))
+        else:
+            quantizer_name = "quantize_nvfp4"
+            tensors = (
+                torch.zeros(128, 128, dtype=torch.uint8),
+                torch.ones(128, 16),
+                torch.ones(()),
+            )
+        quantizer = Mock(return_value=tensors)
+        with patch(
+            f"tensorrt_llm._torch.visual_gen.quantization.loader.{quantizer_name}", quantizer
+        ):
+            loader.load_linear_weights(module, "proj_out", [{"weight": source}])
+        if quantized:
+            quantizer.assert_called_once()
+            assert module.loaded[0]["weight"] is tensors[0]
+            assert module.loaded[0]["weight_scale"] is tensors[1]
+        else:
+            quantizer.assert_not_called()
+            assert module.loaded[0]["weight"] is source
+            assert "weight_scale" not in module.loaded[0]
+
+    def test_quantized_module_alias_cannot_bypass_missing_scales(self):
+        loader = _make_loader(QuantAlgo.FP8_BLOCK_SCALES, exclude_modules=["proj_out"])
+        module = _StubLinear()
+        module.quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+        module.weight = torch.empty(8, 16, dtype=torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="appears to be unquantized"):
+            loader.load_linear_weights(module, "proj_out", [_bf16_weights()])
+        assert module.loaded is None
 
     def test_unquantizable_module_keeps_high_precision_weights(self) -> None:
         """A module that was never built quantized must not be refused.
