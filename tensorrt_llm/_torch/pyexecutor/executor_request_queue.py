@@ -7,7 +7,7 @@ import enum
 import queue
 import threading
 import time
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Literal, Optional
 
 import numpy as np
 
@@ -141,6 +141,8 @@ class ExecutorRequestQueue:
         self.start_times = {}
         self.active = True
         self.admission_state = RequestAdmissionState.RUNNING
+        self._admission_failure_reason: Literal["checkpoint",
+                                                "sleep_wakeup"] | None = None
         self._pending_sleep_tags: frozenset[str] = frozenset()
         self._parked_tags: frozenset[str] = frozenset()
         self._pending_wakeup_tags: frozenset[str] = frozenset()
@@ -235,6 +237,8 @@ class ExecutorRequestQueue:
         """Revoke all admission atomically, including during restore rebinding."""
         with self.enqueue_lock:
             self.admission_state = RequestAdmissionState.FAILED
+            if self._admission_failure_reason is None:
+                self._admission_failure_reason = "checkpoint"
             self._checkpoint_validation_token = None
 
     def _transition_admission_state(
@@ -320,11 +324,21 @@ class ExecutorRequestQueue:
         """Permanently close admission after sleep/wakeup may have mutated state."""
         with self.enqueue_lock:
             self.admission_state = RequestAdmissionState.FAILED
+            if self._admission_failure_reason is None:
+                self._admission_failure_reason = "sleep_wakeup"
 
-    def get_memory_status(self) -> tuple[RequestAdmissionState, frozenset[str]]:
-        """Return an atomic snapshot of admission state and parked tags."""
+    def get_memory_status(
+        self
+    ) -> tuple[RequestAdmissionState, frozenset[str],
+               Literal["checkpoint", "sleep_wakeup"] | None]:
+        """Return admission state, parked tags and the first failure category.
+
+        Returns:
+            Atomic memory status, including None before admission fails.
+        """
         with self.enqueue_lock:
-            return self.admission_state, self._parked_tags
+            return (self.admission_state, self._parked_tags,
+                    self._admission_failure_reason)
 
     def get_admission_state(self) -> RequestAdmissionState:
         with self.enqueue_lock:
@@ -361,9 +375,11 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             assert self.active, "PyExecutor has already been shutdown."
             if self.admission_state is not RequestAdmissionState.RUNNING:
+                reason = (f" ({self._admission_failure_reason})"
+                          if self._admission_failure_reason else "")
                 raise RuntimeError(
                     "Cannot enqueue requests while executor admission is "
-                    f"{self.admission_state.value}")
+                    f"{self.admission_state.value}{reason}")
             if self._checkpoint_session is not None:
                 requests = list(requests)
                 if (len(requests) != 1

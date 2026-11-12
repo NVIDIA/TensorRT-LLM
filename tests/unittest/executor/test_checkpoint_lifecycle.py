@@ -26,9 +26,106 @@ from tensorrt_llm.executor.checkpoint import (
     PrepareCaptureRequest,
     RankCheckpointEvidence,
     ValidateRuntimeRequest,
+    checkpoint_enabled,
+    checkpoint_probe_sampling_params,
+    validate_checkpoint_config,
+    validate_checkpoint_evidence,
+)
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    LoadFormat,
+    MemoryMonitorConfig,
+    RemoteCacheConfig,
+    RemoteDonorConfig,
+    SleepConfig,
+    TorchLlmArgs,
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_checkpoint_opt_in_is_per_engine(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE", "1")
+    assert not checkpoint_enabled(None)
+    assert not checkpoint_enabled({})
+    assert not checkpoint_enabled({"TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE": "0"})
+    assert checkpoint_enabled({"TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE": "1"})
+
+
+@pytest.mark.parametrize("length", [2, 8, 64])
+def test_probe_sampling_helper(length) -> None:
+    params = checkpoint_probe_sampling_params(length)
+    assert params.max_tokens == length
+    assert params.temperature == 0 and params.ignore_eos
+    assert params.end_id == -1 and params.pad_id == 0
+    params.max_tokens = 99
+    assert checkpoint_probe_sampling_params(length).max_tokens == length
+
+
+@pytest.mark.parametrize("length", [0, 1, 65])
+def test_probe_sampling_helper_rejects_invalid_length(length) -> None:
+    with pytest.raises(ValueError, match="2 through 64"):
+        checkpoint_probe_sampling_params(length)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("tensor_parallel_size", 4),
+        ("pipeline_parallel_size", 2),
+        ("context_parallel_size", 2),
+        ("max_beam_width", 2),
+        ("memory_monitor_config", MemoryMonitorConfig(mode="full")),
+        ("sleep_config", SleepConfig()),
+        ("load_format", LoadFormat.GMS),
+        ("checkpoint_format", "MX"),
+        ("allreduce_strategy", "AUTO"),
+        ("gather_generation_logits", True),
+        ("num_serve_frontends", 2),
+        ("orchestrator_type", "ray"),
+        ("num_postprocess_workers", 1),
+    ],
+)
+def test_requested_profile_preflight_names_unsupported_field(monkeypatch, field, value) -> None:
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        allreduce_strategy="NCCL",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True, enable_block_reuse=False, host_cache_size=0
+        ),
+    )
+    validate_checkpoint_config(args)
+    changed = args.model_copy(update={field: value})
+    with pytest.raises(ValueError, match=field):
+        validate_checkpoint_config(changed)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("use_kv_cache_manager_v2", False),
+        ("enable_block_reuse", True),
+        ("host_cache_size", None),
+        ("disk_cache_size", 1024),
+        (
+            "remote_cache_config",
+            RemoteCacheConfig(directory="/tmp/donor", donor=RemoteDonorConfig(size=1 << 30)),
+        ),
+    ],
+)
+def test_requested_profile_preflight_rejects_unqualified_storage(field, value) -> None:
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        allreduce_strategy="NCCL",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True, enable_block_reuse=False, host_cache_size=0
+        ),
+    )
+    args.kv_cache_config = args.kv_cache_config.model_copy(update={field: value})
+    with pytest.raises(ValueError, match=f"kv_cache_config.{field}"):
+        validate_checkpoint_config(args)
+
 
 CHECKS = [
     "admission_closed",
@@ -62,6 +159,38 @@ def evidence(context: CheckpointContext) -> list[RankCheckpointEvidence]:
         )
         for rank in range(2)
     ]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("checks", ["progression_stopped"]),
+        ("state_digest", ""),
+        ("session_id", "old"),
+        ("profile_digest", "old"),
+        ("cohort_digest", "old"),
+    ],
+)
+def test_abort_requires_complete_evidence(lifecycle, backend, field, value) -> None:
+    lifecycle.prepare_capture(PrepareCaptureRequest(context=context(lifecycle, "prepare")))
+    request = AbortCheckpointRequest(context=context(lifecycle, "abort"), reason="test")
+    ranks = evidence(request.context)
+    ranks[1] = ranks[1].model_copy(update={field: value})
+    backend.step.return_value = ranks
+    backend.step.side_effect = None
+    result = lifecycle.abort_operation(request)
+    assert result.status == "failed"
+    assert not lifecycle.admission_open()
+
+
+@pytest.mark.parametrize("step", list(CheckpointStep))
+def test_shared_evidence_validation_covers_every_step(lifecycle, step) -> None:
+    ctx = context(lifecycle, "step")
+    ranks = evidence(ctx)
+    validate_checkpoint_evidence(step, ctx, ranks, [0, 1])
+    ranks[1].checks = []
+    with pytest.raises(RuntimeError, match="incomplete"):
+        validate_checkpoint_evidence(step, ctx, ranks, [0, 1])
 
 
 @pytest.fixture
@@ -488,6 +617,37 @@ def test_expired_attempt_cannot_activate_or_extend_budget(lifecycle, backend, mo
         lifecycle.activate(request)
     assert backend.step.call_count == before
     assert not lifecycle.get_lifecycle_status().readiness.runtime_ready
+
+
+def test_activation_expires_between_native_ack_and_publication(
+    lifecycle, backend, monkeypatch
+) -> None:
+    """A completed native commit is not permission to publish after the attempt deadline."""
+    now = 100.0
+    monkeypatch.setattr(
+        "tensorrt_llm.executor.checkpoint.time", SimpleNamespace(monotonic=lambda: now)
+    )
+    prepare(lifecycle)
+    validate(lifecycle)
+    request = activation(lifecycle)
+
+    def check_evidence(step, ctx, ranks, expected) -> None:
+        nonlocal now
+        validate_checkpoint_evidence(step, ctx, ranks, expected)
+        if step == CheckpointStep.ACTIVATION_COMMIT:
+            now += request.context.time_budget_seconds
+
+    with patch(
+        "tensorrt_llm.executor.checkpoint.validate_checkpoint_evidence", side_effect=check_evidence
+    ):
+        result = lifecycle.activate(request)
+    assert backend.step.call_args.args[0] == CheckpointStep.ACTIVATION_COMMIT
+    assert result.status == "failed" and result.error and "expired" in result.error
+    assert result.cleanup_status == "host_confirmation_required"
+    assert not lifecycle.admission_open()
+    assert not lifecycle.get_lifecycle_status().readiness.serving_ready
+    assert lifecycle.activate(request) == result
+    backend.fail_closed.assert_called_once()
 
 
 @pytest.mark.parametrize("tokens", [[-1], [], [1]])

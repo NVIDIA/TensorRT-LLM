@@ -318,6 +318,52 @@ def test_get_memory_status_fails_on_worker_divergence():
         llm.get_memory_status()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("reason", ["checkpoint", "sleep_wakeup"])
+async def test_memory_status_preserves_failure_reason(asynchronous: bool, reason: str) -> None:
+    """Both public APIs preserve the workers' terminal failure category.
+
+    Args:
+        asynchronous: Select the asynchronous public API.
+        reason: Native admission failure category.
+    """
+    reply = {"state": "failed", "parked_tags": [], "failure_reason": reason}
+    if asynchronous:
+        llm = _make_async_llm()
+        llm.collective_rpc.return_value = [reply, reply]
+        status = await llm.get_memory_status()
+    else:
+        llm = _make_llm()
+        llm._collective_rpc.return_value = [reply, reply]
+        status = llm.get_memory_status()
+    assert status.state == "failed"
+    assert status.failure_reason == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_memory_status_rejects_divergent_failure_reasons(asynchronous: bool) -> None:
+    """Identical FAILED states must not hide different worker failure categories.
+
+    Args:
+        asynchronous: Select the asynchronous public API.
+    """
+    replies = [
+        {"state": "failed", "parked_tags": [], "failure_reason": reason}
+        for reason in ("checkpoint", "sleep_wakeup")
+    ]
+    with pytest.raises(RuntimeError, match="diverged across workers"):
+        if asynchronous:
+            llm = _make_async_llm()
+            llm.collective_rpc.return_value = replies
+            await llm.get_memory_status()
+        else:
+            llm = _make_llm()
+            llm._collective_rpc.return_value = replies
+            llm.get_memory_status()
+
+
 def test_runtime_memory_api_requires_sleep_config():
     llm = _make_llm()
     llm.args.sleep_config = None

@@ -1452,9 +1452,11 @@ class TestListenerAbortAndShutdown:
         assert sent_acks[0]["error"] is None
         assert "rank 0 send failed" in sent_acks[0]["reason"]
 
-    def test_abort_before_control_barrier_unblocks_later_control_request(self):
-        """An early ABORT is recorded and later consumed by matching control."""
+    @pytest.mark.parametrize("during_publication", [False, True])
+    def test_abort_before_control_barrier_unblocks_later_control_request(self, during_publication):
+        """ABORT retires the matching sentinel, including during publication of its barrier."""
         import threading
+        from contextlib import nullcontext
         from unittest.mock import patch
 
         from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -1495,6 +1497,27 @@ class TestListenerAbortAndShutdown:
         executor.control_requests = [RequestQueueItem(id=CONTROL_REQUEST_ID, control_id=op_id)]
         executor.active_requests = []
         executor.waiting_queue = []
+        executor.dwdp_manager = None
+        executor.hang_detector = SimpleNamespace(pause=nullcontext)
+        executor._sleep_wakeup_pending_abort_lock = threading.Lock()
+        executor._sleep_wakeup_pending_aborts = {}
+        publishing = threading.Event()
+        recording = threading.Event()
+        if during_publication:
+            set_barrier = executor.control_request_barrier.set
+            record_abort = executor._record_sleep_wakeup_abort
+
+            def publish():
+                publishing.set()
+                assert recording.wait(5)
+                set_barrier()
+
+            def record(*args, **kwargs):
+                recording.set()
+                return record_abort(*args, **kwargs)
+
+            executor.control_request_barrier.set = publish
+            executor._record_sleep_wakeup_abort = record
 
         with (
             patch("torch.cuda.set_device"),
@@ -1503,14 +1526,23 @@ class TestListenerAbortAndShutdown:
             patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
             patch("torch.cuda.synchronize"),
         ):
-            try:
-                executor._sleep_wakeup_listener_loop()
-            except StopIteration:
-                pass
-            assert sent_acks
-            assert not executor.control_request_barrier.is_set()
+            if during_publication:
+                from concurrent.futures import ThreadPoolExecutor
 
-            executor._handle_control_request()
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    handled = pool.submit(executor._handle_control_request)
+                    try:
+                        assert publishing.wait(5)
+                        with pytest.raises(StopIteration):
+                            executor._sleep_wakeup_listener_loop()
+                        handled.result(timeout=5)
+                    finally:
+                        executor.control_action_done.set()
+            else:
+                with pytest.raises(StopIteration):
+                    executor._sleep_wakeup_listener_loop()
+                assert not executor.control_request_barrier.is_set()
+                executor._handle_control_request()
 
         assert executor.control_requests == []
         assert not executor.control_request_barrier.is_set()

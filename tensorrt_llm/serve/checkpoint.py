@@ -6,8 +6,11 @@
 import asyncio
 import threading
 import time
+from asyncio import run_coroutine_threadsafe
 from collections.abc import Awaitable, Callable
 from concurrent.futures import CancelledError, Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, TypeVar
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -27,12 +30,12 @@ from tensorrt_llm.executor.checkpoint import (
     PrepareCaptureRequest,
     RankCheckpointEvidence,
     ValidateRuntimeRequest,
+    checkpoint_probe_sampling_params,
 )
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc.rpc_common import RPCCancelled, RPCError
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
-from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.anthropic_adapter import anthropic_error_response
 from tensorrt_llm.serve.openai_protocol import ErrorResponse
 
@@ -40,6 +43,8 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm import LLM
 
 RequestModel = TypeVar("RequestModel", bound=StrictBaseModel)
+# asyncio.to_thread copies this request-local binding. Direct MPI callers own their socket.
+_PROBE_LOOP: ContextVar[asyncio.AbstractEventLoop | None] = ContextVar("probe_loop", default=None)
 
 
 class ExecutorCheckpointBackend:
@@ -201,16 +206,37 @@ class ExecutorCheckpointBackend:
         """
         deadline = time.monotonic() + remaining_seconds
         sampling = self._llm._prepare_sampling_params(
-            SamplingParams(
-                max_tokens=len(validation.expected_token_ids),
-                temperature=0,
-                ignore_eos=True,
-                end_id=-1,
-                pad_id=0,
-            )
+            checkpoint_probe_sampling_params(len(validation.expected_token_ids))
         )
         request = GenerationRequest(validation.prompt_token_ids, sampling)
         request._checkpoint_validation_token = token
+        loop = _PROBE_LOOP.get()
+        if loop is not None:
+
+            async def generate_on_frontend() -> list[int]:
+                # A stalled frontend must not submit a probe after its caller timed out.
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Checkpoint probe expired before submission.")
+                result = self._llm._executor.submit(request)
+                try:
+                    await result.aresult()
+                    return list(result.outputs[0].token_ids)
+                except (asyncio.CancelledError, TimeoutError):
+                    self._llm._executor.abort_request(result.request_id)
+                    raise
+
+            probe = generate_on_frontend()
+            try:
+                future = run_coroutine_threadsafe(probe, loop)
+            except RuntimeError:
+                probe.close()
+                raise
+            try:
+                return future.result(timeout=max(0, deadline - time.monotonic()))
+            except FutureTimeoutError as error:
+                future.cancel()
+                raise TimeoutError("Checkpoint probe timed out.") from error
+
         result = self._llm._executor.submit(request)
         try:
             result.result(timeout=max(0, deadline - time.monotonic()))
@@ -270,7 +296,12 @@ class CheckpointAdmissionMiddleware:
     """Protect all public HTTP paths and retain their full ASGI lifetime."""
 
     def __init__(
-        self, app: ASGIApp, lifecycle: CheckpointLifecycle, ingress: CheckpointIngress
+        self,
+        app: ASGIApp,
+        lifecycle: CheckpointLifecycle,
+        ingress: CheckpointIngress,
+        passive_paths: frozenset[str],
+        passive_prefixes: tuple[str, ...],
     ) -> None:
         """Bind the lifecycle gate and streaming-response tracker.
 
@@ -278,8 +309,12 @@ class CheckpointAdmissionMiddleware:
             app: Next application in the ASGI chain.
             lifecycle: Engine lifecycle authority for admission.
             ingress: Counter shared with capture preparation.
+            passive_paths: Server-owned GET/HEAD paths that need no admission.
+            passive_prefixes: Mounted passive routes, matched at path boundaries.
         """
         self.app, self.lifecycle, self.ingress = app, lifecycle, ingress
+        self.passive_paths = passive_paths
+        self.passive_prefixes = passive_prefixes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Reject new public traffic while keeping authenticated controls reachable.
@@ -298,15 +333,16 @@ class CheckpointAdmissionMiddleware:
                 scope, receive, send
             )
             return
-        administrative = path.startswith("/checkpoint/") or path in (
-            "/health",
-            "/ready",
-            "/memory_status",
-            "/metrics",
-            "/prometheus/metrics",
-            "/prometheus/metrics/",
-            "/version",
-            "/v1/models",
+        administrative = path.startswith("/checkpoint/") or (
+            scope.get("method") in ("GET", "HEAD")
+            and (
+                path == "/ready"
+                or path in self.passive_paths
+                or any(
+                    path == prefix or path.startswith(prefix + "/")
+                    for prefix in self.passive_prefixes
+                )
+            )
         )
         if scope["type"] != "http" or administrative:
             await self.app(scope, receive, send)
@@ -349,6 +385,8 @@ def register_checkpoint_routes(
     authenticate: Callable[[Request], Awaitable[None]],
     ingress: CheckpointIngress,
     check_health: Callable[[], bool],
+    passive_paths: frozenset[str],
+    passive_prefixes: tuple[str, ...] = (),
 ) -> None:
     """Register authenticated operations and gate public traffic independently.
 
@@ -358,10 +396,18 @@ def register_checkpoint_routes(
         authenticate: Route/body-bound runtime-control authentication dependency.
         ingress: Full HTTP response tracker shared with native preparation.
         check_health: Existing engine liveness check, independent of admission.
+        passive_paths: Read-only routes classified by the owning server.
+        passive_prefixes: Read-only mounts classified by the owning server.
     """
     dependencies = [Depends(authenticate)]
 
-    app.add_middleware(CheckpointAdmissionMiddleware, lifecycle=lifecycle, ingress=ingress)
+    app.add_middleware(
+        CheckpointAdmissionMiddleware,
+        lifecycle=lifecycle,
+        ingress=ingress,
+        passive_paths=passive_paths,
+        passive_prefixes=passive_prefixes,
+    )
 
     async def invoke(
         operation: Callable[[RequestModel], CheckpointResult], request: RequestModel
@@ -435,7 +481,11 @@ def register_checkpoint_routes(
         Returns:
             Recorded runtime validation result.
         """
-        return await invoke(lifecycle.validate_runtime, request)
+        binding = _PROBE_LOOP.set(asyncio.get_running_loop())
+        try:
+            return await invoke(lifecycle.validate_runtime, request)
+        finally:
+            _PROBE_LOOP.reset(binding)
 
     @app.post("/checkpoint/activate", dependencies=dependencies, response_model=CheckpointResult)
     async def activate(request: ActivateRequest) -> CheckpointResult | JSONResponse:

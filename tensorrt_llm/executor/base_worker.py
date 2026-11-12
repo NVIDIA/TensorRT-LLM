@@ -64,6 +64,7 @@ from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
+    from .._torch.pyexecutor.checkpoint import NativeCheckpoint
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
@@ -629,6 +630,23 @@ class BaseWorker(GenerationExecutor):
         except Exception as e:
             raise RequestError(str(e)) from e
 
+    def _native_checkpoint(self) -> "NativeCheckpoint | None":
+        """Find the native lifecycle without changing the generic engine protocol."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        return self.engine.checkpoint if isinstance(self.engine,
+                                                    PyExecutor) else None
+
+    def _is_checkpoint_leader(self) -> bool:
+        """Keep rank-zero response and cancellation handling alive while admission is closed."""
+        return self.rank == 0 and self._native_checkpoint() is not None
+
+    def _require_native_checkpoint(self) -> "NativeCheckpoint":
+        """Return enabled native controls, or reject unsupported worker RPCs."""
+        checkpoint = self._native_checkpoint()
+        if checkpoint is None:
+            raise RuntimeError("Checkpoint lifecycle support is not enabled.")
+        return checkpoint
+
     def checkpoint_profile(self) -> dict:
         """Read the fixed participant profile resolved at native startup.
 
@@ -638,12 +656,9 @@ class BaseWorker(GenerationExecutor):
         Raises:
             RuntimeError: If checkpoint lifecycle support is disabled.
         """
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-        if not isinstance(self.engine,
-                          PyExecutor) or self.engine.checkpoint is None:
-            raise RuntimeError("Checkpoint lifecycle support is not enabled.")
+        checkpoint = self._require_native_checkpoint()
         self.start()
-        return self.engine.checkpoint.profile.model_dump()
+        return checkpoint.profile.model_dump()
 
     def checkpoint_step(self,
                         step: str,
@@ -667,25 +682,16 @@ class BaseWorker(GenerationExecutor):
             RuntimeError: If lifecycle support is disabled or a participant fails.
             TimeoutError: If the native group exceeds its deadline.
         """
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-        if not isinstance(self.engine,
-                          PyExecutor) or self.engine.checkpoint is None:
-            raise RuntimeError("Checkpoint lifecycle support is not enabled.")
-        return self.engine.checkpoint.group_step(step, context,
-                                                 remaining_seconds,
-                                                 validation_token,
-                                                 source_session_id)
+        return self._require_native_checkpoint().group_step(
+            step, context, remaining_seconds, validation_token,
+            source_session_id)
 
     def checkpoint_fail_closed(self) -> None:
         """Revoke local admission after a controller operation fails.
 
         This does not claim distributed cleanup or authorize resource reuse.
         """
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-        if not isinstance(self.engine,
-                          PyExecutor) or self.engine.checkpoint is None:
-            raise RuntimeError("Checkpoint lifecycle support is not enabled.")
-        self.engine.checkpoint.fail_closed()
+        self._require_native_checkpoint().fail_closed()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """

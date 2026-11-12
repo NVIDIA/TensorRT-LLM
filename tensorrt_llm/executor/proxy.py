@@ -78,8 +78,8 @@ __all__ = [
 # get_memory_report() is answered by rank-0, which in the memory monitor's
 # full mode gathers the other ranks' reports over its own communicator.
 _MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({
-    "get_memory_report", "get_memory_status", "sleep", "wakeup", "checkpoint_profile",
-    "checkpoint_step", "checkpoint_fail_closed"
+    "get_memory_report", "get_memory_status", "sleep", "wakeup",
+    "checkpoint_profile", "checkpoint_step", "checkpoint_fail_closed"
 })
 
 

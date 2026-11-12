@@ -3215,10 +3215,12 @@ class PyExecutor:
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
     def get_memory_status(self) -> dict[str, object]:
-        state, parked_tags = self.executor_request_queue.get_memory_status()
+        state, parked_tags, failure_reason = self.executor_request_queue.get_memory_status(
+        )
         return {
             "state": state.value,
             "parked_tags": sorted(parked_tags),
+            "failure_reason": failure_reason,
         }
 
     def get_request_admission_state(self) -> RequestAdmissionState:
@@ -5097,16 +5099,11 @@ class PyExecutor:
                         error_msg = (
                             "rank 0 aborted sleep/wakeup before local "
                             f"execution: {msg.get('reason', 'unknown error')}")
-                        active_control_id = getattr(self, "_active_control_id",
-                                                    None)
-                        if op_id is None:
-                            release_control_request = False
-                        else:
-                            if (not self.control_request_barrier.is_set()
-                                    or active_control_id != op_id):
-                                self._record_sleep_wakeup_abort(
-                                    op_id, error_msg)
-                                release_control_request = False
+                        release_control_request = False
+                        if op_id is not None:
+                            self._record_sleep_wakeup_abort(op_id,
+                                                            error_msg,
+                                                            release_active=True)
                             abort_acknowledged = True
                         logger.warning(f"Sleep/wakeup listener: {error_msg}")
                     elif action in (_SleepWakeupAction.PREPARE,
@@ -8394,7 +8391,10 @@ class PyExecutor:
                         control_id,
                         "Scheduler drain timed out.",
                         release_active=True)
-                self.executor_request_queue.fail_sleep_wakeup_transition()
+                if owner:
+                    self.executor_request_queue.fail_checkpoint()
+                else:
+                    self.executor_request_queue.fail_sleep_wakeup_transition()
                 raise TimeoutError(
                     "Timed out draining the scheduler for control.")
             try:
