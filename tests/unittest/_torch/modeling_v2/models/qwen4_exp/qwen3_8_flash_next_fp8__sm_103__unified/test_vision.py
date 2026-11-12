@@ -544,29 +544,71 @@ def _hf_video_in_two_calls(tower, media, references, monkeypatch):
     _check("video in two calls", out, *references["video"])
 
 
+def _counted_runs(tower, monkeypatch) -> list:
+    """The patch rows of each `_run` call `tower` makes from here on."""
+    runs = []
+    run = tower._run
+
+    def counted(pixel_values, grid):
+        runs.append(pixel_values.shape[0])
+        return run(pixel_values, grid)
+
+    monkeypatch.setattr(tower, "_run", counted)
+    return runs
+
+
+def _spliced_in_chunks(tower, data, bounds):
+    """The rows `multimodal_embeds` splices for each `(start, end)` chunk of one request whose
+    `multimodal_data` is `data`, the one dict the executor hands all of a request's chunks."""
+    total = bounds[-1][1]
+    chunks = []
+    for start, end in bounds:
+        runtime = SimpleNamespace(
+            num_cached_mm_tokens=start,
+            num_mm_tokens_in_chunk=end - start,
+            total_embeds_in_request=total,
+        )
+        params = MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
+        kwargs = {"multimodal_params": [params], "mm_token_indices": torch.arange(end - start)}
+        chunks.append(V.multimodal_embeds(tower, kwargs)[0])
+    assert V._TOWER_ROWS_KEY not in data, "the chunk with the last row drops the kept rows"
+    return torch.cat(chunks)
+
+
+def _hf_image_in_chunks(tower, media, references, monkeypatch):
+    """One image spliced over three chunked-prefill chunks: the tower runs once, in the first
+    chunk, and the later chunks read its kept rows, bitwise the one-pass rows."""
+    px, grid = media["image0"]
+    total = int(grid.prod(-1).sum()) // tower.merge**2
+    data = {
+        "mrope_config": {"mrope_position_ids": torch.zeros(3, 1, 8, dtype=torch.int32)},
+        "image": {"pixel_values": px, "image_grid_thw": grid},
+    }
+    with torch.inference_mode():
+        whole = tower(px, grid)
+        runs = _counted_runs(tower, monkeypatch)
+        out = _spliced_in_chunks(tower, data, ((0, 100), (100, 200), (200, total)))
+    assert runs == [px.shape[0]], runs
+    assert torch.equal(out, whole), _mismatch(out, whole)
+    _check("image in three chunks", out, *references["image0"])
+
+
 def _hf_video_in_chunks(tower, media, references, monkeypatch):
     """The video spliced over three chunked-prefill chunks whose boundaries cut its two 96-row
-    frames: each chunk runs only the frames holding its rows, and together they are the one-pass
-    rows bitwise."""
+    frames: each frame runs once, in the first chunk holding its rows, and together the chunks
+    are the one-pass rows bitwise."""
     px, grid = media["video"]
     total = int(grid.prod(-1).sum()) // tower.merge**2
     data = {
         "mrope_config": {"mrope_position_ids": torch.zeros(3, 1, 8, dtype=torch.int32)},
         "video": {"pixel_values_videos": px, "video_grid_thw": grid},
     }
-    chunks = []
     with torch.inference_mode():
         whole = tower(px, grid)
-        for start, end in ((0, 50), (50, 150), (150, total)):
-            runtime = SimpleNamespace(
-                num_cached_mm_tokens=start,
-                num_mm_tokens_in_chunk=end - start,
-                total_embeds_in_request=total,
-            )
-            params = MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
-            kwargs = {"multimodal_params": [params], "mm_token_indices": torch.arange(end - start)}
-            chunks.append(V.multimodal_embeds(tower, kwargs)[0])
-    out = torch.cat(chunks)
+        runs = _counted_runs(tower, monkeypatch)
+        out = _spliced_in_chunks(tower, data, ((0, 50), (50, 150), (150, total)))
+    frame = px.shape[0] // 2
+    assert runs == [frame, frame], runs
     assert torch.equal(out, whole), _mismatch(out, whole)
     _check("video in three chunks", out, *references["video"])
 
@@ -578,6 +620,7 @@ _HF_CASES = {
     "image_pair": _hf_pair(),
     "image_pair_two_calls": _hf_pair(cap=1176),
     "video_two_calls": _hf_video_in_two_calls,
+    "image_chunks": _hf_image_in_chunks,
     "video_chunks": _hf_video_in_chunks,
 }
 
@@ -832,3 +875,21 @@ def test_the_splice_puts_each_items_rows_on_its_placeholders(
     assert vision[1] is indices
     assert h[1 : 1 + num_rows, 0].tolist() == want
     assert torch.all(h[0] == -1.0) and torch.all(h[total - 1] == -1.0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("chunk", range(1, len(MIXED_ROWS) + 1))
+def test_a_chunked_request_runs_each_frame_once(chunk):
+    """Over all of one request's chunks the tower runs each frame once (the one-pass 68 patch
+    rows) and the chunks splice the one-pass rows; the last chunk drops the kept rows."""
+    tower = _Tower()
+    params = _params(**_MIXED)
+    spliced = []
+    for start in range(0, len(MIXED_ROWS), chunk):
+        count = min(chunk, len(MIXED_ROWS) - start)
+        params.multimodal_runtime = _chunk(start, count)
+        kwargs = {"multimodal_params": [params], "mm_token_indices": torch.arange(count)}
+        spliced += V.multimodal_embeds(tower, kwargs)[0][:, 0].tolist()
+    assert spliced == MIXED_ROWS
+    assert tower.patches == 68, (tower.calls, tower.patches)
+    assert V._TOWER_ROWS_KEY not in params.multimodal_data
