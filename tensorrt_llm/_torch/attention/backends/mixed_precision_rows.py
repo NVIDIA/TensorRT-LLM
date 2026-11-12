@@ -10,7 +10,6 @@ are copied to the layer's own blocks so they are complete when the window releas
 
 from typing import TYPE_CHECKING
 
-import torch
 import triton
 import triton.language as tl
 
@@ -95,51 +94,6 @@ def _store_mixed_precision_low_rows_kernel(
         )
 
 
-def _copy_held_block_rows(
-    metadata: "TrtllmAttentionMetadata",
-    local_layer: int,
-    src_offsets: torch.Tensor,
-    dst_offsets: torch.Tensor,
-    ends: torch.Tensor,
-    counts: torch.Tensor,
-    max_count: int,
-) -> None:
-    """Copy positions `[end - count, end)` of each request's held blocks from the blocks at
-    `src_offsets` to the blocks at `dst_offsets`."""
-    manager = metadata.kv_cache_manager
-    high_table = metadata.mixed_precision_high_block_table
-    # The pool in its own layout as rows of one head's bytes; block offsets count K/V blocks.
-    layout = metadata.kv_layout
-    pool = manager._get_mixed_precision_buffers(local_layer, layout, "low")
-    heads, tokens = (
-        (pool.shape[2], pool.shape[3]) if layout == "HND" else (pool.shape[3], pool.shape[2])
-    )
-    head_stride, token_stride = (tokens, 1) if layout == "HND" else (1, heads)
-    pool_rows = pool.view(-1, pool.shape[4])
-    tokens_per_program = 16
-    _store_mixed_precision_low_rows_kernel[
-        (metadata.num_seqs, triton.cdiv(max_count, tokens_per_program), pool.shape[1])
-    ](
-        pool_rows,
-        high_table,
-        high_table.stride(0),
-        src_offsets,
-        dst_offsets,
-        src_offsets.stride(0),
-        src_offsets.stride(1),
-        ends,
-        counts,
-        tokens,
-        high_table.shape[1],
-        heads,
-        head_stride,
-        token_stride,
-        ROW_WIDTH=pool_rows.shape[1],
-        BLOCK_T=tokens_per_program,
-        BLOCK_W=128,
-    )
-
-
 def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> None:
     """Copy this step's rows of the held blocks from the high layer's blocks to the layer's own.
 
@@ -151,41 +105,42 @@ def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_id
     if num_seqs == 0:
         return
     pool_id = int(manager.impl.get_layer_group_id(local_layer))
-    # From the block offsets as attention used them (held blocks point at the high layer's
-    # blocks) to the layer's own block offsets saved before that redirect. This step's new tokens
-    # per request are the query lengths, which speculative decoding corrects on the device before
-    # a draft step (seq_lens_kv keeps a separate, uncorrected copy under CUDA graphs).
-    _copy_held_block_rows(
-        metadata,
-        local_layer,
-        metadata.kv_cache_block_offsets[pool_id],
-        metadata.mixed_precision_low_block_offsets[pool_id],
+    # Block offsets as attention used them (held blocks point at the high layer's blocks) and
+    # the layer's own block offsets saved before that redirect.
+    redirected_offsets = metadata.kv_cache_block_offsets[pool_id]
+    own_offsets = metadata.mixed_precision_low_block_offsets[pool_id]
+    high_table = metadata.mixed_precision_high_block_table
+    # The pool in its own layout as rows of one head's bytes; block offsets count K/V blocks.
+    layout = metadata.kv_layout
+    pool = manager._get_mixed_precision_buffers(local_layer, layout, "low")
+    heads, tokens = (
+        (pool.shape[2], pool.shape[3]) if layout == "HND" else (pool.shape[3], pool.shape[2])
+    )
+    head_stride, token_stride = (tokens, 1) if layout == "HND" else (1, heads)
+    pool_rows = pool.view(-1, pool.shape[4])
+    # This step's new tokens per request: the query lengths, which speculative decoding corrects
+    # on the device before a draft step (seq_lens_kv keeps a separate, uncorrected copy under
+    # CUDA graphs).
+    max_new_tokens = int(metadata.seq_lens[:num_seqs].max())
+    tokens_per_program = 16
+    _store_mixed_precision_low_rows_kernel[
+        (num_seqs, triton.cdiv(max_new_tokens, tokens_per_program), pool.shape[1])
+    ](
+        pool_rows,
+        high_table,
+        high_table.stride(0),
+        redirected_offsets,
+        own_offsets,
+        redirected_offsets.stride(0),
+        redirected_offsets.stride(1),
         metadata.kv_lens_cuda_runtime,
         metadata.seq_lens_cuda[:num_seqs],
-        int(metadata.seq_lens[:num_seqs].max()),
-    )
-
-
-def restore_mixed_precision_high_rows_from_low(
-    metadata: "TrtllmAttentionMetadata", layer_idx: int
-) -> None:
-    """Fill the fresh last-N high blocks of the restoring requests from the layer's own blocks.
-
-    Called only for a layer that has a high layer, before attention reads it.
-    """
-    restore = metadata.mixed_precision_high_restore_spans
-    if restore is None:
-        return
-    manager = metadata.kv_cache_manager
-    local_layer = manager.layer_offsets[layer_idx]
-    pool_id = int(manager.impl.get_layer_group_id(local_layer))
-    ends, counts, max_count = restore
-    _copy_held_block_rows(
-        metadata,
-        local_layer,
-        metadata.mixed_precision_low_block_offsets[pool_id],
-        metadata.kv_cache_block_offsets[pool_id],
-        ends,
-        counts,
-        max_count,
+        tokens,
+        high_table.shape[1],
+        heads,
+        head_stride,
+        token_stride,
+        ROW_WIDTH=pool_rows.shape[1],
+        BLOCK_T=tokens_per_program,
+        BLOCK_W=128,
     )

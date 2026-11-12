@@ -114,13 +114,7 @@ class MixedPrecisionKVStaging:
         batch = len(lengths)
         max_pages = -(-self.max_seq_len // self.block_size)
         # Context forwards, the only ones that restore, never run in a captured graph.
-        pending = manager.mixed_precision_restore_requests
-        restore_rows = []
-        if pending:
-            restore_rows = [
-                row for row, request_id in enumerate(request_ids) if request_id in pending
-            ]
-            pending.difference_update(request_ids[row] for row in restore_rows)
+        restore_spans = manager.take_mixed_precision_restore_spans(request_ids, cached_lengths)
         self.page_tables = {}
         self.restores = {}
         for layer_idx in self.pools:
@@ -132,8 +126,8 @@ class MixedPrecisionKVStaging:
                 (2, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )
             manager.fill_mixed_precision_page_tables(request_ids, owner, tables.numpy())
-            if restore_rows:
-                self._prepare_restore(owner, tables, restore_rows, cached_lengths)
+            if restore_spans:
+                self._prepare_restore(owner, tables, restore_spans)
             self.page_tables[layer_idx] = buffers.get_buffer(
                 (2, self.rows, max_pages),
                 torch.int32,
@@ -158,31 +152,19 @@ class MixedPrecisionKVStaging:
         ) * self.tokens_per_block
 
     def _prepare_restore(
-        self,
-        owner: int,
-        tables: torch.Tensor,
-        rows: Sequence[int],
-        cached_lengths: Sequence[int],
+        self, owner: int, tables: torch.Tensor, restore_spans: Sequence[Tuple[int, int, int]]
     ) -> None:
-        """Plan restoring the fresh last-N pages of `rows` from the low pool.
-
-        The read decodes the cached tokens of those pages from the low pool instead of copying
-        their uninitialized high pages; a second pass copies them to the high pages.
-        """
+        """Plan restoring `restore_spans`, (batch row, first token, end token) each: the read
+        decodes those tokens from the low pool instead of their fresh high pages, and a second pass
+        copies them to the high pages."""
         read, restore = tables.clone(), tables.clone()
         # The low pool already holds these tokens.
         restore[0] = -1
         spans = torch.zeros((2, tables.shape[1]), dtype=torch.int32)
-        # The sink pages came with the prefix; every later page a request holds is fresh.
-        sinks = -(-self.manager.first_n // self.block_size)
-        for row in rows:
-            fresh = torch.nonzero(read[1, row, sinks:] >= 0)
-            if len(fresh) == 0:
-                continue
-            first = sinks + int(fresh[0])
-            read[1, row, first:] = -1
-            spans[0, row] = min(first * self.block_size, cached_lengths[row])
-            spans[1, row] = cached_lengths[row]
+        for row, start, end in restore_spans:
+            if start < end:
+                read[1, row, start // self.block_size :] = -1
+                spans[0, row], spans[1, row] = start, end
         capacity = int((spans[1] - spans[0]).max())
         if capacity > 0:
             self.restores[owner] = (

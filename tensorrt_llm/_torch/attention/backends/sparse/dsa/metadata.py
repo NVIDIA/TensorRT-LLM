@@ -20,10 +20,7 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
-from ..mixed_precision_high_rows import (
-    mixed_precision_high_restore_rows,
-    take_mixed_precision_high_restore,
-)
+from ..mixed_precision_high_rows import mixed_precision_high_restore_rows
 from ..offload import (
     SparseOffloadState,
     allocate_sparse_offload_state,
@@ -535,14 +532,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prepare_for_indexer_k_cache()
         # Restoring requests fill their fresh last-N high rows in this forward; MTP layers on the
         # draft manager restore their own.
+        contexts = self.request_ids[: self.num_contexts]
         if self.mixed_precision_high_block_table is not None:
             self.mixed_precision_high_restore = mixed_precision_high_restore_rows(
-                take_mixed_precision_high_restore(self, self.kv_cache_manager, cached_token_lens)
+                self.kv_cache_manager.take_mixed_precision_restore_spans(
+                    contexts, cached_token_lens
+                )
             )
         if self.draft_mixed_precision_high_block_table is not None:
             self.draft_mixed_precision_high_restore = mixed_precision_high_restore_rows(
-                take_mixed_precision_high_restore(
-                    self, self.draft_kv_cache_manager, cached_token_lens
+                self.draft_kv_cache_manager.take_mixed_precision_restore_spans(
+                    contexts, cached_token_lens
                 )
             )
 

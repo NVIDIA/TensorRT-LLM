@@ -171,17 +171,14 @@ forward converts up to the longest sequence in the batch for every
 mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
-With block reuse, the high-precision copy of a cached prefix's most recent
-tokens can be evicted while its NVFP4 history is still cached. Reuse then stops
-where the high-precision copy is still complete, and the rest of the prefix is
-recomputed. Set `mixed_precision_reuse_last_n_from_low: true` to reuse the
-whole prefix instead: the first forward restores the missing high-precision
-tokens from the NVFP4 history, so those tokens keep NVFP4 precision. Also set
-`mixed_precision_recompute_last_n: true` to recompute those tokens instead: the
-prefix is reused only up to before them, so they keep the high precision at the
-cost of recomputing N tokens. Both options work the same way with the cold-page
-first/last-N window of [cold-page quantization](kv-cache-compression.md), where
-the restore copies the tokens from the history pages at the runtime KV type.
+With block reuse, the high-precision copy of a cached prefix's last N tokens
+can be evicted while its NVFP4 history is still cached; reuse then stops where
+that copy is complete. `mixed_precision_reuse_last_n_from_low: true` reuses the
+whole prefix and restores those tokens from the NVFP4 history, at NVFP4
+precision. `mixed_precision_recompute_last_n: true` also set reuses the prefix
+up to before them and recomputes them in high precision. The cold-page
+first/last-N window of [cold-page quantization](kv-cache-compression.md) restores
+from its history pages, at the runtime KV type.
 
 The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
 FlashInfer attention backend. It supports the standard V2 manager (dense

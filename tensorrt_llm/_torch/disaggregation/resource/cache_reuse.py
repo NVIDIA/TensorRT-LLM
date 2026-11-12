@@ -142,21 +142,16 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
             if status.complete:
                 cached.append(min(scalar, status.endpoint // tpb * tpb))
             elif status.policy == ReusePolicy.SINK_REQUIRED_ONLY:
-                # The transfer must not write the shared sink pages.
-                cached.append(min(scalar, self._sink_tokens(group)))
+                # The transfer must not write the shared sink pages, whole blocks of them.
+                layer = next(
+                    layer
+                    for layer in self._mgr.kv_cache_manager_py_config.layers
+                    if self._mgr.layer_to_pool_mapping_dict[layer.layer_id] == group
+                )
+                cached.append(min(scalar, -(-layer.num_sink_tokens // tpb) * tpb))
             else:
                 cached.append(0)
         return cached
-
-    def _sink_tokens(self, group: int) -> int:
-        """Tokens in the sink blocks of a layer group, rounded up to whole blocks."""
-        tpb = self.tokens_per_block
-        layer = next(
-            layer
-            for layer in self._mgr.kv_cache_manager_py_config.layers
-            if self._mgr.layer_to_pool_mapping_dict[layer.layer_id] == group
-        )
-        return -(-layer.num_sink_tokens // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         # V2 already returns per-cache-level pool slot indices (not logical block

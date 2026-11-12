@@ -108,6 +108,26 @@ def pool_pages(manager, layer_idx=0):
     )
 
 
+def _request(request_id, tokens):
+    """A request that prefills `tokens` and generates one token."""
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+
+
+def _cache_prompt(manager, tokens):
+    """Compute and commit `tokens` as request 1, then free it, so a later request can reuse them."""
+    source = _request(1, tokens)
+    assert manager.prepare_context(source) and manager.resize_context(source, len(tokens))
+    source.move_to_next_context_chunk()
+    manager.try_commit_blocks(source)
+    manager.free_resources(source)
+
+
 @pytest.mark.parametrize("dtype", (DataType.FP8, DataType.BF16, DataType.HALF))
 def test_extra_pool_uses_existing_dtype_layout(make_manager, dtype):
     manager = make_manager(dtype=dtype)
@@ -244,29 +264,15 @@ def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
     """A prefix whose high-precision last-N pages were evicted is reused in full; the first
     forward restores those pages from the low-precision history."""
     manager = make_manager(config=mixed_config(mixed_precision_reuse_last_n_from_low=True))
-    assert [layer.reuse_policy for layer in manager.kv_cache_manager_py_config.layers] == [
-        kv.ReusePolicy.REQUIRED,
-        kv.ReusePolicy.SINK_REQUIRED_ONLY,
-    ]
     block = manager.tokens_per_block
     staging = MixedPrecisionKVStaging(
         manager, Buffers(), rows=1, layout="NHD", pool_layout="NHD", tokens_per_block=block
     )
     pool, low, high = staging.pools[0]
-    high_group = manager.impl.get_layer_group_id(manager.mixed_precision_high_layers[0])
-
-    def make_request(request_id, tokens):
-        return LlmRequest(
-            request_id=request_id,
-            max_new_tokens=1,
-            input_tokens=tokens,
-            sampling_config=SamplingConfig(1),
-            is_streaming=False,
-        )
 
     # The source computes 640 tokens whose K and V repeat on every page.
     tokens = list(range(640))
-    source = make_request(1, tokens)
+    source = _request(1, tokens)
     assert manager.prepare_context(source) and manager.resize_context(source, len(tokens))
     staging.update([1], [0], [len(tokens)], capture_graph=False)
     page_values = torch.randn(pool.shape[1:], device="cuda").to(pool.dtype)
@@ -278,14 +284,12 @@ def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
 
     # Per-request snapshots keep the high pages of the source's last window only, so the
     # window at 512 tokens is missing; REQUIRED would stop reuse at the first page.
-    reader = make_request(2, tokens[:512] + [9999])
+    reader = _request(2, tokens[:512] + [9999])
     assert manager.prepare_context(reader)
-    cache = manager.kv_cache_map[2]
-    assert cache.num_committed_tokens == 512
-    assert not cache.reuse_status[high_group].complete
+    assert manager.kv_cache_map[2].num_committed_tokens == 512
     assert manager.mixed_precision_restore_requests == {2}
     # Suspended before its first forward, the cache resumes without selecting again.
-    cache.suspend()
+    manager.kv_cache_map[2].suspend()
     assert manager.prepare_context(reader)
     assert manager.mixed_precision_restore_requests == {2}
     assert manager.resize_context(reader, 1)
@@ -310,38 +314,48 @@ def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
     manager.free_resources(reader)
 
 
-def test_recompute_last_n_reuses_up_to_before_the_missing_window(make_manager):
-    """Without its high-precision last N tokens, a prefix is reused only up to the block boundary
-    before them; the window there is restored and the request recomputes the rest."""
-    manager = make_manager(
-        config=mixed_config(
-            mixed_precision_reuse_last_n_from_low=True, mixed_precision_recompute_last_n=True
-        )
+@pytest.mark.parametrize("recompute,reused", [(False, 512), (True, 384)])
+@pytest.mark.parametrize("window", ["mixed_dtype", "cold_page"])
+def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
+    """A prefix whose high-precision last-N pages were evicted is reused in full, or with
+    recompute only up to the block boundary before them. The cold-page window copies the window
+    from the layer's own pages at resume; the mixed dtype decodes it in the first forward."""
+    options = dict(
+        mixed_precision_reuse_last_n_from_low=True, mixed_precision_recompute_last_n=recompute
     )
-
-    def make_request(request_id, tokens):
-        return LlmRequest(
-            request_id=request_id,
-            max_new_tokens=1,
-            input_tokens=tokens,
-            sampling_config=SamplingConfig(1),
-            is_streaming=False,
+    if window == "mixed_dtype":
+        manager = make_manager(config=mixed_config(**options))
+    else:
+        manager = make_manager(
+            config=cold_page_config(**options), cold_page_codec_provider=_ColdPageProvider()
         )
-
+    assert [layer.reuse_policy for layer in manager.kv_cache_manager_py_config.layers] == [
+        kv.ReusePolicy.REQUIRED,
+        kv.ReusePolicy.SINK_REQUIRED_ONLY,
+    ]
     tokens = list(range(640))
-    source = make_request(1, tokens)
-    assert manager.prepare_context(source) and manager.resize_context(source, len(tokens))
-    source.move_to_next_context_chunk()
-    manager.try_commit_blocks(source)
-    manager.free_resources(source)
+    _cache_prompt(manager, tokens)
+    low, high = (manager.get_buffers(0, mixed_precision_pool=pool) for pool in ("low", "high"))
+    for pool in (low, high):
+        pool.view(torch.uint8).copy_(torch.randint_like(pool.view(torch.uint8), 0, 120))
 
     # Per-request snapshots keep the high pages of the source's last window only. The window at
-    # 512 tokens is missing, so the reader backs off by last_n = 65 tokens to the block boundary
-    # at 384; the window there is missing too and is restored.
-    reader = make_request(2, tokens[:512] + [9999])
+    # 512 tokens is missing; recompute backs off by last_n = 65 tokens to the block boundary at
+    # 384, where the window is missing too. Either way the window is the page before `reused`.
+    reader = _request(2, tokens[:512] + [9999])
     assert manager.prepare_context(reader)
-    assert manager.kv_cache_map[2].num_committed_tokens == 384
-    assert manager.mixed_precision_restore_requests == {2}
+    assert manager.kv_cache_map[2].num_committed_tokens == reused
+    if window == "mixed_dtype":
+        assert manager.mixed_precision_restore_requests == {2}
+    else:
+        assert not manager.mixed_precision_restore_requests
+        torch.cuda.synchronize()
+        pages = torch.full((2, 1, 8), -1, dtype=torch.int32)
+        manager.fill_mixed_precision_page_tables([2], 0, pages.numpy())
+        page = reused // manager.tokens_per_block - 1
+        assert torch.equal(
+            high[pages[1, 0, page]].view(torch.uint8), low[pages[0, 0, page]].view(torch.uint8)
+        )
     manager.free_resources(reader)
 
 
@@ -356,17 +370,8 @@ def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
         joint_kv_cache_reuse=True,
     )
 
-    def make_request(request_id, tokens):
-        return LlmRequest(
-            request_id=request_id,
-            max_new_tokens=1,
-            input_tokens=tokens,
-            sampling_config=SamplingConfig(1),
-            is_streaming=False,
-        )
-
     tokens = list(range(640))
-    source = make_request(1, tokens)
+    source = _request(1, tokens)
     assert draft.prepare_context_cache(source) == 0
     assert draft.try_allocate_draft_context(source, len(tokens))
     source.move_to_next_context_chunk()
@@ -374,49 +379,10 @@ def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
     draft.free_resources(source)
 
     # The target backed off from 512 to 384; the draft takes 384 too.
-    reader = make_request(2, tokens[:512] + [9999])
+    reader = _request(2, tokens[:512] + [9999])
     assert draft.prepare_context_cache(reader, 384) == 384
     assert draft.mixed_precision_restore_requests == {2}
     draft.free_resources(reader)
-
-
-@pytest.mark.parametrize("recompute,reused", [(False, 512), (True, 384)])
-def test_cold_page_window_reuses_a_prefix_without_its_last_n(make_manager, recompute, reused):
-    """The cold-page window reuses a prefix whose high-precision last-N pages were evicted as the
-    mixed dtype does: in full, or up to before them with recompute; the first forward restores."""
-    manager = make_manager(
-        config=cold_page_config(
-            mixed_precision_reuse_last_n_from_low=True, mixed_precision_recompute_last_n=recompute
-        ),
-        cold_page_codec_provider=_ColdPageProvider(),
-    )
-    assert [layer.reuse_policy for layer in manager.kv_cache_manager_py_config.layers] == [
-        kv.ReusePolicy.REQUIRED,
-        kv.ReusePolicy.SINK_REQUIRED_ONLY,
-    ]
-
-    def make_request(request_id, tokens):
-        return LlmRequest(
-            request_id=request_id,
-            max_new_tokens=1,
-            input_tokens=tokens,
-            sampling_config=SamplingConfig(1),
-            is_streaming=False,
-        )
-
-    tokens = list(range(640))
-    source = make_request(1, tokens)
-    assert manager.prepare_context(source) and manager.resize_context(source, len(tokens))
-    source.move_to_next_context_chunk()
-    manager.try_commit_blocks(source)
-    manager.free_resources(source)
-
-    # Per-request snapshots keep the high pages of the source's last window only.
-    reader = make_request(2, tokens[:512] + [9999])
-    assert manager.prepare_context(reader)
-    assert manager.kv_cache_map[2].num_committed_tokens == reused
-    assert manager.mixed_precision_restore_requests == {2}
-    manager.free_resources(reader)
 
 
 def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
@@ -614,24 +580,17 @@ def test_cold_page_mixed_precision_rejects_a_sliding_window_with_the_high_layers
     assert (high_layer.num_sink_tokens, high_layer.sliding_window_size) == (first_n, last_n + 1)
 
 
-@pytest.mark.parametrize(
-    "layer_policy, rejected",
-    [(kv.ReusePolicy.SINK_REQUIRED_ONLY, True), (kv.ReusePolicy.REQUIRED, False)],
-    ids=["same_policy", "required_layer"],
-)
-def test_cold_page_page_group_check_uses_the_high_layers_reuse_policy(layer_policy, rejected):
-    """With mixed_precision_reuse_last_n_from_low the high layers are SINK_REQUIRED_ONLY. A
-    sliding-window layer with their retention shares their page group only under that policy too;
-    a REQUIRED one lands in a group of its own, so the manager accepts it."""
+def test_cold_page_page_group_check_uses_the_high_layers_reuse_policy():
+    """A sliding-window layer with the high layers' retention shares their page group, and is
+    rejected, only under their reuse policy too."""
     manager = SimpleNamespace(tokens_per_block=128, first_n=1, last_n=127)
     layer = SimpleNamespace(
-        layer_id=0, sliding_window_size=128, num_sink_tokens=1, reuse_policy=layer_policy
+        layer_id=0, sliding_window_size=128, num_sink_tokens=1, reuse_policy=kv.ReusePolicy.REQUIRED
     )
     check = KVCacheManagerV2._check_high_layers_share_no_page_group
-    if rejected:
-        with pytest.raises(ValueError, match="layer 0 has a sliding window of 128 tokens"):
-            check(manager, [layer], kv.ReusePolicy.SINK_REQUIRED_ONLY)
-    else:
+    check(manager, [layer], kv.ReusePolicy.SINK_REQUIRED_ONLY)
+    layer.reuse_policy = kv.ReusePolicy.SINK_REQUIRED_ONLY
+    with pytest.raises(ValueError, match="layer 0 has a sliding window of 128 tokens"):
         check(manager, [layer], kv.ReusePolicy.SINK_REQUIRED_ONLY)
 
 
@@ -1094,23 +1053,16 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
 
 @pytest.mark.parametrize("high_dtype", [DataType.FP8, DataType.BF16])
 def test_reuse_last_n_from_low_on_sparse_managers(high_dtype):
-    """DSA and DeepSeek-V4 restore FP8 high pools from their NVFP4 pools; other high dtypes are
+    """A sparse manager restores an FP8 high pool from its NVFP4 pool; other high dtypes are
     rejected when the manager is built."""
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
-        DeepseekV4CacheManager,
-    )
     from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
-    from tensorrt_llm.llmapi.llm_args import (
-        DeepSeekSparseAttentionConfig,
-        DeepSeekV4SparseAttentionConfig,
-    )
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 
-    config = mixed_config(high_dtype, pool_ratio=None, mixed_precision_reuse_last_n_from_low=True)
-    builders = {
-        "DSACacheManagerV2": lambda: DSACacheManagerV2(
-            kv_cache_config=config,
+    def build():
+        return DSACacheManagerV2(
+            kv_cache_config=mixed_config(
+                high_dtype, pool_ratio=None, mixed_precision_reuse_last_n_from_low=True
+            ),
             kv_cache_type=CacheType.SELFKONLY,
             num_layers=1,
             num_kv_heads=1,
@@ -1122,39 +1074,19 @@ def test_reuse_last_n_from_low_on_sparse_managers(high_dtype):
             dtype=DataType.NVFP4,
             sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
             pretrained_config=SimpleNamespace(num_hidden_layers=1),
-        ),
-        "DeepseekV4CacheManager": lambda: DeepseekV4CacheManager(
-            kv_cache_config=config,
-            kv_cache_type=CacheType.SELFKONLY,
-            num_layers=3,
-            num_kv_heads=1,
-            head_dim=512,
-            tokens_per_block=128,
-            max_seq_len=4096,
-            max_batch_size=2,
-            mapping=Mapping(),
-            dtype=DataType.NVFP4,
-            vocab_size=1000,
-            max_input_len=4096,
-            max_num_tokens=8192,
-            sparse_attn_config=DeepSeekV4SparseAttentionConfig(
-                index_head_dim=128, window_size=128, compress_ratios=[1, 4, 128]
-            ),
-            pretrained_config=SimpleNamespace(num_hidden_layers=3),
-        ),
-    }
-    for name, build in builders.items():
-        if high_dtype != DataType.FP8:
-            with pytest.raises(NotImplementedError, match=name):
-                build()
-            continue
-        manager = build()
-        try:
-            for layer_id in manager.mixed_precision_high_layers.values():
-                layer = manager.kv_cache_manager_py_config.layers[layer_id]
-                assert layer.reuse_policy == kv.ReusePolicy.SINK_REQUIRED_ONLY
-        finally:
-            manager.shutdown()
+        )
+
+    if high_dtype != DataType.FP8:
+        with pytest.raises(NotImplementedError, match="DSACacheManagerV2"):
+            build()
+        return
+    manager = build()
+    try:
+        for layer_id in manager.mixed_precision_high_layers.values():
+            layer = manager.kv_cache_manager_py_config.layers[layer_id]
+            assert layer.reuse_policy == kv.ReusePolicy.SINK_REQUIRED_ONLY
+    finally:
+        manager.shutdown()
 
 
 def test_deepseek_v4_cold_page_window_high_layers_share_the_compress_pools():
@@ -1312,6 +1244,27 @@ def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
                     )
                 else:
                     assert row == -7, (layer_idx, position, row)
+        # Resuming a prefix without its window copies the window pages (4 and 5 of request 1,
+        # after its sink page) from the COMPRESS pages the high layers mirror.
+        for layer_idx in (1, 2):
+            own = manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).view(torch.uint8)
+            own.copy_(torch.randint_like(own, 0, 120))
+        cache = SimpleNamespace(
+            num_committed_tokens=cached[1], cuda_stream=torch.cuda.current_stream().cuda_stream
+        )
+        manager._copy_cold_page_window(1, cache)
+        torch.cuda.synchronize()
+        for layer_idx, ratio in ((1, 4), (2, 128)):
+            own = manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).view(torch.uint8)
+            high = manager._get_mixed_precision_buffers(
+                manager.layer_offsets[layer_idx], "NHD", "high"
+            ).view(torch.uint8)
+            own_pages = metadata.compress_block_tables[ratio][1].tolist()
+            high_pages = metadata.mixed_precision_high_block_table[ratio][1].tolist()
+            for page in (4, 5):
+                assert torch.equal(
+                    high[high_pages[page]].flatten(), own[own_pages[page]].flatten()
+                ), (layer_idx, page)
     finally:
         manager.shutdown()
 

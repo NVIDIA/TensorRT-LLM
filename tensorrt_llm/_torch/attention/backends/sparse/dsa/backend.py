@@ -20,7 +20,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import MlaLatentWriteTarget, TrtllmAttention
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
-from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..mixed_precision_high_rows import (
@@ -71,23 +70,6 @@ def _get_nvfp4_mla_kv_cache_amax() -> float:
             f"{_NVFP4_MLA_KV_CACHE_AMAX_ENV} must be a positive finite float, got {value!r}"
         )
     return amax
-
-
-def _mixed_precision_restore_pool_rows(
-    metadata: DSAtrtllmAttentionMetadata, page_index_scale: int, layer_offset: int
-) -> torch.Tensor:
-    """Pool rows of the positions this forward restores, indexed as the sparse read indexes them."""
-    requests, positions = metadata.mixed_precision_high_restore
-    tokens_per_block = metadata._cached_tokens_per_block
-    return torch.ops.trtllm.convert_req_index_to_global(
-        requests,
-        metadata._cached_block_table_ctx,
-        positions.view(-1, 1),
-        tokens_per_block,
-        1,
-        page_index_scale * tokens_per_block,
-        layer_offset,
-    )
 
 
 class DSATrtllmAttention(TrtllmAttention):
@@ -216,16 +198,14 @@ class DSATrtllmAttention(TrtllmAttention):
             return self._sparse_offload_arena_indices(topk_indices, metadata, forward_args), None
 
         local_layer_idx = self.get_local_layer_idx(metadata)
+        if not is_generation and metadata.mixed_precision_high_restore is not None:
+            self._restore_mixed_precision_high_rows(metadata, local_layer_idx)
         kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4 and not is_generation:
             metadata._ensure_pool_view_cached()
             page_index_scale, layer_offset = (
                 metadata.kv_cache_manager.get_primary_pool_page_index_params(local_layer_idx)
             )
-            if metadata.mixed_precision_high_restore is not None:
-                self._restore_mixed_precision_high_rows(
-                    metadata, local_layer_idx, page_index_scale, layer_offset
-                )
             total_kv_tokens = metadata.num_ctx_mla_kv_tokens
             if total_kv_tokens <= 0:
                 raise RuntimeError("NVFP4 DSA context has no active KV tokens")
@@ -286,8 +266,6 @@ class DSATrtllmAttention(TrtllmAttention):
         if metadata.has_mixed_precision_high_rows and (
             manager.mixed_precision_low_dtype == manager.mixed_precision_high_dtype
         ):
-            if not is_generation and metadata.mixed_precision_high_restore is not None:
-                self._restore_mixed_precision_high_rows_from_pool(metadata, local_layer_idx)
             # Cold-page window: a selected token the high layer holds is read from its row.
             requests = (
                 metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens]
@@ -346,51 +324,40 @@ class DSATrtllmAttention(TrtllmAttention):
         return topk_indices_global, None
 
     def _restore_mixed_precision_high_rows(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        local_layer_idx: int,
-        page_index_scale: int,
-        layer_offset: int,
+        self, metadata: DSAtrtllmAttentionMetadata, local_layer_idx: int
     ) -> None:
-        """Fill fresh last-N high pages from the NVFP4 pool, decoded as the sparse read decodes them."""
+        """Fill fresh last-N high rows from the NVFP4 pool, decoded as the sparse read decodes them."""
         requests, positions = metadata.mixed_precision_high_restore
-        global_indices = _mixed_precision_restore_pool_rows(
-            metadata, page_index_scale, layer_offset
+        manager = metadata.kv_cache_manager
+        metadata._ensure_pool_view_cached()
+        page_index_scale, layer_offset = manager.get_primary_pool_page_index_params(local_layer_idx)
+        tokens_per_block = metadata._cached_tokens_per_block
+        pool_rows = torch.ops.trtllm.convert_req_index_to_global(
+            requests,
+            metadata._cached_block_table_ctx,
+            positions.view(-1, 1),
+            tokens_per_block,
+            1,
+            page_index_scale * tokens_per_block,
+            layer_offset,
         )
         rows = torch.empty(
-            (positions.numel(), 1, metadata.kv_cache_manager.head_dim),
+            (positions.numel(), 1, manager.head_dim),
             dtype=torch.float8_e4m3fn,
             device=positions.device,
         )
         torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
             metadata.host_kv_cache_pool_pointers,
             metadata.host_kv_cache_pool_mapping,
-            global_indices,
+            pool_rows,
             rows,
-            torch.empty_like(global_indices),
+            torch.empty_like(pool_rows),
             self._nvfp4_mla_kv_scale_quant_orig,
             local_layer_idx,
-            metadata.kv_cache_manager.mla_kv_cache_residual_dim,
+            manager.mla_kv_cache_residual_dim,
             metadata._cached_num_pool_tokens,
         )
         restore_mixed_precision_high_rows(self, metadata, rows, requests, positions)
-
-    def _restore_mixed_precision_high_rows_from_pool(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        local_layer_idx: int,
-    ) -> None:
-        """Cold-page window: fill fresh last-N high rows from the layer's own rows of the pool."""
-        requests, positions = metadata.mixed_precision_high_restore
-        metadata._ensure_pool_view_cached()
-        pool_rows = _mixed_precision_restore_pool_rows(
-            metadata, *metadata.kv_cache_manager.get_primary_pool_page_index_params(local_layer_idx)
-        )
-        rows = metadata._cached_pool_view[pool_rows.view(-1).long()]
-        high_dtype = binding_to_torch_dtype(metadata.kv_cache_manager.mixed_precision_high_dtype)
-        restore_mixed_precision_high_rows(
-            self, metadata, rows.view(high_dtype), requests, positions
-        )
 
     def _sparse_offload_arena_indices(
         self,

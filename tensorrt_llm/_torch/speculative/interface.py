@@ -275,18 +275,14 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     attn_metadata.swap_for_draft(
         'host_kv_cache_block_offsets',
         draft_kv_cache_manager.host_kv_cache_block_offsets)
-    # The mixed-precision high page table, the dense block-offset copy and the
-    # dense last-N restore plan are the draft manager's own too (None when its
-    # layers take no mixed precision).
+    # The mixed-precision high page table and the dense block-offset copy are
+    # the draft manager's own too (None when its layers take no mixed precision).
     attn_metadata.swap_for_draft(
         'mixed_precision_high_block_table',
         attn_metadata.draft_mixed_precision_high_block_table)
     attn_metadata.swap_for_draft(
         'mixed_precision_low_block_offsets',
         attn_metadata.draft_mixed_precision_low_block_offsets)
-    attn_metadata.swap_for_draft(
-        'mixed_precision_high_restore_spans',
-        attn_metadata.draft_mixed_precision_high_restore_spans)
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 

@@ -9,7 +9,6 @@ positions are read from its rows in place. High page table: the page index if he
 
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -478,64 +477,19 @@ def overlay_mixed_precision_high_rows(
         )
 
 
-def take_mixed_precision_high_restore(
-    metadata: "DSAtrtllmAttentionMetadata", manager, cached_token_lens
-) -> list[tuple[int, int, int]]:
-    """`(batch row, first token, end token)` of each context request that restores in this forward.
-
-    A context request that reused a prefix without the high-precision copy of its last N tokens
-    holds fresh high pages there; this forward fills them from the low pool before anything reads
-    them. The requests are taken from `manager`, so each restores once.
-
-    Args:
-        metadata: The attention metadata of the step; its context requests come first.
-        manager: The KV cache manager the requests restore in (the target's or the draft's).
-        cached_token_lens: `[num_seqs]` host int32: the cached tokens of each batch row.
-
-    Returns:
-        One `(batch row, first token, end token)` per restoring request: its tokens
-        `[first token, end token)` are restored.
-    """
-    pending = manager.mixed_precision_restore_requests
-    if not pending or metadata.num_contexts == 0:
-        return []
-    request_ids = metadata.request_ids[: metadata.num_contexts]
-    rows = [row for row, request_id in enumerate(request_ids) if request_id in pending]
-    if not rows:
-        return []
-    pending.difference_update(request_ids[row] for row in rows)
-    tokens_per_block = manager.tokens_per_block
-    table = np.full((len(rows), manager.max_blocks_per_seq), -1, dtype=np.int32)
-    # Every high layer holds the same pages, so one table serves them all.
-    high_layer = next(iter(manager.mixed_precision_high_layers.values()))
-    manager._fill_page_table(high_layer, [request_ids[row] for row in rows], table)
-    # The sink pages came with the prefix; every later page the request holds is fresh.
-    sinks = -(-manager.first_n // tokens_per_block)
-    spans = []
-    for index, row in enumerate(rows):
-        fresh = np.flatnonzero(table[index, sinks:] >= 0)
-        end = int(cached_token_lens[row])
-        start = min((sinks + int(fresh[0])) * tokens_per_block, end) if fresh.size else end
-        spans.append((row, start, end))
-    return spans
-
-
 def mixed_precision_high_restore_rows(
     spans: list[tuple[int, int, int]], tokens_per_row: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Flat `(batch rows, row positions)` that `spans` cover; a row covers `tokens_per_row` tokens.
-
-    A DeepSeek-V4 compressed row exists once all of its tokens are cached. A fresh page starts on a
-    block boundary, a multiple of every compression ratio.
+    """Flat `(batch rows, row positions)` of the whole rows that `spans` cover.
 
     Args:
         spans: `(batch row, first token, end token)` per request, as
-            `take_mixed_precision_high_restore` returns them.
-        tokens_per_row: The tokens of one cache row: 1, or the DeepSeek-V4 compression ratio.
+            `KVCacheManagerV2.take_mixed_precision_restore_spans` returns them.
+        tokens_per_row: 1, or the DeepSeek-V4 compression ratio: a compressed row exists once all
+            of its tokens are cached.
 
     Returns:
-        `(requests, positions)`, both `[num_rows]` int32 on the current CUDA device: the batch row
-        and the row position of each row to restore; None if `spans` cover no whole row.
+        `[num_rows]` int32 batch rows and row positions on the current CUDA device, or None.
     """
     requests, positions = [], []
     for row, start, end in spans:
@@ -558,9 +512,7 @@ def restore_mixed_precision_high_rows(
     requests: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
-    """Store `rows`, decoded from the low pool as the read decodes them, at `(request, position)`.
-
-    The FP8 high pool holds rows as the FP8 scratch does, so they are copied without a scale.
+    """Store FP8 `rows`, decoded as the read decodes them, at `(request, position)` unscaled.
 
     Args:
         owner: The attention layer whose mixed-precision high pool receives the rows.

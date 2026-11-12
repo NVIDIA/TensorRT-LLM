@@ -389,10 +389,7 @@ def test_sink_required_claims_sinks_and_selects_window():
 
 
 def test_sink_required_selects_window_at_partial_endpoint():
-    """A SINK_REQUIRED_ONLY window that ends inside a block can be selected.
-
-    The min snapshot publishes the partial block; every reader gets its own copy of it.
-    """
+    """A SINK_REQUIRED_ONLY window can end inside a block; each reader copies that partial block."""
     buffers = [kv.BufferConfig(role="key", size=4096)]
     layers = [
         kv.AttentionLayerConfig(layer_id=0, buffers=buffers),
@@ -417,8 +414,7 @@ def test_sink_required_selects_window_at_partial_endpoint():
     try:
         source = manager.create_kv_cache(None, [], expected_prompt_length=14)
         caches.append(source)
-        assert source.resume(stream.cuda_stream)
-        assert source.resize(14)
+        assert source.resume(stream.cuda_stream) and source.resize(14)
         # The min snapshot also publishes the partial block 3 (tokens 12-13).
         source.commit(tokens)
         group = manager.get_layer_group_id(1)

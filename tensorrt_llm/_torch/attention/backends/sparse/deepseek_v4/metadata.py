@@ -14,10 +14,7 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
-from ..mixed_precision_high_rows import (
-    mixed_precision_high_restore_rows,
-    take_mixed_precision_high_restore,
-)
+from ..mixed_precision_high_rows import mixed_precision_high_restore_rows
 from ..offload import (
     SparseOffloadState,
     allocate_sparse_offload_state,
@@ -804,8 +801,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.prepare_for_block_tables()
         if self.mixed_precision_high_block_table:
             # Restoring requests fill the fresh last-N high rows of every compression ratio.
-            spans = take_mixed_precision_high_restore(
-                self, self.kv_cache_manager, cached_token_lens
+            spans = self.kv_cache_manager.take_mixed_precision_restore_spans(
+                self.request_ids[: self.num_contexts], cached_token_lens
             )
             self.mixed_precision_high_restore = (
                 {

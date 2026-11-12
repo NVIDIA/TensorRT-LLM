@@ -63,10 +63,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
-from .mixed_precision_rows import (restore_mixed_precision_high_rows_from_low,
-                                   store_mixed_precision_low_rows)
+from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import prepare_sparse_runtime_params
-from .sparse.mixed_precision_high_rows import take_mixed_precision_high_restore
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
@@ -318,10 +316,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     draft_mixed_precision_high_block_table: Optional[Any] = None
     mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
     draft_mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
-    # Cold-page window, dense attention: (ends, counts, max count) of the cached positions each
-    # batch row restores into its fresh last-N high blocks in this forward, or None.
-    mixed_precision_high_restore_spans: Optional[tuple] = None
-    draft_mixed_precision_high_restore_spans: Optional[tuple] = None
     # The sparse backends redirect selected rows instead of block offsets.
     mixed_precision_block_offsets_redirect: ClassVar[bool] = True
     # Active block-ID buffers, defaulting to the target cache. Separate draft
@@ -1266,7 +1260,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.prepare_mixed_precision_kv(
                 "HND", min(self.kv_cache_manager.tokens_per_block, 32))
         self._fill_mixed_precision_high_block_tables()
-        self._plan_mixed_precision_high_restore(cached_token_lens)
 
     @property
     def redirects_mixed_precision_block_offsets(self) -> bool:
@@ -1376,35 +1369,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                 pool_block_offsets[:, 1],
                                 out=pool_block_offsets[:, 1])
 
-    def _plan_mixed_precision_high_restore(
-            self, cached_token_lens: Optional[torch.Tensor]) -> None:
-        """Cold-page window, dense attention: plan restoring the fresh last-N high blocks."""
-        if cached_token_lens is None:
-            return
-        if self.mixed_precision_low_block_offsets is not None:
-            self.mixed_precision_high_restore_spans = (
-                self._new_mixed_precision_high_restore_spans(
-                    self.kv_cache_manager, cached_token_lens))
-        if self.draft_mixed_precision_low_block_offsets is not None:
-            self.draft_mixed_precision_high_restore_spans = (
-                self._new_mixed_precision_high_restore_spans(
-                    self.draft_kv_cache_manager, cached_token_lens))
-
-    def _new_mixed_precision_high_restore_spans(
-            self, manager, cached_token_lens: torch.Tensor) -> Optional[tuple]:
-        """`(ends, counts, max count)` of the fresh last-N blocks `manager`'s requests restore, or None."""
-        spans = take_mixed_precision_high_restore(self, manager,
-                                                  cached_token_lens)
-        if not spans:
-            return None
-        ends = torch.zeros(self.num_seqs, dtype=torch.int32)
-        counts = torch.zeros(self.num_seqs, dtype=torch.int32)
-        for row, start, end in spans:
-            ends[row], counts[row] = end, end - start
-        if int(counts.max()) == 0:
-            return None
-        return ends.cuda(), counts.cuda(), int(counts.max())
-
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
         batch = len(view.page_counts)
@@ -1451,10 +1415,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @contextlib.contextmanager
     def mixed_precision_kv_staging(self, layer_idx: int):
-        """Cold-page first/last-N mixed precision: a layer that takes it restores any
-        fresh last-N high rows from its own blocks, reads through its redirected block
-        offsets and copies the step's new rows back afterwards; a layer that does not (a
-        sliding-window layer, for example) runs untouched."""
+        """Cold-page first/last-N mixed precision: a layer that takes it reads through its
+        redirected block offsets and copies the step's new rows back afterwards; a layer that
+        does not (a sliding-window layer, for example) runs untouched."""
         if not self.redirects_mixed_precision_block_offsets:
             with super().mixed_precision_kv_staging(layer_idx):
                 yield
@@ -1462,7 +1425,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if not self._layer_takes_mixed_precision(layer_idx):
             yield
             return
-        restore_mixed_precision_high_rows_from_low(self, layer_idx)
         yield
         store_mixed_precision_low_rows(self, layer_idx)
 
