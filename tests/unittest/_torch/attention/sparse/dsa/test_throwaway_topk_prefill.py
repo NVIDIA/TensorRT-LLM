@@ -41,6 +41,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     Indexer,
     IndexerPrefillChunkMetadata,
+    throwaway_unfused_logits_elem_bound,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
     THROWAWAY_LOGITS_DTYPE_ENV,
@@ -670,6 +671,7 @@ def test_workspace_oom_disables_the_runner(monkeypatch):
     assert len(calls) == 1  # disabled after the first failure
     assert bool((out == -2).all())  # nothing written
     assert runner._k_stage is None  # buffers released
+    assert not runner.ready
 
 
 @skip_not_sm100
@@ -982,6 +984,90 @@ def test_runner_build_failure_is_cached(monkeypatch):
     assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
     assert len(built) == 1
     assert len(warnings) == 1
+
+
+def test_runner_build_oom_falls_back(monkeypatch):
+    """Running out of memory while allocating the runner's buffers keeps the unfused path."""
+    built, warnings = [], []
+
+    class _TooLarge:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+            raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _TooLarge)
+    _fresh_runner_cache(monkeypatch)
+    monkeypatch.setattr(throwaway_topk_module.logger, "warning", warnings.append)
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None  # not retried by later chunks
+    assert len(built) == 1
+    assert len(warnings) == 1
+
+
+class _ReadyRunner:
+    def __init__(self, compress_ratio=4, num_keys=1 << 18, ready=True):
+        self.compress_ratio = compress_ratio
+        self.num_keys = num_keys
+        self.ready = ready
+
+    def can_run(self, num_k_rows):
+        return 0 < num_k_rows <= self.num_keys
+
+
+def _model_with_indexers(*specs):
+    """A module tree holding Indexers with only the fields the logits bound reads."""
+    model = torch.nn.Module()
+    for i, (enabled, failed, runner, min_context) in enumerate(specs):
+        indexer = Indexer.__new__(Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer._use_throwaway_topk = enabled
+        indexer._throwaway_topk_failed = failed
+        indexer._throwaway_topk = runner
+        indexer._throwaway_topk_min_context = min_context
+        model.add_module(f"indexer{i}", indexer)
+    return model
+
+
+_MAX_SEQ_LEN = 1 << 20  # 1M tokens, 256K compressed keys at ratio 4
+
+
+@pytest.mark.parametrize(
+    "max_num_tokens,expected",
+    [
+        # 8192 rows x (64K + 8K) / 4 keys = 151M elements; below the 2^28 packed cap.
+        (8192, 1 << 28),
+        # 32768 rows x (64K + 32K) / 4 keys = 768M elements; above the packed cap.
+        (32768, 32768 * (((1 << 16) + 32768) // 4)),
+    ],
+)
+def test_unfused_logits_bound_covers_short_and_packed_chunks(max_num_tokens, expected):
+    model = _model_with_indexers(
+        (True, False, _ReadyRunner(), 1 << 16), (True, False, _ReadyRunner(), 1 << 16)
+    )
+    assert throwaway_unfused_logits_elem_bound(model, max_num_tokens, _MAX_SEQ_LEN) == expected
+
+
+def test_unfused_logits_bound_never_exceeds_the_full_tile():
+    model = _model_with_indexers((True, False, _ReadyRunner(compress_ratio=1), 1 << 16))
+    # 64 rows x 4096 tokens = 262144 elements, below every other bound.
+    assert throwaway_unfused_logits_elem_bound(model, 64, 4096) == 64 * 4096
+
+
+@pytest.mark.parametrize(
+    "specs",
+    [
+        [],  # no DSA indexer
+        [(False, False, None, 0)],  # fused path not requested
+        [(True, True, None, 0)],  # runner build failed
+        [(True, False, None, 0)],  # runner not built yet (e.g. no profiling run)
+        [(True, False, _ReadyRunner(ready=False), 0)],  # workspace not allocated / disabled
+        [(True, False, _ReadyRunner(num_keys=1024), 0)],  # keys of long chunks do not fit
+        [(True, False, _ReadyRunner(), 0), (True, True, None, 0)],  # one layer failed
+    ],
+)
+def test_unfused_logits_bound_needs_a_ready_runner_on_every_layer(specs):
+    model = _model_with_indexers(*specs)
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN) is None
 
 
 def _chunk_metadata(cached, new_tokens, compress_ratio):

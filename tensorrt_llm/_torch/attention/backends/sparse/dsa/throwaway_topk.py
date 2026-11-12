@@ -236,6 +236,11 @@ class ThrowawayPrefillTopK:
         """KV compression ratio the kernels were built for."""
         return self._compress_ratio
 
+    @property
+    def ready(self) -> bool:
+        """True once the kernels are built and their workspace is allocated."""
+        return self._pool_prepared and not self._failed
+
     def can_run(self, num_k_rows: int) -> bool:
         """Returns True when ``num_k_rows`` compressed keys fit the staging buffer."""
         return 0 < num_k_rows <= self.num_keys
@@ -424,7 +429,8 @@ def get_throwaway_prefill_topk(
     """Returns the runner shared by the live layers for this configuration, building it on
     first use.
 
-    Returns None (after one warning) if the kernels do not support the configuration.
+    Returns None (after one warning) if the kernels do not support the configuration or its
+    buffers do not fit in GPU memory.
     """
     key = (n_heads, index_topk, compress_ratio, max_context_length, str(device), qkv_dtype)
     if key in _FAILED:
@@ -449,7 +455,10 @@ def get_throwaway_prefill_topk(
             device=device,
             qkv_dtype=qkv_dtype,
         )
-    except (ValueError, ImportError) as error:
+    except (ValueError, ImportError, torch.OutOfMemoryError) as error:
+        if isinstance(error, torch.OutOfMemoryError):
+            # Return what the partial build allocated to the unfused path.
+            torch.cuda.empty_cache()
         logger.warning(
             f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K is unavailable for "
             f"heads={n_heads}, top_k={index_topk}, compress_ratio={compress_ratio}, "

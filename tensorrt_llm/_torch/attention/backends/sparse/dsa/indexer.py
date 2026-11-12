@@ -731,6 +731,44 @@ def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
     return min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
 
 
+def throwaway_unfused_logits_elem_bound(
+    model: nn.Module, max_num_tokens: int, max_seq_len: int
+) -> Optional[int]:
+    """Largest MQA-logits tile the unfused path still allocates when the fused Top-K is active.
+
+    The fused throwaway Top-K takes every single-request prefill chunk with at least the
+    min-context of context, so under MLA chunked prefill the unfused path keeps only
+    multi-request chunks, packed to ``_packed_logits_elem_budget``, and shorter single-request
+    chunks: at most ``max_num_tokens`` query rows over ``(min_context + max_num_tokens) /
+    compress_ratio`` keys (under query splitting a rank gates on its own rows, while the gathered
+    keys cover the whole chunk). Only valid when MLA chunked prefill plans the prefill chunks.
+
+    Args:
+        model: Model whose DSA indexers are inspected.
+        max_num_tokens: Max tokens of one forward step.
+        max_seq_len: Max sequence length of the KV cache.
+
+    Returns:
+        The tile bound in elements, or None if no indexer uses the fused path or one of them has
+        no built runner covering ``max_seq_len`` (the unfused path may then take any chunk).
+    """
+    indexers = [m for m in model.modules() if isinstance(m, Indexer) and m._use_throwaway_topk]
+    if not indexers:
+        return None
+    single_request_tile = min(_INDEXER_MQA_LOGITS_ELEM_BUDGET, max_num_tokens * max_seq_len)
+    bound = min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
+    for indexer in indexers:
+        runner = indexer._throwaway_topk
+        if indexer._throwaway_topk_failed or runner is None or not runner.ready:
+            return None
+        ratio = runner.compress_ratio
+        if not runner.can_run(max_seq_len // ratio):
+            return None
+        short_keys = -(-(indexer._throwaway_topk_min_context + max_num_tokens) // ratio)
+        bound = max(bound, max_num_tokens * short_keys)
+    return min(bound, single_request_tile)
+
+
 @maybe_compile(dynamic=True)
 def _scale(weights: torch.Tensor, q_scale: torch.Tensor, s: float) -> torch.Tensor:
     """Scale attention weights by quantization scale and constant factor."""
