@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+version: 0.0.1
+# High-memory generated models; explicitly selected manual qualification, not L0.
+manual_b300_beam_components:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: manual
+      backend: pytorch
+  tests:
+  - unittest/_torch/modeling_v2/models/beam/_components/moe TIMEOUT (45)
+  - unittest/_torch/modeling_v2/models/beam/_components/sparse_block TIMEOUT (45)
+  - unittest/_torch/modeling_v2/models/beam/_components/six_layer_model TIMEOUT (45)

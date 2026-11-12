@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+version: 0.0.1
+manual_b300_beam_distributed:
+# Tiny generated-data test; launch with mpirun -n 4 as documented in the module.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: manual
+      backend: pytorch
+  tests:
+  - unittest/_torch/modeling_v2/models/beam/test_distributed_loading.py TIMEOUT (2)
