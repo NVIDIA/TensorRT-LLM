@@ -304,6 +304,32 @@ def test_sampling_params_accepts_in_range_values(field, value):
     assert getattr(SamplingParams(**{field: value}), field) == value
 
 
+@pytest.mark.parametrize("stop", ["", [""], ["a", ""]])
+def test_sampling_params_rejects_empty_stop_string(stop):
+    with pytest.raises(ValueError, match="stop must not contain an empty string"):
+        SamplingParams(stop=stop)
+
+
+@pytest.mark.parametrize("stop", [None, [], "a", ["a"], ["a", "b"], [" "]])
+def test_sampling_params_accepts_non_empty_stop_strings(stop):
+    assert SamplingParams(stop=stop).stop == stop
+
+
+@pytest.mark.parametrize(
+    "request_cls, base",
+    [
+        (CompletionRequest, {"prompt": "hi"}),
+        (ChatCompletionRequest, {"messages": [{"role": "user", "content": "hi"}]}),
+    ],
+)
+@pytest.mark.parametrize("stop", ["", [""]])
+def test_serve_requests_reject_empty_stop_string(request_cls, base, stop):
+    request = request_cls(model="test", stop=stop, **base)
+
+    with pytest.raises(ValueError, match="stop must not contain an empty string"):
+        request.to_sampling_params(backend="pytorch")
+
+
 @pytest.mark.parametrize(
     "round_trip",
     [lambda params: pickle.loads(pickle.dumps(params)), copy.copy, copy.deepcopy],
