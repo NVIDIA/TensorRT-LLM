@@ -51,8 +51,10 @@ from ..configs.deepseek_v41 import (
 )
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy, allgather
 from ..model_config import ModelConfig
+from ..modules.embedding import LMHead
 from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding, engram_gate
 from ..modules.engram.projection import EngramFp8Projection
+from ..modules.logits_memory import LogitsMemoryFootprint
 from ..modules.mhc.hyper_connection import HCState, mHC
 from ..speculative import SpecMetadata
 from ..speculative.dspark import DSparkSpecMetadata
@@ -2261,9 +2263,13 @@ class _ContextOnlyLogitsProcessor(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
 
-    def get_logits_memory_per_token(self) -> int:
-        """Return bytes for FP32 handoff logits without an LM-head output."""
-        return self.vocab_size * torch.float32.itemsize
+    def logits_memory_footprint(
+        self, lm_head: LMHead, model_dtype: torch.dtype, is_last_pp_rank: bool
+    ) -> LogitsMemoryFootprint:
+        """Return the FP32 per-sequence handoff footprint without an LM head."""
+        return LogitsMemoryFootprint(
+            bytes_per_row=self.vocab_size * torch.float32.itemsize, context_only=True
+        )
 
     def forward(
         self,

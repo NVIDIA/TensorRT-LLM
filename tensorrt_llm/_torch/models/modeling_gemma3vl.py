@@ -23,6 +23,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
+from ..modules.logits_memory import LogitsMemoryWrapper
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma3 import Gemma3ForCausalLM
@@ -179,7 +180,7 @@ class Gemma3MultiModalProjector(torch.nn.Module):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.STRING,
     ))
-class Gemma3VLM(PreTrainedModel):
+class Gemma3VLM(LogitsMemoryWrapper, PreTrainedModel):
 
     lora_owner = DecoderLoraOwner(module_path="language_model")
 

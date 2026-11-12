@@ -44,6 +44,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..modules.embedding import Embedding, LMHead
+from ..modules.logits_memory import LogitsMemoryWrapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
@@ -1205,7 +1206,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         # in VilaInputProcessor.
         content_format=ContentFormat.PASSTHROUGH,
     ))
-class VilaModel(PreTrainedModel):
+class VilaModel(LogitsMemoryWrapper, PreTrainedModel):
     config_class = VilaConfig
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,

@@ -53,6 +53,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
+from ..modules.logits_memory import LogitsMemoryWrapper
 from ..modules.mlp import MLP
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
@@ -900,7 +901,7 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         content_format=ContentFormat.STRING,
     ),
 )
-class MiniCPMV4_6Model(PreTrainedModel):
+class MiniCPMV4_6Model(LogitsMemoryWrapper, PreTrainedModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
         super().__init__(config)

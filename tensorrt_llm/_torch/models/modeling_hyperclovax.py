@@ -24,6 +24,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
+from ..modules.logits_memory import LogitsMemoryWrapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
@@ -1029,7 +1030,7 @@ class HCXVisionModel(nn.Module):
         placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT,
         content_format=ContentFormat.STRING,
     ))
-class HCXVisionForCausalLM(PreTrainedModel):
+class HCXVisionForCausalLM(LogitsMemoryWrapper, PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config

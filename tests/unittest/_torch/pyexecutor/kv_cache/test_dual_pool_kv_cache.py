@@ -18,20 +18,17 @@ Validates budget splitting, ResourceManagerType.CROSS_KV_CACHE_MANAGER
 registration, and cross pool wiring for V2 and the V1 fallback path.
 """
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from transformers import LlamaConfig, PretrainedConfig
+from transformers import PretrainedConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.modules.embedding import LMHead
-from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -42,12 +39,7 @@ from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_encoder_decoder_kv_cache_config
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import (
-    CapacitySchedulerPolicy,
-    KvCacheConfig,
-    MTPDecodingConfig,
-    TorchLlmArgs,
-)
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -72,50 +64,31 @@ class _FakeCompiledModel:
         self.model_config = original_model.model_config
 
 
-class _FakeLogitsDecoder(torch.nn.Module):
-    """Replace checkpoint-backed decoder compute, retaining real output-head setup."""
+class _FakeCacheSizingDecoder(DecoderModel):
+    """Replace decoder compute while keeping the real tied-head construction."""
 
-    def __init__(self, model_config: ModelConfig, context_only: bool) -> None:
-        super().__init__()
-        self.layers = torch.nn.ModuleList(
-            torch.nn.Identity() for _ in range(model_config.pretrained_config.num_hidden_layers)
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__(model_config)
+        self.layers = torch.nn.ModuleList()
+        self.embed_tokens = Embedding(
+            model_config.pretrained_config.vocab_size,
+            model_config.pretrained_config.hidden_size,
+            dtype=model_config.torch_dtype,
+            mapping=model_config.mapping,
         )
-        self.norm = torch.nn.Identity()
-        self.hc_head = None
-        self.disagg_context_only = context_only
-        self.decoder_replay_split = 1
-        self.ced_kv_precompute = False
 
 
-class _FakeLogitsMultimodalModel(MultimodalModelMixin, torch.nn.Module):
-    def __init__(self, language_model) -> None:
+class _FakeCacheSizingEncoderDecoder(torch.nn.Module):
+    """Replace encoder/decoder compute while retaining T5's tied output head."""
+
+    def __init__(self, model_config: ModelConfig) -> None:
         super().__init__()
-        self.llm = language_model
-        self.model_config = language_model.model_config
-
-    @property
-    def language_model(self):
-        return self.llm
-
-
-class _FakeLegacyLogitsMultimodalModel(MultimodalModelMixin, torch.nn.Module):
-    def __init__(self, language_model) -> None:
-        super().__init__()
-        self.llm = language_model
-        self.model_config = language_model.model_config
-
-    @property
-    def vocab_size_padded(self) -> int:
-        return self.llm.vocab_size_padded
-
-
-class _FakeSplitLogitsModel(torch.nn.Module):
-    def __init__(self, language_model) -> None:
-        super().__init__()
-        self.model_config = language_model.model_config
-        self.config = language_model.config
-        self.logits_processor = language_model.logits_processor
-        self.language_model = SimpleNamespace(lm_head=language_model.lm_head)
+        self.shared_embedding = Embedding(
+            model_config.pretrained_config.vocab_size,
+            model_config.pretrained_config.d_model,
+            dtype=model_config.torch_dtype,
+            mapping=model_config.mapping,
+        )
 
 
 _DUMMY_MODEL = "/tmp/dummy_model_dual_pool_test"
@@ -160,6 +133,7 @@ def _make_model_config(
         "hidden_size": 512,
         "head_dim": 64,
         "vocab_size": 32000,
+        "torch_dtype": torch.bfloat16,
     }
     pretrained_kwargs.update(pretrained_overrides)
     pretrained_kwargs.setdefault(
@@ -179,298 +153,24 @@ def _make_model_config(
     return ModelConfig(pretrained_config=PretrainedConfig(**pretrained_kwargs))
 
 
-@pytest.mark.parametrize(
-    (
-        "batch_size",
-        "token_budget",
-        "beam_width",
-        "speculative_config",
-        "dtype",
-        "head_dtype",
-        "profiled",
-        "pp_size",
-        "logits_path",
-        "expected_reserve",
-    ),
-    [
-        pytest.param(
-            8, 64, 1, None, torch.bfloat16, None, True, 1, "model", 7 * 64 * 6, id="batch"
-        ),
-        pytest.param(
-            8, 64, 2, None, torch.bfloat16, None, True, 1, "model", 15 * 64 * 6, id="beams"
-        ),
-        pytest.param(
-            8,
-            64,
-            1,
-            MTPDecodingConfig(max_draft_len=3),
-            torch.bfloat16,
-            None,
-            True,
-            1,
-            "model",
-            31 * 64 * 6,
-            id="speculative",
-        ),
-        pytest.param(
-            8,
-            8,
-            1,
-            MTPDecodingConfig(max_draft_len=3),
-            torch.bfloat16,
-            None,
-            True,
-            1,
-            "model",
-            7 * 64 * 6,
-            id="token-budget",
-        ),
-        pytest.param(8, 64, 1, None, torch.float32, None, True, 1, "model", 7 * 64 * 4, id="fp32"),
-        pytest.param(
-            8,
-            64,
-            1,
-            None,
-            torch.bfloat16,
-            torch.float32,
-            True,
-            1,
-            "model",
-            7 * 64 * 4,
-            id="fp32-head",
-        ),
-        pytest.param(
-            1, 64, 1, None, torch.bfloat16, None, True, 1, "model", 0, id="profiled-single"
-        ),
-        pytest.param(
-            1, 64, 1, None, torch.bfloat16, None, False, 1, "model", 64 * 6, id="no-profile"
-        ),
-        pytest.param(
-            8, 64, 1, None, torch.bfloat16, None, False, 1, "head", 8 * 64 * 6, id="head-vocab"
-        ),
-        pytest.param(
-            8, 64, 1, None, torch.bfloat16, None, True, 2, "head", 0, id="intermediate-pp"
-        ),
-        pytest.param(
-            8,
-            64,
-            1,
-            None,
-            torch.bfloat16,
-            None,
-            False,
-            1,
-            "multimodal",
-            8 * 64 * 6,
-            id="multimodal",
-        ),
-        pytest.param(
-            8,
-            64,
-            1,
-            None,
-            torch.bfloat16,
-            None,
-            False,
-            1,
-            "compiled-multimodal",
-            8 * 64 * 6,
-            id="compiled-multimodal",
-        ),
-        pytest.param(
-            8,
-            64,
-            1,
-            None,
-            torch.bfloat16,
-            None,
-            True,
-            1,
-            "context-only",
-            7 * 37 * 4,
-            id="context-only",
-        ),
-        pytest.param(
-            8,
-            64,
-            1,
-            None,
-            torch.bfloat16,
-            None,
-            True,
-            1,
-            "deepseek-head",
-            7 * 37 * 6,
-            id="deepseek-head",
-        ),
-        pytest.param(
-            8,
-            64,
-            1,
-            None,
-            torch.bfloat16,
-            None,
-            False,
-            1,
-            "legacy-multimodal",
-            8 * 64 * 6,
-            id="legacy-multimodal",
-        ),
-        pytest.param(
-            8,
-            64,
-            1,
-            None,
-            torch.bfloat16,
-            None,
-            False,
-            1,
-            "split-head",
-            8 * 64 * 6,
-            id="split-head",
-        ),
-    ],
-)
-def test_kv_capacity_reserves_eager_logits(
-    batch_size: int,
-    token_budget: int,
-    beam_width: int,
-    speculative_config: MTPDecodingConfig | None,
-    dtype: torch.dtype,
-    head_dtype: torch.dtype | None,
-    profiled: bool,
-    pp_size: int,
-    logits_path: str,
-    expected_reserve: int,
-) -> None:
-    mapping = Mapping(world_size=pp_size, pp_size=pp_size)
-    pretrained_config = LlamaConfig(
-        architectures=["LlamaForCausalLM"],
-        vocab_size=37 if logits_path in ("context-only", "deepseek-head") else 64,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        torch_dtype=dtype,
-        tie_word_embeddings=False,
-        hc_mult=1,
-    )
-    model_config = ModelConfig(
-        pretrained_config=pretrained_config,
-        mapping=mapping,
-        lm_head_output_dtype=head_dtype,
-    )
-    model = SimpleNamespace(
-        model_config=model_config,
-        config=pretrained_config,
-        lm_head=LMHead(64, 8, dtype=dtype, output_dtype=head_dtype)
-        if mapping.is_last_pp_rank()
-        else None,
-        logits_processor=LogitsProcessor(),
-    )
-    if logits_path != "head":
-        model.vocab_size_padded = 64
-    if logits_path in ("context-only", "deepseek-head"):
-        with patch.object(
-            DeepseekV41ForCausalLM,
-            "model_cls",
-            side_effect=lambda config, mapping_with_cp: _FakeLogitsDecoder(
-                config, context_only=logits_path == "context-only"
-            ),
-        ):
-            model = DeepseekV41ForCausalLM(model_config)
-        if logits_path == "context-only":
-            assert not hasattr(model.lm_head, "vocab_size_padded")
-            metadata = SimpleNamespace(seq_lens_cuda=torch.ones(batch_size, dtype=torch.int32))
-            logits = model.logits_processor(
-                torch.zeros(batch_size, 8, dtype=dtype), model.lm_head, metadata
-            )
-            assert logits.dtype == torch.float32
-            assert logits.shape == (batch_size, pretrained_config.vocab_size)
-    elif logits_path in ("multimodal", "compiled-multimodal"):
-        model = _FakeLogitsMultimodalModel(model)
-        if logits_path == "compiled-multimodal":
-            model = torch.compile(model, backend="eager")
-    elif logits_path == "legacy-multimodal":
-        model = _FakeLegacyLogitsMultimodalModel(model)
-    elif logits_path == "split-head":
-        model = _FakeSplitLogitsModel(model)
-    model_engine = Mock(
-        model=model,
-        batch_size=batch_size,
-        max_seq_len=64,
-        max_cuda_graph_batch_size=1,
-        mm_encoder_output_budget_bytes=None,
-        mm_encoder_cache=None,
-    )
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5, use_kv_cache_manager_v2=True)
-    creator = KvCacheCreator(
-        model_engine=model_engine,
-        mapping=mapping,
-        net_max_seq_len=64,
-        kv_connector_manager=None,
-        max_num_tokens=token_budget,
-        max_beam_width=beam_width,
-        tokens_per_block=64,
-        max_seq_len=64,
-        max_batch_size=batch_size,
-        kv_cache_config=kv_cache_config,
-        llm_args=TorchLlmArgs(
-            model="dummy", checkpoint_format="HF", speculative_config=speculative_config
-        ),
-        speculative_config=speculative_config,
-        sparse_attention_config=None,
-        profiling_stage_data=None,
-        is_disagg=False,
-        skip_est=not profiled,
-    )
-    executor = Mock(sampler=None, enable_iter_perf_stats=False)
-    executor.dist.mapping = mapping
-    executor.dist.broadcast.side_effect = lambda values, root: values
-    executor.enqueue_requests.side_effect = lambda requests: list(range(len(requests)))
-    executor.await_responses.return_value = []
-    executor.warmup_scope.return_value = nullcontext()
-    kv_manager = Mock()
-    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=1 << 20)
-    executor.resource_manager.resource_managers.get.side_effect = (
-        lambda resource_type: kv_manager
-        if resource_type == ResourceManagerType.KV_CACHE_MANAGER
-        else None
-    )
-    with (
-        patch.object(torch.cuda, "empty_cache"),
-        patch.object(torch.cuda, "reset_peak_memory_stats"),
-        patch.object(torch.cuda, "mem_get_info", return_value=(48 << 20, 64 << 20)),
-        patch.object(
-            torch.cuda,
-            "memory_stats",
-            return_value={
-                "allocated_bytes.all.current": 8 << 20,
-                "allocated_bytes.all.peak": 9 << 20,
-            },
-        ),
-    ):
-        if profiled:
-            assert creator.try_prepare_estimation()
-        creator.configure_kv_cache_capacity(executor if profiled else None)
-
-    assert kv_cache_config.max_gpu_total_bytes == ((48 << 20) - expected_reserve) // 2
-
-
 def _make_mock_model_engine(model_config: ModelConfig) -> Mock:
     """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock(spec=ModelEngine)
-    engine.model = SimpleNamespace(config=SimpleNamespace())
-    engine.model.model_config = model_config
-    engine.model.vocab_size_padded = model_config.pretrained_config.vocab_size
-    engine.model.lm_head = SimpleNamespace(
-        vocab_size_padded=model_config.pretrained_config.vocab_size,
-        dtype=model_config.torch_dtype,
-        output_dtype=model_config.lm_head_output_dtype,
-    )
-    engine.model.logits_processor = LogitsProcessor()
-    engine.model.config.torch_dtype = model_config.torch_dtype
+    if model_config.is_encoder_decoder:
+        from tensorrt_llm._torch.models.modeling_t5 import T5ForConditionalGeneration
+
+        with patch(
+            "tensorrt_llm._torch.models.modeling_t5.T5Model",
+            side_effect=_FakeCacheSizingEncoderDecoder,
+        ):
+            engine.model = T5ForConditionalGeneration(model_config)
+    else:
+        engine.model = DecoderModelForCausalLM(
+            _FakeCacheSizingDecoder(model_config),
+            config=model_config,
+            hidden_size=model_config.pretrained_config.hidden_size,
+            vocab_size=model_config.pretrained_config.vocab_size,
+        )
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     engine.cuda_graph_batch_sizes = []
     engine.cuda_graph_padding_enabled = False

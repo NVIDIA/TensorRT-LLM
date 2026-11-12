@@ -54,6 +54,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
+from ..modules.logits_memory import LogitsMemoryWrapper
 from ..modules.mlp import MLP
 from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
@@ -1209,7 +1210,7 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
         content_format=ContentFormat.OPENAI,
     ),
 )
-class Step3p7VLForConditionalGeneration(nn.Module):
+class Step3p7VLForConditionalGeneration(LogitsMemoryWrapper, nn.Module):
     """Multimodal entry point for the Step3p7 Flash checkpoint.
 
     Wraps the existing text-only ``Step3p7ForCausalLM`` plus the

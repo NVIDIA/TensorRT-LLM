@@ -42,6 +42,7 @@ from ..model_config import ModelConfig
 from ..modules.embedding import Embedding, LMHead
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import TensorParallelMode
+from ..modules.logits_memory import LogitsMemoryFootprint
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.mlp import MLP
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
@@ -587,6 +588,12 @@ class BartForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
             self.lm_head.weight = self.model.shared_embedding.weight
 
         self.logits_processor = LogitsProcessor()
+
+    def get_logits_memory_footprint(self) -> LogitsMemoryFootprint:
+        """Account for this model's output head and logits processor."""
+        return self.logits_processor.logits_memory_footprint(
+            self.lm_head, self.model_config.torch_dtype, self.model_config.mapping.is_last_pp_rank()
+        )
 
     def __post_init__(self):
         for _, module in self.named_modules():

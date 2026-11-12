@@ -70,6 +70,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.logits_memory import LogitsMemoryWrapper
 from ..modules.mlp import MLP
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
@@ -1564,7 +1565,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ),
 )
-class KimiK25ForConditionalGeneration(PreTrainedModel):
+class KimiK25ForConditionalGeneration(LogitsMemoryWrapper, PreTrainedModel):
     """Kimi K2.5 vision-language model: MoonViT3d + DeepSeek-V3 LLM.
 
     Single entry point for K2.5. Uses DeepseekV3ForCausalLM directly as
