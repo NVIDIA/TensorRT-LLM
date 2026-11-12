@@ -29,6 +29,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
+from ..custom_ops.fast_custom_op import fast_custom_op
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
 from ..locality_domain.policy import LocalityDomainExecutionPlanner, LocalityDomainPolicy
@@ -124,7 +125,7 @@ def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> torc
     return outputs[0]
 
 
-@torch.library.custom_op("trtllm::create_mla_outputs", mutates_args=())
+@fast_custom_op("trtllm::create_mla_outputs", mutates_args=())
 def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
@@ -134,7 +135,7 @@ def _create_mla_outputs_fake(hidden_states: torch.Tensor, layer_idx: str) -> tor
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
-@torch.library.custom_op(
+@fast_custom_op(
     "trtllm::mla_custom_op_inplace",
     mutates_args=("output",),
 )
@@ -164,6 +165,19 @@ def mla_custom_op_inplace(
         attn_output=[output],
         latent_cache_gen=latent_cache_gen,
     )
+
+
+@mla_custom_op_inplace.register_fake
+def _mla_custom_op_inplace_fake(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+    output: torch.Tensor,
+    latent_cache_gen: Optional[torch.Tensor],
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
+) -> None:
+    return None
 
 
 maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)

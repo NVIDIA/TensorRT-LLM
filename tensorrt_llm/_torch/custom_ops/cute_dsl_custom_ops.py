@@ -2650,10 +2650,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return (self.use_tvm_ffi, 'gelu_fp4out')
 
     # a/b: fp4, scale: fp8, output: fp4 + sfc, fused non-gated GELU(tanh)
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
-        mutates_args=(),
-        device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
+                    mutates_args=())
     def cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -3000,10 +2998,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c_tensor, raw_sf_tensor
 
     # a/b: fp4, scale: fp8, output: fp4 + raw sf (deferred), fused non-gated GELU(tanh)
-    @torch.library.custom_op(
+    @fast_custom_op(
         "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell",
-        mutates_args=(),
-        device_types="cuda")
+        mutates_args=())
     def cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -5563,9 +5560,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c_tensor
 
     # a/b: fp8, scale: fp32, output: bf16
-    @torch.library.custom_op("trtllm::cute_dsl_fp8_gemm_blackwell",
-                             mutates_args=(),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_fp8_gemm_blackwell", mutates_args=())
     def cute_dsl_fp8_gemm_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -5918,9 +5913,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
     # a/b: fp8, scale: fp32, output: bf16
-    @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
-                             mutates_args=("output", ),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
+                    mutates_args=("output", ))
     def cute_dsl_fp8_bmm_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -10077,9 +10071,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      context_lens, schedule_meta, num_phys_blocks, exp_B)
             return logits
 
-    @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits",
-                             mutates_args=(),
-                             device_types="cuda")
+    @fast_custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits", mutates_args=())
     def cute_dsl_fp8_paged_mqa_logits(
         q: torch.Tensor,
         kv_fused: torch.Tensor,

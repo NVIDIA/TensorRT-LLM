@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+from tensorrt_llm._torch.custom_ops.fast_custom_op import fast_custom_op
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import eager_on_graph
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
@@ -19,7 +20,7 @@ def _extract_extra_attrs(layer_idx: str):
     return extract_extra_attrs(layer_idx, "mla")
 
 
-@torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
+@fast_custom_op("trtllm::mla_dsa_proj", mutates_args=())
 def mla_dsa_proj(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
@@ -102,7 +103,7 @@ def _mla_dsa_proj_fake(
     return [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights, q_scale]
 
 
-@torch.library.custom_op("trtllm::mla_dsa_attn_inplace", mutates_args=("output",))
+@fast_custom_op("trtllm::mla_dsa_attn_inplace", mutates_args=("output",))
 def mla_dsa_attn_inplace(
     q: torch.Tensor,
     compressed_kv: torch.Tensor,

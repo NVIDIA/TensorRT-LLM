@@ -34,6 +34,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .fast_custom_op import fast_custom_op
+
 FP8_MAX = 448.0
 
 
@@ -110,9 +112,10 @@ def sfc_finalize(
     return sf, s, max_raw
 
 
-@torch.library.custom_op(
+@fast_custom_op(
     "trtllm::nvfp4_sfc_finalize",
     mutates_args=(),
+    device_types=("CUDA", "CPU"),
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 def nvfp4_sfc_finalize(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

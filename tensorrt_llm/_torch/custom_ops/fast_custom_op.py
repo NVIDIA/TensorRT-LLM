@@ -57,6 +57,7 @@ def fast_custom_op(
     *,
     mutates_args: Union[Iterable[str], str] = (),
     device_types: Union[str, Tuple[str, ...]] = "CUDA",
+    tags: Tuple[torch.Tag, ...] = (),
 ) -> Callable[[Callable], "FastCustomOp"]:
     """Register a Python function as a fast custom torch op.
 
@@ -65,6 +66,7 @@ def fast_custom_op(
       mutates_args: names of arguments that are mutated in-place; empty tuple
         means the op is pure.
       device_types: backend(s) to register the impl on (default ``"CUDA"``).
+      tags: ``torch.Tag`` values to attach to the op's schema.
     """
     if "::" not in qualname:
         raise ValueError(f"qualname must be '<ns>::<name>', got {qualname!r}")
@@ -79,7 +81,7 @@ def fast_custom_op(
     def decorator(fn: Callable) -> "FastCustomOp":
         schema = infer_schema(fn, op_name=op_name, mutates_args=mutates_args_tuple)
         lib = _get_library(namespace)
-        lib.define(schema)
+        lib.define(schema, tags=tags)
         for dt in dev_types:
             lib.impl(op_name, fn, dt)
         return FastCustomOp(qualname=qualname, namespace=namespace, op_name=op_name, python_fn=fn)
@@ -96,7 +98,7 @@ class FastCustomOp:
     ``@custom_op``.
     """
 
-    __slots__ = ("qualname", "namespace", "op_name", "_python_fn", "_op")
+    __slots__ = ("qualname", "namespace", "op_name", "_python_fn", "_op", "_abstract_fn")
 
     def __init__(self, qualname: str, namespace: str, op_name: str, python_fn: Callable):
         self.qualname = qualname
@@ -104,12 +106,16 @@ class FastCustomOp:
         self.op_name = op_name
         self._python_fn = python_fn
         self._op = getattr(getattr(torch.ops, namespace), op_name)
+        self._abstract_fn = None
 
     def __call__(self, *args, **kwargs):
         return self._op(*args, **kwargs)
 
     def register_fake(self, fake_fn: Callable) -> Callable:
         register_fake(self.qualname, fake_fn)
+        # custom_op keeps its fake under the same name, so code that looks the
+        # fake up there finds it on either kind of op.
+        self._abstract_fn = fake_fn
         return fake_fn
 
     @property
