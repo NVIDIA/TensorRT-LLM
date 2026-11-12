@@ -5284,6 +5284,47 @@ class TestMiniMaxM2ToolParser:
 
 
 # ============================================================================
+# MiniMaxM3ToolParser Tests
+# ============================================================================
+
+M3_NS = "]<]minimax[>["
+M3_OPEN_CALL = f'{M3_NS}<tool_call>\n{M3_NS}<invoke name="get_weather">\n'
+M3_CLOSE_CALL = (f"{M3_NS}<location>Paris{M3_NS}</location>\n"
+                 f"{M3_NS}</invoke>\n{M3_NS}</tool_call>")
+
+
+class TestMiniMaxM3ToolParser:
+    """Test suite for MiniMaxM3ToolParser class."""
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            # The tool-call opener starts with "]", so these are held back.
+            ["The primes are ", "[2, 3, 5]"],
+            ["See the docs [1]"],
+            # The stream stops inside a call.
+            ["Let me check. " + M3_OPEN_CALL],
+            ["Checking. " + M3_OPEN_CALL, M3_CLOSE_CALL],
+        ],
+    )
+    def test_streaming_matches_detect_and_parse(self, sample_tools, chunks):
+        """Streaming plus finish() returns what one-shot parsing returns."""
+        expected = MiniMaxM3ToolParser().detect_and_parse(
+            "".join(chunks), sample_tools)
+
+        parser = MiniMaxM3ToolParser()
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+        results.append(parser.finish(sample_tools))
+
+        assert "".join(r.normal_text for r in results) == expected.normal_text
+        assert [(c.name, c.parameters) for r in results for c in r.calls
+                ] == [(c.name, c.parameters) for c in expected.calls]
+
+
+# ============================================================================
 # Reasoning Parser Tests for Interleaved Thinking
 # ============================================================================
 
