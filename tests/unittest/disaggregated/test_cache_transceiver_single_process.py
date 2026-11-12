@@ -1890,7 +1890,6 @@ def _offload_lifecycle_executor(
         effects=PyExecutorEffects(executor),
         registry=PyExecutorRequestRegistry(executor),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=True,
         is_kv_manager_v2=True,
     )
     return executor, responses
