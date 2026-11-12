@@ -190,6 +190,9 @@ def test_pretrained_quantization_takes_precedence_over_fallback(
             False,
             "the overlap scheduler is not supported by this eager Beam target",
         ),
+        ("load_format", "dummy", "load_format must be auto"),
+        ("max_beam_width", 2, "max_beam_width must be 1"),
+        ("max_num_tokens", None, "max_num_tokens must be explicitly set"),
         ("max_num_tokens", MAX_NUM_TOKENS + 1, f"max_num_tokens {MAX_NUM_TOKENS + 1} is outside"),
     ],
 )
@@ -268,3 +271,18 @@ def test_checkpoint_digests_follow_diagnostic_mode(diagnostics, tmp_path) -> Non
     assert Target.load_checkpoint(target, checkpoint) is record
     load.assert_called_once_with(checkpoint, record_digests=diagnostics)
     assert target.load_record is record
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("chunked,reuse", [(False, False), (True, False), (False, True)])
+def test_route_checks_paged_context_page_size(route_setup, page_size, chunked, reuse) -> None:
+    config, args, reads = route_setup
+    args.enable_chunked_prefill = chunked
+    args.kv_cache_config = NS(dtype="auto", tokens_per_block=page_size, enable_block_reuse=reuse)
+    if page_size != 32 and (chunked or reuse):
+        with pytest.raises(NoTarget, match="kv_cache_config.tokens_per_block must be 32"):
+            routing.route(config, args, (10, 3))
+        assert reads == []
+    else:
+        assert routing.route(config, args, (10, 3)) is Target
+        assert reads == [None]

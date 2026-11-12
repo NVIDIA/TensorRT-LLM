@@ -57,10 +57,20 @@ def engine_refusal(llm_args: TorchLlmArgs | None) -> str | None:
             reasons.append(f"{field} is not supported by this Beam target")
     if getattr(llm_args, "enable_return_routed_experts", False):
         reasons.append("returning routed experts is not supported")
-    max_tokens = getattr(llm_args, "max_num_tokens", None)
-    if max_tokens is not None:
-        if not 1 <= max_tokens <= MAX_NUM_TOKENS:
-            reasons.append(f"max_num_tokens {max_tokens} is outside [1, {MAX_NUM_TOKENS}]")
+    cache = getattr(llm_args, "kv_cache_config", None)
+    paged_context = getattr(llm_args, "enable_chunked_prefill", False) or getattr(
+        cache, "enable_block_reuse", True
+    )
+    page_size = getattr(cache, "tokens_per_block", 32)
+    if paged_context and page_size != 32:
+        reasons.append(
+            "kv_cache_config.tokens_per_block must be 32 for Beam paged-context attention"
+        )
+    max_tokens = getattr(llm_args, "max_num_tokens", MAX_NUM_TOKENS)
+    if max_tokens is None:
+        reasons.append(f"max_num_tokens must be explicitly set in [1, {MAX_NUM_TOKENS}], not None")
+    elif not 1 <= max_tokens <= MAX_NUM_TOKENS:
+        reasons.append(f"max_num_tokens {max_tokens} is outside [1, {MAX_NUM_TOKENS}]")
     return "; ".join(reasons) or None
 
 
