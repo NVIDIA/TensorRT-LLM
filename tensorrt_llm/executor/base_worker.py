@@ -32,7 +32,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
-from .._torch.pyexecutor.iteration_stats_json import iteration_stats_row
+from .._torch.pyexecutor.iteration_stats import IterationStatsRecord
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
@@ -48,6 +48,7 @@ from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
+from ..metrics.perf import PerfMetricsCollector
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
@@ -1288,31 +1289,23 @@ class BaseWorker(GenerationExecutor):
             return
         stop_fn()
 
-    # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
+        """Serialize named stats records, legacy tuples, or tagged per-rank rows."""
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
         # Already serialized on the producing rank via allgather — just emit.
         if (isinstance(stats, tuple) and len(stats) == 2
                 and stats[0] == "per_rank_dict"):
-            return json.dumps(stats[1])
+            return PerfMetricsCollector.collect_iteration(
+                stats[1]).iteration_json()
         # Attention-DP fanout rows are serialized when rank 0 appends them.
         if isinstance(stats, str):
             return stats
 
-        # Newer slots are guarded with len() checks so historical 4-tuples
-        # and external code still appending the legacy shape keep working.
-        return json.dumps(
-            iteration_stats_row(
-                stats[0],
-                stats[1],
-                kv_iter_stats=stats[2] if len(stats) > 2 else None,
-                attention_dp_rank=stats[3] if len(stats) > 3 else None,
-                host_step_time_ms=stats[4] if len(stats) > 4 else None,
-                prev_device_step_time_ms=stats[5] if len(stats) > 5 else None,
-                scheduler_mode=stats[6] if len(stats) > 6 else None,
-                gpu_forward_time_ms=stats[7] if len(stats) > 7 else None,
-            ))
+        entry = IterationStatsRecord.from_tuple(stats)
+        # Preserve the public JSON shape while collecting categories before exposure.
+        record = PerfMetricsCollector.collect_iteration(entry.to_dict())
+        return record.iteration_json()
 
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:
