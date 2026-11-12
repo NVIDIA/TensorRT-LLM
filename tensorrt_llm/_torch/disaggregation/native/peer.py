@@ -622,6 +622,12 @@ class PeerRegistrar:
     @staticmethod
     def _group_rank_info(rank_info: RankInfo, layer_group: AttentionLayerGroup) -> RankInfo:
         tp_size, tp_rank = MambaPolicy._mamba_tp(rank_info)
+        total, heads = layer_group.total_kv_head_num, layer_group.kv_head_num_per_rank
+        if total is not None and heads != max(1, total // tp_size):
+            raise ValueError(
+                f"Standalone draft group holds {heads} KV heads/rank; a {tp_size}-way head grid "
+                f"over {total} heads needs {max(1, total // tp_size)}"
+            )
         return replace(
             rank_info,
             tp_size=tp_size,
