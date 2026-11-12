@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const MARKER = '<!-- pyrefly-diff-report -->';
-const WORKFLOW = '.github/workflows/pyrefly-diff.yml';
+const WORKFLOW = '.github/workflows/pyrefly-check.yml';
 const escapeHtml = text => String(text).replace(/[&<>]/g,
   character => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[character]));
 
@@ -23,28 +23,38 @@ function validate(report) {
 
 function bodyFor(report, run, serverUrl) {
   const count = report.diagnostics.length;
+  const found = `${count || 'no'} ${count === 1 ? 'diagnostic' : 'diagnostics'} from your changes`;
   const title = report.error ? '⚠️ Pyrefly check incomplete' :
-    count ? `⚠️ Pyrefly: ${count} new diagnostics` : '✅ Pyrefly: no new diagnostics';
-  const lines = [MARKER, `### ${title}`, '',
-    `Target: <code>${escapeHtml(report.base_ref)}</code> ` +
-      `(${report.base_sha.slice(0, 12) || 'unavailable'}). PR head: ${report.head_sha.slice(0, 12)}.`, ''];
+    `${count ? '⚠️' : '✅'} Pyrefly: ${found}`;
+  const head = report.head_sha.slice(0, 12);
+  const branch = `<code>${escapeHtml(report.base_ref)}</code>`;
+  const target = `${branch} (${report.base_sha.slice(0, 12) || 'unavailable'})`;
+  const merged = `after merging this PR (${head}) into the latest ${target}`;
+  const lines = [MARKER, `### ${title}`, ''];
   if (report.error) {
-    lines.push('The comparison did not finish, so this is not a clean result.',
+    lines.push(`Target: ${target}. PR head: ${head}.`, '',
+      'The comparison did not finish, so this is not a clean result.',
       `<pre>${escapeHtml(report.error.slice(0, 2000))}</pre>`);
-  } else if (count) {
-    lines.push('This check is advisory and does not fail CI. ' +
-      'Please fix these diagnostics or accept them, then resolve this conversation.', '');
-    let shown = 0;
+  } else if (!count) {
+    lines.push(`Checked ${merged}.`);
+  } else {
+    lines.push(`Found ${merged}. Line numbers refer to the merged code.`, '',
+      'This check is advisory and does not block the PR for now. ' +
+      `Some of the diagnostics below may come from a semantic conflict with the latest ${branch}, ` +
+      'so please look at each one carefully and decide whether to fix it. ' +
+      'Resolve this conversation before merging the PR.', '');
+    // One code block: each location on its own line, then the indented error kind and message.
+    const shown = [];
+    let size = 0;
     for (const item of report.diagnostics.slice(0, 50)) {
-      const entry = `<code>${escapeHtml(item.path.slice(0, 500))}:${item.line}</code> ` +
-        `<code>[${escapeHtml(item.name.slice(0, 100))}]</code>\n` +
-        `<pre>${escapeHtml(item.message.slice(0, 1200))}</pre>`;
-      if (lines.join('\n').length + entry.length > 48000) break;
-      lines.push(entry, '');
-      shown++;
+      const entry = escapeHtml(`${item.path.slice(0, 500)}:${item.line}\n` +
+        `    [${item.name.slice(0, 100)}] ${item.message.slice(0, 1200).replace(/\n/g, '\n    ')}`);
+      if (size + entry.length > 48000) break;
+      shown.push(entry);
+      size += entry.length + 1;
     }
-    if (shown < count) lines.push(`Showing ${shown} of ${count} diagnostics.`);
-    lines.push('Locations refer to the temporary merged source tree.');
+    lines.push(`<pre>${shown.join('\n')}</pre>`);
+    if (shown.length < count) lines.push('', `Showing ${shown.length} of ${count} diagnostics.`);
   }
   lines.push('', `[Full reports and workflow logs](${serverUrl}/${run.repository.full_name}/actions/runs/${run.id})`);
   return lines.join('\n');

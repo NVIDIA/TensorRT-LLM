@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Scans the target branch tip and a temporary merge of the PR head, then uploads the
-# diagnostics the PR adds. New diagnostics do not fail the job; a check that could not
-# finish does. This workflow runs PR code, so it holds no write permission;
+# Runs the Pyrefly type check on two trees: the tip of the target branch, and that tip
+# with the PR head temporarily merged in. Uploads the type errors that exist only in
+# the merged tree. Type errors do not fail the job; the job fails only when the check
+# itself cannot finish (merge conflict, dependency install failure, scan failure or
+# timeout). This workflow runs PR code, so it holds no write permission;
 # pyrefly-report.yml publishes the result.
-name: Pyrefly diff
+name: Pyrefly type check
 
 on:
   pull_request:
@@ -28,10 +30,16 @@ jobs:
     env:
       # actions/checkout skips LFS only for its own git commands.
       GIT_LFS_SKIP_SMUDGE: 1
-      PYREFLY_BASE_ROOT: ${{ github.workspace }}/../pyrefly-base
-      PYREFLY_MERGED_ROOT: ${{ github.workspace }}/../pyrefly-merged
-      PYREFLY_REPORT_DIR: ${{ github.workspace }}/../pyrefly-diff
     steps:
+      # The work directories live outside the checkout. Job-level `env` cannot read
+      # `runner.temp`, and upload-artifact rejects a path that contains `..`.
+      - name: Set work directories
+        run: |
+          {
+            echo "PYREFLY_BASE_ROOT=$RUNNER_TEMP/pyrefly-base"
+            echo "PYREFLY_MERGED_ROOT=$RUNNER_TEMP/pyrefly-merged"
+            echo "PYREFLY_REPORT_DIR=$RUNNER_TEMP/pyrefly-diff"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           # The merge needs full history; file contents are fetched only when used.
