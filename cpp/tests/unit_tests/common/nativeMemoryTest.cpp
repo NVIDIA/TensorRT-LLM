@@ -53,14 +53,19 @@ TEST(NativeMemoryTest, ExactRecordsBalance)
     char const* label = "test_exact";
     recordNativeAllocation(label, 3, 100);
     recordNativeAllocation(label, 3, 50);
+    recordNativeAllocation(label, 4, 70);
     EXPECT_EQ(usageOf(label, 3).count, 2);
     EXPECT_EQ(usageOf(label, 3).bytes, 150);
+    EXPECT_EQ(usageOf(label, 4).count, 1) << "records are per device";
+    EXPECT_EQ(usageOf(label, 4).bytes, 70) << "records are per device";
     recordNativeRelease(label, 3, 100);
     recordNativeRelease(label, 3, 50);
     auto const usage = usageOf(label, 3);
     EXPECT_EQ(usage.count, 0);
     EXPECT_EQ(usage.bytes, 0);
-    EXPECT_EQ(usageOf(label, 4).count, 0) << "records are per device";
+    EXPECT_EQ(usageOf(label, 4).count, 1) << "releases on device 3 leave device 4 alone";
+    recordNativeRelease(label, 4, 70);
+    EXPECT_EQ(usageOf(label, 4).count, 0);
 }
 
 TEST(NativeMemoryTest, AdjustChangesBytesButNotCount)
@@ -143,7 +148,7 @@ TEST(NativeMemoryTest, LabelScopesNestAndRestore)
 
 TEST(NativeMemoryTest, LabelsAreUnique)
 {
-    auto const& all = native_memory_label::kAll;
+    auto const& all = nativeMemoryLabels::kAll;
     for (std::size_t i = 0; i < all.size(); ++i)
     {
         for (std::size_t j = i + 1; j < all.size(); ++j)

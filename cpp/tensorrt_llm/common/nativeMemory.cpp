@@ -67,29 +67,29 @@ thread_local char const* tCurrentLabel = nullptr;
 
 void recordNativeAllocation(char const* label, int device, std::int64_t bytes) noexcept
 {
-    addNativeMemory(label, device, 1, bytes, 0);
+    addNativeMemory(label, device, /*count=*/1, /*bytes=*/bytes, /*unmeasured=*/0);
 }
 
 void recordNativeRelease(char const* label, int device, std::int64_t bytes) noexcept
 {
-    addNativeMemory(label, device, -1, -bytes, 0);
+    addNativeMemory(label, device, /*count=*/-1, /*bytes=*/-bytes, /*unmeasured=*/0);
 }
 
 void recordNativeRelease(NativeMemoryRecord const& record) noexcept
 {
     if (record.bytes == NativeMemoryRecord::kUnmeasured)
     {
-        addNativeMemory(record.label, record.device, -1, 0, -1);
+        addNativeMemory(record.label, record.device, /*count=*/-1, /*bytes=*/0, /*unmeasured=*/-1);
     }
     else
     {
-        addNativeMemory(record.label, record.device, -1, -record.bytes, 0);
+        addNativeMemory(record.label, record.device, /*count=*/-1, /*bytes=*/-record.bytes, /*unmeasured=*/0);
     }
 }
 
 void adjustNativeAllocation(char const* label, int device, std::int64_t deltaBytes) noexcept
 {
-    addNativeMemory(label, device, 0, deltaBytes, 0);
+    addNativeMemory(label, device, /*count=*/0, /*bytes=*/deltaBytes, /*unmeasured=*/0);
 }
 
 std::int64_t currentDeviceFreeBytes() noexcept
@@ -118,12 +118,12 @@ NativeMemoryRecord recordNativeAllocationMeasured(char const* label, std::int64_
     if (freeAfter < 0 || delta < 0)
     {
         record.bytes = NativeMemoryRecord::kUnmeasured;
-        addNativeMemory(label, record.device, 1, 0, 1);
+        addNativeMemory(label, record.device, /*count=*/1, /*bytes=*/0, /*unmeasured=*/1);
     }
     else
     {
         record.bytes = delta;
-        addNativeMemory(label, record.device, 1, delta, 0);
+        addNativeMemory(label, record.device, /*count=*/1, /*bytes=*/delta, /*unmeasured=*/0);
     }
     return record;
 }

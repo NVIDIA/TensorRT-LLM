@@ -172,7 +172,7 @@ public:
             // Every NVLS allocation below (the output buffer and the workspace's barriers) is recorded, at its
             // rounded size, under this label until it is freed.
             tensorrt_llm::common::NativeMemoryLabelScope const nativeMemoryLabel(
-                tensorrt_llm::common::native_memory_label::kGemmAllreduceNvls);
+                tensorrt_llm::common::nativeMemoryLabels::kGemmAllreduceNvls);
             handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;

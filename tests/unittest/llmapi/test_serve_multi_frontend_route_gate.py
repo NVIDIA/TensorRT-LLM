@@ -76,6 +76,7 @@ def _llm_server_routes() -> list[tuple[str, str]]:
         args=SimpleNamespace(
             return_perf_metrics=False,
             memory_monitor_config=MemoryMonitorConfig(mode="full"),
+            num_serve_frontends=1,
         ),
     )
     server.use_harmony = False

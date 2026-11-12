@@ -51,7 +51,7 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
     m.impl("get_native_memory_labels",
         []()
         {
-            auto const& all = tensorrt_llm::common::native_memory_label::kAll;
+            auto const& all = tensorrt_llm::common::nativeMemoryLabels::kAll;
             return std::vector<std::string>(all.begin(), all.end());
         });
 }

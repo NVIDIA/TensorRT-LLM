@@ -17,6 +17,7 @@
 #include "ipcsocket.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "userbuffers.h"
 
 #include <cassert>
@@ -374,6 +375,9 @@ int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* 
 
     comm->uchandles[hndl] = (CUmemGenericAllocationHandle*) malloc(nranks * sizeof(CUmemGenericAllocationHandle));
     CUCHECK(cuMemCreate(&(comm->uchandles[hndl][myrank]), aligned_size, &prop, 0));
+    // Registered buffers stay mapped until the process exits, so the record is never released.
+    tensorrt_llm::common::recordNativeAllocation(
+        tensorrt_llm::common::nativeMemoryLabels::kUserbuffers, comm->mydev, static_cast<std::int64_t>(aligned_size));
 
 #ifdef MNNVL
     CUmemFabricHandle* exphndl;

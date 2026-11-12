@@ -291,7 +291,7 @@ private:
     }
 
     // Neither buffer comes from the PyTorch caching allocator.
-    static constexpr char const* kSlotMemoryLabel = tensorrt_llm::common::native_memory_label::kUlyssesA2aSlots;
+    static constexpr char const* kSlotMemoryLabel = tensorrt_llm::common::nativeMemoryLabels::kUlyssesA2aSlots;
 
     // Lazy collective allocator. Cached when size is sufficient; reallocates
     // (releasing the old handle) on size-up. All ranks must reach this in the

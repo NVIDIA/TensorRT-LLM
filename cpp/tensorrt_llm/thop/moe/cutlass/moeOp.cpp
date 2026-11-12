@@ -1272,7 +1272,7 @@ private:
     size_t mProfileWorkspaceSize = 0;
     int mProfileWorkspaceDevice = 0;
     static constexpr char const* kProfileWorkspaceLabel
-        = tensorrt_llm::common::native_memory_label::kMoeGemmProfilerWorkspace;
+        = tensorrt_llm::common::nativeMemoryLabels::kMoeGemmProfilerWorkspace;
     std::map<std::pair<int, cudaStream_t>, WorkspaceInfo> mStreamWorkspaces;
     ActivationParamBuffers mActivationParamBuffers;
 

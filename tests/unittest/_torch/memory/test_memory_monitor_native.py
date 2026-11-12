@@ -188,5 +188,9 @@ def test_eplb_host_accessible_memory_is_recorded(monkeypatch):
     assert sum(e.size_bytes or 0 for e in entries if e.category is Category.WEIGHTS) < 16 * MB
     del module, weight
     gc.collect()
-    assert _ledger()[label] == before.get(label, (0, 0))
+    if label == "eplb_gpu_numa":
+        # The NUMA huge-page pool keeps its pages mapped until exit, so freeing the tensor records no release.
+        assert _ledger()[label] == after[label]
+    else:
+        assert _ledger()[label] == before.get(label, (0, 0))
     del balancer

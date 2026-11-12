@@ -217,7 +217,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     // With NCCL_RUNTIME_CONNECT=0 (set above) NCCL allocates its connection buffers here and reports no size.
     *nativeMemory = tensorrt_llm::common::recordNativeAllocationMeasured(
-        tensorrt_llm::common::native_memory_label::kNcclCommunicators, freeBefore);
+        tensorrt_llm::common::nativeMemoryLabels::kNcclCommunicators, freeBefore);
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     if (common::nccl_util::isNcclWindowSupported())
     {

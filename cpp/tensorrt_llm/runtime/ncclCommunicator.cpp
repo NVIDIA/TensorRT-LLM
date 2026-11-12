@@ -181,7 +181,7 @@ ncclComm_t NcclCommunicator::createComm(
     auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
     TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
     nativeMemory = tensorrt_llm::common::recordNativeAllocationMeasured(
-        tensorrt_llm::common::native_memory_label::kNcclCommunicators, freeBefore);
+        tensorrt_llm::common::nativeMemoryLabels::kNcclCommunicators, freeBefore);
     return comm;
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable

@@ -379,7 +379,7 @@ char const* HostAccessibleDeviceAllocator::nativeMemoryLabel(bool gdr) const
 {
     // Only the GDRCopy path is plain device memory. The NUMA path maps the GPU's memory as a host NUMA node and the
     // fallback is managed memory; neither is reliably in the device's per-process usage, so they are kept apart.
-    namespace label = tensorrt_llm::common::native_memory_label;
+    namespace label = tensorrt_llm::common::nativeMemoryLabels;
     if (gdr)
     {
         return label::kEplbDevice;

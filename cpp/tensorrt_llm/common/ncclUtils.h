@@ -361,6 +361,9 @@ public:
     };
 
     //! \brief Usage on `device`; all zero for a device with no buffers.
+    //!
+    //! Reads totals kept under their own lock, so it never waits for a window allocation or
+    //! registration in progress, which hold mMutex across collectives with other ranks.
     DeviceUsage getDeviceUsage(int device) const;
 
     // Check if a communicator is valid (non-null)
@@ -438,6 +441,11 @@ private:
         uint64_t releaseEpoch{0};
     };
 
+    // Keep mDeviceUsage in step with mBufferPool. Each assumes mMutex is already locked and takes mUsageMutex.
+    void addEntryUsageLocked(BufferEntry const& entry);
+    void removeEntryUsageLocked(BufferEntry const& entry);
+    void setInUseLocked(BufferEntry& entry, bool inUse);
+
     struct TensorLeaseScope;
 
     struct TensorLease
@@ -467,6 +475,9 @@ private:
     mutable std::mutex mMutex;
     std::atomic_bool mSuppressLifecycleWarningAssertionsForTest{false};
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
+    // Per-device totals of mBufferPool, guarded by mUsageMutex (taken after mMutex, never before it).
+    mutable std::mutex mUsageMutex;
+    std::unordered_map<int, DeviceUsage> mDeviceUsage;
     std::unordered_set<ncclComm_t> mRegisteredComms;
     // Smallest request size that is known to fail collectively for each communicator.
     // Requests below the recorded size may still succeed and already-pooled buffers are always

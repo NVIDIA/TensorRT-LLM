@@ -43,7 +43,7 @@ namespace common
 //! - The ledger is never destroyed, so releases recorded from static destructors are safe.
 
 //! \brief Labels the ledger accepts. `providers/native.py` describes each one; a test keeps the two in step.
-namespace native_memory_label
+namespace nativeMemoryLabels
 {
 constexpr char const* kNcclCommunicators = "nccl_communicators";
 constexpr char const* kGemmAllreduceNvls = "gemm_allreduce_nvls";
@@ -52,11 +52,12 @@ constexpr char const* kMoeGemmProfilerWorkspace = "moe_gemm_profiler_workspace";
 constexpr char const* kEplbDevice = "eplb_device";
 constexpr char const* kEplbGpuNuma = "eplb_gpu_numa";
 constexpr char const* kEplbManaged = "eplb_managed";
+constexpr char const* kUserbuffers = "userbuffers";
 
 //! \brief Every label above.
-constexpr std::array<char const*, 7> kAll{kNcclCommunicators, kGemmAllreduceNvls, kUlyssesA2aSlots,
-    kMoeGemmProfilerWorkspace, kEplbDevice, kEplbGpuNuma, kEplbManaged};
-} // namespace native_memory_label
+constexpr std::array<char const*, 8> kAll{kNcclCommunicators, kGemmAllreduceNvls, kUlyssesA2aSlots,
+    kMoeGemmProfilerWorkspace, kEplbDevice, kEplbGpuNuma, kEplbManaged, kUserbuffers};
+} // namespace nativeMemoryLabels
 
 //! \brief Totals for one label on one device.
 struct NativeMemoryUsage
