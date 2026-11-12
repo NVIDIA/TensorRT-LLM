@@ -1110,6 +1110,8 @@ class _MergeKernel:
 # ---------------------------------------------------------------------------------------
 
 _COMPILED: dict = {}
+#: (geometry, gated, gate tensor rank) forms whose every reachable split plan is compiled.
+_PLANNED: set = set()
 
 #: Splits by (rows x KV heads), per pool element size, measured at the routed geometries
 #: (`MAX_ROWS`): one tile a CTA while the grid is under about a wave, then fewer, longer splits;
@@ -1147,6 +1149,39 @@ def plan_splits(rows: int, kv_heads: int, width: int, elem: int) -> tuple[int, i
     want = max(1, min(n_tiles, want, MAX_SPLITS))
     tps = -(-n_tiles // want)
     return -(-n_tiles // tps), tps
+
+
+def reachable_plans(max_rows: int, kv_heads: int, width: int, elem: int) -> list:
+    """Every `(splits, tiles per split)` `plan_splits` returns for 1..max_rows rows."""
+    return sorted({plan_splits(r, kv_heads, width, elem) for r in range(1, max_rows + 1)})
+
+
+def _compile_split(geometry: tuple, splits: int, tps: int, gated: bool, kern_kw: dict, args):
+    """The split pass of `geometry` at plan `(splits, tps)` (`gated`: the one-split pass stores
+    the gated output), compiled once; `args()` builds the compile arguments."""
+    key = geometry + (splits, tps, gated)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        kern = _SplitKernel(splits=splits, tps=tps, gated=gated, **kern_kw)
+        fn = cute.compile(kern, *args(), options="--opt-level 2 --enable-tvm-ffi")
+        _COMPILED[key] = fn
+    return fn
+
+
+def _compile_merge(heads: int, splits: int, gated: bool, pdl: bool, gdim: int, args):
+    """The merge of `splits` partials, compiled once per gate tensor rank `gdim` (the trunk's
+    `[rows, Hq * D]` gate, the draft layer's `[rows, Hq, D]` view, q when ungated); `args()`
+    builds the compile arguments."""
+    key = ("merge", heads, splits, gated, gdim, pdl)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        fn = cute.compile(
+            _MergeKernel(heads=heads, splits=splits, gated=gated, pdl=pdl),
+            *args(),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+        _COMPILED[key] = fn
+    return fn
 
 
 def _ptr(t: torch.Tensor, dtype, align=16):
@@ -1193,23 +1228,6 @@ def sparse_gqa_decode(
         else:
             assert output_gate.shape == (rows, num_q_heads * head_dim)
     req64 = request_indices.dtype == torch.int64
-    key = (
-        elem,
-        group,
-        num_kv_heads,
-        width,
-        tpb,
-        n_splits,
-        tps,
-        float(softmax_scale),
-        num_pages,
-        tuple(block_table.shape),
-        tuple(k_cache.stride()[:3]),
-        tuple(q.stride()[:2]),
-        req64,
-        gated and n_splits == 1,
-        use_pdl,
-    )
     if n_splits > 1:
         part = torch.empty(
             (n_splits, rows, num_q_heads, head_dim), dtype=torch.float32, device=q.device
@@ -1220,27 +1238,38 @@ def sparse_gqa_decode(
         o_t, l_t = out, out
     gate_t = output_gate if gated else q
     gate_stride = output_gate.stride(0) if gated else 0
-    fn = _COMPILED.get(key)
-    if fn is None:
-        kern = _SplitKernel(
-            elem=elem,
-            group=group,
-            kv_heads=num_kv_heads,
-            width=width,
-            tpb=tpb,
-            splits=n_splits,
-            tps=tps,
-            scale=float(softmax_scale),
-            num_pages=num_pages,
-            bt_width=block_table.shape[1],
-            num_requests=block_table.shape[0],
-            kv_strides=tuple(k_cache.stride()[:3]),
-            q_strides=tuple(q.stride()[:2]),
-            gated=gated and n_splits == 1,
-            pdl=use_pdl,
-        )
-        fn = cute.compile(
-            kern,
+    # The compile key without the split plan (rows pick it) and the one-split gate.
+    geometry = (
+        elem,
+        group,
+        num_kv_heads,
+        width,
+        tpb,
+        float(softmax_scale),
+        num_pages,
+        tuple(block_table.shape),
+        tuple(k_cache.stride()[:3]),
+        tuple(q.stride()[:2]),
+        req64,
+        use_pdl,
+    )
+    kern_kw = dict(
+        elem=elem,
+        group=group,
+        kv_heads=num_kv_heads,
+        width=width,
+        tpb=tpb,
+        scale=float(softmax_scale),
+        num_pages=num_pages,
+        bt_width=block_table.shape[1],
+        num_requests=block_table.shape[0],
+        kv_strides=tuple(k_cache.stride()[:3]),
+        q_strides=tuple(q.stride()[:2]),
+        pdl=use_pdl,
+    )
+
+    def split_args():
+        return (
             from_dlpack(selected_tokens, assumed_align=4).mark_layout_dynamic(leading_dim=1),
             _ptr(q, cutlass.BFloat16),
             _ptr(k_cache, cutlass.Uint8),
@@ -1255,9 +1284,41 @@ def sparse_gqa_decode(
             cutlass.Int32(gate_stride),
             cutlass.Int32(gate_hs),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--opt-level 2 --enable-tvm-ffi",
         )
-        _COMPILED[key] = fn
+
+    def merge_args(gate, stride):
+        # The partials' pointers only type the compile (a one-split call has none: `out`'s).
+        return lambda: (
+            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=gate.dim() - 1),
+            _ptr(o_t, cutlass.Float32),
+            _ptr(l_t, cutlass.Float32, 4),
+            _ptr(out, cutlass.BFloat16),
+            cutlass.Int32(rows),
+            cutlass.Int32(stride),
+            cutlass.Int32(gate_hs),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        )
+
+    # The plan depends on the call's row count: the first call of a geometry in a gate form
+    # compiles the split pass and merge of every plan its rows can reach (`MAX_ROWS`), so no
+    # serving step compiles one; a gated call also compiles the ungated flavours, which a mixed
+    # step's generation rows (and a draft-extend step's) call at the geometry a decode step
+    # calls gated. The engine's warmup runs each captured decode batch eagerly first.
+    form = geometry + (gated, gate_t.dim())
+    if form not in _PLANNED:
+        _PLANNED.add(form)
+        cap = max(rows, MAX_ROWS.get((num_q_heads, num_kv_heads, k_cache.dtype), 0))
+        for splits, per in reachable_plans(cap, num_kv_heads, width, elem):
+            _compile_split(geometry, splits, per, gated and splits == 1, kern_kw, split_args)
+            if splits == 1:
+                if gated:
+                    _compile_split(geometry, splits, per, False, kern_kw, split_args)
+                continue
+            gm = merge_args(gate_t, gate_stride)
+            _compile_merge(num_q_heads, splits, gated, use_pdl, gate_t.dim(), gm)
+            if gated:
+                _compile_merge(num_q_heads, splits, False, use_pdl, q.dim(), merge_args(q, 0))
+    fn = _compile_split(geometry, n_splits, tps, gated and n_splits == 1, kern_kw, split_args)
     fn(
         selected_tokens,
         q.data_ptr(),
@@ -1275,32 +1336,9 @@ def sparse_gqa_decode(
     )
     if n_splits == 1:
         return out
-
-    def _compile_merge(merge_gated, gate, stride):
-        return cute.compile(
-            _MergeKernel(heads=num_q_heads, splits=n_splits, gated=merge_gated, pdl=use_pdl),
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=gate.dim() - 1),
-            _ptr(part, cutlass.Float32),
-            _ptr(lse, cutlass.Float32, 4),
-            _ptr(out, cutlass.BFloat16),
-            cutlass.Int32(rows),
-            cutlass.Int32(stride),
-            cutlass.Int32(gate_hs),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--opt-level 2 --enable-tvm-ffi",
-        )
-
-    mkey = ("merge", num_q_heads, n_splits, gated, gate_t.dim(), use_pdl)
-    mfn = _COMPILED.get(mkey)
-    if mfn is None:
-        mfn = _compile_merge(gated, gate_t, gate_stride)
-        _COMPILED[mkey] = mfn
-        # A mixed step's generation rows (and a draft-extend step's) call the merge ungated at
-        # the geometry a decode step calls it gated: compile that flavour now as well, so it
-        # never compiles inside a served step. Ungated, the gate operand is `q` (3-D).
-        ukey = ("merge", num_q_heads, n_splits, False, q.dim(), use_pdl)
-        if gated and ukey not in _COMPILED:
-            _COMPILED[ukey] = _compile_merge(False, q, 0)
+    mfn = _compile_merge(
+        num_q_heads, n_splits, gated, use_pdl, gate_t.dim(), merge_args(gate_t, gate_stride)
+    )
     mfn(gate_t, part.data_ptr(), lse.data_ptr(), out.data_ptr(), rows, gate_stride, gate_hs)
     return out
 

@@ -1157,6 +1157,63 @@ def _check_sparse_gqa_splitk(cell, monkeypatch) -> None:
         _replay_in_a_graph(_sgc_op, args, lambda: _refill(args, seed + 1, _rolled_selection), out)
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(
+            mod._verify(dict(mod._TEP2, slots=128), 128, last=30000, step=150, **mod._TEP2_ROW),
+            id="tep2",
+        ),
+        pytest.param(mod._verify(mod._DEP4, 32, last=60000, step=1700, **mod._DEP4_ROW), id="dep4"),
+        pytest.param(mod._verify(mod._TEP4, 4, **mod._TEP4_ROW), id="tep4"),
+    ],
+)
+def test_sparse_gqa_splitk_first_decode_call_compiles_every_plan(spec, monkeypatch) -> None:
+    """A geometry's first gated decode call compiles the split pass and both merge flavours of
+    every plan its row counts reach (`MAX_ROWS`). A mixed step's ungated generation rows then
+    compile nothing at any plan (at tp2/tep2, 164..256 and 324..512 rows take three splits),
+    nor do gated calls, and the results stay within the reference band."""
+    monkeypatch.setattr(mod, "_COMPILED", {})
+    monkeypatch.setattr(mod, "_PLANNED", set())
+    args = _sgc_build(spec, seed=4242)
+    q, k = args["q"], args["k_cache"]
+    cap = mod.MAX_ROWS[(q.shape[1], k.shape[1], k.dtype)]
+    assert q.shape[0] == cap, "the build covers every routed row count"
+    width = args["selected_tokens"].shape[1]
+    elem = 1 if k.dtype == torch.float8_e4m3fn else 2
+    sliced = ("q", "selected_tokens", "request_indices", "output_gate")
+
+    def call(rows, gated):
+        a = {n: (v[:rows] if n in sliced else v) for n, v in args.items()}
+        if not gated:
+            del a["output_gate"]
+        return a, _sgc_op(**a)
+
+    call(4, True)  # the decode warmup's first call of the geometry
+    compiled = set(mod._COMPILED)
+    by_plan = {}
+    for r in range(1, cap + 1):
+        by_plan.setdefault(mod.plan_splits(r, k.shape[1], width, elem), []).append(r)
+    assert sorted(by_plan) == mod.reachable_plans(cap, k.shape[1], width, elem)
+    pdl = bool(mod.get_env_enable_pdl())
+    for splits, _ in by_plan:
+        if splits > 1:
+            assert ("merge", q.shape[1], splits, False, 3, pdl) in compiled, splits
+            assert ("merge", q.shape[1], splits, True, 2, pdl) in compiled, splits
+    # Each plan's first and last row count; at tp2/tep2 also the mixed steps' three-split ranges.
+    picks = {r for rows in by_plan.values() for r in (rows[0], rows[-1])}
+    if cap == 512:
+        extra = (164, 256, 324, 512)
+        assert {mod.plan_splits(r, 1, width, elem)[0] for r in extra} == {3}
+        picks |= set(extra)
+    for r in sorted(picks):
+        for gated in (False, True):
+            a, out = call(r, gated)
+            assert set(mod._COMPILED) == compiled, f"{r} rows, gated={gated} compiled"
+            if r == by_plan[mod.plan_splits(r, k.shape[1], width, elem)][-1]:
+                _gqa_compare(out, _sgc_op.reference(**a))  # each plan's widest call
+
+
 def _sgg_selection(spec, seed):
     """Rows of a request select from its block scores plus `overlap` x noise (None: independent)."""
     cr, token_topk, spread = spec["compress_ratio"], spec["token_topk"], spec.get("overlap")

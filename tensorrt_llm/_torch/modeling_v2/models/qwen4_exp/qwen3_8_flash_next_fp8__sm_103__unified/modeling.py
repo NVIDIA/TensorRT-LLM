@@ -5559,10 +5559,12 @@ class PrefillTarget:
             md.qsa_topk_row_starts[:rows].index_select(0, query),
             selected,
         )
+        # q keeps the packed rows' strides (gathered whole), so the call shares the draft decode
+        # step's split-K geometry and the kernels its warmup compiled.
         out = _sparse_gqa(
             core,
             draft.kv,
-            _packed_q(core, qkv).index_select(0, query),
+            _packed_q(core, qkv.index_select(0, query)),
             md.qsa_block_table,
             selected,
             req_idx,
