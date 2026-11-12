@@ -76,10 +76,21 @@ class KimiK3DFlashWorker(DFlashWorker):
         if cache_flag not in ("0", "1"):
             raise ValueError("TRTLLM_K3_INFERACT_CACHE_WRITE must be 0 or 1")
         self._inferact_cache_write_enabled = cache_flag == "1"
+        context_flag = os.environ.get("TRTLLM_K3_INFERACT_CONTEXT", "0")
+        if context_flag not in ("0", "1"):
+            raise ValueError("TRTLLM_K3_INFERACT_CONTEXT must be 0 or 1")
+        self._inferact_context_enabled = context_flag == "1"
         super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
 
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
+        if self._inferact_context_enabled:
+            from .inferact_boundary import _model_supported
+            from .inferact_context import try_prepare_context
+
+            if _model_supported(draft_model, self.mapping):
+                draft_model._inferact_context_prepare = try_prepare_context
+                logger.info("K3 Inferact five-layer context fusion enabled")
         if self._inferact_cache_write_enabled:
             from .inferact_cache_write import InferactPagedCacheWrite
 

@@ -3343,6 +3343,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         Returns ``(latent, None)``: ``[N, L, 1, kv_lora_rank + qk_rope_head_dim]``
         and no V half, which is what ``_kv_factor == 1`` means to the worker.
         """
+        context_prepare = getattr(self, "_inferact_context_prepare", None)
+        if context_prepare is not None:
+            prepared = context_prepare(self, projected_hidden, positions)
+            if prepared is not None:
+                return prepared
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
         n = projected_hidden.shape[0]
