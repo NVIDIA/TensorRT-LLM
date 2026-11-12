@@ -285,6 +285,21 @@ def test_unsupported_declared_draft_kv_dtype_is_rejected():
         creator._get_draft_kv_model_config()
 
 
+def test_declared_draft_kv_dtype_other_than_the_weights_dtype_is_rejected():
+    """An unquantized draft pool is stored in the drafter's weights dtype (bf16 here)."""
+    creator = _declaring_creator(torch.float16)
+
+    with pytest.raises(ValueError, match="weights dtype"):
+        creator._get_draft_kv_model_config()
+
+
+def test_declared_draft_kv_dtype_must_be_a_torch_dtype():
+    creator = _declaring_creator("fp8")
+
+    with pytest.raises(ValueError, match="must be a torch.dtype"):
+        creator._get_draft_kv_model_config()
+
+
 def test_k3_like_drafter_shares_the_hybrid_manager_in_disagg():
     # NVFP4 target pages and FP8 draft pages: both K-only, so both transfer.
     creator = _creator(is_disagg=True)
