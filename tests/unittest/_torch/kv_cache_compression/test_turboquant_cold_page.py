@@ -218,6 +218,9 @@ def test_codebooks_and_matrices_match_the_paper_and_the_seed():
     assert torch.allclose(rotation @ rotation.T, torch.eye(576, dtype=torch.float64), atol=1e-10)
     assert torch.equal(rotation, tq_math.haar_rotation.__wrapped__(0, 576))
     assert not torch.equal(rotation, tq_math.haar_rotation.__wrapped__(1, 576))
+    projection = tq_math.qjl_projection(0, 128)
+    assert torch.equal(projection, tq_math.qjl_projection.__wrapped__(0, 128))
+    assert not torch.equal(projection, tq_math.qjl_projection.__wrapped__(1, 128))
     centroids, thresholds = tq_math.lloyd_max_codebook(128, 3)
     assert torch.allclose(centroids, -centroids.flip(0), atol=1e-9)
     assert torch.all(thresholds[1:] > thresholds[:-1])
@@ -374,7 +377,8 @@ def test_cold_page_bytes_stay_within_the_bit_budget(bits, mode, code_bits):
 
 
 @requires_cuda
-def test_encoding_is_deterministic_and_seeded():
+@pytest.mark.parametrize("mode", ("mse", "prod"))
+def test_encoding_is_deterministic_and_seeded(mode):
     generator = torch.Generator(device="cuda").manual_seed(6)
     values = {
         key: _vectors("outlier_channels", (4, 2, 32, 128), generator)
@@ -382,7 +386,7 @@ def test_encoding_is_deterministic_and_seeded():
     }
     blobs = []
     for seed in (0, 0, 1):
-        codec = _kv_codec(_provider(3, seed=seed))
+        codec = _kv_codec(_provider(3, mode, seed=seed))
         _round_trip(codec, values)
         blobs.append(codec.cold.clone())
         codec.encode([0, 1, 2, 3], [0, 1, 2, 3])

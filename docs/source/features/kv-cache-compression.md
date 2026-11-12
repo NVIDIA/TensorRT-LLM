@@ -342,11 +342,13 @@ reconstruction error than `mse` at the same bit width.
 
 Fractional widths (2.5 and 3.5 bits, `mse` only) treat outlier channels
 separately, as the paper does. For each group of vectors that share a page,
-layer, buffer, and KV head, the codec ranks the channels by their energy in that
-page, computed while encoding without any calibration. The half of the channels
-with the most energy uses `turboquant_bits + 0.5` bits and the other half
-`turboquant_bits - 0.5` bits, each half with its own rotation, codebook, and
-scales; a channel mask per group records the split.
+layer, buffer, and KV head, the codec computes the energy of every channel in
+that page while encoding, without any calibration. The channels whose energy
+exceeds four times the median channel energy are outliers; they and then the
+lowest-numbered other channels, up to half of the channels, use
+`turboquant_bits + 0.5` bits, and the other half uses `turboquant_bits - 0.5`
+bits, each half with its own rotation, codebook, and scales; a channel mask per
+group records the split.
 
 The rotations and projections depend only on `turboquant_seed` and the vector
 width and are generated the same way in every process, so equal configurations
@@ -375,8 +377,9 @@ A configuration fails when it is constructed if it sets `turboquant_*` fields
 with `quant: nvfp4`, sets `nvfp4_residual_dim` or `scale_checkpoint_path` with
 `quant: turboquant`, or combines `prod` with 2.5 or 3.5 bits. When the
 executor builds the KV cache, TensorRT-LLM also rejects TurboQuant on a GPU with
-compute capability below 8.0 and when the active KV cache is NVFP4; TurboQuant
-decodes into an FP16, BF16, or FP8 active KV cache.
+compute capability below 8.0, with an FP8 active KV cache below compute
+capability 8.9, and when the active KV cache is NVFP4; TurboQuant decodes into an
+FP16, BF16, or FP8 active KV cache.
 
 | `turboquant_mode` | `turboquant_bits` | Stored for each vector of `n` quantized values | Bits per value, `n` = 128 |
 | --- | --- | --- | --- |
@@ -410,6 +413,8 @@ rotation, codebook and scale, because decoding accumulates all output values of
 an instance on chip: with `mse`, instances of 256 values plus the rest (576 =
 256 + 256 + 64, three BF16 scales); with `prod`, the first 512 values and the
 rest (four BF16 values). The per-vector side information stays within 64 bits.
+Fractional bit widths are not split this way: their two halves (288 + 288 values
+of a 576-value vector) already are two instances.
 
 For example, Llama-3.1-8B (32 layers, 8 KV heads, head dimension 128) with
 32-token Pages and a BF16 cache has 4 MiB hot Pages. TurboQuant stores them in
@@ -432,14 +437,17 @@ and Conv state are preserved losslessly. See [Support](#support).
   their cold Pages independently, and draft cold Pages always quantize whole
   vectors, ignoring `skip_rope_quantization`.
 - TurboQuant kernels are written in Triton and need compute capability 8.0 or
-  newer; NVFP4 cold pages need an SM100-family GPU.
+  newer (8.9 with an FP8 KV cache); NVFP4 cold pages need an SM100-family GPU.
 
 Integer-bit `mse` reaches the paper's distortion (normalized MSE 0.117, 0.034, and
 0.0094 at 2, 3, and 4 bits for head dimension 128) on every input structure tested, and
 re-encoding a decoded Page reproduces its codes, so Pages that migrate repeatedly do not
-accumulate error. `prod` stays unbiased but adds fresh QJL noise on every re-encoding; prefer
-`mse` when Pages migrate repeatedly. Encode and decode are bound by the host link for
-conventional K/V Pages, so they take about the NVFP4 time scaled by the cold-page size.
+accumulate error. `prod` is unbiased for one encoding, but every re-encoding adds QJL error
+again and its error grows with the number of round trips; prefer `mse` when Pages migrate
+repeatedly. Encode and decode are bound by the host link for
+conventional K/V Pages, so they take about the NVFP4 time scaled by the cold-page size. MLA
+latents and DeepSeek-V4 CSA rows need more decode work; with a fast host link (about 200 GB/s)
+their decode takes about 1.1-1.2x the NVFP4 time.
 
 For measured quality, encode and decode times, end-to-end accuracy, a complete configuration,
 and how to confirm that Pages pass through the cold tier, see the

@@ -20,8 +20,10 @@ the Host/Disk tier and decodes it when the page is onboarded for block reuse. Pe
 own process: prime (prefill each synthetic prefix of ``Full Name: 6-digit code`` lines, exactly
 ``--prefix-tokens`` long), flush (unrelated prompts, ``--flush-factor`` x the measured GPU KV
 capacity, push the prefix pages to the cold tier), ask ("What is the access code of X?", greedy,
-exact match). Iteration statistics prove the cold-tier traffic; a format whose questions reused
-no attention page from a cold level is reported INVALID.
+exact match). Iteration statistics show the cold-tier traffic of the question phase as a whole,
+not per question; a format whose questions reused no attention page from a cold level (the Disk
+level with ``--disk``) is reported INVALID. The exit status is 0 only if every requested format
+ran to completion with a valid measurement.
 
 Run from a directory outside the TensorRT-LLM source tree, e.g. on 4 GPUs:
 
@@ -154,6 +156,8 @@ def build_dataset(tokenizer: Any, args: argparse.Namespace) -> Dict[str, Any]:
                 break
             facts.append((name, str(code)))
             ids += line
+        if not facts:
+            raise ValueError(f"--prefix-tokens {args.prefix_tokens} is too short for one fact")
         ids += [newline] * (args.prefix_tokens - len(ids))
         prefixes.append(ids)
         prime_tails.append(_encode(tokenizer, _question(facts[-1][0], chat) + tail))
@@ -221,6 +225,8 @@ def summarize(records: List[dict]) -> Dict[str, Any]:
                 attention_groups.add(str(lc.get("poolGroupId")))
                 _add(s["attn_reuse_by_level"], lc.get("iterFullReusedBlocksByLevel") or [])
                 _add(s["attn_reuse_by_level"], lc.get("iterPartialReusedBlocksByLevel") or [])
+        # Page sizes and cold capacity of this record, summed over its attention pool groups.
+        hot_bytes, cold_bytes, cold_blocks = None, None, 0
         for key, group in (record.get("kvCacheIterationStatsByPoolGroup") or {}).items():
             attention = bool(group.get("windowSizes")) or str(key) in attention_groups
             for field in MOVED:
@@ -228,11 +234,15 @@ def summarize(records: List[dict]) -> Dict[str, Any]:
             if attention:
                 blocks = int(group.get("primaryMaxNumBlocks") or 0)
                 s["gpu_attn_blocks"] = max(s["gpu_attn_blocks"], blocks)
-                s["hot_bytes"] = sum(group.get("slotSize") or [])
+                hot_bytes = (hot_bytes or 0) + sum(group.get("slotSize") or [])
         for group in (record.get("kvCacheIterationStatsByColdPoolGroup") or {}).values():
             if group.get("windowSizes"):
-                s["cold_bytes"] = sum(group.get("slotSize") or [])
-                s["cold_attn_blocks"] = int(group.get("secondaryMaxNumBlocks") or 0)
+                cold_bytes = (cold_bytes or 0) + sum(group.get("slotSize") or [])
+                cold_blocks += int(group.get("secondaryMaxNumBlocks") or 0)
+        if hot_bytes is not None:
+            s["hot_bytes"] = hot_bytes
+        if cold_bytes is not None:
+            s["cold_bytes"], s["cold_attn_blocks"] = cold_bytes, cold_blocks
         spec = record.get("specDecodingStats") or {}
         if spec.get("numDraftTokens"):
             s["spec"]["accepted"] += int(spec.get("numAcceptedTokens") or 0)
@@ -379,7 +389,11 @@ def run_worker(args: argparse.Namespace) -> int:
         correct = [a == q["answer"] for a, q in zip(answers, questions)]
         cached = [getattr(out, "cached_tokens", 0) or 0 for out in outputs]
         q, flush = phases["questions"], phases["flush"]
-        cold_blocks = sum(q["attn_reuse_by_level"][1:])  # level 0 is always the GPU tier
+        reuse = q["attn_reuse_by_level"]
+        if args.disk:  # a Disk run must reuse from Disk, not only from a Host tier above it
+            cold_blocks = sum(n for tier, n in zip(q["tiers"], reuse) if tier == "disk")
+        else:
+            cold_blocks = sum(reuse[1:])  # level 0 is always the GPU tier
         expected = len(prefixes) * args.prefix_tokens // tokens_per_block
         spec = q["spec"]
         texts = [out.outputs[0].text for out in outputs]
@@ -411,8 +425,9 @@ def run_worker(args: argparse.Namespace) -> int:
         )
         if not valid:
             log(
-                "!!! INVALID: the questions reused no attention page from a cold tier, so the "
-                "accuracy does not measure the codec; raise --flush-factor or --host-gib"
+                "!!! INVALID: the questions reused no attention page from the "
+                f"{'Disk' if args.disk else 'cold'} tier, so the accuracy does not measure the "
+                "codec; raise --flush-factor or --host-gib"
             )
     return 0 if valid else 5
 
@@ -420,6 +435,9 @@ def run_worker(args: argparse.Namespace) -> int:
 # Driver: one process per format
 def run_format(args: argparse.Namespace, fmt: str, env: Dict[str, str]) -> Dict[str, Any]:
     log_path = os.path.join(args.output_dir, f"log_{fmt}.txt")
+    result_path = os.path.join(args.output_dir, f"result_{fmt}.json")
+    if os.path.exists(result_path):  # never read a previous run's result
+        os.remove(result_path)
     cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
     cmd += ["--output-dir", args.output_dir, "--worker", fmt]
     print(f"--- {fmt} (log: {log_path})", flush=True)
@@ -444,10 +462,14 @@ def run_format(args: argparse.Namespace, fmt: str, env: Dict[str, str]) -> Dict[
             proc.wait()
         reader.join(timeout=30)
     try:
-        with open(os.path.join(args.output_dir, f"result_{fmt}.json")) as f:
+        with open(result_path) as f:
             result = json.load(f)
     except (OSError, ValueError):
         result = {"format": fmt, "status": "crashed", "error": f"exit {code}, see {log_path}"}
+    if result.get("status") == "valid" and code != 0:
+        # The worker saves its result before the engine shuts down; a later failure voids it.
+        result["status"] = "timeout" if code == "timeout" else "crashed"
+        result["error"] = f"exit {code} after the measurement, see {log_path}"
     result["wall_s"] = time.time() - t0
     return result
 
@@ -491,7 +513,7 @@ def run_driver(args: argparse.Namespace) -> int:
         print("".join(f"{c:<{w}}" for c, w in zip(cells, widths)), flush=True)
     with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
         json.dump(results, f, indent=1, default=str)
-    return 0 if all(r["status"] in ("valid", "config_error") for r in results.values()) else 1
+    return 0 if all(r["status"] == "valid" for r in results.values()) else 1
 
 
 def main() -> int:
@@ -521,8 +543,10 @@ def main() -> int:
     add("--output-dir", default=None)
     add("--worker", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.prefix_tokens % 128:
-        parser.error("--prefix-tokens must be a multiple of 128")
+    if args.prefix_tokens <= 0 or args.prefix_tokens % 128:
+        parser.error("--prefix-tokens must be a positive multiple of 128")
+    if args.num_prefixes <= 0 or args.questions_per_prefix <= 0:
+        parser.error("--num-prefixes and --questions-per-prefix must be positive")
     return run_worker(args) if args.worker else run_driver(args)
 
 

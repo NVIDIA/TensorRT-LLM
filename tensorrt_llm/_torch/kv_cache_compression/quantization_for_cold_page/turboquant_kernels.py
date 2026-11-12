@@ -26,6 +26,9 @@ import triton.language as tl
 OUTLIER_RATIO: tl.constexpr = tl.constexpr(4.0)
 """Energy ratio to the median channel above which a channel is an outlier (fractional bits)."""
 
+LUT_STRIDE: tl.constexpr = tl.constexpr(16)
+"""fp32 entries per codebook in the centroid table (codebook 0, then codebook 1)."""
+
 
 @triton.jit
 def _pack(codes, W: tl.constexpr, BLOCK_M: tl.constexpr, C: tl.constexpr):
@@ -45,65 +48,47 @@ def _unpack(packed, W: tl.constexpr, BLOCK_M: tl.constexpr, C: tl.constexpr):
 
 
 @triton.jit
-def _magnitude_index(a, BITS: tl.constexpr, CB):
-    """Cell of ``a = |v|`` among the positive half of a symmetric codebook (binary search).
+def _quantize(v, BITS: tl.constexpr, CB, lut):
+    """Return (code, centroid) of every coordinate of ``v`` (sqrt(n)-scaled units).
 
-    ``CB`` holds the positive thresholds T1..T7 and centroid magnitudes C0..C7 of the codebook;
-    T_i separates magnitude cells i - 1 and i.
+    The codebook is symmetric: a binary search over the positive thresholds picks the cell ``m``
+    of the magnitude, the sign the half. The centroid is selected with the search's own
+    comparisons, so it needs no compare of its own. Codes ``H + m`` (positive) and
+    ``H - 1 - m`` (negative) order like the centroids (``lut`` holds them for decoding).
     """
+    H: tl.constexpr = 1 << (BITS - 1)
     T1, T2, T3, T4, T5, T6, T7 = CB[0], CB[1], CB[2], CB[3], CB[4], CB[5], CB[6]
+    C0, C1, C2, C3, C4, C5, C6, C7 = CB[7], CB[8], CB[9], CB[10], CB[11], CB[12], CB[13], CB[14]
+    a = tl.abs(v)
     if BITS == 1:
         m = tl.zeros(a.shape, tl.int32)
+        magnitude = tl.zeros(a.shape, tl.float32) + C0
     elif BITS == 2:
-        m = (a > T1).to(tl.int32)
+        b0 = a > T1
+        m = b0.to(tl.int32)
+        magnitude = tl.where(b0, C1, C0)
     elif BITS == 3:
-        high = a > T2
-        low = a > tl.where(high, T3, T1)
-        m = 2 * high.to(tl.int32) + low.to(tl.int32)
+        b1 = a > T2
+        b0 = a > tl.where(b1, T3, T1)
+        m = 2 * b1.to(tl.int32) + b0.to(tl.int32)
+        magnitude = tl.where(b1, tl.where(b0, C3, C2), tl.where(b0, C1, C0))
     else:
         b2 = a > T4
         b1 = a > tl.where(b2, T6, T2)
         b0 = a > tl.where(b2, tl.where(b1, T7, T5), tl.where(b1, T3, T1))
         m = 4 * b2.to(tl.int32) + 2 * b1.to(tl.int32) + b0.to(tl.int32)
-    return m
-
-
-@triton.jit
-def _centroid_magnitude(m, BITS: tl.constexpr, CB):
-    C0, C1, C2, C3, C4, C5, C6, C7 = CB[7], CB[8], CB[9], CB[10], CB[11], CB[12], CB[13], CB[14]
-    if BITS == 1:
-        value = tl.zeros(m.shape, tl.float32) + C0
-    elif BITS == 2:
-        value = tl.where(m == 1, C1, C0)
-    elif BITS == 3:
-        value = tl.where(m >= 2, tl.where(m == 3, C3, C2), tl.where(m == 1, C1, C0))
-    else:
-        low = tl.where(m >= 2, tl.where(m == 3, C3, C2), tl.where(m == 1, C1, C0))
-        high = tl.where(m >= 6, tl.where(m == 7, C7, C6), tl.where(m == 5, C5, C4))
-        value = tl.where(m >= 4, high, low)
-    return value
-
-
-@triton.jit
-def _quantize(v, BITS: tl.constexpr, CB):
-    """Return (code, centroid) of every coordinate of ``v`` (sqrt(n)-scaled units).
-
-    The codebook is symmetric: the magnitude picks the cell ``m`` of the positive half, the sign
-    the half. Codes ``H + m`` (positive) and ``H - 1 - m`` (negative) order like the centroids.
-    """
-    H: tl.constexpr = 1 << (BITS - 1)
-    m = _magnitude_index(tl.abs(v), BITS, CB)
+        magnitude = tl.where(
+            b2,
+            tl.where(b1, tl.where(b0, C7, C6), tl.where(b0, C5, C4)),
+            tl.where(b1, tl.where(b0, C3, C2), tl.where(b0, C1, C0)),
+        )
     positive = v > 0
-    value = _centroid_magnitude(m, BITS, CB)
-    return tl.where(positive, H + m, H - 1 - m), tl.where(positive, value, -value)
+    return tl.where(positive, H + m, H - 1 - m), tl.where(positive, magnitude, -magnitude)
 
 
 @triton.jit
-def _dequantize(code, BITS: tl.constexpr, CB):
-    H: tl.constexpr = 1 << (BITS - 1)
-    positive = code >= H
-    value = _centroid_magnitude(tl.where(positive, code - H, H - 1 - code), BITS, CB)
-    return tl.where(positive, value, -value)
+def _dequantize(code, lut):
+    return tl.load(lut + code)
 
 
 @triton.jit
@@ -353,6 +338,7 @@ def _quantize_group(
     G: tl.constexpr,
     BITS: tl.constexpr,
     CB,
+    lut,
     OFF0: tl.constexpr,
     W0: tl.constexpr,
     OFF1: tl.constexpr,
@@ -376,7 +362,7 @@ def _quantize_group(
         y = _rotate_chunk(
             w_ptr, cols, x0, x1, x2, x3, pos0, pos1, pos2, pos3, N, P0, P1, P2, P3, GATHER, PIECES
         )
-        code, value = _quantize(y * inv_norm[:, None], BITS, CB)
+        code, value = _quantize(y * inv_norm[:, None], BITS, CB, lut)
         dot_yc += tl.sum(y * value, axis=1)
         dot_cc += tl.sum(value * value, axis=1)
         _store_codes(cold[:, None], code, j, rows, row_mask, OFF0, W0, OFF1, W1, ROWS, BLOCK_M, C)
@@ -430,6 +416,7 @@ def _encode_block(
     PIECES: tl.constexpr,
     BITS: tl.constexpr,
     CB,
+    lut,
     OFF0: tl.constexpr,
     W0: tl.constexpr,
     OFF1: tl.constexpr,
@@ -472,6 +459,7 @@ def _encode_block(
         G,
         BITS,
         CB,
+        lut,
         OFF0,
         W0,
         OFF1,
@@ -516,7 +504,7 @@ def _encode_block(
                 False,
                 PIECES,
             )
-            code, value = _quantize(y * inv_norm[:, None], BITS, CB)
+            code, value = _quantize(y * inv_norm[:, None], BITS, CB, lut)
             residual = y - alpha[:, None] * value
             residual_norm += tl.sum(residual * residual, axis=1)
             r16 = residual.to(tl.float16)
@@ -545,6 +533,86 @@ def _encode_block(
         )
 
 
+@triton.jit
+def _prescale(amax):
+    """Power of two that puts a row's largest magnitude in [1, 2): exact, and safe for the fp16
+    tensor-core operands and the fp32 sums whatever the input range."""
+    exponent = (_float_bits(amax) >> 23) & 0xFF
+    return (tl.maximum(254 - exponent, 1) << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _encode_instance(
+    cold,
+    w_ptr,
+    s_ptr,
+    row_ptr,
+    prescale,
+    rows,
+    row_mask,
+    START: tl.constexpr,
+    P: tl.constexpr,
+    PIECE: tl.constexpr,
+    BITS: tl.constexpr,
+    CB,
+    lut,
+    OFF0: tl.constexpr,
+    W0: tl.constexpr,
+    OFF1: tl.constexpr,
+    W1: tl.constexpr,
+    OFF_QJL: tl.constexpr,
+    OFF_SCALE: tl.constexpr,
+    ALPHA_AT: tl.constexpr,
+    N: tl.constexpr,
+    P0: tl.constexpr,
+    P1: tl.constexpr,
+    P2: tl.constexpr,
+    P3: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    C: tl.constexpr,
+):
+    """Encode the mse instance held by piece ``PIECE`` (bit) of a blocked row, loading only it."""
+    x = _load_piece(row_ptr, row_mask, START, P) * prescale[:, None]
+    h = x.to(tl.float16)
+    _encode_block(
+        cold,
+        w_ptr,
+        s_ptr,
+        h,
+        h,
+        h,
+        h,
+        tl.sum(x * x, axis=1),
+        prescale,
+        rows,
+        row_mask,
+        0,
+        START,
+        P,
+        PIECE,
+        BITS,
+        CB,
+        lut,
+        OFF0,
+        W0,
+        OFF1,
+        W1,
+        OFF_QJL,
+        OFF_SCALE,
+        ALPHA_AT,
+        0,
+        N,
+        P0,
+        P1,
+        P2,
+        P3,
+        ROWS,
+        BLOCK_M,
+        C,
+    )
+
+
 @triton.jit(do_not_specialize=["page_ptr", "cold_page_bytes", "num_pages"])
 def _tq_encode_kernel(
     page_ptr,
@@ -555,6 +623,7 @@ def _tq_encode_kernel(
     table_ptr,
     w_ptr,
     s_ptr,
+    lut_ptr,
     ELEM: tl.constexpr,
     N: tl.constexpr,
     STRIDE: tl.constexpr,
@@ -595,6 +664,8 @@ def _tq_encode_kernel(
     buffer = tl.program_id(1)
     tile = tl.program_id(2)
     lane = tl.arange(0, BLOCK_M)
+    lut0 = lut_ptr
+    lut1 = lut_ptr + LUT_STRIDE
     if PAGES_PER_TILE > 1:
         # Buffers with few rows per Page: one tile takes the rows of several Pages.
         page = tile_page * PAGES_PER_TILE + lane // ROWS_PAD
@@ -621,182 +692,71 @@ def _tq_encode_kernel(
     cold = cold_ptr + cold_rows
     row_ptr = hot + rows.to(tl.int64) * STRIDE + QS
 
-    x0 = _load_piece(row_ptr, row_mask, 0, P0)
-    amax = _abs_max(x0)
-    x1 = x0
-    x2 = x0
-    x3 = x0
-    if P1 > 0:
-        x1 = _load_piece(row_ptr, row_mask, P0, P1)
-        amax = tl.maximum(amax, _abs_max(x1))
-    if P2 > 0:
-        x2 = _load_piece(row_ptr, row_mask, P0 + P1, P2)
-        amax = tl.maximum(amax, _abs_max(x2))
-    if P3 > 0:
-        x3 = _load_piece(row_ptr, row_mask, P0 + P1 + P2, P3)
-        amax = tl.maximum(amax, _abs_max(x3))
-    # Scale every row by a power of two so that its largest magnitude lies in [1, 2): exact,
-    # and safe for the fp16 tensor-core operands and the fp32 sums whatever the input range.
-    exponent = (_float_bits(amax) >> 23) & 0xFF
-    prescale = (tl.maximum(254 - exponent, 1) << 23).to(tl.float32, bitcast=True)
-    x0 = x0 * prescale[:, None]
-    x1 = x1 * prescale[:, None]
-    x2 = x2 * prescale[:, None]
-    x3 = x3 * prescale[:, None]
-
-    if MODE == 2:
-        G: tl.constexpr = N // 2
-        # Rows holding NaN or Inf (garbage tokens of a partial Page) do not vote on the split.
-        voters = row_mask & (amax < float("inf"))
-        e0 = _piece_energy_bits(x0, voters)
-        e1 = e0
-        e2 = e0
-        e3 = e0
+    if BLOCKED == 2:
+        # Rows wider than 512 (mse): every piece is an independent instance, its codes in the
+        # piece's chunks of the shared bit planes, its scale at scalar row i. The pieces are
+        # encoded one at a time, so only one is live: a first pass over the row finds the prescale
+        # (the same power of two as for any other row), then each piece is read again (from L2).
+        amax = _abs_max(_load_piece(row_ptr, row_mask, 0, P0))
         if P1 > 0:
-            e1 = _piece_energy_bits(x1, voters)
+            amax = tl.maximum(amax, _abs_max(_load_piece(row_ptr, row_mask, P0, P1)))
         if P2 > 0:
-            e2 = _piece_energy_bits(x2, voters)
+            amax = tl.maximum(amax, _abs_max(_load_piece(row_ptr, row_mask, P0 + P1, P2)))
         if P3 > 0:
-            e3 = _piece_energy_bits(x3, voters)
-        o0, o1, o2, o3 = _select_outliers(e0, e1, e2, e3, P0, P1, P2, P3, G)
-        mask_ptr = cold_ptr + tl.max(cold_rows, axis=0) + OFF_MASK + tile * (N // 8)
-        _store_mask(mask_ptr, o0, 0, P0)
-        pos0, before = _outlier_positions(o0, 0, 0, P0, G)
-        norm_hi = tl.sum(tl.where(o0[None, :], x0 * x0, 0.0), axis=1)
-        norm_all = tl.sum(x0 * x0, axis=1)
-        pos1 = pos0
-        pos2 = pos0
-        pos3 = pos0
-        if P1 > 0:
-            _store_mask(mask_ptr, o1, P0, P1)
-            pos1, before = _outlier_positions(o1, before, P0, P1, G)
-            norm_hi += tl.sum(tl.where(o1[None, :], x1 * x1, 0.0), axis=1)
-            norm_all += tl.sum(x1 * x1, axis=1)
-        if P2 > 0:
-            _store_mask(mask_ptr, o2, P0 + P1, P2)
-            pos2, before = _outlier_positions(o2, before, P0 + P1, P2, G)
-            norm_hi += tl.sum(tl.where(o2[None, :], x2 * x2, 0.0), axis=1)
-            norm_all += tl.sum(x2 * x2, axis=1)
-        if P3 > 0:
-            _store_mask(mask_ptr, o3, P0 + P1 + P2, P3)
-            pos3, before = _outlier_positions(o3, before, P0 + P1 + P2, P3, G)
-            norm_hi += tl.sum(tl.where(o3[None, :], x3 * x3, 0.0), axis=1)
-            norm_all += tl.sum(x3 * x3, axis=1)
-        norm_lo = tl.maximum(norm_all - norm_hi, 0.0)
-        root_g = tl.sqrt(G * 1.0)
-        inv_hi = tl.where(norm_hi > 0, root_g * tl.math.rsqrt(norm_hi), 0.0)
-        inv_lo = tl.where(norm_lo > 0, root_g * tl.math.rsqrt(norm_lo), 0.0)
-        alpha_hi = _quantize_group(
+            amax = tl.maximum(amax, _abs_max(_load_piece(row_ptr, row_mask, P0 + P1 + P2, P3)))
+        prescale = _prescale(amax)
+        _encode_instance(
             cold,
             w_ptr,
-            x0.to(tl.float16),
-            x1.to(tl.float16),
-            x2.to(tl.float16),
-            x3.to(tl.float16),
-            pos0,
-            pos1,
-            pos2,
-            pos3,
-            inv_hi,
+            s_ptr,
+            row_ptr,
+            prescale,
             rows,
             row_mask,
             0,
-            G,
+            P0,
+            1,
             BITS0,
             CB0,
+            lut0,
             OFF_A0,
             W_A0,
             OFF_A1,
             W_A1,
+            OFF_QJL,
+            OFF_SCALE,
+            0,
             N,
             P0,
             P1,
             P2,
             P3,
-            True,
             ROWS,
             BLOCK_M,
             C,
-            15,
         )
-        alpha_lo = _quantize_group(
-            cold,
-            w_ptr,
-            x0.to(tl.float16),
-            x1.to(tl.float16),
-            x2.to(tl.float16),
-            x3.to(tl.float16),
-            pos0,
-            pos1,
-            pos2,
-            pos3,
-            inv_lo,
-            rows,
-            row_mask,
-            G,
-            G,
-            BITS1,
-            CB1,
-            OFF_B0,
-            W_B0,
-            OFF_B1,
-            W_B1,
-            N,
-            P0,
-            P1,
-            P2,
-            P3,
-            True,
-            ROWS,
-            BLOCK_M,
-            C,
-            15,
-        )
-        scale_ptr = (cold + OFF_SCALE).to(tl.pointer_type(tl.bfloat16))
-        tl.store(scale_ptr + rows, (alpha_hi / prescale).to(tl.bfloat16), mask=row_mask)
-        tl.store(scale_ptr + ROWS + rows, (alpha_lo / prescale).to(tl.bfloat16), mask=row_mask)
-    else:
-        h0 = x0.to(tl.float16)
-        h1 = x1.to(tl.float16)
-        h2 = x2.to(tl.float16)
-        h3 = x3.to(tl.float16)
-        norm_first = tl.sum(x0 * x0, axis=1)
-        norm_rest = tl.zeros([BLOCK_M], tl.float32)
         if P1 > 0:
-            norm_rest += tl.sum(x1 * x1, axis=1)
-        if P2 > 0:
-            norm_rest += tl.sum(x2 * x2, axis=1)
-        if P3 > 0:
-            norm_rest += tl.sum(x3 * x3, axis=1)
-        if BLOCKED == 2:
-            # Rows wider than 512 (mse): every piece is an independent instance, its codes in
-            # the piece's chunks of the shared bit planes, its scale at scalar row i.
-            _encode_block(
+            _encode_instance(
                 cold,
                 w_ptr,
                 s_ptr,
-                h0,
-                h1,
-                h2,
-                h3,
-                norm_first,
+                row_ptr,
                 prescale,
                 rows,
                 row_mask,
-                MODE,
-                0,
                 P0,
-                1,
-                BITS0,
-                CB0,
-                OFF_A0,
+                P1,
+                2,
+                BITS0 if P1 == P0 else BITS1,
+                CB0 if P1 == P0 else CB1,
+                lut0 if P1 == P0 else lut1,
+                OFF_A0 + P0 // C * ROWS * (C * W_A0 // 8),
                 W_A0,
-                OFF_A1,
+                OFF_A1 + P0 // C * ROWS * (C * W_A1 // 8),
                 W_A1,
                 OFF_QJL,
                 OFF_SCALE,
-                0,
-                0,
+                ROWS,
                 N,
                 P0,
                 P1,
@@ -806,141 +766,27 @@ def _tq_encode_kernel(
                 BLOCK_M,
                 C,
             )
-            if P1 > 0:
-                _encode_block(
-                    cold,
-                    w_ptr,
-                    s_ptr,
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    tl.sum(x1 * x1, axis=1),
-                    prescale,
-                    rows,
-                    row_mask,
-                    MODE,
-                    P0,
-                    P1,
-                    2,
-                    BITS0 if P1 == P0 else BITS1,
-                    CB0 if P1 == P0 else CB1,
-                    OFF_A0 + P0 // C * ROWS * (C * W_A0 // 8),
-                    W_A0,
-                    OFF_A1 + P0 // C * ROWS * (C * W_A1 // 8),
-                    W_A1,
-                    OFF_QJL,
-                    OFF_SCALE,
-                    ROWS,
-                    0,
-                    N,
-                    P0,
-                    P1,
-                    P2,
-                    P3,
-                    ROWS,
-                    BLOCK_M,
-                    C,
-                )
-            if P2 > 0:
-                _encode_block(
-                    cold,
-                    w_ptr,
-                    s_ptr,
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    tl.sum(x2 * x2, axis=1),
-                    prescale,
-                    rows,
-                    row_mask,
-                    MODE,
-                    P0 + P1,
-                    P2,
-                    4,
-                    BITS0 if P2 == P0 else BITS1,
-                    CB0 if P2 == P0 else CB1,
-                    OFF_A0 + (P0 + P1) // C * ROWS * (C * W_A0 // 8),
-                    W_A0,
-                    OFF_A1 + (P0 + P1) // C * ROWS * (C * W_A1 // 8),
-                    W_A1,
-                    OFF_QJL,
-                    OFF_SCALE,
-                    2 * ROWS,
-                    0,
-                    N,
-                    P0,
-                    P1,
-                    P2,
-                    P3,
-                    ROWS,
-                    BLOCK_M,
-                    C,
-                )
-            if P3 > 0:
-                _encode_block(
-                    cold,
-                    w_ptr,
-                    s_ptr,
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    tl.sum(x3 * x3, axis=1),
-                    prescale,
-                    rows,
-                    row_mask,
-                    MODE,
-                    P0 + P1 + P2,
-                    P3,
-                    8,
-                    BITS0 if P3 == P0 else BITS1,
-                    CB0 if P3 == P0 else CB1,
-                    OFF_A0 + (P0 + P1 + P2) // C * ROWS * (C * W_A0 // 8),
-                    W_A0,
-                    OFF_A1 + (P0 + P1 + P2) // C * ROWS * (C * W_A1 // 8),
-                    W_A1,
-                    OFF_QJL,
-                    OFF_SCALE,
-                    3 * ROWS,
-                    0,
-                    N,
-                    P0,
-                    P1,
-                    P2,
-                    P3,
-                    ROWS,
-                    BLOCK_M,
-                    C,
-                )
-        elif BLOCKED == 1:
-            # Rows wider than 512 (prod): the first piece and the rest are independent instances.
-            _encode_block(
+        if P2 > 0:
+            _encode_instance(
                 cold,
                 w_ptr,
                 s_ptr,
-                h0,
-                h1,
-                h2,
-                h3,
-                norm_first,
+                row_ptr,
                 prescale,
                 rows,
                 row_mask,
-                MODE,
-                0,
-                P0,
-                1,
-                BITS0,
-                CB0,
-                OFF_A0,
+                P0 + P1,
+                P2,
+                4,
+                BITS0 if P2 == P0 else BITS1,
+                CB0 if P2 == P0 else CB1,
+                lut0 if P2 == P0 else lut1,
+                OFF_A0 + (P0 + P1) // C * ROWS * (C * W_A0 // 8),
                 W_A0,
-                OFF_A1,
+                OFF_A1 + (P0 + P1) // C * ROWS * (C * W_A1 // 8),
                 W_A1,
                 OFF_QJL,
                 OFF_SCALE,
-                0,
                 2 * ROWS,
                 N,
                 P0,
@@ -951,31 +797,27 @@ def _tq_encode_kernel(
                 BLOCK_M,
                 C,
             )
-            _encode_block(
+        if P3 > 0:
+            _encode_instance(
                 cold,
                 w_ptr,
                 s_ptr,
-                h0,
-                h1,
-                h2,
-                h3,
-                norm_rest,
+                row_ptr,
                 prescale,
                 rows,
                 row_mask,
-                MODE,
-                P0,
-                N - P0,
-                14,
-                BITS1,
-                CB1,
-                OFF_B0,
-                W_B0,
-                OFF_B1,
-                W_B1,
+                P0 + P1 + P2,
+                P3,
+                8,
+                BITS0 if P3 == P0 else BITS1,
+                CB0 if P3 == P0 else CB1,
+                lut0 if P3 == P0 else lut1,
+                OFF_A0 + (P0 + P1 + P2) // C * ROWS * (C * W_A0 // 8),
+                W_A0,
+                OFF_A1 + (P0 + P1 + P2) // C * ROWS * (C * W_A1 // 8),
+                W_A1,
                 OFF_QJL,
                 OFF_SCALE,
-                ROWS,
                 3 * ROWS,
                 N,
                 P0,
@@ -986,42 +828,264 @@ def _tq_encode_kernel(
                 BLOCK_M,
                 C,
             )
-        else:
-            _encode_block(
+    else:
+        x0 = _load_piece(row_ptr, row_mask, 0, P0)
+        amax = _abs_max(x0)
+        x1 = x0
+        x2 = x0
+        x3 = x0
+        if P1 > 0:
+            x1 = _load_piece(row_ptr, row_mask, P0, P1)
+            amax = tl.maximum(amax, _abs_max(x1))
+        if P2 > 0:
+            x2 = _load_piece(row_ptr, row_mask, P0 + P1, P2)
+            amax = tl.maximum(amax, _abs_max(x2))
+        if P3 > 0:
+            x3 = _load_piece(row_ptr, row_mask, P0 + P1 + P2, P3)
+            amax = tl.maximum(amax, _abs_max(x3))
+        prescale = _prescale(amax)
+        x0 = x0 * prescale[:, None]
+        x1 = x1 * prescale[:, None]
+        x2 = x2 * prescale[:, None]
+        x3 = x3 * prescale[:, None]
+
+        if MODE == 2:
+            G: tl.constexpr = N // 2
+            # Rows holding NaN or Inf (garbage tokens of a partial Page) do not vote on the split.
+            voters = row_mask & (amax < float("inf"))
+            e0 = _piece_energy_bits(x0, voters)
+            e1 = e0
+            e2 = e0
+            e3 = e0
+            if P1 > 0:
+                e1 = _piece_energy_bits(x1, voters)
+            if P2 > 0:
+                e2 = _piece_energy_bits(x2, voters)
+            if P3 > 0:
+                e3 = _piece_energy_bits(x3, voters)
+            o0, o1, o2, o3 = _select_outliers(e0, e1, e2, e3, P0, P1, P2, P3, G)
+            mask_ptr = cold_ptr + tl.max(cold_rows, axis=0) + OFF_MASK + tile * (N // 8)
+            _store_mask(mask_ptr, o0, 0, P0)
+            pos0, before = _outlier_positions(o0, 0, 0, P0, G)
+            norm_hi = tl.sum(tl.where(o0[None, :], x0 * x0, 0.0), axis=1)
+            norm_all = tl.sum(x0 * x0, axis=1)
+            pos1 = pos0
+            pos2 = pos0
+            pos3 = pos0
+            if P1 > 0:
+                _store_mask(mask_ptr, o1, P0, P1)
+                pos1, before = _outlier_positions(o1, before, P0, P1, G)
+                norm_hi += tl.sum(tl.where(o1[None, :], x1 * x1, 0.0), axis=1)
+                norm_all += tl.sum(x1 * x1, axis=1)
+            if P2 > 0:
+                _store_mask(mask_ptr, o2, P0 + P1, P2)
+                pos2, before = _outlier_positions(o2, before, P0 + P1, P2, G)
+                norm_hi += tl.sum(tl.where(o2[None, :], x2 * x2, 0.0), axis=1)
+                norm_all += tl.sum(x2 * x2, axis=1)
+            if P3 > 0:
+                _store_mask(mask_ptr, o3, P0 + P1 + P2, P3)
+                pos3, before = _outlier_positions(o3, before, P0 + P1 + P2, P3, G)
+                norm_hi += tl.sum(tl.where(o3[None, :], x3 * x3, 0.0), axis=1)
+                norm_all += tl.sum(x3 * x3, axis=1)
+            norm_lo = tl.maximum(norm_all - norm_hi, 0.0)
+            root_g = tl.sqrt(G * 1.0)
+            inv_hi = tl.where(norm_hi > 0, root_g * tl.math.rsqrt(norm_hi), 0.0)
+            inv_lo = tl.where(norm_lo > 0, root_g * tl.math.rsqrt(norm_lo), 0.0)
+            alpha_hi = _quantize_group(
                 cold,
                 w_ptr,
-                s_ptr,
-                h0,
-                h1,
-                h2,
-                h3,
-                norm_first + norm_rest,
-                prescale,
+                x0.to(tl.float16),
+                x1.to(tl.float16),
+                x2.to(tl.float16),
+                x3.to(tl.float16),
+                pos0,
+                pos1,
+                pos2,
+                pos3,
+                inv_hi,
                 rows,
                 row_mask,
-                MODE,
                 0,
-                N,
-                15,
+                G,
                 BITS0,
                 CB0,
+                lut0,
                 OFF_A0,
                 W_A0,
                 OFF_A1,
                 W_A1,
-                OFF_QJL,
-                OFF_SCALE,
-                0,
-                ROWS,
                 N,
                 P0,
                 P1,
                 P2,
                 P3,
+                True,
                 ROWS,
                 BLOCK_M,
                 C,
+                15,
             )
+            alpha_lo = _quantize_group(
+                cold,
+                w_ptr,
+                x0.to(tl.float16),
+                x1.to(tl.float16),
+                x2.to(tl.float16),
+                x3.to(tl.float16),
+                pos0,
+                pos1,
+                pos2,
+                pos3,
+                inv_lo,
+                rows,
+                row_mask,
+                G,
+                G,
+                BITS1,
+                CB1,
+                lut1,
+                OFF_B0,
+                W_B0,
+                OFF_B1,
+                W_B1,
+                N,
+                P0,
+                P1,
+                P2,
+                P3,
+                True,
+                ROWS,
+                BLOCK_M,
+                C,
+                15,
+            )
+            scale_ptr = (cold + OFF_SCALE).to(tl.pointer_type(tl.bfloat16))
+            tl.store(scale_ptr + rows, (alpha_hi / prescale).to(tl.bfloat16), mask=row_mask)
+            tl.store(scale_ptr + ROWS + rows, (alpha_lo / prescale).to(tl.bfloat16), mask=row_mask)
+        else:
+            h0 = x0.to(tl.float16)
+            h1 = x1.to(tl.float16)
+            h2 = x2.to(tl.float16)
+            h3 = x3.to(tl.float16)
+            norm_first = tl.sum(x0 * x0, axis=1)
+            norm_rest = tl.zeros([BLOCK_M], tl.float32)
+            if P1 > 0:
+                norm_rest += tl.sum(x1 * x1, axis=1)
+            if P2 > 0:
+                norm_rest += tl.sum(x2 * x2, axis=1)
+            if P3 > 0:
+                norm_rest += tl.sum(x3 * x3, axis=1)
+            if BLOCKED == 1:
+                # Rows wider than 512 (prod): the first piece and the rest are independent instances.
+                _encode_block(
+                    cold,
+                    w_ptr,
+                    s_ptr,
+                    h0,
+                    h1,
+                    h2,
+                    h3,
+                    norm_first,
+                    prescale,
+                    rows,
+                    row_mask,
+                    MODE,
+                    0,
+                    P0,
+                    1,
+                    BITS0,
+                    CB0,
+                    lut0,
+                    OFF_A0,
+                    W_A0,
+                    OFF_A1,
+                    W_A1,
+                    OFF_QJL,
+                    OFF_SCALE,
+                    0,
+                    2 * ROWS,
+                    N,
+                    P0,
+                    P1,
+                    P2,
+                    P3,
+                    ROWS,
+                    BLOCK_M,
+                    C,
+                )
+                _encode_block(
+                    cold,
+                    w_ptr,
+                    s_ptr,
+                    h0,
+                    h1,
+                    h2,
+                    h3,
+                    norm_rest,
+                    prescale,
+                    rows,
+                    row_mask,
+                    MODE,
+                    P0,
+                    N - P0,
+                    14,
+                    BITS1,
+                    CB1,
+                    lut1,
+                    OFF_B0,
+                    W_B0,
+                    OFF_B1,
+                    W_B1,
+                    OFF_QJL,
+                    OFF_SCALE,
+                    ROWS,
+                    3 * ROWS,
+                    N,
+                    P0,
+                    P1,
+                    P2,
+                    P3,
+                    ROWS,
+                    BLOCK_M,
+                    C,
+                )
+            else:
+                _encode_block(
+                    cold,
+                    w_ptr,
+                    s_ptr,
+                    h0,
+                    h1,
+                    h2,
+                    h3,
+                    norm_first + norm_rest,
+                    prescale,
+                    rows,
+                    row_mask,
+                    MODE,
+                    0,
+                    N,
+                    15,
+                    BITS0,
+                    CB0,
+                    lut0,
+                    OFF_A0,
+                    W_A0,
+                    OFF_A1,
+                    W_A1,
+                    OFF_QJL,
+                    OFF_SCALE,
+                    0,
+                    ROWS,
+                    N,
+                    P0,
+                    P1,
+                    P2,
+                    P3,
+                    ROWS,
+                    BLOCK_M,
+                    C,
+                )
 
     if RAW > 0:
         # Elements outside the quantized range (e.g. RoPE) are copied unchanged.
@@ -1063,7 +1127,7 @@ def _accumulate_group(
     COORD0: tl.constexpr,
     G: tl.constexpr,
     BITS: tl.constexpr,
-    CB,
+    lut,
     OFF0: tl.constexpr,
     W0: tl.constexpr,
     OFF1: tl.constexpr,
@@ -1083,7 +1147,7 @@ def _accumulate_group(
     """Add the decoded group to the output pieces FIRST..LAST-1."""
     for j in range(G // C):
         code = _load_codes(cold[:, None], j, rows, row_mask, OFF0, W0, OFF1, W1, ROWS, BLOCK_M, C)
-        z = (alpha[:, None] * _dequantize(code, BITS, CB)).to(tl.bfloat16)
+        z = (alpha[:, None] * _dequantize(code, lut)).to(tl.bfloat16)
         krows = COORD0 + j * C + tl.arange(0, C)
         if FIRST <= 0:
             a0 += tl.dot(z, _decode_matrix(w_ptr, krows, tl.arange(0, P0), pos0, N, GATHER))
@@ -1171,9 +1235,9 @@ def _decode_rows(
     P2: tl.constexpr,
     P3: tl.constexpr,
     BITS0: tl.constexpr,
-    CB0,
+    lut0,
     BITS1: tl.constexpr,
-    CB1,
+    lut1,
     OFF_A0: tl.constexpr,
     W_A0: tl.constexpr,
     OFF_A1: tl.constexpr,
@@ -1214,7 +1278,7 @@ def _decode_rows(
             0,
             G,
             BITS0,
-            CB0,
+            lut0,
             OFF_A0,
             W_A0,
             OFF_A1,
@@ -1248,7 +1312,7 @@ def _decode_rows(
             G,
             G,
             BITS1,
-            CB1,
+            lut1,
             OFF_B0,
             W_B0,
             OFF_B1,
@@ -1288,7 +1352,7 @@ def _decode_rows(
             START,
             WIDTH,
             BITS0 if WIDTH == P0 else BITS1,
-            CB0 if WIDTH == P0 else CB1,
+            lut0 if WIDTH == P0 else lut1,
             OFF_A0 + START // C * ROWS * (C * W_A0 // 8),
             W_A0,
             OFF_A1 + START // C * ROWS * (C * W_A1 // 8),
@@ -1323,7 +1387,7 @@ def _decode_rows(
             0,
             P0,
             BITS0,
-            CB0,
+            lut0,
             OFF_A0,
             W_A0,
             OFF_A1,
@@ -1383,7 +1447,7 @@ def _decode_rows(
             P0,
             N - P0,
             BITS1,
-            CB1,
+            lut1,
             OFF_B0,
             W_B0,
             OFF_B1,
@@ -1443,7 +1507,7 @@ def _decode_rows(
             0,
             N,
             BITS0,
-            CB0,
+            lut0,
             OFF_A0,
             W_A0,
             OFF_A1,
@@ -1489,9 +1553,44 @@ def _decode_rows(
 
 
 @triton.jit
-def _store_piece(row_ptr, row_mask, acc, START: tl.constexpr, P: tl.constexpr, ELEM: tl.constexpr):
+def _decode_columns(
+    cold,
+    w_ptr,
+    alpha,
+    rows,
+    row_mask,
+    col0,
+    COORD0: tl.constexpr,
+    G: tl.constexpr,
+    lut,
+    OFF0: tl.constexpr,
+    W0: tl.constexpr,
+    OFF1: tl.constexpr,
+    W1: tl.constexpr,
+    N: tl.constexpr,
+    COLS: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    C: tl.constexpr,
+):
+    """Output columns ``col0..col0+COLS-1`` of one mse instance (coordinates COORD0..+G), fp32."""
+    acc = tl.zeros([BLOCK_M, COLS], tl.float32)
+    cols = col0 + tl.arange(0, COLS)
+    for j in range(G // C):
+        code = _load_codes(cold[:, None], j, rows, row_mask, OFF0, W0, OFF1, W1, ROWS, BLOCK_M, C)
+        z = (alpha[:, None] * _dequantize(code, lut)).to(tl.bfloat16)
+        krows = COORD0 + j * C + tl.arange(0, C)
+        acc += tl.dot(z, tl.load(w_ptr + krows[:, None] * N + cols[None, :]))
+    return acc
+
+
+@triton.jit
+def _store_piece(row_ptr, row_mask, acc, START, P: tl.constexpr, ELEM: tl.constexpr):
+    # A reconstruction can exceed the largest finite value next to it: saturate, never store inf.
     if ELEM == tl.float8e4nv:
         acc = tl.minimum(tl.maximum(acc, -448.0), 448.0)
+    elif ELEM == tl.float16:
+        acc = tl.minimum(tl.maximum(acc, -65504.0), 65504.0)
     columns = START + tl.arange(0, P)
     tl.store(row_ptr[:, None] + columns[None, :], acc.to(ELEM), mask=row_mask[:, None])
 
@@ -1506,6 +1605,7 @@ def _tq_decode_kernel(
     table_ptr,
     w_ptr,
     s_ptr,
+    lut_ptr,
     ELEM: tl.constexpr,
     N: tl.constexpr,
     STRIDE: tl.constexpr,
@@ -1541,8 +1641,19 @@ def _tq_decode_kernel(
     OFF_RAW: tl.constexpr,
     RAW: tl.constexpr,
     RAW_BLOCK: tl.constexpr,
+    COL_BLOCKS: tl.constexpr,
+    SPLIT: tl.constexpr,
 ):
-    tile_page = tl.program_id(0)
+    # COL_BLOCKS > 1 (mse passes of one instance): the instance's output columns are accumulated
+    # in COL_BLOCKS blocks, so that each accumulator fits tensor memory. SPLIT neighbouring
+    # programs share the rows and take COL_BLOCKS / SPLIT blocks each (one program per row tile
+    # reads the codes once; more fit an SM).
+    if SPLIT > 1:
+        tile_page = tl.program_id(0) // SPLIT
+        col_block = tl.program_id(0) % SPLIT
+    else:
+        tile_page = tl.program_id(0)
+        col_block = 0
     buffer = tl.program_id(1)
     tile = tl.program_id(2)
     lane = tl.arange(0, BLOCK_M)
@@ -1621,59 +1732,94 @@ def _tq_decode_kernel(
     else:
         FIRST: tl.constexpr = 0
         LAST: tl.constexpr = 4
-    a0, a1, a2, a3 = _decode_rows(
-        cold,
-        w_ptr,
-        s_ptr,
-        alpha,
-        alpha_lo,
-        weight,
-        weight_lo,
-        pos0,
-        pos1,
-        pos2,
-        pos3,
-        rows,
-        row_mask,
-        MODE,
-        N,
-        P0,
-        P1,
-        P2,
-        P3,
-        BITS0,
-        CB0,
-        BITS1,
-        CB1,
-        OFF_A0,
-        W_A0,
-        OFF_A1,
-        W_A1,
-        OFF_B0,
-        W_B0,
-        OFF_B1,
-        W_B1,
-        OFF_QJL,
-        ROWS,
-        BLOCK_M,
-        C,
-        BLOCKED,
-        FIRST,
-        LAST,
-    )
-    if FIRST == 0:
-        _store_piece(row_ptr, row_mask, a0, 0, P0, ELEM)
-    if P1 > 0 and FIRST <= 1 and LAST > 1:
-        _store_piece(row_ptr, row_mask, a1, P0, P1, ELEM)
-    if P2 > 0 and FIRST <= 2 and LAST > 2:
-        _store_piece(row_ptr, row_mask, a2, P0 + P1, P2, ELEM)
-    if P3 > 0 and LAST > 3:
-        _store_piece(row_ptr, row_mask, a3, P0 + P1 + P2, P3, ELEM)
+    if COL_BLOCKS > 1:
+        # One instance per pass (blocked mse, or a single-piece row): its codes against its
+        # output columns, one block at a time.
+        START: tl.constexpr = (
+            (P0 if FIRST >= 1 else 0) + (P1 if FIRST >= 2 else 0) + (P2 if FIRST >= 3 else 0)
+        )
+        WIDTH: tl.constexpr = P0 if FIRST == 0 else P1 if FIRST == 1 else P2 if FIRST == 2 else P3
+        COLS: tl.constexpr = WIDTH // COL_BLOCKS
+        BLOCKS: tl.constexpr = COL_BLOCKS // SPLIT
+        for block in tl.static_range(BLOCKS):
+            col0 = START + (col_block * BLOCKS + block) * COLS
+            acc = _decode_columns(
+                cold,
+                w_ptr,
+                alpha,
+                rows,
+                row_mask,
+                col0,
+                START,
+                WIDTH,
+                lut_ptr if WIDTH == P0 else lut_ptr + LUT_STRIDE,
+                OFF_A0 + START // C * ROWS * (C * W_A0 // 8),
+                W_A0,
+                OFF_A1 + START // C * ROWS * (C * W_A1 // 8),
+                W_A1,
+                N,
+                COLS,
+                ROWS,
+                BLOCK_M,
+                C,
+            )
+            _store_piece(row_ptr, row_mask, acc, col0, COLS, ELEM)
+    else:
+        a0, a1, a2, a3 = _decode_rows(
+            cold,
+            w_ptr,
+            s_ptr,
+            alpha,
+            alpha_lo,
+            weight,
+            weight_lo,
+            pos0,
+            pos1,
+            pos2,
+            pos3,
+            rows,
+            row_mask,
+            MODE,
+            N,
+            P0,
+            P1,
+            P2,
+            P3,
+            BITS0,
+            lut_ptr,
+            BITS1,
+            lut_ptr + LUT_STRIDE,
+            OFF_A0,
+            W_A0,
+            OFF_A1,
+            W_A1,
+            OFF_B0,
+            W_B0,
+            OFF_B1,
+            W_B1,
+            OFF_QJL,
+            ROWS,
+            BLOCK_M,
+            C,
+            BLOCKED,
+            FIRST,
+            LAST,
+        )
+        if FIRST == 0:
+            _store_piece(row_ptr, row_mask, a0, 0, P0, ELEM)
+        if P1 > 0 and FIRST <= 1 and LAST > 1:
+            _store_piece(row_ptr, row_mask, a1, P0, P1, ELEM)
+        if P2 > 0 and FIRST <= 2 and LAST > 2:
+            _store_piece(row_ptr, row_mask, a2, P0 + P1, P2, ELEM)
+        if P3 > 0 and LAST > 3:
+            _store_piece(row_ptr, row_mask, a3, P0 + P1 + P2, P3, ELEM)
 
     if RAW > 0 and FIRST == 0:
         raw_cols = tl.arange(0, RAW_BLOCK)
         raw_dst = tl.where(raw_cols < QS, raw_cols, raw_cols + N)
         raw_mask = row_mask[:, None] & (raw_cols < RAW)[None, :]
+        if SPLIT > 1:  # the first column block of the pass copies them
+            raw_mask = raw_mask & (col_block == 0)
         raw_ptr = (cold + OFF_RAW).to(tl.pointer_type(ELEM))
         values = tl.load(raw_ptr[:, None] + rows[:, None] * RAW + raw_cols[None, :], mask=raw_mask)
         tl.store(

@@ -4385,6 +4385,16 @@ def create_kv_cache_compression_manager(
                     "kv_cache_compression_config.")
             validate_kv_cache_compression_compatibility(
                 config, kv_cache_config, model_engine.spec_config)
+            active_kv_is_fp8 = getattr(
+                kv_cache_config, "dtype",
+                "auto") == "fp8" or (quant_config is not None and getattr(
+                    quant_config, "kv_cache_quant_algo", None) == QuantAlgo.FP8)
+            if active_kv_is_fp8 and get_sm_version() < 89:
+                # Triton's FP8 (e4m3) loads and stores need SM89.
+                raise UnsupportedError(
+                    "TurboQuant cold pages of an FP8 KV cache require a device "
+                    "with compute capability 8.9 or newer; use an FP16 or BF16 "
+                    "KV cache on this device.")
             # The TurboQuant codec imports Triton; keep executor startup lazy.
             from ..kv_cache_compression.quantization_for_cold_page.turboquant_quantization import \
                 TurboQuantColdPageQuantizationCompression
