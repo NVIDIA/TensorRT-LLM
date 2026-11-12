@@ -634,6 +634,30 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
     assert sorted(window(2, 2).tables) == [0, 1]  # gains on both windows: installed
 
 
+def test_even_rows_keep_every_layer_home(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    decider = FakeDecision(0, copy_ms=0.5).decider
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    for w in range(3):  # a replica adds a weight stream to its GPU and offloads none: never planned
+        window_stats(decider.stats, range(E))
+        assert decider.decide(w).tables == {}
+        decider.schedule(w, np.array([[10 + 20 * w, 0, 0.0, 0]] * R))
+    assert (decider.layout == HOME).all()
+
+
+def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    decider = FakeDecision(0, copy_ms=0.5).decider
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    window_stats(decider.stats)  # GPU 0's experts 0 and 1 are hot: both layers take replicas
+    assert decider.decide(0).moved == [0, 1]
+    decider.schedule(0, np.array([[10, 2, 1.0, 0]] * R))
+    window_stats(decider.stats, range(E))[:, L * (E + 1) : L * (E + 2)] = 0  # even rows, installs live
+    update = decider.decide(1)
+    assert sorted(update.tables) == [0, 1] and update.moved == [] and not update.copy_items
+    assert (decider.layout == HOME).all()
+
+
 def test_decision_process_answers_and_reports_its_failure():
     process = rt.DecisionProcess(rt.DecisionConfig(GEOMETRY, MODEL, np.tile(HOME, (L, 1)), 1, 1))
     try:

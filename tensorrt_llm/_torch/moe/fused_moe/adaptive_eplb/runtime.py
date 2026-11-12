@@ -257,6 +257,18 @@ class _Decider:
         model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
         self.evaluations.model = model
         gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
+        copy_ms = copy_ms_per_layer(_timings(self.copy_timings))
+        if copy_ms is None:
+            copy_ms = cfg.copy_ms
+        # The home layout is a candidate too: retiring the replicas copies nothing, so it replaces
+        # the plan where it gains more than the plan does net of a layer's copy over the steps left.
+        home = cfg.home_layouts[planned]
+        home_shares = (home >= 0).astype(np.float64)
+        home_gains = evaluate_gains(*current, home, home_shares, model, geometry)
+        left = steps_left or 0.0
+        to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - (copy_ms or 0.0))
+        new_layout[to_home], new_shares[to_home] = home[to_home], home_shares[to_home]
+        gains[to_home] = home_gains[to_home]
         previous_load = None
         for i, layer in enumerate(planned.tolist()):
             # The latest kept window that neither the installed layout (planned on the window the
@@ -275,13 +287,13 @@ class _Decider:
             )
             gains = np.minimum(gains, previous_gains)
         gain = dict(zip(planned.tolist(), gains.tolist()))
-        copy_ms = copy_ms_per_layer(_timings(self.copy_timings))
-        if copy_ms is None:
-            copy_ms = cfg.copy_ms
+        retire = {layer: gain.pop(layer) for layer in planned[to_home].tolist()}
         chosen = choose_layers_to_install(gain, steps_left, copy_ms or 0.0)
         if copy_ms is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
+        # A retirement copies nothing: it pays as soon as it gains.
+        chosen += [layer for layer, g in retire.items() if g * (steps_left or 0.0) > 0.0]
         growth = self.evaluations.read_cost(
             range(layers), rows, self.layout, self.shares, self.open_call
         )
