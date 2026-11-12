@@ -348,6 +348,7 @@ def test_rank_info_admission_waits_for_asymmetric_receive_fences(
 
     for rank in range(2):
         tc = object.__new__(KvCacheTransceiverV2)
+        tc.kv_transfer_timeout_ms = None
         tc._gen_need_sync = True
         tc._init_gen_idle_poll(idle_skip)
         tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
@@ -372,6 +373,7 @@ def test_rank_info_admission_waits_for_asymmetric_receive_fences(
         coordinator._transceiver = tc
         coordinator._defer_unready_gen_receives = True
         coordinator._unpublished_gen_receives = {7: (req, fence)}
+        coordinator._retiring_gen_receives = {}
         coordinator._stamp_gen_transfer_start = Mock()
         coordinator.inflight_cancel_active = Mock(return_value=False)
         coordinator._check_transfer_errors = Mock()
