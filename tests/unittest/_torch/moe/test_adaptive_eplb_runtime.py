@@ -257,8 +257,7 @@ def spy(monkeypatch, seen: dict) -> None:
     given; every window after the first lasts ``FORWARDS`` forwards."""
 
     def plan(load, *args):
-        if len(args) == 4:  # not a layer's keep-first plan (a sixth argument)
-            seen.setdefault("load", []).append(np.array(load))
+        seen.setdefault("load", []).append(np.array(load))
         return REAL_PLAN(load, *args)
 
     def solve(rows, layout, geometry, model=None):
@@ -338,9 +337,7 @@ def test_a_window_counts_every_ranks_rows_over_its_own_forwards(host_cuda, monke
     seen, rows, _, ranks = window_inputs(monkeypatch, (FORWARDS, FORWARDS + 1))
     expected = rows[0].astype(np.float64) / FORWARDS + rows[1].astype(np.float64) / (FORWARDS + 1)
     assert len(seen["load"]) == R * L  # every layer planned on both ranks: not skipped
-    for i, (load, solved) in enumerate(
-        zip(seen["load"], seen["rows"][::3])
-    ):  # plan, installed, kept
+    for i, (load, solved) in enumerate(zip(seen["load"], seen["rows"][::2])):  # plan, installed
         assert np.array_equal(load, expected[i % L]) and np.array_equal(solved, expected[i % L])
     last = [runtime._event.records[-1] for runtime in (*ranks, base_ranks[0])]
     for key in ("window", "open_call", "solved_call"):

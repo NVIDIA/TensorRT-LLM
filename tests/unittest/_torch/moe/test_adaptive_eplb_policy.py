@@ -115,7 +115,7 @@ def _layout(geometry: ExpertGeometry, replicas: dict[int, int] | list) -> np.nda
     return layout
 
 
-def _plan(load, current=None, total=None, geometry=SMALL, keep_first=False):
+def _plan(load, current=None, total=None, geometry=SMALL):
     home = geometry.home_layout()
     return plan_layout(
         np.asarray(load, dtype=np.float64),
@@ -123,7 +123,6 @@ def _plan(load, current=None, total=None, geometry=SMALL, keep_first=False):
         home,
         home if current is None else current,
         active_slots(geometry) if total is None else total,
-        keep_first,
     )
 
 
@@ -143,11 +142,8 @@ def _gpus(row: tuple[int, ...], geometry: ExpertGeometry) -> list[int]:
     return sorted(slot // geometry.local_slots for slot in row)
 
 
-def _check_steps(
-    load: np.ndarray, current: np.ndarray, geometry: ExpertGeometry, keep=False
-) -> None:
-    """The invariants every step of :func:`plan_layout` keeps (``keep``: keep-first), on its own
-    intermediate rows."""
+def _check_steps(load: np.ndarray, current: np.ndarray, geometry: ExpertGeometry) -> None:
+    """The invariants every step of :func:`plan_layout` keeps, on its own intermediate rows."""
     home = geometry.home_layout()
     homes, is_home = home.tolist(), (home >= 0).tolist()
     home_slot = [homes.index(e) for e in range(geometry.num_experts)]
@@ -155,9 +151,8 @@ def _check_steps(
     total = active_slots(geometry)
     spare = geometry.ep_size * (geometry.local_slots - geometry.local_experts)
     assert total - geometry.num_experts <= spare
+    proposed = policy._place_replicas(rows, homes, home_slot, geometry, total)
     installed = policy._expert_slots_of(current.tolist(), geometry.num_experts)
-    copies = policy._copies(rows, total)
-    proposed = policy._place_replicas(rows, homes, copies, geometry, installed if keep else None)
     fitted = policy._fit_free_slots(installed, proposed, rows, geometry)
     paired = policy._keep_replica_slots(installed, fitted, is_home, geometry)
     targets = policy._one_install(installed, fitted, is_home, geometry)
@@ -227,15 +222,6 @@ def test_installed_replicas_keep_their_slots():
     _check_one_install(plan, SMALL, current)
 
 
-def test_keep_first_keeps_a_needed_replica_on_its_least_loaded_gpu_and_copies_nothing():
-    # Expert 0 needs one replica and holds two, on GPU 1 (4 rows) and GPU 3 (2 rows); the plan
-    # copies one to GPU 2 (2 rows, the lower id) instead.
-    current, load = _layout(SMALL, {6: 0, 14: 0}), [8.0, 1.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    assert _plan(load, current, 9).layout.tolist() == _layout(SMALL, {10: 0}).tolist()
-    kept = _plan(load, current, 9, keep_first=True)
-    assert kept.layout.tolist() == _layout(SMALL, {14: 0}).tolist()
-
-
 def test_random_installed_layouts_are_reached_in_one_install():
     geometry = ExpertGeometry(num_experts=48, num_slots=64, ep_size=4)
     home = geometry.home_layout()
@@ -248,11 +234,7 @@ def test_random_installed_layouts_are_reached_in_one_install():
         load = rng.gamma(0.3, 50.0, geometry.num_experts)
         plan = _plan(load, current=current, geometry=geometry)
         _check_one_install(plan, geometry, current)
-        kept = _plan(load, current=current, geometry=geometry, keep_first=True)
-        _check_one_install(kept, geometry, current)
-        assert sum(len(row) for row in kept.expert_slots) <= active_slots(geometry)
         _check_steps(load, current, geometry)
-        _check_steps(load, current, geometry, keep=True)
         assert sum(len(row) for row in plan.expert_slots) <= active_slots(geometry)
         again = _plan(load.tolist(), current=current.tolist(), geometry=geometry)
         assert again.expert_slots == plan.expert_slots

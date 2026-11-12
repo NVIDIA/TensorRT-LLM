@@ -43,7 +43,6 @@ from .policy import (
     choose_layers_to_install,
     evaluate_gains,
     plan_layout,
-    slot_rows,
     solve_shares,
 )
 
@@ -261,22 +260,11 @@ class _Decider:
         home, installed = cfg.home_layouts[planned], self.layout[planned]
         # This window's rows, replaced below by an earlier window's rows where one is kept.
         previous_load = rows[planned]
-        left = steps_left or 0.0
         for i, layer in enumerate(planned.tolist()):
             plan = plan_layout(rows[layer], geometry, home[i], installed[i], self.active)
             new_layout[i] = plan.layout
             new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry, model)
             resolved[i] = solve_shares(rows[layer], installed[i], geometry, model)
-            # Keep-first (the installed replicas stay, only the missing ones are copied) replaces the
-            # plan where its time over the steps left is lower, or equal and its busiest GPU copies less.
-            keep = plan_layout(rows[layer], geometry, home[i], installed[i], self.active, True)
-            both = np.stack([new_layout[i], keep.layout]), np.stack([new_shares[i], new_shares[i]])
-            both[1][1] = solve_shares(rows[layer], keep.layout, geometry, model)
-            time = model.layer_time_us(slot_rows(rows[[layer, layer]], *both), geometry.ep_size)
-            moves = ((both[0] >= 0) & (both[0] != installed[i])).reshape(2, geometry.ep_size, -1)
-            busiest = moves.sum(2).max(1)
-            if (time[1] * left, busiest[1]) < (time[0] * left, busiest[0]):
-                new_layout[i], new_shares[i] = keep.layout, both[1][1]
             # The latest kept window that neither the installed layout (planned on the window the
             # layer was committed in) nor the new one (planned on this window) was planned on, at
             # this window's batch; a layer without one keeps only this window's gains.
@@ -301,7 +289,7 @@ class _Decider:
         # only where it gains more than the home layout, net of a layer's copy over the steps left.
         home_shares = (home >= 0).astype(np.float64)
         home_gains = evaluate_gains(*current, home, home_shares, model, geometry)
-        copy = (per_replica or 0.0) * copied.max(1, initial=0)
+        left, copy = steps_left or 0.0, (per_replica or 0.0) * copied.max(1, initial=0)
         to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - copy)
         # Both candidates must also gain on that window, and the plan beat the home layout there.
         earlier = (previous_load, *current[1:])
