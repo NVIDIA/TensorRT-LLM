@@ -448,7 +448,7 @@ def render(c: dict) -> tuple[dict, dict, list[dict]]:
 
     result = {}
     for name in ("metrics", "logs"):
-        if name == "logs" and not d.get("include_logs", True):
+        if name == "logs" and not d.get("include_logs", False):
             continue
         spec = walk(
             json.loads((HERE / "templates" / f"{name}.json").read_text(encoding="utf-8")), replace
@@ -488,7 +488,7 @@ def render(c: dict) -> tuple[dict, dict, list[dict]]:
                     s.update(x=x, y=y)
                     x += s["width"]
                     height = max(height, s["height"])
-        if not d.get("include_logs", True):
+        if not d.get("include_logs", False):
             spec["links"] = [x for x in spec["links"] if x.get("url") != "/d/" + d["logs_uid"]]
         if name == "logs":
             add_unique_sessions(spec, c)
@@ -704,7 +704,11 @@ class Client:
                 return None
 
         try:
-            with urllib.request.build_opener(NoRedirect()).open(req, timeout=60) as response:
+            handlers = [NoRedirect()]
+            if urllib.parse.urlsplit(req.full_url).hostname in ("localhost", "127.0.0.1", "::1"):
+                # Loopback credentials must stay local even when proxy variables are set.
+                handlers.append(urllib.request.ProxyHandler({}))
+            with urllib.request.build_opener(*handlers).open(req, timeout=60) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             if missing_ok and error.code == 404:

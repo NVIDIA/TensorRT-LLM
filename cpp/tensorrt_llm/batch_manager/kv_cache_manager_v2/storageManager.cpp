@@ -551,6 +551,7 @@ StorageManager::~StorageManager()
 void StorageManager::destroy()
 {
     mPendingMigrationTimings.clear();
+    mTimingEvents.clear();
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);

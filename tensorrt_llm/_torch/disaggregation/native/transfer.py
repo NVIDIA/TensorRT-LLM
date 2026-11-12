@@ -406,6 +406,12 @@ class _LogicalOutcomes:
     def fail(self, error: Exception) -> None:
         self._end(_LogicalOutcome(SessionStatus.ERROR, reason=str(error)))
 
+    def timeout(self) -> None:
+        """Commit an expired blocking wait without changing physical ownership."""
+        self._end(
+            _LogicalOutcome(SessionStatus.ERROR, reason="KV transfer timed out", timed_out=True)
+        )
+
     def cancel(self, by_peer: bool) -> None:
         self._end(_LogicalOutcome(SessionStatus.CANCELLED, by_peer=by_peer))
 
@@ -4329,7 +4335,7 @@ class RxSession(RxSessionBase):
 
     @property
     def timed_out(self) -> bool:
-        """Whether the whole-session deadline committed the terminal outcome."""
+        """Whether a deadline or blocking wait committed a timeout outcome."""
         terminal = self._logical_outcomes.terminal
         return terminal is not None and terminal.timed_out
 
@@ -4463,6 +4469,7 @@ class RxSession(RxSessionBase):
             for task in self._kv_tasks:
                 done = task.wait(timeout=timeout)
                 if not done:
+                    self._logical_outcomes.timeout()
                     return self._failed_wait_result()
                 if task.status == TaskStatus.ERROR:
                     return self._failed_wait_result()

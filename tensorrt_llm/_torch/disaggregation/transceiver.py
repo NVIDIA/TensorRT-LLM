@@ -1459,7 +1459,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
                 settlement_outcome = "completed"
             else:
-                if result == WaitResult.TIMEOUT or getattr(session, "timed_out", False) is True:
+                if getattr(session, "timed_out", False) is True:
                     req.py_kv_transfer_timed_out = True
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 settlement_outcome = "failed"

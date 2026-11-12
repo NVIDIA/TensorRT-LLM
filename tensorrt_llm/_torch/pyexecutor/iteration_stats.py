@@ -30,8 +30,8 @@ class IterationStatsRecord(NamedTuple):
     prev_device_step_time_ms: float | None = None
     scheduler_mode: Literal["overlap", "non_overlap"] | None = None
     gpu_forward_time_ms: float | None = None
-    kv_transfer_outcomes: tuple[int, int, int] | None = None
     executor_loop: dict[str, object] | None = None
+    kv_transfer_outcomes: tuple[int, int, int] | None = None
 
     @classmethod
     def from_tuple(cls, stats: tuple) -> IterationStatsRecord:

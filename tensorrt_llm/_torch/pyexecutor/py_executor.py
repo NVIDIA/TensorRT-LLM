@@ -1209,6 +1209,8 @@ class PyExecutor:
         # above: _append_iter_stats is reached from per-rank-divergent gates,
         # so its tp_allgather collective is lifted to _flush_iter_stats_synced.
         self._pending_iter_stats_dict: Optional[Dict] = None
+        self._last_published_transfer_outcomes: Optional[tuple[int, int,
+                                                               int]] = None
         # Legacy ADP dummy role for overlap and PP fallback paths. The generic
         # non-overlap path derives its role from fresh per-iteration intent.
         self._adp_dummy_is_gen: bool = True
@@ -8027,9 +8029,34 @@ class PyExecutor:
             if validate_mm is not None:
                 validate_mm(mm_data)
 
+    def _publish_transfer_outcomes(self) -> None:
+        """Publish changed terminal counts before an idle request wait."""
+        if not self.enable_iter_perf_stats or self.enable_attention_dp:
+            return
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        if coordinator is None:
+            return
+        outcomes = getattr(coordinator, "transfer_outcomes", None)
+        if outcomes is None or outcomes == getattr(
+                self, "_last_published_transfer_outcomes", None):
+            return
+        snapshot = {
+            "attentionDpRank":
+            0,
+            "kvTransferOutcomes":
+            dict(zip(("success", "error", "timeout"), outcomes))
+        }
+        with self.stats_lock:
+            if (not _stats_buffer_is_unbounded(self.max_stats_len)
+                    and len(self.stats) > self.max_stats_len):
+                self.stats.pop(0)
+            self.stats.append(("per_rank_dict", snapshot))
+            self._last_published_transfer_outcomes = outcomes
+
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
+        self._publish_transfer_outcomes()
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # ADP polls owner-local completions before routing. All owners must
