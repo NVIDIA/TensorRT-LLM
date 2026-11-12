@@ -72,10 +72,22 @@ class KimiK3DFlashWorker(DFlashWorker):
             raise ValueError("TRTLLM_K3_INFERACT_BOUNDARY must be 0 or 1")
         self._inferact_boundary_enabled = flag == "1"
         self._inferact_boundary = None
+        cache_flag = os.environ.get("TRTLLM_K3_INFERACT_CACHE_WRITE", "0")
+        if cache_flag not in ("0", "1"):
+            raise ValueError("TRTLLM_K3_INFERACT_CACHE_WRITE must be 0 or 1")
+        self._inferact_cache_write_enabled = cache_flag == "1"
         super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
 
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
+        if self._inferact_cache_write_enabled:
+            from .inferact_cache_write import InferactPagedCacheWrite
+
+            draft_model._inferact_cache_writer = InferactPagedCacheWrite(draft_model, self.mapping)
+            logger.info(
+                "K3 Inferact direct paged cache write enabled; "
+                f"stock MLA admission={draft_model._inferact_cache_writer.model_supported}"
+            )
         if self._inferact_boundary_enabled:
             from .inferact_boundary import InferactBoundaryPreparation
 

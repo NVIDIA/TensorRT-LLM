@@ -3534,15 +3534,39 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             # RMSNorm over the latent, RoPE over k_pe, one kernel. norm_dim keeps
             # k_pe out of the reduction, which is what DeepSeek-style MLA wants
             # and what DSpark's own convention (whole row) does not do.
-            blk_kv = _rmsnorm_rope_batched(
-                blk_latent,
-                attn.kv_a_layernorm.weight,
-                attn.kv_a_layernorm.variance_epsilon,
-                self.qk_rope_head_dim,
-                blk_freqs,
-                norm_dim=latent_dim,
+            # Optional model-owned MLA specialization; unsupported operands keep
+            # the original norm/scatter path. Writes precede the unchanged decode.
+            cache_writer = getattr(self, "_inferact_cache_writer", None)
+            direct_cache = (
+                variant == "cute_dsl"
+                and cache_writer is not None
+                and cache_writer.try_write(
+                    blk_latent,
+                    attn.kv_a_layernorm.weight,
+                    attn.kv_a_layernorm.variance_epsilon,
+                    blk_freqs,
+                    ctx_kv_cache[layer_idx][:, 0, 0],
+                    fixup.pages,
+                    fixup.offsets,
+                )
             )
-            if use_kernel:
+            blk_kv = (
+                None
+                if direct_cache
+                else _rmsnorm_rope_batched(
+                    blk_latent,
+                    attn.kv_a_layernorm.weight,
+                    attn.kv_a_layernorm.variance_epsilon,
+                    self.qk_rope_head_dim,
+                    blk_freqs,
+                    norm_dim=latent_dim,
+                )
+            )
+            if direct_cache:
+                ctx_out = self._cute_dsl_block_decode(
+                    query, ctx_kv_cache[layer_idx], fixup, block_size
+                )
+            elif use_kernel:
                 ctx_out = self._mla_paged_attention(
                     query,
                     blk_kv,
