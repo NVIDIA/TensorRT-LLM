@@ -3123,6 +3123,21 @@ def _varlen_launcher(
                 and not reg_options.get("cr2", False)
             ):
                 reg_options["fp16_radix_impl"] = 2
+            if (
+                dtype is torch.bfloat16
+                and sm_version not in _BLACKWELL_SM_VERSIONS
+                and num_sms not in _HOPPER_BLACKWELL_BANDWIDTH_SMS
+                and reg_options.get("code_radix", False)
+                and not pcw
+                and int(plan_free["tpl"][0]) * int(plan_free["tpl"][2]) <= 1024
+                and num_rows > wave * int(plan_free["tpl"][2])
+            ):
+                # A batch taller than one wave of co-resident one-row CTAs runs kern_cr in lock-step
+                # waves that alternate row loads with an SM-bound select: once its row has landed,
+                # each CTA's BF16 window prefetches the row one wave ahead into L2, so the next
+                # wave's loads overlap this wave's select. Plans at the 32-register wall (blk * minb
+                # = 2048 threads per SM) keep it off: there it gained nothing (up to 5 % slower).
+                reg_options["succ_la"] = wave * int(plan_free["tpl"][2])
             fn = dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
                 varlen=True,

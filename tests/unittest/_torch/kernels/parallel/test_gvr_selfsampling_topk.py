@@ -1275,6 +1275,89 @@ def test_selfsampling_hopper_one_wave_row_pass_evicts_first(monkeypatch) -> None
         assert not l2ef(512, 65539, 1024, dtype), dtype
 
 
+def _succ_la(monkeypatch, requests, rows, n, k, dtype, num_sms=132, sm_version=90):
+    for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, cache, {})
+    requests.clear()
+    _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
+    reg = [kwargs for name, kwargs in requests if name == "get_compiled__reg"]
+    return reg[-1].get("succ_la", 0) if reg else None
+
+
+def test_selfsampling_hopper_multiwave_lookahead(monkeypatch) -> None:
+    """BF16 code-radix register plans of Hopper parts other than the H20 prefetch the row one wave
+    of co-resident CTAs (SMs x minb) ahead when the batch is taller than that wave, except plans
+    at the 32-register wall (blk x minb = 2048). One-wave batches, FP16, the H20 and Blackwell
+    keep it off."""
+    requests = _record_compile_requests(monkeypatch)
+    for rows, n, k, wave in (
+        (512, 16399, 2048, 264),
+        (1024, 16399, 2048, 264),
+        (1024, 8207, 2048, 528),
+        (1024, 8195, 1024, 528),
+        (1024, 8195, 512, 528),
+    ):
+        assert _succ_la(monkeypatch, requests, rows, n, k, torch.bfloat16) == wave, (rows, n, k)
+        assert not _succ_la(monkeypatch, requests, rows, n, k, torch.float16), (rows, n, k)
+        for num_sms, sm_version in ((78, 90), (148, 100)):
+            assert not _succ_la(
+                monkeypatch, requests, rows, n, k, torch.bfloat16, num_sms, sm_version
+            ), (rows, n, k, num_sms)
+    assert not _succ_la(monkeypatch, requests, 256, 16399, 2048, torch.bfloat16)  # one wave
+    assert not _succ_la(monkeypatch, requests, 1057, 3000, 512, torch.bfloat16)  # blk x minb 2048
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 90 or torch.cuda.get_device_properties(0).multi_processor_count != 132,
+    reason="requires a 132-SM Hopper GPU (H100 / H200 SXM)",
+)
+@pytest.mark.parametrize(
+    "rows,ncols,top_k,next_n,compress_ratio",
+    [
+        pytest.param(300, 16399, 2048, 1, 1, id="k2048_partial_wave"),
+        pytest.param(600, 16399, 2048, 2, 1, id="k2048_mtp2"),
+        pytest.param(600, 8195, 512, 1, 4, id="k512_cr4"),
+        pytest.param(1024, 8195, 1024, 2, 4, id="k1024_mtp2"),
+    ],
+)
+def test_selfsampling_hopper_multiwave_lookahead_exact(
+    monkeypatch, rows: int, ncols: int, top_k: int, next_n: int, compress_ratio: int
+) -> None:
+    """Batches taller than one wave that prefetch the next wave's rows stay exact."""
+    real = ss_host._device()
+    requests = []
+
+    class RecordingDevice:
+        def __getattr__(self, name: str):
+            attr = getattr(real, name)
+            if not name.startswith("get_compiled"):
+                return attr
+
+            def compile_request(*args: object, **kwargs: object):
+                requests.append((name, kwargs))
+                return attr(*args, **kwargs)
+
+            return compile_request
+
+    monkeypatch.setattr(ss_host, "_device", RecordingDevice)
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
+    logits, kv_lens, lengths = _make_low_varlen_case(
+        rows, ncols, top_k, next_n, compress_ratio, "ties", torch.bfloat16
+    )
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        logits,
+        kv_lens,
+        indices,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        max_seq_len=ncols * compress_ratio,
+    )
+    torch.cuda.synchronize()
+    assert any(kwargs.get("succ_la") for name, kwargs in requests if name == "get_compiled__reg")
+    _check_low_varlen_exact(logits, indices, lengths)
+
+
 @pytest.mark.skipif(
     getSMVersion() != 90
     or torch.cuda.get_device_properties(0).multi_processor_count
