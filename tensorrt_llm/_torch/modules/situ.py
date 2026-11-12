@@ -66,7 +66,14 @@ def situ_and_mul_kernel(
     LAUNCH_WITH_PDL: tl.constexpr,
     GATE_UP_INTERLEAVE: tl.constexpr = 0,
 ) -> None:
-    """SiTU on packed ``[gate | up]`` rows or interleaved gate/up blocks."""
+    """SiTU on packed ``[gate | up]`` rows or interleaved gate/up blocks.
+
+    With ``GATE_UP_INTERLEAVE == 0`` each input row is ``[g0 .. g(d-1), u0 .. u(d-1)]``.
+    With ``GATE_UP_INTERLEAVE == G`` it alternates blocks of ``G`` gate and ``G`` up
+    columns, ``[g0 .. g(G-1), u0 .. u(G-1), gG .. g(2G-1), uG .. u(2G-1), ...]``, and
+    ``d`` must be a multiple of ``G`` (the launcher checks it). The output row is
+    ``d`` wide either way.
+    """
     i = tl.program_id(axis=0).to(tl.int64)
     j = tl.program_id(axis=1)
 
