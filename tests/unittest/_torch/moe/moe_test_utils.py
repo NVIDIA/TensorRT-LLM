@@ -437,16 +437,14 @@ def should_skip_trtllm(
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
         # Keep unvalidated NVFP4 seq=8 configurations skipped, except for
-        # the restored single-GPU Relu2 case below.
+        # the restored Relu2 case below. This exemption assumes the single-GPU
+        # generators in test_moe_backend.py; multi-GPU sweeps use SwiGLU.
         is_restored_relu2_seq8_case = (
             model_config == MoeModelConfig(60, 4, 2048, 1408)
             and dtype == torch.bfloat16
             and activation_type == ActivationType.Relu2
             and routing_method_cls is RenormalizeMoeRoutingMethod
             and not swiglu_gptoss_style
-            and moe_tp_size == 1
-            and parallel_mode is None
-            and comm_method is None
         )
         if (
             num_experts >= 60

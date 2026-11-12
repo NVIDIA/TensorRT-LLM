@@ -42,7 +42,6 @@ from _torch.moe.moe_test_utils import (
     iter_base_test_configs,
     replay_tactics_and_check,
     should_skip_to_accelerate_ci,
-    should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
@@ -107,6 +106,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
+    MoEEligibility,
     MoEEnvironment,
     MoEInputRequirement,
     MoEProblem,
@@ -1291,8 +1291,8 @@ def test_trtllm_nvfp4_seq8_skip(
     overrides: dict[str, object],
     expected_skip: bool,
 ) -> None:
-    backend = Mock()
-    backend.can_implement.return_value = SimpleNamespace(eligible=True)
+    backend = Mock(spec_set=["can_implement"])
+    backend.can_implement.return_value = MoEEligibility.ok()
     monkeypatch.setattr("_torch.moe.moe_test_utils.find_backend_classes", lambda *_: [backend])
     params = dict(
         swiglu_combos=[(1, 0, float("inf"))],
@@ -1330,23 +1330,6 @@ def test_trtllm_nvfp4_seq8_skip(
         generated_ids = {param.id for param in generate_element_wise_test_params()}
         assert f"act=Relu2-{base_test_id}" in generated_ids
         assert f"act=Silu-{base_test_id}" not in generated_ids
-
-        for deployment_overrides in (
-            {"moe_tp_size": 2},
-            {"parallel_mode": "DEP"},
-            {"comm_method": "NVLINK_ONE_SIDED"},
-        ):
-            skip_reason = should_skip_trtllm(
-                MoeBackendType.TRTLLM,
-                QuantAlgo.NVFP4,
-                MoeModelConfig(60, 4, 2048, 1408),
-                RenormalizeMoeRoutingMethod,
-                seq_len=8,
-                dtype=torch.bfloat16,
-                activation_type=ActivationType.Relu2,
-                **deployment_overrides,
-            )
-            assert skip_reason is not None and "seq_len=8" in skip_reason
 
 
 def should_skip_gptoss(
