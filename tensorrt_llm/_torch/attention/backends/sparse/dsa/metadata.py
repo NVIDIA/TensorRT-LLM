@@ -131,6 +131,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
+    # Build the skip-indexer dense top-k table on the device instead of the host. A model
+    # sets this on the metadata it is given; the default keeps the host build.
+    dense_topk_on_device: bool = False
     shared_topk_indices: Optional[torch.Tensor] = None
     indexer_skip_topk: bool = False
     in_mtp_draft_loop: bool = False
@@ -2283,7 +2286,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.skip_indexer_for_gen_reqs = False
-        self.prepare_dense_topk_indices(kv_lens)
+        if self.dense_topk_on_device:
+            self.prepare_dense_topk_indices(
+                kv_lens.to(self.seq_lens_cuda.device, non_blocking=True), device=True
+            )
+        else:
+            self.prepare_dense_topk_indices(kv_lens)
 
     def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
         if self.num_contexts > 0:
