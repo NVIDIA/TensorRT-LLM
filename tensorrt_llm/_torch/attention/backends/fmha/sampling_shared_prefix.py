@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared-prompt generation attention for ``n``-sample requests with speculative decoding (SM90).
+"""Shared-prompt generation attention for ``n``-sample requests with speculative decoding (SM90, SM100).
 
 The children of an ``n``-sample request (``beam_width == 1``) are independent requests that map
 the same leading prompt pages when KV-cache block reuse lets them share the parent's blocks. The
@@ -28,7 +28,7 @@ written into the row's own pages at ``kv_len - q_len + j``, exactly as the regul
 the two paths are interchangeable step by step. Kernels: ``shared_prefix_fa4``.
 
 Scope: generation-only batches with a linear draft (``q_len = 1 + K`` tokens per row, ``q_len >=
-MIN_Q_LEN``) of a dense GQA/MHA model on SM90, bf16 paged KV cache of KV cache manager V2, no
+MIN_Q_LEN``) of a dense GQA/MHA model on SM90 or SM100, bf16 paged KV cache of KV cache manager V2, no
 sliding window, sinks, custom masks, beam search or tree drafts. Every other batch is declined and
 the regular kernel runs. The draft layers run on the same metadata with the draft KV manager
 swapped in and are declined.

@@ -19,16 +19,16 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
+    fa4_arch_supported,
     fa4_forward,
     fa4_paged_generation,
 )
-from tensorrt_llm._utils import get_sm_version
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
     pytest.mark.skipif(
-        not torch.cuda.is_available() or get_sm_version() != 90 or fa4_forward() is None,
-        reason="FlashAttention-4 generation path is SM90-only",
+        not fa4_arch_supported() or fa4_forward() is None,
+        reason="FlashAttention-4 generation path needs SM90 or SM100",
     ),
 ]
 

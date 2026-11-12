@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generation-phase attention through FlashAttention-4 (CuTe DSL) on SM90.
+"""Generation-phase attention through FlashAttention-4 (CuTe DSL) on SM90 and SM100.
 
 Serves the generation rows of a batch, plain decode (one query token per row) and
 linear speculative-decoding verification (``q_len = 1 + K`` tokens per row), for dense
@@ -51,7 +51,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
@@ -60,6 +59,7 @@ from .combined import generation_rows_uniform
 from .flash_attn4_kernels import (
     SPLITS_ENV,
     allocate_split_workspace,
+    fa4_arch_supported,
     fa4_forward,
     fa4_paged_generation,
     fa4_paged_generation_split,
@@ -153,7 +153,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        if get_sm_version() != 90 or fa4_forward() is None:
+        if not fa4_arch_supported() or fa4_forward() is None:
             return False
         if (
             getattr(attn, "is_mla_enable", False)

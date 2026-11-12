@@ -733,7 +733,7 @@ their own non-evicting lifecycle with the FP4 MLA page size, and
 `fmha/cute_dsl_mla.py` serves their generation phase, including in mixed
 batches.
 
-##### 3.2.2.8 Opt-in SM90 generation libraries
+##### 3.2.2.8 Opt-in SM90 and SM100 generation libraries
 
 Two libraries are off by default and enabled together with
 `TLLM_FMHA_LIBS=+sampling_shared_prefix,+flash_attn4_generation`; see
