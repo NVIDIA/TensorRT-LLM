@@ -288,14 +288,17 @@ thinking-phase acceptance (`use_relaxed_acceptance_for_thinking=True`, which acc
 without the rejection rule) or with DSpark confidence scheduling (which admits only greedy
 requests under rejection sampling); those combinations are rejected when the config is built.
 
-With a standalone DSpark drafter that has a Markov head, sampled drafts without a top-k/top-p
-filter (`draft_temperature_only=True`, or requests that set neither) are drawn ancestrally: each
-position is sampled from the drafter's distribution given the token drawn before it, so the
-stored proposals are the drafter's own joint distribution. One fused kernel draws the whole
-block, so this raises the acceptance length at no extra per-step cost.
-`DSparkDecodingConfig.ancestral_draft_sampling=True` (prototype, off by default) extends this to
-filtered drafts, which cost one sampler call per draft position; at low concurrency that
-outweighs the acceptance gain.
+With a standalone DSpark drafter that has a Markov head, sampled drafts are drawn ancestrally
+when the deployment drops the draft filters, with `draft_temperature_only=True` or
+`advanced_sampling_mode="no_topk_no_topp"`: each position is sampled from the drafter's
+distribution given the token drawn before it, so the stored proposals are the drafter's own
+joint distribution. A fused Triton chain draws the block with three launches per position and one
+normalization at the end; on GB300 its sampler time stayed below the block sampler's at every
+batch size measured, so the acceptance gain comes without extra per-step cost. The choice is made per deployment, not per request: under the default
+`advanced_sampling_mode="full"`, a request that sets no top-k/top-p still takes the existing
+path. `DSparkDecodingConfig.ancestral_draft_sampling=True` (prototype, off by default) extends
+ancestral drawing to all other sampled drafts, which cost one sampler call per draft position; at
+low concurrency that outweighs the acceptance gain.
 
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig

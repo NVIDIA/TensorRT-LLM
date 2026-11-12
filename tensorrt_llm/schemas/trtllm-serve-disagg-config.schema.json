@@ -1093,7 +1093,7 @@
         },
         "ancestral_draft_sampling": {
           "default": false,
-          "description": "Sampled drafts of a standalone drafter with a Markov head are drawn ancestrally when they carry no top-k/top-p filter (draft_temperature_only or unfiltered requests): each position is sampled given the token drawn before it by one fused kernel, so the stored proposals are the drafter's joint distribution, which raises acceptance. If true, filtered drafts are drawn ancestrally too, at one sampler call per draft position. False (default) chains the Markov bias of filtered drafts through the greedy argmax and samples every position at once. Requires use_rejection_sampling=True; standalone drafters only, not supported with confidence scheduling.",
+          "description": "Sampled drafts of a standalone drafter with a Markov head are drawn ancestrally when the deployment drops the draft filters (draft_temperature_only=True or advanced_sampling_mode='no_topk_no_topp'): each position is sampled given the token drawn before it by a fused Triton chain, so the stored proposals are the drafter's joint distribution, which raises acceptance. If true, all other sampled drafts are drawn ancestrally too, at one sampler call per draft position. False (default) chains the Markov bias of the other sampled drafts through the greedy argmax and samples every position at once. Requires use_rejection_sampling=True; standalone drafters only, not supported with confidence scheduling.",
           "status": "prototype",
           "title": "Ancestral Draft Sampling",
           "type": "boolean"

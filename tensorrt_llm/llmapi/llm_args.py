@@ -4081,13 +4081,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         status="prototype",
         description=
         "Sampled drafts of a standalone drafter with a Markov head are drawn "
-        "ancestrally when they carry no top-k/top-p filter (draft_temperature_only "
-        "or unfiltered requests): each position is sampled given the token drawn "
-        "before it by one fused kernel, so the stored proposals are the "
-        "drafter's joint distribution, which raises acceptance. If true, "
-        "filtered drafts are drawn ancestrally too, at one sampler call per "
-        "draft position. False (default) chains the Markov bias of filtered "
-        "drafts through the greedy argmax and samples every position at once. "
+        "ancestrally when the deployment drops the draft filters "
+        "(draft_temperature_only=True or "
+        "advanced_sampling_mode='no_topk_no_topp'): each position is sampled "
+        "given the token drawn before it by a fused Triton chain, so the stored "
+        "proposals are the drafter's joint distribution, which raises "
+        "acceptance. If true, all other sampled drafts are drawn ancestrally "
+        "too, at one sampler call per draft position. False (default) chains "
+        "the Markov bias of the other sampled drafts through the greedy argmax "
+        "and samples every position at once. "
         "Requires use_rejection_sampling=True; standalone drafters only, not "
         "supported with confidence scheduling.")
 
@@ -7591,6 +7593,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 "decoding: its ragged verification windows cannot be "
                 "watermarked. Use another speculation mode or drop "
                 "watermark_config.")
+        if (self.watermark_config is not None and spec is not None and getattr(
+                spec, "rejection_sample_method", "standard") == "block"):
+            raise ValueError(
+                "watermark_config is not supported with "
+                "rejection_sample_method='block': the watermark redraws the "
+                "token after the accepted drafts from the token-level "
+                "rejection residual, which block verification does not use.")
         return self
 
     attn_backend: str = Field(

@@ -34,7 +34,11 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecWorkerBase
 from tensorrt_llm._torch.speculative.utils import get_spec_metadata
-from tensorrt_llm._torch.speculative.vocab_parallel import _gumbel_fine, markov_sampled_chain
+from tensorrt_llm._torch.speculative.vocab_parallel import (
+    _gumbel_fine,
+    _PairExchange,
+    markov_sampled_chain,
+)
 from tensorrt_llm.llmapi.llm_args import (
     AdvancedSamplingMode,
     DSparkDecodingConfig,
@@ -57,11 +61,15 @@ class _MarkovDrafter(_DSparkHeadMixin):
 
 
 def _drafter(
-    generator: torch.Generator, vocab: int = V, scale: float = 1.0, device: str = "cpu"
+    generator: torch.Generator,
+    vocab: int = V,
+    scale: float = 1.0,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
 ) -> _MarkovDrafter:
     w1 = scale * torch.randn(vocab, RANK, generator=generator)
     w2 = torch.randn(vocab, RANK, generator=generator)
-    return _MarkovDrafter(w1.to(device), w2.to(device))
+    return _MarkovDrafter(w1.to(device, dtype), w2.to(device, dtype))
 
 
 def _worker(ancestral: bool = True) -> DSparkWorker:
@@ -280,6 +288,28 @@ _SETTINGS = {
         dict(enable_confidence_scheduling=True, confidence_cost_table_path="/path/to/costs"),
     ),
 }
+
+
+@pytest.mark.parametrize("method", ["standard", "block"])
+@pytest.mark.cpu_only
+def test_llm_args_reject_watermarking_with_block_verification(method: str) -> None:
+    # The watermark redraws the token after the accepted drafts from the
+    # token-level rejection residual, which block verification does not use.
+    from tensorrt_llm.watermark.config import WatermarkConfig
+
+    def build() -> TorchLlmArgs:
+        return TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            watermark_config=WatermarkConfig(key=1),
+            speculative_config=_mtp(rejection_sample_method=method),
+        )
+
+    if method == "standard":
+        build()
+    else:
+        with pytest.raises(ValueError, match="rejection_sample_method='block'"):
+            build()
 
 
 @pytest.mark.parametrize("option", _REJECTION_OPTIONS, ids=["block", "temperature_only"])
@@ -563,21 +593,23 @@ def test_sampled_block_captures_in_a_cuda_graph(
 
 
 @_needs_cuda
+@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16], ids=["fp32_w", "bf16_w"])
 @pytest.mark.parametrize(
     "temperature_only, mode",
     [(True, AdvancedSamplingMode.FULL), (False, AdvancedSamplingMode.NO_TOPK_NO_TOPP)],
     ids=["temperature_only", "no_topk_no_topp"],
 )
 def test_unfiltered_chain_draws_follow_the_stored_proposals(
-    temperature_only: bool, mode: AdvancedSamplingMode
+    temperature_only: bool, mode: AdvancedSamplingMode, w_dtype: torch.dtype
 ) -> None:
     """Without filters the fused chain draws ancestrally, also with ancestral_draft_sampling
     off: the joint of two positions is p(d0) p(d1 | d0) under the stored rows, and a greedy
-    row takes the argmax chain."""
+    row takes the argmax chain. BF16 Markov weights over FP32 logits are the checkpoint
+    layout: the bias is taken in the weights' dtype, as on the other draft paths."""
     generator = torch.Generator().manual_seed(51)
     vocab, num_gens, draft_len, temperature = 8, 40000, 2, 0.9
     worker = _worker(ancestral=False)
-    drafter = _drafter(generator, vocab=vocab, device="cuda")
+    drafter = _drafter(generator, vocab=vocab, device="cuda", dtype=w_dtype)
     one = torch.randn(1, draft_len, vocab, generator=generator).cuda()
     anchor = torch.randint(vocab, (1,), generator=generator).cuda()
     base, anchors = one.expand(num_gens, -1, -1).contiguous(), anchor.expand(num_gens).contiguous()
@@ -686,26 +718,36 @@ def test_chain_draws_tied_tokens_evenly_at_large_scaled_logits(
 ) -> None:
     """Two tied top tokens in different splits are each drawn half the time, as stored, even
     when logit / T is so large that noise added to it unscaled would round away."""
-    vocab, num_reqs, rank = 1 << 17, 4096, 8
+    # Few rows per launch so the vocab spans several splits; batches with distinct RNG
+    # offsets accumulate the draws.
+    vocab, num_reqs, num_batches, rank = 1 << 17, 64, 64, 8
+    layout = _PairExchange(None, 1, 0).layout(num_reqs, vocab, torch.device("cuda"))
+    assert layout.splits > 1 and (vocab - 1) // layout.chunk > 0
     base = torch.full((1, 1, vocab), logit - 64 * logit / 2**20, device="cuda")
     base[..., 0] = base[..., vocab - 1] = logit
     base = base.expand(num_reqs, -1, -1).contiguous()
     zeros = torch.zeros(vocab, rank, device="cuda")
     probs = torch.empty(num_reqs, 1, vocab, device="cuda")
-    tokens = markov_sampled_chain(
-        base,
-        torch.zeros(num_reqs, dtype=torch.int64, device="cuda"),
-        zeros,
-        zeros,
-        torch.full((num_reqs,), temperature, device="cuda"),
-        torch.arange(num_reqs, dtype=torch.int64, device="cuda") + 5,
-        torch.zeros(1, num_reqs, dtype=torch.int64, device="cuda"),
-        probs,
-    )
-    torch.testing.assert_close(probs[:, 0, [0, vocab - 1]].cpu(), torch.full((num_reqs, 2), 0.5))
-    assert set(tokens.flatten().tolist()) <= {0, vocab - 1}
+    draws = []
+    for batch in range(num_batches):
+        tokens = markov_sampled_chain(
+            base,
+            torch.zeros(num_reqs, dtype=torch.int64, device="cuda"),
+            zeros,
+            zeros,
+            torch.full((num_reqs,), temperature, device="cuda"),
+            torch.arange(num_reqs, dtype=torch.int64, device="cuda") + 5,
+            torch.full((1, num_reqs), batch, dtype=torch.int64, device="cuda"),
+            probs,
+        )
+        torch.testing.assert_close(
+            probs[:, 0, [0, vocab - 1]].cpu(), torch.full((num_reqs, 2), 0.5)
+        )
+        draws.append(tokens.flatten())
+    tokens = torch.cat(draws)
+    assert set(tokens.tolist()) <= {0, vocab - 1}
     share = (tokens == 0).double().mean().item()
-    assert abs(share - 0.5) < 4 * 0.5 / num_reqs**0.5, share
+    assert abs(share - 0.5) < 4 * 0.5 / tokens.numel() ** 0.5, share
 
 
 @_needs_cuda

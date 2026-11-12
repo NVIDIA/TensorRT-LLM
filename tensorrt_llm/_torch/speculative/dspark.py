@@ -1364,9 +1364,10 @@ class DSparkWorker(DFlashWorker):
         token drawn before it (the anchor for k = 0), and that distribution is
         stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
         raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
-        int32 draft tokens and the stored vocab width. Unfiltered drafts
-        (``draft_temperature_only`` or no top-k/top-p in the batch) take the
-        fused :func:`markov_sampled_chain`; filtered drafts take a per-position
+        int32 draft tokens and the stored vocab width. When the deployment drops
+        the draft filters (``draft_temperature_only`` or the
+        ``NO_TOPK_NO_TOPP`` sampling mode) drafts take the fused
+        :func:`markov_sampled_chain`; other sampled drafts take a per-position
         sampler loop and only with ``ancestral_draft_sampling``. Otherwise,
         without a Markov head, for argmax drafts, or for a drafter that also
         carries a DFlash 2 candidate scorer (LiLiCorr or the selector), the DFlash path
@@ -1376,8 +1377,8 @@ class DSparkWorker(DFlashWorker):
         has_candidate_scorer = getattr(draft_model, "lilicorr", None) is not None or getattr(
             draft_model, "has_candidate_selector", False
         )
-        # Unfiltered drafts take the fused chain, which costs no more than the
-        # block sampler, so they are drawn ancestrally without the option.
+        # Deploy-time unfiltered drafts take the fused chain, which costs no more
+        # than the block sampler, so they are drawn ancestrally without the option.
         fused_chain = gen_logits.is_cuda and (
             spec_metadata.draft_temperature_only
             or spec_metadata.advanced_sampling_mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP

@@ -225,8 +225,14 @@ claim so the target recomputes the last tokens of the prompt:
   would see without reuse; the recomputed target K/V can still differ numerically from a cold
   prefill, so the output need not match it token for token.
 * `-1`: a prefix hit re-prefills the whole prompt.
-* `null`: resolved from the drafter config to its attention window, or `-1` when the drafter
-  attends to its whole context (`0` for the embedded DeepSeek-V4 drafter).
+* `null`: resolved from the drafter config, differently per drafter:
+  * DSpark checks each layer: the tail is the widest attention window over the layers, or `-1`
+    when any layer uses full attention or the drafter is MLA-shaped (`0` for the embedded
+    DeepSeek-V4 drafter).
+  * DFlash reads only the drafter-wide `dflash_config.use_swa` and `swa_window_size`: the tail is
+    `swa_window_size` when `use_swa` is set, else `-1`. Per-layer `layer_types` are not
+    consulted, so a DFlash drafter that mixes sliding-window and full-attention layers resolves to
+    the window; set `-1` explicitly for it.
 
 The recomputed tokens cost TTFT and prefill throughput on every hit and are not loaded from a
 KV connector. A disaggregated context server recomputes only when the draft layers share the
