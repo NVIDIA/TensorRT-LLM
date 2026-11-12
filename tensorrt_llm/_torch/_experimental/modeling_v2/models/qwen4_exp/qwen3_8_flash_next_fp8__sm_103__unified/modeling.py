@@ -6892,11 +6892,11 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
                 "pads every rank to one prefill bucket, so a rank holding only generation "
                 "requests is handed more rows than its batch, which the decode step refuses"
             )
+        # Unset, max_seq_len is inferred after the build from the text tower's
+        # max_position_embeddings (the pinned rope declares no scaling factor).
         windows = llm_args.kv_cache_config.max_attention_window
-        full = llm_args.max_seq_len or model_config.max_seq_len
-        if windows is not None and (
-            any(w < full for w in windows) if full else len(set(windows)) > 1
-        ):
+        full = llm_args.max_seq_len or model_config.max_seq_len or text.max_position_embeddings
+        if windows is not None and any(w < full for w in windows):
             raise NoTarget(
                 f"kv_cache_config.max_attention_window={windows}; the target implements no "
                 "sliding window: every attention layer's window is max_seq_len"

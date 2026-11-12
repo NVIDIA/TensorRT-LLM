@@ -144,6 +144,7 @@ def _qwen4_exp_config(text_overrides=None, composite_overrides=None, **vision_ov
         rope_theta=10000000,
         partial_rotary_factor=0.25,
         rope_scaling=dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True),
+        max_position_embeddings=262144,
         mtp=dict(_MTP_BLOCK),
         mtp_num_hidden_layers=1,
         mtp_use_dedicated_embeddings=False,
@@ -240,6 +241,8 @@ def test_each_member_is_admitted_as_the_llm_api_spells_it(on_sm103, member, para
             dict(kv_cache_config=KvCacheConfig(dtype="nvfp4")),
         ),
         ("tp4", None, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="bfloat16"))),
+        # A window of the full length, max_seq_len unset (inferred from max_position_embeddings).
+        ("tep4", None, dict(kv_cache_config=KvCacheConfig(max_attention_window=[262144]))),
     ],
     ids=[
         "tp1-mtp1",
@@ -247,6 +250,7 @@ def test_each_member_is_admitted_as_the_llm_api_spells_it(on_sm103, member, para
         "tep4-mtp3-fp8-kv",
         "dep4-mtp3-nvfp4-kv",
         "tp4-bf16-state",
+        "tep4-full-window",
     ],
 )
 def test_the_engine_choices_the_target_runs_are_admitted(
@@ -338,6 +342,11 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
         ),
         (
             dict(member="tep4"),
+            dict(kv_cache_config=KvCacheConfig(max_attention_window=[32768])),
+            "sliding window",
+        ),
+        (
+            dict(member="tep4"),
             dict(moe_config=MoeConfig(load_balancer={"num_slots": 512})),
             r"load_balancer \(EPLB\)",
         ),
@@ -367,6 +376,7 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
         "other-rope-theta",
         "other-mtp-layer",
         "sliding-window",
+        "sliding-window-inferred-max-seq-len",
         "eplb",
         "vision-gpu-normalize",
     ],
