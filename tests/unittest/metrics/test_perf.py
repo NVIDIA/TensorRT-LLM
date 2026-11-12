@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
+from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
 from tensorrt_llm.metrics.collector import MetricsCollector, PrometheusExposure
 from tensorrt_llm.metrics.enums import MetricNames
 from tensorrt_llm.metrics.logging import LoggerExposure
@@ -210,3 +211,52 @@ def test_cached_rank_observations_are_not_replayed_by_multiple_loops() -> None:
     assert prom.kv_cache_utilization.labels(
         **prom.labels, dp_rank="0"
     )._value.get() == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize("tp_rank", [None, 3])
+def test_iteration_record_preserves_transport_fields(tp_rank: int | None) -> None:
+    stats = Mock()
+    stats.to_json_str.return_value = '{"iter": 7, "futureField": {"value": 1}}'
+    request = Mock()
+    request.to_json_str.return_value = '{"id": 9}'
+    loop = {"kind": "loop", "per_iter": {"iter": 7}}
+    entry = IterationStatsRecord(
+        iteration_stats=stats,
+        request_stats=[request],
+        attention_dp_rank=2,
+        host_step_time_ms=0.0,
+        prev_device_step_time_ms=1.0,
+        scheduler_mode="overlap",
+        gpu_forward_time_ms=2.0,
+        kv_transfer_outcomes=(0, 1, 2),
+        executor_loop=loop,
+    )
+    expected = {
+        "iter": 7,
+        "futureField": {"value": 1},
+        "requestStats": [{"id": 9}],
+        "hostStepTimeMS": 0.0,
+        "prevDeviceStepTimeMS": 1.0,
+        "gpuForwardTimeMS": 2.0,
+        "schedulerMode": "overlap",
+        "kvTransferOutcomes": {"success": 0, "error": 1, "timeout": 2},
+        "executorLoop": loop,
+    }
+    if tp_rank is None:
+        expected["attentionDpRank"] = 2
+    else:
+        expected["rank"] = tp_rank
+    assert entry.to_dict(tp_rank=tp_rank) == expected
+    assert json.loads(PerfMetricsCollector.collect_iteration(expected).iteration_json()) == expected
+
+
+@pytest.mark.parametrize("width", range(1, 11))
+def test_iteration_record_accepts_historical_tuple_widths(width: int) -> None:
+    stats = Mock()
+    stats.to_json_str.return_value = '{"iter": 7}'
+    legacy = (stats,) + (None,) * (width - 1)
+    entry = IterationStatsRecord.from_tuple(legacy)
+    assert entry.to_dict() == {"iter": 7, "attentionDpRank": 0}
+    assert entry.to_dict(tp_rank=3) == {"iter": 7, "rank": 3}
+    assert IterationStatsRecord.from_tuple(entry) is entry
+    assert IterationStatsRecord.from_tuple(legacy + (None,) * 10).to_dict() == entry.to_dict()

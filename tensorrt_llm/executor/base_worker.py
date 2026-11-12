@@ -33,7 +33,6 @@ from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
 from .._torch.pyexecutor.iteration_stats import IterationStatsRecord
-from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
@@ -1296,57 +1295,7 @@ class BaseWorker(GenerationExecutor):
 
         entry = IterationStatsRecord.from_tuple(stats)
 
-        stats_dict = json.loads(entry.iteration_stats.to_json_str())
-        # Always tag the row so Dynamo's adapter can read
-        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
-        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
-        stats_dict["attentionDpRank"] = (0 if entry.attention_dp_rank is None
-                                         else entry.attention_dp_rank)
-
-        if entry.request_stats is not None and len(entry.request_stats) > 0:
-            stats_dict["requestStats"] = []
-            for req_stat in entry.request_stats:
-                stats_dict["requestStats"].append(
-                    json.loads(req_stat.to_json_str()))
-
-        append_kv_cache_iteration_stats(stats_dict, entry.kv_iteration_stats)
-
-        # Per-loop CPU wall captured by profile_step() — always a clean
-        # single-loop measurement, matching the log line's `host_step_time`.
-        # Prefer this over iterLatencyMS when you need absolute per-loop
-        # CPU cost, especially under the overlap scheduler where
-        # iterLatencyMS measures the batch's full lifecycle (~2 loops).
-        if entry.host_step_time_ms is not None:
-            stats_dict["hostStepTimeMS"] = entry.host_step_time_ms
-        # GPU forward time read via the ping-pong CUDA event pair in
-        # profile_step(). Note the "prev" in the name: under steady state
-        # the value lags its sibling host_step_time on the same record by
-        # one loop (the event-pair being read corresponds to the loop
-        # before the one host_step_time describes). See the ping-pong
-        # comment in PyExecutor._profiler for the design rationale.
-        if entry.prev_device_step_time_ms is not None:
-            stats_dict["prevDeviceStepTimeMS"] = entry.prev_device_step_time_ms
-        # Batch-matched GPU forward time measured from the CUDA events around
-        # this record's _forward_step. This is the preferred field for
-        # ForwardPassMetrics wall_time.
-        if entry.gpu_forward_time_ms is not None:
-            stats_dict["gpuForwardTimeMS"] = entry.gpu_forward_time_ms
-        # Scheduler mode for this record. "overlap" means iterLatencyMS
-        # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
-        # "non_overlap" means iterLatencyMS is itself the clean per-loop
-        # CPU wall. Set per-record so consumers do not need server config.
-        if entry.scheduler_mode is not None:
-            stats_dict["schedulerMode"] = entry.scheduler_mode
-
-        if entry.kv_transfer_outcomes is not None:
-            stats_dict["kvTransferOutcomes"] = dict(
-                zip(("success", "error", "timeout"),
-                    entry.kv_transfer_outcomes))
-
-        if entry.executor_loop is not None:
-            stats_dict["executorLoop"] = entry.executor_loop
-        # Preserve the public JSON shape while collecting categories before exposure.
-        record = PerfMetricsCollector.collect_iteration(stats_dict)
+        record = PerfMetricsCollector.collect_iteration(entry.to_dict())
         return record.iteration_json()
 
     @staticmethod
