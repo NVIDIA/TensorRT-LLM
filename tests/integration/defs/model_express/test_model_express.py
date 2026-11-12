@@ -272,7 +272,8 @@ _MX_CASES = (
             moe_disable_finalize_fusion=True,
         ),
         id="deepseek-v3-bf16-tp2",
-        marks=pytest.mark.skip_less_device(4),
+        # Each role holds roughly 26 GiB of BF16 weights per GPU.
+        marks=[pytest.mark.skip_less_device(4), pytest.mark.skip_less_device_memory(40000)],
     ),
     pytest.param(
         MxE2ECase(
@@ -284,7 +285,8 @@ _MX_CASES = (
             moe_disable_finalize_fusion=True,
         ),
         id="deepseek-v3-bf16-tp2-ep2",
-        marks=pytest.mark.skip_less_device(4),
+        # Each role holds roughly 26 GiB of BF16 weights per GPU.
+        marks=[pytest.mark.skip_less_device(4), pytest.mark.skip_less_device_memory(40000)],
     ),
 )
 
