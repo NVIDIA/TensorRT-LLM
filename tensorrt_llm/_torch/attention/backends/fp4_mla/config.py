@@ -8,7 +8,7 @@ import inspect
 import os
 from typing import Any, Literal, Optional
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 
 HP_BLOCK_SIZE: int = 16
 
@@ -69,6 +69,9 @@ FP4_MLA_Q_SF_GROUPS: int = FP4_MLA_Q_LOGICAL_DIM // FP4_BLOCK_SIZE
 
 
 FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
+# Triton V prepacking is opt-in: every metadata otherwise retains a whole-pool V copy.
+FP4_MLA_PREPACK_V_ENV = "TRTLLM_FP4_MLA_PREPACK_V"
+FP4_MLA_TRITON_PREPACK_V_ENV = "TRTLLM_FP4_MLA_TRITON_PREPACK_V"
 
 
 FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV = "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE"
@@ -176,6 +179,13 @@ def _fp4_mla_attention_backend() -> str:
     if get_sm_version() == 107 and _cutedsl_backend_available():
         return _FP4_MLA_CUTEDSL_BACKEND
     return "triton"
+
+
+def _fp4_mla_generation_backend_supported(sm_version: int, backend: str) -> bool:
+    """Static hardware/backend eligibility shared by validation and generation."""
+    return backend in _FP4_MLA_K_RESIDUAL_BACKENDS and (
+        sm_version == 107 or (backend == "triton" and is_blackwell_datacenter(sm_version))
+    )
 
 
 # Modules the FP4 MLA CuTe DSL kernels import.

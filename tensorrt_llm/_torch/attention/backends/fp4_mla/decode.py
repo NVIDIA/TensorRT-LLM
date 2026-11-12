@@ -31,7 +31,6 @@ from .config import (
     _fp4_mla_packed_rows_per_seq,
 )
 from .layout import (
-    _ensure_decode_scratch_tensor,
     _ensure_workspace_tensor,
     _get_fp4_mla_global_scale,
     _get_fp4_mla_kv_cache_tensors,
@@ -285,19 +284,21 @@ def _run_triton_attention_decode(
     # scaling trick. The page-max correction is applied later by
     # prob_scale_kernel via p_sf in-place rescaling.
     page_stats_shape = (num_queries, max_pages, num_heads)
-    page_max = _ensure_decode_scratch_tensor(
+    page_max = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_page_max_buf",
         page_stats_shape,
         dtype=torch.float32,
         device=q_fp4.device,
+        shared=True,
     )
-    page_sum = _ensure_decode_scratch_tensor(
+    page_sum = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_page_sum_buf",
         page_stats_shape,
         dtype=torch.float32,
         device=q_fp4.device,
+        shared=True,
     )
 
     pack_prob_in_page_stats = True
@@ -416,6 +417,7 @@ def _run_triton_attention_decode(
             (num_queries, num_reduce_groups, num_heads),
             dtype=torch.float32,
             device=q_fp4.device,
+            shared=True,
         )
         group_sum = _ensure_workspace_tensor(
             metadata,
@@ -423,6 +425,7 @@ def _run_triton_attention_decode(
             (num_queries, num_reduce_groups, num_heads),
             dtype=torch.float32,
             device=q_fp4.device,
+            shared=True,
         )
         _attn_group_reduce_stats_kernel[(num_queries, num_head_blocks, num_reduce_groups)](
             group_max,
@@ -547,6 +550,7 @@ def _run_triton_attention_decode(
             (num_queries, page_split, num_heads, kv_lora_rank),
             dtype=torch.float32,
             device=q_fp4.device,
+            shared=True,
         )
         if use_triton_v_packed_cache:
             _attn_pv_prepacked_v_kernel[
@@ -1409,34 +1413,38 @@ def run_fp4_mla_attention_decode(
         return
 
     total_p_rows = num_queries * max_pages * num_heads
-    p_fp4 = _ensure_decode_scratch_tensor(
+    p_fp4 = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_p_buf",
         (max(total_p_rows, 1), metadata.page_size // 2),
         dtype=torch.uint8,
         device=q.device,
+        shared=True,
     )[:total_p_rows]
-    p_sf = _ensure_decode_scratch_tensor(
+    p_sf = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_p_sf_buf",
         (max(_get_fp4_mla_swizzled_scale_size(total_p_rows, metadata.page_size), 1),),
         dtype=torch.float8_e4m3fn,
         device=q.device,
+        shared=True,
     )
     stats_shape = (num_queries, num_heads)
-    max_scores = _ensure_decode_scratch_tensor(
+    max_scores = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_max_buf",
         stats_shape,
         dtype=torch.float32,
         device=q.device,
+        shared=True,
     )
-    denom = _ensure_decode_scratch_tensor(
+    denom = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_denom_buf",
         stats_shape,
         dtype=torch.float32,
         device=q.device,
+        shared=True,
     )
 
     if backend != "triton":

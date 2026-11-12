@@ -65,9 +65,11 @@ class Fp4MlaState:
     num_context_blocks: int = 0
     num_generation_blocks: int = 0
     # The KV length every generation sequence of this step shares, from the host
-    # lengths prepare() receives; None when they differ, for CUDA-graph metadata,
+    # lengths prepare() receives; None with no generation, differing lengths, CUDA graphs,
     # and when speculative decoding can advance the device lengths past them.
-    generation_kv_len: int | None = None
+    uniform_generation_kv_len_host: int | None = None
+    # Per-forward scratch shared only by graphs of the owning runner; clear() releases it.
+    decode_scratch_buffers: Buffers | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
     v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
 
@@ -145,6 +147,7 @@ class Fp4MlaState:
         self.generation_lengths_num_contexts = -1
         self.generation_lengths_capture_recorded = False
         self.packed_plan_key = None
+        self.uniform_generation_kv_len_host = None
 
     def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
         # All local layers reuse this FP8 view only within the current batch.
@@ -159,11 +162,17 @@ class Fp4MlaState:
                 "FP4 MLA requires fixed-stride device page metadata; the "
                 "current KV-cache manager or batch layout is unsupported."
             )
-        self.generation_kv_len = None
-        if not metadata.is_cuda_graph and not metadata.kv_lens_advance_on_device():
-            generation_kv_lens = kv_lens[metadata.num_contexts : metadata.num_seqs].tolist()
-            if generation_kv_lens and min(generation_kv_lens) == max(generation_kv_lens):
-                self.generation_kv_len = int(generation_kv_lens[0])
+        self.uniform_generation_kv_len_host = None
+        if (
+            not metadata.is_cuda_graph
+            and not metadata.kv_lens_advance_on_device()
+            and not metadata.max_total_draft_tokens
+        ):
+            generation_kv_lens_host = kv_lens[metadata.num_contexts : metadata.num_seqs].tolist()
+            if generation_kv_lens_host and min(generation_kv_lens_host) == max(
+                generation_kv_lens_host
+            ):
+                self.uniform_generation_kv_len_host = int(generation_kv_lens_host[0])
         # Graph capture's on_update_kv_lens owns the append kernel. Uniform
         # generation derives token positions in the fused update instead.
         if not metadata.is_cuda_graph and metadata.num_tokens > 0 and metadata.num_contexts > 0:

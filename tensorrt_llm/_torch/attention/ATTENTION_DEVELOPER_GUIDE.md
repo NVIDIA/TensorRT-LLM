@@ -300,6 +300,11 @@ The core contract is:
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
   chunked prefill limits that workspace to the current KV chunk (default
   `True`)
+- `runtime_workspace_min_tokens(model_config, mapping, *, max_num_tokens,
+  runtime_features)` — backend staging floor in per-token workspace units
+  (default `0`); the estimator credits staging covered by its profiling peak.
+  Dense chunked FP8 context MLA declares its complete partition/query buffer here;
+  sparse gather implementations retain their own layouts and default to zero.
 - `runtime_workspace_fixed_bytes(model_config, mapping, **capacities)` — retained
   workspace sized by serving capacity rather than admitted attended-KV length
   (default `0`)

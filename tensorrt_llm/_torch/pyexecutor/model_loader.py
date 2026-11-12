@@ -358,6 +358,16 @@ def validate_fp4_mla_config(model_config: ModelConfig,
     if not supports_fp4_mla_attention(model_config):
         raise UnsupportedError(
             "Dense FP4 MLA requires the TRTLLM attention backend.")
+    from ..attention.backends.fp4_mla.config import (
+        FP4_MLA_ATTENTION_BACKEND_ENV, _fp4_mla_attention_backend,
+        _fp4_mla_generation_backend_supported)
+    backend = _fp4_mla_attention_backend()
+    sm_version = get_sm_version()
+    if not _fp4_mla_generation_backend_supported(sm_version, backend):
+        raise UnsupportedError(
+            f"Dense FP4 MLA generation does not support SM{sm_version} with "
+            f"{FP4_MLA_ATTENTION_BACKEND_ENV}={backend}. Use Triton on SM100/SM103, "
+            "or Triton/CuTe DSL on SM107.")
     mapping = model_config.mapping
     if mapping.cp_size != 1 and not mapping.has_cp_helix():
         raise UnsupportedError(

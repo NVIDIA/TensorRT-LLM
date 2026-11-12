@@ -575,6 +575,8 @@ def configure_fp4_mla_device_page_table(
             max_page_capacity,
             max(1, _ceil_div(max_kv_len, FP4_MLA_TOKENS_PER_BLOCK)),
         )
+        # Bound eager Triton specializations to logarithmically many page strides.
+        max_pages = min(max_page_capacity, 1 << (max_pages - 1).bit_length())
         if num_contexts > 0:
             max_context_len = int(kv_lens[:num_contexts].max().item())
             max_context_pages = _ceil_div(
@@ -929,42 +931,9 @@ def _host_int_list(value: Any, start: int, end: int) -> Optional[list[int]]:
 
 
 def _infer_assume_full_pages(metadata: Any, max_pages: int, page_size: int) -> bool:
-    if getattr(metadata, "is_cuda_graph", False):
-        return False
-
-    start = metadata.num_contexts
-    end = metadata.num_seqs
-    block_counts = _host_int_list(getattr(metadata.fp4_mla_state, "num_blocks", None), start, end)
-    if block_counts is not None and (
-        not block_counts or min(block_counts) != max_pages or max(block_counts) != max_pages
-    ):
-        return False
-
-    if isinstance(getattr(metadata, "kv_lens_cuda_runtime", None), torch.Tensor):
-        # Fp4MlaState.prepare() records the step's generation KV length from its
-        # host lengths, so this never waits on a device-to-host copy.
-        kv_len = metadata.fp4_mla_state.generation_kv_len
-        return kv_len is not None and kv_len == max_pages * page_size
-
-    kv_cache_params = getattr(metadata, "kv_cache_params", None)
-    cached_token_lens = _host_int_list(
-        getattr(kv_cache_params, "num_cached_tokens_per_seq", None),
-        start,
-        end,
-    )
-    seq_lens_kv = _host_int_list(getattr(metadata, "seq_lens_kv", None), start, end)
-    if cached_token_lens is not None and seq_lens_kv is not None:
-        if len(cached_token_lens) != len(seq_lens_kv):
-            return False
-        kv_lens = [
-            cached_len + seq_len for cached_len, seq_len in zip(cached_token_lens, seq_lens_kv)
-        ]
-    elif kv_cache_params is None:
-        kv_lens = _host_int_list(getattr(metadata, "prompt_lens_cpu_runtime", None), start, end)
-    else:
-        return False
-
-    return bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
+    # prepare() provides only host lengths proven stable for this eager step.
+    kv_len = metadata.fp4_mla_state.uniform_generation_kv_len_host
+    return not metadata.is_cuda_graph and kv_len is not None and kv_len == max_pages * page_size
 
 
 def _get_linear_mtp_query_len_per_seq(

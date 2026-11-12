@@ -15,8 +15,10 @@ from tensorrt_llm.bindings import DataType
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
     FP4_BLOCK_SIZE,
+    FP4_MLA_PREPACK_V_ENV,
     FP4_MLA_SCALE_ROW_GROUP,
     FP4_MLA_TOKENS_PER_BLOCK,
+    FP4_MLA_TRITON_PREPACK_V_ENV,
     HP_BLOCK_SIZE,
     _ceil_div,
     _env_enabled_default,
@@ -187,8 +189,8 @@ def _triton_prepack_v_enabled() -> bool:
     # The prepacked-V buffer spans every page of the FP4 KV pool. Each attention
     # metadata (eager and every CUDA graph) holds its own copy, and the KV-cache
     # budget does not count it, so the triton backend uses it only when opted in.
-    default = _env_enabled_default("TRTLLM_FP4_MLA_PREPACK_V", False)
-    return _env_enabled_default("TRTLLM_FP4_MLA_TRITON_PREPACK_V", default)
+    default = _env_enabled_default(FP4_MLA_PREPACK_V_ENV, False)
+    return _env_enabled_default(FP4_MLA_TRITON_PREPACK_V_ENV, default)
 
 
 def _triton_can_prepack_v(v_head_dim: int, page_size: int, block_v: int) -> bool:

@@ -276,7 +276,7 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
     ],
 )
 def test_workspace_reserve_cap(budget, k, w, kv_len_cap, expected_cap):
-    reserve, cap = get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, 0)
+    reserve, cap = get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, fixed_bytes=0)
     assert cap == expected_cap
     assert cap == int(reserve / w)  # the cap is exactly what the reserve covers
     assert reserve <= w * kv_len_cap  # never reserves beyond the worst case
@@ -295,7 +295,7 @@ def test_workspace_reserve_cap(budget, k, w, kv_len_cap, expected_cap):
 )
 def test_workspace_reserve_zero_for_bad_inputs(budget, k, w, kv_len_cap):
     # Any non-positive input -> reserve nothing and carry no cap (no admission cap applied).
-    assert get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, 0) == (0, None)
+    assert get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, fixed_bytes=0) == (0, None)
 
 
 # ---- carried admission-cap read (executor side, V1/V2) ----
@@ -400,14 +400,32 @@ def test_ctx_cap_no_cap_during_warmup():
     assert exe._get_ctx_mla_kv_len_cap() is None
 
 
-@pytest.mark.parametrize("floor", [64, 128, 200])
-def test_workspace_reserve_covers_minimum_partition(floor: int) -> None:
+@pytest.mark.parametrize(
+    "floor,profiled,expected_reserve,expected_cap",
+    [
+        (64, 0, 204.8, 102),
+        (128, 0, 256, 128),
+        (200, 0, 400, 200),
+        (200, 64, 272, 200),
+    ],
+)
+def test_workspace_reserve_honors_staging_floor(
+    floor: int,
+    profiled: int,
+    expected_reserve: float,
+    expected_cap: int,
+) -> None:
     reserve, cap = get_mla_context_workspace_reserve(
-        1024, 3, 2, 4096, fixed_bytes=512, min_workspace_tokens=floor
+        1024,
+        3,
+        2,
+        4096,
+        fixed_bytes=512,
+        min_workspace_tokens=floor,
+        profiled_workspace_tokens=profiled,
     )
-    assert reserve >= 2 * floor
-    assert cap >= floor
-    assert 1024 - reserve >= 512
+    assert reserve == pytest.approx(expected_reserve)
+    assert cap == expected_cap
 
 
 def test_workspace_reserve_rejects_unaffordable_floor() -> None:

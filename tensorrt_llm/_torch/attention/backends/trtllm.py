@@ -60,9 +60,9 @@ from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_args)
+                        AttentionRuntimeFeatures, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -2234,6 +2234,31 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 separate_q_and_kv_input=True,
                 sparse_mla=stages_no_buffer,
             ))
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: "Mapping",
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Dense FP8 context MLA's complete chunked-prefill K/V staging capacity."""
+        if (not is_mla(model_config.pretrained_config)
+                or not runtime_features.chunked_prefill):
+            return 0
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        if sparse_algorithm == "csa2":
+            return 0
+        if (sparse_algorithm in ("dsa", "deepseek_v4")
+                and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
+            return 0
+        # Mirrors MLA::contextWorkspaceLayout's buffer_batch_size * query_tokens floor
+        # and the cached-partition capacity prepared by this backend's metadata.
+        return runtime_features.chunked_prefill_buffer_batch_size * max(
+            runtime_features.chunk_size, max_num_tokens)
 
     @classmethod
     def runtime_workspace_fixed_bytes(cls, model_config: "ModelConfig",

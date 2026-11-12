@@ -1285,6 +1285,22 @@ class AttentionBackend(Generic[TMetadata]):
         return True
 
     @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Minimum staging capacity in per-token workspace units; default zero.
+
+        The estimator subtracts staging already covered by the profiling peak
+        before reserving additional memory for this backend-specific floor.
+        """
+        return 0
+
+    @classmethod
     def runtime_workspace_fixed_bytes(
         cls,
         model_config: "ModelConfig",

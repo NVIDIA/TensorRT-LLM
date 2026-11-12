@@ -296,6 +296,7 @@ class CUDAGraphRunner:
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
             self._create_shared_static_tensors()
+        self.fp4_mla_decode_buffers = Buffers()
         self.cuda_graph_meta_buffers = (Buffers()
                                         if config.private_metadata_buffers else
                                         get_memory_buffers())
@@ -777,6 +778,9 @@ class CUDAGraphRunner:
             )
             graph_attn_metadata.num_contexts = key.num_contexts
         assert graph_attn_metadata.is_cuda_graph
+        fp4_state = getattr(graph_attn_metadata, "fp4_mla_state", None)
+        if fp4_state is not None:
+            fp4_state.decode_scratch_buffers = self.fp4_mla_decode_buffers
 
         if enable_spec_decode:
             graph_spec_metadata = spec_metadata.create_cuda_graph_metadata(
@@ -1596,6 +1600,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.fp4_mla_decode_buffers.buffers.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()

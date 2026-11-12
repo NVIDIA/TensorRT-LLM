@@ -141,6 +141,7 @@ def test_mla_profile_respects_context_limit(
         assert creator._mla_chunked_profile_length == 73728
     else:
         assert creator._mla_chunked_profile_length is None
+        assert creator._profiled_prompt_len == min(creator._max_num_tokens, input_seq_len)
         assert sum(len(req.input_token_ids) for req in requests) == 8192
 
 
@@ -1690,6 +1691,10 @@ def _run_mla_workspace_estimation(
             "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
             return_value=bounded,
         ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.trtllm.TrtllmAttention.runtime_workspace_min_tokens",
+            return_value=4 * max_num_tokens if bounded and chunked_prefill else 0,
+        ),
     ):
         assert creator.try_prepare_estimation()
         assert kv_cache_config.max_tokens == estimation_max_tokens
@@ -1731,6 +1736,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
         chunked_workspace_profiled=chunked_workspace_profiled,
         chunked_prefill=chunked_prefill,
         bounded=bounded,
+        max_seq_len=4096,
     )
 
     assert kv_cache_config.max_gpu_total_bytes == expected_budget
@@ -1767,10 +1773,10 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
         # One request holds at most 512 // (3 + 1) = 128 tokens with its workspace:
         # without a fixed cost that is the split itself.
         (False, True, 0, 16, 192, None, 384, 128),
-        # Beside a fixed cost, that request needs more workspace than the split's 64 tokens.
-        (False, True, 256, 16, 192, None, 400, 128),
-        # A backend that attends the complete prefix keeps that floor with chunked prefill.
-        (True, False, 256, 16, 192, None, 400, 128),
+        # The fixed cost cannot hold tokens; the split already covers one resident request.
+        (False, True, 256, 16, 192, None, 448, 64),
+        # An unbounded gather backend does not inherit the dense chunked-staging floor.
+        (True, False, 256, 16, 192, None, 448, 64),
     ],
     ids=[
         "split_beyond_fixed",
@@ -2475,3 +2481,15 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
     warmup_scope.__exit__.assert_called_once()
     assert executor.enable_iter_perf_stats is True
     assert executor.set_gather_responses.call_args.args == (False,)
+
+
+def test_estimation_original_chunk_dimensions_reject_unaffordable_floor() -> None:
+    with pytest.raises(ResourceError, match="workspace floor"):
+        _run_mla_workspace_estimation(
+            sm=100,
+            chunked_workspace_profiled=False,
+            chunked_prefill=True,
+            bounded=True,
+            max_num_tokens=256,
+            max_seq_len=4096,
+        )

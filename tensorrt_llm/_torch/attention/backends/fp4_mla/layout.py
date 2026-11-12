@@ -234,8 +234,21 @@ def _ensure_workspace_tensor(
     *,
     dtype: torch.dtype,
     device: torch.device,
+    shared: bool = False,
 ) -> torch.Tensor:
     workspaces = metadata.fp4_mla_state.workspaces
+    # Only per-forward scratch may be shared; persistent caches keep metadata ownership.
+    if (
+        shared
+        and metadata.is_cuda_graph
+        and metadata.fp4_mla_state.decode_scratch_buffers is not None
+    ):
+        buffers = metadata.fp4_mla_state.decode_scratch_buffers
+        tensor = metadata.get_empty(
+            buffers, list(shape), dtype, f"fp4_mla_decode{attr_name}", capture_graph=True
+        )
+        workspaces[attr_name] = tensor  # Capture readiness probes use this same registry.
+        return tensor
     tensor = workspaces.get(attr_name)
     needs_alloc = (
         tensor is None
@@ -255,25 +268,3 @@ def _ensure_workspace_tensor(
 
     slices = tuple(slice(0, dim) for dim in shape)
     return tensor[slices]
-
-
-def _ensure_decode_scratch_tensor(
-    metadata: Any,
-    attr_name: str,
-    shape: tuple[int, ...],
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return decode scratch that every forward writes before it reads it.
-
-    CUDA graphs replay one at a time, so CUDA-graph metadata takes this scratch
-    from the graph runner's buffer pool, where all graphs reuse the block of the
-    largest graph instead of each keeping its own. Eager metadata keeps its own.
-    """
-    buffers = getattr(metadata, "cuda_graph_buffers", None)
-    if getattr(metadata, "is_cuda_graph", False) and buffers is not None:
-        return buffers.get_buffer(
-            list(shape), dtype, f"fp4_mla_decode{attr_name}", reserve_buffer=True
-        )
-    return _ensure_workspace_tensor(metadata, attr_name, shape, dtype=dtype, device=device)
