@@ -1588,6 +1588,42 @@ repos:
         entry: ./scripts/check_test_list.py --check-duplicate-waives
         language: script
         pass_filenames: false
+    -   id: test-db-check
+        name: Keep test-db entries on a live L0 stage
+        entry: ./scripts/check_l0_test_db.py
+        language: script
+        pass_filenames: false
+        files: >
+          (?x)^(
+            scripts/check_l0_test_db\.py|
+            jenkins/L0_Test\.groovy|
+            jenkins/scripts/cbts/cbts/blocks\.py|
+            tests/integration/test_lists/waives\.txt|
+            tests/integration/test_lists/test-db/.*\.ya?ml
+          )$
+    -   id: test-db-skip-check
+        name: Reject a new pytest.skip that would skip a selected test-db entry
+        entry: ./scripts/check_l0_test_db.py --skips
+        language: script
+        pass_filenames: false
+        files: >
+          (?x)^(
+            scripts/check_l0_test_db\.py|
+            tests/integration/test_lists/waives\.txt|
+            tests/.*\.py
+          )$
+    -   id: pre-post-merge-duplicate-check
+        name: Reject a new test listed on both pre-merge and post-merge for the same mako
+        entry: ./scripts/check_l0_test_db.py --pre-post-duplicates
+        language: script
+        pass_filenames: false
+        files: >
+          (?x)^(
+            scripts/check_l0_test_db\.py|
+            jenkins/L0_Test\.groovy|
+            jenkins/scripts/cbts/cbts/blocks\.py|
+            tests/integration/test_lists/test-db/.*\.ya?ml
+          )$
     -   id: validate-test-lists
         name: Validate test list entries exist in source files (AST)
         entry: ./scripts/check_test_list.py --validate
