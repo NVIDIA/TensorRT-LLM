@@ -1573,36 +1573,16 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             _pool.check_replay_history(g, i, history, ssm0.shape[0], *old[i][:3])
         replay = _Replay(old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width)
         if ssm0.dtype == torch.bfloat16 and ssm0.is_cuda:
-            # The CuTe replay kernels of the default mapping a verify step launches, compiled
-            # here: a compile costs 5-10 s, and the padded decode graphs skip the request counts
-            # an eager mixed step carries. PDL up to `_GDN_REPLAY_PDL_MAX_HEAD_ROWS`
-            # (request x value head) pairs.
-            heads = (width, self.num_k_heads, self.num_v_heads)
-            partition_from = CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-            requests = md.max_num_requests
-            if heads[1:] == _GDN_REPLAY_HT_GEOMETRY:
-                requests = min(requests, _GDN_REPLAY_HT_MIN_REQUESTS - 1)
-            pdl_requests = min(requests, _GDN_REPLAY_PDL_MAX_HEAD_ROWS // self.num_v_heads)
-            if get_env_enable_pdl() and pdl_requests > 0:
-                gdn_replay_precompile(*heads, pdl_requests, pdl=True, partition_from=partition_from)
-            gdn_replay_precompile(*heads, requests, pdl=False, partition_from=partition_from)
-            if (
-                heads[1:] == _GDN_REPLAY_HT_GEOMETRY
-                and md.max_num_requests >= _GDN_REPLAY_HT_MIN_REQUESTS
-            ):
-                # A tp2/tep2 HT batch takes its own mapping and conv fold (`_gdn_replay_launch`,
-                # `_gdn_verify_folds_conv`). The decode warmup compiles its kernels with the norm
-                # folded (`_gdn_verify_folds_norm`); a mixed step's verify rows
-                # (`PrefillTarget._gdn_core`) launch them without, compiled here.
-                gdn_replay_precompile(
-                    *heads,
-                    md.max_num_requests,
-                    pdl=False,
-                    partition_from=partition_from,
-                    min_requests=_GDN_REPLAY_HT_MIN_REQUESTS,
-                    launch=lambda n: _gdn_replay_launch(self, n),
-                    conv_fold=lambda n: _gdn_verify_folds_conv(self, n),
-                )
+            # Every CuTe replay kernel a verify step launches, compiled here: a compile costs
+            # 5-10 s, the padded decode graphs skip the request counts an eager step carries,
+            # and the generic warmup skips this cache manager.
+            gdn_replay_precompile(
+                width,
+                self.num_k_heads,
+                self.num_v_heads,
+                md.max_num_requests,
+                **_gdn_replay_launches(self, width),
+            )
         return dict(int_idx=int_idx, int_conv=int_conv, replay=replay)
 
     def _bind_draft_cache_manager(self, md) -> None:
@@ -2132,6 +2112,19 @@ def _gdn_replay_launch(core, n: int) -> tuple:
             if n <= bound:
                 return pdl, mapping
     return get_env_enable_pdl() and n * core.num_v_heads <= _GDN_REPLAY_PDL_MAX_HEAD_ROWS, None
+
+
+def _gdn_replay_launches(core, width: int) -> dict:
+    """The launch rules `gdn_replay_precompile` takes: those `_gdn_verify` and its callers apply
+    to a verify step of `width` rows a request (`_gdn_replay_launch`, `_gdn_verify_folds_conv`,
+    `_gdn_verify_folds_norm`)."""
+    return dict(
+        partition_from=CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+        launch=lambda n: _gdn_replay_launch(core, n),
+        conv_fold=lambda n: _gdn_verify_folds_conv(core, n),
+        fold_norm=lambda n: _gdn_verify_folds_norm(core, n, width),
+        norm_eps=float(core.eps),
+    )
 
 
 def _draft_positions(position_ids: torch.Tensor) -> tuple:
