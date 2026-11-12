@@ -2460,6 +2460,49 @@ def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
     assert trace == [("wait", "plan")]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device to capture a graph")
+def test_megamoe_staging_cuda_graph_replay_resets_rows_an_eager_launch_wrote():
+    """Staging captured in a CUDA graph at 2 tokens, an eager launch of 6 tokens into the
+    same bucket, then a replay of the graph: the kernel routes every row whose expert id
+    is valid, so the replay must leave -1 in every row past its 2 tokens."""
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    max_tokens, top_k, device = 8, 4, torch.device("cuda")
+    idx_dtype = moe._topk_idx_dtype
+    bufs = SimpleNamespace(
+        activation=torch.zeros(max_tokens, 16, dtype=torch.uint8, device=device),
+        activation_sf=torch.zeros(max_tokens, 4, dtype=torch.uint8, device=device),
+        topk_weights=torch.zeros(max_tokens, top_k, dtype=torch.float32, device=device),
+        topk_idx_local=torch.full((max_tokens, top_k), -1, dtype=idx_dtype, device=device),
+    )
+
+    def launch(num_tokens: int, expert: int):
+        # Inputs live outside the capture, like a graph's static input buffers.
+        inputs = dict(
+            x=torch.ones(num_tokens, 16, dtype=torch.uint8, device=device),
+            x_sf=torch.ones(num_tokens, 4, dtype=torch.uint8, device=device),
+            topk_idx=torch.full((num_tokens, top_k), expert, dtype=idx_dtype, device=device),
+            topk_weights=torch.full((num_tokens, top_k), 0.25, dtype=torch.float32, device=device),
+        )
+        return lambda: moe._stage_inputs(
+            bufs=bufs, **inputs, num_tokens=num_tokens, top_k=top_k, stage_activation=True
+        )
+
+    decode, mixed = launch(2, expert=1), launch(6, expert=7)
+    # Warm up at the captured size, as a graph runner does before it captures.
+    decode()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode()
+    mixed()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    routes = bufs.topk_idx_local.cpu()
+    assert torch.equal(routes[:2], torch.full((2, top_k), 1, dtype=idx_dtype))
+    assert torch.equal(routes[2:], torch.full((6, top_k), -1, dtype=idx_dtype)), routes.tolist()
+    assert not bufs.topk_weights[2:].any()
+
+
 @pytest.mark.cpu_only
 def test_megamoe_run_moe_hands_routes_to_staging_unconverted():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
@@ -2529,6 +2572,10 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
         calls.append(("sm_budget", sf_vec_size, sf_use_ue8m0, is_sf_swizzled, reserved_sms))
         return outputs(x)
 
+    def into(x, scale, out, out_sf, is_sf_swizzled, reserved_sms):
+        calls.append(("into", is_sf_swizzled, reserved_sms))
+
+    fp4_quantize.into = into
     if has_sm_budget:
         fp4_quantize.sm_budget = sm_budget
     monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fp4_quantize, raising=False)
@@ -2537,14 +2584,22 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     moe.fc31_input_scale = torch.ones(1)
+    moe._active_launch_max_tokens = None  # a forward that run_moe does not stage
     x = torch.zeros(3, 64, dtype=torch.bfloat16)
 
+    moe.quantize_input(x)
+    moe.quantize_input(x, reserved_sms=4)
+    # A forward that run_moe stages quantizes into the staging, with the same reservation.
+    staging = SimpleNamespace(
+        activation=outputs(x)[0], activation_sf=torch.zeros(3, 4, dtype=torch.uint8)
+    )
+    moe._staging_of_next_run = lambda rows, device: staging
     moe.quantize_input(x)
     moe.quantize_input(x, reserved_sms=4)
 
     default = ("default", 16, False, False)
     budget = ("sm_budget", 16, False, False, 4) if has_sm_budget else default
-    assert calls == [default, budget]
+    assert calls == [default, budget, ("into", False, 0), ("into", False, 4)]
 
 
 @pytest.mark.cpu_only
@@ -3928,6 +3983,7 @@ def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
     backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
     torch.nn.Module.__init__(backend)
     backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    backend._active_launch_max_tokens = None  # a forward that run_moe does not stage
     # Weight creation registers the slot as None, and only a checkpoint that
     # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
     backend.register_parameter("fc31_act_scale", None)

@@ -205,7 +205,9 @@ A model that runs other work on a side stream while the routed experts run (e.g.
 
 ```text
 [EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
-  → backend.quantize_input → backend.run_moe (fused dispatch+GEMM+act+GEMM+combine)
+  → backend.set_adaptive_launch_tokens(max(all_rank_num_tokens))
+  → backend.quantize_input (may quantize into that bucket's staging)
+  → backend.run_moe (fused dispatch+GEMM+act+GEMM+combine)
   → [EPLB start_set_cpu + done_set_cpu]
 ```
 

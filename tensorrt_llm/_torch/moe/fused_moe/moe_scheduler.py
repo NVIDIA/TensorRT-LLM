@@ -1639,6 +1639,14 @@ class FusedCommMoEScheduler(MoEScheduler):
             token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             replica_plan = None
 
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier. Set before the
+        # input quantization, which may write into that bucket's staging.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+
         # ----- quantize / prepare -----
         if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
             # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
@@ -1657,13 +1665,6 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe_input, x_sf = moe.backend.quantize_input(
                 x_chunk_real, reserved_sms=replica_plan.reserved_sms
             )
-
-        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
-        # one adaptive bucket on every EP rank; using a local token count could
-        # diverge and deadlock its in-kernel NVLink barrier.
-        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
-        if set_adaptive is not None:
-            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- MoE compute -----
         # The fused kernel waits for the other ranks inside the kernel, so it
