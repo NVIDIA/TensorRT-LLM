@@ -3282,7 +3282,8 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_one_wave_split(
         backend="cutedsl",
         fused_v_transpose=False,
         num_heads=num_heads,
-        seq_lens=[131 + 7 * i for i in range(num_requests)],
+        # non-uniform KV from the floor of the one-wave split
+        seq_lens=[fp4_mla_dispatch.FLOOR_KV_ONE_WAVE_SPLIT + 7 * i for i in range(num_requests)],
         seed=45,
         query_len_per_seq=query_len_per_seq,
         packed_queries=True,

@@ -73,9 +73,10 @@ wave more than the 2x kernel, and the plain 4x path pays for that wave at short 
 replays): two waves against one are 34-51 % slower up to KV 2K, 23-30 % at 4K, 7-12 % at 8K and level at 12K; three
 against two 14-27 % slower up to 2K, 5-12 % at 4K, 0-7 % at 6K and level from 7K (requests of a single pair task
 cross earlier: level at 6K and at 5K).  Under ``extra_wave_floor_kv`` such a call is therefore taken only by a
-two-stream split that drops the extra wave: the one-wave split of ``fp4_mla_twostream.one_wave_split`` at every KV
-where the host launches its 4x wave FULL (the call is then one wave of the machine, and one wave has no floor), else
-the planner's split from the graded floor, else 2x.
+two-stream split that drops the extra wave: the one-wave split of ``fp4_mla_twostream.one_wave_split`` where the
+host launches its 4x wave FULL (the call is then one wave of the machine, which needs no graded floor, only the few
+hundred tokens of ``FLOOR_KV_ONE_WAVE_SPLIT`` under which the 2x kernel is still ahead), else the planner's split
+from the graded floor, else 2x.
 
 Above the floor the static 4x envelope (``fp4_mla_cutedsl_4x_host.envelope_reason_static``:
 small-batch rules, Helix / softmax-stats / packed-V requirements, split-mode bounds) decides whether the 4x kernel
@@ -140,6 +141,12 @@ FLOOR_KV_4X_MANY_WAVES = 8192
 # ``FLOOR_KV_4X_MANY_WAVES`` beyond.  Two waves against one: plain 4x ties both 2x and the one-wave split at 12K.
 # Three against two: it ties 2x at 7K, and before 6K when a request is a single pair task, which sets the floor.
 FLOOR_KV_4X_EXTRA_WAVE = ((1, 12288), (2, 6144))
+# KV floor (tokens) of the one-wave split; shorter steps keep the 2x kernel.  The 2x kernel's time steps up between
+# 512 and 768 tokens while the split's cost is flat there: measured against 2x (graph replays, eight first-window
+# batches of 128 heads q2 / q4 and 96 heads q8) the split is 20-29 % slower at 256 tokens, 5-15 % at 512 and
+# 16-28 % faster at 768.  The step lies under 640 tokens (the split is 15-28 % ahead there on three of the
+# batches), so this floor errs towards the 2x kernel.
+FLOOR_KV_ONE_WAVE_SPLIT = 768
 
 PATH_2X = "2x"
 PATH_4X = "4x"
@@ -275,8 +282,9 @@ def kv_regimes_for_batch(
     on the regime ceiling, and ``plan_two_stream`` drops the split at long KV where its gain fades below the gate:
     B48/q4 keeps r2 = 2 up to ~50K and runs plain 4x beyond, so a 160K page table gets a two-stream regime for the
     short steps), ``kv_regime_grid`` adds its points, and the capacity closes the list.  In an extra-wave window
-    (``extra_wave_floor_kv``) that floor ends a regime as well, and either floor does only where the decision
-    changes across it: the one-wave split runs under the graded floor, a planner split through the window floor.
+    (``extra_wave_floor_kv``) that floor and the floor of the one-wave split (``FLOOR_KV_ONE_WAVE_SPLIT``) end a
+    regime as well, and each of the three does only where the decision changes across it: the one-wave split runs
+    under the graded floor, a planner split through the window floor.
     ``envelope_reason`` as in ``choose_decode_strategy``.  A runner whose steps no regime can move keys its graphs
     by none and does not ask: Helix (only one-wave shapes leave ``2x``; their graded floor is 0 and they are in no
     extra-wave window; a flat ``TRTLLM_FP4_MLA_4X_MIN_KV`` is then compared with the capacity), a device where the
@@ -295,7 +303,11 @@ def kv_regimes_for_batch(
     if reason is not None:
         return (capacity,)
     floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
-    if floor <= 1 or capacity < floor:
+    # The extra-wave rule is the automatic choice's; in a window the one-wave split runs under the graded floor.
+    window_floor = (
+        extra_wave_floor_kv(num_requests, rows_per_seq, sm_count) if _env_path() == "auto" else 0
+    )
+    if floor <= 1 or (capacity < floor and not window_floor):
         return (capacity,)
     ceilings = {floor - 1}
     ceilings.update(ceiling for ceiling in kv_regime_grid() if floor < ceiling < capacity)
@@ -308,9 +320,8 @@ def kv_regimes_for_batch(
             sm_count=sm_count,
         )
     )
-    window_floor = extra_wave_floor_kv(num_requests, rows_per_seq, sm_count)
-    if window_floor and _env_path() == "auto":
-        # Extra-wave window: a floor's boundary stays only where the decision changes across it.
+    if window_floor:
+        # Extra-wave window: a boundary of its rule stays only where the decision changes across it.
         def decision(kv: int) -> tuple[str, int]:
             strategy = choose_decode_strategy(
                 num_requests=num_requests,
@@ -325,7 +336,7 @@ def kv_regimes_for_batch(
             )
             return strategy.path, strategy.r2
 
-        floors = {floor - 1, window_floor - 1}
+        floors = {floor - 1, window_floor - 1, FLOOR_KV_ONE_WAVE_SPLIT - 1}
         ordered = sorted(ceiling for ceiling in ceilings | floors if ceiling < capacity)
         ceilings = {
             ceiling
@@ -439,11 +450,11 @@ def choose_decode_strategy(
         )
     floor = four_x_floor_kv(num_requests, rows_per_seq, sm_count)
     # Extra-wave window: under its floor only a two-stream split that drops the extra wave takes the call, and the
-    # one-wave split does so at every KV, under the graded floor too.
+    # one-wave split does so from its own floor, under the graded floor too.
     window_floor = extra_wave_floor_kv(num_requests, rows_per_seq, sm_count)
     under_window_floor = forced == "auto" and kv_decision < window_floor
     plan = None
-    if under_window_floor:
+    if under_window_floor and kv_decision >= FLOOR_KV_ONE_WAVE_SPLIT:
         plan = one_wave_split(
             num_requests=num_requests,
             rows_per_request=rows_per_seq,
