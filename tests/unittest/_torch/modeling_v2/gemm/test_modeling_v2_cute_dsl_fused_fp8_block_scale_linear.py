@@ -10,7 +10,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fused_f
 )
 
 __extra_import_path__ = [".."]
-from _validating import assert_within_ulp  # noqa: E402
+from _validating import assert_within_ulp, certifying  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
@@ -124,10 +124,13 @@ def test_fused_opposite_scale_exponents():
     assert_within_ulp(actual, expected, element_ulp=4, rms_ulp=2)
 
 
-@pytest.mark.parametrize("n,k", ((1024, 6144), (1536, 6144), (6144, 768), (6144, 1024)))
-@pytest.mark.parametrize("seed", (11, 23, 47))
-def test_fused_catalog_dispatch(n, k, seed):
-    x = _input(4, k, seed)
+@pytest.mark.parametrize("cell", op.CELLS, ids=[cell.why for cell in op.CELLS])
+@pytest.mark.parametrize("draw", range(3))
+def test_certified_cells(cell, draw, certifying) -> None:  # noqa: F811 — pytest fixture
+    certifying(op)
+    m, n, k = (cell.spec[name] for name in ("m", "n", "k"))
+    seed = cell.seed_base() + 2 * draw
+    x = _input(m, k, seed)
     weight, scale = _weights(n, k, seed + 1)
     actual = op(x, weight, scale)
     expected = op.reference(x, weight, scale)
