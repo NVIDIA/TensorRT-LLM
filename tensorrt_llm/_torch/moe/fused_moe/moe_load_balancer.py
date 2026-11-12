@@ -1148,9 +1148,11 @@ def maybe_create_moe_load_balancer(
             )
             logger.info(
                 "Created per-layer dynamic MoE LoadBalancer, num_slots=%s, "
-                "auxiliary_sms=%s...",
+                "auxiliary_sms=%s, planner=%s, helper_slot_mode=%s...",
                 config.num_slots,
                 getattr(config, "auxiliary_sms", 4),
+                getattr(config, "planner", "halo_q"),
+                getattr(config, "helper_slot_mode", "per_layer_resident"),
             )
         elif mode == "standard":
             if config.layer_updates_per_iter > 0:

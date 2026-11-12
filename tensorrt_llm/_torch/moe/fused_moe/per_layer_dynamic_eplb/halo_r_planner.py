@@ -207,8 +207,8 @@ class HaloRRelayEndpoint(LiveBankLease):
     shares its lease bookkeeping (``LiveBankLease``): a launch may overwrite
     the helper slots only after the bound reuse authority has proven, for the
     previous generation, that every rank's consumer precedes the next launch.
-    An exception in any native call aborts the handoff for good; the owner
-    then rebuilds the group.
+    An exception in any native call aborts the handoff for good: every later
+    call raises, and the endpoint cannot launch again.
     """
 
     def __init__(
@@ -564,9 +564,9 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
 
         Each rank maps every peer's helper chunks and builds its native
         context; either can fail on one rank only (VMM resources, for
-        example). The ranks exchange the outcome where HALO-Q's endpoint needs
-        no meeting point, so every rank raises the root cause instead of
-        waiting for a failed peer.
+        example). The ranks then exchange the outcome, so every rank raises
+        the root cause instead of waiting for a failed peer at its next
+        collective.
         """
 
         def bind() -> None:

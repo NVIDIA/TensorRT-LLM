@@ -23,8 +23,8 @@ class LiveBankLease:
     A launch may overwrite the helper slots only after the bound reuse
     authority has proven, for the previous generation, that every rank's
     consumer precedes the next launch. HALO-Q's and HALO-R's copy endpoints
-    share this bookkeeping. An endpoint holds ``_lock``, ``_handoff_aborted``
-    and ``_generation``, calls ``_init_lease`` from its constructor and
+    share this bookkeeping. An endpoint holds ``_lock`` and
+    ``_handoff_aborted``, calls ``_init_lease`` from its constructor and
     provides:
 
     - ``_require_bindable()``: raise unless an authority may still bind;
@@ -33,8 +33,15 @@ class LiveBankLease:
       authority's copy module is this endpoint (or its backend);
     - ``_wait_for_consumer(handle)``: order the copy stream after the event.
 
-    A failed consumer wait aborts the handoff for good: the owner rebuilds
-    the group.
+    Its ``submit_fused`` must, under ``_lock``, call
+    ``_require_operational()`` and ``_require_live_bank_reusable()`` before
+    it launches, set ``_active_generation`` to the launched generation after
+    the launch succeeds and set ``_handoff_aborted`` if the launch raises;
+    ``release_generation_after`` and ``mark_collective_reuse_safe`` accept
+    only that generation.
+
+    A failed consumer wait aborts the handoff for good: every later call
+    raises, and the endpoint cannot launch again.
     """
 
     live_bank_count = 1

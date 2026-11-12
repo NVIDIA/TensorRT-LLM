@@ -945,7 +945,9 @@ set wrong has a test that catches it:
   `SharedSlotArenaProvider`): the relay writes peers' helper rows through
   `peer_helper_bases`, and the provider returns the layer's base
   `LiveWeightArena`, whose helper planes have `mc_view=None` and no HALO
-  levels. Only the READY record pages keep their multicast objects. Contract tests in
+  levels. Only the record pages keep their multicast objects: they hold the
+  READY cells and the small fp32 scale planes, whose views keep their
+  `mc_view`. Contract tests in
   `test_halo_r_contracts.py` pin the attributes HALO-R sets for HALO-Q's
   methods and the methods it overrides. Each CTA checks every status word and
   then raises the route counter; a failure traps before that, so MegaMoE never

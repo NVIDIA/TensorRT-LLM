@@ -116,7 +116,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self.finish_replica_plan()
 
     # The other hooks of the standard EPLB layer interface are intentionally
-    # empty: HALO-Q produces the routing and statistics on the GPU, and no CPU
+    # empty: the planner produces the routing and statistics on the GPU, and no CPU
     # stage migrates weights.
     def start_wait_gpu_stage(self) -> None:
         pass

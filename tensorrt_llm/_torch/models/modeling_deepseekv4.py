@@ -1985,7 +1985,7 @@ class DeepseekV4MoE(nn.Module):
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
         # With per-layer dynamic EPLB, the route runs the shared experts after
-        # MAIN has enqueued both HALO-Q and the TMA copy on the high-priority
+        # MAIN has enqueued the replica planner and its copy on the high-priority
         # copy stream, so they overlap planning and the helper-weight copy.
         # Every rank installs the same function.
         if (

@@ -564,7 +564,7 @@ class _SharedSlotPool:
     ``per_layer_sets`` the pool adds one set per layer as the layers are built,
     so only a layer's own copies write its helper rows; otherwise every layer
     shares two sets. No extra synchronization guards reuse of a shared set:
-    layer ``i``'s copy follows HALO-Q's all-rank exchange, which every rank
+    layer ``i``'s copy follows its planner's all-rank exchange, which every rank
     enters only after MAIN finished the previous layers' MegaMoE.
 
     READY terminals stay per layer because one forward shares its generation

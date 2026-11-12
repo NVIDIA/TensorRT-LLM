@@ -45,10 +45,10 @@ __all__ = [
 
 
 class SchedulerSpinBound:
-    """Bound of the HALO-Q scheduler's cross-rank waits, chosen per launch.
+    """Bound of the planner kernel's cross-rank waits, chosen per launch.
 
-    HALO-Q exchanges route counts with every EP rank inside the kernel and
-    traps once a peer is later than this bound. During warmup, one-time JIT
+    HALO-Q and HALO-R exchange route counts with every EP rank inside the
+    kernel and trap once a peer is later than this bound. During warmup, one-time JIT
     compilation and autotuning can delay a healthy rank by minutes. As a MoE
     communication timeout proxy, the bound follows every warmup transition:
     warmup gets the warmup timeout, and serving the serving timeout or the
@@ -91,7 +91,7 @@ class _LiveBankLeaseProvider:
     """Authorize ordered reuse, not a claim of completed GPU work on the host.
 
     release_generation_after() registers the local consumer; the next fused
-    HALO-Q + TMA launch orders COPY after it on MAIN. prove() is legal right
+    launch (the planner and its copy) orders COPY after it on MAIN. prove() is legal right
     before that launch. The launch's bounded all-rank count exchange precedes its plan,
     and its copy follows the plan in the same CTAs. Therefore a delayed peer
     consumer blocks every rank's overwrite without a host-side barrier.
@@ -214,8 +214,8 @@ class RebalanceSlotSchedulerGroup:
 
         logical_expert_count = self.home_experts * ep_size
 
-        # Use the EP rank, not the CUDA ordinal. HALO-Q and the TMA copy run in
-        # the same CTAs, one per auxiliary SM.
+        # Use the EP rank, not the CUDA ordinal. The planner and its copy run
+        # in the same CTAs, one per auxiliary SM.
         cfg = CudaSchedulerConfig(
             ep_size=ep_size,
             logical_expert_count=logical_expert_count,
@@ -257,7 +257,7 @@ class RebalanceSlotSchedulerGroup:
         self._route_target = 0
 
         # Every peer address must be connected before the first fused launch;
-        # HALO-Q performs an all-rank exchange on the COPY stream.
+        # the planner kernel performs an all-rank exchange on the COPY stream.
         self.symmetric = FabricSymmetricBuffer(
             4 * symmetric_buffer_ints(ep_size, logical_expert_count), self.device
         )
@@ -277,12 +277,12 @@ class RebalanceSlotSchedulerGroup:
         # connect_peer_bases() synchronized this device, so its zeroed exchange
         # buffer and peer mappings are complete. The barrier extends that to every
         # rank before any rank binds its copy and can launch the fused kernel,
-        # whose HALO-Q exchange writes into its peers' buffers.
+        # whose count exchange writes into its peers' buffers.
         ep_comm.barrier()
 
         self._bind_copy_endpoint(arena=arena, helper_residency=bool(helper_residency))
 
-        # The previous consumer precedes the next HALO-Q EP rendezvous.
+        # The previous consumer precedes the next launch's EP rendezvous.
         self.lease = _LiveBankLeaseProvider(self)
         self.broadcaster.bind_generation_reuse_authority(self.lease)
 
@@ -400,8 +400,8 @@ class RebalanceSlotSchedulerGroup:
         """Submit contiguous CUDA int32 routes [tokens, topk] without staging.
 
         The route producer must allocate and write this tensor on MAIN and must
-        not overwrite it until HALO-Q finishes. The group holds the tensor until
-        wait_for_routes() orders MAIN after the route epoch. Every HALO-Q CTA
+        not overwrite it until the planner finishes. The group holds the tensor
+        until wait_for_routes() orders MAIN after the route epoch. Every CTA
         reads its routes before it raises that epoch, so the caching allocator
         can only reuse the block for MAIN work queued after that wait. This needs
         no COPY-stream allocator event, which every later allocation would poll
@@ -481,7 +481,7 @@ class RebalanceSlotSchedulerGroup:
         return physical, self._generation
 
     def wait_for_routes(self) -> None:
-        """Order the first MAIN route read after HALO-Q, without a host wait.
+        """Order the first MAIN route read after the planner, without a host wait.
 
         The first call of a generation checks the owner and queues the stream
         wait. Later calls of that generation return at once: their consumers
@@ -495,7 +495,7 @@ class RebalanceSlotSchedulerGroup:
             raise RuntimeError("No scheduler generation is available")
         self._wait_route_epoch(self._execution_stream_handle)
         self._route_wait_generation = generation
-        # MAIN work queued from here on runs after every HALO-Q read of the routes.
+        # MAIN work queued from here on runs after every planner read of the routes.
         self._routes_in_flight = None
 
     def plan(
