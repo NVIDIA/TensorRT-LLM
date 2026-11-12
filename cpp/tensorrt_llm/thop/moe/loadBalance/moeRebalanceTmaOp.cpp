@@ -45,13 +45,7 @@ void checkTmaResult(int error, char const* operation)
 }
 
 using moeRebalanceOp::checkCudaResult;
-
-int checkedInt(int64_t value, char const* name)
-{
-    TORCH_CHECK(value >= std::numeric_limits<int>::min() && value <= std::numeric_limits<int>::max(), name,
-        " is outside the int32 range");
-    return static_cast<int>(value);
-}
+using moeRebalanceOp::checkedInt;
 
 uint64_t checkedUnsigned(int64_t value, char const* name)
 {

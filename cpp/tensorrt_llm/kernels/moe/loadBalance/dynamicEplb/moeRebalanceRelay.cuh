@@ -65,7 +65,7 @@ struct RelayWork
     int broadcast[haloR::kMaxHaloRBroadcasts];
     unsigned need[haloR::kMaxHaloRBroadcasts];        //!< The broadcast's need set N_b, the receivers it stores into.
     int prefix[haloR::kMaxHaloRBroadcasts + 1];
-    int destinationCount[haloR::kMaxHaloRBroadcasts]; //!< |need[b]|, the receivers that split the broadcast.
+    int destinationCount[haloR::kMaxHaloRBroadcasts]; //!< |need[entry]|, how many receivers split the broadcast.
     int index[haloR::kMaxHaloRBroadcasts];
     long long slices;
     unsigned long long planeBytes[haloR::kRelayMaxPlanes];
@@ -91,25 +91,8 @@ __device__ __forceinline__ void relayLoad(
 
 __device__ __forceinline__ void relayAwait(RelaySlotControl* slot)
 {
-    // A volatile wait: cudaAsyncOps.cuh's mbarrier_try_wait_parity is not volatile, so the compiler could hoist it
-    // out of this spin loop.
-    unsigned const barrier = __as_ptr_smem(&slot->barrier);
     unsigned const phase = slot->phase;
-    unsigned ready = 0;
-    do
-    {
-        asm volatile(
-            "{ .reg .pred p; "
-            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; "
-            "selp.u32 %0, 1, 0, p; }"
-            : "=r"(ready)
-            : "r"(barrier), "r"(phase)
-            : "memory");
-        if (!ready)
-        {
-            __nanosleep(kRelayAwaitBackoffNs);
-        }
-    } while (!ready);
+    mbarrierWaitParityVolatile(&slot->barrier, phase, kRelayAwaitBackoffNs);
     slot->phase = phase ^ 1U;
 }
 

@@ -28,6 +28,7 @@
  * The copy runs as the second phase of one kernel whose first phase is the
  * HALO-Q scheduler that produces its plan.
  */
+#include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceCompletion.cuh"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceFusedLaunch.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h"
@@ -120,21 +121,9 @@ __device__ __forceinline__ void load_fragment(unsigned char* buffer, SlotControl
 
 __device__ __forceinline__ void await_slice(SlotControl* slot)
 {
-    unsigned ready;
-    unsigned bar = shared_address(&slot->barrier);
     unsigned phase = slot->phase;
-    do
-    {
-        asm volatile(
-            "{ .reg .pred p; "
-            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; "
-            "selp.u32 %0, 1, 0, p; }"
-            : "=r"(ready)
-            : "r"(bar), "r"(phase)
-            : "memory");
-        if (!ready)
-            __nanosleep(32);
-    } while (!ready);
+    // The helper takes a uint64_t*, which is unsigned long*; the barrier is an unsigned long long of the same width.
+    tensorrt_llm::kernels::mbarrierWaitParityVolatile(reinterpret_cast<uint64_t*>(&slot->barrier), phase, 32);
     // Only a slot that actually issued and completed TMA advances its phase.
     slot->phase = phase ^ 1U;
 }

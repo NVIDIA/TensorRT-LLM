@@ -108,6 +108,31 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx_no_state(uint64_t* add
 #endif
 }
 
+// Spins until the mbarrier completes the phase of parity `phaseParity`, with acquire semantics at CTA scope, sleeping
+// `backoffNs` between polls. Unlike mbarrier_try_wait_parity, the wait is volatile, so the compiler cannot hoist it out
+// of the loop.
+__device__ __forceinline__ void mbarrierWaitParityVolatile(uint64_t* addr, uint32_t phaseParity, uint32_t backoffNs)
+{
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
+    uint32_t const barrier = __as_ptr_smem(addr);
+    uint32_t ready = 0;
+    do
+    {
+        asm volatile(
+            "{ .reg .pred p; "
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; "
+            "selp.u32 %0, 1, 0, p; }"
+            : "=r"(ready)
+            : "r"(barrier), "r"(phaseParity)
+            : "memory");
+        if (!ready)
+        {
+            __nanosleep(backoffNs);
+        }
+    } while (!ready);
+#endif
+}
+
 __device__ __forceinline__ bool mbarrier_try_wait_parity(uint64_t* addr, uint32_t const& phaseParity)
 {
 #if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
