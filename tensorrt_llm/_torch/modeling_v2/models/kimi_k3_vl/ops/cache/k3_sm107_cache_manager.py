@@ -10,6 +10,9 @@ the subclasses here as ``RuntimeHooks.kv_cache_manager_cls``, and the engine bui
 * :class:`KimiK3Sm107CacheManager` (dep16, helix8): mid-chunk snapshots off, which leaves every step
   as the engine's ``KimiK3HybridCacheManager`` runs it.
 
+Both keep the KDA replay buffers of speculative decoding in the recurrent-state slot, which the
+SM107 KDA kernels address them by, instead of the engine's replay region.
+
 The KV cache managers are runtime interfaces, not Modeling V1 model code (``modeling_v2/README.md``,
 "Modeling V1 code"), so the family subclasses the engine's class rather than reimplementing it. The
 switch is a class constant of the declared class; nothing here reads the environment.
@@ -34,7 +37,10 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KDAReplayState,
+    KimiK3HybridCacheManager,
+)
 from tensorrt_llm.logger import logger
 
 from ...common.kda_metadata import KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT
@@ -54,11 +60,28 @@ class _KDAMidchunkSnapshot(NamedTuple):
     slot: int | None
 
 
+class _StateSlotKDAReplayState(KDAReplayState):
+    """``KDAReplayState`` whose replay buffers live in the recurrent-state slot.
+
+    The SM107 KDA kernels (the fused verify, the replay conv-window commit) address the replay
+    caches and the accepted-draft counts by the recurrent-state slot, so the manager declares the
+    replay buffers with the recurrent state rather than as a replay region of their own.
+    """
+
+    @property
+    @override
+    def replay_shares_state_slot(self) -> bool:
+        return True
+
+
 class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
     """``KimiK3HybridCacheManager`` with KDA mid-chunk snapshots (see the module).
 
     Mid-chunk snapshots are on when the class's ``KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT`` is positive, block
     reuse is on and the manager is not a draft model's; this class keeps them off.
+
+    The KDA replay buffers of speculative decoding share the recurrent-state slot
+    (:class:`_StateSlotKDAReplayState`), and the KV cache size estimate counts them per state slot.
     """
 
     # Step alignment, in tokens, at which the model's KDA prefill stores a snapshot inside a context
@@ -76,6 +99,33 @@ class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
         self._kda_midchunk_snapshots_skipped_total = 0
         super().__init__(*args, **kwargs)
         self._kda_midchunk_snapshot_alignment = self._get_kda_midchunk_snapshot_alignment()
+
+    @override
+    def _initialize_spec_state(self):
+        state = super()._initialize_spec_state()
+        if not isinstance(state, KDAReplayState) or state.replay_shares_state_slot:
+            return state
+        self._kda_replay = _StateSlotKDAReplayState(
+            state.num_speculative_tokens,
+            stochastic_rounding=self._mamba_ssm_stochastic_rounding,
+            draft_records=state.draft_records,
+        )
+        self._kda_replay.validate(self._state_layout)
+        return self._kda_replay
+
+    @classmethod
+    @override
+    def _extra_state_bytes_per_rank(cls, model_config, mapping, **kwargs) -> int:
+        # Every recurrent-state slot holds the replay buffers besides the seeds.
+        return KDAReplayState.estimate_seed_bytes_per_slot(
+            model_config, mapping, **kwargs
+        ) + KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
+
+    @classmethod
+    @override
+    def _estimate_fixed_region_bytes(cls, model_config, mapping, **kwargs) -> int:
+        # No replay region: the replay buffers are counted per recurrent-state slot.
+        return 0
 
     def _get_kda_midchunk_snapshot_alignment(self) -> int | None:
         """Step alignment of mid-chunk snapshot points, or None when they are off.
