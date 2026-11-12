@@ -34,6 +34,8 @@ _CANDIDATE_CAPACITY = 4096
 # thread, so its cost doubles just above 512 candidates; 512 is the measured
 # break-even against the refine path.
 _REFINE_CUTOFF = 512
+# The refine's two 9-bit column digits separate tied columns below this.
+MAX_COLUMNS = 1 << 18
 
 
 def _make_prefill_histogram_topk_class():
@@ -57,8 +59,8 @@ def _make_prefill_histogram_topk_class():
           **dynamic** loop of 9-bit radix rounds (512 bins = one block scan of
           the 512 threads) resolves the exact remaining set: value digits
           (bits 23..31, 14..22, 5..13, 0..4 of the ordered fp32 key) then column
-          digits (bits 6..14, 0..5). One round is ~8 shared-memory loads + <= 8 warp-aggregated
-          SMEM atomics + one block scan + <= 8 appends per thread;
+          digits (bits 9..17, 0..8: columns below ``MAX_COLUMNS``). One round is ~8
+          shared-memory loads + <= 8 warp-aggregated SMEM atomics + one block scan + <= 8 appends per thread;
         * threshold bin > 4096 (more than the list holds): the fp32 row passes
           of the original schedule (steps 1..3), with the threshold computed for ``top_k - found``
           so the set stays exact, then the list; > 4096 bit-identical scores at
@@ -168,7 +170,9 @@ def _make_prefill_histogram_topk_class():
             """(use_column, shift, mask) of 9-bit refine digit ``digit`` (uniform).
 
             0..3: ordered value bits 23..31, 14..22, 5..13, 0..4;
-            4..5: column bits 6..14, 0..5 (columns < 32768).
+            4..5: column bits 9..17, 0..8 (columns < ``MAX_COLUMNS`` = 2**18; the
+            original 6..14, 0..5 split ignored column bits 15+, so two tied columns
+            32768 apart were never separated).
             """
 
             shift = cutlass.Int32(0)
@@ -183,11 +187,11 @@ def _make_prefill_histogram_topk_class():
                 shift = cutlass.Int32(5)
                 mask = cutlass.Uint32(0x1FF)
             elif digit == cutlass.Int32(4):
-                shift = cutlass.Int32(6)
+                shift = cutlass.Int32(9)
                 mask = cutlass.Uint32(0x1FF)
             elif digit == cutlass.Int32(5):
                 shift = cutlass.Int32(0)
-                mask = cutlass.Uint32(0x3F)
+                mask = cutlass.Uint32(0x1FF)
             use_column = digit >= cutlass.Int32(4)
             return use_column, shift, mask
 

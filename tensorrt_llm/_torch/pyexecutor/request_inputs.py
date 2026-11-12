@@ -41,6 +41,7 @@ class PythonRequestInputs:
     conversation_params: ConversationParams | None = None
     uncached_prefill_tokens: int | None = None
     kv_hints: KvHintsSnapshot | None = None
+    watermarking: bool | None = None
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":
@@ -70,6 +71,7 @@ class PythonRequestInputs:
             conversation_params=getattr(request, "py_conversation_params", None),
             uncached_prefill_tokens=getattr(request, "py_uncached_prefill_tokens", None),
             kv_hints=getattr(request, "py_kv_hints", None),
+            watermarking=getattr(request, "py_watermarking", None),
         )
 
 
