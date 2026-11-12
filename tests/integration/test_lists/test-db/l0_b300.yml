@@ -49,7 +49,7 @@ l0_b300:
   #   (l0_cpu). GB300 (l0_gb300_multi_gpus, post_merge) also runs the GPU cases; it is
   #   the only Blackwell stage that does.
   # - The other files ignored here have their own entries below.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic --ignore=unittest/_torch/attention/sparse/csa2 TIMEOUT (90)
   # Run cold-JIT MSA coverage separately from the attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
@@ -58,6 +58,8 @@ l0_b300:
   - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  # CSA2 (DeepSeek-V4.1 sparse attention) keeps the aggregate above inside its 90-minute budget.
+  - unittest/_torch/attention/sparse/csa2
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/modeling/test_qwen4_exp_support.py
   - unittest/_torch/moe/kernels/parallel
