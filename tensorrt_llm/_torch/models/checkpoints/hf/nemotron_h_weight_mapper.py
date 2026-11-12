@@ -11,10 +11,11 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "NemotronHPuzzleForCausalLM")
-@register_mapper("HF", "NemotronHForCausalLM")
+@register_mapper(CheckpointFormat.HF, "NemotronHPuzzleForCausalLM")
+@register_mapper(CheckpointFormat.HF, "NemotronHForCausalLM")
 class NemotronHHfWeightMapper(HfWeightMapper):
 
     @staticmethod

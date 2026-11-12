@@ -282,6 +282,9 @@ class GDNReplayState:
         self.use_flashinfer_ring = use_flashinfer_ring
         self.replay_step_width = tokens_per_gen_step
         self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
+        # Whether the GDN layers verify drafts with the fused kernels, which commit
+        # in-layer at every batch size (the manager's gdn_fused_verify).
+        self.fused_verify = False
         self.prev_num_accepted_tokens: torch.Tensor | None = None
         self.cache_buf_idx: torch.Tensor | None = None
         self.old_x: torch.Tensor | None = None
@@ -294,6 +297,9 @@ class GDNReplayState:
         self.g_ring: torch.Tensor | None = None
         self._state_descriptors: torch.Tensor | None = None
         self._state_strides: tuple[int, int, int] | None = None
+        # Linear draft chains: the accepted position is the accepted token count
+        # minus one (see update).
+        self._linear_steps = True
 
     @property
     def intermediate_ssm(self) -> torch.Tensor | None:
@@ -322,6 +328,7 @@ class GDNReplayState:
         self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
         self._stacked_conv = _stack_state_views(conv_states)
+        self._linear_steps = not getattr(context.spec_config, "use_dynamic_tree", False)
         self._seed_rank_offset = (
             context.mapping.tp_rank * 1_000_003
             + context.mapping.pp_rank * 1_000_033
@@ -504,7 +511,12 @@ class GDNReplayState:
 
     def update(self, batch: MambaAcceptanceBatch) -> None:
         num_decodes = batch.num_generations
-        if not self.use_flashinfer_ring and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
+        # Same rule as MambaHybridCacheManager.gdn_replay_partitioned.
+        if (
+            not self.use_flashinfer_ring
+            and not self.fused_verify
+            and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+        ):
             self.commit_all_layers(batch.attention_metadata, num_decodes)
         metadata = self.get_replay_metadata()
         if metadata is None:
@@ -516,6 +528,9 @@ class GDNReplayState:
                 batch.destination_state_indices,
                 batch.is_dummy_request,
             )
+        if self._linear_steps and self._stacked_conv is not None:
+            self._promote_conv_states_and_advance_replay(batch, metadata)
+            return
         _advance_replay_state(
             metadata,
             batch.destination_state_indices,
@@ -524,6 +539,33 @@ class GDNReplayState:
         )
         _promote_intermediate_states(
             self._conv_states, self.intermediate_conv, batch, self._stacked_conv
+        )
+
+    def _promote_conv_states_and_advance_replay(
+        self, batch: MambaAcceptanceBatch, metadata: ReplayStateUpdateMetadata
+    ) -> None:
+        """Replay-path update after a linear speculative step, in one launch.
+
+        The cached replay keeps no intermediate SSM states, so only the
+        accepted convolution windows of all layers are promoted; the same
+        launch advances PNAT and the active history buffer (the arithmetic of
+        ``_advance_replay_state``).
+        """
+        from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
+
+        mamba_cache_manager._promote_mamba_state_triton(
+            self._stacked_conv,
+            self.intermediate_conv,
+            batch.source_state_indices,
+            batch.num_accepted_tokens,
+            batch.destination_state_indices,
+            num_accepted_tokens=batch.num_accepted_tokens,
+            position_source_is_token_count=True,
+            replay_pnat=metadata.prev_num_accepted_tokens,
+            replay_cache_buf_idx=metadata.cache_buf_idx,
+            dummy_request_mask=batch.is_dummy_request,
+            replay_step_width=metadata.replay_step_width,
+            replay_history_size=metadata.replay_history_size,
         )
 
     def commit_all_layers(self, attention_metadata: object, num_decodes: int) -> None:
@@ -699,8 +741,11 @@ def create_gdn_state(
         )
     if allow_flashinfer_ring and _use_flashinfer_ring_replay(manager, state is not None):
         logger.info("GDN replay kernel: FlashInfer ring buffer")
-        return GDNReplayState(manager.spec_config.tokens_per_gen_step, use_flashinfer_ring=True)
-    return state or GDNIntermediateState()
+        state = GDNReplayState(manager.spec_config.tokens_per_gen_step, use_flashinfer_ring=True)
+    if state is None:
+        return GDNIntermediateState()
+    state.fused_verify = manager.gdn_fused_verify
+    return state
 
 
 def validate_gdn_layout(
@@ -716,6 +761,10 @@ def validate_gdn_layout(
 
 class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     """Qwen3.5/Qwen3Next recurrent state with shared GDN replay."""
+
+    # The GDN mixer implements the in-forward snapshot split.
+    _supports_inforward_snapshot = True
+    _skips_steady_state_index_upload = True
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:

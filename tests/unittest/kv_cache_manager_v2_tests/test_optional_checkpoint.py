@@ -10,10 +10,48 @@ import torch
 
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
 ]
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_sparse_fetch_buffer_policy_overrides(split):
+    buffers = [
+        kv.BufferConfig(
+            role=role, size=4096, is_sparse=is_sparse, reuse_policy=kv.ReusePolicy.PRIVATE
+        )
+        for role, is_sparse in (("key", False), ("value", True))
+    ]
+    if split:
+        buffers.append(kv.BufferConfig(role="index", size=2048))
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+        layers=[
+            kv.AttentionLayerConfig(
+                layer_id=0,
+                buffers=buffers,
+                sparse_cache=kv.SparseCacheConfig(
+                    num_selected_blocks=2, max_cached_units=4, unit_tokens=4
+                ),
+            )
+        ],
+    )
+    if split:
+        with pytest.raises(RuntimeError, match="layer groups"):
+            kv.KVCacheManager(config)
+        return
+    manager = kv.KVCacheManager(config)
+    try:
+        assert manager.get_buffer_group_id(0, "key") == manager.get_buffer_group_id(0, "value")
+        assert manager.get_sparse_cache_max_units(0) == 4
+        assert manager.get_sparse_cache_units_per_page(0) == 1
+        assert manager.get_sparse_cache_buffer_count(0) == 1
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.parametrize("priority", [None, 80])
@@ -23,9 +61,7 @@ def test_reuse_status_and_optional_selection_bindings(priority):
             layer_id=i,
             buffers=[kv.BufferConfig(role="key", size=4096)],
             sliding_window_size=None if i == 0 else 4 if i == 1 else 2,
-            reuse_policy=kv.AttentionReusePolicy.OPTIONAL
-            if i
-            else kv.AttentionReusePolicy.REQUIRED,
+            reuse_policy=kv.ReusePolicy.OPTIONAL if i else kv.ReusePolicy.REQUIRED,
         )
         for i in range(3)
     ]
@@ -91,3 +127,399 @@ def test_reuse_status_and_optional_selection_bindings(priority):
         for cache in reversed(caches):
             cache.close()
         manager.shutdown()
+
+
+@pytest.mark.parametrize("length", [7, 8])
+@pytest.mark.parametrize("select_optional", [False, True])
+@pytest.mark.parametrize("split_layer", [False, True])
+def test_ssm_layer_reuse_policies(length, select_optional, split_layer):
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=[kv.BufferConfig(role="key", size=4096)]),
+        *[
+            kv.SsmLayerConfig(
+                layer_id=i,
+                buffers=[
+                    kv.BufferConfig(role="state", size=4096),
+                    kv.BufferConfig(role="conv", size=4096),
+                ],
+                reuse_policy=policy,
+            )
+            for i, policy in enumerate(
+                [kv.ReusePolicy.REQUIRED, kv.ReusePolicy.OPTIONAL, kv.ReusePolicy.PRIVATE],
+                start=1,
+            )
+        ],
+    ]
+    if split_layer:
+        layers = [
+            layers[0],
+            kv.SsmLayerConfig(
+                layer_id=1,
+                reuse_policy=kv.ReusePolicy.PRIVATE,
+                buffers=[
+                    kv.BufferConfig(role=role, size=4096, reuse_policy=policy)
+                    for role, policy in (
+                        ("state", kv.ReusePolicy.REQUIRED),
+                        ("checkpoint", kv.ReusePolicy.OPTIONAL),
+                        ("replay", None),
+                    )
+                ],
+            ),
+        ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=8 << 20)],
+        layers=layers,
+        commit_min_snapshot=True,
+    )
+    manager = kv.KVCacheManager(config)
+    stream = torch.cuda.Stream()
+    tokens = list(range(length))
+    caches = []
+    try:
+        source = manager.create_kv_cache(input_tokens=[])
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(length)
+        source.commit(tokens, is_end=True)
+        source.close()
+        required, optional, private = (
+            [manager.get_buffer_group_id(1, role) for role in ("state", "checkpoint", "replay")]
+            if split_layer
+            else [manager.get_layer_group_id(i) for i in (1, 2, 3)]
+        )
+        assert len({required, optional, private}) == 3
+        manager.get_and_reset_ssm_snapshot_iteration_stats()
+        reader = manager.create_kv_cache(input_tokens=tokens)
+        caches.append(reader)
+        assert reader.num_committed_tokens == length
+        assert reader.reuse_status[required].policy == kv.ReusePolicy.REQUIRED
+        assert reader.reuse_status[optional].complete
+        assert list(reader.reuse_status[optional].coverage) == [(length, length)]
+        assert not reader.reuse_status[private].complete
+        assert reader.resume(
+            stream.cuda_stream, optional_reuse_groups=[optional] if select_optional else []
+        )
+        reader.commit_pending_stats()
+        stats = manager.get_and_reset_ssm_snapshot_iteration_stats()
+        assert stats[required].iter_snapshot_hits == 1
+        if select_optional:
+            assert stats[optional].iter_snapshot_lookups == stats[optional].iter_snapshot_hits == 1
+        elif optional in stats:
+            assert stats[optional].iter_snapshot_lookups == 0
+            assert stats[optional].iter_snapshot_hits == stats[optional].iter_snapshot_misses == 0
+        indices = [
+            reader.get_ssm_block_base_index(group) for group in (required, optional, private)
+        ]
+        assert all(index >= 0 for index in indices)
+        reader.suspend()
+        assert reader.resume(stream.cuda_stream)
+        assert indices == [
+            reader.get_ssm_block_base_index(group) for group in (required, optional, private)
+        ]
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("length", [7, 8])
+def test_ssm_buffer_reuse_policies(length):
+    replay = kv.BufferConfig(role="old_x", size=2048, reuse_policy=kv.ReusePolicy.PRIVATE)
+    assert replay.reuse_policy == kv.ReusePolicy.PRIVATE
+    assert kv.BufferConfig(role="state", size=4096).reuse_policy is None
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=[kv.BufferConfig(role="key", size=4096)]),
+        *[
+            kv.SsmLayerConfig(
+                layer_id=i,
+                buffers=[
+                    kv.BufferConfig(role="state", size=4096),
+                    kv.BufferConfig(role="conv", size=4096),
+                    kv.BufferConfig(role="old_x", size=2048, reuse_policy=kv.ReusePolicy.PRIVATE),
+                ],
+            )
+            for i in (1, 2)
+        ],
+    ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=8 << 20)],
+        layers=layers,
+        commit_min_snapshot=True,
+    )
+    assert config.layers[1].buffers[2].reuse_policy == kv.ReusePolicy.PRIVATE
+    manager = kv.KVCacheManager(config)
+    stream = torch.cuda.Stream()
+    tokens = list(range(length))
+    caches = []
+    try:
+        required = manager.get_buffer_group_id(1, "state")
+        private = manager.get_buffer_group_id(layer_id=1, role="old_x")
+        assert required != private
+        assert manager.get_buffer_group_id(2, "conv") == required
+        assert manager.get_buffer_group_id(2, "old_x") == private
+        assert manager.get_layer_group_id(0) == manager.get_buffer_group_id(0, "key")
+        for layer_id in (1, 2):
+            with pytest.raises(RuntimeError, match="layer groups"):
+                manager.get_layer_group_id(layer_id)
+        assert manager.num_layers == 3
+        assert sorted(manager.layer_ids) == [0, 1, 2]
+        with pytest.raises(RuntimeError, match="layer groups"):
+            _ = manager.layer_grouping
+        for group in (required, private):
+            assert sorted({buffer.layer_id for buffer in manager.buffer_grouping[group]}) == [1, 2]
+        grouped = [
+            (buffer.layer_id, buffer.role) for group in manager.buffer_grouping for buffer in group
+        ]
+        assert len(grouped) == len(set(grouped)) == len(list(manager.all_buffer_ids))
+
+        source = manager.create_kv_cache(input_tokens=[])
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(length)
+        source.commit(tokens, is_end=True)
+        source.close()
+        reader = manager.create_kv_cache(input_tokens=tokens)
+        caches.append(reader)
+        assert reader.num_committed_tokens == length
+        assert reader.reuse_status[required].complete
+        assert not reader.reuse_status[private].complete
+        assert reader.resume(stream.cuda_stream)
+        indices = [reader.get_ssm_block_base_index(group) for group in (required, private)]
+        assert all(index >= 0 for index in indices)
+        reader.suspend()
+        assert reader.resume(stream.cuda_stream)
+        assert indices == [reader.get_ssm_block_base_index(group) for group in (required, private)]
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+def test_sink_required_claims_sinks_and_selects_window():
+    """SINK_REQUIRED_ONLY sinks constrain the match and are claimed with it; the window stays OPTIONAL."""
+    policy = kv.ReusePolicy.SINK_REQUIRED_ONLY
+    buffers = [kv.BufferConfig(role="key", size=4096)]
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=buffers),
+        # One sink block and a one-block window.
+        kv.AttentionLayerConfig(
+            layer_id=1,
+            buffers=buffers,
+            sliding_window_size=4,
+            num_sink_tokens=4,
+            reuse_policy=policy,
+        ),
+        # Two sink blocks, so a 6-token prefix ends inside the sinks.
+        kv.AttentionLayerConfig(
+            layer_id=2,
+            buffers=buffers,
+            sliding_window_size=4,
+            num_sink_tokens=8,
+            reuse_policy=policy,
+        ),
+    ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4, cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)], layers=layers
+    )
+    stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
+    caches = []
+    tokens = list(range(16))
+    try:
+        source = manager.create_kv_cache(None, [], expected_prompt_length=16)
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(16)
+        source.commit(tokens)
+        one_sink, two_sinks = (manager.get_layer_group_id(i) for i in (1, 2))
+        old = {group: source.get_base_page_indices(group).copy() for group in (one_sink, two_sinks)}
+        source.close()
+
+        # Window present: selecting it reuses the old window as well as the sinks.
+        warm = manager.create_kv_cache(None, tokens)
+        caches.append(warm)
+        status = warm.reuse_status[one_sink]
+        assert status.policy == policy and status.complete and status.endpoint == 16
+        assert list(status.coverage) == [(0, 4), (12, 16)]
+        assert warm.resume(stream.cuda_stream, optional_reuse_groups=[one_sink])
+        assert warm.get_base_page_indices(one_sink)[0] == old[one_sink][0]
+        assert warm.get_base_page_indices(one_sink)[3] == old[one_sink][3]
+
+        # Endpoint inside a block: the window cannot be selected, the sinks are still claimed.
+        mid = manager.create_kv_cache(None, tokens[:14])
+        caches.append(mid)
+        assert mid.num_committed_tokens == 14 and not mid.reuse_status[one_sink].complete
+        assert mid.resume(stream.cuda_stream, optional_reuse_groups=[])
+        assert mid.get_base_page_indices(one_sink)[0] == old[one_sink][0]
+        assert mid.get_base_page_indices(one_sink)[3] != old[one_sink][3]
+
+        # Prefix ends inside the sinks: the claimed partial sink is copied, as for REQUIRED.
+        short = manager.create_kv_cache(None, tokens[:6])
+        caches.append(short)
+        assert short.num_committed_tokens == 6
+        assert short.resume(stream.cuda_stream, optional_reuse_groups=[])
+        assert short.get_base_page_indices(two_sinks)[0] == old[two_sinks][0]
+        assert short.get_base_page_indices(two_sinks)[1] != old[two_sinks][1]
+
+        # Window evicted: the match keeps its length and only the window gets fresh pages.
+        _introspection.drop_optional_pages(warm, 16, [one_sink])
+        cold = manager.create_kv_cache(None, tokens)
+        caches.append(cold)
+        status = cold.reuse_status[one_sink]
+        assert cold.num_committed_tokens == 16
+        assert not status.complete and not list(status.coverage)
+        with pytest.raises(ValueError):
+            cold.resume(stream.cuda_stream, optional_reuse_groups=[one_sink])
+        assert cold.resume(stream.cuda_stream, optional_reuse_groups=[])
+        assert cold.get_base_page_indices(one_sink)[0] == old[one_sink][0]
+        assert cold.get_base_page_indices(one_sink)[3] != old[one_sink][3]
+
+        # Sink evicted: the match is shortened, as for REQUIRED.
+        _introspection.drop_optional_pages(warm, 4, [one_sink])
+        gone = manager.create_kv_cache(None, tokens)
+        caches.append(gone)
+        assert gone.num_committed_tokens == 0
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("length", [7, 8])
+@pytest.mark.parametrize("select_optional", [False, True])
+def test_attention_buffer_reuse_policies(length, select_optional):
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+        layers=[
+            kv.AttentionLayerConfig(
+                layer_id=0,
+                reuse_policy=kv.ReusePolicy.PRIVATE,
+                sliding_window_size=4,
+                buffers=[
+                    kv.BufferConfig(role="key", size=4096, reuse_policy=kv.ReusePolicy.REQUIRED),
+                    kv.BufferConfig(role="index", size=2048, reuse_policy=kv.ReusePolicy.OPTIONAL),
+                    kv.BufferConfig(role="scratch", size=1024),
+                ],
+            )
+        ],
+    )
+    manager = kv.KVCacheManager(config)
+    stream = torch.cuda.Stream()
+    caches = []
+    try:
+        required, optional, private = [
+            manager.get_buffer_group_id(0, role) for role in ("key", "index", "scratch")
+        ]
+        assert len({required, optional, private}) == 3
+        source = manager.create_kv_cache(input_tokens=[])
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(length)
+        source.commit(list(range(length)), is_end=True)
+        source.close()
+        reader = manager.create_kv_cache(input_tokens=list(range(length)))
+        caches.append(reader)
+        assert reader.num_committed_tokens == length
+        assert reader.reuse_status[required].complete
+        optional_complete = length % config.tokens_per_block == 0
+        assert reader.reuse_status[optional].complete == optional_complete
+        assert not reader.reuse_status[private].complete
+        if select_optional and not optional_complete:
+            with pytest.raises(ValueError):
+                reader.resume(stream.cuda_stream, optional_reuse_groups=[optional])
+            select_optional = False
+        assert reader.resume(
+            stream.cuda_stream, optional_reuse_groups=[optional] if select_optional else []
+        )
+        reader.suspend()
+        assert reader.resume(stream.cuda_stream)
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_scratch_addresses_with_unequal_buffer_membership(split):
+    layers = []
+    for layer in range(3):
+        buffers = [kv.BufferConfig(role="key", size=2048, tokens_per_block_override=2)]
+        if layer < 2:
+            buffers.extend(
+                [
+                    kv.BufferConfig(role="value", size=4096),
+                    kv.BufferConfig(role="side", size=512, coalescing_group=7),
+                ]
+            )
+        buffers.append(
+            kv.BufferConfig(
+                role="private", size=1024, reuse_policy=kv.ReusePolicy.PRIVATE if split else None
+            )
+        )
+        layers.append(
+            kv.AttentionLayerConfig(layer_id=layer, buffers=buffers, sliding_window_size=8)
+        )
+    manager = kv.KVCacheManager(
+        kv.KVCacheManagerConfig(
+            tokens_per_block=4,
+            layers=layers,
+            cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+            swa_scratch_reuse=kv.SwaScratchReuseConfig(),
+        )
+    )
+    stream = torch.cuda.Stream()
+    cache = manager.create_kv_cache(input_tokens=list(range(64)))
+    try:
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(64)
+        required = manager.get_buffer_group_id(0, "key")
+        scratch_range = cache.get_swa_scratch_range(required)
+        assert scratch_range
+        blocks = scratch_range.end - scratch_range.beg
+        # The side pool has one buffer for each of two layers and needs half
+        # a slot per logical block, more than K/V's two-fifths share.
+        assert len(cache.get_scratch_slots(required)) == (blocks + 1) // 2
+        for layer in layers:
+            spans = []
+            for buffer in layer.buffers:
+                group = manager.get_buffer_group_id(layer.layer_id, buffer.role)
+                converter = manager.get_page_index_converter(layer.layer_id, buffer.role)
+                indices = converter(
+                    cache.get_base_page_indices(group),
+                    kv.PageIndexMode.PER_LAYER,
+                    cache.get_swa_scratch_range(group),
+                    cache.get_scratch_slots(group),
+                )
+                base = manager.get_mem_pool_base_address(
+                    layer.layer_id, buffer.role, kv.PageIndexMode.PER_LAYER
+                )
+                stride = manager.get_page_stride(layer.layer_id, buffer.role)
+                assert len(indices) == 16 * converter.expansion
+                for index in indices:
+                    assert index >= 0
+                    spans.append((base + index * stride, base + (index + 1) * stride))
+            spans.sort()
+            assert all(end <= following for (_, end), (following, _) in zip(spans, spans[1:]))
+    finally:
+        cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("window", [None, 4])
+@pytest.mark.parametrize("on_buffer", [False, True])
+def test_sink_required_only_needs_window_and_sinks(on_buffer, window):
+    policy = kv.ReusePolicy.SINK_REQUIRED_ONLY
+    buffer = kv.BufferConfig(role="key", size=4096, reuse_policy=policy if on_buffer else None)
+    layer = kv.AttentionLayerConfig(
+        layer_id=0,
+        buffers=[buffer],
+        sliding_window_size=window,
+        reuse_policy=kv.ReusePolicy.REQUIRED if on_buffer else policy,
+    )
+    with pytest.raises(ValueError, match="requires a sliding window with sink tokens"):
+        kv.KVCacheManagerConfig(
+            tokens_per_block=4, cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)], layers=[layer]
+        )

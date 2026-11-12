@@ -44,10 +44,10 @@ DecodedEventBlock decodeEventBlock(Block const& block, std::optional<int> mmToke
     DecodedEventBlock result;
     result.tokenIds.reserve(block.tokens.size());
 
-    Digest const* itemDigest = nullptr;
+    MmItemContext const* itemContext = nullptr;
     if (mmTokenIdOffset.has_value() && block.prev != nullptr && block.prev->type() == NodeBase::Type::kBLOCK)
     {
-        itemDigest = static_cast<Block const*>(block.prev)->getLastTokenDigest().get();
+        itemContext = static_cast<Block const*>(block.prev)->getLastMmItemContext().get();
     }
     bool inMmRun = false;
     for (auto const& token : block.tokens)
@@ -57,10 +57,11 @@ DecodedEventBlock decodeEventBlock(Block const& block, std::optional<int> mmToke
             result.tokenIds.emplace_back(std::in_place_index<1>, digestToHex(token.digest()));
             if (mmTokenIdOffset.has_value())
             {
-                itemDigest = &token.digest();
+                itemContext = &token.mmItemContext();
                 result.mmKeys.push_back(
-                    {std::string(reinterpret_cast<char const*>(itemDigest->data()), itemDigest->size()), 0,
-                        std::nullopt, false});
+                    {std::string(reinterpret_cast<char const*>(itemContext->digest.data()), itemContext->digest.size()),
+                        0, itemContext->uuid,
+                        itemContext->uuid.has_value() ? MmKeyUuidMode::kAdditive : MmKeyUuidMode::kNone});
                 inMmRun = true;
             }
             continue;
@@ -68,13 +69,14 @@ DecodedEventBlock decodeEventBlock(Block const& block, std::optional<int> mmToke
 
         auto const tokenId = token.tokenId();
         result.tokenIds.emplace_back(std::in_place_index<0>, tokenId);
-        if (itemDigest != nullptr && tokenId > *mmTokenIdOffset)
+        if (itemContext != nullptr && tokenId > *mmTokenIdOffset)
         {
             if (!inMmRun)
             {
                 result.mmKeys.push_back(
-                    {std::string(reinterpret_cast<char const*>(itemDigest->data()), itemDigest->size()),
-                        tokenId - *mmTokenIdOffset, std::nullopt, false});
+                    {std::string(reinterpret_cast<char const*>(itemContext->digest.data()), itemContext->digest.size()),
+                        tokenId - *mmTokenIdOffset, itemContext->uuid,
+                        itemContext->uuid.has_value() ? MmKeyUuidMode::kAdditive : MmKeyUuidMode::kNone});
             }
             inMmRun = true;
         }

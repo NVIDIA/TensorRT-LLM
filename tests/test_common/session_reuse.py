@@ -19,6 +19,10 @@ Pool isolation and reuse rules:
                               construction seam. Reused IPC workers have
                               thread-local allreduce state incompatible with
                               RPC's rank-0 engine-setup thread.
+- child processes          -> a test starting one drains the cache first:
+                              the child cannot use cached pools but shares
+                              their GPUs (nvidia-smi is exempt; os.fork and
+                              os.posix_spawn are not intercepted)
 - tests passing their own ``_mpi_session`` (the explicit fixtures) -> never
   reach the patched seam
 - ``@pytest.mark.private_mpi_session`` -> explicit opt-out: the cache is
@@ -471,7 +475,7 @@ class SessionReuseCache:
         """Bypass the cache for the current test (private_mpi_session)."""
         self._suspended = suspended
 
-    def drain(self, timeout: float = 60.0) -> None:
+    def drain(self, timeout: float = 60.0, reason: str | None = None) -> None:
         """Shut down all cached pools in parallel (frees GPU/CPU footprint).
 
         Also reaps in-flight retire threads: drain runs at natural rendezvous
@@ -484,6 +488,8 @@ class SessionReuseCache:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
             return
+        if reason:
+            print(f"[session-reuse] draining before {reason}", flush=True)
 
         threads = [
             # daemon: a wedged pool shutdown must not keep the interpreter

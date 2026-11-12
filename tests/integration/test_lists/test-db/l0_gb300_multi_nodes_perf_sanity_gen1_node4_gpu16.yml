@@ -16,3 +16,5 @@ l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16:
   tests:
   # deepseek-v4-pro-fp4 8k1k con666
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (30)
+  # kimi-k3-fp4 dspark 160k1k con32, helix CP16 gen worker
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_kimi-k3-fp4-dspark_160k1k_con32_ctx16_dwdp16_gen1_helix16_bs32_dspark6_ccb-NIXL] TIMEOUT (30)

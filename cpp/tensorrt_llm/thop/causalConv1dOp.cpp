@@ -22,6 +22,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <limits>
 #include <optional>
 #include <torch/all.h>
 #include <utility>
@@ -141,6 +142,18 @@ bool tensorsOverlap(at::Tensor const& a, at::Tensor const& b)
         d += pitch;
     }
     return d < lb->runBytes || d + la->runBytes > pitch;
+}
+
+//! `t.stride(dim)` as the kernels store it (`ConvParamsBase::index_t`, 32 bits): a wider stride
+//! would be truncated into a wrong address, so it is refused.
+tensorrt_llm::kernels::causal_conv1d::ConvParamsBase::index_t checkedStride(
+    at::Tensor const& t, int64_t dim, char const* name)
+{
+    using index_t = tensorrt_llm::kernels::causal_conv1d::ConvParamsBase::index_t;
+    int64_t const stride = t.stride(dim);
+    TORCH_CHECK(stride >= 0 && stride <= static_cast<int64_t>(std::numeric_limits<index_t>::max()), name, ".stride(",
+        dim, ") is ", stride, ", past the causal_conv1d kernels' 32-bit strides");
+    return static_cast<index_t>(stride);
 }
 } // namespace
 
@@ -277,7 +290,7 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
         TORCH_CHECK(conv_states_.scalar_type() == input_type);
         TORCH_CHECK(conv_states_.is_cuda());
         params.conv_states_ptr = conv_states_.data_ptr();
-        params.conv_states_batch_stride = conv_states_.stride(0);
+        params.conv_states_batch_stride = checkedStride(conv_states_, 0, "conv_states");
         params.conv_states_c_stride = conv_states_.stride(1);
         params.conv_states_l_stride = conv_states_.stride(2);
     }
@@ -380,7 +393,7 @@ void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::T
     params.conv_state_ptr = conv_state.data_ptr();
     params.conv_state_len = conv_state_len;
     // All stride are in elements, not bytes.
-    params.conv_state_batch_stride = conv_state.stride(0);
+    params.conv_state_batch_stride = checkedStride(conv_state, 0, "conv_state");
     params.conv_state_c_stride = conv_state.stride(1);
     params.conv_state_l_stride = conv_state.stride(2);
 

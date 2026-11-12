@@ -36,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -115,11 +116,60 @@ def test_python_runtime_accepts_v2_manager(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.KvCacheTransceiverV2", constructor
     )
+    monkeypatch.setattr(transceiver_module.logger, "_appeared_keys", set())
+    emitted = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "log", emitted)
 
     result = transceiver_module.create_kv_cache_transceiver(None, None, manager, None, config)
 
     assert result is constructor.return_value
     constructor.assert_called_once_with(None, None, manager, config)
+    assert not any(
+        "deprecated" in str(argument)
+        for recorded in emitted.call_args_list
+        for argument in recorded.args[1:]
+    )
+
+
+@pytest.mark.parametrize("runtime", ["CPP", None, "auto"])
+def test_cpp_deprecation_warning_is_emitted_once(
+    runtime: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = object.__new__(KVCacheManager)
+    manager.impl = Mock()
+    manager.total_num_kv_heads_per_layer = [1]
+    manager.num_kv_heads_per_layer = [1]
+    manager.head_dim = 128
+    manager.tokens_per_block = 32
+    manager.dtype = transceiver_module.tensorrt_llm.bindings.DataType.HALF
+    manager.enable_indexer_k_cache = False
+    dist = Mock()
+    dist.pp_allgather.return_value = [1]
+    native_constructor = Mock()
+    emitted = Mock()
+    monkeypatch.setattr(transceiver_module, "CacheTransceiverCpp", native_constructor)
+    monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_enabled_cache", False)
+    monkeypatch.delenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", raising=False)
+    monkeypatch.setattr(transceiver_module.logger, "_appeared_keys", set())
+    monkeypatch.setattr(transceiver_module.logger, "log", emitted)
+
+    for _ in range(2):
+        config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
+        result = transceiver_module.create_kv_cache_transceiver(
+            Mapping(), dist, manager, transceiver_module.AttentionTypeCpp.DEFAULT, config
+        )
+        assert isinstance(result, transceiver_module.BindKvCacheTransceiver)
+        assert config.transceiver_runtime == ("CPP" if runtime == "CPP" else None)
+
+    warnings = [
+        recorded
+        for recorded in emitted.call_args_list
+        if recorded.args[0] == transceiver_module.logger.WARNING
+        and "The C++ cache transceiver" in recorded.args[1]
+        and "deprecated" in recorded.args[1]
+    ]
+    assert len(warnings) == 1
+    assert native_constructor.call_count == 2
 
 
 def test_python_runtime_rejects_separate_legacy_mamba_manager() -> None:

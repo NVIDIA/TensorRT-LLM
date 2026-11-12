@@ -54,6 +54,36 @@ def raise_moe_lora_multichunk_unsupported(num_chunks: int) -> None:
     )
 
 
+def moe_lora_active(lora_params: dict | None, layer_idx: int | None) -> bool:
+    """Return True when ``lora_params`` carries routed-expert MoE LoRA tensors
+    for layer ``layer_idx``.
+
+    ``lora_params`` describes every adapter of the forward, so a backend that
+    cannot fuse MoE LoRA asks this rather than refusing any ``lora_params``.
+    """
+    if not lora_params or layer_idx is None:
+        return False
+    # CUDA-graph slot-indexed mode carries MoE LoRA in cuda_graph_params
+    # rather than a per-layer eager dict (mirrors _extract_moe_lora_tensors),
+    # so consult the graph layer map to keep the multi-chunk guard effective
+    # during capture/replay.
+    if lora_params.get("use_cuda_graph_mode", False):
+        cuda_graph_params = lora_params.get("cuda_graph_params")
+        if cuda_graph_params is None:
+            return False
+        layer_module2key = getattr(cuda_graph_params, "layer_module2key", {})
+        return any(
+            (layer_idx, int(LoraModuleType.from_string(name))) in layer_module2key
+            for name in MOE_LORA_MODULE_NAMES
+        )
+    layer_params = lora_params.get(layer_idx, {})
+    if not layer_params:
+        return False
+    return any(
+        int(LoraModuleType.from_string(name)) in layer_params for name in MOE_LORA_MODULE_NAMES
+    )
+
+
 class CutlassMoELoraMixin:
     """The LoRA half of a CUTLASS leaf that supports routed-expert LoRA.
 
@@ -200,27 +230,7 @@ class CutlassMoELoraMixin:
         """Return True when lora_params carries routed-expert MoE LoRA tensors
         for this layer, meaning run_moe would fuse a LoRA delta.
         """
-        if not lora_params or self.layer_idx is None:
-            return False
-        # CUDA-graph slot-indexed mode carries MoE LoRA in cuda_graph_params
-        # rather than a per-layer eager dict (mirrors _extract_moe_lora_tensors),
-        # so consult the graph layer map to keep the multi-chunk guard effective
-        # during capture/replay.
-        if lora_params.get("use_cuda_graph_mode", False):
-            cuda_graph_params = lora_params.get("cuda_graph_params")
-            if cuda_graph_params is None:
-                return False
-            layer_module2key = getattr(cuda_graph_params, "layer_module2key", {})
-            return any(
-                (self.layer_idx, int(LoraModuleType.from_string(name))) in layer_module2key
-                for name in MOE_LORA_MODULE_NAMES
-            )
-        layer_params = lora_params.get(self.layer_idx, {})
-        if not layer_params:
-            return False
-        return any(
-            int(LoraModuleType.from_string(name)) in layer_params for name in MOE_LORA_MODULE_NAMES
-        )
+        return moe_lora_active(lora_params, self.layer_idx)
 
     @staticmethod
     def _empty_kernel_slot_dict() -> dict[str, torch.Tensor | None]:
@@ -317,6 +327,7 @@ class CutlassMoELoraMixin:
             "host_request_types": _slice(lora_params["host_request_types"]),
             "host_context_lengths": _slice(lora_params["prompt_lens_cpu"]),
             "lora_max_low_rank": active_max_rank,
+            "lora_dtype": lora_params.get("data_type"),
         }
 
     def _extract_moe_lora_tensors_cuda_graph(self, lora_params: dict) -> dict[str, object] | None:
@@ -376,4 +387,5 @@ class CutlassMoELoraMixin:
             ),
             "token_to_slot": token_to_slot,
             "lora_max_low_rank": max_rank,
+            "lora_dtype": lora_params.get("data_type"),
         }

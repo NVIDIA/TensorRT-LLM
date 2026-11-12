@@ -24,14 +24,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // ---------------------------------------------------------------------------
-// DigestPool — process-global, address-stable store of 32-byte multi-modal
-// Digests, referenced by a 31-bit slot index packed into a TokenIdExt. It is a
+// DigestPool — process-global, address-stable store of immutable multi-modal
+// item contexts, referenced by a 31-bit slot index packed into a TokenIdExt. It is a
 // pure implementation detail of TokenIdExt, so it lives here (anonymous
 // namespace) rather than in the header.
 //
@@ -74,28 +76,35 @@ public:
     DigestPool(DigestPool&&) = delete;
     DigestPool& operator=(DigestPool&&) = delete;
 
-    // Store a copy of `digest` in the lowest free slot; return its index.
-    uint32_t alloc(Digest const& digest)
+    // Store `context` in the lowest free slot; return its index.
+    uint32_t alloc(MmItemContext context)
     {
         std::lock_guard<std::mutex> const lock(mMutex);
-        return allocLocked(digest);
+        return allocLocked(std::make_shared<MmItemContext const>(std::move(context)));
     }
 
-    // Duplicate the digest at slot `idx` into a fresh slot; return the new index.
+    // Share the context at slot `idx` through a fresh slot; return the new index.
     uint32_t duplicate(uint32_t idx)
     {
         std::lock_guard<std::mutex> const lock(mMutex);
-        return allocLocked(mStore[idx]); // Safe for deque
+        return allocLocked(liveSlotLocked(idx)); // Share immutable context, including long UUID strings.
     }
 
-    // The digest at slot `idx`. The reference stays valid after the lock is
+    // The context at slot `idx`. The reference stays valid after the lock is
     // released and across later shrinks (which only pop free tail slots). Uses
     // at() so a bad index (e.g. the sentinel of a moved-from handle) throws
-    // rather than reading out of bounds; digests are rare so the check is cheap.
-    [[nodiscard]] Digest const& get(uint32_t idx) const
+    // rather than reading out of bounds; contexts are rare so the check is cheap.
+    [[nodiscard]] MmItemContext const& get(uint32_t idx) const
     {
         std::lock_guard<std::mutex> const lock(mMutex);
-        return mStore.at(idx);
+        return *liveSlotLocked(idx);
+    }
+
+    // Shared ownership of the context at slot `idx`.
+    [[nodiscard]] std::shared_ptr<MmItemContext const> getShared(uint32_t idx) const
+    {
+        std::lock_guard<std::mutex> const lock(mMutex);
+        return liveSlotLocked(idx);
     }
 
     // Clear slot `idx` and reclaim trailing free slots.
@@ -106,6 +115,7 @@ public:
             return; // the default / moved-from sentinel index — nothing to free
         }
         std::lock_guard<std::mutex> const lock(mMutex);
+        mStore[idx].reset();
         mInUse.clear(idx);
         if (idx < mMinFreeHint)
         {
@@ -123,6 +133,14 @@ public:
 private:
     DigestPool() = default;
 
+    // Precondition: caller holds mMutex. Validate that `idx` names a live slot.
+    [[nodiscard]] std::shared_ptr<MmItemContext const> const& liveSlotLocked(uint32_t idx) const
+    {
+        auto const& slot = mStore.at(idx);
+        TLLM_CHECK_WITH_INFO(slot != nullptr, "DigestPool slot %u is not live", idx);
+        return slot;
+    }
+
     // Slot count. Also checks the occupancy bitset stays sized to the store.
     // Precondition: caller holds mMutex and mStore/mInUse are in sync (i.e. not
     // called between growing/shrinking one and resizing the other).
@@ -132,9 +150,9 @@ private:
         return mStore.size();
     }
 
-    // Precondition: caller holds mMutex. Store `digest` in the lowest free slot
+    // Precondition: caller holds mMutex. Store `context` in the lowest free slot
     // (front-packing), growing the deque only when no free slot exists.
-    uint32_t allocLocked(Digest const& digest)
+    uint32_t allocLocked(std::shared_ptr<MmItemContext const> context)
     {
         size_t const cap = capacity();
         size_t idx = mMinFreeHint;
@@ -147,12 +165,12 @@ private:
             // No free slot below the high-water mark — grow by one. Indices stay
             // strictly below kValueMask, which is reserved as the bad-handle sentinel.
             TLLM_CHECK_WITH_INFO(cap < TokenIdExt::kValueMask, "DigestPool exhausted the 31-bit index space");
-            mStore.push_back(digest);
+            mStore.push_back(std::move(context));
             mInUse.resize(mStore.size()); // re-sync the bitset; new bit is clear
         }
         else
         {
-            mStore[idx] = digest;
+            mStore[idx] = std::move(context);
         }
         mInUse.set(idx);
         mMinFreeHint = idx + 1; // everything below is now occupied
@@ -191,9 +209,9 @@ private:
     static constexpr size_t kSlackLow = 64;
 
     mutable std::mutex mMutex;
-    std::deque<Digest> mStore; // slot storage; mStore.size() == the slot count (== bitset capacity)
-    DynamicBitset mInUse{0};   // bit i set == slot i occupied
-    size_t mMinFreeHint{0};    // lower bound on the lowest free slot index
+    std::deque<std::shared_ptr<MmItemContext const>> mStore; // address-stable slot storage
+    DynamicBitset mInUse{0};                                 // bit i set == slot i occupied
+    size_t mMinFreeHint{0};                                  // lower bound on the lowest free slot index
 };
 
 } // namespace
@@ -202,8 +220,13 @@ private:
 // TokenIdExt — RAII members that touch the pool (construct/copy=alloc, dtor=free).
 // ---------------------------------------------------------------------------
 
-TokenIdExt::TokenIdExt(Digest const& digestValue)
-    : mBits(DigestPool::instance().alloc(digestValue) | kTagMask)
+TokenIdExt::TokenIdExt(Digest const& digestValue, std::optional<std::string> uuid)
+    : TokenIdExt(MmItemContext{digestValue, std::move(uuid)})
+{
+}
+
+TokenIdExt::TokenIdExt(MmItemContext context)
+    : mBits(DigestPool::instance().alloc(std::move(context)) | kTagMask)
 {
 }
 
@@ -219,7 +242,17 @@ uint32_t TokenIdExt::duplicateSlot(uint32_t index)
 
 Digest const& TokenIdExt::digest() const
 {
+    return mmItemContext().digest;
+}
+
+MmItemContext const& TokenIdExt::mmItemContext() const
+{
     return DigestPool::instance().get(digestIndex());
+}
+
+std::shared_ptr<MmItemContext const> TokenIdExt::sharedMmItemContext() const
+{
+    return DigestPool::instance().getShared(digestIndex());
 }
 
 namespace detail

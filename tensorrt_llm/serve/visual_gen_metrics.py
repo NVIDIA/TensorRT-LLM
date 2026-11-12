@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Optional
 
+from tensorrt_llm.serve._perf_metrics_schema import SERVER_TIMING_HEADER
+
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen.output import VisualGenMetrics
 
-SERVER_TIMING_HEADER = "Server-Timing"
 VISUAL_GEN_PRE_DENOISE_TIMING = "pre_denoise"
 VISUAL_GEN_DENOISE_TIMING = "denoise"
 VISUAL_GEN_POST_DENOISE_TIMING = "post_denoise"
