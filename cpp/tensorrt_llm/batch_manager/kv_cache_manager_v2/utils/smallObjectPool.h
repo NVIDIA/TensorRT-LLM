@@ -21,9 +21,10 @@
 // nodes, short per-block vectors). Claiming or releasing a long prefix allocates or frees them by the
 // thousand in one burst, which overflows the general-purpose allocator's thread cache.
 //
-// Blocks come from ::operator new and go back to ::operator delete past the per-class cap. The cache
-// is trivially destructible, so thread and process exit are safe; a thread's cached blocks are not
-// returned when it exits (the cap bounds them).
+// Blocks come from ::operator new and go back to ::operator delete past the per-class cap. The first
+// cached free of a thread registers a thread-exit hook that returns the thread's cached blocks to the
+// heap, so threads that come and go (PyExecutor's worker across release and rebind) do not leak them.
+// Frees after the hook ran, from thread-local or static destructors, go straight to the heap.
 
 #include <cstddef>
 #include <cstdint>
@@ -46,13 +47,55 @@ struct PoolFreeNode
     PoolFreeNode* next;
 };
 
+//! PoolThreadCache::state: no exit hook yet, hook registered, cache returned to the heap.
+inline constexpr uint8_t kPoolUnhooked = 0;
+inline constexpr uint8_t kPoolHooked = 1;
+inline constexpr uint8_t kPoolClosed = 2;
+
+//! Trivially destructible, so it needs no guard on access; PoolThreadExitHook empties it.
 struct PoolThreadCache
 {
     PoolFreeNode* head[kPoolNumClasses];
     uint32_t count[kPoolNumClasses];
+    uint8_t state;
 };
 
 inline thread_local constinit PoolThreadCache tPoolThreadCache{};
+
+//! Return this thread's cached blocks to the heap; later frees on the thread bypass the cache.
+inline void poolReleaseThreadCache() noexcept
+{
+    auto& cache = tPoolThreadCache;
+    cache.state = kPoolClosed;
+    for (size_t cls = 0; cls < kPoolNumClasses; ++cls)
+    {
+        PoolFreeNode* node = cache.head[cls];
+        while (node != nullptr)
+        {
+            PoolFreeNode* const next = node->next;
+            ::operator delete(node);
+            node = next;
+        }
+        cache.head[cls] = nullptr;
+        cache.count[cls] = 0;
+    }
+}
+
+struct PoolThreadExitHook
+{
+    ~PoolThreadExitHook()
+    {
+        poolReleaseThreadCache();
+    }
+};
+
+//! Register the hook that releases this thread's cache when the thread exits.
+[[gnu::noinline]] inline void poolHookThreadExit() noexcept
+{
+    thread_local PoolThreadExitHook hook;
+    static_cast<void>(hook);
+    tPoolThreadCache.state = kPoolHooked;
+}
 
 //! Whether a type of this size and alignment is served by the pool.
 constexpr bool poolServes(size_t size, size_t align) noexcept
@@ -82,6 +125,15 @@ inline void poolDeallocate(void* ptr, size_t size) noexcept
 {
     size_t const cls = poolClass(size);
     auto& cache = tPoolThreadCache;
+    if (cache.state != kPoolHooked) [[unlikely]]
+    {
+        if (cache.state == kPoolClosed)
+        {
+            ::operator delete(ptr);
+            return;
+        }
+        poolHookThreadExit();
+    }
     if (cache.count[cls] < kPoolMaxCached)
     {
         auto* node = static_cast<PoolFreeNode*>(ptr);

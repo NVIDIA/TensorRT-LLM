@@ -21,8 +21,10 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace
@@ -82,6 +84,63 @@ TEST(KvCacheManagerV2SmallObjectPoolTest, CapsCachedBlocksPerClass)
         pool::poolDeallocate(block, kSize);
     }
     EXPECT_EQ(cache.count[cls], pool::kPoolMaxCached);
+}
+
+constexpr std::size_t kExitProbeSize = 48;
+constexpr std::uint32_t kExitProbeBlocks = 100;
+
+struct ThreadExitResult
+{
+    std::atomic<std::uint32_t> cachedBeforeExit{0};
+    std::atomic<std::uint32_t> cachedAfterExit{~0u};
+    std::atomic<std::uint8_t> stateAfterExit{pool::kPoolUnhooked};
+};
+
+ThreadExitResult gThreadExitResult;
+
+// Constructed before the pool's exit hook, so destroyed after it: reads the cache the hook left and
+// frees one more block, which must bypass the closed cache.
+struct ThreadExitProbe
+{
+    ~ThreadExitProbe()
+    {
+        pool::poolDeallocate(pool::poolAllocate(kExitProbeSize), kExitProbeSize);
+        std::uint32_t cached = 0;
+        for (std::size_t c = 0; c < pool::kPoolNumClasses; ++c)
+        {
+            cached += pool::tPoolThreadCache.count[c];
+            cached += pool::tPoolThreadCache.head[c] != nullptr ? 1u : 0u;
+        }
+        gThreadExitResult.cachedAfterExit = cached;
+        gThreadExitResult.stateAfterExit = pool::tPoolThreadCache.state;
+    }
+};
+
+// A thread that exits returns its cached blocks to the heap; frees after that skip the cache.
+TEST(KvCacheManagerV2SmallObjectPoolTest, ReturnsCachedBlocksWhenTheThreadExits)
+{
+    std::thread worker(
+        []
+        {
+            thread_local ThreadExitProbe probe;
+            static_cast<void>(probe);
+            EXPECT_EQ(pool::tPoolThreadCache.state, pool::kPoolUnhooked);
+            std::vector<void*> blocks(kExitProbeBlocks);
+            for (auto& block : blocks)
+            {
+                block = pool::poolAllocate(kExitProbeSize);
+            }
+            for (void* block : blocks)
+            {
+                pool::poolDeallocate(block, kExitProbeSize);
+            }
+            EXPECT_EQ(pool::tPoolThreadCache.state, pool::kPoolHooked);
+            gThreadExitResult.cachedBeforeExit = pool::tPoolThreadCache.count[pool::poolClass(kExitProbeSize)];
+        });
+    worker.join();
+    EXPECT_EQ(gThreadExitResult.cachedBeforeExit, kExitProbeBlocks);
+    EXPECT_EQ(gThreadExitResult.cachedAfterExit, 0u);
+    EXPECT_EQ(gThreadExitResult.stateAfterExit, pool::kPoolClosed);
 }
 
 // PoolAllocator serves small arrays from the pool; a larger or over-aligned one bypasses it.
