@@ -4832,6 +4832,110 @@ def test_megamoe_cutedsl_nvfp4_awq_matches_cutlass() -> None:
         ref_fused_moe.check_accuracy(megamoe_output, unscaled_ref_output)
 
 
+@pytest.mark.parametrize("reserved_sms", [0, 8])
+def test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run(
+    monkeypatch: pytest.MonkeyPatch, reserved_sms: int
+) -> None:
+    """With the bucket hint set and the bucket's staging built, ``quantize_input`` quantizes into
+    that staging and ``run_moe`` launches from it without copying the activation; the rows and the
+    output equal the copy path's bit for bit, also with SMs left to a replica plan's HALO-Q/TMA."""
+    dtype, num_experts, top_k = torch.bfloat16, 8, 2
+    hidden_size, intermediate_size, seq_len = 512, 512, 16
+    verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    backend_type = MoeBackendType.MEGAMOE_CUTEDSL
+    mapping = Mapping(rank=mpi_rank())
+    _ensure_single_proc_dist_for_megamoe(backend_type, mapping.rank)
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, backend_type
+        )
+        quant_kwargs.pop("ref_cls")
+        weights = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        ).create_weights(**quant_kwargs)
+        token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        stage_activation = []
+        stage_inputs = backend._stage_inputs
+        monkeypatch.setattr(
+            backend,
+            "_stage_inputs",
+            lambda **kw: stage_activation.append(kw["stage_activation"]) or stage_inputs(**kw),
+        )
+
+        def forward() -> Tuple[Tuple[int, int], torch.Tensor, torch.Tensor, torch.Tensor]:
+            backend.set_adaptive_launch_tokens(seq_len)
+            x_fp4, x_sf = backend.quantize_input(x, reserved_sms=reserved_sms)
+            rows = (x_fp4.clone(), x_sf.clone())
+            out = run_backend_moe(
+                backend,
+                backend_type,
+                x_fp4,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+            return (x_fp4.data_ptr(), x_sf.data_ptr()), *rows, out
+
+        with torch.inference_mode():
+            # The first launch into the bucket builds its staging and copies the rows into it.
+            _, copied_fp4, copied_sf, reference = forward()
+            backend.set_adaptive_launch_tokens(seq_len)
+            bufs = backend._staging_of_next_run(seq_len, x.device)
+            assert bufs is not None
+            addresses, staged_fp4, staged_sf, output = forward()
+        torch.cuda.synchronize()
+
+    assert addresses == (bufs.activation.data_ptr(), bufs.activation_sf.data_ptr())
+    assert stage_activation == [True, False]
+    assert torch.equal(staged_fp4, copied_fp4) and torch.equal(staged_sf, copied_sf)
+    assert torch.equal(output, reference)
+
+
 @pytest.fixture(scope="module")
 def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):

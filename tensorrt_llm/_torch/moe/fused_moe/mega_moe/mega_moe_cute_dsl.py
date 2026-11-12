@@ -666,6 +666,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
+        # (staging address, rows) that ``quantize_input`` quantized into for the NEXT run_moe.
+        self._quantized_into: Optional[Tuple[int, int]] = None
 
         # Resolve EP ProcessGroup at construction. Resolving at forward
         # time would be collective on a non-synchronous call stack and
@@ -1224,7 +1226,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         reservation), and the returned tensors are views of it. On EP>1 that staging is the
         symmetric region every same-shape MegaMoE layer shares, so the views
         hold these rows only until the next MegaMoE ``quantize_input`` or
-        ``run_moe``.
+        ``run_moe``. That ``run_moe`` raises unless it launches exactly these
+        rows from that staging.
 
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
@@ -1269,6 +1272,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             torch.ops.trtllm.fp4_quantize.into(
                 x_bf16, self.fc31_input_scale, x_fp4, x_sf, False, reserved_sms
             )
+            self._quantized_into = (staged.activation.data_ptr(), rows)
             return x_fp4, x_sf
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
         # default overload remains unchanged without a plan.
@@ -1953,6 +1957,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # the full bucket.
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
         self._active_launch_max_tokens = None
+        quantized_into, self._quantized_into = self._quantized_into, None
         if num_tokens > launch_max_T:
             # By construction num_tokens <= max(all_rank_num_tokens) <=
             # launch_max_T; fail loudly rather than desync the barrier.
@@ -2014,6 +2019,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             x.data_ptr() == bufs.activation.data_ptr()
             and x_sf.data_ptr() == bufs.activation_sf.data_ptr()
         )
+        # Both sides decide the bucket: a mismatch would copy the rows again, or launch stale ones.
+        if quantized_into != ((x.data_ptr(), num_tokens) if activation_staged else None):
+            raise RuntimeError(
+                f"MegaMoECuteDsl: quantize_input quantized (staging address, rows) "
+                f"{quantized_into}, but run_moe launches {num_tokens} rows at {x.data_ptr():#x} "
+                f"into bucket {launch_max_T}, whose staging is at "
+                f"{bufs.activation.data_ptr():#x}. Set the bucket hint before quantize_input "
+                f"and run_moe on its output."
+            )
         if not use_direct_routing_inputs:
             self._stage_inputs(
                 bufs=bufs,

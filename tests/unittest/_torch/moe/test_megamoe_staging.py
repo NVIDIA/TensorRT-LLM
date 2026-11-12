@@ -57,3 +57,69 @@ def test_the_staging_of_the_next_run_is_handed_out_only_for_a_run_that_stages():
     assert staging(5, cpu) is None  # more rows than the hinted bucket holds
     backend._active_launch_max_tokens = 5
     assert staging(5, cpu) is None  # bucket 8 is selected but not built
+
+
+def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_there():
+    """``run_moe`` takes the staging's rows as already quantized only when ``quantize_input``
+    recorded that it quantized exactly those rows into it; any other pairing raises instead of
+    copying the rows again or launching stale ones."""
+    act = torch.zeros(8, 4, dtype=torch.uint8)
+    act_sf = torch.zeros(8, 1, dtype=torch.uint8)
+    t = torch.zeros(8, 2)
+    bufs = mm._MegaMoeBuffers(
+        activation=act,
+        activation_sf=act_sf,
+        topk_weights=t,
+        combine_output=t,
+        shared_workspace=t,
+        peer_offsets=(0,),
+        topk_idx_local=torch.full((8, 2), -1, dtype=torch.int64),
+    )
+    stage_activation = []
+    backend = SimpleNamespace(
+        _active_launch_max_tokens=None,
+        _quantized_into=None,
+        ep_size=1,
+        ep_rank=0,
+        tactic_autotune=False,
+        _genphase_direct_input_buckets=set(),
+        _select_launch_max_tokens=lambda hint: 8,
+        _acquire_buffers=lambda **kw: bufs,
+        _stage_inputs=lambda **kw: stage_activation.append(kw["stage_activation"]),
+        _launch_megamoe_kernel=lambda **kw: "out",
+    )
+    backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
+    routes = torch.zeros(3, 2, dtype=torch.int64)
+
+    def run(x: torch.Tensor, x_sf: torch.Tensor) -> str:
+        return IMPL._run_moe(
+            backend,
+            x=x,
+            x_sf=x_sf,
+            topk_idx=routes,
+            topk_weights=routes.float(),
+            weight_view=None,
+            num_tokens=x.shape[0],
+            top_k=2,
+            hidden=8,
+            device=torch.device("cpu"),
+            output_dtype=torch.bfloat16,
+        )
+
+    staged, fresh = (
+        (act[:3], act_sf[:3]),
+        (torch.zeros(3, 4, dtype=torch.uint8), act_sf[:3].clone()),
+    )
+    backend._quantized_into = (act.data_ptr(), 3)
+    assert run(*staged) == "out" and stage_activation == [False]
+    assert run(*fresh) == "out" and stage_activation == [False, True]
+    for record, inputs in (
+        ((act.data_ptr(), 3), fresh),  # quantized into this staging, launched from elsewhere
+        ((act.data_ptr(), 2), staged),  # another row count
+        (None, staged),  # a view of the staging that this run's quantize_input did not write
+    ):
+        backend._quantized_into = record
+        with pytest.raises(RuntimeError, match="quantize_input quantized"):
+            run(*inputs)
+        assert backend._quantized_into is None  # consumed by the launch it was meant for
+    assert stage_activation == [False, True]
