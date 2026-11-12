@@ -34,7 +34,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.cache.k
     KimiK3Sm107MidchunkCacheManager,
     _KDAMidchunkSnapshot,
 )
-from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KDAReplayState,
+    KimiK3HybridCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor._util import model_declared_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
@@ -46,7 +49,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataTy
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import _get_forced_context_chunk_size
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig, MambaStateConfig
+from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
+    KvCacheConfig,
+    MambaStateConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
 
@@ -810,5 +818,78 @@ def test_real_manager_branch_snapshot_inside_step_is_reused_by_sibling(policy):
         assert torch.equal(ssm[reused], snapshot_ssm)
         assert torch.equal(conv[reused], snapshot_conv)
         mgr.free_resources(sibling_c)
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.cpu_only
+def test_the_size_estimate_counts_the_replay_buffers_per_state_slot(monkeypatch):
+    """The replay buffers are part of every recurrent-state slot, so no replay region is estimated."""
+    monkeypatch.setattr(KDAReplayState, "estimate_seed_bytes_per_slot", lambda *a, **k: 8)
+    monkeypatch.setattr(KDAReplayState, "estimate_bytes_per_slot", lambda *a, **k: 1000)
+    for cls in (KimiK3Sm107CacheManager, KimiK3Sm107MidchunkCacheManager):
+        assert cls._extra_state_bytes_per_rank(None, None) == 1008
+        assert (
+            cls._estimate_fixed_region_bytes(None, None, max_batch_size=4, kv_cache_config=None)
+            == 0
+        )
+    # The engine's manager keeps them in a replay region of their own instead.
+    assert KimiK3HybridCacheManager._extra_state_bytes_per_rank(None, None) == 8
+
+
+def _build_kda_replay_manager(cls, num_spec=3, num_heads=2, head_dim=64):
+    return cls(
+        mamba_d_state=head_dim,
+        mamba_d_conv=4,
+        mamba_num_heads=num_heads,
+        mamba_n_groups=num_heads,
+        mamba_head_dim=head_dim,
+        mamba_num_layers=2,
+        mamba_layer_mask=[True, True],
+        mamba_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.float32,
+        kv_cache_config=KvCacheConfig(max_tokens=128, enable_block_reuse=False),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=0,
+        num_kv_heads=0,
+        head_dim=head_dim,
+        tokens_per_block=32,
+        max_seq_len=64,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.BF16,
+        spec_config=MTPDecodingConfig(max_draft_len=num_spec),
+        layer_mask=[False, False],
+        conv_state_layout="q_k_v",
+        kda_replay_num_spec=num_spec,
+    )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("cls", [KimiK3Sm107CacheManager, KimiK3Sm107MidchunkCacheManager])
+def test_kda_replay_buffers_share_the_recurrent_state_slot(cls):
+    """The SM107 KDA kernels address the replay caches by the recurrent-state slot."""
+    mgr = _build_kda_replay_manager(cls)
+    try:
+        assert mgr._kda_replay.replay_shares_state_slot
+        assert not mgr._kda_replay.draft_records
+        assert mgr.replay_layer_group_id is None
+        assert mgr.cuda_replay_state_indices is mgr.cuda_state_indices
+        request_ids = [11, 12]
+        mgr.add_dummy_requests(request_ids, token_nums=[8, 8], is_gen=False)
+        assert list(mgr.get_replay_state_indices(request_ids)) == list(
+            mgr.get_state_indices(request_ids)
+        )
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_the_engine_manager_keeps_kda_replay_in_a_region_of_its_own():
+    """Contrast: without the drafts' records the engine's manager gives replay slots of their own."""
+    mgr = _build_kda_replay_manager(KimiK3HybridCacheManager)
+    try:
+        assert not mgr._kda_replay.replay_shares_state_slot
+        assert mgr.replay_layer_group_id is not None
     finally:
         mgr.shutdown()

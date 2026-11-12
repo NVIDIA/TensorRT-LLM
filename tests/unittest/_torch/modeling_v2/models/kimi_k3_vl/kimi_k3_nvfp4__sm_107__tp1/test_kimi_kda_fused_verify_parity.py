@@ -313,13 +313,16 @@ def _rep(name, a, b):
 
 
 def _make_kvcm_replay_manager(num_heads):
-    """A V2 hybrid manager whose KVCM pools hold the KDA states and replay caches, with a host tier to offload to."""
-    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+    """The target's V2 hybrid manager, whose KVCM pools hold the KDA states with their replay caches in the same
+    slots, with a host tier to offload to."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager import (  # noqa: E501
+        KimiK3Sm107MidchunkCacheManager,
+    )
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
     from tensorrt_llm.mapping import Mapping
 
-    return KimiK3HybridCacheManager(
+    return KimiK3Sm107MidchunkCacheManager(
         mamba_d_state=K,
         mamba_d_conv=W,
         mamba_num_heads=num_heads,
