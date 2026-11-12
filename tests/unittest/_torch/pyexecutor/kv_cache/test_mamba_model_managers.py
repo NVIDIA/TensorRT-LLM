@@ -208,11 +208,26 @@ def _shutdown_manager(manager, monkeypatch):
     pool_shutdown.assert_called_once_with()
 
 
+def _prepare_nemotron_replay(manager):
+    manager._replay_capacity = 0
+    manager._replay_headroom = 0
+    manager._replay_history_bytes = 0
+    manager._request_id_to_replay_slot = {}
+    manager._free_replay_slots = []
+    manager._ssm_to_replay_slot_host = {}
+    manager._num_reserved_dummy_slots = 1
+    manager.ssm_state_shape = list(manager._state_layout.ssm_state_shape)
+    manager.conv_state_dtype = manager._state_layout.conv_state_dtype
+    manager._n_groups_per_rank = manager._state_layout.n_groups_per_rank
+
+
 def _prepare_model_layout(manager):
     """Supply constructor-resolved inputs when testing the pre-pool hook alone."""
     manager._mamba_ssm_stochastic_rounding = False
     manager._state_layout = replace(_layout(), spec_config=manager.spec_config)
     manager.local_num_mamba_layers = 2
+    if isinstance(manager, NemotronHybridCacheManager):
+        _prepare_nemotron_replay(manager)
     manager._global_n_groups = 2
     if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_params = None
@@ -385,6 +400,7 @@ def test_mamba2_seed_lifecycle_without_speculative_decoding(monkeypatch):
     manager._requested_replay = False
     manager._mamba_ssm_stochastic_rounding = True
     manager._state_layout = replace(_layout(), spec_config=None)
+    _prepare_nemotron_replay(manager)
     views = _state_views()
     manager.all_ssm_states = views.all_ssm_states
     manager.all_conv_states = views.all_conv_states
@@ -1624,3 +1640,35 @@ def test_legacy_kda_replay_retains_cpp_manager_gate(monkeypatch):
             False,
             False,
         ) == ("qwen3_next", False, expected)
+
+
+@pytest.mark.cpu_only
+def test_fixed_replay_reservation_crosses_native_rounding_boundary(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as module
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._get_external_cache_bytes = lambda cache: 15
+
+    class Pool:
+        quota = 1008
+        resize_quotas = []
+
+        def get_quota(self, level):
+            return self.quota
+
+        def resize(self, level, quota):
+            self.resize_quotas.append(quota)
+            self.quota = (quota + 15) // 16 * 16
+            return True
+
+    pool = Pool()
+    monkeypatch.setattr(module, "KVCacheManagerPy", lambda *args, **kwargs: pool)
+    config = KVCacheManagerConfig(
+        tokens_per_block=32, layers=[], cache_tiers=[GpuCacheTierConfig(quota=1000)]
+    )
+    manager._allocate_cache_pools(
+        config, event_manager=None, cold_page_codec=None, max_gpu_total_bytes=1015
+    )
+    assert pool.quota == 992
+    assert pool.quota + manager._get_external_cache_bytes(pool) <= 1015
+    assert len(pool.resize_quotas) == 1

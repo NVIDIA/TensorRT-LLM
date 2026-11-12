@@ -163,6 +163,10 @@ class BaseMambaCacheManager(ABC):
     def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache | None:
         """Return the typed recurrent cache payload for one layer."""
 
+    def get_replay_state_indices(self, state_indices: torch.Tensor) -> torch.Tensor:
+        """Map recurrent-state slots to replay slots; shared indexing by default."""
+        return state_indices
+
     def on_state_transfer_complete(self, request_ids: list[int]) -> None:
         """Notify a model manager after a disaggregated transfer."""
 
@@ -318,13 +322,15 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
 
 
-def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
+def _host_slots_to_device(
+    slots: list[int], device: torch.device, *, dtype: torch.dtype = torch.long
+) -> torch.Tensor:
     """Copy host slot IDs without synchronizing queued GPU work.
 
     Each copy uses fresh pinned storage so later host writes cannot race it.
     """
     return torch.tensor(
-        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
+        slots, dtype=dtype, pin_memory=device.type == "cuda" and prefer_pinned()
     ).to(device, non_blocking=True)
 
 

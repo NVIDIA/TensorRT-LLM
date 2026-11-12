@@ -66,6 +66,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     DataRole,
+    GpuCacheTierConfig,
     KVCacheDesc,
     LayerId,
     PageIndexMode,
@@ -597,15 +598,31 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0
 
+    def _fixed_external_cache_bytes(self) -> int:
+        """Return model-owned GPU bytes outside the native pools that do not scale with them.
+
+        These bytes are part of every quota: token capacity converts to quota
+        including them, and the native pools receive the remainder.
+        """
+        return 0
+
     @override
     def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:
+        fixed_bytes = self._fixed_external_cache_bytes()
         bytes_per_slot = self._extra_scratch_bytes_per_slot()
         if not bytes_per_slot or not self.mamba_pp_layers:
-            return 0
+            return fixed_bytes
         layer_id = LayerId(self.layer_offsets[self.mamba_pp_layers[0]])
         scale = cache.get_page_index_scale(layer_id, MambaRole.SSM_STATE)
         pages = cache.get_page_index_upper_bound(layer_id, MambaRole.SSM_STATE)
-        return ((pages + scale - 1) // scale) * bytes_per_slot
+        return fixed_bytes + ((pages + scale - 1) // scale) * bytes_per_slot
+
+    @override
+    def get_kv_cache_stats(self):
+        stats = super().get_kv_cache_stats()
+        # Capacity profiling subtracts cache-owned allocations from its peak.
+        stats.allocated_bytes += self._fixed_external_cache_bytes()
+        return stats
 
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
         """Declare all buffers sharing one recurrent layer's slot lifecycle."""
@@ -777,7 +794,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if snapshot_slots > 0
             else 0
         )
-        return attention_quota + state_quota + extra_attention_quota
+        return (
+            attention_quota
+            + state_quota
+            + extra_attention_quota
+            + self._fixed_external_cache_bytes()
+        )
 
     @override
     def _get_max_tokens_from_quota(self, quota: int) -> float:
@@ -801,13 +823,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return low
 
     def _minimum_live_gpu_quota(self) -> int:
-        """Return the minimum quota for live states and one attention page."""
+        """Return the minimum quota for live states, one attention page and fixed storage."""
         attention_block_quota = self._attention_cache_bytes_per_token() * self.tokens_per_block
         num_state_slots = self._max_resident_sequences() + self._num_reserved_dummy_slots
         state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
         return max(
             self._get_quota_from_max_tokens(0),
-            state_quota + attention_block_quota,
+            state_quota + attention_block_quota + self._fixed_external_cache_bytes(),
         )
 
     @override
@@ -820,6 +842,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 "The V2 Mamba GPU cache quota is too small for live recurrent "
                 f"states and attention pages: got {gpu_quota} bytes, need at "
                 f"least {minimum_live_quota} bytes."
+            )
+        fixed_bytes = self._fixed_external_cache_bytes()
+        if fixed_bytes:
+            config = replace(
+                config,
+                cache_tiers=[
+                    GpuCacheTierConfig(quota=gpu_quota - fixed_bytes),
+                    *config.cache_tiers[1:],
+                ],
             )
         # _build_base_config already constructed every attention layer,
         # including dtype-specific scale and subclass-provided side buffers.

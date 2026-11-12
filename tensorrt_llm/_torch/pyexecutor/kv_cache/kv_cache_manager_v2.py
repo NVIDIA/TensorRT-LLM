@@ -4325,6 +4325,9 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_quota = min(
             upper_quota - 1,
             native_bytes * max_gpu_total_bytes // (native_bytes + external_bytes),
+            # Native pools round quotas up to allocation grains. Subtract the
+            # physical overrun too, so the first resize crosses that boundary.
+            upper_quota - (native_bytes + external_bytes - max_gpu_total_bytes),
         )
         while lower_quota < pool_quota < upper_quota:
             if not cache.resize(GPU_LEVEL, pool_quota):

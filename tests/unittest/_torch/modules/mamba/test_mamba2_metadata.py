@@ -57,6 +57,9 @@ class _GdnReplayCacheManager:
         self.prev_num_accepted_tokens = prev_num_accepted_tokens
         self.cache_buf_idx = cache_buf_idx
 
+    def get_replay_state_indices(self, state_indices):
+        return state_indices
+
     def get_replay_state_update_metadata(self):
         return ReplayStateUpdateMetadata(
             prev_num_accepted_tokens=self.prev_num_accepted_tokens,
@@ -78,6 +81,7 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
 
     class Manager:
         get_replay_state_update_metadata = Mock(return_value=replay if enabled else None)
+        get_replay_state_indices = Mock(side_effect=lambda indices: indices)
 
         @property
         def use_replay_state_update(self):
@@ -85,7 +89,8 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
 
     manager = Manager()
     metadata = object.__new__(Mamba2Metadata)
-    metadata.state_indices = [7, 2, 9]
+    metadata.state_indices = torch.tensor([7, 2, 9], dtype=torch.int32)
+    metadata.replay_state_indices = torch.zeros(3, dtype=torch.int32)
     metadata.replay_work_items = object()
     metadata.replay_n_writes = object()
     build = Mock()
@@ -97,8 +102,9 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
     manager.get_replay_state_update_metadata.assert_called_once_with()
     assert metadata.replay_num_decodes == (num_decodes if enabled else 0)
     if enabled and num_decodes:
-        build.assert_called_once_with(
-            [2, 9],
+        build.assert_called_once()
+        torch.testing.assert_close(build.call_args.args[0], metadata.state_indices[1:])
+        assert build.call_args.args[1:] == (
             replay.prev_num_accepted_tokens,
             replay.cache_buf_idx,
             metadata.replay_work_items,
@@ -347,6 +353,9 @@ class TestMamba2Metadata:
 
             def get_state_indices(self, request_ids, is_padding):
                 return self.state_indices[: len(request_ids)]
+
+            def get_replay_state_indices(self, state_indices):
+                return state_indices
 
             def get_replay_state_update_metadata(self):
                 return ReplayStateUpdateMetadata(
