@@ -398,7 +398,7 @@ def _ctx_lens_around(window, block_size, page_size):
     )
 
 
-@pytest.mark.parametrize("page_size", [32, 64])
+@pytest.mark.parametrize("page_size", [32, 64, 128, 256])
 @pytest.mark.parametrize("block_size", [1, 2, 4, 7])
 @pytest.mark.parametrize("heads", [(16, 1), (16, 2)])
 @pytest.mark.parametrize("window", [64, 4096])

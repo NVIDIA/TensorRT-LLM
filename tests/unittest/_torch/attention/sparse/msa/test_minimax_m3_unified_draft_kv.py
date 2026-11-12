@@ -32,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.dflash_attention import DFLASH_FOLDED_DECODE_LOWERING
 from tensorrt_llm.bindings import DataType
@@ -87,6 +87,7 @@ def _manager(
     max_seq_len: int = 1024,
     max_batch_size: int = 2,
     enable_block_reuse: bool = False,
+    shared_draft_block_width: Optional[int] = None,
 ) -> MiniMaxM3KVCacheManagerV2:
     """A MiniMax-M3 manager (hybrid NVFP4 MSA by default), with or without draft layer specs."""
     return MiniMaxM3KVCacheManagerV2(
@@ -114,6 +115,7 @@ def _manager(
         layer_specs=layer_specs,
         is_disagg=is_disagg,
         enable_stats=enable_block_reuse,
+        shared_draft_block_width=shared_draft_block_width,
     )
 
 
@@ -453,6 +455,49 @@ def _finish_context(manager: MiniMaxM3KVCacheManagerV2, request: LlmRequest) -> 
     request.context_chunk_size = request.context_remaining_length
     request.move_to_next_context_chunk()
     manager.update_context_resources(batch)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_the_drafters_block_lands_on_allocated_draft_pages() -> None:
+    """Every draft page the drafter's block writes is backed, on the context step and on decode.
+
+    The drafter appends its block after the request's context, through a block table whose
+    unbacked entries alias another page, and no runtime check sees past the allocation. The
+    prompt ends a few tokens before a page boundary that the decode steps then cross.
+    """
+    torch.cuda.init()
+    block_width = 16
+    prompt_len = 2 * 128 - block_width - 3
+    manager = _manager(_specs(), max_seq_len=4096, shared_draft_block_width=block_width)
+    try:
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=32,
+            input_tokens=list(range(100, 100 + prompt_len)),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+
+        def assert_block_backed(num_ctx: int) -> None:
+            first_page, end_page = num_ctx // 128, -(-(num_ctx + block_width) // 128)
+            for layer in manager.draft_layer_ids:
+                rows = manager.get_batch_cache_indices([1], layer_idx=layer)[0]
+                assert len(rows) >= end_page, (num_ctx, layer, rows)
+                for page in range(first_page, end_page):
+                    assert rows[page] >= 0, (num_ctx, layer, page, rows)
+
+        _prefill_once(manager, request)
+        assert_block_backed(prompt_len)
+        _finish_context(manager, request)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        for step in range(2 * block_width):
+            request.add_new_token(7, 0)
+            assert manager.try_allocate_generation(request)
+            assert_block_backed(request.get_num_tokens(0))
+        assert request.get_num_tokens(0) + block_width > 2 * 128
+        manager.free_resources(request)
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
