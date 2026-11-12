@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression coverage for matching advisory Pyrefly diagnostics."""
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -66,7 +68,7 @@ class DiffTests(unittest.TestCase):
             "--error",
             error,
         ]
-        with patch("sys.argv", arguments):
+        with patch("sys.argv", arguments), contextlib.redirect_stdout(io.StringIO()):
             main()
         return json.loads((output / "report.json").read_text())
 
@@ -95,6 +97,11 @@ class DiffTests(unittest.TestCase):
     def test_failed_workflow_step_produces_incomplete_report_without_scan_results(self) -> None:
         report = self._run_cli(error="Could not install the target branch dependencies.")
         self.assertEqual(report["error"], "Could not install the target branch dependencies.")
+        self.assertEqual(report["diagnostics"], [])
+
+    def test_missing_scan_report_is_incomplete(self) -> None:
+        report = self._run_cli()
+        self.assertIn("base.json", report["error"])
         self.assertEqual(report["diagnostics"], [])
 
     def test_rename_input_preserves_spaces_and_accepts_an_empty_diff(self) -> None:

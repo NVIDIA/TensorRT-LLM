@@ -93,6 +93,12 @@ test('clean comparison does not create a thread', async () => {
   assert.deepEqual(state.writes, []);
 });
 
+test('incomplete check does not create a thread', async () => {
+  const state = harness({existing: false, diagnostics: [], error: 'Scanner failed'});
+  await state.publish();
+  assert.deepEqual(state.writes, []);
+});
+
 test('incomplete check never changes whether an existing thread is resolved', async () => {
   for (const resolved of [false, true]) {
     const state = harness({resolved, diagnostics: [], error: 'Scanner failed'});
