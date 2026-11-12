@@ -86,8 +86,8 @@ T* checkedPointer(std::int64_t value, char const* name)
 //! precede the wait in every schedule, and the relay can still overlap MAIN's work after the route release.
 //!
 //! A CUDA error in any call poisons the context: every later call fails with it. Nothing recovers a poisoned context
-//! in place; HALO-R runs again only on a new state, and after a kernel trap, which faults the CUDA context, only in a
-//! new process.
+//! in place and nothing builds a new state for the layer, so HALO-R runs again only in a new process; a kernel trap
+//! also faults the CUDA context.
 class MoeRebalanceHaloRState : public torch::CustomClassHolder
 {
 public:
