@@ -48,6 +48,10 @@ from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 import tensorrt_llm._utils
+from tensorrt_llm._torch.memory.monitor.settings import reset as reset_memory_monitor_settings
+from tensorrt_llm._torch.memory.monitor.settings import (
+    resolve_environment as resolve_memory_monitor_environment,
+)
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.llmapi.disagg_utils import (
     CtxGenServerConfig,
@@ -56,6 +60,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     RouterConfig,
     ServerRole,
 )
+from tensorrt_llm.llmapi.llm_args import MemoryMonitorConfig
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -88,6 +93,9 @@ _CLEARED_ENV_VARS = (
     "DISABLE_HARMONY_ADAPTER",
     "TRTLLM_RESPONSES_API_DISABLE_STORE",
     "TRTLLM_KVCACHE_TIME_OUTPUT_PATH",
+    # With a runtime-control key, the GPU memory monitor's full mode adds GET /memory_report.
+    "TLLM_MEM_MONITOR",
+    "TRTLLM_RUNTIME_CONTROL_API_KEY",
 )
 
 
@@ -100,6 +108,9 @@ class AggConfig:
     governor_queue: bool = False  # FakeExecutor(resource_governor_queue=object())
     rl_control: bool = False  # FakeAsyncLLM + enable_rl_control_endpoints
     runtime_control: bool = False  # sleep_config + enable_runtime_control_endpoints
+    # memory_monitor_config.mode="full" + a runtime-control key: registers GET /memory_report
+    memory_report: bool = False
+    num_serve_frontends: int = 1  # FakeLlmArgs.num_serve_frontends
     return_perf_metrics: bool = False
     perf_metrics_output_dir: bool = False  # sets args.perf_metrics_output_dir=<tmp>/perf
     env: tuple = ()  # (name, value) pairs applied before construction
@@ -207,6 +218,11 @@ class ServeTestEnv:
             encode_only=config.role is ServerRole.EMBEDDING,
             reasoning_parser=config.reasoning_parser,
             num_postprocess_workers=config.num_postprocess_workers,
+            num_serve_frontends=config.num_serve_frontends,
+            # TorchLlmArgs folds the TLLM_MEM_MONITOR* variables into the config the same way.
+            memory_monitor_config=resolve_memory_monitor_environment(
+                MemoryMonitorConfig(mode="full") if config.memory_report else None
+            ),
         )
         executor = FakeExecutor(resource_governor_queue=object() if config.governor_queue else None)
         if config.role is ServerRole.VISUAL_GEN:
@@ -243,7 +259,9 @@ class ServeTestEnv:
             enable_rl_control_endpoints=config.rl_control,
             rl_control_api_key="test-key" if config.rl_control else None,
             enable_runtime_control_endpoints=config.runtime_control,
-            runtime_control_api_key="test-key" if config.runtime_control else None,
+            runtime_control_api_key=(
+                "test-key" if config.runtime_control or config.memory_report else None
+            ),
             multi_frontend_serving=multi_frontend_serving,
         )
         self._servers.append(server)
@@ -364,3 +382,5 @@ def isolated_serve_env(tmp_dir: Path) -> Iterator[ServeTestEnv]:
             usage_lib._SESSION = saved_session
     finally:
         env_patcher.stop()
+        # Resolving the environment above can leave per-process warning state behind.
+        reset_memory_monitor_settings()

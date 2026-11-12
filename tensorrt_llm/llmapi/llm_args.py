@@ -4318,25 +4318,34 @@ class _SleepConfigDefaultFactory:
         return self.default_mode
 
 
-#: Longest memory monitor interval: a week, far below ``threading.TIMEOUT_MAX``.
+# The memory monitor's bounds and defaults. The monitor's ``settings`` module
+# keeps the same values for its environment variables; a test keeps the two
+# equal, since this module cannot import the monitor at definition time.
+#: Longest interval: a week, far below ``threading.TIMEOUT_MAX``.
 _MEMORY_MONITOR_MAX_INTERVAL_S = 7 * 24 * 3600.0
+_MEMORY_MONITOR_MIN_PERIODIC_INTERVAL_S = 1.0
+_MEMORY_MONITOR_DEFAULT_OOM_INTERVAL_S = 60.0
+_MEMORY_MONITOR_MAX_PERIODIC_FILES = 100
 
 
 class MemoryMonitorConfig(StrictBaseModel):
     """Configuration for the GPU memory monitor.
 
     Each field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;
-    a variable set to a non-empty value overrides the field. See
+    a variable set to a non-blank value overrides the field, and
+    ``TorchLlmArgs`` applies it when the arguments are validated. See
     ``docs/source/features/memory-monitor.md``.
     """
 
     mode: Literal["off", "oom", "full"] = Field(
         default="oom",
-        description="'oom' reports when GPU memory runs out and does nothing "
-        "until then; 'full' also records startup, reports when it completes "
-        "and compares later reports with that point; 'off' produces no "
-        "reports on its own. YAML's unquoted off and on (booleans) and 0 and "
-        "1 are read as 'off' and 'full'. Overridden by TLLM_MEM_MONITOR.")
+        description="'oom' reports out-of-memory errors that the executor's "
+        "own error handling sees and records nothing else; 'full' also "
+        "records startup, reports when it completes, compares later reports "
+        "with that point and reports out-of-memory errors seen anywhere in "
+        "the process; 'off' produces no reports on its own. YAML's unquoted "
+        "off and on (booleans) and 0 and 1 are read as 'off' and 'full'. "
+        "Overridden by TLLM_MEM_MONITOR.")
     ranks: Optional[List[NonNegativeInt]] = Field(
         default=None,
         min_length=1,
@@ -4349,16 +4358,16 @@ class MemoryMonitorConfig(StrictBaseModel):
         "down by the code that allocated it. Slows every PyTorch allocation; "
         "meant for reproducing a problem. Overridden by "
         "TLLM_MEM_MONITOR_STACKS.")
-    periodic_report_interval: Optional[float] = Field(
+    periodic_report_interval_s: Optional[float] = Field(
         default=None,
-        ge=1.0,
+        ge=_MEMORY_MONITOR_MIN_PERIODIC_INTERVAL_S,
         le=_MEMORY_MONITOR_MAX_INTERVAL_S,
         allow_inf_nan=False,
         description="In 'full' mode, report every this many seconds while "
         "serving, at most once a week. Overridden by "
-        "TLLM_MEM_MONITOR_INTERVAL.")
-    oom_report_interval: float = Field(
-        default=60.0,
+        "TLLM_MEM_MONITOR_INTERVAL, where 0 turns the periodic report off.")
+    oom_report_interval_s: float = Field(
+        default=_MEMORY_MONITOR_DEFAULT_OOM_INTERVAL_S,
         ge=0.0,
         le=_MEMORY_MONITOR_MAX_INTERVAL_S,
         allow_inf_nan=False,
@@ -4367,10 +4376,15 @@ class MemoryMonitorConfig(StrictBaseModel):
     report_dir: Optional[str] = Field(
         default=None,
         min_length=1,
-        description="Directory to which every report is also written, one "
-        "file per report. It is created readable by its owner only, and only "
-        "the newest 100 periodic reports of each rank are kept. Overridden by "
-        "TLLM_MEM_MONITOR_DIR.")
+        description="Directory to which every report except on-demand ones "
+        "is also written, one file per report. It is created readable by its "
+        "owner only, and only the newest "
+        f"{_MEMORY_MONITOR_MAX_PERIODIC_FILES} periodic reports of each rank "
+        "and process are kept. Overridden by TLLM_MEM_MONITOR_DIR.")
+
+    #: Fields whose value came from a ``TLLM_MEM_MONITOR*`` variable, so that
+    #: messages name the variable rather than the field.
+    _from_environment: frozenset = PrivateAttr(default_factory=frozenset)
 
     @field_validator("mode",
                      mode="before",
@@ -7953,11 +7967,29 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def resolve_memory_monitor_environment(self) -> 'TorchLlmArgs':
+        """Fold the ``TLLM_MEM_MONITOR*`` variables into ``memory_monitor_config``.
+
+        Read once, in the process that builds the arguments, so that every
+        rank and the ``trtllm-serve`` frontend get the same settings with
+        them instead of reading their own environment. An invalid variable,
+        or a rank filter that selects none of the job's ranks, is reported
+        and ignored.
+        """
+        from tensorrt_llm._torch.memory.monitor.settings import \
+            resolve_environment
+        self.memory_monitor_config = resolve_environment(
+            self.memory_monitor_config, self.parallel_config.world_size)
+        return self
+
+    @model_validator(mode="after")
     def validate_memory_monitor_ranks(self) -> 'TorchLlmArgs':
         """Reject a memory monitor rank filter naming ranks the job lacks.
 
         Such a filter would turn the monitor off on every rank without a
-        word. ``TLLM_MEM_MONITOR_RANKS`` is checked when the monitor arms.
+        word. A rank filter from ``TLLM_MEM_MONITOR_RANKS`` that selects
+        none of them is ignored instead, by
+        :meth:`resolve_memory_monitor_environment`.
         """
         config = self.memory_monitor_config
         if config is None or config.ranks is None:

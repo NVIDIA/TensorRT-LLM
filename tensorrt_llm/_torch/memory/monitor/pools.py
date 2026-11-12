@@ -44,8 +44,10 @@ report and classified on the next one.
 from __future__ import annotations
 
 import gc
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import torch
 
@@ -65,6 +67,7 @@ __all__ = [
     "pool_usage",
     "prime",
     "register_pool",
+    "released_tags_pinned",
 ]
 
 DEFAULT_POOL = (0, 0)
@@ -78,6 +81,16 @@ _sleep_tags: dict[tuple[int, int], str] = {}
 #: backs it, so without this a sleeping process looks larger than it is and
 #: the residual goes negative.
 _released_tags: set[str] = set()
+#: Sleep-mode tags the monitored executor allocated memory under. A tag
+#: released by another executor in the process says nothing about the
+#: monitored executor's memory unless that executor has memory under it too:
+#: ``releaseWithTag`` releases every blob of the tag in the process.
+_monitored_sleep_tags: set[str] = set()
+#: Guards ``_released_tags``: the sleep path changes it on its own thread
+#: while a report reads it.
+_released_lock = threading.Lock()
+#: Per thread, the released set a report pinned for its whole reading.
+_pinned = threading.local()
 #: Pools already classified as graph or unregistered MemPool.
 _seen: dict[tuple[int, int], tuple[str, str]] = {}
 
@@ -96,16 +109,49 @@ def register_pool(pool_id: Iterable[int], label: str, sleep_tag: str | None = No
     _mem_pools[key] = label
     if sleep_tag is not None:
         _sleep_tags[key] = sleep_tag
+        # Imported here: the providers package imports this module.
+        from .providers import unmonitored_executor_current
+
+        if not unmonitored_executor_current():
+            _monitored_sleep_tags.add(sleep_tag)
 
 
 def mark_released(tags: Iterable[str]) -> None:
     """Record that sleep mode has released the memory of ``tags``."""
-    _released_tags.update(tags)
+    with _released_lock:
+        _released_tags.update(tags)
 
 
 def mark_materialized(tags: Iterable[str]) -> None:
     """Record that the memory of ``tags`` is backed again."""
-    _released_tags.difference_update(tags)
+    with _released_lock:
+        _released_tags.difference_update(tags)
+
+
+def _released() -> frozenset[str]:
+    """The released tags: the pinned set inside :func:`released_tags_pinned`, else the current one."""
+    pinned = getattr(_pinned, "tags", None)
+    if pinned is not None:
+        return pinned
+    with _released_lock:
+        return frozenset(_released_tags)
+
+
+@contextmanager
+def released_tags_pinned() -> Iterator[None]:
+    """Within this block, every release query on this thread reads one snapshot.
+
+    A report reads the release state for the pools, the tags and the KV
+    cache rows; sleep or wakeup on another thread in between would let one
+    of them count a pool the others leave out, and the rows would no longer
+    add up to the process total.
+    """
+    previous = getattr(_pinned, "tags", None)
+    _pinned.tags = _released() if previous is None else previous
+    try:
+        yield
+    finally:
+        _pinned.tags = previous
 
 
 def forget_released_tags() -> None:
@@ -115,25 +161,34 @@ def forget_released_tags() -> None:
     and a tag left marked would make the next executor's pools under the
     same tag look released.
     """
-    _released_tags.clear()
+    with _released_lock:
+        _released_tags.clear()
+    _monitored_sleep_tags.clear()
 
 
 def is_tag_released(tag: str) -> bool:
-    """Whether sleep mode has released the memory allocated under ``tag``."""
-    return tag in _released_tags
+    """Whether sleep mode has released the monitored executor's memory under ``tag``.
+
+    False for a tag the monitored executor has no sleep-mode memory under,
+    such as ``kv_cache`` of an executor without ``sleep_config`` while
+    another executor in the process sleeps.
+    """
+    return tag in _monitored_sleep_tags and tag in _released()
 
 
 def is_released(pool_id: Iterable[int]) -> bool:
     """Whether ``pool_id`` is a sleep-mode pool whose memory is released."""
     tag = _sleep_tags.get(tuple(pool_id))
-    return tag is not None and tag in _released_tags
+    return tag is not None and tag in _released()
 
 
 def clear_registered_pools() -> None:
     """Forget every registration. For tests."""
     _mem_pools.clear()
     _sleep_tags.clear()
-    _released_tags.clear()
+    _monitored_sleep_tags.clear()
+    with _released_lock:
+        _released_tags.clear()
     _seen.clear()
 
 

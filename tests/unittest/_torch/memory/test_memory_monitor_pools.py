@@ -190,7 +190,11 @@ def test_graph_memory_is_cuda_graphs_not_reusable_cache():
         assert sum(s for s in totals.sizes.values() if s is not None) == totals.process_total, (
             "groups still add up with a graph alive"
         )
-        rows = [e for e in _tag_entries() if e.category is Category.CUDA_GRAPHS]
+        rows = [
+            e
+            for e in _tag_entries(tagging.live_bytes_by_tag(tagging.get_frozen_map()))
+            if e.category is Category.CUDA_GRAPHS
+        ]
         assert rows and rows[0].owner == "in use by graphs", "graph rows use a readable owner"
     finally:
         del graph, kept
@@ -223,8 +227,9 @@ def test_pools_are_classified_ahead_of_reports_and_the_walk_cannot_break_them(mo
         def walked():
             raise AssertionError("pools seen at startup must not be walked for again")
 
-        monkeypatch.setattr(pool_mod, "_live_mempool_ids", walked)
-        usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
+        with monkeypatch.context() as patch:
+            patch.setattr(pool_mod, "_live_mempool_ids", walked)
+            usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
         assert usage[tuple(unregistered.id)] == "mempool", "primed, without a walk"
         assert usage[tuple(pool)] == "graph"
 
@@ -236,14 +241,50 @@ def test_pools_are_classified_ahead_of_reports_and_the_walk_cannot_break_them(mo
         def failing():
             raise RuntimeError("walk failed")
 
-        monkeypatch.setattr(pool_mod, "_live_mempool_ids", failing)
-        usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
+        with monkeypatch.context() as patch:
+            patch.setattr(pool_mod, "_live_mempool_ids", failing)
+            usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
         assert usage[tuple(later.id)] == "unclassified"
         assert usage[tuple(pool)] == "graph", "pools already classified keep their kind"
-        monkeypatch.undo()
         usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
         assert usage[tuple(later.id)] == "mempool", "retried once the walk works"
         assert odd  # kept alive through every walk above
         del late
     finally:
         del held, graph, kept
+
+
+def test_one_report_reads_one_sleep_release_state(monkeypatch):
+    """Sleep or wakeup on another thread must not change the state mid-report."""
+    import threading
+
+    from tensorrt_llm._torch.memory.monitor import providers
+
+    seen = []
+
+    class _Probe:
+        name = "probe"
+        category = None
+
+        def available(self):
+            return True
+
+        def collect(self):
+            seen.append(pool_mod.is_tag_released("kv_cache"))
+            flip = threading.Thread(target=pool_mod.mark_released, args=(("kv_cache",),))
+            flip.start()
+            flip.join()
+            seen.append(pool_mod.is_tag_released("kv_cache"))
+            return []
+
+    pool_mod.clear_registered_pools()
+    providers.clear_registered_providers()
+    try:
+        pool_mod.register_pool((7, 4), "sleep: kv_cache", sleep_tag="kv_cache")
+        providers.register_provider(_Probe())
+        assert _capture() is not None
+        assert seen == [False, False], "the release state changed during one report"
+        assert pool_mod.is_tag_released("kv_cache"), "the next report sees the release"
+    finally:
+        providers.clear_registered_providers()
+        pool_mod.clear_registered_pools()

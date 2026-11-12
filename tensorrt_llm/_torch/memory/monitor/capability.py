@@ -190,12 +190,16 @@ def nvml_process_usage(device_index: int) -> tuple[int | None, str]:
     Falling back to ``total - free`` would silently attribute colocated
     processes' memory to this one.
     """
+    # Imported here: ``_torch.utils`` imports the quantization utilities,
+    # which are not loaded yet when this package is.
+    from ...utils import get_device_uuid
+
     unavailable = (None, NVML_UNAVAILABLE)
     try:
         # By UUID, not by index: torch numbers only the devices
         # CUDA_VISIBLE_DEVICES exposes, NVML numbers every device on the
         # host, and the two disagree whenever the variable remaps them.
-        uuid = f"GPU-{torch.cuda.get_device_properties(device_index).uuid}"
+        uuid = get_device_uuid(device_index)
     except (AssertionError, RuntimeError):
         return unavailable
     if not _nvml.ready():
@@ -218,27 +222,13 @@ def nvml_process_usage(device_index: int) -> tuple[int | None, str]:
     return None, _NOT_LISTED
 
 
-def _nvml_available() -> bool:
-    """Whether NVML initialises and reports at least one device.
-
-    Initialising is not enough: on some hosts NVML initialises while every
-    query fails.
-    """
-    if not _nvml.ready():
-        return False
-    try:
-        return pynvml.nvmlDeviceGetCount() > 0
-    except pynvml.NVMLError:
-        return False
-
-
-def probe_capability(nvml_available: bool | None = None) -> Capability:
+def probe_capability(nvml_available: bool) -> Capability:
     """Probe the allocator without perturbing it.
 
     Performs no allocation, no cache release and no synchronisation: a
     diagnostic that changes the thing it measures is worse than no
-    diagnostic. ``nvml_available`` lets a caller that has just queried NVML
-    pass the answer instead of opening a second NVML session.
+    diagnostic. ``nvml_available`` is whether the reading that comes with
+    this probe got an answer from NVML; it is recorded, not queried again.
     """
     conf, conf_var = _alloc_conf()
     return Capability(
@@ -247,5 +237,5 @@ def probe_capability(nvml_available: bool | None = None) -> Capability:
         alloc_conf_var=conf_var,
         expandable_segments="expandable_segments:True" in conf,
         metadata_supported=metadata_supported(),
-        nvml_available=_nvml_available() if nvml_available is None else nvml_available,
+        nvml_available=nvml_available,
     )

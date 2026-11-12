@@ -50,11 +50,13 @@ __all__ = [
     "DeepEpProvider",
     "DwdpLocalWeightsProvider",
     "DwdpPagePoolProvider",
+    "ExecutorToken",
     "IpcMemoryProvider",
     "McastAllReduceProvider",
     "MemoryCountersProvider",
     "MnnvlProvider",
     "MonitorProvider",
+    "NOT_MONITORED",
     "NativeMemoryProvider",
     "NcclWindowProvider",
     "SymmMemProvider",
@@ -64,8 +66,10 @@ __all__ = [
     "collect_all",
     "default_providers",
     "end_executor",
-    "has_other_live_executors",
+    "executor_monitored",
+    "monitor_held",
     "register_provider",
+    "unmonitored_executor_current",
     "unregister_providers_of",
 ]
 
@@ -87,49 +91,111 @@ class MonitorProvider(Protocol):
 #: process-wide accessor, so the code that builds them registers them
 #: instead of this module guessing where to look.
 _registered: list[tuple[object | None, MonitorProvider]] = []
+
+#: Why an executor gets no monitoring: the monitor follows one executor per process.
+NOT_MONITORED = (
+    "not monitored: another executor in this process holds the GPU memory monitor, "
+    "which follows one executor per process"
+)
+
+
+class ExecutorToken:
+    """An executor's registration with the monitor, from :func:`begin_executor`.
+
+    ``monitored`` says whether the monitor follows this executor. Only one
+    executor per process is monitored: the monitor's startup records,
+    warmup baseline, device and settings describe a single executor, and a
+    second executor in the same process would otherwise mix its memory into
+    the first one's reports.
+    """
+
+    __slots__ = ("monitored",)
+
+    def __init__(self, monitored: bool) -> None:
+        self.monitored = monitored
+
+    def __repr__(self) -> str:
+        return f"ExecutorToken(monitored={self.monitored})"
+
+
 #: The executor being built; registrations made meanwhile belong to it.
-_current_executor: object | None = None
-#: Executors begun and not yet ended, oldest first.
-_live_executors: list[object] = []
+_current_executor: ExecutorToken | None = None
+#: The executor the monitor follows, from its creation to its shutdown.
+_monitored: ExecutorToken | None = None
 
 
-def begin_executor() -> object:
+def begin_executor() -> ExecutorToken:
     """Start a new executor's registrations; returns its token.
 
-    Providers registered from now on belong to this executor, so a second
-    executor in the same process adds its own KV cache instead of replacing
-    the first one's. Pass the token to :func:`end_executor` at shutdown.
+    The executor is monitored unless another monitored executor is still
+    alive in this process; one that is not is told so once, in the log.
+    Providers registered while it is being built belong to it. Pass the
+    token to :func:`end_executor` at shutdown.
     """
-    global _current_executor
-    _current_executor = object()
-    _live_executors.append(_current_executor)
-    return _current_executor
+    global _current_executor, _monitored
+    token = ExecutorToken(monitored=_monitored is None)
+    if token.monitored:
+        _monitored = token
+    else:
+        logger.warning(
+            "memory monitor: another executor in this process is monitored, so this "
+            "executor is not: it gets no out-of-memory reports, startup record or "
+            "memory report of its own"
+        )
+    _current_executor = token
+    return token
 
 
-def current_executor() -> object | None:
+def current_executor() -> ExecutorToken | None:
     """The token of the executor being built, if any."""
     return _current_executor
 
 
-def has_other_live_executors() -> bool:
-    """Whether an executor other than the one being built is alive."""
-    return any(token is not _current_executor for token in _live_executors)
+def executor_monitored(token: ExecutorToken | None = None) -> bool:
+    """Whether the monitor follows ``token``'s executor (default: the one being built)."""
+    if token is None:
+        token = _current_executor
+    return token is not None and token is _monitored
 
 
-def end_executor(token: object) -> None:
-    """Drop what the executor ``token`` registered, at its shutdown.
+def unmonitored_executor_current() -> bool:
+    """Whether the executor being built, or last built, is one the monitor does not follow.
 
-    Once no executor has registrations left, sleep-mode release state is
-    forgotten too: the pools it described are gone, and a new executor's
-    pools under the same tag would otherwise look released.
+    Its startup is not recorded, its providers are not registered and its
+    creation does not suspend reporting for the monitored executor. False
+    when no executor was begun, so code run outside an executor is
+    monitored as before.
     """
-    global _current_executor
-    _registered[:] = [(owner, p) for owner, p in _registered if owner is not token]
-    _live_executors[:] = [t for t in _live_executors if t is not token]
+    return _current_executor is not None and _current_executor is not _monitored
+
+
+def monitor_held() -> bool:
+    """Whether a monitored executor is alive in this process."""
+    return _monitored is not None
+
+
+def end_executor(token: ExecutorToken) -> None:
+    """Release everything the monitor holds for ``token``'s executor, at its shutdown.
+
+    For the monitored executor: its out-of-memory reporting, its startup
+    records and stack recording, its registered providers and the
+    sleep-mode release state its pools had; the next executor created in
+    this process is then monitored. Safe to call more than once and for an
+    executor that is not monitored.
+    """
+    global _current_executor, _monitored
+    # Imported here: both modules build on this package.
+    from .. import tagging, triggers
+
     if _current_executor is token:
         _current_executor = None
-    if not any(owner is not None for owner, _ in _registered):
-        pools.forget_released_tags()
+    if token is not _monitored:
+        return
+    triggers.release_oom_reporter(owner=token)
+    tagging.forget_startup_of(token)
+    _registered[:] = [(owner, p) for owner, p in _registered if owner is not token]
+    _monitored = None
+    pools.forget_released_tags()
 
 
 def register_provider(provider: MonitorProvider) -> None:
@@ -137,9 +203,11 @@ def register_provider(provider: MonitorProvider) -> None:
 
     Registering the same ``name`` twice for one executor replaces the
     earlier one rather than reporting the component twice: a rebuilt KV
-    cache manager supersedes the one it replaced. Another executor's
-    provider of the same name is kept.
+    cache manager supersedes the one it replaced. A provider registered
+    while an executor that is not monitored is being built is dropped.
     """
+    if unmonitored_executor_current():
+        return
     owner = _current_executor
     _registered[:] = [
         (o, p) for o, p in _registered if not (o is owner and p.name == provider.name)
@@ -162,11 +230,11 @@ def unregister_providers_of(component: object) -> None:
 
 
 def clear_registered_providers() -> None:
-    """Drop every registration, of every executor."""
-    global _current_executor
+    """Drop every registration and executor token, of every executor."""
+    global _current_executor, _monitored
     _registered.clear()
-    _live_executors.clear()
     _current_executor = None
+    _monitored = None
 
 
 def default_providers() -> list[MonitorProvider]:
@@ -192,7 +260,7 @@ def default_providers() -> list[MonitorProvider]:
 
 def _failed_entry(provider: MonitorProvider, exc: Exception) -> Entry:
     """A provider that raised, listed as unmeasured rather than left out."""
-    category = getattr(provider, "category", None)
+    category = provider.category
     if GROUP_OF.get(category) is None:
         category = Category.TAGGED_OTHER
     return Entry(
@@ -201,7 +269,7 @@ def _failed_entry(provider: MonitorProvider, exc: Exception) -> Entry:
         source=Source.COMPONENT,
         placement=Placement.NON_TORCH,
         basis=Basis.PHYSICAL_BACKING,
-        owner=getattr(provider, "name", type(provider).__name__),
+        owner=provider.name,
         note=f"provider failed: {type(exc).__name__}: {exc}",
     )
 

@@ -4173,7 +4173,7 @@
     },
     "MemoryMonitorConfig": {
       "additionalProperties": false,
-      "description": "Configuration for the GPU memory monitor.\n\nEach field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;\na variable set to a non-empty value overrides the field. See\n``docs/source/features/memory-monitor.md``.",
+      "description": "Configuration for the GPU memory monitor.\n\nEach field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;\na variable set to a non-blank value overrides the field, and\n``TorchLlmArgs`` applies it when the arguments are validated. See\n``docs/source/features/memory-monitor.md``.",
       "properties": {
         "mode": {
           "anyOf": [
@@ -4199,18 +4199,18 @@
             }
           ],
           "default": "oom",
-          "description": "'oom' reports when GPU memory runs out and does nothing until then; 'full' also records startup, reports when it completes and compares later reports with that point; 'off' produces no reports on its own. YAML's unquoted off and on (booleans) and 0 and 1 are read as 'off' and 'full'. Overridden by TLLM_MEM_MONITOR.",
+          "description": "'oom' reports out-of-memory errors that the executor's own error handling sees and records nothing else; 'full' also records startup, reports when it completes, compares later reports with that point and reports out-of-memory errors seen anywhere in the process; 'off' produces no reports on its own. YAML's unquoted off and on (booleans) and 0 and 1 are read as 'off' and 'full'. Overridden by TLLM_MEM_MONITOR.",
           "title": "Mode"
         },
-        "oom_report_interval": {
+        "oom_report_interval_s": {
           "default": 60.0,
           "description": "Minimum seconds between two out-of-memory reports, at most a week. Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.",
           "maximum": 604800.0,
           "minimum": 0.0,
-          "title": "Oom Report Interval",
+          "title": "Oom Report Interval S",
           "type": "number"
         },
-        "periodic_report_interval": {
+        "periodic_report_interval_s": {
           "anyOf": [
             {
               "maximum": 604800.0,
@@ -4222,8 +4222,8 @@
             }
           ],
           "default": null,
-          "description": "In 'full' mode, report every this many seconds while serving, at most once a week. Overridden by TLLM_MEM_MONITOR_INTERVAL.",
-          "title": "Periodic Report Interval"
+          "description": "In 'full' mode, report every this many seconds while serving, at most once a week. Overridden by TLLM_MEM_MONITOR_INTERVAL, where 0 turns the periodic report off.",
+          "title": "Periodic Report Interval S"
         },
         "ranks": {
           "anyOf": [
@@ -4260,7 +4260,7 @@
             }
           ],
           "default": null,
-          "description": "Directory to which every report is also written, one file per report. It is created readable by its owner only, and only the newest 100 periodic reports of each rank are kept. Overridden by TLLM_MEM_MONITOR_DIR.",
+          "description": "Directory to which every report except on-demand ones is also written, one file per report. It is created readable by its owner only, and only the newest 100 periodic reports of each rank and process are kept. Overridden by TLLM_MEM_MONITOR_DIR.",
           "title": "Report Dir"
         }
       },

@@ -1074,12 +1074,12 @@
     {
       "capture_policy": "float",
       "kind": "value",
-      "path": "memory_monitor_config.oom_report_interval"
+      "path": "memory_monitor_config.oom_report_interval_s"
     },
     {
       "capture_policy": "float|none",
       "kind": "value",
-      "path": "memory_monitor_config.periodic_report_interval"
+      "path": "memory_monitor_config.periodic_report_interval_s"
     },
     {
       "capture_policy": "list[int]|none",

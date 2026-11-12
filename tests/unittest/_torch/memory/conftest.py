@@ -40,10 +40,8 @@ _SETTING_VARS = (
 
 
 def _reset_monitor() -> None:
-    # Providers go first: settings.configure() keeps the configuration while
-    # an executor a test leaked is still registered.
     providers.clear_registered_providers()
-    settings.configure(None)
+    settings.reset()
     startup.clear()
     claims.clear_claims()
     if tagging.tagging_window_active():

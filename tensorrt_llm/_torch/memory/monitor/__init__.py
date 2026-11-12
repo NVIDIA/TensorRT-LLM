@@ -16,8 +16,10 @@
 
 ``memory_monitor_config`` in the LLM arguments, or ``TLLM_MEM_MONITOR``,
 selects a mode (see :func:`mode`). By default only an out-of-memory error
-produces a report, and nothing runs until one happens; full mode also
-records startup and reports when it completes.
+that reaches the executor's error handling produces a report, and nothing
+is recorded or hooked in the meantime; full mode also records startup,
+reports when it completes and watches the whole process for out-of-memory
+errors. The monitor follows one executor per process.
 
 Usage::
 
@@ -45,6 +47,7 @@ from .settings import (
     configure,
     current_rank,
     full_mode,
+    full_mode_in,
     full_mode_requested,
     mode,
     oom_reports_enabled,
@@ -69,6 +72,7 @@ __all__ = [
     "configure",
     "current_rank",
     "full_mode",
+    "full_mode_in",
     "full_mode_requested",
     "mode",
     "oom_reports_enabled",

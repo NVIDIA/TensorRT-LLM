@@ -213,7 +213,7 @@ def _window_lookup(
     return lookup
 
 
-def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
+def start_tagging_window() -> bool:
     """Begin recording allocation history so tags land in the trace.
 
     Returns whether recording started. Keep the window to startup.
@@ -235,6 +235,7 @@ def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
         )
         return False
     try:
+        max_entries = _DEFAULT_MAX_ENTRIES
         torch.cuda.memory._record_memory_history(context=None, max_entries=max_entries)
     except RuntimeError as exc:
         logger.debug(f"memory monitor: could not start history recording ({exc})")
@@ -254,6 +255,8 @@ def stop_tagging_window() -> None:
     """Stop recording and discard the trace. Safe to call when it was never started."""
     global _recording
     _recording = False
+    # The windows describe the discarded trace.
+    _windows.clear()
     try:
         torch.cuda.memory._record_memory_history(None)
     except RuntimeError as exc:
@@ -275,9 +278,6 @@ class TagSnapshot:
     #: an owner's address takes the label only if its requested size matches;
     #: an owner without a recorded size matches any size.
     sizes: dict[int, int] = field(default_factory=dict)
-
-    def __bool__(self) -> bool:
-        return self.supported
 
     def owner_of(self, address: int, size: int) -> str | None:
         """The label of the block at ``address``, if it is still that block."""
@@ -428,7 +428,10 @@ def live_attribution(
                 claimed.setdefault(address, label)
 
     # Precedence: a claimed module, then the graph pool a block sits in, then
-    # the creation step's tag.
+    # the creation step's tag. A block that carries frames was allocated
+    # after the freeze -- startup records no stacks, stack recording starts
+    # only once the map is frozen -- so the frozen map never applies to it,
+    # even when it reuses a freed startup block's address and size.
     totals: dict[str, int] = {UNTAGGED: 0}
     # What is left untagged, by the code that allocated it -- populated only
     # when stack recording is on, since blocks carry frames only then.
@@ -436,7 +439,12 @@ def live_attribution(
     for address, size, in_graph, frames, requested in blocks:
         label = claimed.get(address)
         if label is None:
-            label = CUDA_GRAPHS if in_graph else (snapshot.owner_of(address, requested) or UNTAGGED)
+            if in_graph:
+                label = CUDA_GRAPHS
+            elif frames:
+                label = UNTAGGED
+            else:
+                label = snapshot.owner_of(address, requested) or UNTAGGED
         totals[label] = totals.get(label, 0) + size
         if label == UNTAGGED:
             site = site_of(frames)
@@ -498,17 +506,12 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
     if not full_mode(rank):
         yield False
         return
-    if providers.has_other_live_executors():
+    if providers.unmonitored_executor_current():
         # Startup records -- steps, regions, the warmup baseline and the
         # frozen tags -- are per process. Recording this executor's startup
         # would overwrite those of the executor still serving, whose reports
         # would then compare against the wrong warmup and lose the names of
-        # its buffers.
-        logger.warning(
-            "memory monitor: another executor is running in this process; this "
-            "executor's startup is not recorded, and reports keep describing the "
-            "running executor's startup"
-        )
+        # its buffers. ``begin_executor`` has already said so in the log.
         # Steps, regions and the KV sizing plan of this startup must not be
         # written into the running executor's record either.
         with startup.recording_paused():
@@ -551,30 +554,36 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
                 else:
                     _recording = False
         set_frozen_map(snapshot)
-        if not interrupted:
+        if failed and _crash_kill_pending():
+            # The watchdog kills this rank after its grace period; building a
+            # report first could use that time up before the error that
+            # explains the failure reaches the client.
+            logger.warning(
+                "memory monitor: startup failed while a rank-crash kill is pending; "
+                "the startup breakdown is skipped so the error is delivered first"
+            )
+        elif not interrupted:
             _log_window_result(snapshot, rank, failed=failed, out_of_memory=out_of_memory)
+
+
+def _crash_kill_pending() -> bool:
+    # Imported here: the executor package imports this module.
+    from ...pyexecutor.hang_detector import rank_crash_kill_pending
+
+    return rank_crash_kill_pending()
 
 
 def _is_out_of_memory(exc: BaseException) -> bool:
     """Whether ``exc``, or an exception it was raised from, is a device OOM.
 
-    Uses the same predicate as the runtime OOM report, so startup and
-    serving agree on what counts as running out of device memory.
+    Uses the same test as the runtime OOM report, so startup and serving
+    agree on what counts as running out of device memory.
     """
     # Imported here: ``triggers`` builds reports through ``capture``, which
     # reads this module's tags.
-    from .triggers import is_device_oom_message
+    from .triggers import is_device_oom
 
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, torch.OutOfMemoryError):
-            return True
-        if is_device_oom_message(str(current)):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+    return is_device_oom(exc)
 
 
 def _log_window_result(

@@ -320,23 +320,23 @@ def test_registrations_belong_to_their_executor():
     pools.forget_released_tags()
     try:
         first = reg.begin_executor()
+        pools.register_pool((7, 3), "sleep: kv_cache", sleep_tag="kv_cache")
         reg.register_provider(_Kv(10))
         reg.register_provider(_Kv(20))  # rebuilt by the same executor: replaces
         assert kv_sizes() == [20]
 
         second = reg.begin_executor()
-        reg.register_provider(_Kv(30))  # another executor's KV cache is kept
-        assert kv_sizes() == [20, 30]
+        reg.register_provider(_Kv(30))  # an executor the monitor does not follow
+        assert kv_sizes() == [20]
 
         pools.mark_released(["kv_cache"])
-        reg.end_executor(first)
-        assert kv_sizes() == [30]
-        assert pools.is_tag_released("kv_cache"), "the second executor still sleeps"
-
         reg.end_executor(second)
+        assert kv_sizes() == [20] and pools.is_tag_released("kv_cache"), "nothing of the first's"
+
+        reg.end_executor(first)
         assert kv_sizes() == []
-        # Nothing left that released memory: a new executor starts awake.
+        # The monitored executor is gone: a new executor starts awake.
         assert not pools.is_tag_released("kv_cache")
     finally:
         reg.clear_registered_providers()
-        pools.forget_released_tags()
+        pools.clear_registered_pools()

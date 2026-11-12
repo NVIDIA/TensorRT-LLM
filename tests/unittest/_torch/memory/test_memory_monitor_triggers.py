@@ -24,21 +24,15 @@ import gc
 import os
 import stat
 import threading
-import types
 
 import pytest
 import torch
-from memory_monitor_test_utils import MB, FakeKvManager, kv_stats
+from memory_monitor_test_utils import MB, FakeKvManager, capture_warnings, kv_stats
 
 from tensorrt_llm._torch.memory.monitor import providers, settings, startup
-from tensorrt_llm._torch.memory.monitor.providers import (
-    clear_registered_providers,
-    collect_all,
-    default_providers,
-    register_provider,
-)
+from tensorrt_llm._torch.memory.monitor.providers import collect_all, register_provider
 from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
-from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
+from tensorrt_llm._torch.memory.monitor.schema import Category
 from tensorrt_llm._torch.memory.monitor.triggers import (
     install_oom_reporter,
     release_oom_reporter,
@@ -46,48 +40,6 @@ from tensorrt_llm._torch.memory.monitor.triggers import (
     suspend_reporting,
 )
 from tensorrt_llm.logger import logger
-
-
-def _capture_warnings(monkeypatch) -> list[str]:
-    """Warnings logged from now on, each once-only warning included again."""
-    warnings: list[str] = []
-    monkeypatch.setattr(logger, "_appeared_keys", set())
-
-    def log(severity, *msg):
-        if severity == logger.WARNING:
-            warnings.append(" ".join(str(m) for m in msg))
-
-    monkeypatch.setattr(logger, "log", log)
-    return warnings
-
-
-@pytest.mark.cpu_only
-def test_registry():
-    def physical():
-        return [
-            e
-            for e in collect_all()
-            if e.category is Category.KV_CACHE_POOL and e.basis is Basis.PHYSICAL_BACKING
-        ]
-
-    # The default set cannot find the manager; without a registration the
-    # pool would land in the residual bucket.
-    assert not any(isinstance(p, KvCacheProvider) for p in default_providers())
-    assert not [e for e in collect_all() if e.category is Category.KV_CACHE_POOL]
-
-    manager = FakeKvManager(kv_stats(100, 40, 10))
-    register_provider(KvCacheProvider(manager))
-    kv = [e for e in collect_all() if e.category is Category.KV_CACHE_POOL]
-    assert kv, "a registered provider must reach the report"
-    assert physical()[0].size_bytes == 100 * MB
-
-    clear_registered_providers()
-    first = FakeKvManager(kv_stats(100, 0, 0))
-    second = FakeKvManager(kv_stats(200, 0, 0))
-    register_provider(KvCacheProvider(first))
-    register_provider(KvCacheProvider(second))
-    assert len(physical()) == 1, "a rebuilt manager must supersede the old one"
-    assert physical()[0].size_bytes == 200 * MB
 
 
 @pytest.mark.cpu_only
@@ -133,13 +85,13 @@ def test_reports_only_where_enabled(monkeypatch):
 def test_rank_filter_is_parsed_strictly(monkeypatch):
     from tensorrt_llm._torch.memory import monitor
 
-    warnings = _capture_warnings(monkeypatch)
+    warnings = capture_warnings(monkeypatch)
     for raw, expected, warns in [
         ("0,4", frozenset({0, 4}), False),
         (" 1 , 2 ", frozenset({1, 2}), False),
         ("0-3,8", frozenset({0, 1, 2, 3, 8}), False),
         ("", None, False),
-        (" ", None, True),
+        (" ", None, False),  # blank: unset
         (",", None, True),
         ("garbage", None, True),
         ("0;4", None, True),
@@ -177,7 +129,7 @@ def test_a_rank_filter_outside_the_job_reports_on_every_rank(monkeypatch):
     import tensorrt_llm._torch.memory.monitor.triggers as mod
 
     monkeypatch.setattr(mod, "_attached", True)
-    warnings = _capture_warnings(monkeypatch)
+    warnings = capture_warnings(monkeypatch)
     # Rank 8 of an eight-rank job does not exist: every rank would be silent.
     monkeypatch.setenv(settings.RANK_ENV_VAR, "8")
     assert install_oom_reporter(rank=0, device=0, world_size=8) is True
@@ -196,7 +148,7 @@ def test_settings_are_validated(monkeypatch):
     from tensorrt_llm._torch.memory import monitor
     from tensorrt_llm._torch.memory.monitor import triggers
 
-    warnings = _capture_warnings(monkeypatch)
+    warnings = capture_warnings(monkeypatch)
     for raw, expected in [
         ("abc", 60.0),
         ("-1", 60.0),
@@ -245,7 +197,7 @@ def armed(monkeypatch):
 
     clock = [1000.0]
     monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(mod, "_enabled_flag", True)
+    monkeypatch.setattr(mod, "_armed", mod._Armed(owner=None, rank=None, device=3, hooks=True))
     monkeypatch.setattr(mod, "_device", 3)
     monkeypatch.setattr(mod, "_device_nearly_full", lambda: False)
     emitted = []
@@ -283,7 +235,7 @@ def test_torch_observer_only_records(armed):
     assert len(emitted) == 1
     headline = emitted[0]["headline"]
     assert "PyTorch could not allocate 1.00 GiB on device 0" in headline
-    assert "device free 0.50 GiB; PyTorch may use up to 80.00 GiB" in headline
+    assert "device free 512.00 MiB; PyTorch may use up to 80.00 GiB" in headline
     assert "CUDA out of memory" in headline
     assert emitted[0]["device_index"] == 3, "built on the executor's device"
 
@@ -319,10 +271,38 @@ def test_only_the_failed_allocation_the_error_names_is_in_the_headline(armed):
     mod._on_out_of_memory(0, (1 << 30) + (4 << 20), 80 << 30, 1 << 29)
     mod.notify_error(_TORCH_OOM)
     assert "PyTorch could not allocate 1.00 GiB on device 0" in emitted[0]["headline"]
-    reset()
-    mod._on_out_of_memory(0, 20 << 20, 80 << 30, 1 << 29)
+
+
+@pytest.mark.cpu_only
+def test_the_headline_reads_like_pytorchs_own_message(armed):
+    """A full device failing a small request is the most common real OOM."""
+    mod, _, emitted, reset = armed
+
+    mod._on_out_of_memory(0, 20 << 20, 80 << 30, 3 << 20)
     mod.notify_error("CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total")
-    assert "PyTorch could not allocate 0.02 GiB on device 0" in emitted[0]["headline"]
+    assert (
+        "PyTorch could not allocate 20.00 MiB on device 0 (device free 3.00 MiB; "
+        "PyTorch may use up to 80.00 GiB" in emitted[0]["headline"]
+    )
+    reset()
+    mod._on_out_of_memory(0, 512, 80 << 30, 0)
+    mod.notify_error("CUDA out of memory. Tried to allocate 512 bytes. GPU 0 has a total")
+    assert (
+        "could not allocate 512 bytes on device 0 (device free 0 bytes" in (emitted[0]["headline"])
+    )
+
+    # An error logged as a whole traceback is headed by the exception, its last line.
+    reset()
+    mod.notify_error(
+        "Traceback (most recent call last):\n"
+        '  File "worker.py", line 723, in run\n'
+        "    step()\n"
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0\n"
+    )
+    assert emitted[0]["headline"] == (
+        "OUT OF MEMORY: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. "
+        "GPU 0"
+    )
 
 
 @pytest.mark.cpu_only
@@ -360,15 +340,16 @@ def test_oom_reports_are_rate_limited(armed, monkeypatch):
     assert len(failed) == 1 and len(emitted) == 1, "the slot after a failed report"
 
 
+_NCCL_CUDA_ERROR = (
+    "Failed, NCCL error /src/cpp/tensorrt_llm/common/opUtils.cpp:212 "
+    "'unhandled cuda error (run with NCCL_DEBUG=INFO for details)'"
+)
+
+
 @pytest.mark.cpu_only
-def test_notify_error_reports_only_device_out_of_memory(armed, monkeypatch):
-    mod, _, emitted, reset = armed
-    nccl = (
-        "Failed, NCCL error /src/cpp/tensorrt_llm/common/opUtils.cpp:212 "
-        "'unhandled cuda error (run with NCCL_DEBUG=INFO for details)'"
-    )
-    for message in (
-        "CUDA error: out of memory",
+@pytest.mark.parametrize(
+    "message",
+    [
         "[TensorRT-LLM][ERROR] CUDA runtime error in cudaMallocAsync: out of memory",
         "cudaErrorMemoryAllocation",
         "CUDA driver error: CUDA_ERROR_OUT_OF_MEMORY",
@@ -376,46 +357,131 @@ def test_notify_error_reports_only_device_out_of_memory(armed, monkeypatch):
         "[TensorRT-LLM][ERROR] CUBLAS_STATUS_ALLOC_FAILED",
         "Failed to create cublas handle. Status: 3, Context: 0x5a1, Free Memory: 12 MB "
         "(0.0%), Total: 81559 MB. Consider reducing kv_cache_config.free_gpu_memory_fraction.",
-    ):
-        reset()
-        mod.notify_error(message)
-        assert len(emitted) == 1, f"not recognised: {message!r}"
-        assert emitted[0]["headline"].startswith("OUT OF MEMORY: ")
-    for message in (
+    ],
+)
+def test_device_out_of_memory_messages_are_reported(armed, message):
+    mod, _, emitted, _ = armed
+    mod.notify_error(message)
+    assert len(emitted) == 1 and emitted[0]["headline"].startswith("OUT OF MEMORY: ")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "message",
+    [
         "Encountered an error in decode: index out of range",
         "error",
         "",
         None,
+        "Failed to create cublas handle. Status: 1, Context: 0x5a1, Free Memory: 40000 MB",
         # Host memory, not the GPU's.
         "cuMemHostRegister failed: out of memory",
         "HostOOMError: Host out of memory",
-        "Failed to create cublas handle. Status: 1, Context: 0x5a1, Free Memory: 40000 MB",
-        # NCCL's generic CUDA error, with plenty of memory free.
-        nccl,
-    ):
-        reset()
-        mod.notify_error(message)
-        assert emitted == [], f"not a device OOM: {message!r}"
+        "[TensorRT-LLM][ERROR] CUDA runtime error in cudaHostRegister(ptr, size, "
+        "cudaHostRegisterDefault): out of memory",
+        "mmap failed: Cannot allocate memory",
+    ],
+)
+def test_other_errors_and_host_memory_are_not_reported(armed, message):
+    mod, _, emitted, _ = armed
+    mod.notify_error(message)
+    assert emitted == []
 
-    # The same NCCL error on a device that is nearly full is an OOM.
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "message",
+    [
+        # PyTorch's pinned host allocator and a raw cudaMalloc alike.
+        "CUDA error: out of memory",
+        # The KV cache manager's CuOOMError, for any CUDA_ERROR_OUT_OF_MEMORY.
+        "tensorrt_llm.runtime.kv_cache_manager_v2.CuOOMError: CUDA out of memory",
+        _NCCL_CUDA_ERROR,
+    ],
+)
+def test_a_failure_that_names_no_memory_is_a_gpu_oom_only_on_a_full_device(
+    armed, monkeypatch, message
+):
+    mod, _, emitted, reset = armed
+    mod.notify_error(message)
+    assert emitted == [], "plenty of device memory free: not the GPU's"
     reset()
     monkeypatch.setattr(mod, "_device_nearly_full", lambda: True)
-    mod.notify_error(nccl)
-    assert len(emitted) == 1, "NCCL failure on a full device"
+    mod.notify_error(message)
+    assert len(emitted) == 1, "the device is nearly full"
+
+
+class _PinnedAllocationError(RuntimeError):
+    """Shaped like ``torch.AcceleratorError`` for a failed ``cudaHostAlloc``."""
+
+    __module__ = "torch"
+    error_code = 2
+
+
+_PinnedAllocationError.__name__ = "AcceleratorError"
+
+
+class HostOOMError(RuntimeError):
+    """Named like the KV cache manager's host-memory error."""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "error, reported",
+    [
+        # The type decides where it can: PyTorch raises OutOfMemoryError only
+        # from its device allocators, whatever the message says.
+        (torch.OutOfMemoryError("CUDA error: out of memory"), True),
+        (_PinnedAllocationError("CUDA error: out of memory"), False),
+        (HostOOMError("cuMemHostRegister failed: out of memory"), False),
+        (MemoryError(), False),
+        (ValueError("index out of range"), False),
+    ],
+)
+def test_an_exception_is_classified_by_its_type(armed, error, reported):
+    mod, _, emitted, _ = armed
+    mod.notify_error(error=error)
+    assert bool(emitted) is reported
+
+
+@pytest.mark.cpu_only
+def test_an_exception_is_classified_along_its_cause_chain(armed):
+    mod, _, emitted, _ = armed
+    try:
+        try:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0")
+        except torch.OutOfMemoryError as inner:
+            raise RuntimeError("Executor step failed") from inner
+    except RuntimeError as outer:
+        mod.notify_error(str(outer), error=outer)
+    assert len(emitted) == 1
+    assert emitted[0]["headline"] == "OUT OF MEMORY: Executor step failed"
+
+
+@pytest.mark.cpu_only
+def test_another_executors_error_is_not_reported(armed, monkeypatch):
+    mod, _, emitted, _ = armed
+    mine, other = object(), object()
+    monkeypatch.setattr(mod, "_armed", mod._Armed(owner=mine, rank=None, device=3, hooks=False))
+    mod.notify_error(_TORCH_OOM, owner=other)
+    assert emitted == [], "reports describe the armed executor"
+    mod.notify_error(_TORCH_OOM, owner=mine)
+    assert len(emitted) == 1
 
 
 @pytest.mark.cpu_only
 def test_oom_handlers_never_get_in_the_way(armed, monkeypatch):
     mod, _, emitted, _ = armed
+    armed_state = mod._armed
 
     # torch cannot detach an observer, so the callback stays attached
     # and must simply do nothing once uninstalled.
-    monkeypatch.setattr(mod, "_enabled_flag", False)
+    monkeypatch.setattr(mod, "_armed", None)
     _oom(mod)
     mod.notify_error(_TORCH_OOM)
     assert emitted == [] and mod._last_failed_allocation is None, "inert when not armed"
 
-    monkeypatch.setattr(mod, "_enabled_flag", True)
+    monkeypatch.setattr(mod, "_armed", armed_state)
     with suspend_reporting():
         _oom(mod)
         mod.notify_error(_TORCH_OOM)
@@ -467,6 +533,7 @@ def test_report_files_have_safe_names(monkeypatch, tmp_path):
     path = mod._save("text", "warmup/before_warmup", rank=1)
     assert path is not None and os.path.dirname(path) == str(tmp_path)
     assert path.endswith("_warmup_before_warmup.txt")
+    assert "Z-" in os.path.basename(path), "named in UTC"
 
 
 @pytest.mark.cpu_only
@@ -476,6 +543,7 @@ def test_report_files_are_private_and_periodic_ones_are_capped(monkeypatch, tmp_
     directory = tmp_path / "reports"
     monkeypatch.setenv(mod.DIR_VAR, str(directory))
     monkeypatch.setattr(mod, "MAX_PERIODIC_FILES", 3)
+    monkeypatch.setattr(mod, "_periodic_files", {})
     path = mod._save("text", "out_of_memory", rank=0)
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700, "only the owner may list it"
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, "only the owner may read it"
@@ -489,16 +557,35 @@ def test_report_files_are_private_and_periodic_ones_are_capped(monkeypatch, tmp_
 
 
 @pytest.mark.cpu_only
+def test_periodic_files_are_kept_in_the_order_they_were_written(monkeypatch, tmp_path):
+    """The clock going back, as in the hour a daylight-saving change repeats."""
+    import tensorrt_llm._torch.memory.monitor.triggers as mod
+
+    monkeypatch.setenv(mod.DIR_VAR, str(tmp_path))
+    monkeypatch.setattr(mod, "MAX_PERIODIC_FILES", 3)
+    monkeypatch.setattr(mod, "_periodic_files", {})
+    hours = iter(["02", "02", "02", "01", "01", "01"])
+
+    def strftime(fmt, *args):
+        return f"20261101T{next(hours)}0000Z"
+
+    monkeypatch.setattr(mod.time, "strftime", strftime)
+    written = [mod._save(f"periodic {i}", "periodic", rank=0) for i in range(6)]
+    kept = {p.name for p in tmp_path.glob("*_periodic.txt")}
+    assert kept == {os.path.basename(p) for p in written[-3:]}, "the newest three written"
+
+
+@pytest.mark.cpu_only
 def test_an_unwritable_report_directory_warns_once_and_never_raises(monkeypatch, tmp_path):
     import tensorrt_llm._torch.memory.monitor.triggers as mod
     from tensorrt_llm.llmapi import MemoryMonitorConfig
 
-    warnings = _capture_warnings(monkeypatch)
+    warnings = capture_warnings(monkeypatch)
     # A NUL byte from a YAML or Python config raises ValueError, not OSError.
     settings.configure(MemoryMonitorConfig(report_dir=f"{tmp_path}/bad\0dir"))
     assert mod._save("text", "startup", rank=0) is None
     assert mod._save("text", "startup", rank=0) is None
-    settings.configure(None)
+    settings.reset()
     blocker = tmp_path / "file"
     blocker.write_text("")
     monkeypatch.setenv(mod.DIR_VAR, str(blocker / "sub"))
@@ -531,29 +618,6 @@ def test_report_now(monkeypatch):
     assert report_now(tag="unit", rank=0) is not None, "a broken provider broke the report"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_trace_log_hook(monkeypatch):
-    """``log_mem_snapshot`` is the other way into the report: the real entry
-    point must put the report in the log."""
-    import tensorrt_llm._torch.pyexecutor.trace_log_utils as mod
-
-    monkeypatch.setenv("TLLM_LOG_MEM_PROFILE", "1")
-    logged = []
-    monkeypatch.setattr(mod.logger, "info", lambda msg, *a, **k: logged.append(msg))
-
-    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    mod.log_mem_snapshot("unit")
-    assert any("GPU memory monitor" in str(m) for m in logged), (
-        "the monitor report must reach the log through log_mem_snapshot"
-    )
-
-    logged.clear()
-    monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
-    mod.log_mem_snapshot("unit")
-    assert logged, "the one-line snapshot is still logged"
-    assert not any("GPU memory monitor" in str(m) for m in logged), "monitor off"
-
-
 @pytest.mark.cpu_only
 def test_failed_startup_is_labelled(monkeypatch):
     from tensorrt_llm._torch.memory.monitor import tagging
@@ -574,59 +638,89 @@ def test_failed_startup_is_labelled(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_oom_reporter_is_armed_only_after_startup(monkeypatch):
-    import contextlib
-
+def test_the_monitor_follows_one_executor_per_process(monkeypatch):
     import tensorrt_llm._torch.memory.monitor.triggers as trig
-    import tensorrt_llm._torch.pyexecutor.py_executor_creator as creator
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
 
-    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    monkeypatch.setattr(torch._C, "_cuda_attach_out_of_memory_observer", lambda cb: None)
-    monkeypatch.setattr(trig, "_attached", False)
-    monkeypatch.setattr(creator.gpu_memory_tagging, "startup_window", contextlib.nullcontext)
-    monkeypatch.setattr(creator, "monitor_executor_initialization", contextlib.nullcontext)
+    monkeypatch.setattr(trig, "_attached", True)
+    warnings = capture_warnings(monkeypatch)
+    settings.configure(MemoryMonitorConfig(mode="full", periodic_report_interval_s=60))
+    first = providers.begin_executor()
+    assert providers.executor_monitored(first)
+    first_manager = FakeKvManager(kv_stats(100, 0, 0))
+    register_provider(KvCacheProvider(first_manager, role="first"))
+    assert install_oom_reporter(rank=0, device=1, owner=first)
+    periodic = trig._periodic
 
-    during_startup = []
+    # A second LLM in the same process, with the default configuration.
+    settings.configure(MemoryMonitorConfig(mode="off"))
+    second = providers.begin_executor()
+    assert not providers.executor_monitored(second)
+    assert [w for w in warnings if "this executor is not" in w]
+    assert settings.mode() == "full", "the monitored executor's settings stay"
+    manager = FakeKvManager(kv_stats(200, 0, 0))
+    register_provider(KvCacheProvider(manager, role="second"))
+    assert [p.name for _, p in providers._registered] == ["kv_cache.first"], (
+        "no providers of its own"
+    )
+    with suspend_reporting():
+        assert trig._suspended == 0, "building it does not silence the serving executor"
+    assert install_oom_reporter(rank=0, device=2, owner=second) is False
+    assert trig._device == 1 and trig._periodic is periodic, "reports describe the first"
 
-    def fake_impl(**kwargs):
-        # Warmup and KV sizing catch their own OOMs here; nothing may be
-        # reported meanwhile, also for an executor already serving.
-        during_startup.append((trig._enabled_flag, trig._suspended))
-        return types.SimpleNamespace(device_id=None)
-
-    monkeypatch.setattr(creator, "_create_py_executor_impl", fake_impl)
-    first = creator.create_py_executor(llm_args=None)
-    assert during_startup == [(False, 1)], "not armed while the first executor starts"
-    assert first._oom_reporter_armed and trig._enabled_flag
-
-    # A second executor in the same process: reporting is suspended while it
-    # is built and stays armed until both have released it.
-    second = creator.create_py_executor(llm_args=None)
-    assert during_startup[1] == (True, 1), "suspended while the second executor starts"
-    assert second._oom_reporter_armed and trig._suspended == 0
-    release_oom_reporter()
-    assert trig._enabled_flag, "still armed for the executor that is serving"
-    release_oom_reporter()
-    assert not trig._enabled_flag, "the last release disarms"
-    release_oom_reporter()  # an extra release is harmless
+    # The unmonitored executor shuts down first: nothing changes.
+    providers.end_executor(second)
+    assert trig._armed is not None and trig._armed.owner is first
+    # The monitored one shuts down: the slot is free for the next executor.
+    providers.end_executor(first)
+    assert trig._armed is None and trig._periodic is None and not providers._registered
+    settings.configure(None)
+    assert settings.mode() == "oom", "the next executor's configuration applies"
+    third = providers.begin_executor()
+    assert providers.executor_monitored(third)
+    providers.end_executor(third)
 
 
 @pytest.mark.cpu_only
-def test_periodic_reporter_follows_the_latest_executor(monkeypatch):
+def test_arming_is_released_only_by_its_owner(monkeypatch):
     import tensorrt_llm._torch.memory.monitor.triggers as trig
 
-    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    monkeypatch.setenv(trig.PERIODIC_INTERVAL_VAR, "60")
     monkeypatch.setattr(trig, "_attached", True)
-    assert install_oom_reporter(rank=0, device=1)
-    first = trig._periodic
-    assert first is not None and first._device == 1
-    assert install_oom_reporter(rank=0, device=2)
-    assert trig._periodic is not first and trig._periodic._device == 2
-    assert not first._thread.is_alive(), "the previous reporter is stopped"
-    release_oom_reporter()
-    release_oom_reporter()
-    assert trig._periodic is None
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    owner, stranger = providers.begin_executor(), providers.begin_executor()
+    assert install_oom_reporter(rank=0, device=1, owner=stranger) is False, "not monitored"
+    assert install_oom_reporter(rank=0, device=1, owner=owner)
+    assert install_oom_reporter(rank=0, device=1, owner=owner), "arming twice is harmless"
+    release_oom_reporter(owner=stranger)
+    assert trig._armed is not None and trig._armed.owner is owner
+    release_oom_reporter(owner=owner)
+    assert trig._armed is None
+    release_oom_reporter(owner=owner)  # released twice: no effect
+
+
+@pytest.mark.cpu_only
+def test_disarming_clears_the_state_before_waiting_for_a_report(monkeypatch):
+    """A report still being built is waited for after disarming, not during."""
+    import tensorrt_llm._torch.memory.monitor.triggers as trig
+
+    monkeypatch.setattr(trig, "_attached", True)
+    assert install_oom_reporter(rank=0, device=0)
+    seen_while_waiting = []
+
+    class _Building:
+        def join(self, timeout=None):
+            seen_while_waiting.append((trig._armed, trig._device))
+            # Another thread may arm meanwhile without waiting for this join.
+            acquired = trig._arm_lock.acquire(blocking=False)
+            seen_while_waiting.append(acquired)
+            if acquired:
+                trig._arm_lock.release()
+
+    monkeypatch.setattr(trig, "_background_report", _Building())
+    waiter = threading.Thread(target=trig.uninstall_oom_reporter)
+    waiter.start()
+    waiter.join()
+    assert seen_while_waiting == [(None, None), True]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -666,6 +760,42 @@ def test_baseline_is_taken_when_startup_completes(monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_the_default_mode_installs_no_process_wide_hook(monkeypatch):
+    import logging
+
+    import tensorrt_llm._torch.memory.monitor.triggers as trig
+
+    monkeypatch.setattr(trig, "_attached", False)
+    attaches = []
+    monkeypatch.setattr(
+        torch._C, "_cuda_attach_out_of_memory_observer", lambda cb: attaches.append(cb)
+    )
+    excepthook = threading.excepthook
+    reported = []
+    monkeypatch.setattr(trig, "_report_oom", lambda headline, **kw: reported.append(headline))
+
+    assert install_oom_reporter(rank=0, device=0)  # the default mode, oom
+    assert trig._log_filter not in logger.python_logger.filters
+    assert threading.excepthook is excepthook and attaches == []
+    # A logged error is not reported; the executor's own error handling is.
+    logger.python_logger.handle(
+        logging.LogRecord("TRT-LLM", logging.ERROR, __file__, 1, _TORCH_OOM, None, None)
+    )
+    assert reported == []
+    trig.notify_error(error=torch.OutOfMemoryError(_TORCH_OOM))
+    assert len(reported) == 1
+    release_oom_reporter()
+
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    assert install_oom_reporter(rank=0, device=0)
+    assert trig._log_filter in logger.python_logger.filters
+    assert threading.excepthook is trig._thread_excepthook and len(attaches) == 1
+    release_oom_reporter()
+    assert trig._log_filter not in logger.python_logger.filters
+    assert threading.excepthook is excepthook
+
+
+@pytest.mark.cpu_only
 def test_armed_even_without_a_torch_observer(monkeypatch):
     import tensorrt_llm._torch.memory.monitor.triggers as mod
 
@@ -673,11 +803,11 @@ def test_armed_even_without_a_torch_observer(monkeypatch):
     monkeypatch.setattr(mod, "_attached", False)
     monkeypatch.delattr(torch._C, "_cuda_attach_out_of_memory_observer", raising=False)
     assert mod.install_oom_reporter() is True
-    assert mod._enabled_flag is True
+    assert mod._armed is not None
 
 
 @pytest.mark.cpu_only
-def test_a_failed_arming_is_undone_and_leaves_other_executors_armed(monkeypatch):
+def test_a_failed_arming_is_undone(monkeypatch):
     from tensorrt_llm._torch.memory.monitor import triggers
 
     monkeypatch.setattr(triggers, "_attached", True)  # leave torch's observer alone
@@ -691,72 +821,19 @@ def test_a_failed_arming_is_undone_and_leaves_other_executors_armed(monkeypatch)
     with monkeypatch.context() as failing:
         failing.setattr(triggers, "_start_periodic", no_threads)
         assert install_oom_reporter(rank=0) is False, "a failed arming reports reporting as off"
-    assert triggers._armed == [] and triggers._enabled_flag is False
+    assert triggers._armed is None
     assert triggers._previous_thread_hook is hooks_before, "its hooks are removed again"
-
-    monkeypatch.setenv("TLLM_MEM_MONITOR", "oom")
-    assert install_oom_reporter(rank=0) is True
-    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    with monkeypatch.context() as failing:
-        failing.setattr(triggers, "_start_periodic", no_threads)
-        assert install_oom_reporter(rank=0) is False
-    assert len(triggers._armed) == 1 and triggers._enabled_flag, "the first executor stays armed"
+    assert install_oom_reporter(rank=0) is True, "and a later arming succeeds"
     release_oom_reporter()
-
-
-@pytest.mark.cpu_only
-def test_releasing_one_executor_restores_the_other(monkeypatch):
-    """Two executors in one process; the second runs with the default config."""
-    import tensorrt_llm._torch.memory.monitor.triggers as trig
-    from tensorrt_llm.llmapi import MemoryMonitorConfig
-
-    monkeypatch.setattr(trig, "_attached", True)
-    settings.configure(MemoryMonitorConfig(mode="full", periodic_report_interval=60))
-    first_token = providers.begin_executor()
-    assert install_oom_reporter(rank=0, device=1, owner=first_token)
-    settings.configure(None)  # the second LLM's default config is not applied
-    second_token = providers.begin_executor()
-    assert install_oom_reporter(rank=0, device=2, owner=second_token)
-    assert trig._device == 2 and trig._periodic._device == 2
-
-    # The second executor shuts down first.
-    release_oom_reporter(owner=second_token)
-    providers.end_executor(second_token)
-    assert trig._device == 1, "reports describe the remaining executor's device"
-    assert trig._periodic is not None and trig._periodic._device == 1, "and its periodic reports"
-    assert trig._periodic._thread.is_alive()
-    assert settings.mode() == "full", "still in the first executor's mode"
-
-    release_oom_reporter(owner=first_token)
-    providers.end_executor(first_token)
-    assert trig._armed == [] and trig._periodic is None and trig._device is None
-
-
-@pytest.mark.cpu_only
-def test_releasing_an_older_executor_keeps_the_newest_one_reporting(monkeypatch):
-    import tensorrt_llm._torch.memory.monitor.triggers as trig
-
-    monkeypatch.setattr(trig, "_attached", True)
-    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    monkeypatch.setenv(trig.PERIODIC_INTERVAL_VAR, "60")
-    first, second = object(), object()
-    assert install_oom_reporter(rank=0, device=1, owner=first)
-    assert install_oom_reporter(rank=0, device=2, owner=second)
-    newest = trig._periodic
-    release_oom_reporter(owner=first)
-    assert trig._device == 2 and trig._periodic is newest, "the newest executor is untouched"
-    release_oom_reporter(owner=first)  # released twice: no effect
-    assert len(trig._armed) == 1
-    release_oom_reporter(owner=second)
-    assert trig._armed == [] and trig._periodic is None
 
 
 @pytest.mark.cpu_only
 def test_settings_that_act_only_in_full_mode_are_reported(monkeypatch):
     import tensorrt_llm._torch.memory.monitor.triggers as trig
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
 
     monkeypatch.setattr(trig, "_attached", True)
-    warnings = _capture_warnings(monkeypatch)
+    warnings = capture_warnings(monkeypatch)
     monkeypatch.setenv(trig.PERIODIC_INTERVAL_VAR, "30")
     monkeypatch.setenv(settings.STACKS_ENV_VAR, "1")
     assert install_oom_reporter(rank=0, device=0)  # the default mode, oom
@@ -766,8 +843,21 @@ def test_settings_that_act_only_in_full_mode_are_reported(monkeypatch):
     assert any("TLLM_MEM_MONITOR_STACKS='1' takes effect only in full mode" in w for w in warnings)
     release_oom_reporter()
 
+    # Set in the configuration, a setting is named by its field.
     warnings.clear()
     monkeypatch.delenv(trig.PERIODIC_INTERVAL_VAR)
+    monkeypatch.delenv(settings.STACKS_ENV_VAR)
+    settings.configure(MemoryMonitorConfig(periodic_report_interval_s=30))
+    assert install_oom_reporter(rank=0, device=0)
+    assert [w for w in warnings if "takes effect only in full mode" in w] == [
+        "memory monitor: memory_monitor_config.periodic_report_interval_s='30.0' takes effect "
+        "only in full mode, and the mode is oom; no periodic report is taken"
+    ]
+    release_oom_reporter()
+    settings.reset()
+
+    warnings.clear()
+    monkeypatch.setenv(settings.STACKS_ENV_VAR, "1")
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
     monkeypatch.setattr(trig, "tagging_supported", lambda: False)
     assert install_oom_reporter(rank=0, device=0)
@@ -783,6 +873,7 @@ def test_a_thread_hook_that_chains_back_does_not_recurse(monkeypatch):
     """A library hook saved ours as its previous; re-arming saved it as ours."""
     import tensorrt_llm._torch.memory.monitor.triggers as trig
 
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")  # the hooks are installed in full mode
     monkeypatch.setattr(trig, "_attached", True)
     monkeypatch.setattr(threading, "excepthook", threading.__excepthook__)
     printed = []

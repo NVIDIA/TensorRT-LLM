@@ -244,7 +244,7 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
     import types
 
     from tensorrt_llm._torch.memory.monitor import capability
-    from tensorrt_llm._torch.memory.monitor.capability import _nvml_available, nvml_process_usage
+    from tensorrt_llm._torch.memory.monitor.capability import nvml_process_usage
 
     class NVMLError(Exception):
         pass
@@ -260,14 +260,6 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
         monkeypatch.setattr(capability, "pynvml", fake)
         monkeypatch.setattr(capability, "_nvml", capability._NvmlSession())
         return fake
-
-    # Initialising is not enough: the library has to answer.
-    use(nvmlDeviceGetCount=broken)
-    assert _nvml_available() is False
-    use(nvmlInit=broken, nvmlDeviceGetCount=lambda: 1)
-    assert _nvml_available() is False
-    use(nvmlDeviceGetCount=lambda: 1)
-    assert _nvml_available() is True
 
     looked_up = []
     proc = types.SimpleNamespace(pid=os.getpid(), usedGpuMemory=7 * GIB)
@@ -289,10 +281,18 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
     assert nvml_process_usage(0) == (7 * GIB, "")
     assert looked_up == ["GPU-6b4fa2a7-2f22-4b34-1f72-7e6c4a551774"]
 
-    # A process NVML does not list (another PID namespace) is unknown, with the reason.
-    proc.pid = -1
+    # NVML that does not initialise has no figure either.
+    use(nvmlInit=broken)
+    assert nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
+    monkeypatch.setattr(capability, "pynvml", fake)
+    monkeypatch.setattr(capability, "_nvml", capability._NvmlSession())
+
+    # A process NVML does not list (another PID namespace: NVML lists the
+    # host PID, never ours) is unknown, with the reason.
+    proc.pid = os.getpid() + 100000
     used, reason = nvml_process_usage(0)
     assert used is None and "not in NVML's process list" in reason
+    assert "PID namespace" in reason
     # So is NVML failing outright.
     fake.nvmlDeviceGetComputeRunningProcesses_v3 = broken
     assert nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)

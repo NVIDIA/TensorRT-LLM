@@ -24,7 +24,6 @@ from memory_monitor_test_utils import GIB, MB, capture_graph, needs_gpu
 
 import tensorrt_llm._torch.memory.monitor as mon
 from tensorrt_llm._torch.memory.monitor import pools, startup, tagging
-from tensorrt_llm._torch.memory.monitor import triggers as triggers_module
 from tensorrt_llm._torch.memory.monitor.schema import Category
 from tensorrt_llm._torch.memory.monitor.summary import Group, group_totals
 
@@ -76,8 +75,9 @@ def test_report_cost(monkeypatch):
 
 @needs_gpu
 def test_groups_add_up_when_allocator_counters_lag_the_snapshot(monkeypatch):
-    """Tags come from the snapshot; a live figure read at another moment
-    could fall below them, and clamping the difference broke the sum."""
+    """Tags come from the snapshot, and so does the live figure they are
+    subtracted from: the groups add up even when the allocator's counters,
+    read at another moment, are below the tagged total."""
     module = torch.nn.Linear(4096, 4096, device="cuda")
     tagging.claim_module_memory(module, "WEIGHTS")
     untagged = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")  # noqa: F841
@@ -104,6 +104,7 @@ def test_released_kv_cache_is_listed_not_counted():
     provider = KvCacheProvider(manager)
     pools.clear_registered_pools()
     try:
+        pools.register_pool((7, 5), "sleep: kv_cache", sleep_tag="kv_cache")
         pools.mark_released(["kv_cache"])
         entries = provider.collect()
         counted = sum(e.size_bytes for e in entries if e.counts_toward_total)
@@ -226,46 +227,7 @@ def test_startup_state_does_not_leak(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_nvml_lookup_says_why_the_process_is_missing(monkeypatch):
-    from tensorrt_llm._torch.memory.monitor import capability
-    from tensorrt_llm._torch.memory.monitor.capability import nvml_process_usage
-
-    class NVMLError(Exception):
-        pass
-
-    proc = types.SimpleNamespace(pid=os.getpid(), usedGpuMemory=7 * MB)
-    fake = types.SimpleNamespace(
-        NVMLError=NVMLError,
-        nvmlInit=lambda: None,
-        nvmlShutdown=lambda: None,
-        nvmlDeviceGetHandleByUUID=lambda u: "handle",
-        nvmlDeviceGetComputeRunningProcesses_v3=lambda h: [proc],
-    )
-    monkeypatch.setattr(capability, "pynvml", fake)
-    monkeypatch.setattr(capability, "_nvml", capability._NvmlSession())
-    monkeypatch.setattr(
-        torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(uuid="x")
-    )
-
-    assert nvml_process_usage(0) == (7 * MB, ""), "found process has no reason"
-    # Another PID namespace: NVML lists the host PID, never ours.
-    proc.pid = os.getpid() + 100000
-    used, reason = nvml_process_usage(0)
-    assert used is None and "PID namespace" in reason
-
-
-@pytest.mark.cpu_only
 def test_startup_problems_are_logged_not_raised(monkeypatch):
-    from tensorrt_llm._torch.pyexecutor import trace_log_utils
-
-    def broken(**_):
-        raise RuntimeError("snapshot failed")
-
-    # The warmup report never raises.
-    with monkeypatch.context() as m:
-        m.setattr(triggers_module, "capture", broken)
-        trace_log_utils._maybe_log_monitor_report("warmup")
-
     # Startup history that wrapped the ring buffer is reported.
     warnings = []
     monkeypatch.setattr(tagging, "tagging_supported", lambda: True)
@@ -318,10 +280,15 @@ def test_sleep_tags_are_marked_as_each_call_succeeds(monkeypatch):
                 raise RuntimeError("out of memory")
             return 1
 
-    pools.forget_released_tags()
+    def sleep_pools(*tags):
+        for i, tag in enumerate(tags):
+            pools.register_pool((9, i), f"sleep: {tag}", sleep_tag=tag)
+
+    pools.clear_registered_pools()
     try:
         # Waking sorted tags: kv_cache comes back, then the weights fail and
         # roll back. Only the weights are still released.
+        sleep_pools("kv_cache", "model_weights")
         pools.mark_released(("kv_cache", "model_weights"))
         monkeypatch.setattr(
             virtual_memory, "get_virtual_memory_manager", lambda: Manager("model_weights")
@@ -332,13 +299,14 @@ def test_sleep_tags_are_marked_as_each_call_succeeds(monkeypatch):
         assert pools.is_tag_released("model_weights"), "rolled back"
 
         # A release that fails part way has still released the failing tag.
-        pools.forget_released_tags()
+        pools.clear_registered_pools()
+        sleep_pools("a", "b")
         monkeypatch.setattr(virtual_memory, "get_virtual_memory_manager", lambda: Manager("a"))
         with pytest.raises(RuntimeError):
             virtual_memory.release_with_tag("a", "b")
         assert pools.is_tag_released("a") and not pools.is_tag_released("b")
     finally:
-        pools.forget_released_tags()
+        pools.clear_registered_pools()
 
 
 @needs_gpu

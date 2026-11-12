@@ -19,50 +19,53 @@ The memory lives in the executor's process, not the one that created the
 context and nothing else -- so every trigger here has to fire inside the
 worker.
 
-Two triggers fire there. In full mode startup ends with one breakdown --
-tagged ``startup_failed`` if startup raised. After that, an out-of-memory
-error reports, which is the moment the breakdown answers a question somebody
-is actually asking.
+The monitor follows one executor per process (see
+:func:`providers.begin_executor`); the triggers below describe that
+executor's device, and an executor that is not monitored arms nothing.
+
+In full mode startup ends with one breakdown -- tagged ``startup_failed`` if
+startup raised. After that, an out-of-memory error reports, which is the
+moment the breakdown answers a question somebody is actually asking.
 
 A report is built only for an out-of-memory error nobody handled. Some
 callers allocate optimistically and fall back when that fails -- KV cache
 sizing, warmup and graph capture, optional workspaces in attention and MoE
-kernels -- and torch's OOM observer fires before any of them can catch the
-error. The observer therefore only records the failed allocation. The report
-is built when the error is seen to escape: the executor's error handler and
-the sleep/wakeup listener pass their message to :func:`notify_error`,
-TensorRT-LLM's logger passes every ERROR message through it -- background
-threads such as the KV transfer workers catch their failures and log them --
-and a thread that dies of an out-of-memory error reaches it through
-``threading.excepthook``. The recorded allocation goes into the report's
-headline only when the error is that failure -- PyTorch's message names the
-same size on the same device: how much was asked for and what PyTorch held
-at that moment, before the failing step's memory was released. Any other
-error, such as a native allocation failing after PyTorch recovered from its
-own, is described by its own first line.
+kernels -- so the report is built when the error is seen to escape: the
+executor's error handling and the sleep/wakeup path pass the error to
+:func:`notify_error`. That is all the default ``oom`` mode does; it installs
+nothing process-wide.
 
-The same path covers allocations made outside the PyTorch allocator --
-cuBLAS workspaces, NCCL buffers, TensorRT-LLM's own pools -- which torch's
-observer never sees. :func:`notify_error` recognises their messages; NCCL's
-generic CUDA error is taken for an out-of-memory error only when the device
-is nearly full. Host-memory failures are not GPU memory and are ignored.
+Full mode also watches the rest of the process: TensorRT-LLM's logger passes
+every ERROR message through :func:`notify_error` -- background threads such as
+the KV transfer workers catch their failures and log them -- a thread that
+dies of an out-of-memory error reaches it through ``threading.excepthook``,
+and torch's OOM observer records the failed PyTorch allocation. Torch calls
+the observer before any caller can catch the error, so it only records; the
+recorded allocation goes into the report's headline only when the error is
+that failure -- PyTorch's message names the same size on the same device.
 
-Reporting is suspended while an executor is being created
+Errors are classified with TensorRT-LLM's one out-of-memory test
+(:func:`tensorrt_llm._startup_errors.out_of_memory_kind`), by exception type
+where the exception is at hand and by message otherwise. Host-memory failures
+are not GPU memory and are ignored; a failure that does not say which memory
+ran out -- CUDA's generic "out of memory", NCCL's "unhandled cuda error" -- is
+taken for a GPU one only when the device is nearly full.
+
+Reporting is suspended while the monitored executor is being created
 (:func:`suspend_reporting`), since creation runs allocations into the wall on
-purpose, and every executor that armed reporting releases it when it shuts
-down (:func:`release_oom_reporter`). Reports describe the device of the most
-recently armed executor still alive, and the periodic reporter follows it.
+purpose, and the executor releases it when it shuts down
+(:func:`release_oom_reporter`).
 
-In full mode with ``periodic_report_interval`` (``TLLM_MEM_MONITOR_INTERVAL``)
+In full mode with ``periodic_report_interval_s`` (``TLLM_MEM_MONITOR_INTERVAL``)
 set to a number of seconds, a background thread also reports at that interval, so
 memory that grows slowly while serving shows up before it runs out. It only
 wakes on its timer; nothing is added to the executor loop.
 
 With ``report_dir`` (``TLLM_MEM_MONITOR_DIR``) set, every report except on-demand ones is
-also written to its own file there, named by rank, process, time and tag.
+also written to its own file there, named by rank, process, UTC time and tag.
 The directory is created readable by its owner only (``0o700``) and each
 file likewise (``0o600``); only the newest :data:`MAX_PERIODIC_FILES`
-periodic files of a rank and process are kept.
+periodic files a process wrote are kept.
 
 Reports are built on the executor's device, recorded when reporting is
 armed: the thread that logs an error may never have selected a device, and
@@ -79,6 +82,7 @@ interval.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 import os
@@ -90,14 +94,18 @@ from typing import Iterator
 
 import torch
 
+from tensorrt_llm._startup_errors import OomKind, out_of_memory_kind
 from tensorrt_llm.logger import logger
 
+from . import providers
 from .capability import tagging_supported
 from .capture import capture, render_capture
 from .schema import GIB
 from .settings import (
+    DEFAULT_OOM_INTERVAL_S,
     DIR_VAR,
     FULL,
+    MIN_PERIODIC_INTERVAL_S,
     OOM_INTERVAL_VAR,
     PERIODIC_INTERVAL_VAR,
     STACKS_ENV_VAR,
@@ -118,7 +126,7 @@ __all__ = [
     "OOM_INTERVAL_VAR",
     "PERIODIC_INTERVAL_VAR",
     "install_oom_reporter",
-    "is_device_oom_message",
+    "is_device_oom",
     "notify_error",
     "release_oom_reporter",
     "report_now",
@@ -126,15 +134,9 @@ __all__ = [
     "uninstall_oom_reporter",
 ]
 
-#: Shortest periodic interval; each report takes an allocator snapshot.
-MIN_PERIODIC_INTERVAL_S = 1.0
-
-#: Periodic report files kept per rank and process in ``TLLM_MEM_MONITOR_DIR``;
-#: older ones are deleted as new ones are written.
+#: Periodic report files a process keeps in ``TLLM_MEM_MONITOR_DIR``; the
+#: oldest it wrote are deleted as new ones are written.
 MAX_PERIODIC_FILES = 100
-
-#: Minimum seconds between two OOM reports when none is configured.
-_DEFAULT_OOM_INTERVAL_S = 60.0
 
 #: A failed PyTorch allocation older than this is not linked to an error.
 _FAILED_ALLOCATION_WINDOW_S = 30.0
@@ -144,24 +146,23 @@ _FAILED_ALLOCATION_WINDOW_S = 30.0
 #: attach would double every report.
 _attached = False
 
-#: Whether OOM reporting is armed. Independent of ``_attached``: errors
-#: passed to :func:`notify_error` are reported even where torch offers no
-#: observer.
-_enabled_flag = False
-
 
 @dataclass(frozen=True)
 class _Armed:
-    """An executor that armed reporting and has not released it."""
+    """The executor that armed reporting and has not released it."""
 
     owner: object | None
     rank: int | None
     device: int | None
+    #: Whether the process-wide hooks are installed for it (full mode).
+    hooks: bool
 
 
-#: Executors that armed reporting, oldest first.
-_armed: list[_Armed] = []
-#: Device reports are built on: the most recently armed live executor's.
+#: The armed executor, or ``None`` when reporting is not armed.
+_armed: _Armed | None = None
+#: Serialises arming, releasing and disarming.
+_arm_lock = threading.RLock()
+#: Device reports are built on: the armed executor's.
 _device: int | None = None
 #: Nesting depth of :func:`suspend_reporting`.
 _suspended = 0
@@ -177,25 +178,18 @@ _background_report: threading.Thread | None = None
 #: How long disarming waits for a report still being built for a logged error.
 _BACKGROUND_REPORT_JOIN_S = 30.0
 
-#: Messages that mean a device allocation failed, from CUDA, the driver,
-#: PyTorch, cuBLAS and TensorRT-LLM's C++ code.
-_OOM_PATTERN = re.compile(
-    r"out of memory|OUT_OF_MEMORY|cudaErrorMemoryAllocation|OutOfMemoryError"
-    r"|CUBLAS_STATUS_ALLOC_FAILED|Failed to create cublas handle\. Status: 3\b",
-    re.IGNORECASE,
-)
-#: Failures that are often, but not always, an allocation failing: NCCL
-#: reports a failed ``cudaMalloc`` as a generic CUDA error.
-_MAYBE_OOM_PATTERN = re.compile(r"unhandled cuda error", re.IGNORECASE)
-#: A device this full makes a :data:`_MAYBE_OOM_PATTERN` error an OOM.
+#: A device this full makes an allocation failure that does not say which
+#: memory ran out (:attr:`OomKind.UNSURE`) a GPU one.
 _NEARLY_FULL_FRACTION = 0.02
 _NEARLY_FULL_BYTES = GIB
-#: Host-memory failures, which mention "out of memory" too.
-_HOST_MEMORY_PATTERN = re.compile(
-    r"HostOOMError|Host out of memory|cuMemHostRegister|cudaHostAlloc|cudaMallocHost"
-    r"|pinned memory",
-    re.IGNORECASE,
-)
+
+
+def _format_size(nbytes: int) -> str:
+    """``nbytes`` in the largest fitting binary unit, as PyTorch's OOM message writes it."""
+    for unit, size in (("GiB", GIB), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if abs(nbytes) >= size:
+            return f"{nbytes / size:.2f} {unit}"
+    return f"{nbytes} bytes"
 
 
 @dataclass(frozen=True)
@@ -216,13 +210,13 @@ class _FailedAllocation:
         held = ""
         if self.live_bytes is not None and self.reserved_bytes is not None:
             held = (
-                f"; PyTorch held {self.live_bytes / GIB:.2f} GiB live, "
-                f"{self.reserved_bytes / GIB:.2f} GiB reserved"
+                f"; PyTorch held {_format_size(self.live_bytes)} live, "
+                f"{_format_size(self.reserved_bytes)} reserved"
             )
         return (
-            f"PyTorch could not allocate {self.requested_bytes / GIB:.2f} GiB on device "
-            f"{self.device} (device free {self.device_free / GIB:.2f} GiB; PyTorch may use up "
-            f"to {self.pytorch_limit / GIB:.2f} GiB{held})"
+            f"PyTorch could not allocate {_format_size(self.requested_bytes)} on device "
+            f"{self.device} (device free {_format_size(self.device_free)}; PyTorch may use "
+            f"up to {_format_size(self.pytorch_limit)}{held})"
         )
 
     def is_reported_by(self, message: str) -> bool:
@@ -251,7 +245,7 @@ _last_failed_allocation: _FailedAllocation | None = None
 
 
 def _oom_interval_s() -> float:
-    return seconds_setting(OOM_INTERVAL_VAR, _DEFAULT_OOM_INTERVAL_S)
+    return seconds_setting(OOM_INTERVAL_VAR, DEFAULT_OOM_INTERVAL_S)
 
 
 def _periodic_interval_s() -> float:
@@ -374,14 +368,18 @@ def _save(text: str, tag: str, rank: int | None) -> str | None:
 
     The directory is created ``0o700`` and the file ``0o600``: a report
     names the job's layout and sizes, and the directory may be shared.
-    Periodic reports keep only the newest :data:`MAX_PERIODIC_FILES` per
-    rank and process. A file that cannot be written is reported once per
-    directory and never raises.
+    Only the newest :data:`MAX_PERIODIC_FILES` periodic reports this
+    process wrote are kept. A file that cannot be written is reported once
+    per directory and never raises.
     """
     directory = (setting(DIR_VAR) or "").strip()
     if not directory:
         return None
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
+    # UTC, so that names sort in the order they were written across a
+    # daylight-saving change.
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + (
+        f"-{time.time_ns() % 1_000_000_000:09d}"
+    )
     rank_part = "x" if rank is None else str(rank)
     safe_tag = _UNSAFE_FILE_CHARS.sub("_", tag) or "report"
     prefix = f"memory_rank{rank_part}_pid{os.getpid()}_"
@@ -392,7 +390,7 @@ def _save(text: str, tag: str, rank: int | None) -> str | None:
         with os.fdopen(fd, "w") as handle:
             handle.write(text + "\n")
         if safe_tag == _PERIODIC_TAG:
-            _prune_periodic(directory, prefix)
+            _prune_periodic(os.path.join(directory, prefix), path)
     except (OSError, ValueError) as exc:
         # ValueError: a path with a NUL byte.
         logger.warning_once(
@@ -404,15 +402,22 @@ def _save(text: str, tag: str, rank: int | None) -> str | None:
     return path
 
 
-def _prune_periodic(directory: str, prefix: str) -> None:
-    """Delete this rank and process's oldest periodic files beyond the cap."""
-    suffix = f"_{_PERIODIC_TAG}.txt"
-    names = sorted(
-        name for name in os.listdir(directory) if name.startswith(prefix) and name.endswith(suffix)
-    )
-    for name in names[:-MAX_PERIODIC_FILES]:
+#: Periodic report files this process wrote, oldest first, by directory
+#: and file-name prefix (rank and process).
+_periodic_files: dict[str, collections.deque[str]] = {}
+
+
+def _prune_periodic(key: str, path: str) -> None:
+    """Record ``path`` and delete the oldest periodic files under ``key`` beyond the cap.
+
+    The files are pruned in the order they were written, which no clock
+    change can reorder; another process's files are left alone.
+    """
+    written = _periodic_files.setdefault(key, collections.deque())
+    written.append(path)
+    while len(written) > MAX_PERIODIC_FILES:
         with contextlib.suppress(FileNotFoundError):
-            os.remove(os.path.join(directory, name))
+            os.remove(written.popleft())
 
 
 def _claim_report_slot() -> bool:
@@ -445,7 +450,7 @@ def _report_oom(headline: str, *, background: bool = False) -> None:
     slot is still taken here, so a burst of errors starts one report.
     """
     global _background_report
-    if not _enabled_flag or _suspended or getattr(_reporting, "active", False):
+    if _armed is None or _suspended or getattr(_reporting, "active", False):
         return
     if not _claim_report_slot():
         return
@@ -501,7 +506,8 @@ def _on_out_of_memory(
     is a failure is decided later, when it reaches :func:`notify_error`.
     """
     global _last_failed_allocation
-    if not _enabled_flag or _suspended:
+    armed = _armed
+    if armed is None or not armed.hooks or _suspended:
         return
     live = reserved = None
     try:
@@ -549,36 +555,64 @@ def _device_nearly_full() -> bool:
     return free < max(_NEARLY_FULL_BYTES, _NEARLY_FULL_FRACTION * total)
 
 
-def is_device_oom_message(message: str) -> bool:
-    """Whether an error message describes a failed device allocation.
+def is_device_oom(error: BaseException | str) -> bool:
+    """Whether ``error`` -- an exception or a message -- is a failed device allocation.
 
-    The monitor's one test for a GPU out-of-memory error. Host-memory
-    failures are not; NCCL's generic "unhandled cuda error" is only when
-    the reporting device is nearly full.
+    The monitor's test for a GPU out-of-memory error, built on
+    :func:`tensorrt_llm._startup_errors.out_of_memory_kind`: an exception is
+    read by type and along its cause chain, a message by its text.
+    Host-memory failures are not; a failure that does not say which memory
+    ran out is only when the reporting device is nearly full.
     """
-    if _HOST_MEMORY_PATTERN.search(message):
-        return False
-    if _OOM_PATTERN.search(message):
+    kind = out_of_memory_kind(error)
+    if kind is OomKind.DEVICE:
         return True
-    return bool(_MAYBE_OOM_PATTERN.search(message)) and _device_nearly_full()
+    return kind is OomKind.UNSURE and _device_nearly_full()
 
 
-def notify_error(message: str | None, *, background: bool = False) -> None:
-    """Report if ``message`` describes a failed device allocation. Never raises.
+def _headline_line(message: str) -> str:
+    """The line of ``message`` that names the error, at most 200 characters.
+
+    The first line, or for a formatted traceback the last one, which holds
+    the exception.
+    """
+    lines = [line.strip() for line in message.strip().splitlines() if line.strip()]
+    if not lines:
+        return ""
+    line = lines[-1] if lines[0].startswith("Traceback (most recent call last)") else lines[0]
+    return line[:200]
+
+
+def notify_error(
+    message: str | None = None,
+    *,
+    error: BaseException | None = None,
+    owner: object | None = None,
+    background: bool = False,
+) -> None:
+    """Report if the error is a failed device allocation. Never raises.
 
     Called with errors that escaped their caller: the executor's error
-    handler, logged ERROR messages and uncaught thread exceptions. Cheap
-    when reporting is not armed or the message is unrelated. With
-    ``background`` the report is built on its own thread; see
-    :func:`_report_oom`.
+    handling and the sleep/wakeup path, and in full mode logged ERROR
+    messages and uncaught thread exceptions. ``error`` is the exception when
+    the caller has it, and decides the classification; ``message``, its
+    text otherwise, heads the report. ``owner`` is the executor reporting
+    the error; another executor's error is ignored, since reports describe
+    the armed executor. Cheap when reporting is not armed or the error is
+    unrelated. With ``background`` the report is built on its own thread;
+    see :func:`_report_oom`.
     """
     try:
-        if not _enabled_flag or _suspended or not message:
+        armed = _armed
+        if armed is None or _suspended or (owner is not None and owner is not armed.owner):
             return
-        if getattr(_reporting, "active", False) or not is_device_oom_message(message):
+        text = message or ("" if error is None else f"{type(error).__name__}: {error}")
+        if not text or getattr(_reporting, "active", False):
             return
-        first_line = message.strip().splitlines()[0][:200]
-        failed = _failed_allocation_of(message)
+        if not is_device_oom(text if error is None else error):
+            return
+        first_line = _headline_line(text)
+        failed = _failed_allocation_of(text)
         if failed is not None:
             headline = f"OUT OF MEMORY: {failed.describe()}. Error: {first_line}"
         else:
@@ -621,7 +655,8 @@ def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
     _in_thread_hook.active = True
     try:
         try:
-            notify_error(f"{getattr(args.exc_type, '__name__', 'Error')}: {args.exc_value}")
+            if args.exc_value is not None:
+                notify_error(error=args.exc_value)
         finally:
             (_previous_thread_hook or threading.__excepthook__)(args)
     finally:
@@ -676,30 +711,26 @@ _periodic: _PeriodicReporter | None = None
 
 
 def _start_periodic(rank: int | None, device: int | None) -> None:
-    """(Re)start the periodic reporter on ``device``, if an interval is set."""
+    """Start the periodic reporter on ``device``, if an interval is set."""
     global _periodic
-    _stop_periodic()
     interval = _periodic_interval_s()
     if interval > 0:
         _periodic = _PeriodicReporter(interval, rank, device)
 
 
-def _stop_periodic() -> None:
-    global _periodic
-    if _periodic is not None:
-        _periodic.stop()
-        _periodic = None
-
-
 @contextlib.contextmanager
 def suspend_reporting() -> Iterator[None]:
-    """No OOM report while this is open, in any thread.
+    """No OOM report while this is open, in any thread, if it creates the monitored executor.
 
     Opened around executor creation, which deliberately runs allocations
-    out of memory and catches the error. Process-wide: an executor already
-    serving in the same process is not reported on meanwhile either.
+    out of memory and catches the error. Creating an executor the monitor
+    does not follow suspends nothing: the monitored executor may be serving
+    meanwhile, and the new executor's own errors are not reported anyway.
     """
     global _suspended
+    if providers.unmonitored_executor_current():
+        yield
+        return
     with _rate_lock:
         _suspended += 1
     try:
@@ -720,118 +751,113 @@ def install_oom_reporter(
 
     See the module docstring for why arming earlier is wrong. ``device`` is
     the executor's device, by default the calling thread's current one;
-    reports describe it. ``owner`` identifies the executor, so that
-    :func:`release_oom_reporter` releases its arming and not another's.
-    ``world_size`` is the job's rank count: a rank filter that selects none
-    of its ranks is reported and ignored.
+    reports describe it. ``owner`` is the executor's token from
+    :func:`providers.begin_executor`: an executor the monitor does not
+    follow arms nothing, and :func:`release_oom_reporter` with the same
+    owner disarms. ``world_size`` is the job's rank count: a rank filter
+    that selects none of its ranks is reported and ignored.
 
-    Returns whether reporting is armed. Each successful call must be paired
-    with :func:`release_oom_reporter`. The callback is attached to torch at
-    most once per process, because torch keeps every observer it is handed
-    and cannot remove one.
+    In full mode this also installs the process-wide hooks: a filter on
+    TensorRT-LLM's logger, ``threading.excepthook`` and torch's OOM
+    observer. The default mode installs none of them.
+
+    Returns whether reporting is armed. The callback is attached to torch
+    at most once per process, because torch keeps every observer it is
+    handed and cannot remove one.
     """
-    global _attached, _enabled_flag, _device
+    global _armed, _device
 
+    if owner is not None and not providers.executor_monitored(owner):
+        return False
     _check_settings(world_size)
     if not oom_reports_enabled(rank):
         return False
-
     if device is None and torch.cuda.is_available():
         device = torch.cuda.current_device()
-    armed = _Armed(owner=owner, rank=rank, device=device)
-    _armed.append(armed)
-    _device = device
-    # Armed even if torch's observer cannot be attached: errors from outside
-    # the PyTorch allocator still arrive through notify_error.
-    _enabled_flag = True
-    try:
-        _install_error_hooks()
-        _follow_newest_executor()
-    except RuntimeError as exc:
-        # A diagnostic must not fail the executor it serves: undo this arming
-        # (another executor's stays) and report that it is off.
-        _armed.remove(armed)
-        # The thread that failed to start for this executor may fail again
-        # for the previous one; that one then goes without periodic reports.
-        with contextlib.suppress(RuntimeError):
-            _restore_after_release()
-        logger.warning(f"memory monitor: could not arm out-of-memory reporting ({exc})")
-        return False
-    if _attached:
-        return True
+    hooks = full_mode(rank)
+    with _arm_lock:
+        if _armed is not None:
+            if _armed.owner is owner:
+                return True
+            logger.warning(
+                "memory monitor: out-of-memory reporting is already armed for another "
+                "executor; not arming it again"
+            )
+            return False
+        armed = _Armed(owner=owner, rank=rank, device=device, hooks=hooks)
+        _armed = armed
+        _device = device
+        try:
+            if hooks:
+                _install_error_hooks()
+                _start_periodic(rank, device)
+        except RuntimeError as exc:
+            # A diagnostic must not fail the executor it serves.
+            _disarm()
+            logger.warning(f"memory monitor: could not arm out-of-memory reporting ({exc})")
+            return False
+        if hooks:
+            _attach_observer()
+    return True
 
+
+def _attach_observer() -> None:
+    """Attach :func:`_on_out_of_memory` to torch, once per process."""
+    global _attached
+    if _attached:
+        return
     attach = getattr(torch._C, "_cuda_attach_out_of_memory_observer", None)
     if attach is None:
         logger.debug("memory monitor: this torch has no OOM observer")
-        return True
-
+        return
     try:
         attach(_on_out_of_memory)
     except RuntimeError as exc:
         logger.debug(f"memory monitor: could not attach the OOM observer ({exc})")
-        return True
-
+        return
     _attached = True
-    return True
-
-
-def _follow_newest_executor() -> None:
-    """Point reports and the periodic reporter at the newest armed executor."""
-    global _device
-    newest = _armed[-1]
-    _device = newest.device
-    if full_mode(newest.rank):
-        _start_periodic(newest.rank, newest.device)
-    else:
-        _stop_periodic()
-
-
-def _restore_after_release() -> None:
-    """Follow the newest executor still armed, or disarm if none is."""
-    if _armed:
-        _follow_newest_executor()
-    else:
-        uninstall_oom_reporter()
 
 
 def release_oom_reporter(owner: object | None = None) -> None:
-    """Release one :func:`install_oom_reporter`; the last release disarms.
+    """Disarm reporting armed by ``owner``'s :func:`install_oom_reporter`.
 
-    Releases the arming made with ``owner``, or the newest one when
-    ``owner`` is ``None``. Reports then describe the newest executor still
-    armed, and its periodic reporter takes over.
+    ``None`` releases whatever is armed. Another owner's arming is left alone.
     """
-    if not _armed:
-        return
-    index = len(_armed) - 1
-    if owner is not None:
-        matches = [i for i, armed in enumerate(_armed) if armed.owner is owner]
-        if not matches:
+    with _arm_lock:
+        if _armed is None or (owner is not None and _armed.owner is not owner):
             return
-        index = matches[-1]
-    was_newest = index == len(_armed) - 1
-    del _armed[index]
-    if not _armed:
-        uninstall_oom_reporter()
-    elif was_newest:
-        _follow_newest_executor()
+    uninstall_oom_reporter()
+
+
+def _disarm() -> tuple[threading.Thread | None, _PeriodicReporter | None]:
+    """Clear the arming and the hooks; returns the threads left to join.
+
+    Holds :data:`_arm_lock`; the threads are joined after it is released, so
+    a report still being built never blocks another thread's arming.
+    """
+    global _armed, _device, _last_report_at, _last_failed_allocation, _background_report
+    global _periodic
+    with _arm_lock:
+        _armed = None
+        _device = None
+        _last_report_at = None
+        _last_failed_allocation = None
+        _remove_error_hooks()
+        building, _background_report = _background_report, None
+        periodic, _periodic = _periodic, None
+    return building, periodic
 
 
 def uninstall_oom_reporter() -> None:
-    """Stop OOM reporting regardless of how many executors armed it.
+    """Stop OOM reporting and remove the hooks, whoever armed it.
 
     torch offers no way to detach an observer, so the callback stays
     attached and is made inert instead. ``_attached`` deliberately survives:
-    re-installing must not attach a second copy.
+    re-installing must not attach a second copy. A report still being
+    built for a logged error, and the periodic reporter, are waited for.
     """
-    global _enabled_flag, _last_report_at, _device, _last_failed_allocation, _background_report
-    _enabled_flag = False
-    building, _background_report = _background_report, None
+    building, periodic = _disarm()
+    if periodic is not None:
+        periodic.stop()
     if building is not None and building is not threading.current_thread():
         building.join(_BACKGROUND_REPORT_JOIN_S)
-    _armed.clear()
-    _device = None
-    _last_report_at = None
-    _last_failed_allocation = None
-    _remove_error_hooks()
-    _stop_periodic()

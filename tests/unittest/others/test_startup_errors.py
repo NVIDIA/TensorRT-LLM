@@ -662,3 +662,57 @@ def test_cli_boundary_skips_failures_after_an_llm_initialized(fresh_process):
         info = se.log_startup_error(ValueError("x"), "LLM initialization failed")
     assert info is not None
     log_error.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "make_exc, reason",
+    [
+        # One out-of-memory test for startup classification and the GPU memory monitor.
+        (lambda: RuntimeError("[TensorRT-LLM][ERROR] CUBLAS_STATUS_ALLOC_FAILED"), "gpu_oom"),
+        (lambda: RuntimeError("CUDA error: out of memory"), "gpu_oom"),
+        (
+            lambda: RuntimeError(
+                "CUDA runtime error in cudaHostRegister(ptr, size, 0): out of memory"
+            ),
+            "host_memory",
+        ),
+        (lambda: _fake_exception("HostOOMError", "tensorrt_llm.bindings"), "host_memory"),
+        (lambda: _fake_exception("CuOOMError", "tensorrt_llm.bindings"), "gpu_oom"),
+        (lambda: RuntimeError("NCCL error: unhandled cuda error"), "distributed"),
+    ],
+)
+def test_out_of_memory_errors_say_which_memory_ran_out(make_exc, reason):
+    assert se.classify_startup_error(make_exc()).reason == reason
+
+
+@pytest.mark.parametrize(
+    "error, kind",
+    [
+        (torch.OutOfMemoryError("CUDA error: out of memory"), se.OomKind.DEVICE),
+        ("CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0", se.OomKind.DEVICE),
+        ("[TensorRT-LLM][ERROR] CUBLAS_STATUS_ALLOC_FAILED", se.OomKind.DEVICE),
+        (MemoryError(), se.OomKind.HOST),
+        ("cudaHostRegister(ptr, size, 0): out of memory", se.OomKind.HOST),
+        ("mmap failed: Cannot allocate memory", se.OomKind.HOST),
+        ("CUDA error: out of memory", se.OomKind.UNSURE),
+        ("CuOOMError: CUDA out of memory", se.OomKind.UNSURE),
+        ("unhandled cuda error (run with NCCL_DEBUG=INFO for details)", se.OomKind.UNSURE),
+        ("cudaHostAlloc: invalid argument", None),
+        (ValueError("index out of range"), None),
+    ],
+)
+def test_out_of_memory_kind(error, kind):
+    assert se.out_of_memory_kind(error) is kind
+
+
+def test_out_of_memory_kind_prefers_a_definite_answer_along_the_chain():
+    unsure = RuntimeError("CUDA error: out of memory")
+    outer = RuntimeError("cudaHostRegister failed")
+    outer.__cause__ = unsure
+    assert se.out_of_memory_kind(outer) is se.OomKind.UNSURE, "the outer error is no OOM"
+    outer = RuntimeError("cudaHostRegister failed: out of memory")
+    outer.__cause__ = unsure
+    assert se.out_of_memory_kind(outer) is se.OomKind.HOST
+    outer = RuntimeError("Executor step failed")
+    outer.__cause__ = torch.OutOfMemoryError("CUDA out of memory")
+    assert se.out_of_memory_kind(outer) is se.OomKind.DEVICE

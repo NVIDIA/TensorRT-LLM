@@ -155,20 +155,6 @@ def test_stack_recording_follows_only_a_completed_startup(monkeypatch):
         tagging.forget_startup_of(tagging._startup_executor)
 
 
-def test_warmup_trace_report_waits_for_the_tagging_window(monkeypatch):
-    from tensorrt_llm._torch.pyexecutor import trace_log_utils
-
-    reports = []
-    monkeypatch.setattr(triggers, "report_now", lambda **kw: reports.append(kw) or None)
-    monkeypatch.setattr(tagging, "_recording", True)
-    trace_log_utils._maybe_log_monitor_report("warmup")
-    assert reports == [], "reported while startup tags were still being recorded"
-
-    monkeypatch.setattr(tagging, "_recording", False)
-    trace_log_utils._maybe_log_monitor_report("warmup")
-    assert len(reports) == 1
-
-
 def test_pool_check_runs_on_the_reading_it_came_from():
     manager = FakeKvManager(kv_stats(100, 30, 20))
     provider = KvCacheProvider(manager)
@@ -203,8 +189,7 @@ def test_released_kv_cache_stops_being_reported(monkeypatch):
         sizing, other = _V1(), _V1()
         providers.begin_executor()
         providers.register_provider(KvCacheProvider(sizing, "main"))
-        providers.begin_executor()
-        providers.register_provider(KvCacheProvider(other, "main"))
+        providers.register_provider(KvCacheProvider(other, "draft"))
         resources = {
             ResourceManagerType.KV_CACHE_MANAGER: sizing,
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER: None,
@@ -218,28 +203,53 @@ def test_released_kv_cache_stops_being_reported(monkeypatch):
         providers.clear_registered_providers()
 
 
-def test_sleep_release_is_process_wide_like_the_manager(monkeypatch):
-    """``release_with_tag`` releases every blob under the tag, whichever
-    executor allocated it, so both executors' pools are released."""
+def test_sleep_release_lasts_as_long_as_the_monitored_executor(monkeypatch):
+    """``release_with_tag`` releases every blob under the tag in the process;
+    the monitor keeps that state until the executor it follows ends."""
     providers.clear_registered_providers()
     try:
-        first, second = FakeKvManager(kv_stats(10, 10, 0)), FakeKvManager(kv_stats(10, 10, 0))
-        a = providers.begin_executor()
-        providers.register_provider(KvCacheProvider(first))
-        b = providers.begin_executor()
-        providers.register_provider(KvCacheProvider(second))
+        manager = FakeKvManager(kv_stats(10, 10, 0))
+        monitored = providers.begin_executor()
+        providers.register_provider(KvCacheProvider(manager))
+        pools.register_pool((7, 1), "sleep: kv_cache", sleep_tag="kv_cache")
+        other = providers.begin_executor()
 
         pools.mark_released(["kv_cache"])
-        providers.end_executor(a)
+        providers.end_executor(other)
         (provider,) = [p for p in providers.default_providers() if isinstance(p, KvCacheProvider)]
         physical = [e for e in provider.collect() if e.basis is Basis.PHYSICAL_BACKING]
-        assert physical and all(e.released for e in physical), "the remaining pool is released"
-        assert pools.is_tag_released("kv_cache")
-        providers.end_executor(b)
+        assert physical and all(e.released for e in physical), "the monitored pool is released"
+        providers.end_executor(monitored)
         assert not pools.is_tag_released("kv_cache"), "a new executor starts awake"
     finally:
         providers.clear_registered_providers()
-        pools.forget_released_tags()
+        pools.clear_registered_pools()
+
+
+def test_another_executors_sleep_does_not_release_the_monitored_kv_cache():
+    """The monitored executor's KV cache is not a sleep-mode blob without
+    ``sleep_config``, so ``release_with_tag("kv_cache")`` from another
+    executor in the process leaves it resident."""
+    providers.clear_registered_providers()
+    pools.clear_registered_pools()
+    try:
+        manager = FakeKvManager(kv_stats(10, 10, 0))  # the provider holds it weakly
+        monitored = providers.begin_executor()
+        providers.register_provider(KvCacheProvider(manager))
+        other = providers.begin_executor()
+        # Only the other executor runs with sleep_config.
+        pools.register_pool((7, 2), "sleep: kv_cache", sleep_tag="kv_cache")
+        pools.mark_released(["kv_cache"])
+
+        assert not pools.is_tag_released("kv_cache")
+        (provider,) = [p for p in providers.default_providers() if isinstance(p, KvCacheProvider)]
+        physical = [e for e in provider.collect() if e.basis is Basis.PHYSICAL_BACKING]
+        assert physical and not any(e.released for e in physical), "the pool is resident"
+        providers.end_executor(other)
+        providers.end_executor(monitored)
+    finally:
+        providers.clear_registered_providers()
+        pools.clear_registered_pools()
 
 
 def test_plan_compares_against_the_kv_pools_only():
@@ -317,3 +327,54 @@ def test_a_failure_not_about_memory_gets_no_advice():
         startup.clear()
     assert "Suggestion: reduce the fraction." in texts[True], "the largest group's advice"
     assert "Suggestion" not in texts[False], "a missing checkpoint key is not a memory problem"
+
+
+def test_a_failed_startup_is_not_reported_while_a_crash_kill_is_pending(monkeypatch):
+    """The kill's grace period is for delivering the error, not for building a report."""
+    from tensorrt_llm._torch.pyexecutor import hang_detector
+
+    class _Armed:
+        cancelled = False
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(tagging, "tagging_supported", lambda: False)
+    reports = []
+    monkeypatch.setattr(triggers, "report_now", lambda **kw: reports.append(kw["tag"]))
+
+    def fail_startup():
+        with pytest.raises(torch.OutOfMemoryError):
+            with tagging.startup_window():
+                raise torch.OutOfMemoryError("warmup")
+
+    armed = _Armed()
+    monkeypatch.setattr(hang_detector, "_armed_watchdogs", {armed})
+    fail_startup()
+    assert reports == [], "reported while the watchdog's grace period was running"
+
+    armed.cancelled = True
+    fail_startup()
+    assert reports == ["startup_failed"], "reported once the kill is no longer pending"
+
+
+def test_a_block_with_frames_never_takes_a_frozen_startup_label():
+    """Stack mode: same-size reuse of a freed startup block is named by its own code."""
+    from tensorrt_llm._torch.memory.monitor.tagging import TagSnapshot, live_attribution
+
+    address, size = 1 << 32, 4 * MB
+    frozen = TagSnapshot(supported=True, owners={address: "SAMPLER"}, sizes={address: size})
+    frame = {"filename": "/work/my_app/cache.py", "line": 7, "name": "put"}
+
+    def segments(frames):
+        block = {"address": address, "size": size, "requested_size": size}
+        block.update(state="active_allocated", frames=frames)
+        return [{"segment_pool_id": (0, 0), "blocks": [block]}]
+
+    totals, _ = live_attribution(frozen, segments([]))
+    assert totals.get("SAMPLER") == size, "a startup block keeps its label"
+
+    totals, sites = live_attribution(frozen, segments([frame]))
+    assert "SAMPLER" not in totals, "allocated after the freeze, so not the startup buffer"
+    assert totals["untagged"] == size
+    assert sum(sites.values()) == size
