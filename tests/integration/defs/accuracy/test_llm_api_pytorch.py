@@ -7130,6 +7130,9 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+# Reading this 352 GB checkpoint cold over a slow model-store link takes most of
+# an hour before evaluation starts. A test-list TIMEOUT still takes precedence.
+@pytest.mark.timeout(7200)
 class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
     MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"

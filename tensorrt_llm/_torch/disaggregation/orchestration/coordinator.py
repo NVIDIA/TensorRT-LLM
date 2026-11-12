@@ -32,6 +32,16 @@ if TYPE_CHECKING:
 
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
+_LEGACY_RETIRE_RETRY_INTERVAL = 2
+"""Polls to wait between legacy cancel retries on an idle decode worker."""
+
+
+# How long, in multiples of kv_transfer_timeout_ms, a context send may wait for
+# its generation peer to ask for the data before its transfer clock starts
+# counting regardless. The peer's request can queue behind a full generation
+# batch for a while, but a peer that never asks must stay reclaimable.
+_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER = 3
+
 
 def is_gen_only_no_context_benchmark() -> bool:
     """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
@@ -95,7 +105,6 @@ class DisaggTransferCoordinator:
         effects: ExecutorEffects,
         registry: ActiveRequestRegistry,
         enable_attention_dp: bool,
-        force_terminate_ctx_for_partial_reuse: bool,
         draft_kv_cache_manager=None,
         admission_controller: Optional[DisaggTransferAdmissionController] = None,
         is_kv_manager_v2: bool = False,
@@ -109,7 +118,6 @@ class DisaggTransferCoordinator:
         self._effects = effects
         self._registry = registry
         self._enable_attention_dp = enable_attention_dp
-        self._force_terminate_ctx_for_partial_reuse = force_terminate_ctx_for_partial_reuse
         # Transfer-window budget; None or a disabled controller means no window.
         self._admission_controller = admission_controller
         self._is_kv_manager_v2 = is_kv_manager_v2
@@ -119,7 +127,12 @@ class DisaggTransferCoordinator:
         # Timed-out generation requests whose error response waits for the
         # ADP-safe consensus point.
         self._pending_timed_out_requests: List[LlmRequest] = []
-        # Requests whose timed-out transfer was already cancelled in flight.
+        # Retire attempts whose legacy cancel could not yet prove page release;
+        # retried only every second poll so an idle decode worker's re-poll
+        # loop (pace_idle sleeps ~1 ms) does not hammer transceivers that
+        # cannot cancel an already-started receive.
+        self._legacy_retire_retry: Dict[int, int] = {}
+        self._legacy_retire_poll_index = 0
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
@@ -251,6 +264,49 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
+        else:
+            self._retire_legacy_timed_out_gen_transfers()
+
+    def _retire_legacy_timed_out_gen_transfers(self) -> None:
+        """Progress expired receives without requiring a runnable model batch.
+
+        A successful legacy cancel authorizes memory release; a refused or
+        failed cancel must be retried with the request and its KV still held.
+        Multi-rank ADP publishes failures at the existing loop-head error vote.
+        """
+        timeout_ms = self._transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
+        canceled_ids = set(self._registry.canceled_request_ids())
+        retired = False
+        poll_index = self._legacy_retire_poll_index
+        self._legacy_retire_poll_index = poll_index + 1
+        for request in list(self._registry.active_requests()):
+            if not request.is_generation_only_request or self._vote_id(request) in canceled_ids:
+                continue
+            if request.is_disagg_generation_transmission_in_progress:
+                self._flag_transfer_timeout(request, "generation", timeout_ms)
+            if (
+                not request.py_kv_transfer_timed_out
+                or request.state == LlmRequestState.DISAGG_TRANS_ERROR
+            ):
+                continue
+            request_id = request.py_request_id
+            if poll_index < self._legacy_retire_retry.get(request_id, 0):
+                continue
+            if self.request_cancellation(request):
+                # The cancel contract proves no transfer still owns these KV
+                # pages. Clear the in-progress state before the error handler
+                # checks ownership, so it can terminate instead of parking.
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._legacy_retire_retry.pop(request_id, None)
+                retired = True
+            else:
+                # Legacy transceivers refuse receives that already started;
+                # retry later instead of on every idle poll.
+                self._legacy_retire_retry[request_id] = poll_index + _LEGACY_RETIRE_RETRY_INTERVAL
+        if retired:
+            self._check_transfer_errors("generation requests")
 
     def _describe_transfer_timeout(self, request: LlmRequest) -> str:
         """Get optional native progress only when an existing deadline expires.
@@ -329,12 +385,44 @@ class DisaggTransferCoordinator:
 
         # Context requests start their clock on the last chunk, which is also
         # when they enter the transfer manager, so this covers the whole
-        # context side.
+        # context side. Nothing is sent before every peer rank has asked for
+        # the data, so a send still waiting for that is not flagged, and once
+        # the peers have asked, the transfer is measured from that moment
+        # rather than charged with their queueing delay.
         for req in self._transfers.requests_in_transfer().values():
-            self._flag_transfer_timeout(req, "context", timeout_ms)
+            now = time.monotonic()
+            if self._context_send_awaits_peer(req, now, timeout_ms):
+                continue
+            peer_ready_time = self._transceiver.context_transfer_peer_ready_time(req)
+            if (
+                peer_ready_time is not None
+                and req.py_kv_transfer_start_time is not None
+                and peer_ready_time > req.py_kv_transfer_start_time
+            ):
+                req.py_kv_transfer_start_time = peer_ready_time
+            self._flag_transfer_timeout(req, "context", timeout_ms, current_time=now)
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 self._flag_transfer_timeout(req, "generation", timeout_ms)
+
+    def _context_send_awaits_peer(self, req: LlmRequest, now: float, timeout_ms: int) -> bool:
+        """Whether a context send is still exempt from its transfer timeout.
+
+        The send is posted when the context finishes, but nothing is sent
+        until every generation peer rank asks, and under load that request can
+        sit in the generation queue for longer than the transfer timeout.
+        Expiring then gives up on transfers that never got to run, and the peer
+        later finds no data. A peer that never asks must still be reclaimed,
+        since this deadline is the only thing that ends such a send, so the
+        wait is capped at ``_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER`` times the
+        timeout, counted from the send.
+        """
+        if req.py_kv_transfer_start_time is None:
+            return False
+        waited_ms = (now - req.py_kv_transfer_start_time) * 1000
+        if waited_ms > timeout_ms * _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER:
+            return False
+        return self._transceiver.context_transfer_is_waiting_for_peer(req)
 
     # -- scheduling ----------------------------------------------------------
 
@@ -822,8 +910,8 @@ class DisaggTransferCoordinator:
         request; ``AsyncTransferManager`` counts them. A request that is still
         active gets its response created here (the transfer completed before
         the response pass could run) and staged for the rank-synchronized
-        flush; a failed transfer only releases its claim so the synchronized
-        error path can respond once every owner is done.
+        flush. An active failed request stays on the synchronized error path;
+        a departed request is reclaimed when its final owner releases it.
         """
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
         if self._registry.contains(request):
@@ -847,12 +935,10 @@ class DisaggTransferCoordinator:
                 self._effects.terminate_request(request)
             return
         if self._transfers.end_transfer(request):
-            if transfer_failed:
-                return
-            # Skip if the PP=1 early path already terminated this request;
-            # under PP>1 that path is off, so terminate here on completion.
-            if not self._force_terminate_ctx_for_partial_reuse:
-                self._effects.terminate_request(request)
+            # The response pass removed this request, but termination was
+            # deferred while a transfer owned its KV blocks. No active-request
+            # error pass can reclaim it now, so the last owner must do so.
+            self._effects.terminate_request(request)
 
     # -- timeouts and cancellation -------------------------------------------
 
@@ -1026,6 +1112,7 @@ class DisaggTransferCoordinator:
         """Drop per-request cancellation bookkeeping once the request is freed."""
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
+        self._legacy_retire_retry.pop(request_id, None)
         self._unpublished_gen_receives.pop(request_id, None)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
@@ -1193,7 +1280,6 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             effects=None,
             registry=None,
             enable_attention_dp=False,
-            force_terminate_ctx_for_partial_reuse=False,
         )
 
     def handle_errors_synced(self) -> bool:

@@ -582,6 +582,7 @@ class BaseWorker(GenerationExecutor):
                     conversation_params=request.conversation_params,
                     kv_hints=request.kv_hints,
                     arrival_time=request.arrival_time,
+                    watermarking=request.sampling_params.watermarking,
                 ),
             )
 
@@ -1193,9 +1194,8 @@ class BaseWorker(GenerationExecutor):
                 can_shutdown = self.engine.can_enqueue_requests
             if can_shutdown():
                 self.engine.shutdown()
-                local_cleanup = getattr(self.engine, "local_cleanup", None)
-                if local_cleanup is not None:
-                    local_cleanup()
+                if getattr(self.engine, "local_cleanup", None) is not None:
+                    self.engine.local_cleanup()
                 self.engine = None
 
     def get_disaggregated_params(self) -> dict:
