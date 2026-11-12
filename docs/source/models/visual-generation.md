@@ -41,6 +41,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
+| `Qwen/Qwen-Image-2.1` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
 | `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
@@ -71,11 +72,23 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image 2.1** | Yes | Yes | No | No | No | Yes | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
+
+Qwen-Image 2.1's conditioning-prefix KV cache is distinct from TeaCache and Cache-DiT.
+Negative-prompt CFG is enabled only when `guidance_scale > 1` and
+`negative_prompt` is provided (an empty string also enables the negative branch).
+The default `guidance_scale: 1.0` disables CFG and ignores negative prompts,
+matching Diffusers. The direct pipeline API also accepts `true_cfg_scale`, which
+overrides `negative_prompt_cfg_scale`. Positive and negative branches maintain
+separate prefix KV caches; their predictions use the plain CFG formula without
+the norm rescaling applied by the original Qwen-Image pipeline.
+Set `parallel_config.cfg_size: 2` to split the positive and negative branches
+across two GPUs when CFG is enabled.
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
@@ -228,6 +241,13 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 ```
 
 Omit `quant_config` for BF16/FP16 baseline.
+
+Qwen-Image 2.1 supports dynamic `FP8`, `FP8_BLOCK_SCALES`, and `NVFP4`
+quantization of transformer-block attention and feed-forward linear layers.
+Conditioning and input/output projections remain in BF16. Use `dynamic: true`
+with the original BF16 checkpoint; pre-quantized checkpoints are not supported.
+NVFP4 requires Blackwell or newer GPUs. Quantization is lossy; validate image
+quality for your prompts and settings.
 
 #### Wan VAE NVFP4
 

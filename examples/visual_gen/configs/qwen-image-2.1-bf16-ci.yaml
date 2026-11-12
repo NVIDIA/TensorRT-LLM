@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Lightweight CI-oriented Qwen-Image 2.1 BF16 VisualGenArgs config.
+# This file is for wiring/import validation only, not full E2E evidence.
+# Production model id: qwen-image-2.1 / Qwen/Qwen-Image-2.1.
+# CI generation metadata: full_e2e=false, media_sanity_required=false,
+# lpips_required=false.  Full E2E validation must use the frozen run manifest.
+# Keep the source/SDK denoising default documented for CI wiring:
+# default_num_inference_steps: 30.  Do not normalize CI on one-step smoke media.
+# Checkpoint policy remains external to VisualGenArgs and is recorded in M4/M10
+# run artifacts rather than this parser-facing YAML.
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: false
+torch_compile_config:
+  enable: false
