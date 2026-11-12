@@ -7673,9 +7673,13 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
             module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
 
     def cache_derived_state(self, module: torch.nn.Module) -> None:
+        """Restore activation registers after materialization or weight transfer.
+
+        Args:
+            module: Weight owner holding the semantic activation configuration
+                and the loaded FC1 gate dequantization scales.
+        """
         super().cache_derived_state(module)
-        # Rebuild non-persistent registers from semantic activation constants,
-        # including after meta materialization or a runtime-weight transfer.
         params = materialize_activation_params(
             module.activation,
             resolve_activation_support(module),
