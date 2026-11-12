@@ -2608,8 +2608,16 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"Per-layer head_dim: {len(self.head_dim_per_layer)} layers, "
                     f"unique values={set(self.head_dim_per_layer)}"
                 )
-        # Appended draft specs are rank-local already.
+        # The appended draft specs are rank-local: writing the rank-local head count
+        # into total_num_kv_heads_per_layer is only the global count for a K-only
+        # (one-head) draft cache, or when every rank holds the whole draft latent.
         for local_layer_id, layer in self._appended_draft_layer_specs.items():
+            assert layer.num_kv_heads == 1 or tp_size == 1, (
+                f"Appended draft layer {layer.global_layer_id} has "
+                f"{layer.num_kv_heads} rank-local KV heads; only a K-only draft "
+                "cache or attention tensor parallelism 1 keeps the "
+                "disaggregated head mapping consistent."
+            )
             self.num_kv_heads_per_layer[local_layer_id] = layer.num_kv_heads
             self.total_num_kv_heads_per_layer[layer.global_layer_id] = layer.num_kv_heads
             self.head_dim_per_layer[local_layer_id] = layer.head_dim
