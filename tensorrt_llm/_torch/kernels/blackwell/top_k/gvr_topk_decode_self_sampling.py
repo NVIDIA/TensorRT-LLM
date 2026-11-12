@@ -9942,6 +9942,38 @@ def _bf16_window_emit_ballot(
         position_tied = position_tied + cutlass.Int32(popc(tie_masks[slot]))
 
 
+def _cr_row_l2_lines(blk: int, vpt: int) -> int:
+    """Upper bound on the 128-byte lines of one ``kern_cr`` row of 16-bit scores: the packed batch
+    (4 * blk * vpt scores), a scalar tail of at most blk scores and one line of misalignment."""
+    return (2 * (4 * blk * vpt + blk) + 127) // 128 + 1
+
+
+@cute.jit
+def _prefetch_row_l2(
+    logits: cute.Tensor,
+    row,
+    length,
+    tid,
+    elem_bytes: cutlass.Constexpr,
+    blk: cutlass.Constexpr,
+    max_lines: cutlass.Constexpr,
+):
+    """``prefetch.global.L2`` the 128-byte lines of ``logits[row, 0:length]`` if the row exists.
+
+    Thread ``tid`` of the ``blk``-thread CTA takes lines ``tid``, ``tid + blk``, ...; ``max_lines``
+    bounds the line count at trace time. ``kern_cr``'s successor-row lookahead (``succ_la``) calls
+    it for the row one wave ahead once the CTA's own row has landed.
+    """
+    if row < cutlass.Int32(logits.shape[0]):
+        row_addr = logits[row, None].iterator.toint()
+        head = cutlass.Int32(row_addr & cutlass.Int64(127))
+        lines = (head + length * cutlass.Int32(elem_bytes) + cutlass.Int32(127)) >> cutlass.Int32(7)
+        line_addr = row_addr - cutlass.Int64(head) + cutlass.Int64(tid) * cutlass.Int64(128)
+        for step in cutlass.range_constexpr((max_lines + blk - 1) // blk):
+            if tid + cutlass.Int32(step * blk) < lines:
+                _prefetch_l2(line_addr + cutlass.Int64(step * blk * 128))
+
+
 @cute.jit
 def _bf16_try_window_cr(
     hp,
@@ -9959,6 +9991,10 @@ def _bf16_try_window_cr(
     pk16: cutlass.Constexpr,
     stage_output: cutlass.Constexpr,
     packed_signcount_bf16: cutlass.Constexpr,
+    succ_la: cutlass.Constexpr = 0,
+    la_logits=None,
+    la_row=None,
+    la_length=None,
 ):
     """One-pass BF16 code window of ``kern_cr`` (static K): 1 if it emitted the row, else 0.
 
@@ -9968,7 +10004,9 @@ def _bf16_try_window_cr(
     end. The row is emitted only when every element was counted, the crossing bin lies strictly
     inside the window and the K-th code is finite; otherwise ``kern_cr`` runs its radix passes.
     Uses smem words 0-103, ``hist_bins`` words from ``STATIC_WORDS`` and, with ``stage_output``,
-    the staged output row of ``kern``.
+    the staged output row of ``kern``. With ``succ_la`` > 0 the CTA prefetches row ``la_row +
+    succ_la`` of ``la_logits`` (``la_length`` scores) into L2 after its first barrier, when its own
+    row has landed (``kern_cr``'s successor-row lookahead).
     """
     done = cutlass.Int32(0)
     target = cutlass.Int32(static_k)
@@ -10050,6 +10088,18 @@ def _bf16_try_window_cr(
         if cutlass.const_expr(_BF16_CR_BALLOT_EMIT or vpt == 8):
             s_cnt[0] = cutlass.Int32(0)
     cute.arch.barrier()
+    if cutlass.const_expr(succ_la > 0):
+        # successor-row lookahead: this row has landed (the sign count consumed it); the row one
+        # wave ahead streams into L2 while this row selects
+        _prefetch_row_l2(
+            la_logits,
+            la_row + cutlass.Int32(succ_la),
+            la_length,
+            tid,
+            2,
+            blk,
+            _cr_row_l2_lines(blk, vpt),
+        )
 
     part_pc = cutlass.Int32(0)
     part_positive = cutlass.Int32(-32768)
@@ -10243,7 +10293,9 @@ class GvrTopkRegKernel:
     bits-domain window, ``packed_prefetch`` keeps the kernel-head prefetch packed, ``parts``
     splits a row's emit over that many CTAs, ``static_env_bf16`` fixes the BF16 envelope
     (n, npad, k), and ``code_radix`` launches the code-radix kernels, which ``clus``,
-    ``candidate_list``, ``cr2``, ``lane_hash``, ``static_n`` and ``packed_signcount_bf16`` tune.
+    ``candidate_list``, ``cr2``, ``lane_hash``, ``static_n`` and ``packed_signcount_bf16`` tune;
+    ``succ_la`` > 0 makes ``kern_cr``'s BF16 window prefetch the row ``succ_la`` rows ahead into
+    L2.
     """
 
     def __init__(
@@ -10282,6 +10334,7 @@ class GvrTopkRegKernel:
         cr2: bool = False,
         lane_hash: bool = False,
         static_n: int | None = None,
+        succ_la: int = 0,
     ) -> None:
         self.det = bool(det)
         self.lane_hash = bool(lane_hash)
@@ -10437,6 +10490,11 @@ class GvrTopkRegKernel:
         self.static_env_bf16 = (
             static_env_bf16 if dtype is cutlass.BFloat16 and not self.code_radix else None
         )
+        # Successor-row lookahead of `kern_cr` (one CTA per row): once its row has landed, a CTA
+        # prefetches row + succ_la into L2 (0: off). The launcher passes one wave of co-resident
+        # CTAs (SMs * minb), so the next wave's row loads overlap this wave's select.
+        self.succ_la = int(succ_la) if self.code_radix and self.clus == 1 and not self.cr2 else 0
+        assert self.succ_la >= 0
 
     def _part_hist_offset(self, s: int) -> int:
         return ((s * self.parts) // self.S) * self.nbh * 4
@@ -14392,6 +14450,9 @@ class GvrTopkRegKernel:
         - BF16 with a static K (within vpt, nbh, K and stage_output limits): a window of
           single-code bins (``_bf16_try_window_cr``) runs first; when it finds the K-th code it
           emits the row and the two passes are skipped.
+        - ``succ_la`` > 0 (BF16 window builds): once its row has landed (after the window's first
+          barrier) the CTA prefetches the 128-byte lines of row ``row + succ_la`` into L2, so a
+          batch taller than one wave streams its next wave while this one selects.
 
         Padding lanes (vector index >= n4) hold key 0: bin 0 of pass 1, and of pass 2 when
         B1 == 0, starts at -(padded keys), and no emit selects them.  Shared memory: the 256-bin
@@ -14458,6 +14519,9 @@ class GvrTopkRegKernel:
                 x_addr + cutlass.Int64((env4 << cutlass.Int32(2)) + tid) * cutlass.Int64(2)
             )
 
+        # successor-row lookahead extent (succ_la): the envelope, which the head loads cover
+        n_envelope = n
+
         # ---- per-row varlen prologue (the `kern` contract: short rows emit identity + (-1) tail)
         short = cutlass.Int32(0)
         if cutlass.const_expr(self.varlen):
@@ -14484,7 +14548,7 @@ class GvrTopkRegKernel:
                         ov = i
                     out[row, i] = ov
                     i = i + cutlass.Int32(BLK)
-        if cutlass.const_expr(
+        window_cr = (
             self.dtype == cutlass.BFloat16
             and self.vpt <= 8
             and self.nbh >= 512
@@ -14497,7 +14561,17 @@ class GvrTopkRegKernel:
                     and (pre_idx.shape[1] % self.blk == 0 or not self.stage_output)
                 )
             )
-        ):
+        )
+        # succ_la: a window build prefetches the successor row after the window's first barrier
+        la_window = {}
+        if cutlass.const_expr(self.succ_la > 0 and window_cr):
+            la_window = {
+                "succ_la": self.succ_la,
+                "la_logits": logits,
+                "la_row": row,
+                "la_length": n_envelope,
+            }
+        if cutlass.const_expr(window_cr):
             if short == cutlass.Int32(0):
                 window_done = _bf16_try_window_cr(
                     hp,
@@ -14515,6 +14589,7 @@ class GvrTopkRegKernel:
                     pk16=self.pk16,
                     stage_output=self.stage_output,
                     packed_signcount_bf16=self.packed_signcount_bf16,
+                    **la_window,
                 )
                 if window_done != cutlass.Int32(0):
                     short = cutlass.Int32(1)
@@ -15988,6 +16063,7 @@ def get_compiled__reg(
     cr2: bool = False,
     fp16_radix_impl: int = 0,
     static_n: int | None = None,
+    succ_la: int = 0,
 ) -> Any:
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
@@ -16014,7 +16090,9 @@ def get_compiled__reg(
     n is compiled in). pcw compiles the BF16 satellite's
     ``GvrPackedClampWindowKernel`` from blk, vpt, minb, next_n, cr_shift,
     varlen, parts (up to 8), stage_output, static_k, static_npad, pcw_bins and
-    pcw_cluster, and ignores the other kernel options.
+    pcw_cluster, and ignores the other kernel options. succ_la > 0 (``kern_cr`` builds
+    only: code_radix, clus == 1, not cr2, pcw or fp16_radix_impl=2) makes the BF16 window prefetch
+    the row succ_la rows ahead into L2 once a CTA's own row has landed.
     """
     if static_k is not None:
         assert static_k > 0
@@ -16067,6 +16145,17 @@ def get_compiled__reg(
         key += (("fp16_radix_impl", fp16_radix_impl),)
     if dtype == "f16" and static_n is not None:
         key += (("static_n", int(static_n)),)
+    if not (
+        code_radix
+        and dtype != "f32"
+        and clus == 1
+        and not cr2
+        and not pcw
+        and not (dtype == "f16" and fp16_radix_impl == 2)
+    ):
+        succ_la = 0  # only GvrTopkRegKernel.kern_cr takes the lookahead
+    if succ_la:
+        key += (("succ_la", int(succ_la)),)
     static_env_bf16 = (
         tuple(map(int, static_env_bf16))
         if dtype == "bf16" and not pcw and not code_radix and static_env_bf16 is not None
@@ -16140,6 +16229,7 @@ def get_compiled__reg(
                 lane_hash=lane_hash,
                 cr2=cr2,
                 static_n=static_n,
+                succ_la=succ_la,
             )
             if dtype == "f16" and fp16_radix_impl == 2:
                 kernel = _fp16.GvrCodeRadixCounterKernel(kernel)
