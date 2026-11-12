@@ -1381,16 +1381,16 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         enable_thinking=False,
                         add_generation_prompt=True,
                     )
-                    prompt_ids = tokenizer.encode(prompt_text,
-                                                  add_special_tokens=False)
+
+                # Count the final text after decoding and any template rendering.
+                prompt_ids = tokenizer.encode(prompt_text,
+                                              add_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
                     max_seq_len = model_config['max_seq_len']
                     if len(prompt_ids) + output_len > max_seq_len:
                         raise ValueError(
                             "Rendered V4.1 prompt and output cap exceed max_seq_len"
                         )
-                elif self._config.model_name in QWEN38_MTP_MODELS:
-                    prompt_ids = tokenizer.encode(prompt_text,
-                                                  add_special_tokens=False)
 
                 sample = {
                     "input": {
