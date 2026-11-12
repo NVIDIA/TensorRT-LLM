@@ -164,15 +164,10 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
-  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
-  # Only CUTLASS and MARLIN backends run on H100 (SM90). TRTLLM/CUTEDSL/DEEPGEMM require SM100+.
-  # --- CUTLASS ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
-  # --- MARLIN (SM90-only; focused DEP + ALLGATHER x NVFP4 matrix) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
+  # ------------- MoE: multi-GPU module tests ---------------
+  # The SM90 part of the pre-merge subset (_MULTI_GPU_PREMERGE_CASES in test_moe_module.py):
+  # CUTLASS and MARLIN, the backends that run on SM90. The full matrix runs post-merge.
+  - unittest/_torch/moe/test_moe_module.py::test_moe_multi_gpu_premerge
   # ------------- MoE: test_multi_gpu_eplb ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
 - condition:
@@ -340,7 +335,7 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
-  # ---- FP8 per-tensor (QDQ) moved to post-merge; block-scale stays in pre ----
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES"
+  # The full multi-GPU MoE module matrix; pre-merge runs test_moe_multi_gpu_premerge.
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on]

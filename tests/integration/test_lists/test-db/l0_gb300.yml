@@ -67,7 +67,7 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
   - unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestSparseResolve::test_colliding_selections_preserve_slots_and_eviction
-  - unittest/_torch/moe/kernels/parallel
+  # moe/kernels/parallel runs on B300 (l0_b300), the same SM103 kernels.
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
@@ -132,7 +132,6 @@ l0_gb300:
   tests:
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
-  - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
