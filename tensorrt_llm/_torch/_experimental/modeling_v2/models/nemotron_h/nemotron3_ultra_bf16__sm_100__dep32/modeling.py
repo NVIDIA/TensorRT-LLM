@@ -56,6 +56,12 @@ with `TRTLLM_NEMOTRON_ULTRA_DEP32_BLOCK_REUSE=1`, not gated yet: the cache manag
 and restores the prompt-end Mamba snapshots in the state pools, and the prefill seeds the
 scan and the conv window from the slot wherever `has_initial_states` says so.
 
+Breakable prefill CUDA graphs (`prefill_cuda_graph_backend: breakable`): the prefill body is
+captured once per token bucket; the mamba conv + scan + recurrence and the attention core, the
+only parts that read the step's batch, run in `eager_on_graph` breaks that read the step's
+metadata at every replay, and every other op is row-wise over the bucket's rows. The engine
+pads every rank to the same bucket, so the MoE exchange's per-rank counts are fixed per bucket.
+
 Each target is self-contained: it holds the per-layer weight views it reads,
 passes every argument to every op at the call site, and shares no code with the
 other targets.
@@ -73,6 +79,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
+    eager_on_graph,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     flashinfer_fused_add_rmsnorm,
 )
@@ -108,6 +117,8 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
@@ -686,30 +697,17 @@ class PrefillTarget:
         d = core.dims
         md = attn_metadata
         eps = self._eps
-        bound = core._bound
 
         self._check_step_contract(md)
-        step = self.step_args(md)
-        window = md.max_seq_len
-        # One token count per rank (host ints): every MoE layer's exchange reads them.
+        # One token count per rank (host ints): every MoE layer's exchange reads them. Under a
+        # breakable prefill CUDA graph the engine pads every rank to the same bucket, so the
+        # list is `[T] * world_size` at capture and at every replay of that bucket.
         all_rank_num_tokens = md.all_rank_num_tokens
-
-        # Host-side batch split: context rows first, then single-token generation rows.
-        nc = md.num_contexts
-        nct = md.num_ctx_tokens
-        ns = md.num_seqs
-        mm = md.mamba_metadata
-        si = mm.state_indices
-        qsl = mm.query_start_loc
-        hi = mm.has_initial_states
-        use_init = mm.use_initial_states
-        seq_idx = mm.seq_idx
-        chunk_indices = mm.chunk_indices
-        chunk_offsets = mm.chunk_offsets
-        chunk = mm.chunk_size
-        si_ctx = si[:nc]
-        si_gen = si[nc:ns]
-        has_gen = ns > nc
+        # Under a breakable prefill CUDA graph this body is captured once per token bucket and
+        # replayed without running this Python: everything that reads the step's batch (the
+        # mamba conv + scan + recurrence, the attention core) runs in a break, the rest is
+        # row-wise over the bucket's `T` rows.
+        bcg = is_in_breakable_cuda_graph()
 
         if inputs_embeds is None:
             h = nn.functional.embedding(input_ids, core.w["embed"])
@@ -718,112 +716,30 @@ class PrefillTarget:
         num_tokens = h.shape[0]
         attn_out = torch.empty([num_tokens, d.q_width_r], dtype=h.dtype, device=h.device)
 
-        din, conv_c = d.d_inner_r, d.conv_r
-        heads, hd, gn = d.heads_r, d.head_dim_ssm, d.gn_r
-        groups, st = d.groups_r, d.ssm_state
+        din = d.d_inner_r
+        heads, hd = d.heads_r, d.head_dim_ssm
 
         x = flashinfer_rmsnorm(h, self._norm0, eps)
         residual = h
         for i, (L, norm_next) in enumerate(self._layers):
             if isinstance(L, _Mamba):
-                conv_state = bound.conv[i]
-                ssm_state = bound.ssm[i]
                 zxbcdt = cublas_mm(x, L.in_w)
                 z = zxbcdt[:, :din]
-                xbc = zxbcdt[:, din : din + conv_c]
-                dt = zxbcdt[:, din + conv_c :]
                 y = torch.empty([num_tokens, heads, hd], dtype=h.dtype, device=h.device)
-
-                # Context rows: varlen conv (seeding from and writing back the conv
-                # state), then the chunked scan seeded from the SSM state where the
-                # sequence has one, with each sequence's final state written back.
-                # Channel-last views on both sides: the result is token-major
-                # [nct, x|B|C], so x, B and C are column views of it.
-                xbc_ctx = causal_conv1d_fwd(
-                    xbc[:nct].t(),
-                    L.conv_w,
-                    L.conv_b,
-                    conv_state,
-                    qsl[: nc + 1],
-                    si_ctx,
-                    hi[:nc],
-                    True,
-                    _PAD_SLOT_ID,
-                    torch.empty([nct, conv_c], dtype=h.dtype, device=h.device).t(),
-                ).t()
-                xs = xbc_ctx[:, :din].reshape(1, nct, heads, hd)
-                Bm = xbc_ctx[:, din : din + gn].reshape(1, nct, groups, st)
-                Cm = xbc_ctx[:, din + gn :].reshape(1, nct, groups, st)
-                # A fresh row's slot still holds the previous request's state, which
-                # the scan cannot tell apart from a carried one: zero it here.
-                init = None
-                if use_init:
-                    init = ssm_state[si_ctx].to(torch.float32)
-                    init.masked_fill_(~hi[:nc].view(nc, 1, 1, 1), 0)
-                final = mamba_chunk_scan_combined(
-                    xs,
-                    dt[:nct].unsqueeze(0),
-                    L.A,
-                    Bm,
-                    Cm,
-                    chunk,
-                    L.D,
-                    None,
-                    L.dt_bias,
-                    init,
-                    seq_idx,
-                    chunk_indices,
-                    chunk_offsets,
-                    qsl[: nc + 1],
-                    True,
-                    _DT_LIMIT,
-                    y[:nct].view(1, nct, heads, hd),
-                    False,
-                    True,
-                    torch.float32,
-                )
-                ssm_state[si_ctx] = final.to(ssm_state.dtype)
-
-                # Generation rows: one conv step and one recurrence step each.
-                if has_gen:
-                    # Activates the generation rows of xBC in place inside zxbcdt.
-                    xbc_gen = causal_conv1d_update(
-                        xbc[nct:], conv_state, L.conv_w, L.conv_b, True, None, si_gen, _PAD_SLOT_ID
-                    )
-                    ng = num_tokens - nct
-                    selective_state_update(
-                        ssm_state,
-                        xbc_gen[:, :din].reshape(ng, heads, hd),
-                        dt[nct:][:, :, None].expand(ng, heads, hd),
-                        L.A_hd,
-                        xbc_gen[:, din : din + gn].reshape(ng, groups, st),
-                        xbc_gen[:, din + gn :].reshape(ng, groups, st),
-                        D=L.D_hd,
-                        z=None,
-                        dt_bias=L.dt_bias_hd,
-                        dt_softplus=True,
-                        state_batch_indices=si_gen,
-                        pad_slot_id=_PAD_SLOT_ID,
-                        out=y[nct:],
-                    )
-
+                if bcg:
+                    eager_on_graph(zxbcdt, y, i, inner=self._mamba_break)
+                else:
+                    self._mamba_core(i, zxbcdt, y, md, num_tokens)
                 yn = rms_norm_gated_grouped(
                     y.reshape(num_tokens, din), z, L.gnorm, eps, d.norm_group
                 )
                 out = cublas_mm(yn, L.out_w)
             elif isinstance(L, _Attention):
                 qkv = cublas_mm(x, L.qkv)
-                attn_out = thop_attention(
-                    q=qkv,
-                    output=attn_out,
-                    local_layer_idx=bound.pool_row[i],
-                    num_heads=d.q_heads_r,
-                    num_kv_heads=d.kv_heads,
-                    head_size=d.head_dim,
-                    attention_window_size=window,
-                    **step,
-                    **_CALL_CONSTANTS,
-                )
+                if bcg:
+                    eager_on_graph(qkv, attn_out, i, inner=self._attention_break)
+                else:
+                    attn_out = self._attention_core(i, qkv, attn_out, md, num_tokens)
                 out = cublas_mm(attn_out, L.o)
             else:
                 # The shared expert reads only x: run it on the side stream while the
@@ -855,6 +771,143 @@ class PrefillTarget:
                 out = out + shared
             x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)
         return x
+
+    def _mamba_core(self, i: int, zxbcdt: torch.Tensor, y: torch.Tensor, md, live: int) -> None:
+        """Layer `i`'s conv + scan + recurrence over the step's `live` rows: writes rows
+        `[:live]` of `y` `[T, heads, head_dim]` and zeroes rows `[live:]` (the bucket's padding).
+
+        Context rows first, then single-token generation rows. Every branch is on a host int
+        of the step. A breakable-graph replay on a rank with no context rows (its peers have
+        some) carries generation rows only, so the context part is skipped when `nc` is 0."""
+        core = self.core
+        d = core.dims
+        L = self._layers[i][0]
+        bound = core._bound
+        conv_state = bound.conv[i]
+        ssm_state = bound.ssm[i]
+        din, conv_c = d.d_inner_r, d.conv_r
+        heads, hd, gn = d.heads_r, d.head_dim_ssm, d.gn_r
+        groups, st = d.groups_r, d.ssm_state
+        xbc = zxbcdt[:, din : din + conv_c]
+        dt = zxbcdt[:, din + conv_c :]
+
+        # Host-side batch split: context rows first, then single-token generation rows.
+        nc = md.num_contexts
+        nct = md.num_ctx_tokens
+        ns = md.num_seqs
+        mm = md.mamba_metadata
+        si = mm.state_indices
+        qsl = mm.query_start_loc
+        hi = mm.has_initial_states
+        si_ctx = si[:nc]
+        si_gen = si[nc:ns]
+
+        if nc:
+            # Context rows: varlen conv (seeding from and writing back the conv
+            # state), then the chunked scan seeded from the SSM state where the
+            # sequence has one, with each sequence's final state written back.
+            # Channel-last views on both sides: the result is token-major
+            # [nct, x|B|C], so x, B and C are column views of it.
+            xbc_ctx = causal_conv1d_fwd(
+                xbc[:nct].t(),
+                L.conv_w,
+                L.conv_b,
+                conv_state,
+                qsl[: nc + 1],
+                si_ctx,
+                hi[:nc],
+                True,
+                _PAD_SLOT_ID,
+                torch.empty([nct, conv_c], dtype=zxbcdt.dtype, device=zxbcdt.device).t(),
+            ).t()
+            xs = xbc_ctx[:, :din].reshape(1, nct, heads, hd)
+            Bm = xbc_ctx[:, din : din + gn].reshape(1, nct, groups, st)
+            Cm = xbc_ctx[:, din + gn :].reshape(1, nct, groups, st)
+            # A fresh row's slot still holds the previous request's state, which
+            # the scan cannot tell apart from a carried one: zero it here.
+            init = None
+            if mm.use_initial_states:
+                init = ssm_state[si_ctx].to(torch.float32)
+                init.masked_fill_(~hi[:nc].view(nc, 1, 1, 1), 0)
+            final = mamba_chunk_scan_combined(
+                xs,
+                dt[:nct].unsqueeze(0),
+                L.A,
+                Bm,
+                Cm,
+                mm.chunk_size,
+                L.D,
+                None,
+                L.dt_bias,
+                init,
+                mm.seq_idx,
+                mm.chunk_indices,
+                mm.chunk_offsets,
+                qsl[: nc + 1],
+                True,
+                _DT_LIMIT,
+                y[:nct].view(1, nct, heads, hd),
+                False,
+                True,
+                torch.float32,
+            )
+            ssm_state[si_ctx] = final.to(ssm_state.dtype)
+
+        # Generation rows: one conv step and one recurrence step each.
+        if ns > nc:
+            # Activates the generation rows of xBC in place inside zxbcdt.
+            xbc_gen = causal_conv1d_update(
+                xbc[nct:live], conv_state, L.conv_w, L.conv_b, True, None, si_gen, _PAD_SLOT_ID
+            )
+            ng = live - nct
+            selective_state_update(
+                ssm_state,
+                xbc_gen[:, :din].reshape(ng, heads, hd),
+                dt[nct:live][:, :, None].expand(ng, heads, hd),
+                L.A_hd,
+                xbc_gen[:, din : din + gn].reshape(ng, groups, st),
+                xbc_gen[:, din + gn :].reshape(ng, groups, st),
+                D=L.D_hd,
+                z=None,
+                dt_bias=L.dt_bias_hd,
+                dt_softplus=True,
+                state_batch_indices=si_gen,
+                pad_slot_id=_PAD_SLOT_ID,
+                out=y[nct:live],
+            )
+        if live < y.shape[0]:
+            y[live:].zero_()
+
+    def _mamba_break(self, zxbcdt: torch.Tensor, y: torch.Tensor, i: int) -> None:
+        """Break: `_mamba_core` on the step the engine is running, read at every replay."""
+        md = get_model_extra_attrs()["attention_metadata"]()
+        self._mamba_core(i, zxbcdt, y, md, int(md.num_tokens))
+
+    def _attention_core(
+        self, i: int, qkv: torch.Tensor, attn_out: torch.Tensor, md, live: int
+    ) -> torch.Tensor:
+        """Layer `i`'s attention over the step's `live` rows: writes rows `[:live]` of
+        `attn_out` in place, zeroes rows `[live:]` and returns `attn_out`."""
+        d = self.core.dims
+        thop_attention(
+            q=qkv[:live],
+            output=attn_out[:live],
+            local_layer_idx=self.core._bound.pool_row[i],
+            num_heads=d.q_heads_r,
+            num_kv_heads=d.kv_heads,
+            head_size=d.head_dim,
+            attention_window_size=md.max_seq_len,
+            **self.step_args(md),
+            **_CALL_CONSTANTS,
+        )
+        if live < attn_out.shape[0]:
+            attn_out[live:].zero_()
+        return attn_out
+
+    def _attention_break(self, qkv: torch.Tensor, attn_out: torch.Tensor, i: int) -> None:
+        """Break: `_attention_core` on the step the engine is running, read at every replay."""
+        md = get_model_extra_attrs()["attention_metadata"]()
+        self._attention_core(i, qkv, attn_out, md, int(md.num_tokens))
 
 
 class DecodeTarget:

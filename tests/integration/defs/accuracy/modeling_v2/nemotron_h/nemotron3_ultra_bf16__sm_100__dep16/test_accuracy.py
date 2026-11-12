@@ -18,6 +18,9 @@ import pytest
 
 from .._common import NemotronHBf16Target, skip_not_gb200
 
+# Prefill CUDA graph buckets: powers of two to 512, then coarser steps to the 4096-token step.
+_BCG_BUCKETS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]
+
 
 @skip_not_gb200
 @pytest.mark.skip_less_mpi_world_size(16)
@@ -47,6 +50,17 @@ class TestModelingV2Nemotron3UltraBf16Sm100Dep16(NemotronHBf16Target):
             moe_backend="MEGAMOE_CUTEDSL",
             moe_max_num_tokens=1024,
             max_num_tokens=4096,
+        )
+
+    def test_gsm8k_megamoe_cutedsl_bcg(self):
+        # The context tier's serving path with breakable prefill CUDA graphs: every bucket up to
+        # the 4096-token step captured, the mamba core and attention eager between segments.
+        self._gsm8k(
+            max_batch_size=32,
+            moe_backend="MEGAMOE_CUTEDSL",
+            moe_max_num_tokens=1024,
+            max_num_tokens=4096,
+            prefill_capture_num_tokens=_BCG_BUCKETS,
         )
 
     def test_gsm8k(self):
