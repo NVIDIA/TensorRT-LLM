@@ -401,7 +401,10 @@ def format_failure(name: str, differences: Sequence[str]) -> str:
         "If the change is intended, regenerate with "
         "`PYTHONPATH=tests python3 -m test_common.serve.routes --write`, commit the YAML, "
         "and request review from @NVIDIA/trt-llm-noncommitted-api-review-committee "
-        "(owner of tests/unittest/api_stability/). Do not add routes or methods to "
+        "(owner of tests/unittest/api_stability/). New endpoints are a router and a "
+        "serving class under tensorrt_llm/serve/api/<dialect>/<endpoint>/: create the "
+        "router with make_router() and add a RouterSpec to ROUTERS "
+        "(tensorrt_llm/serve/_base/routing.py). Do not add routes or methods to "
         "OpenAIServer; see tensorrt_llm/serve/AGENTS.md."
     )
 
