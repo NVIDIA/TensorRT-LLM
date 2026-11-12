@@ -299,9 +299,10 @@ def check_step_buffers(g: PoolGeometry, int_conv, conv, int_idx) -> None:
     )
 
 
-def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> None:
+def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm, replay_slots) -> None:
     """Cached replay, manager-wide: the geometry the replay entry is certified at, and the
-    per-slot bookkeeping, which must cover every pool slot."""
+    per-slot bookkeeping, which must cover every replay slot. The manager may address the
+    history by replay slots of its own, which then differ from the recurrent pool's."""
     assert ssm.dtype in SSM_STATE_DTYPES, (
         f"the recurrent pool is {ssm.dtype}; the replay entry is certified at an fp32 or a "
         "bf16 checkpoint"
@@ -314,22 +315,24 @@ def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> Non
         f"verify rows and never above the history ({history})"
     )
     for name, t in (("prev_num_accepted_tokens", prev_accepted), ("cache_buf_idx", cache_buf_idx)):
-        assert t.dim() == 1 and t.shape[0] >= ssm.shape[0] and t.dtype == torch.int32, (
-            f"{name} is {tuple(t.shape)} {t.dtype}; the kernel reads one int32 per pool slot "
-            f"({ssm.shape[0]})"
+        assert t.dim() == 1 and t.shape[0] >= replay_slots and t.dtype == torch.int32, (
+            f"{name} is {tuple(t.shape)} {t.dtype}; the kernel reads one int32 per replay slot "
+            f"({replay_slots})"
         )
 
 
 def check_replay_history(
-    g: PoolGeometry, layer: int, history, pool_slots, old_x, old_B, old_dt
+    g: PoolGeometry, layer: int, history, replay_slots, old_x, old_B, old_dt
 ) -> None:
-    """One GDN layer's replay history: `[slots, 2 halves, ...]` over this rank's heads, addressed
-    by `history` and the head geometry, never by the buffer's own shape."""
+    """One GDN layer's replay history: `[replay slots, 2 halves, ...]` over this rank's heads,
+    addressed by `history` and the head geometry, never by the buffer's own shape."""
     for name, t in (("old_x", old_x), ("old_B", old_B), ("old_dt", old_dt)):
         assert t is not None, f"layer {layer}: the manager's layer cache carries no {name}"
-    assert old_x.shape[0] >= pool_slots, (
-        f"layer {layer}: the replay history has {old_x.shape[0]} slots for a {pool_slots}-slot pool"
-    )
+    for name, t in (("old_x", old_x), ("old_B", old_B), ("old_dt", old_dt)):
+        assert t.shape[0] >= replay_slots, (
+            f"layer {layer}: the replay history {name} has {t.shape[0]} slots for "
+            f"{replay_slots} replay slots"
+        )
     bf16, fp32 = torch.bfloat16, torch.float32
     x_tail, b_tail = (history, g.num_v_heads, g.head_v_dim), (history, g.num_k_heads, g.head_k_dim)
     _check_pool(old_x, f"layer {layer}: old_x", 2, x_tail, bf16)

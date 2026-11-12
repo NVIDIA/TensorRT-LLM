@@ -1692,6 +1692,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 md.max_num_requests,
                 pdl=_GDN_REPLAY_PDL,
                 partition_from=CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+                work_item_width=mm.replay_work_items.shape[1],
+                separate_replay_slots=_has_replay_slots(cm),
             )
         # No sliding window: the targets pass `max_seq_len` as the window.
         windows = cm.max_attention_window_vec
@@ -1755,8 +1757,11 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
         ssm0 = pools.ssm[g0]
         history, width = meta.replay_history_size, meta.replay_step_width
+        # The bookkeeping has one row per replay slot; a step indexes it, and the history,
+        # with the metadata's `replay_state_indices`.
+        replay_slots = meta.prev_num_accepted_tokens.shape[0]
         _pool.check_replay_state(
-            history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0
+            history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0, replay_slots
         )
         if getattr(cm, "use_gdn_flashinfer_ring_replay", False):
             # FlashInfer's ring replay (the manager chose it at load: MTP with 3 or 7 drafts
@@ -1782,7 +1787,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         old = {}
         for i, cache in layer_caches.items():
             old[i] = (cache.old_x, cache.old_B, cache.old_dt, cache.old_dA_cumsum)
-            _pool.check_replay_history(g, i, history, ssm0.shape[0], *old[i][:3])
+            _pool.check_replay_history(g, i, history, replay_slots, *old[i][:3])
         replay = _Replay(old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width)
         return dict(int_idx=int_idx, int_conv=int_conv, replay=replay)
 
@@ -2310,24 +2315,37 @@ def _verify_rows(core, md, spec_metadata, num_seqs: int, num_rows: int) -> tuple
     return p, spec_metadata is not None and num_seqs > 0 and p > 1
 
 
-def _verify_state(core, mm, num_decodes: int) -> tuple:
+def _has_replay_slots(cm) -> bool:
+    """Whether the manager keeps the replay history in slots of its own, which the metadata's
+    `replay_state_indices` then address (otherwise it aliases the recurrent-state slots)."""
+    return getattr(cm, "replay_layer_group_id", None) is not None
+
+
+def _verify_state(core, mm, num_decodes: int, num_prefills: int = 0) -> tuple:
     """What a verify step's `_gdn_verify` reads besides the layer: the rows
-    `update_mamba_states` promotes the conv windows from, and the replay's work items. Work
+    `update_mamba_states` promotes the conv windows from, the replay's work items, and the
+    generation rows' replay slots (behind `num_prefills` context rows). Work
     items go to the kernel from `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests on, and the
     kernel leaves the history commit to the manager's all-layer commit exactly when the
     manager runs one after the step -- the stock Gated-DeltaNet layer's two conditions. The
-    FlashInfer ring replay folds in-kernel and reads no work items."""
+    FlashInfer ring replay folds in-kernel and reads no work items; its history shares the
+    recurrent-state slots."""
     assert core._bound.int_idx is not None, "the cache-manager bind has not run"
     int_idx = core._bound.int_idx[:num_decodes]
     if core._bound.replay.ring is not None:
-        return int_idx, None, None, False
+        return int_idx, None, None, False, None
     partitioned = num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
     all_layer = partitioned and bool(
         getattr(core._bound.cm, "use_gdn_cached_replay_all_layer_commit", False)
     )
     work_items = mm.replay_work_items[:num_decodes] if partitioned else None
     n_writes = mm.replay_n_writes if partitioned else None
-    return int_idx, work_items, n_writes, all_layer
+    replay_indices = (
+        mm.replay_state_indices[num_prefills : num_prefills + num_decodes]
+        if _has_replay_slots(core._bound.cm)
+        else None
+    )
+    return int_idx, work_items, n_writes, all_layer, replay_indices
 
 
 def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.Tensor:
@@ -2347,7 +2365,7 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
 
     `mq_out` is the conv output when the input projection's GEMV ran the conv step as its
     epilogue (`fp8_gemv_conv1d_verify`, `nvfp4_split_gemv_conv1d_verify`; `mq` is then None)."""
-    int_idx, work_items, n_writes, all_layer = verify
+    int_idx, work_items, n_writes, all_layer, replay_indices = verify
     pools = core._bound.pools
     replay = core._bound.replay
     ssm = pools.ssm[i]
@@ -2435,6 +2453,7 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
         packed_qkv=mq_out,
         use_all_layer_commit=all_layer,
         output=None,
+        replay_indices=replay_indices,
     )
     return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
 
@@ -4295,7 +4314,7 @@ class PrefillTarget:
             qsl_long_p,
             num_decodes,
             gen_p,
-            _verify_state(core, mm, num_decodes) if is_verify else None,
+            _verify_state(core, mm, num_decodes, num_prefills) if is_verify else None,
         )
 
         # PLE carry flags must cover the whole batch, but `has_initial_states` is filled for
