@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -529,6 +530,68 @@ def test_sparse_decode_cuda_graph_replay_tracks_inputs(num_topk_chunks):
         q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev, HEAD_DIM**-0.5, 1
     )
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
+
+
+def test_sparse_decode_bf16_cache_zero_length_rows_are_zero_not_nan() -> None:
+    """CUDA-graph padding rows of a BF16 cache emit zeros, not NaN."""
+    seq_lens = [1024, 0, 512, 0]
+    inputs = _make_inputs(seq_lens, kv_dtype=torch.bfloat16, seed=75)
+    for num_topk_chunks in (None, 1):
+        kwargs = {} if num_topk_chunks is None else {"num_topk_chunks": num_topk_chunks}
+        out = _run(*inputs, 1, **kwargs)
+        assert torch.isfinite(out).all()
+        assert torch.equal(out[1], torch.zeros_like(out[1]))
+        assert torch.equal(out[3], torch.zeros_like(out[3]))
+        assert out[0].abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    "num_topk_chunks", [None, 1, 4], ids=["default", "direct-output", "split-merge"]
+)
+def test_sparse_decode_bf16_cache_cuda_graph_replay_equals_eager(
+    num_topk_chunks: Optional[int],
+) -> None:
+    """A captured BF16-cache decode replays bit-identically to eager on new inputs."""
+    seq_lens = [174, 4097, 900]
+    q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev = _make_inputs(
+        seq_lens, kv_dtype=torch.bfloat16, num_kv_heads=1, group=16, seed=77
+    )
+    kwargs = {}
+    if num_topk_chunks is not None:
+        kwargs["num_topk_chunks"] = num_topk_chunks
+    out = torch.empty_like(q)
+
+    def run(target: torch.Tensor) -> None:
+        minimax_m3_sparse_attn_decode(
+            q,
+            k_paged,
+            v_paged,
+            topk_idx,
+            block_table,
+            seq_lens_dev,
+            sm_scale=HEAD_DIM**-0.5,
+            output=target,
+            decode_query_len=1,
+            **kwargs,
+        )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        run(out)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(out)
+
+    generator = torch.Generator(device="cuda").manual_seed(101)
+    q.copy_(torch.randn(q.shape, device="cuda", generator=generator, dtype=torch.float32))
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = torch.empty_like(q)
+    run(eager)
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
 
 
 @skip_not_sm100
