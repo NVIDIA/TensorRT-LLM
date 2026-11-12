@@ -1269,7 +1269,9 @@ def run_transfer_test(
                 is_mla=is_mla,
                 use_v2=use_v2,
                 max_attention_window_vec=max_attention_window_vec,
-                num_layers=num_layers,
+                # Draft-owned layers appended after the target's must move like
+                # the target's; verify their contents outside helix too.
+                num_layers=num_layers + num_draft_layers,
                 gen_scratch_tokens=gen_scratch_tokens,
             )
 
@@ -1601,6 +1603,28 @@ def test_cache_transceiver_helix_cp_with_draft_layers(gen_cp):
         use_v2=True,
         max_attention_window_vec=None,
         gen_cp=gen_cp,
+        num_draft_layers=2,
+    )
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_with_draft_layers():
+    """Unified draft KV cache without helix: draft layers move like the target's.
+
+    K-only draft layers appended after the MLA target's on both sides transfer
+    with the target's blocks, and the verifier checks their contents at
+    gen_cp==1 (the only case the helix tests leave uncovered).
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=True,
+        max_attention_window_vec=None,
         num_draft_layers=2,
     )
 
