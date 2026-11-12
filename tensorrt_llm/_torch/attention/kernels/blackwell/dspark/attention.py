@@ -3,7 +3,7 @@
 
 """Blackwell DSpark attention specialization and persistent scheduler."""
 
-from typing import Optional, Tuple, Type
+from typing import Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -205,18 +205,18 @@ class DSparkAttention(DSparkAttentionKernel):
     pv_tiler_mn = (128, 256)
     qk_tiler_k = 128
     page_size_draft = 8
-    page_size_win = 128
+    window_len = 128
 
     @staticmethod
     def _compute_grid(
-        o: cute.Tensor,
+        q_latent: cute.Tensor,
         cluster_shape_mnk: cute.Shape,
         max_active_clusters: int,
     ) -> Tuple[DSparkPersistentTileSchedulerParams, cute.Shape]:
         """Build scheduler parameters and cap the persistent DSpark grid."""
         tile_sched_params = DSparkPersistentTileSchedulerParams(
-            cute.size(o.shape[3]),
-            cute.size(o.shape[2]),
+            cute.size(q_latent.shape[3]),
+            cute.size(q_latent.shape[2]),
             cluster_shape_mnk,
         )
         grid = DSparkPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
@@ -237,14 +237,13 @@ class DSparkAttention(DSparkAttentionKernel):
         mma_pv_tiler_mn: Tuple[int, int],
         max_active_clusters: int,
         page_size_draft: int,
-        page_size_win: int,
+        window_len: int,
         skip_correction_threshold: float,
         *,
         arch_str: str,
         seq_len_q: int = block_size,
         mma_qk_tiler_k: int = qk_tiler_k,
         inverse_rope_dim: int = 0,
-        output_groups: int | None = None,
         history_page_size: int = 32,
         num_heads: int = num_heads,
     ):
@@ -256,7 +255,7 @@ class DSparkAttention(DSparkAttentionKernel):
             "mma_qk_tiler_mn": (mma_qk_tiler_mn, self.qk_tiler_mn),
             "mma_pv_tiler_mn": (mma_pv_tiler_mn, self.pv_tiler_mn),
             "page_size_draft": (page_size_draft, self.page_size_draft),
-            "page_size_win": (page_size_win, self.page_size_win),
+            "window_len": (window_len, self.window_len),
             "mma_qk_tiler_k": (mma_qk_tiler_k, self.qk_tiler_k),
         }
         mismatches = [
@@ -269,15 +268,11 @@ class DSparkAttention(DSparkAttentionKernel):
         if seq_len_q not in (5, 6):
             raise ValueError(f"DSpark block size must be 5 or 6, got {seq_len_q}")
         if history_page_size not in (16, 32, 64, 128, 256):
-            raise ValueError("DSpark history page size must be 16, 32, 64, 128, or 256")
+            raise ValueError(
+                f"DSpark history page size must be 16, 32, 64, 128, or 256, got {history_page_size}"
+            )
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
-        if output_groups is not None and (
-            output_groups <= 0 or self.num_heads % output_groups != 0
-        ):
-            raise ValueError(
-                f"DSpark output groups must divide {self.num_heads}, got {output_groups}"
-            )
 
         super().__init__(
             acc_dtype,
@@ -285,7 +280,7 @@ class DSparkAttention(DSparkAttentionKernel):
             mma_pv_tiler_mn,
             max_active_clusters,
             page_size_draft,
-            page_size_win,
+            window_len,
             skip_correction_threshold,
             arch_str=arch_str,
             seq_len_q=seq_len_q,
@@ -297,7 +292,6 @@ class DSparkAttention(DSparkAttentionKernel):
         self.tma_page_size_draft = self.qk_tiler_mn[1]
         self.fixed_cache_seq_len = self.window_size + seq_len_q
         self.inverse_rope_dim = inverse_rope_dim
-        self.output_groups = output_groups
         self.history_page_size = history_page_size
         # Subdivide the 64-row loads at physical-page and cyclic-window boundaries.
         self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
@@ -320,7 +314,6 @@ class DSparkAttention(DSparkAttentionKernel):
         attn_sink_ptr: cute.Pointer,
         inverse_rope_freqs_ptr: cute.Pointer,
         o_tensor: cute.Tensor,
-        o_scale_tensor: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -362,10 +355,7 @@ class DSparkAttention(DSparkAttentionKernel):
             page_table_ptr,
             layout=cute.make_layout((table_width, batch_size), stride=(1, table_stride)),
         )
-        if cutlass.const_expr(self.output_groups is None):
-            output = cute.make_tensor(o_tensor.iterator, layout=q_layout)
-        else:
-            output = o_tensor
+        output = cute.make_tensor(o_tensor.iterator, layout=q_layout)
         cache_seqs = cute.make_tensor(
             cache_seqs_ptr,
             layout=cute.make_layout((batch_size,), stride=(1,)),
@@ -395,7 +385,6 @@ class DSparkAttention(DSparkAttentionKernel):
             draft,
             page_table,
             output,
-            o_scale_tensor,
             cache_seqs,
             valid_len,
             capacities,
