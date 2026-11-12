@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Certification matrix for the FP8 target's `ce_exchange__sp_pair` copy-engine exchange at the
-tep2 / tp2 pair under mpirun: eager exchanges and graph replays with new inputs, byte-exact.
+tep2 / tp2 pair under mpirun: setup failing on one rank yields None on both, then eager exchanges
+and graph replays with new inputs, byte-exact.
 Run as `CUDA_VISIBLE_DEVICES=0,1 python _ce_exchange__sp_pair_op_matrix.py --world-size 2`."""
 
 import argparse
@@ -43,6 +44,29 @@ def _worker() -> None:
             )
         else:
             t.copy_(torch.randn(t.shape, generator=g, device=dev).to(t.dtype))
+
+    # check_failed_setup: one rank's allocation, then one rank's open of the peer's handle,
+    # fails; both ranks get None (no hang), and each frees what it allocated.
+    from cuda.bindings import runtime
+
+    def fail(*_):
+        return (runtime.cudaError_t.cudaErrorMemoryAllocation, 0)
+
+    for name, failing in (("cudaMalloc", 1), ("cudaIpcOpenMemHandle", 0)):
+        torch.cuda.synchronize()
+        free_before = torch.cuda.mem_get_info()[0]
+        real = getattr(runtime, name)
+        if rank == failing:
+            setattr(runtime, name, fail)
+        try:
+            got = ce_mod.CopyEngineExchange.create(mapping, 512 << 20)
+        finally:
+            setattr(runtime, name, real)
+        assert got is None, f"rank {rank}: built an exchange although {name} failed on {failing}"
+        torch.cuda.synchronize()
+        leaked = free_before - torch.cuda.mem_get_info()[0]
+        assert leaked < 64 << 20, f"rank {rank}: {leaked} bytes kept after {name} failed"
+        comm.Barrier()
 
     # check_create: the buffer holds the largest cell, 8192 int32 rows of 2051.
     capacity = 72 << 20
