@@ -615,7 +615,9 @@ export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp
 export UCX_NET_DEVICES=eth0
 ```
 
-Set `UCX_NET_DEVICES` to a named interface rather than `all`. See the next entry for why.
+These values let UCX reach other nodes over TCP only. On InfiniBand or RoCE clusters, also add the RDMA transport to `UCX_TLS` (for example `rc`; `ucx_info -d` inside the container lists the transports the node offers) and the RDMA devices to `UCX_NET_DEVICES`, or inter-node KV transfers fall back to TCP.
+
+Set `UCX_NET_DEVICES` to named devices rather than `all`. See the next entry for why.
 
 `examples/disaggregated/slurm/cache_transceiver_test/` sweeps these variables and reports the transport UCX actually selected, which is the quickest way to find a working combination on a new cluster.
 
@@ -631,7 +633,7 @@ RuntimeError: Failed to create NIXL backend: UCX
 
 UCX could not open one of the interfaces it was told to use, and creating the UCX worker failed. NIXL treats that as fatal, so the worker dies. The same bind error is often present and harmless in aggregated serving logs, where nothing depends on that UCX worker.
 
-The usual cause is `UCX_NET_DEVICES=all`, or leaving it unset so UCX defaults to all devices. A node can expose interfaces that are not usable from inside the container — for example virtual-function or bridge interfaces carrying only an IPv6 link-local address, which cannot be bound. List them with `ip -o addr` or `ls /sys/class/net` inside the container and set `UCX_NET_DEVICES` to a single interface with a bindable address (commonly `eth0`).
+The usual cause is `UCX_NET_DEVICES=all`, or leaving it unset so UCX defaults to all devices. A node can expose interfaces that are not usable from inside the container — for example virtual-function or bridge interfaces carrying only an IPv6 link-local address, which cannot be bound. List them with `ip -o addr` or `ls /sys/class/net` inside the container and set `UCX_NET_DEVICES` to the bindable interfaces you need (commonly `eth0`). On InfiniBand or RoCE nodes, also list the RDMA devices (for example `mlx5_0:1`): `UCX_NET_DEVICES` filters every transport, the RDMA ones included.
 
 Note this is the opposite of the advice for the different-NVLink-domain case above, which suggests unsetting `UCX_NET_DEVICES`. Prefer a named interface, and only widen the selection if a transfer needs a device that is excluded.
 
@@ -654,13 +656,13 @@ Check the libraries before concluding the backend is missing:
 
 ```bash
 ls -lL /usr/local/ucx/lib/libucp.so.0
-python3 -c "import pathlib, tensorrt_llm; print(pathlib.Path(tensorrt_llm.__file__).parent / 'libs/ucx')"
+python3 -c "import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec('tensorrt_llm').origin).parent / 'libs' / 'ucx')"
 ```
 
-TensorRT-LLM ships its own complete UCX under `tensorrt_llm/libs/ucx`. If the system copy is damaged, prepend the bundled directory so the plugin resolves against a good copy:
+TensorRT-LLM ships its own complete UCX under `tensorrt_llm/libs/ucx`. If the system copy is damaged, prepend the bundled directory so the plugin resolves against a good copy. The command finds the package without importing it, because importing `tensorrt_llm` prints a version banner to stdout, which the command substitution would capture:
 
 ```bash
-export LD_LIBRARY_PATH=$(python3 -c "import pathlib, tensorrt_llm; print(pathlib.Path(tensorrt_llm.__file__).parent / 'libs/ucx')"):$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$(python3 -c "import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec('tensorrt_llm').origin).parent / 'libs' / 'ucx')"):$LD_LIBRARY_PATH
 ```
 
 Because a node can be broken in isolation, a NIXL failure that appears on only one of several otherwise identical nodes is worth checking here first, before spending a full weight load on an environment change.
