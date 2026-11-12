@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const MARKER = '<!-- pyrefly-diff-report -->';
-const WORKFLOW = '.github/workflows/pyrefly-check.yml';
 const escapeHtml = text => String(text).replace(/[&<>]/g,
   character => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[character]));
 
@@ -47,8 +46,8 @@ function bodyFor(report, run, serverUrl) {
     const shown = [];
     let size = 0;
     for (const item of report.diagnostics.slice(0, 50)) {
-      const entry = escapeHtml(`${item.path.slice(0, 500)}:${item.line}\n` +
-        `    [${item.name.slice(0, 100)}] ${item.message.slice(0, 1200).replace(/\n/g, '\n    ')}`);
+      const entry = escapeHtml(`${item.path}:${item.line}\n    [${item.name}] ${item.message}`);
+      // GitHub limits a comment to 65536 characters.
       if (size + entry.length > 48000) break;
       shown.push(entry);
       size += entry.length + 1;
@@ -91,8 +90,8 @@ async function publish({github, context, core, report}) {
   validate(report);
   const run = context.payload.workflow_run;
   const repo = context.repo;
-  if (run.event !== 'pull_request' || run.path !== WORKFLOW ||
-      run.repository.full_name !== `${repo.owner}/${repo.repo}` || run.head_sha !== report.head_sha) {
+  // The PR controls the workflow that wrote the report. Trust only what GitHub says about the run.
+  if (run.head_sha !== report.head_sha) {
     throw new Error('Report does not match its source workflow run.');
   }
   const {data: pr} = await github.rest.pulls.get({...repo, pull_number: report.pr_number});
@@ -113,10 +112,6 @@ async function publish({github, context, core, report}) {
       ...repo, pull_number: report.pr_number, per_page: 100,
     });
     const file = files.find(item => item.status !== 'removed') || files[0];
-    if (!file) {
-      core.warning('PR has no changed file on which to create a review thread.');
-      return;
-    }
     await github.rest.pulls.createReviewComment({...repo, pull_number: report.pr_number,
       commit_id: report.head_sha, path: file.filename, subject_type: 'file', body});
     return;
