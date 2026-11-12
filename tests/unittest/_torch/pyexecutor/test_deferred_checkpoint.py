@@ -5,12 +5,14 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch import kernel_builder
 from tensorrt_llm._torch.kernel_builder import KernelBuilder
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
     _ModuleTree,
     fill_rehearsal_values,
+    runner_rehearses,
 )
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
@@ -54,13 +56,21 @@ def _state(model):
     return {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
 
 
+def _kernel_builder(monkeypatch, rehearse):
+    # No op family: the families would queue real kernel builds.
+    monkeypatch.setattr(kernel_builder, "_FAMILIES", {})
+    monkeypatch.setattr(
+        KernelBuilder, "_instance", KernelBuilder(threads=1, enabled=True, rehearse=rehearse)
+    )
+
+
 @cuda
 def test_a_deferred_load_matches_a_direct_one(checkpoint, monkeypatch):
+    _kernel_builder(monkeypatch, rehearse=True)
     _, direct = _load(checkpoint, defer_checkpoint=False)
     expected = _state(direct)
     del direct
 
-    monkeypatch.setattr(KernelBuilder, "wants_rehearsal", lambda self, model_config, model: True)
     loader, model = _load(checkpoint, defer_checkpoint=True)
     assert loader.has_deferred_checkpoint
     rehearsal = _state(model)
@@ -75,9 +85,29 @@ def test_a_deferred_load_matches_a_direct_one(checkpoint, monkeypatch):
 
 
 @cuda
-def test_no_deferral_for_a_model_no_op_family_reaches(checkpoint):
+def test_no_deferral_with_the_rehearsal_off(checkpoint, monkeypatch):
+    _kernel_builder(monkeypatch, rehearse=False)
     loader, _ = _load(checkpoint, defer_checkpoint=True)
     assert not loader.has_deferred_checkpoint
+
+
+@pytest.mark.cpu_only
+def test_only_a_decoder_runner_with_context_warmups_rehearses():
+    from types import SimpleNamespace
+
+    def model(**config):
+        config = {"is_generation": True, "is_encoder_decoder": False, **config}
+        return SimpleNamespace(model_config=SimpleNamespace(**config))
+
+    def args(**flags):
+        return SimpleNamespace(**{"mm_encoder_only": False, "encode_only": False, **flags})
+
+    assert runner_rehearses(model(), args())
+    # Encoder-decoder: no context warmups. Pooling, encode-only, multimodal encoder: no decoder.
+    assert not runner_rehearses(model(is_encoder_decoder=True), args())
+    assert not runner_rehearses(model(is_generation=False), args())
+    assert not runner_rehearses(model(), args(encode_only=True))
+    assert not runner_rehearses(model(), args(mm_encoder_only=True))
 
 
 @pytest.mark.cpu_only

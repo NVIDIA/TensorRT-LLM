@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The KernelBuilder rehearsal: warmup forwards on dummy weights, before the checkpoint loads.
 
-For a model a KernelBuilder op family reaches, the model engine is built on dummy weights
-(``ModelEngine(defer_checkpoint=True)``). ``rehearse`` then runs the autotuner warmup's
-forwards on throwaway KV cache managers inside a KernelBuilder rehearsal, in the
-autotuner's build state: the ops list their kernels, and the kernels build on worker
-threads while the checkpoint loads. ``join_gpu_builds`` then waits for the builds that run
-kernels on the GPU.
+Where the checkpoint can load later (``ModelLoader.load``), the model engine is built on
+dummy weights (``ModelEngine(defer_checkpoint=True)``). ``rehearse`` then runs the
+autotuner warmup's forwards on throwaway KV cache managers inside a KernelBuilder
+rehearsal, in the autotuner's build state: the ops list their kernels, and the kernels
+build on worker threads while the checkpoint loads. ``join_gpu_builds`` then waits for the
+builds that run kernels on the GPU.
 """
 
 from __future__ import annotations

@@ -170,38 +170,30 @@ def test_a_rehearsal_leaves_its_builds_running_for_the_next_pass():
     assert builder.state("op", "k") == "done"
 
 
-def test_the_rehearsal_runs_for_a_model_an_op_family_reaches(monkeypatch):
-    reached = []
-    family = types.ModuleType("family")
-    family.reaches = (
-        lambda model_config, model: reached.append((model_config, model)) or model_config == "msa"
-    )
-    monkeypatch.setitem(sys.modules, "family", family)
-    monkeypatch.setattr(kernel_builder, "_FAMILIES", {"op": "family:reaches"})
-    builder = KernelBuilder(threads=1, enabled=True)
-    assert builder.wants_rehearsal("msa", "model")
-    assert not builder.wants_rehearsal("dense", "model")
-    assert reached == [("msa", "model"), ("dense", "model")]
-    assert not KernelBuilder(threads=1, enabled=True, rehearse=False).wants_rehearsal("msa")
-    assert not KernelBuilder(threads=1, enabled=False).wants_rehearsal("msa")
-
-
-def test_the_builds_a_configuration_determines_start_without_a_rehearsal(monkeypatch):
-    family = types.ModuleType("family")
+def test_each_op_family_queues_its_builds_when_the_model_is_created(monkeypatch):
     builder = KernelBuilder(threads=1, enabled=True, rehearse=False)
-    built = []
+    asked, built = [], []
 
     def queue_builds(model_config, model):
+        asked.append((model_config, model))
         builder.submit("module", model_config, _recorder(built, model_config))
-        return False
 
+    family = types.ModuleType("family")
     family.queue_builds = queue_builds
     monkeypatch.setitem(sys.modules, "family", family)
     monkeypatch.setattr(kernel_builder, "_FAMILIES", {"module": "family:queue_builds"})
-    assert not builder.wants_rehearsal("config", "model")
+    # The builds need only the configuration, so they start with the rehearsal off too.
+    builder.model_created("config", "model")
     builder.join(timeout=30)
+    assert asked == [("config", "model")]
     assert built == ["config"]
-    assert builder.state("module", "config") == "done"
+    # A family that cannot queue its builds leaves its kernels to their first use.
+    family.queue_builds = lambda model_config, model: 1 / 0
+    builder.model_created("config", "model")
+    # Turned off, KernelBuilder asks no family.
+    family.queue_builds = queue_builds
+    KernelBuilder(threads=1, enabled=False).model_created("other", "model")
+    assert asked == [("config", "model")]
 
 
 def test_a_flashinfer_module_builds_once_only_where_nothing_is_built(monkeypatch):

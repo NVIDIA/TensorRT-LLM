@@ -406,16 +406,14 @@ def warmup_sampling_module() -> None:
         )
 
 
-def queue_sampling_module_build(model_config: Any, model: Any) -> bool:
+def queue_sampling_module_build(model_config: Any, model: Any) -> None:
     """KernelBuilder op family: the sampling module ``warmup_sampling_module`` loads at every
-    model's warmup, built on a worker thread from when the model is created. It needs no
-    forward: False."""
+    model's warmup, built on a worker thread from when the model is created."""
     del model_config, model
     if IS_FLASHINFER_AVAILABLE:
         from flashinfer.jit.sampling import gen_sampling_module
 
         queue_flashinfer_module_build("sampling", gen_sampling_module)
-    return False
 
 
 _topk_module_ready: Optional[bool] = None

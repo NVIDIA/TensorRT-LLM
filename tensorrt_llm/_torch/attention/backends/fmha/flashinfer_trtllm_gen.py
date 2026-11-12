@@ -1407,10 +1407,9 @@ def queue_trtllm_gen_fmha_module_build() -> bool:
     return queue_flashinfer_module_build("trtllm_gen_fmha", gen_trtllm_gen_fmha_module)
 
 
-def queue_fmha_module_build(model_config: Any, model: Any) -> bool:
+def queue_fmha_module_build(model_config: Any, model: Any) -> None:
     """KernelBuilder op family: the trtllm-gen FMHA module, for a model with an attention
-    layer this library serves, built from when the model is created. It needs no forward:
-    False."""
+    layer this library serves, built from when the model is created."""
     del model_config
     if model is not None and any(
         isinstance(fmha, FlashInferTrtllmGenFmha)
@@ -1420,4 +1419,3 @@ def queue_fmha_module_build(model_config: Any, model: Any) -> bool:
         for fmha in getattr(getattr(value, "_fmha_manager", None), "fmha_libs", ())
     ):
         queue_trtllm_gen_fmha_module_build()
-    return False

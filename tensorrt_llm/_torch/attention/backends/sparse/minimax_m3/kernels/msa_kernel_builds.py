@@ -14,9 +14,9 @@ the package's variant lookup recording the variant it is asked for instead of co
 it. Each variant found is submitted to ``KernelBuilder``, whose workers compile it in the
 directory and under the file lock the package's own lookup uses. The plan, split-KV
 reduction and sparse top-k modules, and the k2q CSR extension the sparse prefill loads,
-need nothing from a call: ``reaches`` submits them, or else the first run in a build pass.
-``reaches`` also queues FlashInfer's trtllm-gen FMHA module, on which M3's dense layers
-decode.
+need nothing from a call: ``queue_builds`` submits them, or else the first run in a build
+pass. ``queue_builds`` also queues FlashInfer's trtllm-gen FMHA module, on which M3's dense
+layers decode.
 
 In a rehearsal every run is such a replay: it compiles and launches nothing, and its
 outputs hold zeros and an empty maximum score.
@@ -307,9 +307,10 @@ def _import_k2q_csr() -> bool:
     return time.perf_counter() - t0 >= 1.0
 
 
-def reaches(model_config: Any, model: Any = None) -> bool:
-    """True when the model runs MiniMax-M3's MSA attention on fmha_sm100, whose modules
-    are then submitted, with the trtllm-gen FMHA module its dense layers decode on."""
+def queue_builds(model_config: Any, model: Any = None) -> None:
+    """KernelBuilder op family: for a model that runs MiniMax-M3's MSA attention on
+    fmha_sm100, submit its modules and the trtllm-gen FMHA module its dense layers decode
+    on."""
     from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
         queue_trtllm_gen_fmha_module_build,
     )
@@ -320,15 +321,14 @@ def reaches(model_config: Any, model: Any = None) -> bool:
 
     config = getattr(model_config, "sparse_attention_config", None)
     if not isinstance(config, MiniMaxM3SparseAttentionConfig) or config.implementation != "msa":
-        return False
+        return
     if not is_sm_100f() or not msa_package_available():
-        return False
+        return
     require_msa_module()
     if _package is None:
-        return False
+        return
     _package.submit_modules()
     queue_trtllm_gen_fmha_module_build()
-    return True
 
 
 def install(module: types.ModuleType) -> None:

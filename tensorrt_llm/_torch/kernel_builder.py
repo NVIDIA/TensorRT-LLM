@@ -21,13 +21,12 @@ build state (``autotuner.build_kernels``), ``choose_one`` queues here the builds
 shape, runner and tactic the op's tuning will time.
 
 An op whose kernels the configuration alone determines needs no forward: its op family in
-``_FAMILIES`` queues their builds when the model is created, for every model.
+``_FAMILIES`` queues their builds when the model is created (``model_created``).
 
 A rehearsal is a build pass over the autotuner warmup's forwards on dummy weights, run
 before the checkpoint loads, in the autotuner's build state: the ops list their kernels
 without building or launching them, and the pass does not wait, so the builds run while
-the weights load. It runs for a model one of whose op families in ``_FAMILIES`` lists
-kernels from a forward.
+the weights load. It runs wherever the checkpoint can load after it (``ModelLoader.load``).
 
 ``TLLM_KERNEL_BUILDER=0`` turns it off: no pass is active and nothing is submitted.
 ``TLLM_KERNEL_BUILDER_REHEARSAL=0`` keeps the builds but not the rehearsal: those a forward
@@ -73,15 +72,14 @@ _REHEARSAL_ENV = "TLLM_KERNEL_BUILDER_REHEARSAL"
 _THREADS_ENV = "TLLM_KERNEL_BUILDER_THREADS"
 _PROGRESS_EVERY_S = 60.0
 
-# The op families: name -> "module:function". The function takes the model config and the
-# model as created, queues the builds of the family's kernels that the configuration alone
-# determines, and returns True when a rehearsal would list more of them from a forward. A
+# The op families with kernels the configuration alone determines: name -> "module:function".
+# The function takes the model config and the model as created and queues those builds. A
 # module is imported only when asked.
 _FAMILIES = {
     "fmha_sm100": (
-        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_kernel_builds:reaches"
+        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_kernel_builds"
+        ":queue_builds"
     ),
-    "deep_gemm": "tensorrt_llm._torch.modules.linear:deep_gemm_reaches",
     "flashinfer_sampling": (
         "tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer:queue_sampling_module_build"
     ),
@@ -259,27 +257,21 @@ class KernelBuilder:
         """True inside a rehearsal: an op lists its kernels, then skips its own launch."""
         return self.enabled and self._rehearsals > 0
 
-    def wants_rehearsal(self, model_config: Any, model: Any = None) -> bool:
-        """Called once ``model`` is created from ``model_config``, before its weights load.
-
-        Each op family in ``_FAMILIES`` queues the builds the configuration alone
-        determines. True when the rehearsal is on and a family would list more of its
-        kernels from a forward.
-        """
+    def model_created(self, model_config: Any, model: Any = None) -> None:
+        """Each op family in ``_FAMILIES`` queues the builds the configuration alone
+        determines; called once ``model`` is created from ``model_config``, before its
+        weights load."""
         if not self.enabled:
-            return False
-        wanted = False
+            return
         for name, target in _FAMILIES.items():
             module_name, function = target.split(":")
             try:
-                queue_builds = getattr(importlib.import_module(module_name), function)
-                wanted = bool(queue_builds(model_config, model)) or wanted
+                getattr(importlib.import_module(module_name), function)(model_config, model)
             except Exception as e:  # noqa: BLE001 - the family's kernels build on first use
                 logger.warning(
                     f"[KernelBuilder] {name}: could not queue its builds for the model; its "
                     f"kernels build on first use. {type(e).__name__}: {e}"
                 )
-        return self.rehearse and wanted
 
     # Registration.
 

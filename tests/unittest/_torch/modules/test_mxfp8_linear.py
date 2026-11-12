@@ -948,8 +948,8 @@ def test_flashinfer_autotuner_module_is_queued_for_a_model_that_tunes_through_fl
         return root
 
     # The native backend never tunes through FlashInfer.
-    assert not linear_module.queue_flashinfer_autotune_build(None, model(False))
+    linear_module.queue_flashinfer_autotune_build(None, model(False))
     assert queued == []
     # A model the warmup may switch to FlashInfer tunes through its autotuner.
-    assert not linear_module.queue_flashinfer_autotune_build(None, model(True))
+    linear_module.queue_flashinfer_autotune_build(None, model(True))
     assert queued == ["trtllm_utils"]

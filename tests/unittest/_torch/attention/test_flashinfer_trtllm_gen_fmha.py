@@ -346,11 +346,9 @@ def test_a_model_this_library_serves_queues_its_module_build(
         root.layer = layer
         return root
 
-    assert not flashinfer_trtllm_gen.queue_fmha_module_build(
-        None, model(FallbackFmha(FakeAttention()))
-    )
+    flashinfer_trtllm_gen.queue_fmha_module_build(None, model(FallbackFmha(FakeAttention())))
     assert queued == []
-    assert not flashinfer_trtllm_gen.queue_fmha_module_build(
+    flashinfer_trtllm_gen.queue_fmha_module_build(
         None, model(FallbackFmha(FakeAttention()), FlashInferTrtllmGenFmha(FakeAttention()))
     )
     assert queued == [True]

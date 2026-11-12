@@ -483,6 +483,17 @@ def _fill_dummy_quantized(tensor: torch.Tensor,
         values.uniform_(low, high, generator=generator).to(tensor.dtype))
 
 
+def runner_rehearses(model: torch.nn.Module, llm_args) -> bool:
+    """Whether the runner ``model`` starts with runs the KernelBuilder rehearsal's
+    forwards: a decoder runner with context warmups (``resolve_runner_type``), not
+    an encoder-only, pooling, multimodal-encoder or encoder-decoder one."""
+    from .engine.runners import DecoderRunner, resolve_runner_type
+
+    runner_cls = resolve_runner_type(model, llm_args)
+    return (issubclass(runner_cls, DecoderRunner)
+            and runner_cls._context_warmups_supported)
+
+
 def fill_rehearsal_values(tensors: Iterable[torch.Tensor],
                           low: float = -1e-3,
                           high: float = 1e-3,
@@ -1348,8 +1359,9 @@ class ModelLoader:
         Args:
             checkpoint_dir: The directory of the model checkpoint.
             checkpoint_loader: The loader object for model checkpoints.
-            defer_checkpoint: For a model a KernelBuilder rehearsal reaches,
-                return it with dummy weights instead; `has_deferred_checkpoint`
+            defer_checkpoint: Where the checkpoint can load later as it would
+                now (below) and the KernelBuilder rehearsal is on, return the
+                model with dummy weights instead; `has_deferred_checkpoint`
                 then tells, and `load_deferred_checkpoint` loads the checkpoint.
 
         Returns:
@@ -1400,7 +1412,7 @@ class ModelLoader:
                                           self.llm_args.lm_head_output_dtype)
             # Queues the kernel builds the configuration alone determines; they
             # run on KernelBuilder's worker threads while the weights load.
-            wants_rehearsal = KernelBuilder.get().wants_rehearsal(config, model)
+            KernelBuilder.get().model_created(config, model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
@@ -1537,14 +1549,16 @@ class ModelLoader:
             # Deferred only where the checkpoint can load later as it would now:
             # the AUTO loader fills tensors materialized from meta, nothing
             # else holds them (MoE load balancer, pinned host copies), and the
-            # module tree is the Modeling V1 one the refit hooks cover.
+            # module tree is the Modeling V1 one the refit hooks cover. And
+            # only where the model's runner rehearses.
             if (defer_checkpoint and materialized
                     and load_format == LoadFormat.AUTO and
                     checkpoint_loader.checkpoint_format != CheckpointFormat.MX
                     and not requires_standard_hf_loading
                     and moe_load_balancer is None and getattr(
                         model.model_config, "modeling_v2_target", None) is None
-                    and wants_rehearsal):
+                    and KernelBuilder.get().rehearse
+                    and runner_rehearses(model, self.llm_args)):
                 self._deferred = self._load_rehearsal_weights(
                     model,
                     config,

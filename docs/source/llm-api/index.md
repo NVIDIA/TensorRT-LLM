@@ -217,10 +217,14 @@ is created, for every model, and build while the weights load: FlashInfer's samp
 trtllm-gen FMHA and autotuner modules, and MiniMax-M3's MSA modules with its k2q CSR
 extension. The calls that need them find them built, or wait for their builds.
 
-For a model with an op that lists its kernels as it runs, the engine first loads dummy
-weights and runs the autotuner warmup's two forwards on them (a context batch at the
-maximum token count and one generation request) in the build state, then loads the
-checkpoint while the kernels build.
+Where the checkpoint can load after them, the engine first loads dummy weights and runs the
+autotuner warmup's two forwards on them (a context batch at the maximum token count and one
+generation request) in the build state, then loads the checkpoint while the kernels the
+forwards listed build. It loads the checkpoint first with load formats other than AUTO, MX
+checkpoints, host-resident weights, a failed meta-device init, sleep mode, the MoE load
+balancer, DWDP, the multimodal encoders' CUDA graphs, Modeling V2 targets, encoder-only,
+pooling, multimodal-encoder and encoder-decoder models, and where the KV cache estimation is
+off.
 The startup log shows these as the `rehearsal`, `checkpoint` and `gpu_builds` phases,
 which `model_engine_creation_seconds` then does not include; `gpu_builds` waits for the
 builds that run kernels on the GPU. Supported ops: MiniMax-M3's MSA attention

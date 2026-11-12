@@ -1420,20 +1420,6 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                                   shard_offset, shard_size)
 
 
-def deep_gemm_reaches(model_config, model) -> bool:
-    """Whether ``model`` runs an FP8 block-scale linear through DeepGEMM, whose
-    kernels the autotuner builds in its build state (a KernelBuilder op family)."""
-    del model_config
-    if model is None or not is_sm_100f():
-        return False
-    return any(
-        isinstance(getattr(module, "quant_method", None),
-                   FP8BlockScalesLinearMethod)
-        and not (getattr(module, "use_cute_dsl_blockscaling_mm", False)
-                 or getattr(module, "disable_deep_gemm", False))
-        for module in model.modules())
-
-
 class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     # fp8_block_scaling_gemm does not support writing into an NCCL window buffer.
@@ -3626,17 +3612,16 @@ def flashinfer_mxfp8_autotune() -> Iterator[None]:
         _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)
 
 
-def queue_flashinfer_autotune_build(model_config, model) -> bool:
+def queue_flashinfer_autotune_build(model_config, model) -> None:
     """KernelBuilder op family: FlashInfer's ``trtllm_utils`` module, whose
     delay kernel FlashInfer's autotuner loads when the warmup tunes the MXFP8
     linears that dispatch through FlashInfer (``flashinfer_mxfp8_autotune``),
     built on a worker thread from when the model is created. Queued for a
     model with MXFP8 linears that use FlashInfer already, or that the warmup
-    may switch to it (``_use_flashinfer_mxfp8_decode_graph_default``). It
-    needs no forward: False."""
+    may switch to it (``_use_flashinfer_mxfp8_decode_graph_default``)."""
     del model_config
     if model is None:
-        return False
+        return
     modules = list(model.modules())
     methods = [
         module.quant_method for module in modules
@@ -3652,7 +3637,6 @@ def queue_flashinfer_autotune_build(model_config, model) -> bool:
 
         from ..flashinfer_utils import queue_flashinfer_module_build
         queue_flashinfer_module_build("trtllm_utils", gen_trtllm_utils_module)
-    return False
 
 
 @contextmanager

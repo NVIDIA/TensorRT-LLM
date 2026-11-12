@@ -138,7 +138,7 @@ def test_an_msa_model_queues_the_modules_its_calls_load(fmha_sm100, monkeypatch)
     config = SimpleNamespace(
         sparse_attention_config=MiniMaxM3SparseAttentionConfig(implementation="msa")
     )
-    assert msa_kernel_builds.reaches(config)
+    msa_kernel_builds.queue_builds(config)
     expected = {name for name, _, _ in msa_kernel_builds._MODULES}
     expected.add(msa_kernel_builds._K2Q_CSR_MODULE)
     if IS_FLASHINFER_AVAILABLE:

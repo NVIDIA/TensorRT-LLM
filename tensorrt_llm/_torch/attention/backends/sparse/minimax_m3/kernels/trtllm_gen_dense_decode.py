@@ -274,7 +274,7 @@ def minimax_m3_trtllm_gen_dense_decode(
     )
     if KernelBuilder.get().rehearsing():
         # A rehearsal runs no trtllm-gen kernel: their module builds on a KernelBuilder
-        # worker (msa_kernel_builds.reaches). The output holds zeros.
+        # worker (msa_kernel_builds.queue_builds). The output holds zeros.
         output.zero_()
         return
 

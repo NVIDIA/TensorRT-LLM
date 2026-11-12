@@ -126,9 +126,9 @@ class ModelEngine:
         model_weights_restore_mode=None,
         defer_checkpoint: bool = False,
     ):
-        """``defer_checkpoint``: for a model a KernelBuilder rehearsal reaches, build
-        the engine on dummy weights; ``has_deferred_checkpoint`` then tells, and the
-        caller runs ``rehearse`` and ``load_deferred_checkpoint``."""
+        """``defer_checkpoint``: build the engine on dummy weights for a KernelBuilder
+        rehearsal, where the loader can (``ModelLoader.load``); ``has_deferred_checkpoint``
+        then tells, and the caller runs ``rehearse`` and ``load_deferred_checkpoint``."""
         # cleanup() also runs on an engine whose construction failed part-way.
         self._cleanup_done = False
         self.model_loader: ModelLoader | None = None

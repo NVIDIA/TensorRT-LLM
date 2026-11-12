@@ -940,7 +940,7 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
-        # A model a KernelBuilder rehearsal reaches is built on dummy weights; its
+        # The model is built on dummy weights for a KernelBuilder rehearsal; its
         # checkpoint loads after the rehearsal below. Not with what takes the
         # weights over as they load (DWDP) or captures graphs on them (the
         # multimodal encoders' CUDA graphs), nor where the KV cache estimation
