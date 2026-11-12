@@ -1564,13 +1564,16 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         )
         ssm0 = pools.ssm[g0]
         history, width = meta.replay_history_size, meta.replay_step_width
+        # The bookkeeping has one row per replay slot; a step indexes it, and the history,
+        # with the metadata's `replay_state_indices`.
+        replay_slots = meta.prev_num_accepted_tokens.shape[0]
         _pool.check_replay_state(
-            history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0
+            history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0, replay_slots
         )
         old = {}
         for i, cache in layer_caches.items():
             old[i] = (cache.old_x, cache.old_B, cache.old_dt, cache.old_dA_cumsum)
-            _pool.check_replay_history(g, i, history, ssm0.shape[0], *old[i][:3])
+            _pool.check_replay_history(g, i, history, replay_slots, *old[i][:3])
         replay = _Replay(old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width)
         if ssm0.dtype == torch.bfloat16 and ssm0.is_cuda:
             # Every CuTe replay kernel a verify step launches, compiled here: a compile costs
@@ -1582,6 +1585,8 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
                 self.num_v_heads,
                 md.max_num_requests,
                 **_gdn_replay_launches(self, width),
+                work_item_width=md.mamba_metadata.replay_work_items.shape[1],
+                separate_replay_slots=_has_replay_slots(cm),
             )
         return dict(int_idx=int_idx, int_conv=int_conv, replay=replay)
 
@@ -1956,8 +1961,15 @@ def _verify_rows(core, spec_metadata, num_seqs: int, num_rows: int) -> tuple[int
     return p, spec_metadata is not None and num_seqs > 0 and p > 1
 
 
-def _verify_state(core, mm, num_decodes: int) -> tuple:
-    """Return what `_gdn_verify` reads besides the layer: promotion rows and replay work items.
+def _has_replay_slots(cm) -> bool:
+    """Whether the manager keeps the replay history in slots of its own, which the metadata's
+    `replay_state_indices` then address (otherwise it aliases the recurrent-state slots)."""
+    return getattr(cm, "replay_layer_group_id", None) is not None
+
+
+def _verify_state(core, mm, num_decodes: int, num_prefills: int = 0) -> tuple:
+    """Return what `_gdn_verify` reads besides the layer: promotion rows, replay work items,
+    and the generation rows' replay slots (behind `num_prefills` context rows).
 
     Work items and the all-layer commit follow the stock Gated-DeltaNet layer's conditions."""
     assert core._bound.int_idx is not None, "the cache-manager bind has not run"
@@ -1968,7 +1980,12 @@ def _verify_state(core, mm, num_decodes: int) -> tuple:
     )
     work_items = mm.replay_work_items[:num_decodes] if partitioned else None
     n_writes = mm.replay_n_writes if partitioned else None
-    return int_idx, work_items, n_writes, all_layer
+    replay_indices = (
+        mm.replay_state_indices[num_prefills : num_prefills + num_decodes]
+        if _has_replay_slots(core._bound.cm)
+        else None
+    )
+    return int_idx, work_items, n_writes, all_layer, replay_indices
 
 
 def _gdn_in_proj_conv_tactic(core, x, L, si_d, verify):
@@ -1999,7 +2016,7 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None, z=None) -
     history, runs the `p` rows and appends them, so rejected rows cost nothing to undo. `mq` is
     the `[n * p, conv_dim]` q|k|v view, `a`/`b` the raw gate columns (the kernel applies
     `A_log`, `dt_bias`, q/k L2 norm). Returns `[1, n * p, num_v_heads, head_v_dim]`."""
-    int_idx, work_items, n_writes, all_layer = verify
+    int_idx, work_items, n_writes, all_layer, replay_indices = verify
     pools = core._bound.pools
     replay = core._bound.replay
     ssm = pools.ssm[i]
@@ -2078,6 +2095,7 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None, z=None) -
         packed_qkv=None if fold is not None else mq_out,
         use_all_layer_commit=all_layer,
         output=None,
+        replay_indices=replay_indices,
         **({"config": mapping} if mapping is not None else {}),
         **({"conv_fold": fold} if fold is not None else {}),
         **({"gated_norm": norm} if norm is not None else {}),
@@ -5159,7 +5177,7 @@ class PrefillTarget:
             qsl_long_p,
             num_decodes,
             gen_p,
-            _verify_state(core, mm, num_decodes) if is_verify else None,
+            _verify_state(core, mm, num_decodes, num_prefills) if is_verify else None,
         )
 
         # `has_initial_states` covers the context prefix only; every generation row carries.

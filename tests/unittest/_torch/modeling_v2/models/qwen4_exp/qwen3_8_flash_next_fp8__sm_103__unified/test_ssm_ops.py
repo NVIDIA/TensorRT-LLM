@@ -6,6 +6,7 @@ the touched slots only (`_SparsePage`); every other byte of their pages is check
 
 from __future__ import annotations
 
+import math
 import types
 import warnings
 import zlib
@@ -57,10 +58,13 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     fused_recurrent_gated_delta_rule_cached_replay_update as stock_replay,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import _build_replay_work_items_triton
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_ITEM_WIDTH,
+    _build_replay_work_items_triton,
+)
 
 __extra_import_path__ = ["../../.."]
-from _validating import ULP, certifying  # noqa: E402,F401 — path above; fixture by name
+from _validating import ULP, certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "the Gated-DeltaNet entries require a CUDA device"
 
@@ -578,7 +582,7 @@ class _ReplayBench:
         if self.path == "all_layer":
             # The engine hands out work items exactly from the all-layer commit's minimum batch.
             assert n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, n
-            self.work_items = torch.zeros(n, 4, dtype=torch.int32, device=DEV)
+            self.work_items = torch.zeros(n, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device=DEV)
             self.n_writes = torch.zeros(1, dtype=torch.int32, device=DEV)
 
         self.exact = exact
@@ -1066,7 +1070,7 @@ def _gvr_build(member: str, n: int, seed: int):
         _bound=types.SimpleNamespace(pools=pools, int_conv=int_conv, replay=replay),
     )
     rows = torch.arange(1, n + 1, dtype=torch.int32, device=DEV)  # slot 0 untouched
-    verify = (torch.arange(n, dtype=torch.int32, device=DEV), None, None, False)
+    verify = (torch.arange(n, dtype=torch.int32, device=DEV), None, None, False, None)
 
     def run():
         outs = []
@@ -1125,13 +1129,19 @@ def test_gdn_verify_agrees_with_the_engines_stock_replay(member, n, monkeypatch)
 GVR_MAX_REQUESTS = 96
 
 
+@pytest.mark.parametrize("separate", [False, True], ids=["coupled", "replay_slots"])
 @pytest.mark.parametrize("pdl", [True, False], ids=["pdl", "no_pdl"])
 @pytest.mark.parametrize("member", list(GVR_GEOM))
-def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(member, pdl, monkeypatch):
+def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(
+    member, pdl, separate, monkeypatch
+):
     """The CuTe replay kernels the bind precompiles (`_gdn_replay_launches`) are exactly those
     `_gdn_verify` launches over 1..`GVR_MAX_REQUESTS` requests, from a generation-only step
     (the gated norm folded where `_gdn_verify_folds_norm` says) and from a mixed step's verify
-    rows (never folded). Kernels are recorded, not compiled or run."""
+    rows (never folded), the partitioned ones with work items of the metadata's width. With
+    `separate` the manager keeps the history at replay slots of its own: precompiled with
+    `separate_replay_slots`, every step passes `replay_indices`. Kernels are recorded, not
+    compiled or run."""
     monkeypatch.setattr(_m, "get_env_enable_pdl", lambda: pdl)
     monkeypatch.setattr(
         _m,
@@ -1159,6 +1169,8 @@ def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(member, pdl, 
         )
     }
     zeros_i32 = torch.zeros(slots, dtype=torch.int32, device=DEV)
+    work_items = torch.zeros(slots, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device=DEV)
+    replay_slots = torch.arange(slots, 2 * slots, dtype=torch.int32, device=DEV)
     pools = types.SimpleNamespace(
         ssm={0: torch.zeros(slots, hv, GVR_V, GVR_K, dtype=bf, device=DEV)},
         conv={0: torch.zeros(slots, conv_dim, GVR_CONV_W - 1, dtype=bf, device=DEV)},
@@ -1189,13 +1201,26 @@ def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(member, pdl, 
         mq, z, a, b = torch.split(proj[: n * t], [conv_dim, value_dim, hv, hv], 1)
         rows = torch.arange(1, n + 1, dtype=torch.int32, device=DEV)
         partitioned = n >= _m.CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-        work = zeros_i32[:n] if partitioned else None
-        verify = (torch.arange(n, dtype=torch.int32, device=DEV), work, work, partitioned)
+        work = work_items[:n] if partitioned else None
+        n_writes = zeros_i32[:1] if partitioned else None
+        replay_indices = replay_slots[:n] if separate else None
+        int_idx = torch.arange(n, dtype=torch.int32, device=DEV)
+        verify = (int_idx, work, n_writes, partitioned, replay_indices)
         _m._gdn_verify(core, mq, a, b, 0, layer, rows, n, t, verify)  # a mixed step's rows
         fold_norm = _m._gdn_verify_folds_norm(core, n, t)
         _m._gdn_verify(core, mq, a, b, 0, layer, rows, n, t, verify, z=z if fold_norm else None)
     want = set(launched)
-    got = cr.precompile_keys(t, h, hv, nmax, **_m._gdn_replay_launches(core, t))
+    got = cr.precompile_keys(
+        t,
+        h,
+        hv,
+        nmax,
+        **_m._gdn_replay_launches(core, t),
+        work_item_width=REPLAY_WORK_ITEM_WIDTH,
+        separate_replay_slots=separate,
+    )
+    assert all(dict(key)["rsep"] == separate for key in got)
+    assert {dict(key)["wi_w"] for key in got if dict(key)["use_wi"]} == {REPLAY_WORK_ITEM_WIDTH}
     assert got == want, (
         f"precompiled but never launched: {len(got - want)}, launched but not precompiled: "
         f"{len(want - got)}"
@@ -1204,6 +1229,339 @@ def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(member, pdl, 
         assert not any(not dict(key)["pdl"] and dict(key)["tpc"] == 2 for key in got), (
             "with PDL on, a batch of up to two requests never launches without it"
         )
+
+
+# ------------------------------------------------ the replay history at slots of its own ---
+
+
+def _replay_pages(slots, layers, h, hv):
+    """The history and its bookkeeping in pages of their own, as a manager keeps them in its
+    KVCM pool: one page per replay slot holding every layer's `old_u`, then every layer's
+    `old_k`, then every layer's `old_G`, then the pending count and the half (int32), and 8
+    bytes nobody writes; every byte 0xFF (NaN history, counts of -1) until written. The
+    `[layers, slots, ...]` history views have the page as their slot stride, the bookkeeping
+    columns the page as their element stride; `data` is the `[slots, page]` bytes, `tail`
+    the offset of the unwritten bytes."""
+    regions = (
+        (torch.bfloat16, (2, HIST, hv, V)),
+        (torch.bfloat16, (2, HIST, h, K)),
+        (torch.float32, (2, hv, HIST)),
+    )
+    sizes = [math.prod(shape) * dtype.itemsize for dtype, shape in regions]
+    page = layers * sum(sizes) + 16
+    data = torch.full((slots, page), 0xFF, dtype=torch.uint8, device=DEV)
+    flat = data.view(-1)
+    views, offset = [], 0
+    for (dtype, shape), size in zip(regions, sizes):
+        es = dtype.itemsize
+        rows = torch.empty(shape, device="meta").stride()
+        views.append(
+            torch.as_strided(
+                flat.view(dtype),
+                (layers, slots, *shape),
+                (size // es, page // es, *rows),
+                offset // es,
+            )
+        )
+        offset += layers * size
+    pnat, buf = (
+        torch.as_strided(flat.view(torch.int32), (slots,), (page // 4,), offset // 4 + field)
+        for field in (0, 1)
+    )
+    return types.SimpleNamespace(
+        data=data, u=views[0], k=views[1], G=views[2], pnat=pnat, buf=buf, tail=offset + 8
+    )
+
+
+class _ReplaySlotBench(_ReplayBench):
+    """`_ReplayBench` (the same draws for the same seed) with the history and its bookkeeping
+    moved to replay slots of their own (`_replay_pages`): row `i`'s at `replay_indices[i]`, a
+    permutation of slots past the checkpoint pool's, so no row's replay slot is a checkpoint
+    slot. The work items carry the replay slot as their fifth field; the kernel is handed their
+    first `width` fields (4: it reads the replay slot from `replay_indices`), the manager's
+    all-layer commit the full items. `writes` is the coupled bench's alone (it reads the
+    bookkeeping at the checkpoint slots)."""
+
+    def __init__(self, spec, seed, width):
+        super().__init__(spec, seed, exact=False)
+        assert "dup" not in spec and "page_layers" not in spec, spec
+        n, slots = self.n, self.state_indices.long()
+        cpu = torch.Generator().manual_seed(seed + 1)
+        replay = torch.randperm(2 * n, generator=cpu)[:n] + self.slots
+        self.replay_indices = replay.to(DEV, torch.int32)
+        rows = self.replay_indices.long()
+        self.pages = _replay_pages(self.slots + 2 * n, self.layers, self.h, self.hv)
+        pages = self.pages
+        for paged, coupled in zip(
+            (pages.u, pages.k, pages.G), (self.old_x, self.old_B, self.old_dt)
+        ):
+            paged[:, rows] = coupled[:, slots]
+        pages.pnat[rows] = self.pnat[slots]
+        pages.buf[rows] = self.buf[slots]
+        self.old_x, self.old_B, self.old_dt = pages.u, pages.k, pages.G
+        self.pnat, self.buf = pages.pnat, pages.buf
+        self.meta = ReplayStateUpdateMetadata(self.pnat, self.buf, self.t, HIST)
+        self.item_width = width
+        self.kernel_items = None
+
+    def prepare(self):
+        if self.path == "all_layer":
+            self.work_items.zero_()
+            _build_replay_work_items_triton(
+                self.live,
+                self.pnat,
+                self.buf,
+                self.work_items,
+                self.n_writes,
+                self.t,
+                HIST,
+                self.replay_indices,
+            )
+            full = self.work_items.shape[1]
+            self.kernel_items = (
+                self.work_items
+                if self.item_width == full
+                else self.work_items[:, : self.item_width].contiguous()
+            )
+
+    def kwargs(self, layer, act):
+        kw = super().kwargs(layer, act)
+        kw["replay_indices"] = self.replay_indices
+        if self.kernel_items is not None:
+            kw["replay_work_items"] = self.kernel_items
+        return kw
+
+    def accept(self, accepted):
+        _advance_replay_state(self.meta, self.replay_indices, accepted)
+
+
+_SLOT_STATE = ("checkpoint", "old_u", "old_k", "old_G", "pending count", "half")
+
+
+def _slot_state(bench):
+    """A bench's checkpoints, and its rows' history and bookkeeping at their history slots
+    (the replay slots, when it has them)."""
+    rows = getattr(bench, "replay_indices", bench.state_indices).long()
+    return (
+        bench.backing,
+        bench.old_x[:, rows],
+        bench.old_B[:, rows],
+        bench.old_dt[:, rows],
+        bench.pnat[rows],
+        bench.buf[rows],
+    )
+
+
+def _rs_spec(heads, path, n, t):
+    h, hv = heads
+    return dict(
+        state_dtype=torch.bfloat16,
+        H=h,
+        HV=hv,
+        path=path,
+        n=n,
+        t=t,
+        layers=2,
+        steps=HIST // t + 3,
+    )
+
+
+#: Replay-slot runs: requests and the work-item width the kernel is handed (None: no work
+#: items, the small path, the kernel commits wrapping rows itself).
+_REPLAY_SLOT_RUNS = {
+    "small_n1": (1, None),
+    "small_n4": (4, None),
+    "w4_all_layer": (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 4),
+    "w5_all_layer": (32, REPLAY_WORK_ITEM_WIDTH),
+}
+
+
+@pytest.mark.parametrize("heads", cr.GEOMETRIES, ids=[f"{h}x{hv}" for h, hv in cr.GEOMETRIES])
+@pytest.mark.parametrize("n,width", list(_REPLAY_SLOT_RUNS.values()), ids=list(_REPLAY_SLOT_RUNS))
+def test_separate_replay_slots_match_coupled(n, width, heads, certifying) -> None:  # noqa: F811
+    """Replay slots that differ from the checkpoint slots give, bit for bit, the coupled run.
+
+    The coupled side is `_ReplayBench`: history and bookkeeping at the checkpoint slots. The
+    other (`_ReplaySlotBench`) keeps the same history and bookkeeping at a permuted set of
+    replay slots past the checkpoint pool's, in pages holding every layer's rows (a slot stride
+    of the whole page, the bookkeeping as strided int32 fields of it), 0xFF elsewhere. Both run
+    verify steps through this entry -- strided a / b and PDL, as the target hands them over --
+    with checkpoint wraps committed in-kernel (no work items) or by the manager's all-layer
+    commit, the kernel handed the work items at `width` fields (4: the replay slot from
+    `replay_indices`; 5: from the items' fifth field), then advance their bookkeeping with the
+    same acceptance. Each replay-slot call is also held to this entry's `reference` given the
+    same `replay_indices`, and no byte of the pages outside the rows' replay slots is written.
+    """
+    certifying(_grc_op)
+    t = 4
+    path = "small" if width is None else "all_layer"
+    spec = _rs_spec(heads, path, n, t)
+    seed = 31 + n
+    coupled = _ReplayBench(spec, seed, exact=False)
+    paged = _ReplaySlotBench(spec, seed, width or REPLAY_WORK_ITEM_WIDTH)
+    sides = (coupled, paged)
+    rows = paged.replay_indices.long()
+    assert not torch.isin(rows, coupled.state_indices.long()).any()
+    wraps = appends = 0
+    for step in range(coupled.steps):
+        wrapped = coupled.writes()[1].numel()
+        wraps += wrapped
+        appends += n - wrapped
+        for side in sides:
+            side.prepare()
+        if width is not None:
+            assert torch.equal(coupled.n_writes, paged.n_writes)
+        for layer in range(coupled.layers):
+            act = coupled.inputs()
+            a, b = _grc_gates(coupled, act, True)
+            outs = []
+            for side in sides:
+                kw = dict(side.kwargs(layer, act), g=a, beta=b, launch_with_pdl=True)
+                if side is paged:
+                    ref = _grc_op.reference(**kw)
+                outs.append(_grc_op(**kw))
+            pool, u, k, G = paged.state(layer)
+            _replay_compare(
+                (outs[1], pool, u[rows], k[rows], G[rows]),
+                (ref[0], ref[1], ref[2][rows], ref[3][rows], ref[4][rows]),
+            )
+            assert torch.equal(outs[0], outs[1]), f"step {step} layer {layer}: outputs differ"
+        for side in sides:
+            side.commit()
+        accepted = coupled.draw_acceptance()
+        for side in sides:
+            side.accept(accepted)
+        for name, x, y in zip(_SLOT_STATE, _slot_state(coupled), _slot_state(paged)):
+            assert torch.equal(x, y), f"step {step}: {name} differs"
+    assert wraps > 0 and appends > 0, f"the run never wrapped or appended ({wraps}, {appends})"
+    pages = paged.pages
+    elsewhere = torch.ones(pages.data.shape[0], dtype=torch.bool, device=DEV)
+    elsewhere[rows] = False
+    assert (pages.data[elsewhere] == 0xFF).all(), "a page outside the rows' replay slots moved"
+    assert (pages.data[:, pages.tail :] == 0xFF).all(), "a page's bytes past its rows moved"
+
+
+#: Context rows ahead of the generation rows in the dispatch test's mixed-step metadata.
+_DISPATCH_PREFILLS = 3
+
+
+def _dispatch_core(bench, separate):
+    """What `_verify_state` and `_gdn_verify` read, over `bench`'s pool, history and
+    bookkeeping: the GDN core's geometry and bind (the pools, the replay buffers, a manager
+    with the all-layer commit on and, with `separate`, replay slots of its own), and the mamba
+    metadata of a mixed step whose generation rows follow `_DISPATCH_PREFILLS` context rows
+    (`bench.prepare` fills the work items)."""
+    replay = _m._Replay(
+        {
+            layer: (
+                bench.old_x[layer],
+                bench.old_B[layer],
+                bench.old_dt[layer],
+                bench.old_dA[layer],
+            )
+            for layer in range(bench.layers)
+        },
+        bench.buf,
+        bench.pnat,
+        HIST,
+        bench.t,
+    )
+    cm = types.SimpleNamespace(
+        use_gdn_cached_replay_all_layer_commit=True,
+        replay_layer_group_id=1 if separate else None,
+    )
+    core = types.SimpleNamespace(
+        conv_dim=bench.width,
+        key_dim=bench.h * K,
+        value_dim=bench.hv * V,
+        num_k_heads=bench.h,
+        head_k_dim=K,
+        num_v_heads=bench.hv,
+        head_v_dim=V,
+        _bound=types.SimpleNamespace(
+            pools=types.SimpleNamespace(ssm=dict(enumerate(bench.pool))),
+            replay=replay,
+            cm=cm,
+            int_idx=torch.arange(bench.n, dtype=torch.int32, device=DEV),
+        ),
+    )
+    context = torch.full((_DISPATCH_PREFILLS,), -1, dtype=torch.int32, device=DEV)
+    rows = bench.replay_indices if separate else bench.state_indices
+    mm = types.SimpleNamespace(
+        replay_work_items=bench.work_items,
+        replay_n_writes=bench.n_writes,
+        replay_state_indices=torch.cat([context, rows]),
+    )
+    return core, mm
+
+
+@pytest.mark.parametrize("heads", cr.GEOMETRIES, ids=[f"{h}x{hv}" for h, hv in cr.GEOMETRIES])
+@pytest.mark.parametrize("separate", [False, True], ids=["coupled", "replay_slots"])
+@pytest.mark.parametrize("n,t", [(1, 4), (4, 4), (32, 4), (5, 3)])
+def test_target_dispatch_matches_the_plain_call(n, t, separate, heads) -> None:
+    """The target's verify dispatch over a bf16 pool (`_verify_state` for a mixed step's
+    generation rows, then `_gdn_verify` per layer: `a` / `b` column views of the input
+    projection, the conv output as `packed_qkv`, the launch `_gdn_replay_launch` picks) against
+    the call it replaces (contiguous `a` / `b`, no PDL, the default mapping), each on its own
+    copy of the pool, the history and the bookkeeping, over consecutive verify steps with
+    random partial acceptance in between: outputs, checkpoints, history and bookkeeping bitwise
+    equal at every step, with the entry's guard on. With `separate` the dispatched side's
+    manager keeps the history and its bookkeeping at replay slots of its own
+    (`_ReplaySlotBench`), which `_verify_state` takes from the metadata's `replay_state_indices`
+    behind the context rows and `_gdn_verify` hands this entry as `replay_indices`. From
+    `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests both sides take the work items and the
+    manager's all-layer commit; below it the kernel commits wraps."""
+    path = "all_layer" if n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE else "small"
+    spec = _rs_spec(heads, path, n, t)
+    seed = 77 + n
+    plain = _ReplayBench(spec, seed, exact=False)
+    disp = (
+        _ReplaySlotBench(spec, seed, REPLAY_WORK_ITEM_WIDTH)
+        if separate
+        else _ReplayBench(spec, seed, exact=False)
+    )
+    core, mm = _dispatch_core(disp, separate)
+    wraps = 0
+    with validating(_grc_op):
+        for step in range(plain.steps):
+            wraps += plain.writes()[1].numel()
+            plain.prepare()
+            disp.prepare()
+            verify = _m._verify_state(core, mm, n, _DISPATCH_PREFILLS)
+            assert verify[3] == (path == "all_layer"), (
+                "the all-layer commit exactly when partitioned"
+            )
+            if separate:
+                assert torch.equal(verify[4], disp.replay_indices), "the rows' replay slots"
+            else:
+                assert verify[4] is None, "no replay slots of its own: the checkpoint slots"
+            for layer in range(plain.layers):
+                act = plain.inputs()
+                a, b = _grc_gates(plain, act, True)
+                want = _grc_op(**plain.kwargs(layer, act))
+                gating = types.SimpleNamespace(a_log=disp.a_log[layer], dt_bias=disp.dt_bias[layer])
+                got = _m._gdn_verify(
+                    core,
+                    None,
+                    a.reshape(n * t, -1),
+                    b.reshape(n * t, -1),
+                    layer,
+                    gating,
+                    disp.state_indices,
+                    n,
+                    t,
+                    verify,
+                    mq_out=act["packed"],
+                )
+                assert torch.equal(got.view_as(want), want), f"step {step} layer {layer}"
+            plain.commit()
+            disp.commit()
+            accepted = plain.draw_acceptance()
+            plain.accept(accepted)
+            disp.accept(accepted)
+            for name, x, y in zip(_SLOT_STATE, _slot_state(disp), _slot_state(plain)):
+                assert torch.equal(x, y), f"step {step}: {name} differs"
+    assert wraps > 0, "no history wrapped: no checkpoint commit was exercised"
 
 
 # ------------------------------------------- causal_conv1d_token_major__verify ---

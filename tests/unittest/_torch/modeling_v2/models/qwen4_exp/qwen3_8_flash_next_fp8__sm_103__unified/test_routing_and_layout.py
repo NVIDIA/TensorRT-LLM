@@ -1814,12 +1814,15 @@ def _stock_mtp(member, rank, max_draft_len):
             assert cache.intermediate_ssm is None, "the cached replay keeps no per-step state"
         assert not cm.use_gdn_flashinfer_ring_replay
         meta = cm.get_replay_state_update_metadata()
+        # The history and its bookkeeping have replay slots of their own.
+        replay_slots = meta.prev_num_accepted_tokens.shape[0]
         P.check_replay_state(
             meta.replay_history_size,
             meta.replay_step_width,
             meta.prev_num_accepted_tokens,
             meta.cache_buf_idx,
             ssm0,
+            replay_slots,
         )
         assert meta.replay_step_width == max_draft_len + 1
         P.check_verify_width(meta.replay_step_width)
@@ -1828,7 +1831,7 @@ def _stock_mtp(member, rank, max_draft_len):
                 g,
                 i,
                 meta.replay_history_size,
-                ssm0.shape[0],
+                replay_slots,
                 cache.old_x,
                 cache.old_B,
                 cache.old_dt,
