@@ -11,6 +11,7 @@ import sys
 import unittest
 from collections.abc import Iterator
 from dataclasses import replace
+from queue import Queue
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest import mock
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warm
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
@@ -1009,6 +1011,28 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Expected exactly 2 empty_cache calls; got order={calls}",
         )
 
+    def test_guided_decoder_runs_the_context_warmup_before_the_autotuner(self) -> None:
+        """A capturable guided decoder rules out the general warmup's
+        generation requests, not its context requests: those still run, then
+        the release of the MoE workspaces and the cache, then the autotuner."""
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
+        model_engine._inputs.guided_decoder = Mock()
+        tracker = _Tracker()
+        calls, _ = _run_warmup_tracked(model_engine, resource_manager, tracker=tracker)
+        (((_, configs), _),) = tracker.call_args["general_warmup"]
+        self.assertTrue(configs, "Expected context warmup requests")
+        self.assertTrue(
+            all(num_gen_tokens == 0 for _, num_gen_tokens in configs),
+            f"Expected context requests only; got {configs}",
+        )
+        self.assertIn((model_engine._config.max_num_tokens, 0), configs)
+        general_idx = calls.index("general_warmup")
+        self.assertEqual(
+            calls[general_idx : general_idx + 5],
+            ["general_warmup", "moe_clear", "empty_cache", "autotuner", "empty_cache"],
+            f"Expected the context warmup and its release before the autotuner; got {calls}",
+        )
+
     def test_helix_cp_runs_only_the_generation_autotuner_warmup(self) -> None:
         """With Helix CP, can_run_general_warmup is False and the context
         warmups (general, Mamba hybrid) are skipped; the autotuner warmup still
@@ -1539,12 +1563,17 @@ class TestWarmupCleanup(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("has_guided_decoder", [False, True])
 @pytest.mark.parametrize(
     "world_size,dwdp_size,is_fatal",
     [(1, 0, False), (2, 0, True), (1, 4, True)],
 )
-def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bool) -> None:
+def test_general_warmup_oom_policy(
+    world_size: int, dwdp_size: int, is_fatal: bool, has_guided_decoder: bool
+) -> None:
     engine = _general_warmup_engine(world_size=world_size, dwdp_size=dwdp_size)
+    guided_decoder = Mock() if has_guided_decoder else None
+    engine._inputs.guided_decoder = guided_decoder
     error = torch.OutOfMemoryError("asymmetric OOM")
     engine._forward_warmup = mock.Mock(side_effect=error if is_fatal else [error, None])
 
@@ -1560,12 +1589,115 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
         # The remaining shape is never attempted: this rank's peers are
         # already stuck in the failed forward's collectives.
         engine._forward_warmup.assert_called_once()
+        if guided_decoder is not None:
+            guided_decoder.reset_warmup_state.assert_not_called()
     else:
         assert engine._forward_warmup.call_count == 2
         # A retry after an OOM between dispatch() and combine() has to start
         # from a clean MoE all-to-all state.
         engine._reset_moe_alltoall_state.assert_called_once_with()
         empty_cache.assert_called_once_with()
+        if guided_decoder is not None:
+            guided_decoder.reset_warmup_state.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("callback_pending", [False, True])
+def test_general_warmup_oom_restores_guided_batch_queue(callback_pending: bool) -> None:
+    """A failed warmup must not shift the next request's grammar snapshot."""
+    engine = _general_warmup_engine(world_size=1, dwdp_size=0)
+    decoder = object.__new__(CapturableGuidedDecoder)
+    decoder.queue = Queue()
+    decoder._num_added_batches = 0
+    decoder.requests = None
+    decoder.requests_hostfunc = None
+    decoder.max_num_draft_tokens = 1
+    engine._inputs.guided_decoder = decoder
+    pending_callbacks: list[Callable[[], None]] = []
+    consumed: list[int] = []
+
+    def enqueue_callback(fn: Callable[..., None], *args: object, **kwargs: object) -> None:
+        pending_callbacks.append(lambda: fn(*args, **kwargs))
+
+    def synchronize() -> None:
+        while pending_callbacks:
+            pending_callbacks.pop(0)()
+            consumed.append(decoder.requests_hostfunc.requests[0].request_id)
+
+    decoder.stream = Mock(synchronize=Mock(side_effect=synchronize))
+
+    def batch(request_id: int, *, guided: bool = False) -> SimpleNamespace:
+        request = SimpleNamespace(
+            py_request_id=request_id,
+            py_guided_decoding_params=object() if guided else None,
+            py_seq_slot=0,
+            py_batch_idx=None,
+            is_context_init_state=True,
+            is_last_context_chunk=True,
+            is_generation_in_progress_state=False,
+            llm_request_type=None,
+            py_decoding_iter=0,
+            get_last_tokens=lambda _: 1,
+            py_draft_tokens=[],
+            py_num_accepted_draft_tokens=0,
+        )
+        return SimpleNamespace(
+            all_requests=lambda: [request], num_context_requests=1, num_generation_requests=0
+        )
+
+    engine._dummy_requests = SimpleNamespace(
+        create_warmup_request=lambda _resources, tokens, _gen: batch(tokens),
+        release_batch_context=lambda requests, _resources: _released_batch(requests),
+    )
+
+    def forward(requests: SimpleNamespace, *_args: object, **_kwargs: object) -> None:
+        assert not pending_callbacks
+        assert decoder.queue.empty()
+        assert decoder.requests is None
+        assert decoder.requests_hostfunc is None
+        decoder.add_batch(requests)
+        if decoder.requests.requests[0].request_id == 128:
+            if callback_pending:
+                # OOM after submitting fetch_batch, before recording the
+                # completion event: recovery must drain the stream itself.
+                decoder.fetch_batch()
+            raise torch.OutOfMemoryError("warmup forward failed after enqueue")
+        decoder.fetch_batch()
+        decoder.stream.synchronize()
+
+    engine._forward_warmup = forward
+    with (
+        _no_cuda_side_effects(),
+        patch("tensorrt_llm._torch.hostfunc.launch_hostfunc", side_effect=enqueue_callback),
+    ):
+        engine._general_warmup_impl(object(), [(128, 0), (64, 0)])
+        assert decoder.queue.empty()
+        assert consumed == ([128, 64] if callback_pending else [64])
+
+        decoder.add_batch(batch(1000, guided=True))
+        decoder.fetch_batch()
+        decoder.stream.synchronize()
+
+    assert consumed[-1] == 1000
+    (guided_request,) = decoder.requests_hostfunc.valid_requests()
+    assert guided_request.require_matcher_init()
+    # The host functions hold the batch the host thread numbered last, so a
+    # build failure is reported under the real request's batch.
+    assert decoder.requests_hostfunc.batch_id == decoder.last_added_batch_id
+    assert decoder.queue.empty()
+
+
+@pytest.mark.cpu_only
+def test_general_warmup_aborts_if_guided_state_cannot_be_reset() -> None:
+    engine = _general_warmup_engine(world_size=1, dwdp_size=0)
+    engine._inputs.guided_decoder = Mock()
+    engine._inputs.guided_decoder.reset_warmup_state.side_effect = RuntimeError("drain failed")
+    engine._forward_warmup = Mock(side_effect=torch.OutOfMemoryError("warmup OOM"))
+
+    with _no_cuda_side_effects(), pytest.raises(RuntimeError, match="drain failed"):
+        engine._general_warmup_impl(object(), [(128, 0), (64, 0)])
+
+    engine._forward_warmup.assert_called_once()
 
 
 @pytest.mark.cpu_only

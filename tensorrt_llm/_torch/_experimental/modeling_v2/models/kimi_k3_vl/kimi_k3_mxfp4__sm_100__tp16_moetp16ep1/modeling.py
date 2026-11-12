@@ -2279,6 +2279,11 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slots = getattr(mamba_metadata, "generation_state_indices", None)
         if slots is None:
             slots = mamba_metadata.state_indices[: x.shape[0]]
+        # The replay caches' slots, which differ from the state slots when the cache manager keeps them in a pool of
+        # their own.
+        replay_slots = getattr(mamba_metadata, "generation_replay_state_indices", None)
+        if replay_slots is None:
+            replay_slots = mamba_metadata.replay_state_indices[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         core = k3_kda_decode_attn(
@@ -2300,7 +2305,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             float(self.o_norm.eps),
         )
         # Speculative decoding's replay caches keep their committed conv window in step with the pool's.
-        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
+        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv, replay_slots)
         return core
 
 
