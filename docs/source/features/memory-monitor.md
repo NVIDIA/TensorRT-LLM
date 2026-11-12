@@ -28,8 +28,8 @@ The memory monitor is a prototype and its report format may change.
 
 | Value | Mode | What it does |
 |---|---|---|
-| unset or `oom` | out-of-memory reports (default) | A report when an allocation fails once the executor has started, and nothing else. |
-| `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, and enables periodic reports and, with a runtime-control key, `GET /memory_report`. |
+| unset or `oom` | out-of-memory reports (default) | A report for an out-of-memory error the executor's own error handling sees -- a failed request, a crashed executor loop, a failed wakeup -- once the executor has started. Nothing is recorded during startup or serving, and nothing is installed process-wide. |
+| `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, installs process-wide hooks so that errors from background threads and logged errors are reported too (see [Hooks](#hooks-installed-in-full-mode)), and enables periodic reports and, with a runtime-control key, `GET /memory_report`. |
 | `0` (or `off`) | off | No reports are produced on their own. |
 
 ```yaml
@@ -47,22 +47,34 @@ llm = LLM(model=..., memory_monitor_config=MemoryMonitorConfig(mode="full"))
 ```
 
 Each field of `memory_monitor_config` has an environment variable, listed
-below. A variable set to a non-empty value overrides the field, so a run can
-be diagnosed without changing its configuration, and logs one warning when
-the two differ; an empty variable (`docker -e VAR=`, `export VAR=${VAR:-}`)
-counts as unset:
+below. A variable set to a non-blank value overrides the field, so a run can
+be diagnosed without changing its configuration; a blank or whitespace-only
+variable (`docker -e VAR=`, `export VAR=${VAR:-}`) counts as unset. The
+variables are read once, where the LLM arguments are built, and travel to
+every rank inside `memory_monitor_config`, so all ranks use the same
+settings. Overriding a field the configuration set explicitly logs one
+warning. Messages name the variable when a value came from the environment,
+and `memory_monitor_config.<field>` otherwise:
 
 ```bash
 TLLM_MEM_MONITOR=1 trtllm-serve <model> ...
 ```
 
 Out-of-memory errors are reported whether they fail in PyTorch or in native
-code such as NCCL, cuBLAS or TensorRT-LLM's own C++ pools, and whether they
-happen on the executor thread or a background thread, as long as the error
-reaches Python: raised as an exception, or logged at ERROR level through
-TensorRT-LLM's Python logger. A failure that native code only logs itself is
-not reported. Errors are reported only once the executor has been created;
-see [Limitations](#limitations).
+code such as NCCL, cuBLAS or TensorRT-LLM's own C++ pools. In the default
+mode the error must reach the executor's own error handling: a request that
+fails, an executor loop that crashes, or a wakeup that cannot restore memory.
+Full mode also reports an error raised on a background thread or logged at
+ERROR level through TensorRT-LLM's Python logger. A failure that native code
+only logs itself is not reported. Errors are reported only once the executor
+has been created; see [Limitations](#limitations).
+
+A failure that says it is a host-memory failure (`cudaHostRegister`,
+`cuMemHostAlloc`, pinned memory, the KV cache manager's `HostOOMError`) is
+never reported as a GPU out-of-memory error. A failure that does not say
+which memory ran out -- CUDA's generic `out of memory`, NCCL's
+`unhandled cuda error`, the KV cache manager's `CuOOMError` -- counts as one
+only when the device is nearly full.
 
 In the default mode a report has every row, but no breakdown by startup step
 and no comparison with warmup: both need startup to be recorded, which only
@@ -81,46 +93,51 @@ them, on every rank -- the LLM API raises the level for rank 0 only.
 |---|---|---|---|
 | `mode` | `off`, `oom` (default), `full`; YAML's unquoted `off`/`on` and `0`/`1` are read as `off`/`full` | `TLLM_MEM_MONITOR` | `0`, `off`, `false`, `no`; `oom`; `1`, `full`, `on`, `true`, `yes`. An unrecognised value is reported once and the default is used. |
 | `ranks` | list of ranks that report, each below the job's world size; default all ranks | `TLLM_MEM_MONITOR_RANKS` | ranks and ranges, e.g. `0,4` or `0-3,8`, from 0 to 65535; a filter that selects none of the job's ranks is reported and ignored |
-| `oom_report_interval` | minimum seconds between two out-of-memory reports, 0 to 604800, default 60; a retry loop that fails repeatedly produces one report per interval | `TLLM_MEM_MONITOR_OOM_INTERVAL` | seconds, 0 to 604800 |
-| `report_dir` | directory that also receives each startup, periodic and out-of-memory report as its own file; see [Report files](#report-files) | `TLLM_MEM_MONITOR_DIR` | directory path |
-| `periodic_report_interval` | full mode only: report every this many seconds while serving, to watch memory that grows slowly; 1 to 604800 | `TLLM_MEM_MONITOR_INTERVAL` | seconds, 0 to 604800 (below 1 uses 1) |
+| `oom_report_interval_s` | minimum seconds between two out-of-memory reports, 0 to 604800, default 60; a retry loop that fails repeatedly produces one report per interval | `TLLM_MEM_MONITOR_OOM_INTERVAL` | seconds, 0 to 604800 |
+| `report_dir` | directory that also receives each startup, periodic and out-of-memory report as its own file, in every mode except `off`; reports asked for with `LLM.get_memory_report()` or `GET /memory_report` are returned, not written; see [Report files](#report-files) | `TLLM_MEM_MONITOR_DIR` | directory path |
+| `periodic_report_interval_s` | full mode only: report every this many seconds while serving, to watch memory that grows slowly; 1 to 604800 | `TLLM_MEM_MONITOR_INTERVAL` | seconds, 0 to 604800; `0` turns periodic reports off, and a value between 0 and 1 uses 1 |
 | `record_stacks` | full mode only: `true` records the allocating Python stack of every live PyTorch block, so that the "PyTorch, unattributed" row is broken down by the code that allocated it. Needs PyTorch's native allocator. Slows PyTorch allocations; turn it on to reproduce a problem, not in production. Recording starts once startup has completed and stops when that executor shuts down. | `TLLM_MEM_MONITOR_STACKS` | `1`/`0` |
 
-`periodic_report_interval` and `record_stacks` act only in full mode; setting
-them in another mode, or `record_stacks` on an allocator that drops allocation
-metadata, logs a warning.
+`periodic_report_interval_s` and `record_stacks` act only in full mode;
+setting them in another mode, or `record_stacks` on an allocator that drops
+allocation metadata, logs a warning. A rank filter from the environment that
+names ranks outside the job drops them, and one that selects none of them is
+reported and ignored, before startup is recorded.
 
-The settings are process-wide. When several executors run in one process,
-the first executor's configuration stays in force while it lives; a later
-executor's differing configuration is reported once and not applied.
+The monitor follows one executor per process, the first one alive. Another
+LLM in the same process runs without it -- no reports, no startup record and
+no change to the settings, with one warning saying so -- until the monitored
+one shuts down.
 
 ### Report files
 
 With `report_dir` set, the directory is created readable by its owner only
 (mode 0700) and each report file likewise (0600). Each report goes to its own
-file, named by rank, process, time and tag; only the newest 100 periodic
-reports of each rank and process are kept, older ones are deleted. Logs from
+file, named by rank, process, UTC time and tag. Each process keeps the
+newest 100 periodic reports it wrote and deletes older ones; files from
+earlier processes are left alone. Logs from
 several ranks interleave and are often cut short when a job dies; the files
 survive. A directory that cannot be written is reported once, and reports are
 then only logged. Use a directory of your own, for example
 `TLLM_MEM_MONITOR_DIR=$HOME/memory-reports`.
 
-### Hooks installed in your process
+### Hooks installed in full mode
 
-In every mode except `off`, arming the monitor installs three hooks:
+The default `oom` mode installs nothing process-wide. In full mode, arming
+the monitor installs three hooks:
 
 * a `threading.excepthook` that reports a thread dying of an out-of-memory
   error and then calls the previously installed hook;
-* a filter on TensorRT-LLM's Python logger (`tensorrt_llm`) that passes ERROR
+* a filter on TensorRT-LLM's Python logger (`logging.getLogger("TRT-LLM")`) that passes ERROR
   messages to the monitor and filters nothing out. A report for a logged
   error is built on its own short-lived thread, so the thread that logged it
   continues at once;
 * a torch out-of-memory observer
   (`torch._C._cuda_attach_out_of_memory_observer`) that records the failed
-  allocation.
+  allocation, so that the headline can name it.
 
-The first two are removed when the last executor shuts down; torch cannot
-detach an observer, so it stays attached and is made inert.
+The first two are removed when the monitored executor shuts down; torch
+cannot detach an observer, so it stays attached and is made inert.
 
 ## Asking for a report
 
@@ -150,13 +167,33 @@ export TRTLLM_RUNTIME_CONTROL_API_KEY='replace-with-a-long-random-secret'
 TLLM_MEM_MONITOR=1 trtllm-serve <model>
 ```
 
-Requests must be signed with that key like the runtime-control routes; see
+The route also needs `memory_monitor_config.mode: full` (or
+`TLLM_MEM_MONITOR=1`) and a single serving frontend. Requests must be signed
+with that key like the runtime-control routes; see
 [Control-plane HTTP endpoints](sleep-wakeup.md#control-plane-http-endpoints)
 for the headers and the signature. A report shows process IDs, other
 processes' GPU usage and, with `TLLM_MEM_MONITOR_STACKS=1`, source paths,
 and each request makes every rank build a report. Without the key, or with
 more than one serving frontend (`num_serve_frontends`), the route is not
 served and the server logs why.
+
+### Which processes report
+
+Reports come from the processes that run a model:
+
+* **LLM API and `trtllm-serve` (PyTorch backend):** each executor rank.
+  Out-of-memory reports in `oom` and `full` mode; in full mode also the
+  startup report, periodic reports, and on-demand reports through
+  `LLM.get_memory_report()` and `GET /memory_report`.
+* **VisualGen (`VisualGen`, `trtllm-serve --visual_gen_args`):** each
+  diffusion worker. Out-of-memory reports for failed requests in `oom` and
+  `full` mode; in full mode also a startup report, with the pipeline load and
+  warmup as the `model` step, and periodic reports. VisualGen has no
+  on-demand report. Configure it with the `TLLM_MEM_MONITOR*` environment
+  variables; `memory_monitor_config` is an LLM API setting.
+
+Reports are logged by the process that builds them and, with `report_dir`
+(`TLLM_MEM_MONITOR_DIR`), also written there.
 
 ## Reading a report
 
@@ -178,7 +215,7 @@ step:
                                 of which (GiB): NCCL communicators 0.94, NCCLWindowAllocator 0.56, custom allreduce workspace 0.50
   CUDA and library overhead       1.28 GiB    1.2%      +0.06 GiB   CUDA context, cuBLAS, NCCL internals and other driver memory
                                 of which (GiB): before the first startup step 0.60, Additional executor resources (temporary for KV cache size estimation) 0.38, Model 0.10, Sampler 0.07, Model resources created during usage 0.06, +1 more
-  Runtime buffers                 0.23 GiB    0.2%      -0.00 GiB   buffers owned by named runtime components
+  Runtime buffers                 0.23 GiB    0.2%      +0.00 GiB   buffers owned by named runtime components
                                 of which (GiB): Additional executor resources 0.10, Model 0.06, Additional executor resources (temporary for KV cache size estimation) 0.03, Model resources created during usage 0.03
   CUDA graphs                     0.05 GiB    0.1%      +0.00 GiB   held by captured CUDA graphs for replay; not reusable
                                 of which (GiB): in use by graphs 0.03, free in graph pools 0.02
@@ -200,14 +237,19 @@ pool, followed by consistency checks between independent readings.
   they hold more than this process, the conclusion says so.
 * **The rows** add up exactly to the total. Large rows list what they are made
   of (`of which`).
+  * *KV cache* is the device memory of the KV cache pools. With sparse KV
+    cache offload, pools whose pages are pinned host memory mapped into the
+    device are listed separately as host-backed and are not counted in the
+    total.
   * *Model weights* follows the loaded model, including weights that were
     replaced or moved after loading.
   * *Runtime buffers* are named by the startup step that allocated them.
   * *Communication buffers* name NCCL communicators, NCCL window buffers,
     CUDA IPC buffers (such as the custom allreduce workspace), NVLS and
     multicast workspaces (including the fused GEMM+allreduce one),
-    symmetric-memory allreduce workspaces, MNNVL buffers, DeepEP buffers and
-    Ulysses all-to-all slots.
+    symmetric-memory allreduce workspaces, MNNVL buffers, DeepEP buffers,
+    userbuffers (the torch.compile allreduce buffers, at their registered,
+    multicast-rounded size) and Ulysses all-to-all slots.
   * *CUDA and library overhead* is what no component accounts for: the CUDA
     context, cuBLAS, NCCL internals and code loaded on demand. It is split by
     when it appeared -- before startup, in each startup step, or since.
@@ -248,23 +290,38 @@ on resume.
 * **No comparison with warmup in the default mode.** The rows and the total
   are the same, but *since warmup*, the startup plan and the split of the
   overhead row by startup step need `TLLM_MEM_MONITOR=1`.
+* **NCCL communicator memory is measured, not read from NCCL.** The row is
+  the drop in the device's free memory across `ncclCommInitRank`, so memory
+  another process allocates on the same GPU during that call is counted too.
+  It also assumes NCCL connects its buffers at initialisation
+  (`NCCL_RUNTIME_CONNECT=0`); buffers NCCL connects later, including those of
+  communicators `torch.distributed` connects after its first collective, land
+  in *CUDA and library overhead*.
+* **Some buffers have no row of their own.** The NIXL transfer agent's bounce
+  arena lives in a library that cannot record into the monitor; it is counted
+  in *KV cache transfer buffers*, the step in which it is created. The CUTLASS
+  MoE scratch is PyTorch memory allocated inside a C++ op, so it shows as
+  *PyTorch, unattributed*, or under its allocating code with allocation
+  stacks on.
 * **Allocation stacks need PyTorch's native allocator.** With
   `PYTORCH_ALLOC_CONF=backend:cudaMallocAsync` or a pluggable allocator,
   `TLLM_MEM_MONITOR_STACKS=1` records nothing.
-* **Startup records belong to one executor per process.** Each executor's
-  components are reported separately. When an executor starts while another
-  one in the same process is still running, its startup is not recorded
-  (a warning says so), so the running executor's startup breakdown, warmup
-  comparison and buffer names stay correct; the records are dropped when the
-  executor they describe shuts down.
+* **One executor per process.** The monitor follows the first executor alive
+  in a process. An executor created while it runs is not monitored (a
+  warning says so): it gets no out-of-memory reports, startup record or
+  report of its own, and its memory shows in the monitored executor's report
+  as other memory of this process. Its own `get_memory_report()` says why it
+  has no report.
 
 ## Cost
 
-In the default `oom` mode no work is done while serving until an allocation
-fails. When startup completes, the process's memory pools are classified
+In the default `oom` mode nothing is installed process-wide and no work is
+done while serving until an error reaches the executor's error handling. When startup completes, the process's memory pools are classified
 once, which walks the Python heap (about 100 ms per million objects), so
 that a later report does not have to. With `TLLM_MEM_MONITOR=1`, allocation
-history is recorded during startup only, and a report takes about a
-millisecond once startup has finished. Neither mode adds work to the
-executor loop. `TLLM_MEM_MONITOR_STACKS=1` is the exception and slows every
-PyTorch allocation while it is on.
+history is recorded during startup only. Neither mode adds work to the
+executor loop. Building one report took 10 to 32 ms on H100 serving
+Llama-3.1-8B at TP=2; `LLM.get_memory_report()` in full mode took 113 to
+264 ms, since rank 0 also gathers the other ranks' reports.
+`TLLM_MEM_MONITOR_STACKS=1` is the exception and slows every PyTorch
+allocation while it is on.

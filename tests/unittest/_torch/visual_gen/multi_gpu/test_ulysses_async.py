@@ -267,6 +267,28 @@ def _slot_memory_logic(rank: int, world_size: int):
     assert recorded() == (count + 4, size + 3 * small + 4 * large)
 
 
+def _worker_report_logic(rank: int, world_size: int):
+    """A VisualGen worker's memory report names the Ulysses slots."""
+    from tensorrt_llm._torch.memory.monitor import triggers
+    from tensorrt_llm._torch.visual_gen.memory_monitor import WorkerMemoryMonitor
+
+    os.environ["TLLM_MEM_MONITOR"] = "1"
+    device = torch.device(f"cuda:{rank}")
+    pg = dist.new_group(ranks=list(range(world_size)))
+    x = torch.randn(2, 64, world_size * 8, 128, dtype=torch.bfloat16, device=device)
+    monitor = WorkerMemoryMonitor(device_id=rank, rank=rank, world_size=world_size)
+    try:
+        with monitor.startup():
+            torch.ops.trtllm.ulysses_a2a_async_prepare(x, pg.boxed())
+            torch.cuda.synchronize()
+        monitor.arm()
+        report = triggers.report_now(tag="test", rank=rank, device_index=rank, save=False)
+        assert report is not None and "Ulysses all-to-all slots" in report, report
+    finally:
+        monitor.release()
+        del os.environ["TLLM_MEM_MONITOR"]
+
+
 def _run(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
@@ -302,3 +324,8 @@ def test_multi_pg():
 def test_slot_memory_is_recorded():
     """Each new slot shows up in the native memory ledger the memory monitor reads."""
     _run(2, _slot_memory_logic)
+
+
+def test_worker_report_names_the_slots():
+    """In full mode a VisualGen worker's report lists the Ulysses slot memory."""
+    _run(2, _worker_report_logic)
