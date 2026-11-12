@@ -29,8 +29,9 @@ import sys
 import types
 import zlib
 from collections import OrderedDict
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import torch
 from torch.overrides import TorchFunctionMode, resolve_name
@@ -38,6 +39,9 @@ from torch.overrides import TorchFunctionMode, resolve_name
 import tensorrt_llm
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_bf16__sm_103__tp1.moe import (
+        BeamMoeBf16Sm103Tp1,
+    )
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 #: CPU op names of PyTorch's SDPA paths, and CUDA kernel names of attention kernels.
@@ -66,7 +70,7 @@ def math_state() -> dict:
     }
 
 
-def ieee_fp32_session(write_evidence):
+def ieee_fp32_session(write_evidence: Callable[[str, dict], None]) -> Iterator[dict]:
     """Enforce IEEE fp32 and verify it before and after the module's tests."""
     matmul = torch.backends.cuda.matmul
     saved = (
@@ -113,7 +117,7 @@ def git_revision() -> str | None:
     return out.stdout.strip() or None
 
 
-def environment(ieee: dict, execution, **extra) -> dict:
+def environment(ieee: dict, execution: Mapping[str, object], **extra: object) -> dict:
     """The device and software a case ran on; ``extra`` entries follow ``execution``."""
     device = torch.cuda.current_device()
     return {
@@ -241,7 +245,9 @@ def compare_exact(name: str, actual: torch.Tensor, expected: torch.Tensor) -> di
     }
 
 
-def output_contract(out, shape: tuple[int, ...], dtype: torch.dtype, sm: tuple[int, int]) -> dict:
+def output_contract(
+    out: object, shape: tuple[int, ...], dtype: torch.dtype, sm: tuple[int, int]
+) -> dict:
     """The forward returned a finite ``shape`` bf16 tensor on the sm_103 device."""
     problems = []
     if not isinstance(out, torch.Tensor):
@@ -302,7 +308,9 @@ def assert_all_pass(results: list[dict]) -> None:
 # -------------------------------------------------- weights
 
 
-def cheap_weights(param_shapes) -> "OrderedDict[str, torch.Tensor]":
+def cheap_weights(
+    param_shapes: Mapping[str, tuple[tuple[int, ...], torch.dtype]],
+) -> "OrderedDict[str, torch.Tensor]":
     """A valid mapping for ``param_shapes`` (name -> (shape, dtype)) that allocates nothing:
     one expanded constant per dtype, so a load that copied any of it would change the
     generated values it replaced."""
@@ -320,12 +328,12 @@ def cheap_weights(param_shapes) -> "OrderedDict[str, torch.Tensor]":
 
 @contextlib.contextmanager
 def recording(
-    *wrappers,
+    *wrappers: Callable[..., object],
     recorded_kwargs: tuple[str, ...],
-    experts=None,
+    experts: type[BeamMoeBf16Sm103Tp1] | None = None,
     data_ptrs: bool = False,
     qkv: bool = False,
-):
+) -> Iterator[list[dict]]:
     """Log every call of these entries, in order, with its nesting depth, the arguments that
     identify the path and its output. ``experts``: an MoE class whose ``_expert`` calls are
     also logged, with the expert asked for and the rows it is passed. ``data_ptrs``: the
@@ -338,7 +346,13 @@ def recording(
         original = cls.__call__
         saved.append((cls, "__call__", original))
 
-        def logged(self, *args, _original=original, _name=cls.__name__, **kwargs):
+        def logged(
+            self,
+            *args: object,
+            _original: Callable[..., object] = original,
+            _name: str = cls.__name__,
+            **kwargs: object,
+        ) -> object:
             tensors = [a for a in args if isinstance(a, torch.Tensor)]
             entry = {
                 "op": _name,
@@ -365,7 +379,14 @@ def recording(
         original_expert = experts._expert
         saved.append((experts, "_expert", original_expert))
 
-        def asked(self, expert_id, rows, _original=original_expert):
+        def asked(
+            self,
+            expert_id: int,
+            rows: torch.Tensor,
+            _original: Callable[
+                [BeamMoeBf16Sm103Tp1, int, torch.Tensor], torch.Tensor
+            ] = original_expert,
+        ) -> torch.Tensor:
             calls.append({"op": "expert", "depth": depth[0], "expert_id": expert_id, "rows": rows})
             return _original(self, expert_id, rows)
 
@@ -389,12 +410,12 @@ def loggable(calls: list[dict], keep: tuple[str, ...]) -> list[dict]:
 
 
 @contextlib.contextmanager
-def builtin_forbidden(targets):
+def builtin_forbidden(targets: Sequence[tuple[type, str]]) -> Iterator[None]:
     """The built-in Beam modeling must not run while the component does: every ``(class,
     method)`` in ``targets`` raises for the duration of the block."""
     saved = [(cls, name, getattr(cls, name)) for cls, name in targets]
 
-    def refuse(self, *args, **kwargs):
+    def refuse(self, *args: object, **kwargs: object) -> NoReturn:
         raise AssertionError(f"the built-in {type(self).__name__} ran inside the component")
 
     for cls, name, _ in saved:
@@ -407,14 +428,14 @@ def builtin_forbidden(targets):
 
 
 @contextlib.contextmanager
-def no_dispatch(ops):
+def no_dispatch(ops: Sequence[Callable[..., object]]) -> Iterator[None]:
     """Fail on any call of ``ops``: rejected inputs must be rejected before a kernel runs."""
     saved = []
     for w in ops:
         cls = type(w)
         saved.append((cls, cls.__call__))
 
-        def refuse(self, *args, _name=cls.__name__, **kwargs):
+        def refuse(self, *args: object, _name: str = cls.__name__, **kwargs: object) -> NoReturn:
             raise AssertionError(f"{_name} dispatched before the input was rejected")
 
         cls.__call__ = refuse
@@ -428,11 +449,17 @@ def no_dispatch(ops):
 class TorchCallTrace(TorchFunctionMode):
     """The name of every torch call made inside the block and the devices of its outputs."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.calls: list[tuple[str, list[str]]] = []
 
-    def __torch_function__(self, func, types, args=(), kwargs=None):
+    def __torch_function__(
+        self,
+        func: Callable[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
         out = func(*args, **(kwargs or {}))
         outs = out if isinstance(out, (tuple, list)) else [out]
         devices = [str(t.device) for t in outs if isinstance(t, torch.Tensor)]
@@ -453,7 +480,7 @@ def fresh_context(
     max_tokens: int,
     request_id: int,
     mgr_args: dict,
-):
+) -> Iterator[TrtllmAttentionMetadata]:
     """A KVCacheManagerV2 built from ``mgr_args`` and prepared TrtllmAttentionMetadata for
     ``num_requests`` new requests of ``num_tokens`` after ``cached_tokens`` cached ones."""
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -523,7 +550,9 @@ _BAD_INPUT_MATCH = {
 }
 
 
-def bad_block_input(case: str, max_tokens: int, dtype: torch.dtype):
+def bad_block_input(
+    case: str, max_tokens: int, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, dict, str | None]:
     """One unsupported call of a block at 17 tokens: ``(hidden_states, position_ids,
     fresh_context kwargs, ValueError message pattern or None)``. ``metadata_type`` keeps
     the valid inputs; the caller replaces the metadata itself."""
@@ -609,7 +638,7 @@ SMALL_MODEL_CONFIG = types.MappingProxyType(
 )
 
 
-def small_model_config(**overrides) -> types.SimpleNamespace:
+def small_model_config(**overrides: object) -> types.SimpleNamespace:
     fields = dict(SMALL_MODEL_CONFIG)
     fields["layer_types"] = list(fields["layer_types"])
     fields["mlp_layer_types"] = list(fields["mlp_layer_types"])
@@ -634,7 +663,9 @@ def _small_model_half_width(name: str, shape: tuple, embed_name: str) -> tuple[f
     return math.sqrt(3.0 / shape[-1]), 0.0
 
 
-def generate_small_model_state(seed: int, model_module) -> "OrderedDict[str, torch.Tensor]":
+def generate_small_model_state(
+    seed: int, model_module: types.ModuleType
+) -> "OrderedDict[str, torch.Tensor]":
     """All 2394 tensors of ``model_module.weight_schema``, each drawn from its own generator
     keyed by seed and name, fp32 then rounded once to the stored dtype."""
     state = OrderedDict()

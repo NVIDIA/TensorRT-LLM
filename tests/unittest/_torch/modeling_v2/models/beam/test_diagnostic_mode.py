@@ -9,7 +9,12 @@ dispatch and the collectives, so they pin which work runs in which mode and in w
 real-checkpoint TP4 refactor-integrity runs exercise the collectives themselves.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 import torch
@@ -52,7 +57,7 @@ def _component(diagnostics: bool, agreements: list) -> SimpleNamespace:
     component.expert_bank = lambda layer: {}
     component._shared_fc1 = {LAYER: [True] * EXPERTS}
 
-    def digests_agree(tensors):
+    def digests_agree(tensors: Sequence[torch.Tensor]) -> list[str]:
         agreements.append(len(tensors))
         return ["digest"] * len(tensors)
 
@@ -63,11 +68,21 @@ def _component(diagnostics: bool, agreements: list) -> SimpleNamespace:
 @pytest.mark.parametrize("cls", [BF16_CLS, NVFP4_CLS], ids=["bf16", "nvfp4"])
 @pytest.mark.parametrize("diagnostics", [False, True], ids=["off", "on"])
 @pytest.mark.parametrize("captured", [False, True], ids=["no-capture", "capture"])
-def test_moe_router_agreement_runs_only_in_diagnostic_mode(monkeypatch, cls, diagnostics, captured):
+def test_moe_router_agreement_runs_only_in_diagnostic_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    cls: type[bf16.BeamCheckpointLayoutBf16Sm103Tp4],
+    diagnostics: bool,
+    captured: bool,
+) -> None:
     agreements = []
     component = _component(diagnostics, agreements)
 
-    def dispatch(h, ids, weights, provider):
+    def dispatch(
+        h: torch.Tensor,
+        ids: torch.Tensor,
+        weights: torch.Tensor,
+        provider: Callable[[int, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
         if cls is BF16_CLS:
             provider(0, h[:1])  # one expert call, so a capture has rows to record
         return torch.ones_like(h)
@@ -93,7 +108,7 @@ def test_moe_router_agreement_runs_only_in_diagnostic_mode(monkeypatch, cls, dia
 class _Reduce:
     """A stand-in for the four-rank all-reduce: returns the sum the peers would produce."""
 
-    def __init__(self, total: int):
+    def __init__(self, total: int) -> None:
         self.total = total
         self.calls = 0
 
@@ -106,7 +121,7 @@ class _Reduce:
     "mine,ranks_on,ok",
     [(False, 0, True), (True, 4, True), (True, 3, False), (False, 1, False), (False, 2, False)],
 )
-def test_every_rank_runs_the_same_diagnostic_mode(mine, ranks_on, ok):
+def test_every_rank_runs_the_same_diagnostic_mode(mine: bool, ranks_on: int, ok: bool) -> None:
     reduce = _Reduce(ranks_on)
     component = SimpleNamespace(
         diagnostics=mine, device=torch.device("cpu"), rank=0, _allreduce=reduce
@@ -120,11 +135,13 @@ def test_every_rank_runs_the_same_diagnostic_mode(mine, ranks_on, ok):
 
 
 @pytest.mark.parametrize("cls", [BF16_CLS, NVFP4_CLS], ids=["bf16", "nvfp4"])
-def test_load_settles_the_mode_before_any_other_collective(cls, tmp_path):
+def test_load_settles_the_mode_before_any_other_collective(
+    cls: type[bf16.BeamCheckpointLayoutBf16Sm103Tp4], tmp_path: Path
+) -> None:
     order = []
     component = SimpleNamespace()
 
-    def mode_mismatch():
+    def mode_mismatch() -> NoReturn:
         order.append("mode")
         raise bf16.LoadError("rank 0: diagnostic validation is on for 1 of 4 ranks")
 
@@ -135,7 +152,7 @@ def test_load_settles_the_mode_before_any_other_collective(cls, tmp_path):
     assert order == ["mode"]
 
 
-def test_router_disagreement_is_detected(monkeypatch):
+def test_router_disagreement_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     component = SimpleNamespace(device=torch.device("cpu"), mapping=None)
     tensors = (
         torch.ones(2, HIDDEN, dtype=torch.bfloat16),
@@ -143,8 +160,8 @@ def test_router_disagreement_is_detected(monkeypatch):
         torch.full((2, 2), 0.5),
     )
 
-    def peers(differing_rank):
-        def allgather(local, mapping, dim=0):
+    def peers(differing_rank: int | None) -> Callable[..., torch.Tensor]:
+        def allgather(local: torch.Tensor, mapping: object, dim: int = 0) -> torch.Tensor:
             rows = [local.clone() for _ in range(bf16.WORLD_SIZE)]
             if differing_rank is not None:
                 rows[differing_rank][0] ^= 1
@@ -169,11 +186,11 @@ class _Stop(Exception):
     ids=["standalone", "full-model-call", "full-model-call-diagnostic", "standalone-diagnostic"],
 )
 def test_attention_rechecks_the_step_per_layer_only_when_needed(
-    monkeypatch, call_checked, diagnostics, rechecks
-):
+    monkeypatch: pytest.MonkeyPatch, call_checked: bool, diagnostics: bool, rechecks: int
+) -> None:
     calls = []
 
-    def stop(md, layer):
+    def stop(md: object, layer: int) -> NoReturn:
         raise _Stop()
 
     monkeypatch.setattr(bf16._attention, "check_batch_metadata", lambda *a, **k: calls.append(a))
@@ -194,7 +211,9 @@ def test_attention_rechecks_the_step_per_layer_only_when_needed(
     assert len(calls) == rechecks
 
 
-def test_full_model_validates_once_and_marks_every_block_call_checked(monkeypatch):
+def test_full_model_validates_once_and_marks_every_block_call_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
         model as full,
     )
@@ -211,11 +230,20 @@ def test_full_model_validates_once_and_marks_every_block_call_checked(monkeypatc
         head=lambda x: x,
     )
 
-    def check_call(input_ids, position_ids, md, **kwargs):
+    def check_call(
+        input_ids: torch.Tensor, position_ids: torch.Tensor, md: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
         checks.append(kwargs)
         return input_ids, position_ids, [(0, T)]
 
-    def block(layer, x, positions, md, capture, **kwargs):
+    def block(
+        layer: int,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        md: object,
+        capture: dict | None,
+        **kwargs: object,
+    ) -> torch.Tensor:
         blocks.append((layer, kwargs.get("call_checked")))
         return x
 
@@ -230,7 +258,9 @@ def test_full_model_validates_once_and_marks_every_block_call_checked(monkeypatc
 
 
 @pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True), ("on", True)])
-def test_diagnostic_mode_is_read_once_from_the_environment(monkeypatch, value, expected):
+def test_diagnostic_mode_is_read_once_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+) -> None:
     if value is None:
         monkeypatch.delenv(MODELING_V2_VALIDATE_ENV, raising=False)
     else:

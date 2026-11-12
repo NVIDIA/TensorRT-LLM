@@ -30,10 +30,14 @@ Every RMSNorm computes its statistics, normalization and affine in fp32 and roun
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Mapping
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Mapping
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
@@ -75,7 +79,9 @@ SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 MAX_TOKENS = 1024
 
 
-def weight_shapes(config) -> "OrderedDict[str, tuple[int, ...]]":
+def weight_shapes(
+    config: PretrainedConfig | SimpleNamespace,
+) -> "OrderedDict[str, tuple[int, ...]]":
     """The block's fifteen tensors by checkpoint name, in checkpoint order, [out, in] for matrices."""
     hidden, inter = config.hidden_size, config.intermediate_size
     q_width = config.num_attention_heads * config.head_dim

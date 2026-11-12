@@ -47,7 +47,8 @@ import json
 import os
 import struct
 import types
-from typing import Optional
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
@@ -64,10 +65,21 @@ from .layout import (
     checkpoint_dir_of,
     read_config,
 )
-from .model import MAX_NUM_TOKENS, NUM_LAYERS, BeamFullModelNvfp4Sm103Tp4
+from .model import MAX_NUM_TOKENS, NUM_LAYERS, BeamFullModelNvfp4Sm103Tp4, LogitRows
+
+if TYPE_CHECKING:
+    from typing import Literal, overload
+
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
 
-def _checkpoint_config(pretrained_config) -> tuple:
+def _checkpoint_config(pretrained_config: PretrainedConfig | None) -> tuple:
     """The checkpoint directory and its ``config.json`` mapping, read as stored and validated.
 
     ``layout.check_checkpoint`` is the validator routing applies too, so a checkpoint routing
@@ -101,11 +113,44 @@ class _Target:
 
     phase = ""
 
-    def __init__(self, model: BeamFullModelNvfp4Sm103Tp4):
+    def __init__(self, model: BeamFullModelNvfp4Sm103Tp4) -> None:
         self.model = model
         self.traced = set()
 
-    def _run(self, attn_metadata, input_ids, position_ids, logit_rows, **kwargs):
+    if TYPE_CHECKING:
+
+        @overload
+        def _run(
+            self,
+            attn_metadata: TrtllmAttentionMetadata,
+            input_ids: torch.Tensor,
+            position_ids: torch.Tensor | None,
+            logit_rows: LogitRows,
+            *,
+            return_hidden: Literal[False] = False,
+            **kwargs: object,
+        ) -> torch.Tensor: ...
+
+        @overload
+        def _run(
+            self,
+            attn_metadata: TrtllmAttentionMetadata,
+            input_ids: torch.Tensor,
+            position_ids: torch.Tensor | None,
+            logit_rows: LogitRows,
+            *,
+            return_hidden: Literal[True],
+            **kwargs: object,
+        ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def _run(
+        self,
+        attn_metadata: TrtllmAttentionMetadata,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        logit_rows: LogitRows,
+        **kwargs: object,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         kind = "batched" if attn_metadata.num_seqs > 1 else "single-request"
         trace = None if kind in self.traced else []
         out = self.model(
@@ -124,7 +169,7 @@ class PrefillTarget(_Target):
 
     def forward(
         self,
-        attn_metadata,
+        attn_metadata: TrtllmAttentionMetadata,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         *,
@@ -141,7 +186,7 @@ class DecodeTarget(_Target):
 
     def forward(
         self,
-        attn_metadata,
+        attn_metadata: TrtllmAttentionMetadata,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         *,
@@ -163,13 +208,13 @@ class VerifyTarget(_Target):
 
     def forward(
         self,
-        attn_metadata,
+        attn_metadata: TrtllmAttentionMetadata,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        spec_metadata,
+        spec_metadata: SpecMetadata,
         *,
         extra_kv_tokens: int,
-    ) -> tuple:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         rows_per_generation = spec_metadata.runtime_draft_len + 1
         if spec_metadata.runtime_tokens_per_gen_step != rows_per_generation:
             raise ValueError(
@@ -201,13 +246,13 @@ _TARGET_MANIFEST_FILES = ("config.json", "hf_quant_config.json", "model.safetens
 _TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "generation_config.json")
 
 
-def _canonical_sha256(value) -> str:
+def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
-def _files_sha256(directory: str, names) -> str:
+def _files_sha256(directory: str, names: Sequence[str]) -> str:
     """One digest over the named files of ``directory`` (name, size and bytes of each)."""
     h = hashlib.sha256()
     for name in names:
@@ -251,7 +296,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
     codes, each layer with its own FP32 scale from the scale table ``load_checkpoint`` takes.
     """
 
-    def __init__(self, model_config: ModelConfig):
+    def __init__(self, model_config: ModelConfig) -> None:
         super().__init__()
         self.model_config = model_config
         mapping = model_config.mapping
@@ -351,7 +396,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         self.extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
 
     @property
-    def config(self):
+    def config(self) -> PretrainedConfig | None:
         return self.model_config.pretrained_config
 
     @property
@@ -465,7 +510,9 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
             )
         return embed, head
 
-    def load_draft_weights(self, weights: dict, weight_mapper=None) -> None:
+    def load_draft_weights(
+        self, weights: dict, weight_mapper: BaseWeightMapper | None = None
+    ) -> None:
         """Load the drafter's own tensors, then give it the target's embedding and head.
 
         The drafter checkpoint carries neither (``DFlashForCausalLM.WEIGHTS_SHARED_WITH_TARGET``)
@@ -582,7 +629,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
     def _disagg_identity_digest(self) -> str:
         return _canonical_sha256(self.disagg_cache_identity())
 
-    def export_disagg_context_request(self, req) -> dict:
+    def export_disagg_context_request(self, req: LlmRequest) -> dict:
         """The handoff record a finished context-only request leaves its generation worker.
 
         Called by the cache transceiver after the context forward, before the request's
@@ -606,7 +653,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
             ),
         }
 
-    def validate_disagg_generation_request(self, req) -> Optional[str]:
+    def validate_disagg_generation_request(self, req: LlmRequest) -> Optional[str]:
         """None when ``req``'s received handoff record fits this worker, else why it does not.
 
         Runs on the generation worker once the transfer session completes and before the
@@ -654,7 +701,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
             return "the context worker drafted but this worker has no drafter"
         return None
 
-    def prepare_disagg_generation_request(self, req) -> None:
+    def prepare_disagg_generation_request(self, req: LlmRequest) -> None:
         """Hand a received request's draft-context cursor to the DFlash worker.
 
         Called by the executor once the request's KV (target and draft pages) has arrived and
@@ -679,15 +726,15 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
 
     def forward(
         self,
-        attn_metadata,
+        attn_metadata: TrtllmAttentionMetadata,
         input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         return_context_logits: bool = False,
-        spec_metadata=None,
-        resource_manager=None,
-        **kwargs,
-    ):
+        spec_metadata: SpecMetadata | None = None,
+        resource_manager: ResourceManager | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | dict:
         if inputs_embeds is not None or input_ids is None:
             raise ValueError("the Beam NVFP4 target takes token ids, not input embeddings")
         if kwargs.get("lora_params") is not None:
