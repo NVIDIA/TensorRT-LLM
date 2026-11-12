@@ -2105,6 +2105,60 @@ def _site_rowtile_scratch_groups(_, monkeypatch) -> None:
     assert all(prev[1] == nxt[0] for prev, nxt in zip(groups, groups[1:]))
 
 
+def _site_draft_share_chunks(case, monkeypatch) -> None:
+    """The IndexShare draft-extend step's context selection (`_score_and_select`, as
+    `mtp_forward` calls it) in equal chunks of a lowered score-table bound, `case` =
+    (((prefix, rows), ...), bound, chunk rows): bitwise the one-call scores and `_selection`
+    the step ran unchunked, block lists and token selection alike."""
+    requests, bound, want = case
+    tpb, cr, token_topk = 32, 4, TKC_TOKEN_TOPK
+    need = [-(-(p + r) // tpb) for p, r in requests]
+    rows = sum(r for _, r in requests)
+    gen, cache, table, slot_of = _index_pool(len(requests), need, rows, 12000, 64)
+    req = torch.cat(
+        [torch.full((r,), int(slot_of[i]), dtype=torch.int32) for i, (_, r) in enumerate(requests)]
+    ).to(DEV)
+    logical = torch.cat([torch.arange(p, p + r, dtype=torch.int64) for p, r in requests]).to(DEV)
+    seq_lens = torch.cat([torch.full((r,), p + r, dtype=torch.int32) for p, r in requests]).to(DEV)
+    visible = ((logical + 1) // cr).to(torch.int32)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    q = torch.randn(rows, 6, 128, generator=gen, device=DEV).to(torch.bfloat16)[:, :4]
+    core = SimpleNamespace(compress_ratio=cr, token_topk=token_topk)
+    columns = table.shape[1] * tpb // cr
+    # At the engine's bound, `max_seq_len` 262144 (8196 pages of 32) scores 32704 rows a call.
+    assert M._score_chunk_rows(core, table, tpb) == 32704
+
+    def topk():
+        return torch.full((rows, token_topk // cr), -7, dtype=torch.int32, device=DEV)
+
+    def selected():
+        return torch.full((rows, token_topk + cr - 1), -7, dtype=torch.int32, device=DEV)
+
+    one_topk, one = topk(), selected()
+    scores = M._context_index_scores(q, cache, table, logical, req, tpb, cr, True)
+    M._selection(core, scores, visible, logical, seq_lens, one_topk, row_starts, one)
+    del scores
+
+    monkeypatch.setattr(M, "_SCORE_TABLE_ELEMENTS", bound * columns + 1)
+    assert M._score_chunk_rows(core, table, tpb) == bound
+    calls = []
+    scorer = M._context_index_scores
+
+    def counted(q_rows, *args):
+        calls.append(q_rows.shape[0])
+        return scorer(q_rows, *args)
+
+    monkeypatch.setattr(M, "_context_index_scores", counted)
+    chunked_topk, chunked = topk(), selected()
+    M._score_and_select(
+        core, cache, q, table, logical, req, tpb, visible, seq_lens, chunked_topk, row_starts,
+        0, rows, True, chunked,
+    )  # fmt: skip
+    assert calls == list(want)
+    assert torch.equal(chunked_topk, one_topk), "block lists"
+    assert torch.equal(chunked, one), "token selection"
+
+
 _SITE_CASES = [
     *(
         pytest.param(_site_prologue, (site, layout), id=f"{site} prologue {layout}")
@@ -2116,6 +2170,16 @@ _SITE_CASES = [
         _site_rowtile_q_in_place, [(3000, 1040), (7000, 1043)], id="rowtile q in place, lone group"
     ),
     pytest.param(_site_rowtile_scratch_groups, None, id="rowtile fp8 scratch groups"),
+    pytest.param(
+        _site_draft_share_chunks,
+        (((88064, 900), (40000, 600), (3, 300)), 512, (512, 512, 512, 264)),
+        id="draft index share chunks, three requests",
+    ),
+    pytest.param(
+        _site_draft_share_chunks,
+        (((250000, 1100),), 512, (384, 384, 332)),
+        id="draft index share chunks, 250k",
+    ),
 ]
 
 
