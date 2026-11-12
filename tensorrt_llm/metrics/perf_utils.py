@@ -18,6 +18,7 @@ Kept in tensorrt_llm/metrics/ so that this logic has no GPU / heavy
 dependencies and can be unit-tested without a full TensorRT-LLM install.
 """
 
+import math
 from typing import Optional
 
 from .enums import MetricNames, RequestEventTiming
@@ -71,6 +72,19 @@ def process_req_perf_metrics(
     # INFERENCE_TIME = first_scheduled → last_token (total execution time).
     if last_token > 0 and first_scheduled > 0:
         stat[MetricNames.INFERENCE_TIME] = last_token - first_scheduled
+
+    transfer_start = req_perf_metrics_dict.get(RequestEventTiming.KV_CACHE_TRANSFER_START, 0)
+    transfer_end = req_perf_metrics_dict.get(RequestEventTiming.KV_CACHE_TRANSFER_END, 0)
+    if (
+        transfer_start > 0
+        and transfer_end > transfer_start
+        and math.isfinite(transfer_start)
+        and math.isfinite(transfer_end)
+    ):
+        stat[MetricNames.KV_CACHE_TRANSFER_TIME] = transfer_end - transfer_start
+    transfer_bytes = req_perf_metrics_dict.get(RequestEventTiming.KV_CACHE_SIZE, 0)
+    if transfer_bytes > 0 and math.isfinite(transfer_bytes):
+        stat[MetricNames.KV_CACHE_TRANSFER_BYTES] = transfer_bytes
 
     # Token counts — recorded per candidate.  When n>1 each candidate has
     # its own timestamps and token stream so metrics are valid per candidate.

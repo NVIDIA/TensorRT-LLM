@@ -321,6 +321,7 @@ class _LogicalOutcome:
     status: SessionStatus
     reason: str = ""
     by_peer: bool = False
+    timed_out: bool = False
 
 
 class _LogicalOutcomes:
@@ -342,7 +343,9 @@ class _LogicalOutcomes:
 
     def _timeout_locked(self) -> None:
         """Commit timeout metadata without entering session, backend or CUDA code."""
-        self._end_locked(_LogicalOutcome(SessionStatus.ERROR, reason="KV transfer timed out"))
+        self._end_locked(
+            _LogicalOutcome(SessionStatus.ERROR, reason="KV transfer timed out", timed_out=True)
+        )
 
     def _end_locked(self, outcome: _LogicalOutcome) -> None:
         """End pending results once, preserving every previously committed outcome."""
@@ -2649,6 +2652,12 @@ class TxSession(TxSessionBase):
             not getattr(self, "_enforce_physical_ownership", False) or self.resources_drained()
         )
 
+    @property
+    def timed_out(self) -> bool:
+        """Whether the whole-session deadline committed the terminal outcome."""
+        terminal = self._logical_outcomes.terminal
+        return terminal is not None and terminal.timed_out
+
     def has_failed(self) -> bool:
         """Non-blocking check: has the transfer failed or been cancelled?"""
         if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
@@ -4317,6 +4326,12 @@ class RxSession(RxSessionBase):
         return self.status is SessionStatus.TRANSFERRED and (
             not self._enforce_physical_ownership or self.resources_drained()
         )
+
+    @property
+    def timed_out(self) -> bool:
+        """Whether the whole-session deadline committed the terminal outcome."""
+        terminal = self._logical_outcomes.terminal
+        return terminal is not None and terminal.timed_out
 
     def has_failed(self) -> bool:
         """Non-blocking check: has the transfer failed or been cancelled?"""

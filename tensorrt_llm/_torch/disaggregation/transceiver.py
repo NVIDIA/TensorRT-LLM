@@ -1129,6 +1129,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._close_session_or_raise(session, rid, "failed")
             req = reqs.pop(rid, None)
             if req is not None:
+                if getattr(session, "timed_out", False) is True:
+                    req.py_kv_transfer_timed_out = True
                 if not mark_retired:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 else:
@@ -1155,6 +1157,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req = req if req is not None else self._send_reqs.get(rid)
         self._send_reqs.pop(rid, None)
         if req is not None:
+            if session is not None and getattr(session, "timed_out", False) is True:
+                req.py_kv_transfer_timed_out = True
             req.py_kv_send_session_retired = True
 
     @staticmethod
@@ -1455,6 +1459,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
                 settlement_outcome = "completed"
             else:
+                if result == WaitResult.TIMEOUT or getattr(session, "timed_out", False) is True:
+                    req.py_kv_transfer_timed_out = True
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 settlement_outcome = "failed"
         except Exception:

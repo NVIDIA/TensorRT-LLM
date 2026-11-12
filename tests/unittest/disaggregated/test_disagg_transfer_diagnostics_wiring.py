@@ -1734,3 +1734,37 @@ def test_native_profile_diagnostics_do_not_affect_worker_setup(
             rank_info=rank_info,
             profile="native_v1",
         )
+
+
+def test_request_transfer_outcomes_ignore_polls_and_deduplicate_timeout_cleanup():
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
+
+    requests = [_disagg_request(i, i) for i in range(1, 5)]
+    for request in requests:
+        request.is_child = False
+    coordinator = _coordinator(active_requests=requests)
+    coordinator._registry.canceled_request_ids = lambda: {4}
+    coordinator._check_transfer_errors = Mock()
+    coordinator.inflight_cancel_active = lambda: False
+    coordinator._describe_transfer_timeout = lambda request: "test deadline"
+    coordinator._transceiver.check_gen_transfer_status = Mock(
+        return_value=GenTransferStatus([], [], [])
+    )
+    for _ in range(5):
+        coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (0, 0, 0)
+
+    timed_out = requests[2]
+    timed_out.py_kv_transfer_start_time = 0.0
+    timed_out.py_kv_transfer_timed_out = False
+    coordinator._flag_transfer_timeout(timed_out, "generation", 1000, current_time=2.0)
+    # A late completion cannot turn the same timed-out request into a success.
+    # Cancellation alone does not count as an error.
+    coordinator._transceiver.check_gen_transfer_status.return_value = GenTransferStatus(
+        [1, 3], [2], [requests[3]]
+    )
+    for _ in range(5):
+        coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (1, 1, 1)
+    coordinator._record_transfer_outcome(timed_out, "error")
+    assert coordinator.transfer_outcomes == (1, 1, 1)

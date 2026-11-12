@@ -165,6 +165,182 @@ class TestKVCacheStats:
         assert _get_gauge_value(collector, "kv_cache_hit_rate", dp_rank=0) == pytest.approx(0.85)
 
 
+class TestIterationLogTimingMetrics:
+    @staticmethod
+    def _sample(collector, name, mode="overlap"):
+        return collector._registry.get_sample_value(
+            "trtllm_" + name, {**collector.labels, "scheduler_mode": mode}
+        )
+
+    def test_units_histograms_and_rank_ownership(self, collector):
+        for host_ms, device_ms, forward_ms in [(1.0, 0.8, 0.5), (3.0, 2.5, 1.5)]:
+            for rank in [1, 0]:
+                collector.log_iteration_stats(
+                    {
+                        "attentionDpRank": rank,
+                        "schedulerMode": "overlap",
+                        "hostStepTimeMS": host_ms,
+                        "prevDeviceStepTimeMS": device_ms,
+                        "gpuForwardTimeMS": forward_ms,
+                    }
+                )
+
+        for name, expected in [
+            ("host_step_time_seconds", 0.003),
+            ("prev_device_step_time_seconds", 0.0025),
+            ("gpu_forward_time_seconds", 0.0015),
+            ("host_step_duration_seconds_count", 2),
+            ("host_step_duration_seconds_sum", 0.004),
+            ("gpu_forward_duration_seconds_count", 2),
+            ("gpu_forward_duration_seconds_sum", 0.002),
+        ]:
+            assert self._sample(collector, name) == pytest.approx(expected)
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_host_step_duration_seconds_bucket",
+                {**collector.labels, "scheduler_mode": "overlap", "le": "0.001"},
+            )
+            == 1
+        )
+
+    def test_optional_fields_and_legacy_scheduler_mode(self, collector):
+        collector.log_iteration_stats({"iterLatencyMS": 8.0})
+        assert self._sample(collector, "host_step_time_seconds", "unknown") is None
+        collector.log_iteration_stats({"hostStepTimeMS": 0.0, "gpuForwardTimeMS": 2.0})
+        collector.log_iteration_stats({"hostStepTimeMS": 4.0})
+        assert self._sample(collector, "host_step_duration_seconds_count", "unknown") == 2
+        assert self._sample(collector, "host_step_duration_seconds_sum", "unknown") == 0.004
+        assert self._sample(collector, "gpu_forward_duration_seconds_count", "unknown") == 1
+        assert self._sample(collector, "gpu_forward_time_seconds", "unknown") == 0.002
+        assert self._sample(collector, "prev_device_step_time_seconds", "unknown") is None
+        assert _get_gauge_value(collector, "iteration_latency_seconds") == 0.008
+
+
+class TestExistingRankAndTransferMetrics:
+    def test_transfer_outcomes_are_cumulative_and_rank_local(self, collector):
+        for rank, counts in [(0, (2, 1, 0)), (1, (1, 0, 2)), (0, (2, 1, 0)), (0, (5, 2, 1))]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "kvTransferOutcomes": dict(zip(("success", "error", "timeout"), counts)),
+                }
+            )
+        for rank, counts in [(0, (5, 2, 1)), (1, (1, 0, 2))]:
+            for outcome, count in zip(("success", "error", "timeout"), counts):
+                assert (
+                    collector._registry.get_sample_value(
+                        "trtllm_kv_cache_transfer_requests_total",
+                        {**collector.labels, "dp_rank": str(rank), "outcome": outcome},
+                    )
+                    == count
+                )
+        # Missing/invalid values and repeated snapshots must not add outcomes.
+        collector.log_iteration_stats({"kvTransferOutcomes": {"success": -1, "error": "2"}})
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_kv_cache_transfer_requests_total",
+                {**collector.labels, "dp_rank": "0", "outcome": "success"},
+            )
+            == 5
+        )
+
+    def test_existing_rank_snapshots_and_optional_kv_details(self, collector):
+        for rank, total, new in [(0, 5, 3), (1, 7, 2), (0, 8, 4)]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "kvCacheStats": {"allocTotalBlocks": total, "allocNewBlocks": new},
+                    "inflightBatchingStats": {
+                        "numCtxKvTokens": 100 + rank,
+                        "numGenKvTokens": 200 + rank,
+                        "numPausedKvTokens": 10 + rank,
+                    },
+                }
+            )
+        for rank, total, new in [(0, 8, 4), (1, 7, 2)]:
+            assert _get_counter_value(collector, "kv_cache_allocated_blocks", rank) == total
+            assert _get_counter_value(collector, "kv_cache_new_blocks", rank) == new
+            assert _get_gauge_value(collector, "context_kv_tokens", rank) == 100 + rank
+            assert _get_gauge_value(collector, "generation_kv_tokens", rank) == 200 + rank
+            assert _get_gauge_value(collector, "paused_kv_tokens", rank) == 10 + rank
+        collector.log_iteration_stats(
+            {
+                "attentionDpRank": 0,
+                "iterSuspendedRequests": 2,
+                "iterResumedRequests": 1,
+                "kvCacheIterationStatsByPoolGroup": {
+                    "0": {
+                        "primaryEvictableNumBlocks": 3,
+                        "primaryPeakUsedNumBlocks": 8,
+                        "iterHostDroppedBytes": 1024,
+                    },
+                    "1": {
+                        "primaryEvictableNumBlocks": 4,
+                        "primaryPeakUsedNumBlocks": 9,
+                        "iterHostDroppedBytes": 2048,
+                    },
+                },
+            }
+        )
+        assert _get_gauge_value(collector, "kv_cache_evictable_blocks", 0) == 7
+        assert _get_gauge_value(collector, "kv_cache_peak_used_blocks", 0) == 17
+        assert _get_counter_value(collector, "kv_cache_host_dropped_bytes", 0) == 3072
+        assert _get_counter_value(collector, "kv_cache_requests_suspended", 0) == 2
+        assert _get_counter_value(collector, "kv_cache_requests_resumed", 0) == 1
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_kv_cache_evictable_blocks", {**collector.labels, "dp_rank": "1"}
+            )
+            is None
+        )
+
+    def test_transfer_perf_metrics_count_once_across_candidates(self, collector):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.executor.result import GenerationResultBase
+
+        result = SimpleNamespace(
+            candidate_metric_records=[],
+            candidate_metrics=[],
+            metrics_dict={},
+            cached_tokens=0,
+            prompt_token_ids=[1, 2],
+            per_pos_drafted=None,
+            per_pos_accepted=None,
+        )
+        output = SimpleNamespace(
+            finish_reason="end_id",
+            token_ids=[3, 4],
+            request_perf_metrics=None,
+            prompt_logprobs=None,
+            length=2,
+            cumulative_logprob=None,
+            logprobs=None,
+        )
+        stats = {
+            RequestEventTiming.KV_CACHE_TRANSFER_START: 10.0,
+            RequestEventTiming.KV_CACHE_TRANSFER_END: 12.0,
+            RequestEventTiming.KV_CACHE_SIZE: 1024,
+        }
+        for sequence_index in [0, 1]:
+            GenerationResultBase.record_stats(result, output, stats, sequence_index)
+        for candidate in result.candidate_metrics:
+            collector.log_request_metrics_dict(candidate)
+        assert _get_counter_value(collector, "kv_cache_transfer_bytes") == 1024
+        assert _get_histogram_count(collector, "histogram_kv_cache_transfer_duration") == 1
+        assert _get_histogram_sum(collector, "histogram_kv_cache_transfer_duration") == 2.0
+        assert MetricNames.KV_CACHE_TRANSFER_BYTES not in result.candidate_metrics[1]
+        assert MetricNames.KV_CACHE_TRANSFER_TIME not in result.candidate_metrics[1]
+        invalid = process_req_perf_metrics(
+            {
+                RequestEventTiming.KV_CACHE_TRANSFER_START: 2.0,
+                RequestEventTiming.KV_CACHE_TRANSFER_END: 1.0,
+            },
+            2,
+        )
+        assert MetricNames.KV_CACHE_TRANSFER_TIME not in invalid
+
+
 class TestAttentionDpIterationMetrics:
     """Keep independent rank histories and shared measurement ownership."""
 
@@ -1862,3 +2038,22 @@ class TestTierStoragePressure:
         stats["kvCacheMigrationTimings"] = []
         collector.log_iteration_stats(stats)
         assert _get_counter_value(collector, "kv_cache_migration_timing_skipped", 1) == 3
+
+
+class TestExecutorLoopObservability:
+    def test_loop_envelope_preserves_source_rank_and_cumulative_counts(self, collector):
+        values = {"globalRank": 4, "numActiveRequests": 3, "numFetchedRequestsTotal": 8}
+        stats = {"iter": 7, "executorLoop": {"kind": "loop", "per_iter": values}}
+        collector.log_iteration_stats(stats)
+        collector.log_iteration_stats(stats)
+        labels = {**collector.labels, "global_rank": "4"}
+        assert collector._loop_gauges["numActiveRequests"].labels(**labels)._value.get() == 3
+        assert collector.loop_requests_fetched.labels(**labels)._value.get() == 8
+        values["numFetchedRequestsTotal"] = 10
+        collector.log_iteration_stats(stats)
+        assert collector.loop_requests_fetched.labels(**labels)._value.get() == 10
+        assert all(
+            sample.labels["global_rank"] == "4"
+            for family in collector.loop_requests_fetched.collect()
+            for sample in family.samples
+        )

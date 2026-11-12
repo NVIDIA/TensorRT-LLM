@@ -24,6 +24,8 @@ class MetricNames(Enum):
     PREFILL_TIME = "prefill_time"
     DECODE_TIME = "decode_time"
     INFERENCE_TIME = "inference_time"
+    KV_CACHE_TRANSFER_TIME = "kv_cache_transfer_time"
+    KV_CACHE_TRANSFER_BYTES = "kv_cache_transfer_bytes"
     PROMPT_TOKENS = "prompt_tokens"
     GENERATION_TOKENS = "generation_tokens"
     PROMPT_CACHE_CACHED_TOKENS = "prompt_cache_cached_tokens"

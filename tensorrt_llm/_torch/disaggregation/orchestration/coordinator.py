@@ -103,6 +103,7 @@ class DisaggTransferCoordinator:
         is_kv_manager_v2: bool = False,
         defer_unready_gen_receives: bool = False,
     ) -> None:
+        self._transfer_outcomes = [0, 0, 0]
         self._transceiver = transceiver
         self._transfers = transfer_manager
         self._kv_cache_manager = kv_cache_manager
@@ -142,6 +143,33 @@ class DisaggTransferCoordinator:
         self._retiring_gen_receives: Dict[int, LlmRequest] = {}
         self._gen_termination_requested: Set[int] = set()
         self._fleet_has_retiring_gen_receives = False
+
+    @property
+    def transfer_outcomes(self) -> tuple[int, int, int]:
+        """Cumulative whole-request success/error/timeout counts on this rank."""
+        return tuple(getattr(self, "_transfer_outcomes", (0, 0, 0)))
+
+    def _record_transfer_outcome(self, request: LlmRequest, outcome: str) -> None:
+        """Count once across chunks, repeated polls, and timeout cleanup.
+
+        An overall deadline breach wins over a later completion or cleanup error.
+        User cancellation alone is not a transfer failure.
+        """
+        if getattr(request, "py_kv_transfer_outcome", None) is not None:
+            return
+        canceled_ids = getattr(self._registry, "canceled_request_ids", lambda: ())()
+        rid = (
+            request.parent_request_id
+            if getattr(request, "is_child", False) is True
+            else request.py_request_id
+        )
+        if rid in canceled_ids:
+            return
+        if getattr(request, "py_kv_transfer_timed_out", False) is True:
+            outcome = "timeout"
+        request.py_kv_transfer_outcome = outcome
+        counts = self.__dict__.setdefault("_transfer_outcomes", [0, 0, 0])
+        counts[("success", "error", "timeout").index(outcome)] += 1
 
     # -- loop head -----------------------------------------------------------
 
@@ -220,6 +248,8 @@ class DisaggTransferCoordinator:
             f"voted_err_count={len(voted_error_ids)}, "
             f"blocked_err_count={len(voted_error_ids & blocked_error_ids)}"
         )
+        for request in local_voted_error_requests:
+            self._record_transfer_outcome(request, "error")
         self._effects.fail_requests(
             "Disagg KV cache transfer error", local_voted_error_requests, charge_budget=False
         )
@@ -362,6 +392,7 @@ class DisaggTransferCoordinator:
                         cancellation_requested=cancel_enabled,
                     )
             request.py_kv_transfer_timed_out = True
+            self._record_transfer_outcome(request, "timeout")
 
     @nvtx_range("check_transfer_timeouts")
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:
@@ -527,6 +558,11 @@ class DisaggTransferCoordinator:
             for req in admitted:
                 self._transceiver.request_and_receive_sync(req)
             self._align_sync_receive_failures_across_cp(admitted)
+            for req in admitted:
+                if req.is_disagg_generation_transmission_complete:
+                    self._record_transfer_outcome(req, "success")
+                elif req.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                    self._record_transfer_outcome(req, "error")
             self._check_transfer_errors("generation requests")
             return
 
@@ -706,6 +742,8 @@ class DisaggTransferCoordinator:
         """
         if not request.is_disagg_generation_transmission_complete:
             return False
+        if not is_gen_only_no_context_benchmark():
+            self._record_transfer_outcome(request, "success")
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
         # commit_blocks_for_reuse requires the position to be at the prompt end.
         request.context_current_position = request.prompt_len
@@ -814,6 +852,9 @@ class DisaggTransferCoordinator:
                     logger.warning(f"Request {request_id} not found in transfer manager")
                 continue
             request = requests_in_transfer[request_id]
+            self._record_transfer_outcome(
+                request, "error" if request_id in failed_req_ids else "success"
+            )
             if request_id in failed_req_ids:
                 # Past the context phase: writing the error state here is safe.
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -851,6 +892,13 @@ class DisaggTransferCoordinator:
     def reap_gen_receives(self, at_least: int = 0) -> None:
         """Poll receive-side transfers; rank-synchronized inside the transceiver."""
         gen_status = self._transceiver.check_gen_transfer_status(at_least)
+        completed_ids = set(gen_status.completed_request_ids)
+        failed_ids = set(gen_status.error_request_ids)
+        if completed_ids or failed_ids:
+            for req in self._registry.active_requests():
+                rid = get_unique_rid(req)
+                if rid in completed_ids or rid in failed_ids:
+                    self._record_transfer_outcome(req, "error" if rid in failed_ids else "success")
         if gen_status.cancelled_requests:
             user_canceled_ids = set(self._registry.canceled_request_ids())
             for req in gen_status.cancelled_requests:
@@ -859,6 +907,7 @@ class DisaggTransferCoordinator:
                     req_id not in user_canceled_ids
                     and req.py_request_id not in self._retiring_gen_receives
                 ):
+                    self._record_transfer_outcome(req, "error")
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
         self._retire_cancelled_gen_receives()
         if not self.inflight_cancel_active():
@@ -1039,6 +1088,8 @@ class DisaggTransferCoordinator:
         Under multi-rank ADP the error response enters a collective, so it is
         deferred to ``handle_timeouts_synced``.
         """
+        for request in requests:
+            self._record_transfer_outcome(request, "timeout")
         if self._enable_attention_dp and self._dist.world_size != 1:
             self._pending_timed_out_requests.extend(requests)
             return
@@ -1171,6 +1222,8 @@ class DisaggTransferCoordinator:
             return
         error_requests = self._requests_in_error_state()
         if error_requests:
+            for request in error_requests:
+                self._record_transfer_outcome(request, "error")
             self._effects.fail_requests(
                 f"Error in kv cache transfer for {kind}", error_requests, charge_budget=False
             )
