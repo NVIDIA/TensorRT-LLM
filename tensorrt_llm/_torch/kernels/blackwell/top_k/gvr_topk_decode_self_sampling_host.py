@@ -68,6 +68,20 @@ def _device():
     return _dev_mod
 
 
+_tallws_mod = None
+
+
+def _tallws():
+    """Lazy import of the tall-batch engine module (reached only by the 132-SM Hopper batches
+    ``_tallws_gate`` considers)."""
+    global _tallws_mod
+    if _tallws_mod is None:
+        from . import gvr_topk_decode_tall_ws as _m
+
+        _tallws_mod = _m
+    return _tallws_mod
+
+
 _DET_SORTING = (None, "ascending")
 
 
@@ -243,6 +257,44 @@ def _three_cta_clusters(b: int, num_sms: int, sm_version: int) -> bool:
         and not cluster_fits(4, b, num_sms, sm_version)
         and cluster_fits(3, b, num_sms, sm_version)
     )
+
+
+# Tall K = 2048 decode batches on the 132-SM Hopper parts (H100 / H200 SXM) run the persistent
+# warp-specialized engine of ``gvr_topk_decode_tall_ws``: one CTA per SM streams its next row
+# through a TMA ring while it selects the current one, which the one-row-per-CTA plans leave
+# serial. It takes batches of 128 rows or more whose rows hold at least 32,768 FP32 or 65,536
+# 16-bit scores. Shorter rows keep their plans, which beat it at some batch sizes (FP32 rows
+# below 32K scores, BF16 rows of 48K scores on H200). A 16-bit batch must also fill 128 CTAs:
+# rows just past a multiple of the SM count leave the engine fewer CTAs (rows 133-254 run two
+# per CTA on 67-127), whose slower stream costs 16-bit rows up to 1.24x, while FP32 rows stay
+# within 2 % there.
+_TALLWS_PROFILE = (132, 90)
+_TALLWS_K = 2048
+_TALLWS_MIN_ROWS = 128
+_TALLWS_MIN_N = {torch.float32: 32768, torch.bfloat16: 65536, torch.float16: 65536}
+_TALLWS_MIN_CTAS_16BIT = 128
+
+
+def _tallws_gate(
+    num_rows: int,
+    n_kernel: int,
+    k: int,
+    num_sms: int,
+    sm_version: int,
+    dtype: torch.dtype,
+    det: bool,
+) -> bool:
+    """Whether a varlen decode launch runs the tall-batch engine (``n_kernel``: the launch
+    envelope clamped to the row stride)."""
+    if not (
+        (num_sms, sm_version) == _TALLWS_PROFILE
+        and k == _TALLWS_K
+        and not det
+        and num_rows >= _TALLWS_MIN_ROWS
+        and n_kernel >= _TALLWS_MIN_N[dtype]
+    ):
+        return False
+    return dtype is torch.float32 or _tallws().grid_of(num_rows, num_sms) >= _TALLWS_MIN_CTAS_16BIT
 
 
 def _even_chunk_u(vectors: int, u: int) -> int:
@@ -2425,6 +2477,28 @@ def _fit_row_window_16bit(
     return blk, vpt, minb
 
 
+def _tallws_launcher(
+    num_rows: int,
+    npad: int,
+    k: int,
+    next_n: int,
+    cr_shift: int,
+    num_sms: int,
+    dtype: torch.dtype,
+) -> tuple:
+    """Tall-batch engine launcher in the main-family ABI ``fn(logits, pre_idx, out, ws, *pre,
+    kv_lens, *tail)`` with ``pre`` = (grid, npad, rows, aim_base, sfac, sd_en): one persistent
+    launch of ``grid_of(rows, num_sms)`` CTAs, which reads neither the hints nor the workspace."""
+    tall = _tallws()
+    fn = tall.get_compiled__tallws(_DTYPE_TAG[dtype], k, next_n=next_n, cr_shift=cr_shift)
+
+    def launch(logits, pre_idx, out, workspace, grid, npad_, rows, aim_base, sfac, sd_en, kv_lens):
+        fn(logits, out, kv_lens, grid, npad_, rows, aim_base, sfac, sd_en)
+
+    pre = (tall.grid_of(num_rows, num_sms), npad, num_rows, *tall.WS_LADDER)
+    return ("tallws", launch, pre, ())
+
+
 def _varlen_launcher(
     num_rows: int,
     npad: int,
@@ -2443,7 +2517,8 @@ def _varlen_launcher(
 
     FP32 picks the family with ``route``; the 16-bit dtypes pick it with ``_route_16bit`` and add
     their own plans, compile options and tuning scalars (many of them per dtype) and a near-K
-    ``complement`` launcher. Every choice is a function of capture-stable quantities only.
+    ``complement`` launcher. Batches ``_tallws_gate`` admits run the tall-batch engine. Every
+    choice is a function of capture-stable quantities only.
     """
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"decode launcher requires float32, bfloat16 or float16, got {dtype}")
@@ -2467,6 +2542,10 @@ def _varlen_launcher(
     n_kernel = min(n_env, npad)
     n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
+    if _tallws_gate(num_rows, n_kernel, k, num_sms, sm_version, dtype, det):
+        lc = _tallws_launcher(num_rows, npad, k, next_n, cr_shift, num_sms, dtype)
+        cache[key] = lc
+        return lc
     dev = _device()
     dtype_options = {"dtype": _DTYPE_TAG[dtype]} if low else {}
     # Near-K envelopes (k < n <= k + 3): the complement kernel finds the at most three
@@ -4752,7 +4831,18 @@ def warmup_varlen(
                 sm_version,
                 det=bool(deterministic),
             )
-            if plan_free["kernel"] == "reg_clus":
+            if _tallws_gate(
+                r,
+                min(n_env_c, npad_c),
+                int(top_k),
+                num_sms,
+                sm_version,
+                dtype,
+                bool(deterministic),
+            ):
+                # one tall-batch engine per (K, next_n, compression): its first row count
+                ekey = ("tallws", int(top_k), nn, int(compress_ratio))
+            elif plan_free["kernel"] == "reg_clus":
                 ekey = ("reg_clus", tuple(plan_free["tpl"]))
             elif plan_free["kernel"] in ("reg", "regimg"):
                 ekey = ("reg", tuple(plan_free["tpl"]))
