@@ -105,6 +105,13 @@ def storage_server_client(storage_server):
     yield create_cluster_storage(cluster_uri, "test")
 
 
+async def _wait_until_absent(storage, key, timeout_sec=10):
+    deadline = time.monotonic() + timeout_sec
+    while await storage.get(key) is not None:
+        assert time.monotonic() < deadline, f"{key} did not expire"
+        await asyncio.sleep(0.1)
+
+
 @pytest.mark.usefixtures("storage_client", "storage_server_client")
 class TestClusterStorage:
     __test__ = False
@@ -140,6 +147,47 @@ class TestClusterStorage:
         assert await storage_client.get("test_key") == "test_value"
         time.sleep(2)
         assert await storage_client.get("test_key") is None
+
+    @timeout(15)
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_expire_after_ttl_lapsed(self, storage_server,
+                                           storage_client):
+        # A worker heartbeat calls expire() on its registration key. Once the
+        # TTL has lapsed, the refresh must report failure (the key is gone),
+        # and the re-registration that follows must succeed.
+        key = gen_key("lapsed_key")
+        assert await storage_client.set(key,
+                                        "test_value",
+                                        overwrite_if_exists=True,
+                                        ttl=2)
+        await _wait_until_absent(storage_client, key)
+        assert not await storage_client.expire(key, 2)
+        assert await storage_client.get(key) is None
+        assert await storage_client.set(key,
+                                        "recovered",
+                                        overwrite_if_exists=True,
+                                        ttl=2)
+        assert await storage_client.get(key) == "recovered"
+        assert await storage_client.expire(key, 2)
+
+    @timeout(15)
+    @pytest.mark.asyncio(loop_scope="module")
+    @pytest.mark.parametrize("overwrite_if_exists", [True, False])
+    async def test_set_after_ttl_lapsed(self, storage_server, storage_client,
+                                        overwrite_if_exists):
+        # Setting a key again after its TTL lapsed, without an intermediate
+        # expire(), must not reuse a lease the storage has already dropped.
+        key = gen_key("lapsed_set_key")
+        assert await storage_client.set(key,
+                                        "test_value",
+                                        overwrite_if_exists=True,
+                                        ttl=2)
+        await _wait_until_absent(storage_client, key)
+        assert await storage_client.set(key,
+                                        "recovered",
+                                        overwrite_if_exists=overwrite_if_exists,
+                                        ttl=2)
+        assert await storage_client.get(key) == "recovered"
 
     @timeout(5)
     @pytest.mark.asyncio(loop_scope="module")
@@ -278,6 +326,32 @@ class TestEtcdClusterStorage(TestClusterStorage):
             yield self.etcd, "etcd://localhost:2379"
         self.etcd.kill()
         self.etcd.wait()
+
+    @timeout(10)
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_expire_with_empty_keepalive_response(self, storage_server,
+                                                        storage_client,
+                                                        monkeypatch):
+        # A keepalive stream that ends without a response must be reported as
+        # a failed refresh as well, and the cached lease must be dropped so
+        # that the following re-registration is granted a new one.
+        key = gen_key("empty_keepalive_key")
+        assert await storage_client.set(key,
+                                        "test_value",
+                                        overwrite_if_exists=True,
+                                        ttl=5)
+        stale_lease_id = storage_client._leases[key].id
+        with monkeypatch.context() as m:
+            m.setattr(storage_client.client, "refresh_lease",
+                      lambda lease_id: iter(()))
+            assert not await storage_client.expire(key, 5)
+        assert key not in storage_client._leases
+        assert await storage_client.set(key,
+                                        "recovered",
+                                        overwrite_if_exists=True,
+                                        ttl=5)
+        assert storage_client._leases[key].id != stale_lease_id
+        assert await storage_client.get(key) == "recovered"
 
 
 @pytest.mark.asyncio
