@@ -4,14 +4,16 @@
 
 import dataclasses
 import random
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-from _torch.moe.halo_r_reference import plan_halo_r
+from _torch.moe.halo_r_reference import Plan, plan_halo_r
 
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
+    PerLayerDynamicMoeLayerLoadBalancer,
     PerLayerDynamicMoeLoadBalancer,
     halo_r_planner,
 )
@@ -56,7 +58,7 @@ def test_receivers_fill_helper_slots_in_expert_order() -> None:
     assert words[2 + 5 * stride + 2] == 1
 
 
-def _moves(plan) -> list:
+def _moves(plan: Plan) -> list:
     return [(b.expert, b.owner, b.rows, b.helper) for b in plan.broadcasts]
 
 
@@ -98,7 +100,7 @@ def test_rows_stop_at_the_owners_excess_over_a_rounded_up_target() -> None:
 
 
 @pytest.mark.parametrize("seed", range(4))
-def test_plans_respect_helper_budget_and_conserve_routes(seed) -> None:
+def test_plans_respect_helper_budget_and_conserve_routes(seed: int) -> None:
     rng = random.Random(seed)
     for _ in range(50):
         ep = rng.choice([2, 4, 8, 16, 32])
@@ -135,7 +137,7 @@ def test_plans_respect_helper_budget_and_conserve_routes(seed) -> None:
     ],
 )
 def test_geometry_validation_rejects_unsupported_shapes(
-    ep_size, home_experts, helper_slots, auxiliary_sms, message
+    ep_size: int, home_experts: int, helper_slots: int, auxiliary_sms: int, message: str | None
 ) -> None:
     def validate() -> None:
         validate_halo_r_geometry(
@@ -162,13 +164,13 @@ class _Config:
     auxiliary_sms = 8
     helper_slot_mode = "shared_banks"
 
-    def __init__(self, planner) -> None:
+    def __init__(self, planner: str) -> None:
         self.planner = planner
 
-    def setup(self, ep_rank, ep_size) -> None:
+    def setup(self, ep_rank: int, ep_size: int) -> None:
         pass
 
-    def validate_expert_capacity(self, num_experts) -> None:
+    def validate_expert_capacity(self, num_experts: int) -> None:
         pass
 
 
@@ -185,7 +187,9 @@ class _Arena:
         return self.flags
 
 
-def _allocate_arena(layer, monkeypatch, arena) -> _Arena:
+def _allocate_arena(
+    layer: PerLayerDynamicMoeLayerLoadBalancer, monkeypatch: pytest.MonkeyPatch, arena: _Arena
+) -> _Arena:
     """Allocate ``arena`` through the layer handle, as the quant method does."""
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
@@ -201,7 +205,9 @@ def _allocate_arena(layer, monkeypatch, arena) -> _Arena:
     )
 
 
-def _patch_group_builders(monkeypatch, **builders) -> None:
+def _patch_group_builders(
+    monkeypatch: pytest.MonkeyPatch, **builders: Callable[..., object]
+) -> None:
     """Replace planners' group builders in the registry that a new manager reads."""
     for name, builder in builders.items():
         spec = dataclasses.replace(PER_LAYER_DYNAMIC_PLANNERS[name], build_group=builder)
@@ -217,7 +223,7 @@ class _Backend:
         self.layer_idx = 3
 
 
-def test_halo_r_planner_builds_the_halo_r_group(monkeypatch) -> None:
+def test_halo_r_planner_builds_the_halo_r_group(monkeypatch: pytest.MonkeyPatch) -> None:
     group = SimpleNamespace(home_experts=4, helper_slots=2)
     halo_r_builder = MagicMock(return_value=group)
     halo_q_builder = MagicMock()
@@ -246,7 +252,7 @@ def test_halo_r_planner_builds_the_halo_r_group(monkeypatch) -> None:
     assert repr(manager).endswith("planner=halo_r)")
 
 
-def test_rebinding_the_backend_forgets_helper_residency(monkeypatch) -> None:
+def test_rebinding_the_backend_forgets_helper_residency(monkeypatch: pytest.MonkeyPatch) -> None:
     """Loaders bind the layer again after they rewrite its weights."""
     group = SimpleNamespace(home_experts=4, helper_slots=2, forget_helper_residency=MagicMock())
     _patch_group_builders(monkeypatch, halo_r=MagicMock(return_value=group))
@@ -280,7 +286,9 @@ def test_manager_keeps_halo_r_helper_slots_resident_per_layer() -> None:
 
 @pytest.mark.parametrize("helper_slot_mode", ["per_layer_resident", "shared_banks"])
 @pytest.mark.parametrize(("planner_name", "multicast"), [("halo_q", True), ("halo_r", False)])
-def test_only_halo_q_helper_sets_get_multicast(planner_name, multicast, helper_slot_mode) -> None:
+def test_only_halo_q_helper_sets_get_multicast(
+    planner_name: str, multicast: bool, helper_slot_mode: str
+) -> None:
     config = _Config(planner_name)
     config.helper_slot_mode = helper_slot_mode
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
@@ -347,7 +355,9 @@ def test_one_capability_map_covers_every_planner() -> None:
     assert config_checks == {"halo_q": None, "halo_r": halo_r_planner.validate_halo_r_config}
 
 
-def test_real_halo_r_config_builds_the_halo_r_group_through_the_factory(monkeypatch) -> None:
+def test_real_halo_r_config_builds_the_halo_r_group_through_the_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The real config, through the model factory, selects HALO-R end to end on the host."""
     from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import maybe_create_moe_load_balancer
     from tensorrt_llm.llmapi.llm_args import MoePerLayerDynamicLoadBalancerConfig

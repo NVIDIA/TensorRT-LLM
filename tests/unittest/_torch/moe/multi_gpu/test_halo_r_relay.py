@@ -62,6 +62,7 @@ import socket
 import sys
 import time
 import traceback
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -301,7 +302,7 @@ class _Kernels:
             from cuda import nvrtc
         self.driver = driver
 
-        def check(result) -> Any:
+        def check(result: object) -> Any:
             error, *values = result if isinstance(result, tuple) else (result,)
             if error not in (driver.CUresult.CUDA_SUCCESS, nvrtc.nvrtcResult.NVRTC_SUCCESS):
                 raise RuntimeError(f"CUDA error {error}")
@@ -345,7 +346,15 @@ class _Kernels:
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.timed_out = torch.zeros(1, dtype=torch.int32, device=f"cuda:{device}")
 
-    def _launch(self, function, blocks: int, threads: int, shared: int, args, stream) -> None:
+    def _launch(
+        self,
+        function: object,
+        blocks: int,
+        threads: int,
+        shared: int,
+        args: tuple[tuple[int, ...], tuple[type, ...]],
+        stream: torch.cuda.Stream,
+    ) -> None:
         self.check(
             self.driver.cuLaunchKernel(
                 function,
@@ -697,7 +706,13 @@ class _Layers:
         self.pending[layer] = []
         self._apply(layer, routes)
 
-    def _route_failures(self, plan, routes: torch.Tensor, slots: torch.Tensor, where: str) -> list:
+    def _route_failures(
+        self,
+        plan: "halo_r_reference.Plan | SimpleNamespace",
+        routes: torch.Tensor,
+        slots: torch.Tensor,
+        where: str,
+    ) -> list:
         """Every route goes to its owner or to a receiver's helper slot of its expert, at the plan's quota."""
         failures = []
         rank, local_slots = self.rank, _HOME_EXPERTS + self.helper_slots
@@ -725,7 +740,13 @@ class _Layers:
             failures.append(f"rank {rank}: {where}: moved routes {totals} != plan {expected}")
         return failures
 
-    def _row_failures(self, layer: int, plan, rows: list, where: str) -> list:
+    def _row_failures(
+        self,
+        layer: int,
+        plan: "halo_r_reference.Plan | SimpleNamespace",
+        rows: list[torch.Tensor],
+        where: str,
+    ) -> list:
         """Every helper row this rank received holds the owner's expert, byte for byte."""
         failures = []
         bound = self.bound(layer)
@@ -741,7 +762,7 @@ class _Layers:
                     )
         return failures
 
-    def check(self, layer: int, routes) -> list:
+    def check(self, layer: int, routes: torch.Tensor | Sequence[torch.Tensor]) -> list:
         """Check the launches of ``layer`` since the previous check, whose routes ``routes`` lists in order.
 
         A single tensor is one launch. Every launch updates the model and is
@@ -1354,7 +1375,7 @@ def _case_graphs_failed_capture(layers: _Layers) -> list:
     return failures
 
 
-def _driver_call(result) -> Any:
+def _driver_call(result: tuple[object, ...]) -> Any:
     """Unpack a cuda.bindings driver call; raise on an error."""
     from cuda.bindings import driver
 
@@ -1370,7 +1391,7 @@ class _GraphView:
     The route wait is the graph's only batched stream memory operation.
     """
 
-    def __init__(self, raw) -> None:
+    def __init__(self, raw: object) -> None:
         from cuda.bindings import driver
 
         count = _driver_call(driver.cuGraphGetNodes(raw, 0))[1]
@@ -1791,7 +1812,7 @@ def _run_worker(case: str) -> tuple[str | None, list[str]]:
         faulthandler.cancel_dump_traceback_later()
 
 
-def _run_on_every_rank(monkeypatch, case: str) -> list:
+def _run_on_every_rank(monkeypatch: pytest.MonkeyPatch, case: str) -> list:
     """Run one case on every EP rank and return each rank's (skip reason, result).
 
     Under ``trtllm-llmapi-launch`` the ranks are the launcher's MPI world, on
@@ -1840,7 +1861,7 @@ def _skip(reason: str) -> None:
 @pytest.mark.parametrize(
     "case", [case for case in _CASES if not case.startswith(("trap_", "halo_q_"))]
 )
-def test_halo_r_cases(monkeypatch, case) -> None:
+def test_halo_r_cases(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
     results = _run_on_every_rank(monkeypatch, case)
     _skip_if_any(results)
     failures = [failure for _, rank_failures in results for failure in rank_failures]
@@ -1848,7 +1869,7 @@ def test_halo_r_cases(monkeypatch, case) -> None:
 
 
 @pytest.mark.parametrize("case", [case for case in _CASES if case.startswith("halo_q_")])
-def test_halo_q_cases(monkeypatch, case) -> None:
+def test_halo_q_cases(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
     """The reference and residency cases with HALO-Q, checked against its own helper experts."""
     results = _run_on_every_rank(monkeypatch, case)
     _skip_if_any(results)
@@ -1864,7 +1885,9 @@ def _traps_selected(config: pytest.Config) -> bool:
 
 
 @pytest.mark.parametrize("kind", _TRAPS)
-def test_halo_r_traps(monkeypatch, request, kind) -> None:
+def test_halo_r_traps(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, kind: str
+) -> None:
     """A broken launch on rank 0 traps it in that call; every peer traps in that call or the next."""
     if not _traps_selected(request.config):
         pytest.skip(

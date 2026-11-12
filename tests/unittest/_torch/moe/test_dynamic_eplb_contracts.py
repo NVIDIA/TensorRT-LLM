@@ -332,7 +332,7 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     # copy stream is no longer ordered after the consumer.
     broadcast._local_release_generation = 1
 
-    def failed_wait(stream, event, flags):
+    def failed_wait(stream: int, event: int, flags: int) -> None:
         raise RuntimeError("cuStreamWaitEvent(live-bank consumer) failed")
 
     broadcast.cuda = SimpleNamespace(cuStreamWaitEvent=failed_wait)

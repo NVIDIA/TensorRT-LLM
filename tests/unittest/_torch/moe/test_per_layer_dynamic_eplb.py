@@ -261,7 +261,7 @@ def test_layer_disables_standard_host_migration_and_checks_geometry():
         )
 
 
-def _patch_halo_q_builder(monkeypatch, builder):
+def _patch_halo_q_builder(monkeypatch: pytest.MonkeyPatch, builder: MagicMock) -> None:
     """Replace HALO-Q's group builder in the registry that a new manager reads."""
     spec = dataclasses.replace(PER_LAYER_DYNAMIC_PLANNERS["halo_q"], build_group=builder)
     monkeypatch.setitem(PER_LAYER_DYNAMIC_PLANNERS, "halo_q", spec)

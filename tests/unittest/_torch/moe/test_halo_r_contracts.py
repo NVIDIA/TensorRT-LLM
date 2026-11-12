@@ -14,7 +14,7 @@ import ast
 import inspect
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -39,7 +39,7 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
 if TYPE_CHECKING:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import _SharedSlotPool
     from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.arena import LiveWeightArena
-    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.geometry import BundleLayout
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.geometry import BundleLayout, Plane
 
 pytestmark = pytest.mark.cpu_only
 
@@ -63,11 +63,14 @@ _MAX_TOKENS = 64
 _SERVING_SPIN_CYCLES = 300 * 2_000_000_000
 _WARMUP_SPIN_CYCLES = 1800 * 2_000_000_000
 
+# What the fakes record: one tuple per call, led by the call's name.
+_Trace = list[tuple[object, ...]]
+
 
 class _Routes:
     """Just enough of a CUDA int32 [tokens, topk] tensor for the group's checks."""
 
-    def __init__(self, rows, *, dtype="int32", device="cuda:0") -> None:
+    def __init__(self, rows: int, *, dtype: str = "int32", device: str = "cuda:0") -> None:
         self.shape = (rows, _TOPK)
         self.ndim = 2
         self.dtype = dtype
@@ -79,14 +82,14 @@ class _Routes:
     def get_device(self) -> int:
         return int(self.device.split(":")[1])
 
-    def __getitem__(self, rows) -> _Routes:
+    def __getitem__(self, rows: slice) -> _Routes:
         return _Routes(rows.stop)
 
 
 class _Tensor:
     _next_address = 0x10000
 
-    def __init__(self, name, trace=None) -> None:
+    def __init__(self, name: str, trace: _Trace | None = None) -> None:
         self.name = name
         self.trace = trace
         _Tensor._next_address += 0x100
@@ -95,18 +98,18 @@ class _Tensor:
     def data_ptr(self) -> int:
         return self.address
 
-    def to(self, device) -> _Tensor:
+    def to(self, device: int) -> _Tensor:
         return self
 
     def zero_(self) -> _Tensor:
         self.trace.append(("zero", self.name))
         return self
 
-    def fill_(self, value) -> _Tensor:
+    def fill_(self, value: int) -> _Tensor:
         self.trace.append(("fill", self.name, value))
         return self
 
-    def view(self, dtype) -> _Tensor:
+    def view(self, dtype: str) -> _Tensor:
         return self
 
 
@@ -131,19 +134,19 @@ def _spin_cycles_for_timeout() -> Callable[[int | None], int]:
 
 
 class _Stream(SimpleNamespace):
-    def __init__(self, handle, priority, trace) -> None:
+    def __init__(self, handle: int, priority: int, trace: _Trace) -> None:
         super().__init__(cuda_stream=handle, priority=priority, trace=trace)
 
-    def wait_event(self, event) -> None:
+    def wait_event(self, event: _Event) -> None:
         self.trace.append(("main_wait", self.cuda_stream, event.recorded_on))
 
 
 class _Event:
-    def __init__(self, trace) -> None:
+    def __init__(self, trace: _Trace) -> None:
         self.trace = trace
         self.recorded_on = None
 
-    def record(self, stream) -> None:
+    def record(self, stream: _Stream) -> None:
         self.recorded_on = stream.cuda_stream
         self.trace.append(("main_record", stream.cuda_stream))
 
@@ -153,16 +156,16 @@ class _Env(SimpleNamespace):
 
 
 def _build(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     *,
-    auxiliary_sms=4,
-    ep_size=8,
-    spin_bound=None,
-    helper_residency=False,
-    fail_create=False,
-    peer_setup_error=None,
+    auxiliary_sms: int = 4,
+    ep_size: int = 8,
+    spin_bound: SimpleNamespace | None = None,
+    helper_residency: bool = False,
+    fail_create: bool = False,
+    peer_setup_error: str | None = None,
 ) -> _Env:
-    trace = []
+    trace: _Trace = []
     state = SimpleNamespace(
         stream=_MAIN,
         device=0,
@@ -174,8 +177,8 @@ def _build(
     )
     priorities = {_MAIN: 0, _OTHER_MAIN: 0, _COPY: -1}
 
-    def call(name) -> Callable[..., tuple[int]]:
-        def record(*args) -> tuple[int]:
+    def call(name: str) -> Callable[..., tuple[int]]:
+        def record(*args: object) -> tuple[int]:
             trace.append((name, *args))
             return (0,)
 
@@ -206,7 +209,7 @@ def _build(
     monkeypatch.setitem(sys.modules, _BREAKABLE_PACKAGE, breakable)
 
     class Config:
-        def __init__(self, **values) -> None:
+        def __init__(self, **values: int) -> None:
             self.__dict__.update(values)
             self.route_count = self.max_tokens_per_rank * self.topk
 
@@ -214,7 +217,7 @@ def _build(
             trace.append(("validate_config", self.ctas))
 
     class Scheduler:
-        def __init__(self, cfg, device) -> None:
+        def __init__(self, cfg: Config, device: str) -> None:
             self.cfg = cfg
             self.device = SimpleNamespace(index=int(device.split(":")[1]))
             self.outputs = SimpleNamespace(
@@ -224,10 +227,10 @@ def _build(
                 hot_expert_source_ranks="owners",
             )
 
-        def connect_peer_bases(self, bases) -> None:
+        def connect_peer_bases(self, bases: list[int]) -> None:
             trace.append(("connect", len(bases)))
 
-        def bind_gpu_direct(self, stream) -> None:
+        def bind_gpu_direct(self, stream: int) -> None:
             trace.append(("bind_gpu_direct", stream))
 
         def fused_launch_args(self) -> tuple[str | int, ...]:
@@ -248,11 +251,11 @@ def _build(
             )
 
     class Symmetric:
-        def __init__(self, nbytes, device) -> None:
+        def __init__(self, nbytes: int, device: int) -> None:
             self.shareable = b"rank"
             self.ptr = 0x5000
 
-        def import_peer(self, handle) -> int:
+        def import_peer(self, handle: bytes) -> int:
             return 0x6000
 
         def close(self) -> None:
@@ -275,12 +278,12 @@ def _build(
     monkeypatch.setitem(sys.modules, multirank.__name__, multirank)
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
 
-    def submit_fused(handle, routes, spin_cycles) -> None:
+    def submit_fused(handle: int, routes: _Routes, spin_cycles: int) -> None:
         trace.append(("submit", handle, routes.shape[0], spin_cycles))
         if state.fail_submit:
             raise RuntimeError("HALO-R kernel launch failed: unspecified launch failure")
 
-    def create(**kwargs) -> SimpleNamespace:
+    def create(**kwargs: object) -> SimpleNamespace:
         # The group passes every argument by its schema name.
         trace.append(("create", len(kwargs)))
         state.create_args = kwargs
@@ -334,7 +337,7 @@ def _build(
         ),
     )
 
-    def allgather(value) -> list[Any]:
+    def allgather(value: object) -> list[object]:
         trace.append(("allgather",))
         if isinstance(value, tuple):
             # A residency reset: every peer reports the same, unless a test makes rank 0 differ.
@@ -380,7 +383,9 @@ def _build(
     return _Env(group=group, endpoint=group.broadcaster, trace=trace, state=state)
 
 
-def _layer_call(group, rows, *, event=None) -> tuple[_Routes, int]:
+def _layer_call(
+    group: HaloRSlotSchedulerGroup, rows: int, *, event: SimpleNamespace | None = None
+) -> tuple[_Routes, int]:
     routes = _Routes(rows)
     physical, generation = group.plan_finish(group.plan_schedule(routes), defer_wait=True)
     group.wait_for_routes()
@@ -388,7 +393,7 @@ def _layer_call(group, rows, *, event=None) -> tuple[_Routes, int]:
     return physical, generation
 
 
-def _self_attributes(cls, method) -> set[str]:
+def _self_attributes(cls: type, method: str) -> set[str]:
     """Names that ``cls.method`` assigns on ``self``."""
     source = inspect.getsource(cls)
     tree = ast.parse(source)
@@ -409,7 +414,9 @@ def _self_attributes(cls, method) -> set[str]:
     return names
 
 
-def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(monkeypatch) -> None:
+def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env = _build(monkeypatch)
     order = [entry[0] for entry in env.trace]
     expected = [
@@ -440,7 +447,7 @@ def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(mo
 
 
 def test_a_capture_that_ends_within_a_layer_call_skips_its_waits_and_aborts(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failure that ends a capture mid-call must not leave an eager wait for a kernel that never runs."""
     env = _build(monkeypatch)
@@ -466,12 +473,16 @@ def test_a_capture_that_ends_within_a_layer_call_skips_its_waits_and_aborts(
         group.plan_schedule(_Routes(4))
 
 
-def test_a_peer_setup_failure_raises_on_this_rank_instead_of_waiting(monkeypatch) -> None:
+def test_a_peer_setup_failure_raises_on_this_rank_instead_of_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with pytest.raises(RuntimeError, match=r"failed on 1 of 8 EP ranks: rank 0: OSError: map"):
         _build(monkeypatch, peer_setup_error="OSError: map")
 
 
-def test_a_local_setup_failure_reaches_every_peer_before_it_raises(monkeypatch) -> None:
+def test_a_local_setup_failure_reaches_every_peer_before_it_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with pytest.raises(RuntimeError, match=r"rank 1: RuntimeError: cuMemMap failed") as raised:
         _build(monkeypatch, fail_create=True)
     # The local root cause is chained.
@@ -480,7 +491,7 @@ def test_a_local_setup_failure_reaches_every_peer_before_it_raises(monkeypatch) 
 
 @pytest.mark.parametrize("auxiliary_sms", [2, 4, 8, 16])
 def test_constant_ready_and_route_target_with_the_route_wait_deferred(
-    monkeypatch, auxiliary_sms
+    monkeypatch: pytest.MonkeyPatch, auxiliary_sms: int
 ) -> None:
     env = _build(monkeypatch, auxiliary_sms=auxiliary_sms)
     group, trace = env.group, env.trace
@@ -512,7 +523,9 @@ def test_constant_ready_and_route_target_with_the_route_wait_deferred(
         assert env.endpoint._collective_safe_generation == generation - 1
 
 
-def test_main_may_change_between_layer_calls_behind_a_fence(monkeypatch) -> None:
+def test_main_may_change_between_layer_calls_behind_a_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env = _build(monkeypatch)
     group, trace, state = env.group, env.trace, env.state
     state.stream = _COPY
@@ -571,7 +584,10 @@ def test_main_may_change_between_layer_calls_behind_a_fence(monkeypatch) -> None
     ],
 )
 def test_each_launch_takes_the_spin_bound_of_its_moment(
-    monkeypatch, environ, warmup_cycles, serving_cycles
+    monkeypatch: pytest.MonkeyPatch,
+    environ: dict[str, str],
+    warmup_cycles: int,
+    serving_cycles: int,
 ) -> None:
     guard = moe_comm_timeout_guard.MoECommTimeoutGuard(environ=environ, is_capturing=lambda: False)
     tuning = [False]
@@ -588,7 +604,7 @@ def test_each_launch_takes_the_spin_bound_of_its_moment(
     assert bound.warmup_cycles == warmup_cycles
     guard.register(bound)
 
-    def launched_cycles(rows=4) -> int:
+    def launched_cycles(rows: int = 4) -> int:
         _layer_call(env.group, rows)
         return next(entry[3] for entry in reversed(env.trace) if entry[0] == "submit")
 
@@ -605,12 +621,14 @@ def test_each_launch_takes_the_spin_bound_of_its_moment(
     tuning[0] = False
 
 
-def test_a_breakable_buckets_first_eager_launch_waits_the_warmup_bound(monkeypatch) -> None:
+def test_a_breakable_buckets_first_eager_launch_waits_the_warmup_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The breakable capture pass runs each bucket first, eagerly, under the serving timeouts."""
     env = _build(monkeypatch)
     state = env.state
 
-    def launched_cycles(rows) -> int:
+    def launched_cycles(rows: int) -> int:
         _layer_call(env.group, rows)
         return next(entry[3] for entry in reversed(env.trace) if entry[0] == "submit")
 
@@ -640,7 +658,9 @@ def test_a_breakable_buckets_first_eager_launch_waits_the_warmup_bound(monkeypat
     )
 
 
-def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(monkeypatch) -> None:
+def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env = _build(monkeypatch)
     _layer_call(env.group, 8)
     assert not any(entry[0] == "wait_event" for entry in env.trace)
@@ -664,7 +684,9 @@ def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(monkeypatch) 
         _layer_call(env.group, 8, event=SimpleNamespace(cuda_event=0))
 
 
-def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(monkeypatch) -> None:
+def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env = _build(monkeypatch)
     _layer_call(env.group, 8)
     env.state.fail_submit = True
@@ -692,7 +714,9 @@ def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(monkeypatch) -> 
     assert ("destroy",) in env.trace and ("symmetric_close",) in env.trace
 
 
-def test_endpoint_refuses_a_launch_while_the_previous_generation_is_leased(monkeypatch) -> None:
+def test_endpoint_refuses_a_launch_while_the_previous_generation_is_leased(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env = _build(monkeypatch)
     endpoint = env.endpoint
     assert endpoint.submit_fused(endpoint._outputs, _Routes(4), 0, spin_cycles=1) == 1
@@ -711,7 +735,7 @@ def test_endpoint_refuses_a_launch_while_the_previous_generation_is_leased(monke
     ] * 2
 
 
-def test_endpoint_accepts_only_its_own_lease_once(monkeypatch) -> None:
+def test_endpoint_accepts_only_its_own_lease_once(monkeypatch: pytest.MonkeyPatch) -> None:
     env = _build(monkeypatch)
     endpoint = env.endpoint
     with pytest.raises(RuntimeError, match="single-assignment"):
@@ -733,7 +757,7 @@ def test_endpoint_accepts_only_its_own_lease_once(monkeypatch) -> None:
             endpoint._validate_reuse_authority(authority)
 
 
-def test_relay_counts_come_from_the_native_context(monkeypatch) -> None:
+def test_relay_counts_come_from_the_native_context(monkeypatch: pytest.MonkeyPatch) -> None:
     env = _build(monkeypatch)
     env.state.counters = [3, 12, 0]
     assert env.endpoint.relay_counts() == (3, 12, 0)
@@ -827,7 +851,7 @@ def _cuda_call_wrappers(body: str) -> list[tuple[str, str]]:
     return calls
 
 
-def _assert_in_order(text: str, parts) -> None:
+def _assert_in_order(text: str, parts: Sequence[str]) -> None:
     positions = [text.index(part) for part in parts]
     assert positions == sorted(positions), parts
 
@@ -1027,7 +1051,7 @@ def test_kernel_runs_in_the_remote_memory_sync_domain() -> None:
     )
 
 
-def _create_argument(env, name) -> Any:
+def _create_argument(env: _Env, name: str) -> Any:
     """The value a fake native create received for the schema parameter ``name``."""
     names = _op_parameters("moe_rebalance_halo_r_create")
     # Every schema parameter is passed by name, so a reordered schema still binds each one.
@@ -1037,7 +1061,7 @@ def _create_argument(env, name) -> Any:
 
 @pytest.mark.parametrize("helper_residency", [False, True])
 def test_residency_table_exists_only_for_per_layer_helper_slots(
-    monkeypatch, helper_residency
+    monkeypatch: pytest.MonkeyPatch, helper_residency: bool
 ) -> None:
     env = _build(monkeypatch, helper_residency=helper_residency)
     table = _create_argument(env, "residency")
@@ -1098,24 +1122,26 @@ def test_kernel_skips_resident_receivers_and_records_residency_before_ready() ->
 
 
 class _FakeVmm:
-    def __init__(self, trace) -> None:
+    def __init__(self, trace: _Trace) -> None:
         self.trace = trace
         self.next_address = 0x100000
 
-    def reserve(self, nbytes) -> int:
+    def reserve(self, nbytes: int) -> int:
         self.next_address += 0x10000
         self.trace.append(("reserve", nbytes))
         return self.next_address
 
-    def import_(self, shareable) -> str:
+    def import_(self, shareable: str) -> str:
         self.trace.append(("import", shareable))
         return f"handle:{shareable}"
 
-    def map(self, address, nbytes, handle) -> None:
+    def map(self, address: int, nbytes: int, handle: str) -> None:
         self.trace.append(("map", address, nbytes, handle))
 
 
-def _pool(trace, *, rank, sets, gathered) -> _SharedSlotPool:
+def _pool(
+    trace: _Trace, *, rank: int, sets: int, gathered: list[list[dict[str, str]]]
+) -> _SharedSlotPool:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import (
         _HelperSet,
         _SharedSlotPool,
@@ -1134,7 +1160,7 @@ def _pool(trace, *, rank, sets, gathered) -> _SharedSlotPool:
     )
     pool.vmm = _FakeVmm(trace)
 
-    def allgather(local) -> list[dict[str, str]]:
+    def allgather(local: dict[str, str]) -> list[dict[str, str]]:
         trace.append(("allgather", dict(local)))
         return gathered.pop(0)
 
@@ -1143,11 +1169,11 @@ def _pool(trace, *, rank, sets, gathered) -> _SharedSlotPool:
 
 
 @pytest.mark.parametrize("sets", [2, 5], ids=["shared-banks", "per-layer"])
-def test_peer_helper_chunks_are_mapped_once_per_set(sets) -> None:
-    trace = []
+def test_peer_helper_chunks_are_mapped_once_per_set(sets: int) -> None:
+    trace: _Trace = []
     world = 4
 
-    def peers(index) -> list[dict[str, str]]:
+    def peers(index: int) -> list[dict[str, str]]:
         return [{"w13": f"r{r}-s{index}-w13", "w2": f"r{r}-s{index}-w2"} for r in range(world)]
 
     pool = _pool(trace, rank=1, sets=sets, gathered=[peers(index) for index in range(sets)])
@@ -1171,7 +1197,7 @@ def test_peer_helper_chunks_are_mapped_once_per_set(sets) -> None:
 
 
 def test_peer_helper_mapping_refuses_mismatched_chunks() -> None:
-    trace = []
+    trace: _Trace = []
     gathered = [
         [{"w13": "a", "w2": "b"}, {"w13": "c"}, {"w13": "e", "w2": "f"}, {"w13": "g", "w2": "h"}]
     ]
@@ -1185,13 +1211,13 @@ def test_peer_helper_mapping_refuses_mismatched_chunks() -> None:
 
 
 class _FakeChunkVmm(_FakeVmm):
-    def create(self, nbytes) -> tuple[str, str]:
+    def create(self, nbytes: int) -> tuple[str, str]:
         self.trace.append(("create", nbytes))
         index = sum(1 for entry in self.trace if entry[0] == "create")
         return f"chunk{index}", f"shareable{index}"
 
 
-def _set_pool(trace, *, helper_multicast) -> _SharedSlotPool:
+def _set_pool(trace: _Trace, *, helper_multicast: bool) -> _SharedSlotPool:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import _SharedSlotPool
 
     pool = _SharedSlotPool.__new__(_SharedSlotPool)
@@ -1210,7 +1236,9 @@ def _set_pool(trace, *, helper_multicast) -> _SharedSlotPool:
 
 
 @pytest.mark.parametrize("count", [1, 2], ids=["per-layer", "shared-banks"])
-def test_halo_q_helper_sets_keep_a_multicast_object_per_level(monkeypatch, count) -> None:
+def test_halo_q_helper_sets_keep_a_multicast_object_per_level(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
     calls = []
@@ -1241,14 +1269,16 @@ def test_halo_q_helper_sets_keep_a_multicast_object_per_level(monkeypatch, count
 
 
 @pytest.mark.parametrize("count", [1, 2], ids=["per-layer", "shared-banks"])
-def test_halo_r_helper_sets_get_no_multicast_object(monkeypatch, count) -> None:
+def test_halo_r_helper_sets_get_no_multicast_object(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
-    def create_multicast(*args) -> None:
+    def create_multicast(*args: object) -> None:
         raise AssertionError("HALO-R helper sets must not create multicast objects")
 
     monkeypatch.setattr(arena_module, "_create_multicast", create_multicast)
-    trace = []
+    trace: _Trace = []
     pool = _set_pool(trace, helper_multicast=False)
     sets = pool._create_sets(count, comm="comm")
     # Only the chunks: no multicast object and no view reservation for one.
@@ -1258,7 +1288,9 @@ def test_halo_r_helper_sets_get_no_multicast_object(monkeypatch, count) -> None:
         assert set(helper_set.chunks) == set(helper_set.shareables) == {"w13", "w2"}
 
 
-def _cuda_view(shape, stride, dtype, element_size, pointer) -> SimpleNamespace:
+def _cuda_view(
+    shape: tuple[int, ...], stride: tuple[int, ...], dtype: str, element_size: int, pointer: int
+) -> SimpleNamespace:
     return SimpleNamespace(
         data_ptr=lambda: pointer,
         shape=shape,
@@ -1270,7 +1302,9 @@ def _cuda_view(shape, stride, dtype, element_size, pointer) -> SimpleNamespace:
     )
 
 
-def _live_arena(world, slots, unicast_planes) -> tuple[LiveWeightArena, BundleLayout]:
+def _live_arena(
+    world: int, slots: int, unicast_planes: int
+) -> tuple[LiveWeightArena, BundleLayout]:
     from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.arena import (
         LivePlaneView,
         LiveTerminalView,
@@ -1281,7 +1315,7 @@ def _live_arena(world, slots, unicast_planes) -> tuple[LiveWeightArena, BundleLa
     bundle = BundleLayout.create(hidden=256, intermediate=128)
     addresses = iter(range(1 << 32, 1 << 40, 1 << 28))
 
-    def view(layout) -> SimpleNamespace:
+    def view(layout: Plane) -> SimpleNamespace:
         shape, stride, dtype, element_size, _ = layout.kernel_metadata(slots)
         return _cuda_view(shape, stride, dtype, element_size, next(addresses))
 
@@ -1305,7 +1339,7 @@ def _live_arena(world, slots, unicast_planes) -> tuple[LiveWeightArena, BundleLa
 
 
 @pytest.mark.parametrize("unicast_planes", [0, 2], ids=["multicast", "unicast-helpers"])
-def test_live_arena_binds_planes_without_a_multicast_alias(unicast_planes) -> None:
+def test_live_arena_binds_planes_without_a_multicast_alias(unicast_planes: int) -> None:
     world, rank, home, helpers = 2, 1, 4, 2
     arena, bundle = _live_arena(world, home + helpers, unicast_planes)
     bound = arena.bind(
@@ -1341,7 +1375,9 @@ def test_hierarchical_arena_refuses_planes_without_a_multicast_alias() -> None:
         )
 
 
-def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch) -> None:
+def test_weight_reload_forgets_residency_between_layer_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env = _build(monkeypatch, helper_residency=True)
     table = env.endpoint.residency
     group = env.group
@@ -1369,7 +1405,9 @@ def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch) -> Non
 
 
 @pytest.mark.parametrize("peer_reset", [(5, 2), (6, 1), (None, 1)])
-def test_weight_reload_raises_when_ranks_reset_differently(monkeypatch, peer_reset) -> None:
+def test_weight_reload_raises_when_ranks_reset_differently(
+    monkeypatch: pytest.MonkeyPatch, peer_reset: tuple[int | None, int]
+) -> None:
     """A rank that reset another layer, or this one another number of times, fails every rank."""
     env = _build(monkeypatch, helper_residency=True)
     _layer_call(env.group, 8)
@@ -1381,7 +1419,7 @@ def test_weight_reload_raises_when_ranks_reset_differently(monkeypatch, peer_res
     assert env.trace == [("allgather",)]
 
 
-def test_weight_reload_without_residency_is_free(monkeypatch) -> None:
+def test_weight_reload_without_residency_is_free(monkeypatch: pytest.MonkeyPatch) -> None:
     env = _build(monkeypatch)
     _layer_call(env.group, 8)
     env.trace.clear()
@@ -1509,7 +1547,7 @@ def test_kernel_drains_ready_before_the_exchange_within_one_bound() -> None:
     )
 
 
-def test_both_endpoints_share_the_live_bank_lease(monkeypatch) -> None:
+def test_both_endpoints_share_the_live_bank_lease(monkeypatch: pytest.MonkeyPatch) -> None:
     """HALO-Q and HALO-R keep one lease implementation; a failed consumer wait aborts either."""
     from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.hierarchical import (
         HierarchicalSamiWeightBroadcast,
