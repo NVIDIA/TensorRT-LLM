@@ -92,6 +92,7 @@ from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -451,6 +452,14 @@ class NemotronUltraBf16Tp8ep2ModelingV2(DecoderModel):
         """Bind the step's cache manager if it changed, then route the step."""
         if self._bound is None or attn_metadata.kv_cache_manager is not self._bound.cm:
             self._bind_cache_manager(attn_metadata)
+        if is_in_breakable_cuda_graph():
+            # The prefill body reads the step's batch on the host; captured whole it would
+            # replay one step's metadata for every later one (the dep16 target breaks there).
+            raise RuntimeError(
+                "nemotron3_ultra_bf16__sm_100__tp8ep2 does not support breakable prefill CUDA "
+                "graphs (prefill_cuda_graph_backend: breakable): its prefill has no "
+                "eager_on_graph breaks"
+            )
         return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
