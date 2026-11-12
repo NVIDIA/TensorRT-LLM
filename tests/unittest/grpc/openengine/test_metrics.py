@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
+from starlette.routing import Match
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
@@ -620,10 +621,16 @@ def _http_enablement() -> None:
             server = OpenAIServer(generator, "test-model", None, None, None)
             try:
                 enabled = requested or output_dir is not None
-                assert (
-                    any(route.path == "/prometheus/metrics" for route in server.app.routes)
-                    == enabled
-                )
+                # Match a request instead of reading .path off app.routes: FastAPI
+                # 0.139 keeps included routers there as objects without a path.
+                scope = {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/prometheus/metrics",
+                    "path_params": {},
+                }
+                exposed = any(route.matches(scope)[0] == Match.FULL for route in server.app.routes)
+                assert exposed == enabled
                 assert server._expose_perf_metrics is requested
                 assert server._collect_perf_metrics is enabled
                 assert args.return_perf_metrics is enabled
