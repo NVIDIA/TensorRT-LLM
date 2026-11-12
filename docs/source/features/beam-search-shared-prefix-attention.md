@@ -21,8 +21,8 @@ This feature is a prototype: its settings may change.
 
 ## Support
 
-- Validated on H100 (SM90). The default prefix kernel has no architecture gate in the code, but
-  other GPUs are untested; the FA4 backend (below) is SM90 only.
+- Validated on H100 (SM90) and GB200 (SM100) with the default `fa2` prefix kernel. Other GPUs are
+  untested; the FA4 backend (below) is SM90 only and declines on other architectures.
 - PyTorch backend, KV cache manager V2 (`use_kv_cache_manager_v2: true`). With the legacy
   manager, planning raises an error instead of falling back.
 - bf16 or fp16 KV cache, head size 64, 128 or 256, no sliding window, attention sinks or custom
