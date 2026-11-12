@@ -74,7 +74,20 @@ class MixedPrecisionKVStaging:
         for layer_idx in self.pools:
             key = manager.mixed_precision_page_table_key(layer_idx)
             self.table_owner[layer_idx] = owners.setdefault(key, layer_idx)
-        # Cache manager interface read by the attention backends.
+        # Pinned host staging for update()'s async H2D copies of page tables and lengths. A fresh
+        # per-call temp is freed at return, so its block can be recycled by a later allocation before
+        # the in-flight copy retires (silent torn KV indices). Owning them here keeps each source alive
+        # for the whole process; cf. the SWA scratch-staging snapshot (#21386).
+        max_pages = -(-self.max_seq_len // self.block_size)
+        self._page_table_staging: Dict[int, torch.Tensor] = {
+            owner: torch.full(
+                (2, self.rows, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+            for owner in set(self.table_owner.values())
+        }
+        self._lengths_staging = torch.zeros(
+            (2, self.rows), dtype=torch.int32, pin_memory=prefer_pinned()
+        )
         self.layer_offsets = {layer: layer for layer in self.pools}
         self.max_attention_window_vec = (None,) * (max(self.pools) + 1)
         self.dtype = manager.dtype
@@ -116,26 +129,23 @@ class MixedPrecisionKVStaging:
             if owner in self.page_tables:
                 self.page_tables[layer_idx] = self.page_tables[owner]
                 continue
-            tables = torch.full(
-                (2, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            manager.fill_mixed_precision_page_tables(request_ids, owner, tables.numpy())
+            host = self._page_table_staging[owner][:, :batch]
+            host.fill_(-1)
+            manager.fill_mixed_precision_page_tables(request_ids, owner, host.numpy())
             self.page_tables[layer_idx] = buffers.get_buffer(
                 (2, self.rows, max_pages),
                 torch.int32,
                 f"{self.name}_page_tables_{owner}",
                 capture_graph,
             )[:, :batch]
-            self.page_tables[layer_idx].copy_(tables, non_blocking=True)
+            self.page_tables[layer_idx].copy_(host, non_blocking=True)
         self.lengths = buffers.get_buffer(
             (2, self.rows), torch.int32, f"{self.name}_lengths", capture_graph
         )[:, :batch]
-        self.lengths.copy_(
-            torch.tensor(
-                [list(cached_lengths), lengths], dtype=torch.int32, pin_memory=prefer_pinned()
-            ),
-            non_blocking=True,
-        )
+        host_lengths = self._lengths_staging[:, :batch]
+        host_lengths[0].copy_(torch.tensor(list(cached_lengths), dtype=torch.int32))
+        host_lengths[1].copy_(torch.tensor(lengths, dtype=torch.int32))
+        self.lengths.copy_(host_lengths, non_blocking=True)
         self.max_new_tokens_per_request = max(seq_lens, default=0)
         # A captured graph cannot change this cap per replay, so it passes the
         # full span; the kernel itself only visits the tokens each request has.
