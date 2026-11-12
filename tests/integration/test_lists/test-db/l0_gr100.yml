@@ -87,3 +87,57 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec
   - unittest/_torch/visual_gen/kernels/parallel/test_fmha_dense_fp8.py
   - unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_qk_norm_rope_fp8.py
+  # VisualGen accuracy checks.
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_lpips_against_golden
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  # FLUX.2 conditioning, FP8 and CUDA graph coverage.
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-cuda-graph]
+  # Cosmos3 Edge image generation and policy actions.
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_policy_droid_example TIMEOUT (20)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_lpips_against_golden TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_t2i_lpips_against_golden TIMEOUT (15)
+  # MiniMax-H3 executor API and dynamic-quantization coverage.
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (60)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    terms:
+      compute_capability: '10.7'
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # Shared quantization, attention and control kernels.
+  - unittest/_torch/visual_gen/test_quant_ops.py
+  - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
+  - unittest/_torch/visual_gen/test_attention_fa4.py
+  - unittest/_torch/visual_gen/test_attention_flashinfer.py::test_flashinfer_attention_matches_sdpa
+  - unittest/_torch/visual_gen/test_control_kernels.py
+  # Model correctness and conditioning without the full integration matrix.
+  - unittest/_torch/visual_gen/test_wan_transformer.py::TestWanUnit::test_allclose_to_hf
+  - unittest/_torch/visual_gen/test_flux_transformer.py::TestFluxTransformer
+  - unittest/_torch/visual_gen/test_flux_attention.py
+  - unittest/_torch/visual_gen/test_flux2_image_conditioning.py
+  - unittest/_torch/visual_gen/test_cosmos3_transformer.py::TestCosmos3Unit
+  - unittest/_torch/visual_gen/test_cosmos3_action.py
+  - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_transfer.py
+  - unittest/_torch/visual_gen/test_cosmos3_pipeline.py -m "not integration"
+  - unittest/_torch/visual_gen/test_cosmos3_edge.py -k "not TestEdgeCheckpoint and not test_per_step_velocity_parity"
+  - unittest/_torch/visual_gen/test_minimax_h3_transformer.py -k "not test_bf16_blocks_run_the_fused_swiglu_epilogue and not test_attention_backends_match_vanilla"
+  # One generation smoke test per model family.
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[nano-1gpu]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
