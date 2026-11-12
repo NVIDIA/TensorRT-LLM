@@ -20,12 +20,16 @@ import torch
 from transformers import BartConfig, LlamaConfig, MllamaConfig, T5Config, WhisperConfig
 
 import tensorrt_llm.bindings.internal.batch_manager as batch_manager
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.embedding import Embedding, LMHead
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
     KvCacheCreator,
@@ -85,6 +89,12 @@ class _FakeLogitsDecoder(torch.nn.Module):
             torch.nn.Identity() for _ in range(model_config.pretrained_config.num_hidden_layers)
         )
         self.norm = torch.nn.Identity()
+        self.embed_tokens = Embedding(
+            model_config.pretrained_config.vocab_size,
+            model_config.pretrained_config.hidden_size,
+            dtype=model_config.torch_dtype,
+            mapping=Mapping(),
+        )
         self.hc_head = None
         self.disagg_context_only = context_only
         self.decoder_replay_split = 1
@@ -92,6 +102,34 @@ class _FakeLogitsDecoder(torch.nn.Module):
 
     def __pp_init__(self) -> None:
         pass
+
+
+class _LogitsProcessorWithoutFootprint(torch.nn.Module):
+    """Represent a custom epilogue exposing forward but no footprint contract."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.processor = LogitsProcessor()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: LMHead,
+        attn_metadata: AttentionMetadata,
+        return_context_logits: bool = False,
+    ) -> torch.Tensor:
+        return self.processor(hidden_states, lm_head, attn_metadata, return_context_logits)
+
+
+class _VilaLogitsTokenizer:
+    """Supply checkpoint-independent tokenizer length and in-vocabulary media IDs."""
+
+    def __init__(self, vocab_size: int) -> None:
+        self.vocab_size = vocab_size
+        self.media_token_ids = {"image": 0, "video": 1}
+
+    def __len__(self) -> int:
+        return self.vocab_size
 
 
 class _FakeLogitsMultimodalModel(MultimodalModelMixin, torch.nn.Module):
@@ -240,6 +278,7 @@ def _run_eager_logits_capacity_case(
     mapping: Mapping | None = None,
     model_layout: str = "decoder",
     vocab_size: int = 64,
+    tokenizer_vocab_size: int = 64,
 ) -> None:
     mapping = mapping or Mapping()
     pretrained_config = LlamaConfig(
@@ -307,6 +346,46 @@ def _run_eager_logits_capacity_case(
             model = Step3p7VLForConditionalGeneration(model_config)
     elif model_layout in ("t5", "bart", "mbart", "whisper", "mllama", "compiled-mllama"):
         model = _make_builtin_logits_model(model_layout, dtype, mapping, vocab_size)
+    elif model_layout == "custom-processor":
+        model.logits_processor = _LogitsProcessorWithoutFootprint()
+    elif model_layout == "vila":
+        from tensorrt_llm._torch.models.modeling_vila import VilaConfig, VilaModel
+
+        language_model = model
+        tokenizer = _VilaLogitsTokenizer(tokenizer_vocab_size)
+        vila_config = ModelConfig(
+            pretrained_config=VilaConfig(
+                llm_cfg="llm",
+                vision_tower_cfg="vision",
+                mm_projector_cfg="projector",
+                model_dtype=dtype,
+                torch_dtype=dtype,
+            ),
+            mapping=mapping,
+        )
+        with (
+            patch(
+                "tensorrt_llm._torch.models.modeling_vila.AutoConfig.from_pretrained",
+                return_value=pretrained_config,
+            ),
+            patch(
+                "tensorrt_llm._torch.models.modeling_vila.init_tokenizer",
+                return_value=tokenizer,
+            ),
+            patch(
+                "tensorrt_llm._torch.models.modeling_vila.AutoModelForCausalLM.from_config",
+                return_value=language_model,
+            ),
+            patch.object(language_model, "load_weights"),
+            patch(
+                "tensorrt_llm._torch.distributed.AllReduce",
+                return_value=torch.nn.Identity(),
+            ),
+            patch.object(Embedding, "to", lambda module, *args, **kwargs: module),
+            patch.object(LMHead, "to", lambda module, *args, **kwargs: module),
+        ):
+            model = VilaModel(vila_config, device="cpu")
+            model.load_weights({})
     elif model_layout == "direct-logits":
         model = torch.nn.Module()
         model.model_config = model_config
@@ -378,6 +457,13 @@ def _run_eager_logits_capacity_case(
         creator.configure_kv_cache_capacity(executor if profiled else None)
 
     assert kv_cache_config.max_gpu_total_bytes == ((_LOGITS_FREE_BYTES) - expected_reserve) // 2
+    if model_layout == "vila":
+        padded_vocab_size = (
+            (tokenizer_vocab_size + mapping.tp_size - 1) // mapping.tp_size * mapping.tp_size
+        )
+        assert model.llm.lm_head.vocab_size_padded == padded_vocab_size
+        assert model.llm.lm_head.num_embeddings == tokenizer_vocab_size
+        assert model.llm.lm_head.padding_size == padded_vocab_size - tokenizer_vocab_size
 
 
 @pytest.mark.parametrize(
@@ -503,6 +589,34 @@ def test_kv_capacity_eager_logits_builtin_heads(
 def test_kv_capacity_eager_logits_head_vocab() -> None:
     _run_eager_logits_capacity_case(
         model_layout="t5", profiled=False, expected_reserve=8 * _LOGITS_BF16_ROW_BYTES
+    )
+
+
+def test_kv_capacity_eager_logits_custom_processor() -> None:
+    _run_eager_logits_capacity_case(
+        model_layout="custom-processor", expected_reserve=7 * _LOGITS_BF16_ROW_BYTES
+    )
+
+
+@pytest.mark.parametrize(
+    "vocab_size,tokenizer_vocab_size,tp_size",
+    [
+        pytest.param(64, 65, 1, id="grown-head"),
+        pytest.param(65, 66, 4, id="grown-head-tp-padding"),
+        pytest.param(64, 64, 1, id="unchanged-head"),
+    ],
+)
+def test_kv_capacity_eager_logits_vila(
+    vocab_size: int, tokenizer_vocab_size: int, tp_size: int
+) -> None:
+    padded_vocab_size = (tokenizer_vocab_size + tp_size - 1) // tp_size * tp_size
+    _run_eager_logits_capacity_case(
+        model_layout="vila",
+        vocab_size=vocab_size,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+        mapping=Mapping(world_size=tp_size, tp_size=tp_size),
+        profiled=False,
+        expected_reserve=8 * padded_vocab_size * (torch.bfloat16.itemsize + torch.float32.itemsize),
     )
 
 

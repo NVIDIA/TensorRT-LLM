@@ -636,6 +636,9 @@ def _resize_lm_head(old_lm_head: LMHead, new_num_tokens: int):
                             num_tokens_to_copy, :] = old_lm_head.weight.data[:
                                                                              num_tokens_to_copy, :]
     old_lm_head.weight.data = new_lm_head.weight.data
+    old_lm_head.out_features = new_lm_head.out_features
+    old_lm_head.num_embeddings = new_lm_head.num_embeddings
+    old_lm_head.padding_size = new_lm_head.padding_size
 
     return old_lm_head
 
