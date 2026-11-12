@@ -2179,7 +2179,7 @@ def test_beam_histories_follow_beam_reordering():
     sampler = create_default_sampler(test_params)
     store = sampler.store.beam_search_store
     assert store is not None
-    A, B, C, D, E, F, G, H, K, L = range(100, 110)
+    A, B, C, D, E, F, G, H, K, L, M, N = range(100, 112)
 
     def apply_steps(slot: int, prompt_len: int,
                     steps: list[tuple[list[int], list[int]]]) -> None:
@@ -2212,19 +2212,28 @@ def test_beam_histories_follow_beam_reordering():
     # A swap, then both survivors descend from slot 0; a shorter prompt in a
     # different slot also checks the per-request offsets of the batched gather.
     apply_steps(1, 3, [([E, F], [0, 0]), ([G, H], [1, 0]), ([K, L], [0, 0])])
+    # A much longer prompt with a single generated token: the copy should
+    # cover each request's generated tokens, not the gap between prompt lengths.
+    apply_steps(2, 100, [([M, N], [0, 0])])
 
-    # Both requests are narrower than the store. The rows above their width
+    # The requests are narrower than the store. The rows above their width
     # are never written by a step, so fill them with values no live row holds
     # and check that the gather neither reads them as indices nor returns them.
     max_beam_width = store.cache_indirection.size(1)
     assert max_beam_width > 2
-    store.cache_indirection[[4, 1], 2:, :] = 10**6
-    store.original_tokens[[4, 1], 2:, :] = -1
+    store.cache_indirection[[4, 1, 2], 2:, :] = 10**6
+    store.original_tokens[[4, 1, 2], 2:, :] = -1
 
-    histories = sampler.start_beam_histories(
-        [stub_request(4, 5, 7), stub_request(1, 3, 6)]).wait()
+    pending = sampler.start_beam_histories([
+        stub_request(4, 5, 7),
+        stub_request(1, 3, 6),
+        stub_request(2, 100, 101)
+    ])
+    assert pending.paths is not None
+    assert pending.paths.size(2) == 3  # The most tokens any request generated.
+    histories = pending.wait()
 
-    assert histories == [[[B, C], [B, D]], [[F, G, K], [F, G, L]]]
+    assert histories == [[[B, C], [B, D]], [[F, G, K], [F, G, L]], [[M], [N]]]
 
 
 class _HistoryCheckingProcessor(LogitsProcessor):

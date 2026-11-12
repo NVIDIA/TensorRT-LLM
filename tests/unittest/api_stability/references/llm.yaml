@@ -79,6 +79,14 @@ methods:
         annotation: int
         default: 1
         status: prototype
+      serve_frontend_affinity_port_stride:
+        annotation: Optional[int]
+        default: null
+        status: prototype
+      serve_graceful_shutdown_timeout_s:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       custom_tokenizer:
         annotation: Optional[str]
         default: null
@@ -108,7 +116,7 @@ methods:
         status: deprecated
       modeling_v2:
         annotation: Literal['off', 'auto', 'require']
-        default: 'off'
+        default: auto
         status: prototype
       cuda_graph_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
@@ -139,11 +147,11 @@ methods:
         default: null
         status: prototype
       checkpoint_format:
-        annotation: Optional[str]
+        annotation: Union[tensorrt_llm.checkpoint_format.CheckpointFormat, str, NoneType]
         default: null
         status: prototype
       checkpoint_io_policy:
-        annotation: Literal['auto', 'native', 'rank_striped_read_ahead']
+        annotation: tensorrt_llm.llmapi.llm_args.CheckpointIOPolicy
         default: auto
         status: prototype
       mx_config:
@@ -182,6 +190,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      watermark_config:
+        annotation: Optional[WatermarkConfig]
+        default: null
+        status: prototype
       lm_head_output_dtype:
         annotation: Literal['auto', 'float32']
         default: auto
@@ -310,6 +322,14 @@ methods:
         annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL', 'NCCL_SYMMETRIC']]
         default: AUTO
         status: beta
+      mnnvl_allreduce_fp8_payload:
+        annotation: bool
+        default: False
+        status: prototype
+      replicate_embedding:
+        annotation: bool
+        default: False
+        status: prototype
       decoding_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
         default: null
@@ -401,6 +421,10 @@ methods:
     return_annotation: None
   generate:
     parameters:
+      kv_hints:
+        annotation: Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], List[Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], NoneType]], NoneType]
+        default: null
+        status: prototype
       disaggregated_params:
         annotation: Union[tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], NoneType]
         default: null
@@ -423,6 +447,10 @@ methods:
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
+      kv_hints:
+        annotation: Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], NoneType]
+        default: null
+        status: prototype
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null

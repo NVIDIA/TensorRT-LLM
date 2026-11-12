@@ -43,8 +43,13 @@ class Fmha(ABC):
     supports_skip_correction: ClassVar[bool] = False
     supports_block_sparse_inputs: ClassVar[bool] = False
     supports_per_tensor_fp8: ClassVar[bool] = False
+    supports_vc_attention: ClassVar[bool] = False
     supports_workspace_reclamation: bool = False
     supports_fp4_mla: ClassVar[bool] = False
+    # Serves a generation call whose QK-norm / RoPE / KV-append prologue the attention module deferred to the
+    # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
+    supports_deferred_prologue: ClassVar[bool] = False
+    supports_variable_window: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -125,6 +130,23 @@ class Fmha(ABC):
             or getattr(forward_args, "v_fp8_per_tensor", False)
         ) and not self.supports_per_tensor_fp8:
             logger.debug(f"{type(self).__name__} does not support per-tensor FP8 recipes.")
+            return False
+        if (
+            forward_args.kv_append is not None
+            and forward_args.kv_append.fold is not None
+            and not self.supports_deferred_prologue
+        ):
+            logger.debug(f"{type(self).__name__} does not run a deferred attention prologue.")
+            return False
+        if getattr(forward_args, "vc_attention", False) and not self.supports_vc_attention:
+            logger.debug(f"{type(self).__name__} does not support VC-Attention.")
+            return False
+        has_variable_window = (
+            forward_args.variable_window_token_starts is not None
+            or forward_args.variable_window_token_ends is not None
+        )
+        if has_variable_window and not self.supports_variable_window:
+            logger.debug(f"{type(self).__name__} does not support variable-window attention.")
             return False
         return self._is_supported(q, k, v, metadata, forward_args, phase=phase)
 

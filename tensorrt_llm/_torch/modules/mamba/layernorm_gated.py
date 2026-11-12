@@ -180,6 +180,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr = False,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -194,6 +195,15 @@ def _rms_norm_gated_fwd_multirow_kernel(
     row_mask = rows < M
     cols = tl.arange(0, N)
     mask2d = row_mask[:, None]
+    if EARLY_TRIGGER:
+        # Dependents read Y only after their own griddepcontrol.wait.
+        tl.extra.cuda.gdc_launch_dependents()
+    # The weight is a parameter (not produced in-step), so it is fetched before
+    # the PDL wait; X (the producer's output) and Z (an earlier in-step kernel's
+    # output) are read only after it.
+    w = tl.load(W + cols).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
     x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
@@ -202,9 +212,6 @@ def _rms_norm_gated_fwd_multirow_kernel(
     rstd = 1.0 / tl.sqrt(var + eps)
     if SAVE_RSTD:
         tl.store(Rstd + rows, rstd, mask=row_mask)
-    w = tl.load(W + cols).to(tl.float32)
-    if WEIGHT_IS_DELTA:
-        w += 1.0
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
@@ -223,7 +230,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
-    if LAUNCH_WITH_PDL:
+    if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -306,6 +313,9 @@ def rms_norm_gated_token_major(
             WEIGHT_IS_DELTA=False,
             LAUNCH_WITH_PDL=launch_with_pdl,
             num_warps=_MULTIROW_NUM_WARPS,
+            # Dependents (out_proj) prefetch their weights; they read Y only
+            # after their own griddepcontrol.wait.
+            EARLY_TRIGGER=_pdl_device_policy(device_index)[0],
             launch_pdl=launch_with_pdl,
         )
     return out

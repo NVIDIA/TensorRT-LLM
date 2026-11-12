@@ -273,6 +273,24 @@ class DrainSkipsOnChange(MemoryDriver):
             return self._quiet()
 
 
+class DrainNeedsABudget(MemoryDriver):
+    """Turns True only inside a call with a budget, however idle it is: a driver that takes the
+    budget as its one chance to wait, or one whose evidence must be newer than each call, which
+    no evidence ever is. The backend only ever calls ``drain(0.0)``."""
+
+    def drain(self, budget_s: float) -> bool:
+        return super().drain(budget_s) and budget_s > 0
+
+
+class DrainWaitsForTheRunningGet(MemoryDriver):
+    """Waits for every operation to end whatever its budget says: a drain with no budget blocks
+    for as long as a get sits in the store. The check fails it from a thread of its own instead
+    of hanging behind it."""
+
+    def drain(self, budget_s: float) -> bool:
+        return super().drain(threading.TIMEOUT_MAX)
+
+
 class DrainForcesAnEnd(MemoryDriver):
     """Once its budget ran out, declares the access of every operation still running ended."""
 
@@ -482,6 +500,16 @@ class EndsAccessOnceARowStarted(MemoryDriver):
             return recorded.access_ended or any(row.started for row in recorded.rows)
 
 
+class EndsAccessBeforeTheSourceIsRead(MemoryDriver):
+    """Calls a put's access over as soon as it is recorded, while the store has yet to read the
+    source: a caller that trusts it overwrites what the store is about to take."""
+
+    def access_ended(self, op: OpHandle) -> bool:
+        with self._lock:
+            recorded = self._op(op)
+            return recorded.access_ended or recorded.kind == "put"
+
+
 class CancelEndsAccessWithTheRowInTheStore(MemoryDriver):
     """On cancel, a row the store holds is called FAULT and the access over, as if the transfer
     had been torn down; the transfer in the store goes on regardless."""
@@ -679,6 +707,16 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
         DEFAULT_CAPABILITIES,
         "test_drain_is_one_way",
     ),
+    "drain turns true without a budget": (
+        DrainNeedsABudget,
+        DEFAULT_CAPABILITIES,
+        "test_drain_polled_without_a_budget_turns_true_once_nothing_runs",
+    ),
+    "drain returns with no budget while a get is in the store": (
+        DrainWaitsForTheRunningGet,
+        DEFAULT_CAPABILITIES,
+        "test_drain_polled_without_a_budget_turns_true_once_nothing_runs",
+    ),
     "close needs a true drain": (
         ClosesAnyTime,
         DEFAULT_CAPABILITIES,
@@ -803,6 +841,11 @@ BROKEN_ASYNC_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities
         DrainSkipsOnChange,
         DEFAULT_CAPABILITIES,
         "test_a_drain_that_ends_an_operation_calls_its_on_change",
+    ),
+    "a put's access stays open while its source is still to be read": (
+        EndsAccessBeforeTheSourceIsRead,
+        DEFAULT_CAPABILITIES,
+        "test_a_put_keeps_its_access_open_while_the_store_still_reads_the_source",
     ),
 }
 

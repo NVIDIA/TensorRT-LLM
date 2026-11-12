@@ -617,6 +617,34 @@ def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> Non
     assert len(manager._cache) == 2
 
 
+@pytest.mark.parametrize("deferred_first", [False, True])
+def test_deferred_prologue_requests_only_reach_libraries_that_declare_support(
+    deferred_first: bool,
+) -> None:
+    """A query that is the raw projection of a deferred prologue must never reach a library that would attend it."""
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    regular_fmha = FakeFmha(attn, "regular", events)
+    deferred_fmha = FakeFmha(attn, "deferred", events)
+    deferred_fmha.supports_deferred_prologue = True
+    manager.fmha_libs = [regular_fmha, deferred_fmha]
+    metadata = _make_metadata(num_contexts=0, num_generations=2)
+    q = torch.empty((2, 4))
+    by_mode = {
+        False: AttentionForwardArgs(kv_append=SimpleNamespace(fold=None)),
+        True: AttentionForwardArgs(kv_append=SimpleNamespace(fold=object())),
+    }
+    order = (True, False) if deferred_first else (False, True)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected = {
+            mode: manager.select(attn, q, None, None, metadata, by_mode[mode]) for mode in order
+        }
+
+    assert selected == {False: regular_fmha, True: deferred_fmha}
+    assert len(manager._cache) == 2
+
+
 @pytest.mark.parametrize("speculative_first", [False, True])
 def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> None:
     events: list[tuple] = []
@@ -864,6 +892,50 @@ def test_fmha_cache_keeps_combined_selections_immutable() -> None:
     assert len(events) == num_events_after_misses
 
 
+@pytest.mark.parametrize("variable_window_first", [False, True])
+def test_fmha_cache_separates_variable_window_selections(variable_window_first: bool) -> None:
+    class _VariableWindowFmha(FakeFmha):
+        supports_variable_window = True
+
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    variable_window_fmha = _VariableWindowFmha(
+        attn,
+        "variable-window",
+        events,
+        support_predicate=lambda args: args.variable_window_token_starts is not None,
+    )
+    regular_fmha = FakeFmha(
+        attn,
+        "regular",
+        events,
+        support_predicate=lambda args: args.variable_window_token_starts is None,
+    )
+    manager.fmha_libs = [variable_window_fmha, regular_fmha]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    regular_args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
+    bounds = torch.zeros(1, dtype=torch.int32)
+    variable_window_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        variable_window_token_starts=bounds,
+        variable_window_token_ends=bounds,
+    )
+    requests = (
+        (variable_window_args, variable_window_fmha),
+        (regular_args, regular_fmha),
+    )
+    if not variable_window_first:
+        requests = tuple(reversed(requests))
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        for forward_args, expected_fmha in requests:
+            selected = manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args)
+            assert selected is expected_fmha
+
+    assert len(manager._cache) == 2
+    assert {key.has_variable_window for key in manager._cache} == {False, True}
+
+
 def test_fmha_cache_is_bypassed_while_autotuning() -> None:
     cases = (
         (False, AttentionInputType.mixed, 1, 1, 1, 2),
@@ -974,3 +1046,60 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     assert isinstance(attn._fmha_manager.fmha_libs[0], _NewFmha)
     assert quant_states_during_construction == [True]
     assert events == [("support", "old", None)]
+
+
+def _listed_fmha(name: str, available: bool, checked: list) -> type:
+    """An FMHA library class that records its availability check."""
+
+    def is_available(cls, attn) -> bool:
+        checked.append((name, attn))
+        return available
+
+    return type(
+        name,
+        (),
+        {"is_available": classmethod(is_available), "__init__": lambda self, attn: None},
+    )
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["undeclared", "empty"])
+def test_manager_without_prepended_libraries_builds_the_registry_list(declared: bool) -> None:
+    checked: list = []
+    registry = [_listed_fmha("First", True, checked), _listed_fmha("Second", True, checked)]
+    attn = FakeAttention()
+    if declared:
+        attn.prepended_fmha_lib_classes = ()
+
+    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
+        manager = FmhaManager(attn)
+
+    assert [type(lib) for lib in manager.fmha_libs] == registry
+    assert TrtllmAttention.prepended_fmha_lib_classes == ()
+
+
+def test_manager_tries_a_prepended_library_first() -> None:
+    checked: list = []
+    registry = [_listed_fmha("First", True, checked), _listed_fmha("Second", True, checked)]
+    prepended = _listed_fmha("Prepended", True, checked)
+    attn = FakeAttention()
+    attn.prepended_fmha_lib_classes = (prepended,)
+
+    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
+        manager = FmhaManager(attn)
+
+    assert [type(lib) for lib in manager.fmha_libs] == [prepended, *registry]
+    assert [name for name, _ in checked] == ["Prepended", "First", "Second"]
+    assert all(checked_attn is attn for _, checked_attn in checked)
+
+
+def test_manager_skips_an_unavailable_prepended_library() -> None:
+    checked: list = []
+    registry = [_listed_fmha("First", True, checked)]
+    attn = FakeAttention()
+    attn.prepended_fmha_lib_classes = (_listed_fmha("Prepended", False, checked),)
+
+    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
+        manager = FmhaManager(attn)
+
+    assert [type(lib) for lib in manager.fmha_libs] == registry
+    assert [name for name, _ in checked] == ["Prepended", "First"]

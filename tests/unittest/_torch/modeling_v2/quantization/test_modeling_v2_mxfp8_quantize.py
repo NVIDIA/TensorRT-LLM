@@ -103,3 +103,21 @@ def test_guard_refuses_a_non_contiguous_input() -> None:
     with pytest.raises(AssertionError, match="contiguous"):
         with validating(op):
             op(x, False, 512)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_routed_hidden() -> None:
+    torch.manual_seed(13)
+    for t in (1, 8, 64, 65, 1024, 8192):
+        x = torch.randn(t, 3584, dtype=torch.bfloat16, device="cuda")
+        data, sf = op(x, False, 512)
+        ref_data, ref_sf = op.reference(x, False, 512)
+        assert data.shape == (t, 3584) and data.dtype == torch.float8_e4m3fn
+        assert sf.shape == (t * 112,) and sf.dtype == torch.uint8
+        assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
+        assert torch.equal(sf, ref_sf)
+        tight_data, tight_sf = op(x, False, 32)
+        assert torch.equal(tight_data.view(torch.uint8), data.view(torch.uint8))
+        assert torch.equal(tight_sf, sf)

@@ -64,6 +64,13 @@
           "title": "Enable Balance",
           "type": "boolean"
         },
+        "enable_kv_balanced_admission": {
+          "default": false,
+          "description": "Admit generation-only requests by per-rank KV load. When True and the first 32 queued requests are all generation-only requests without an attention_dp_rank, the attention DP router chooses which of them to admit and which rank takes each, keeping the largest per-rank request count and KV token count low, instead of admitting them in queue order. Request priorities are respected, and a request passed over in 64 admitting rounds is admitted next. Useful on disaggregated generation workers. Has no effect with kv_cache_routing_conversation_affinity, or with enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+          "status": "prototype",
+          "title": "Enable Kv Balanced Admission",
+          "type": "boolean"
+        },
         "enable_kv_cache_aware_routing": {
           "default": false,
           "description": "Enable internal KV cache-aware routing for attention DP. When enabled, distributes requests among ranks within a single instance's attention DP group, routing them to the rank with the matching prefix KV cache to reduce redundant prefill computation.",
@@ -417,7 +424,8 @@
       "properties": {
         "agent_bounce_buffer_enable": {
           "default": false,
-          "description": "Run the KV-cache bounce in the C++ transfer agent instead of the Python transceiver, using one shared kv_cache_bounce_size_mb buffer (use a power of two). Set this identically on context and generation; kv_cache_bounce_size_mb matters only when its usable capacity (rounded down to a power of two) is below max_chunk_size; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL. By default only writes with many small descriptors (>= 1024, <= 16 KiB average, i.e. head-mismatch layouts) take the path; head-matched layouts (MLA, symmetric TP) stay on standard NIXL unless agent_bounce_params relaxes the gate. Requires the Python (v2) transceiver; see the disaggregated-serving docs.",
+          "description": "DEPRECATED: no-op kept so existing configs still parse; it will be removed in a future release. kv_cache_bounce_size_mb > 0 alone enables the C++ transfer-agent bounce buffer, and 0 disables it.",
+          "status": "deprecated",
           "title": "Agent Bounce Buffer Enable",
           "type": "boolean"
         },
@@ -434,7 +442,7 @@
             }
           ],
           "default": null,
-          "description": "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). Precedence: this dict > environment variable > built-in default. Requires agent_bounce_buffer_enable. request_timeout_ms and the effective max_chunk_size (after the arena clamp) must match between context and generation. max_average_descriptor_size=0 stops outbound routing only (arena, handshake and inbound scatter stay active); set agent_bounce_buffer_enable=False to turn the feature off.",
+          "description": "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). Precedence: this dict > environment variable > built-in default. Requires kv_cache_bounce_size_mb > 0. request_timeout_ms and the effective chunk size (max_chunk_size, capped by the buffer size) must match between context and generation. max_average_descriptor_size=0 stops this worker from sending through the buffer, but it still allocates the buffer and receives bounced writes; set kv_cache_bounce_size_mb=0 to turn the feature off.",
           "title": "Agent Bounce Params"
         },
         "backend": {
@@ -459,13 +467,13 @@
         },
         "enable_pipelined_transfer": {
           "default": false,
-          "description": "Transfer each completed prefill chunk's KV cache while later chunks compute. Requires Python NIXL, generation-first scheduling, chunked prefill, pipeline_parallel_size=1, context_parallel_size=1 on both peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent bounce selected by agent_bounce_buffer_enable is allowed) or Mamba/hybrid cache, and block reuse disabled or set to all_reusable. Invalid static settings fail at startup; per-request constraints reject the request.",
+          "description": "Transfer each completed prefill chunk's KV cache while later chunks compute. Requires Python NIXL, generation-first scheduling, chunked prefill, pipeline_parallel_size=1, context_parallel_size=1 on both peers, beam_width=1, no Mamba/hybrid cache, and block reuse disabled or set to all_reusable. Invalid static settings fail at startup; per-request constraints reject the request.",
           "title": "Enable Pipelined Transfer",
           "type": "boolean"
         },
         "kv_cache_bounce_size_mb": {
           "default": 0,
-          "description": "Capacity in MiB of the native-disagg KV-cache bounce buffer, which coalesces a request's scattered per-block KV for a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. By default two buffers of this size are allocated (one for send, one for recv); with agent_bounce_buffer_enable a single shared buffer is allocated instead and the size should be a power of two (256/512/1024). Requires the Python (v2) transceiver (transceiver_runtime); the C++ transceiver does not support bounce and ignores this field.",
+          "description": "Size in MiB of the KV-cache bounce buffer in the C++ NIXL transfer agent; 0 (default) turns it off and KV fragments are written directly with standard NIXL. A positive value allocates one buffer of this size per rank, shared by send and receive. Use a power of two such as 256, 512 or 1024; for other values only the largest power of two that fits is used. For an eligible write, the sender gathers the fragments into the buffer and sends them in chunks, and the receiver scatters them into its KV cache. By default a write is eligible only with >= 1024 descriptors averaging <= 16 KiB (typical when context and generation split attention heads differently); agent_bounce_params changes that. Set it on both context and generation servers; if either side has 0, the pair uses standard NIXL. If either side's buffer is smaller than max_chunk_size (32 MiB by default), both sides must use the same size, or the pair uses standard NIXL. Requires the Python (v2) transceiver with the C++ NIXL agent; on a build without bounce support (libzmq) a positive value fails at startup. The C++ transceiver and the pure-Python NIXL agent ignore it with a warning.",
           "minimum": 0,
           "title": "Kv Cache Bounce Size Mb",
           "type": "integer"
@@ -540,7 +548,7 @@
             }
           ],
           "default": "PYTHON",
-          "description": "The runtime implementation. 'PYTHON' (default) selects the Python transceiver, while 'CPP' selects the C++ transceiver and requires kv_cache_config.use_kv_cache_manager_v2=False with a model that supports V1. 'auto' adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path.",
+          "description": "The runtime implementation. 'PYTHON' (default) selects the Python transceiver, while 'CPP' selects the C++ transceiver and requires kv_cache_config.use_kv_cache_manager_v2=False with a model that supports V1. 'auto' adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path. The C++ transceiver ('CPP' and None) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period.",
           "title": "Transceiver Runtime"
         }
       },
@@ -554,6 +562,27 @@
         "STATIC_BATCH"
       ],
       "title": "CapacitySchedulerPolicy",
+      "type": "string"
+    },
+    "CheckpointFormat": {
+      "description": "Built-in checkpoint loader formats. Custom registrations can use strings.",
+      "enum": [
+        "HF",
+        "MX",
+        "mistral",
+        "mistral_large_3"
+      ],
+      "title": "CheckpointFormat",
+      "type": "string"
+    },
+    "CheckpointIOPolicy": {
+      "description": "Strategy for reading checkpoint weights and transferring them to GPU.",
+      "enum": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "title": "CheckpointIOPolicy",
       "type": "string"
     },
     "ColdPageQuantizationCompressionConfig": {
@@ -620,6 +649,15 @@
         "FORCE_CHUNK"
       ],
       "title": "ContextChunkingPolicy",
+      "type": "string"
+    },
+    "ContextSchedulingPolicy": {
+      "description": "Order in which the scheduler admits pending context requests.",
+      "enum": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "title": "ContextSchedulingPolicy",
       "type": "string"
     },
     "CpConfig": {
@@ -958,7 +996,7 @@
     },
     "DSparkDecodingConfig": {
       "additionalProperties": false,
-      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. This configuration selects\nnative full-block drafting and does not expose confidence-scheduling or\ncalibration controls.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
+      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. Confidence scheduling is\nopt-in; the default configuration retains native full-block verification.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -1027,6 +1065,42 @@
           "description": "Number of draft positions produced per block. If None, read from the draft model config (dspark_block_size). Should equal max_draft_len.",
           "title": "Block Size"
         },
+        "confidence_calibration_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to a JSON file with per-position temperature-scaling values (key 'sts_temperatures' or 'temperatures') used to calibrate the confidence head. A vector longer than max_draft_len is truncated to its first max_draft_len entries, so one file serves every K. If None, the raw sigmoid is used.",
+          "status": "prototype",
+          "title": "Confidence Calibration Path"
+        },
+        "confidence_cost_table_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to a DSpark cost table: measured decode step times per physical K, rank-local CUDA-graph batch size and verifier-token budget. One file may hold several K values; the entry for max_draft_len is used. Generate one with `python -m tensorrt_llm.tools.dspark_profile_costs`. Required when enable_confidence_scheduling=True.",
+          "status": "prototype",
+          "title": "Confidence Cost Table Path"
+        },
+        "confidence_min_predicted_gain": {
+          "default": 0.04,
+          "description": "Minimum predicted relative goodput gain (expected accepted tokens per millisecond) a compact verifier budget needs over native verification before it is selected. Larger values keep native verification more often.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Confidence Min Predicted Gain",
+          "type": "number"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -1048,6 +1122,20 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "enable_confidence_scheduling": {
+          "default": false,
+          "description": "Enable confidence-guided selection of a measured verifier-token budget for decode-only batches. The full physical draft block is still proposed; target verification and acceptance rules are unchanged. Requires trained confidence-head weights and a cost table (confidence_cost_table_path). Native verification is kept whenever no compact budget is predicted to win by confidence_min_predicted_gain.",
+          "status": "prototype",
+          "title": "Enable Confidence Scheduling",
+          "type": "boolean"
+        },
+        "enable_fused_confidence_scheduler": {
+          "default": true,
+          "description": "Re-rank which draft positions are verified on the GPU, using the confidence of the block being verified rather than the previous step's host copy. The verifier budget is still chosen on the host. On by default; set False to rank on the host only, which drops a device pass and a full input rebuild on compact steps. Only used when enable_confidence_scheduling=True and the overlap scheduler is on; with disable_overlap_scheduler=True, ranking stays on the host.",
+          "status": "prototype",
+          "title": "Enable Fused Confidence Scheduler",
+          "type": "boolean"
         },
         "enable_penalty": {
           "default": false,
@@ -1309,6 +1397,13 @@
           "title": "Enable Heuristic Topk",
           "type": "boolean"
         },
+        "enable_kv_cache_offload": {
+          "default": false,
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 the ratio-4 compressed cache. Each decode step fetches the units the indexer selects into a per-request GPU cache; the indexer and sliding-window caches remain on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
+          "status": "prototype",
+          "title": "Enable Kv Cache Offload",
+          "type": "boolean"
+        },
         "gvr_deterministic_topk": {
           "default": false,
           "description": "Make the self-sampling GVR Top-K deterministic: the selected index set is {score > tau} plus the smallest indices among the ties at tau, and the output order is a fixed function of the input (decode and prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect with enable_heuristic_topk=True and use_self_sampling_topk=True; ignored otherwise.",
@@ -1397,6 +1492,11 @@
           "title": "Indexer Rope Interleave",
           "type": "boolean"
         },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
+        },
         "q_split_threshold": {
           "default": 8192,
           "description": "If number of packed tokens in prefill chunk exceeds this threshold,             q tokens will be evenly distributed across ranks for indexer computation.             If negative, q split will always be disabled.",
@@ -1476,7 +1576,7 @@
         },
         "enable_kv_cache_offload": {
           "default": false,
-          "description": "Offload ratio-4 compressed attention KV history to host memory with KV cache manager v2. The indexer and sliding-window caches remain on GPU. This feature is under development and currently cannot be enabled for inference.",
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 the ratio-4 compressed cache. Each decode step fetches the units the indexer selects into a per-request GPU cache; the indexer and sliding-window caches remain on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
           "type": "boolean"
@@ -1569,6 +1669,11 @@
           "title": "Indexer Rope Interleave",
           "type": "boolean"
         },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
+        },
         "q_split_threshold": {
           "default": 8192,
           "description": "If number of packed tokens in prefill chunk exceeds this threshold,             q tokens will be evenly distributed across ranks for indexer computation.             If negative, q split will always be disabled.",
@@ -1630,6 +1735,160 @@
     },
     "DisaggServerBlock": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "dwdp_config": {
+                "properties": {
+                  "enable_experts": {
+                    "const": true
+                  }
+                },
+                "required": [],
+                "type": "object"
+              }
+            },
+            "required": [
+              "dwdp_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "context_parallel_size": {
+                "const": 1
+              },
+              "cuda_graph_config": {
+                "type": "null"
+              },
+              "dwdp_config": {
+                "properties": {
+                  "dwdp_size": {
+                    "minimum": 2
+                  }
+                }
+              },
+              "pipeline_parallel_size": {
+                "const": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "dwdp_config": {
+                "properties": {
+                  "enable_dense": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "enable_dense"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "dwdp_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "context_parallel_size": {
+                "const": 1
+              },
+              "cuda_graph_config": {
+                "type": "null"
+              },
+              "enable_locality_domains": {
+                "const": false
+              },
+              "lora_config": {
+                "type": "null"
+              },
+              "pipeline_parallel_size": {
+                "const": 1
+              },
+              "prefill_cuda_graph_backend": {
+                "const": "disabled"
+              },
+              "sleep_config": {
+                "type": "null"
+              },
+              "speculative_config": {
+                "type": "null"
+              },
+              "torch_compile_config": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "dwdp_config": {
+                "properties": {
+                  "enable_dense": {
+                    "const": true
+                  },
+                  "enable_experts": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "enable_dense"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "dwdp_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "const": true
+              },
+              "tensor_parallel_size": {
+                "const": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "dwdp_config": {
+                "properties": {
+                  "enable_experts": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "enable_experts"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "dwdp_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enable_attention_dp": {
+                "const": true
+              },
+              "tensor_parallel_size": {
+                "minimum": 2
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "_mpi_session": {
           "description": "Live objects require the Python LLM API.",
@@ -1754,6 +2013,9 @@
         "checkpoint_format": {
           "anyOf": [
             {
+              "$ref": "#/$defs/CheckpointFormat"
+            },
+            {
               "type": "string"
             },
             {
@@ -1761,21 +2023,18 @@
             }
           ],
           "default": null,
-          "description": "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
+          "description": "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
           "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
           "title": "Checkpoint Format"
         },
         "checkpoint_io_policy": {
+          "$ref": "#/$defs/CheckpointIOPolicy",
           "default": "auto",
           "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
-          "enum": [
-            "auto",
-            "native",
-            "rank_striped_read_ahead"
-          ],
-          "status": "prototype",
-          "title": "Checkpoint Io Policy",
-          "type": "string"
+          "status": "prototype"
         },
         "checkpoint_loader": {
           "description": "Live objects require the Python LLM API.",
@@ -2267,10 +2526,16 @@
               },
               "oneOf": [
                 {
-                  "$ref": "#/$defs/ColdPageQuantizationCompressionConfig"
+                  "$ref": "#/$defs/ColdPageQuantizationCompressionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/TriAttentionKvCacheCompressionConfig"
+                  "$ref": "#/$defs/TriAttentionKvCacheCompressionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 }
               ]
             },
@@ -2457,6 +2722,13 @@
           "title": "Mm Encoder Only",
           "type": "boolean"
         },
+        "mnnvl_allreduce_fp8_payload": {
+          "default": false,
+          "description": "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.",
+          "status": "prototype",
+          "title": "Mnnvl Allreduce Fp8 Payload",
+          "type": "boolean"
+        },
         "model": {
           "anyOf": [
             {
@@ -2486,7 +2758,7 @@
           "title": "Model Kwargs"
         },
         "modeling_v2": {
-          "default": "off",
+          "default": "auto",
           "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
           "enum": [
             "off",
@@ -2844,6 +3116,13 @@
           "description": "The request reordering policy to use.",
           "status": "prototype"
         },
+        "replicate_embedding": {
+          "default": false,
+          "description": "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.",
+          "status": "prototype",
+          "title": "Replicate Embedding",
+          "type": "boolean"
+        },
         "request_stats_max_iterations": {
           "anyOf": [
             {
@@ -2902,6 +3181,36 @@
           "description": "Scheduler config.",
           "status": "prototype"
         },
+        "serve_frontend_affinity_port_stride": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
+          "status": "prototype",
+          "title": "Serve Frontend Affinity Port Stride"
+        },
+        "serve_graceful_shutdown_timeout_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an LLM, embedding or multimodal-encoder server waits after a shutdown signal for request handlers that are still running (uvicorn's timeout_graceful_shutdown), in every frontend process. Handlers still running then are cancelled and the server shuts down as usual, so a handler waiting for a final response that never comes cannot hold the shutdown up. None waits for every handler.",
+          "status": "prototype",
+          "title": "Serve Graceful Shutdown Timeout S"
+        },
         "skip_tokenizer_init": {
           "default": false,
           "description": "Whether to skip the tokenizer initialization.",
@@ -2938,25 +3247,46 @@
               },
               "oneOf": [
                 {
-                  "$ref": "#/$defs/QSASparseAttentionConfig"
+                  "$ref": "#/$defs/QSASparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/RocketSparseAttentionConfig"
+                  "$ref": "#/$defs/RocketSparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/DeepSeekSparseAttentionConfig"
+                  "$ref": "#/$defs/DeepSeekSparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/DeepSeekV4SparseAttentionConfig"
+                  "$ref": "#/$defs/DeepSeekV4SparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/CSA2SparseAttentionConfig"
+                  "$ref": "#/$defs/CSA2SparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
+                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/MiniMaxM3SparseAttentionConfig"
+                  "$ref": "#/$defs/MiniMaxM3SparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 }
               ]
             },
@@ -2991,40 +3321,76 @@
               },
               "oneOf": [
                 {
-                  "$ref": "#/$defs/DraftTargetDecodingConfig"
+                  "$ref": "#/$defs/DraftTargetDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/Eagle3DecodingConfig"
+                  "$ref": "#/$defs/Eagle3DecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/EagleDecodingConfig"
+                  "$ref": "#/$defs/EagleDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/MTPDecodingConfig"
+                  "$ref": "#/$defs/MTPDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/NGramDecodingConfig"
+                  "$ref": "#/$defs/NGramDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/SADecodingConfig"
+                  "$ref": "#/$defs/SADecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/UserProvidedDecodingConfig"
+                  "$ref": "#/$defs/UserProvidedDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/SaveHiddenStatesDecodingConfig"
+                  "$ref": "#/$defs/SaveHiddenStatesDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/PARDDecodingConfig"
+                  "$ref": "#/$defs/PARDDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/DFlashDecodingConfig"
+                  "$ref": "#/$defs/DFlashDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/DSparkDecodingConfig"
+                  "$ref": "#/$defs/DSparkDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/AutoDecodingConfig"
+                  "$ref": "#/$defs/AutoDecodingConfig",
+                  "required": [
+                    "decoding_type"
+                  ]
                 }
               ]
             },
@@ -3188,6 +3554,19 @@
           "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
           "status": "prototype",
           "title": "Video Pruning Rate"
+        },
+        "watermark_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WatermarkConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Enables statistical text watermarking of generated tokens (Gumbel-max). Requests may opt out with SamplingParams.watermarking=False unless allow_request_opt_out is False. Greedy and beam-search requests cannot carry a watermark and are generated normally. The key is a secret and must match at detection time (see tensorrt_llm.watermark).",
+          "status": "prototype"
         }
       },
       "type": "object"
@@ -3400,7 +3779,122 @@
     },
     "DwdpConfig": {
       "additionalProperties": false,
-      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\ndouble-buffered P2P remote regions), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enable_experts": {
+                "const": false
+              }
+            },
+            "required": [
+              "enable_experts"
+            ]
+          },
+          "then": {
+            "properties": {
+              "contention_opt": {
+                "const": false
+              },
+              "dwdp_size": {
+                "const": 1
+              },
+              "enable_dense": {
+                "const": true
+              },
+              "num_experts_per_worker": {
+                "const": 0
+              },
+              "num_groups": {
+                "const": 1
+              },
+              "num_prefetch_experts": {
+                "const": 0
+              },
+              "num_prefetch_slots": {
+                "const": 2
+              }
+            },
+            "required": [
+              "enable_dense"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "contention_opt": {
+                "const": true
+              }
+            },
+            "required": [
+              "contention_opt"
+            ]
+          },
+          "then": {
+            "properties": {
+              "copy_mode": {
+                "enum": [
+                  "batched",
+                  null
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "gather_kernel": {
+                "enum": [
+                  "register",
+                  "tma"
+                ]
+              }
+            },
+            "required": [
+              "gather_kernel"
+            ]
+          },
+          "then": {
+            "properties": {
+              "copy_mode": {
+                "const": "gather"
+              }
+            },
+            "required": [
+              "copy_mode"
+            ]
+          }
+        }
+      ],
+      "anyOf": [
+        {
+          "properties": {
+            "num_experts_per_worker": {
+              "const": 0
+            },
+            "num_prefetch_experts": {
+              "const": 0
+            }
+          }
+        },
+        {
+          "properties": {
+            "num_experts_per_worker": {
+              "minimum": 1
+            },
+            "num_prefetch_experts": {
+              "minimum": 1
+            }
+          },
+          "required": [
+            "num_experts_per_worker",
+            "num_prefetch_experts"
+          ]
+        }
+      ],
+      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).\n\nDense DWDP (enable_dense) also shards the replicated dense weights of the\nMoE decoder layers, over the DWDP group or, without expert DWDP\n(enable_experts=False), over the attention-DP ranks of one instance.",
       "properties": {
         "contention_opt": {
           "default": false,
@@ -3408,15 +3902,67 @@
           "title": "Contention Opt",
           "type": "boolean"
         },
+        "copy_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "per_slice",
+                "batched",
+                "gather"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The transfer of every DWDP copy, the expert prefetch and the dense gathers alike: per_slice (one copy-engine copy per slice), batched (one batched copy-engine copy per layer) or gather (the SM fabric gather kernel, which keeps SMs from the compute kernels while it runs). None keeps the default selection: the expert prefetch uses per_slice, batched with contention_opt, or gather when the TRTLLM_DWDP_PREFETCH_GATHER environment variable is set (deprecated: set copy_mode instead); dense copies follow the expert transfer, and dense DWDP without expert DWDP uses batched. contention_opt requires batched or None.",
+          "status": "prototype",
+          "title": "Copy Mode"
+        },
         "dwdp_size": {
           "default": 1,
           "description": "The number of GPUs per DWDP group.",
           "title": "Dwdp Size",
           "type": "integer"
         },
+        "enable_dense": {
+          "default": false,
+          "description": "Dense DWDP: row-shard the replicated dense weights of the MoE decoder layers (attention, shared expert, router and the other dense weights of the MoE block) over the DWDP group, or without expert DWDP over the attention-DP ranks of the instance, and gather each layer into small staging slots two layers ahead of its use, which frees most of them for the KV cache. Only for models whose decoder layers provide dense DWDP roots (Kimi-K3), on context servers: trtllm-serve refuses it on a generation server (--server_role GENERATION, TRTLLM_DISAGG_ROLE=generation, or a generation server of a disaggregated MPI launch) and warns on any other server without the context role, so launch context servers with --server_role CONTEXT (gRPC servers: TRTLLM_DISAGG_ROLE=context). Every server of the DWDP group must set the same value. It needs eager execution (no CUDA graphs, torch.compile or prefill CUDA graphs), no sleep, LoRA or speculative config, locality domains off, pipeline and context parallel size 1 and FABRIC peer handles; with expert DWDP also tensor parallel size 1 and disable_overlap_scheduler=True, without it enable_attention_dp with tensor_parallel_size > 1.",
+          "status": "prototype",
+          "title": "Enable Dense",
+          "type": "boolean"
+        },
+        "enable_experts": {
+          "default": true,
+          "description": "Expert DWDP: each worker of the DWDP group stores a range of the routed experts and prefetches the others from its peers. Set it to False, with enable_dense, for dense DWDP alone on one attention-DP instance (enable_attention_dp with tensor_parallel_size > 1), whose dense weights are then sharded over the instance's attention-DP ranks; the expert DWDP fields (dwdp_size, num_groups, num_experts_per_worker, num_prefetch_experts, contention_opt, num_prefetch_slots) must then keep their defaults.",
+          "status": "prototype",
+          "title": "Enable Experts",
+          "type": "boolean"
+        },
+        "gather_kernel": {
+          "anyOf": [
+            {
+              "enum": [
+                "register",
+                "tma"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The kernel of the SM fabric gather (copy_mode='gather'): register (16-byte loads through registers) or tma (bulk copies staged in shared memory, which needs SM90 or newer and enough opt-in shared memory; without them the gather falls back to register with a warning). None keeps the TRTLLM_DWDP_GATHER_KERNEL environment variable (deprecated: set gather_kernel instead), and register when it is unset. Requires copy_mode='gather'.",
+          "status": "prototype",
+          "title": "Gather Kernel"
+        },
         "num_experts_per_worker": {
           "default": 0,
-          "description": "The number of experts per worker.",
+          "description": "The number of routed experts each worker stores in a strided expert partition, where worker r stores the experts from r * num_prefetch_experts. Leave both fields at 0 (the default) for the balanced partition: every worker stores floor or ceil of num_experts / dwdp_size contiguous experts, and no expert is stored twice.",
+          "minimum": 0,
           "title": "Num Experts Per Worker",
           "type": "integer"
         },
@@ -3428,8 +3974,16 @@
         },
         "num_prefetch_experts": {
           "default": 0,
-          "description": "The number of prefetch experts per worker.",
+          "description": "The stride between the first experts of consecutive workers in a strided expert partition (not a number of prefetched experts). Equal to num_experts_per_worker for disjoint ranges, smaller for ranges that overlap. Leave both fields at 0 for the balanced partition.",
+          "minimum": 0,
           "title": "Num Prefetch Experts",
+          "type": "integer"
+        },
+        "num_prefetch_slots": {
+          "default": 2,
+          "description": "The number of expert prefetch buffer slots. Each slot holds the remote experts of one MoE layer; more slots let the prefetch run further ahead of the MoE compute, at the cost of device memory that is then not available to the KV cache.",
+          "minimum": 2,
+          "title": "Num Prefetch Slots",
           "type": "integer"
         }
       },
@@ -3668,19 +4222,6 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
-        },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
         },
         "sa_config": {
           "anyOf": [
@@ -3967,19 +4508,6 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
-        },
         "spec_dec_variant": {
           "default": 3,
           "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
@@ -4188,6 +4716,61 @@
         "dtype"
       ],
       "title": "EncodeExtraInputSpec",
+      "type": "object"
+    },
+    "GenPreemptionConfig": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "tpot_budget": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "target_output_tps": {
+              "type": "null"
+            }
+          }
+        }
+      ],
+      "description": "GEN slot preemption on a disaggregated generation worker.\n\nWhen every slot is taken and the next waiting request is at risk of missing\nits TTFT target, a decode request is paused in place for it. Set at most\none field to bound the TPOT cost (neither: off). Needs the auto GEN\nadmission policy and the KV cache manager V2 scheduler.",
+      "properties": {
+        "target_output_tps": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-request output tokens/s floor kept by about 80% of requests.",
+          "status": "prototype",
+          "title": "Target Output Tps"
+        },
+        "tpot_budget": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1.0,
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Allowed mean-TPOT increase from pauses, as a fraction (0.10 = +10%).",
+          "status": "prototype",
+          "title": "Tpot Budget"
+        }
+      },
+      "title": "GenPreemptionConfig",
       "type": "object"
     },
     "GmsConfig": {
@@ -4633,7 +5216,7 @@
         },
         "mixed_precision_first_n": {
           "default": 256,
-          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept in whole cache pages.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision First N",
@@ -4641,7 +5224,7 @@
         },
         "mixed_precision_last_n": {
           "default": 256,
-          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept in whole cache pages.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision Last N",
@@ -4714,7 +5297,7 @@
             }
           ],
           "default": true,
-          "description": "Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. 'auto' uses the model-specific preference and falls back to False when the model does not declare one.",
+          "description": "Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. 'auto' uses the model-specific preference and falls back to False when the model does not declare one. V1 is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period.",
           "status": "prototype",
           "title": "Use Kv Cache Manager V2"
         },
@@ -5116,6 +5699,28 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "draft_lm_head_dtype": {
+          "default": "auto",
+          "description": "LM head that greedy MTP-Eagle drafts are sampled from. 'auto': the target LM head. 'mxfp8': an MXFP8 copy of the BF16 vocabulary-parallel head (SM 100 / SM 103 with the CuTe DSL, no attention DP), read by a fused GEMV + argmax for draft passes of up to 16 rows; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "mxfp8"
+          ],
+          "status": "prototype",
+          "title": "Draft Lm Head Dtype",
+          "type": "string"
+        },
+        "draft_moe_dtype": {
+          "default": "auto",
+          "description": "Routed experts of an MTP layer that the checkpoint keeps in BF16. 'auto': as loaded. 'nvfp4': quantized to NVFP4 at load time (weight scales from the weights, fixed activation scales) and run on the TRTLLM-gen MoE like the target layers; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "nvfp4"
+          ],
+          "status": "prototype",
+          "title": "Draft Moe Dtype",
+          "type": "string"
         },
         "dynamic_tree_max_topK": {
           "anyOf": [
@@ -5608,47 +6213,13 @@
         "load_balancer": {
           "anyOf": [
             {
-              "additionalProperties": false,
-              "description": "Pydantic configuration model for the Mixture of Experts (MoE) load balancer.\n\nThis model holds configuration data (`num_slots`, etc.) as well as\nruntime state (`_ep_rank`, `_ep_size`) which must be set via the\n`setup()` method before use.",
-              "properties": {
-                "initial_global_assignments": {
-                  "anyOf": [
-                    {
-                      "additionalProperties": {
-                        "items": {
-                          "type": "integer"
-                        },
-                        "type": "array"
-                      },
-                      "type": "object"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Initial Global Assignments"
-                },
-                "layer_updates_per_iter": {
-                  "default": 0,
-                  "title": "Layer Updates Per Iter",
-                  "type": "integer"
-                },
-                "num_slots": {
-                  "anyOf": [
-                    {
-                      "type": "integer"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Num Slots"
-                }
-              },
-              "title": "MoeLoadBalancerConfig",
-              "type": "object"
+              "$ref": "#/$defs/MoeLoadBalancerConfig"
+            },
+            {
+              "$ref": "#/$defs/MoePerLayerDynamicLoadBalancerConfig",
+              "required": [
+                "mode"
+              ]
             },
             {
               "type": [
@@ -5656,7 +6227,10 @@
                 "null"
               ]
             }
-          ]
+          ],
+          "default": null,
+          "description": "Configuration for standard or per-layer dynamic EPLB.",
+          "title": "Load Balancer"
         },
         "max_num_tokens": {
           "anyOf": [
@@ -5679,6 +6253,106 @@
         }
       },
       "title": "MoeConfig",
+      "type": "object"
+    },
+    "MoeLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure the standard asynchronous EPLB implementation.",
+      "properties": {
+        "initial_global_assignments": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Initial expert placement keyed by MoE layer index. Each value has `num_slots` entries, gives the expert ID held by each global slot, and covers every expert.",
+          "title": "Initial Global Assignments"
+        },
+        "layer_updates_per_iter": {
+          "default": 0,
+          "description": "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB.",
+          "title": "Layer Updates Per Iter",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "standard",
+          "default": "standard",
+          "description": "EPLB mode. `standard` is static EPLB when `layer_updates_per_iter` is 0 and online EPLB otherwise. Configs without `mode` use `standard`.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots.",
+          "title": "Num Slots"
+        }
+      },
+      "title": "MoeLoadBalancerConfig",
+      "type": "object"
+    },
+    "MoePerLayerDynamicLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure per-layer dynamic EPLB with Halo-Q scheduling.",
+      "properties": {
+        "auxiliary_sms": {
+          "default": 4,
+          "description": "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
+          "maximum": 8,
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Auxiliary Sms",
+          "type": "integer"
+        },
+        "helper_slot_mode": {
+          "default": "per_layer_resident",
+          "description": "Storage of the helper slots. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass.",
+          "enum": [
+            "per_layer_resident",
+            "shared_banks"
+          ],
+          "status": "prototype",
+          "title": "Helper Slot Mode",
+          "type": "string"
+        },
+        "mode": {
+          "const": "per_layer_dynamic",
+          "default": "per_layer_dynamic",
+          "description": "EPLB mode. `per_layer_dynamic` replicates each MoE layer's hot experts into helper slots in every forward pass, planned from that layer's current routing.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and greater than the number of experts. Each rank keeps its `num_experts / ep_size` resident experts and adds `(num_slots - num_experts) / ep_size` helper slots. Unlike standard EPLB, the helper slots are not static replicas: every forward pass refills them from that layer's routing; see `helper_slot_mode` for their storage.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Slots",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_slots"
+      ],
+      "title": "MoePerLayerDynamicLoadBalancerConfig",
       "type": "object"
     },
     "MooncakeStoreConfig": {
@@ -5862,6 +6536,13 @@
           "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
           "status": "prototype",
           "title": "Video Pruning Rate"
+        },
+        "vision_gpu_normalize": {
+          "default": false,
+          "description": "Normalize supported uint8 vision inputs on the GPU instead of the CPU. Applies only to models that opt in and whose processors preserve the required normalization settings and pixel layout. Unsupported inputs keep the existing CPU preprocessing path. False (default) disables GPU normalization.",
+          "status": "prototype",
+          "title": "Vision Gpu Normalize",
+          "type": "boolean"
         }
       },
       "title": "MultimodalConfig",
@@ -7448,6 +8129,27 @@
           "default": null,
           "description": "The context chunking policy to use"
         },
+        "context_scheduling_policy": {
+          "$ref": "#/$defs/ContextSchedulingPolicy",
+          "default": "fcfs",
+          "description": "Order in which pending context requests are admitted: 'fcfs' (arrival order) or 'shortest_uncached_first' (fewest prompt tokens not covered by reusable KV cache first, which lowers TTFT under load at the cost of fairness). Only the KV cache manager V2 scheduler supports 'shortest_uncached_first'.",
+          "status": "prototype"
+        },
+        "context_starvation_iterations": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With context_scheduling_policy='shortest_uncached_first', chunked prefill and a max_num_tokens budget: a context request pending for more than this many scheduler iterations takes up to a quarter of max_num_tokens of each iteration's budget ahead of the shortest-first order, oldest first. None disables it.",
+          "status": "prototype",
+          "title": "Context Starvation Iterations"
+        },
         "dynamic_batch_config": {
           "anyOf": [
             {
@@ -7465,6 +8167,11 @@
           "description": "Use KV prefix-reuse estimates for scheduler admission, duplicate-request deferral, and token-budget decisions. This is orthogonal to kv_cache_config.enable_block_reuse.",
           "title": "Enable Prefix Aware Scheduling",
           "type": "boolean"
+        },
+        "gen_preemption": {
+          "$ref": "#/$defs/GenPreemptionConfig",
+          "description": "GEN slot preemption on disaggregated generation workers.",
+          "status": "prototype"
         },
         "use_python_scheduler": {
           "default": false,
@@ -7560,6 +8267,37 @@
         }
       },
       "title": "SleepConfig",
+      "type": "object"
+    },
+    "SparseKvCacheOffloadConfig": {
+      "additionalProperties": false,
+      "description": "Memory sizing for sparse attention KV cache offload.\n\nWith offload, the KV history a sparse attention layer selects from lives in\nhost memory, and each request keeps a GPU cache of the units its selections\nname.",
+      "properties": {
+        "gpu_cache_factor": {
+          "default": 2.0,
+          "description": "Size of each request's GPU cache for offloaded attention history, in selections: the cache holds this many times the units one decode step selects, plus the unit being written, rounded up to whole pages. A larger cache keeps more history on the GPU between decode steps, so fewer units are fetched from host memory, at the cost of GPU memory per request.",
+          "minimum": 1.0,
+          "status": "prototype",
+          "title": "Gpu Cache Factor",
+          "type": "number"
+        },
+        "host_history_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pinned host memory in bytes, per rank, for offloaded attention history and the staging buffers that publish it to the GPU. The KV cache manager holds the history pools within it, beside the GPU KV cache quota, which it does not lower; a size too small for the batches the manager must always hold, such as one max_seq_len request, is rejected. It is separate from kv_cache_config.host_cache_size, the host tier that evicted KV cache pages move to, and the two together must fit this rank's share of available host memory and the pinned-memory limit. When unset, the history pools come first: they may take the host memory automatic sizing may pin, beside the staging buffers and, unless kv_cache_config.host_cache_size or a disk tier is set, room in the host tier for one max_seq_len request. Either way it is an upper bound: the history pools share their slot count with the GPU KV cache pools, so they pin only what the GPU quota's slots pair with. When unset, the automatic host tier takes the host memory they leave, up to the GPU KV cache quota.",
+          "status": "prototype",
+          "title": "Host History Size"
+        }
+      },
+      "title": "SparseKvCacheOffloadConfig",
       "type": "object"
     },
     "TelemetryConfig": {
@@ -7935,11 +8673,248 @@
       ],
       "title": "WaitingQueuePolicy",
       "type": "string"
+    },
+    "WatermarkConfig": {
+      "additionalProperties": false,
+      "description": "Configuration of the statistical text watermark applied while sampling.\n\nThe watermark is keyed: the same ``key`` and sampling settings are needed\nto detect it later. ``key`` is a secret and is excluded from ``repr``.",
+      "properties": {
+        "algorithm": {
+          "default": "gumbel",
+          "description": "Watermarking algorithm. 'gumbel' replaces the random draw of the final token selection with a keyed Gumbel-max draw, which leaves the output distribution unchanged on average over keys. 'gumbel_dual_key' is the same for ordinary decoding and additionally supports speculative decoding with rejection sampling: draft tokens are drawn under the key, and the tokens that replace rejected drafts (or follow the last accepted one) under a second key derived from it, which keeps the output distribution exact.",
+          "enum": [
+            "gumbel",
+            "gumbel_dual_key"
+          ],
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "allow_request_opt_out": {
+          "default": true,
+          "description": "Whether a request may disable watermarking with SamplingParams.watermarking=False. Set to False to enforce the watermark on every request that can carry one.",
+          "title": "Allow Request Opt Out",
+          "type": "boolean"
+        },
+        "allow_target_only_watermarking": {
+          "default": false,
+          "description": "Only relevant to rejection-sampling speculative decoding. Accepted draft tokens are then not watermarked, so the signal weakens in proportion to the acceptance rate.",
+          "title": "Allow Target Only Watermarking",
+          "type": "boolean"
+        },
+        "context_width": {
+          "default": 4,
+          "description": "Number of preceding tokens that seed each sampling decision. Larger values make the mark less robust to edits.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Context Width",
+          "type": "integer"
+        },
+        "deduplicate_contexts": {
+          "default": "single_turn",
+          "description": "How repeated contexts are treated. A repeated context would repeat its token and be counted as independent evidence, so it falls back to ordinary sampling. 'none' disables this; 'single_turn' deduplicates within the tokens this request generates; 'all' also searches the prompt (for instance earlier turns of a conversation) and leaves the first context_width generated tokens unwatermarked, so short answers do not share a random context across requests.",
+          "enum": [
+            "none",
+            "single_turn",
+            "all"
+          ],
+          "title": "Deduplicate Contexts",
+          "type": "string"
+        },
+        "deduplicate_contexts_max_history": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 8192,
+          "description": "How many generated positions back the repeated-context search reaches. None means the whole generation.",
+          "title": "Deduplicate Contexts Max History"
+        },
+        "key": {
+          "description": "Secret key, an integer in [0, 2**64). Detection needs the same value.",
+          "exclusiveMaximum": 18446744073709551616,
+          "minimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Key",
+          "type": "integer"
+        },
+        "prf": {
+          "const": "philox",
+          "default": "philox",
+          "description": "Pseudo-random function that turns (key, context) into per-token random numbers. Fast and parallel, but not a cryptographic PRF: it does not protect against key recovery or forgery.",
+          "title": "Prf",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "title": "WatermarkConfig",
+      "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-disagg-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-disagg-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_experts": {
+                "const": true
+              }
+            },
+            "required": [],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "context_parallel_size": {
+            "const": 1
+          },
+          "cuda_graph_config": {
+            "type": "null"
+          },
+          "dwdp_config": {
+            "properties": {
+              "dwdp_size": {
+                "minimum": 2
+              }
+            }
+          },
+          "pipeline_parallel_size": {
+            "const": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_dense": {
+                "const": true
+              }
+            },
+            "required": [
+              "enable_dense"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "context_parallel_size": {
+            "const": 1
+          },
+          "cuda_graph_config": {
+            "type": "null"
+          },
+          "enable_locality_domains": {
+            "const": false
+          },
+          "lora_config": {
+            "type": "null"
+          },
+          "pipeline_parallel_size": {
+            "const": 1
+          },
+          "prefill_cuda_graph_backend": {
+            "const": "disabled"
+          },
+          "sleep_config": {
+            "type": "null"
+          },
+          "speculative_config": {
+            "type": "null"
+          },
+          "torch_compile_config": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_dense": {
+                "const": true
+              },
+              "enable_experts": {
+                "const": true
+              }
+            },
+            "required": [
+              "enable_dense"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "const": true
+          },
+          "tensor_parallel_size": {
+            "const": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_experts": {
+                "const": false
+              }
+            },
+            "required": [
+              "enable_experts"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "enable_attention_dp": {
+            "const": true
+          },
+          "tensor_parallel_size": {
+            "minimum": 2
+          }
+        }
+      }
+    }
+  ],
   "description": "Static YAML checks only; runtime validation remains authoritative.",
   "properties": {
     "_mpi_session": {
@@ -8061,6 +9036,9 @@
     "checkpoint_format": {
       "anyOf": [
         {
+          "$ref": "#/$defs/CheckpointFormat"
+        },
+        {
           "type": "string"
         },
         {
@@ -8068,21 +9046,18 @@
         }
       ],
       "default": null,
-      "description": "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
+      "description": "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
       "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      },
       "title": "Checkpoint Format"
     },
     "checkpoint_io_policy": {
+      "$ref": "#/$defs/CheckpointIOPolicy",
       "default": "auto",
       "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
-      "enum": [
-        "auto",
-        "native",
-        "rank_striped_read_ahead"
-      ],
-      "status": "prototype",
-      "title": "Checkpoint Io Policy",
-      "type": "string"
+      "status": "prototype"
     },
     "checkpoint_loader": {
       "description": "Live objects require the Python LLM API.",
@@ -8652,10 +9627,16 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/ColdPageQuantizationCompressionConfig"
+              "$ref": "#/$defs/ColdPageQuantizationCompressionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/TriAttentionKvCacheCompressionConfig"
+              "$ref": "#/$defs/TriAttentionKvCacheCompressionConfig",
+              "required": [
+                "algorithm"
+              ]
             }
           ]
         },
@@ -8847,6 +9828,13 @@
       "title": "Mm Encoder Only",
       "type": "boolean"
     },
+    "mnnvl_allreduce_fp8_payload": {
+      "default": false,
+      "description": "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.",
+      "status": "prototype",
+      "title": "Mnnvl Allreduce Fp8 Payload",
+      "type": "boolean"
+    },
     "model": {
       "anyOf": [
         {
@@ -8876,7 +9864,7 @@
       "title": "Model Kwargs"
     },
     "modeling_v2": {
-      "default": "off",
+      "default": "auto",
       "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
       "enum": [
         "off",
@@ -9265,6 +10253,13 @@
       "description": "The request reordering policy to use.",
       "status": "prototype"
     },
+    "replicate_embedding": {
+      "default": false,
+      "description": "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.",
+      "status": "prototype",
+      "title": "Replicate Embedding",
+      "type": "boolean"
+    },
     "request_stats_max_iterations": {
       "anyOf": [
         {
@@ -9319,6 +10314,36 @@
       "description": "Scheduler config.",
       "status": "prototype"
     },
+    "serve_frontend_affinity_port_stride": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
+      "status": "prototype",
+      "title": "Serve Frontend Affinity Port Stride"
+    },
+    "serve_graceful_shutdown_timeout_s": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an LLM, embedding or multimodal-encoder server waits after a shutdown signal for request handlers that are still running (uvicorn's timeout_graceful_shutdown), in every frontend process. Handlers still running then are cancelled and the server shuts down as usual, so a handler waiting for a final response that never comes cannot hold the shutdown up. None waits for every handler.",
+      "status": "prototype",
+      "title": "Serve Graceful Shutdown Timeout S"
+    },
     "server_keep_alive_timeout": {
       "default": 10,
       "title": "Server Keep Alive Timeout",
@@ -9360,25 +10385,46 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/QSASparseAttentionConfig"
+              "$ref": "#/$defs/QSASparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/RocketSparseAttentionConfig"
+              "$ref": "#/$defs/RocketSparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/DeepSeekSparseAttentionConfig"
+              "$ref": "#/$defs/DeepSeekSparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/DeepSeekV4SparseAttentionConfig"
+              "$ref": "#/$defs/DeepSeekV4SparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/CSA2SparseAttentionConfig"
+              "$ref": "#/$defs/CSA2SparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
+              "$ref": "#/$defs/SkipSoftmaxAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/MiniMaxM3SparseAttentionConfig"
+              "$ref": "#/$defs/MiniMaxM3SparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             }
           ]
         },
@@ -9413,40 +10459,76 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/DraftTargetDecodingConfig"
+              "$ref": "#/$defs/DraftTargetDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/Eagle3DecodingConfig"
+              "$ref": "#/$defs/Eagle3DecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/EagleDecodingConfig"
+              "$ref": "#/$defs/EagleDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/MTPDecodingConfig"
+              "$ref": "#/$defs/MTPDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/NGramDecodingConfig"
+              "$ref": "#/$defs/NGramDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/SADecodingConfig"
+              "$ref": "#/$defs/SADecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/UserProvidedDecodingConfig"
+              "$ref": "#/$defs/UserProvidedDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/SaveHiddenStatesDecodingConfig"
+              "$ref": "#/$defs/SaveHiddenStatesDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/PARDDecodingConfig"
+              "$ref": "#/$defs/PARDDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/DFlashDecodingConfig"
+              "$ref": "#/$defs/DFlashDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/DSparkDecodingConfig"
+              "$ref": "#/$defs/DSparkDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/AutoDecodingConfig"
+              "$ref": "#/$defs/AutoDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             }
           ]
         },
@@ -9604,9 +10686,22 @@
       "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
       "status": "prototype",
       "title": "Video Pruning Rate"
+    },
+    "watermark_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WatermarkConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Enables statistical text watermarking of generated tokens (Gumbel-max). Requests may opt out with SamplingParams.watermarking=False unless allow_request_opt_out is False. Greedy and beam-search requests cannot carry a watermark and are generated normally. The key is a secret and must match at detection time (see tensorrt_llm.watermark).",
+      "status": "prototype"
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve disaggregated --config",
+  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve disaggregated --config",
   "type": "object"
 }

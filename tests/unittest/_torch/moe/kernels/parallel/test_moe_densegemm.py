@@ -237,6 +237,48 @@ def test_nvfp4_dense_gemm_swiglu_blackwell(
     )
 
 
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+def test_nvfp4_dense_gemm_swiglu_cluster_padded_n_tiles():
+    """N tiles that the cluster shape pads past the last expert leave every output byte as is."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVFP4DenseGemmSwigluRunner
+
+    sf_vec_size = 16
+    # 7 experts x 1536 columns are 42 N tiles of 256: cluster N 4 pads two of them, cluster N 2
+    # none. 1024 tokens take several persistent waves, so padded tiles run after valid ones.
+    num_expert, weight_per_expert, m, k = 7, 1536, 1024, 256
+    a_bf16 = torch.randint(-1, 2, (m, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    b_bf16 = torch.randint(
+        -1, 2, (num_expert, weight_per_expert, k), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+    a_global_sf = a_bf16.abs().max().float() / (448 * 6)
+    b_global_sf = b_bf16.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a_bf16, 1 / a_global_sf, sf_vec_size, False)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b_bf16, 1 / b_global_sf, sf_vec_size, False)
+    inputs = [
+        a.view(torch.float4_e2m1fn_x2),
+        b.view(torch.float4_e2m1fn_x2),
+        a_sf,
+        b_sf.view(num_expert, weight_per_expert, k // sf_vec_size),
+        a_global_sf * b_global_sf,
+        torch.rand(m, num_expert, dtype=torch.float32, device="cuda") * 0.4 + 0.8,
+        # |up * silu(gate)| <= k * k for entries in [-1, 1].
+        torch.tensor([448 * 6 / k**2], dtype=torch.float32, device="cuda"),
+    ]
+    runner = CuteDSLNVFP4DenseGemmSwigluRunner(
+        num_expert, weight_per_expert, torch.float4_e2m1fn_x2, sf_vec_size
+    )
+    padded_c, padded_sf = runner(inputs, tactic=((128, 256), (1, 4)))
+    c, c_sf = runner(inputs, tactic=((128, 256), (1, 2)))
+
+    assert torch.equal(padded_c.view(torch.uint8), c.view(torch.uint8))
+    assert torch.equal(padded_sf, c_sf), (
+        f"{(padded_sf != c_sf).sum().item()} scale-factor bytes differ"
+    )
+
+
 def nvfp4_dense_gemm_fc2_ref(
     a: torch.Tensor,
     b: torch.Tensor,

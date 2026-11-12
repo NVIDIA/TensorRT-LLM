@@ -344,8 +344,8 @@ commands:
         - "--num_postprocess_workers"
       num_serve_frontends:
         type: int
-        default: 1
-        status: prototype
+        default: 8
+        status: beta
         required: false
         multiple: false
         is_flag: false
@@ -378,6 +378,24 @@ commands:
         is_flag: true
         flags:
         - "--openengine-enable-load-metrics"
+      openengine_metrics_host:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-metrics-host"
+      openengine_metrics_port:
+        type: int
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-metrics-port"
       otlp_traces_endpoint:
         type: str
         default: null
@@ -416,7 +434,7 @@ commands:
         flags:
         - "--post_processor_hook"
       reasoning_parser:
-        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm', 'glm45', 'glm47', 'glm_moe_dsa', 'k-exaone', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
+        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm', 'glm45', 'glm47', 'glm_moe_dsa', 'k-exaone', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'musespark', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
         required: false
@@ -491,7 +509,7 @@ commands:
         flags:
         - "--tokenizer"
       tool_parser:
-        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'kimi_k3', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
+        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'kimi_k3', 'minimax_m2', 'minimax_m3', 'musespark', 'poolside_v1', 'qwen3', 'qwen3_coder'])
         default: null
         status: prototype
         required: false

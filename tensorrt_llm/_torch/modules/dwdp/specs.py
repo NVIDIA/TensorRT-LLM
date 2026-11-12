@@ -19,65 +19,267 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Dict, List, Tuple
+from typing import Dict, List, Literal, Sequence, Tuple
 
 import torch
 
-# (local_start, local_end_capped) for one peer DWDP rank.  ``local_start``
-# is ``peer_rank * num_prefetch_experts`` (the rank-to-rank stride).
-# ``local_end_capped`` is the *valid* upper bound — i.e.,
-# ``min(local_start + num_experts_per_worker, num_experts_total)``; the
-# tail rank's storage may extend past ``num_experts_total`` but the cap
-# truncates the valid range.  Adjacent ranks' valid ranges may overlap
-# when ``num_prefetch_experts < num_experts_per_worker`` (redundancy mode).
+# ``(start, end)``: one DWDP rank stores the routed experts ``[start, end)`` in rows
+# ``0 .. end - start - 1`` of its expert weights.  ``ExpertPartition.ranges`` holds one per rank;
+# adjacent ranges overlap only in a redundant partition.
 PeerRange = Tuple[int, int]
 # Indexed by peer DWDP rank; ``len(PeerRanges) == dwdp_size``.
 PeerRanges = List[PeerRange]
 
-
-def compute_peer_ranges(
-    *,
-    dwdp_size: int,
-    num_experts_per_worker: int,
-    num_prefetch_experts: int,
-    num_experts_total: int,
-) -> PeerRanges:
-    """Compute every peer rank's valid expert range.
-
-    Each peer's storage holds ``num_experts_per_worker`` slots starting
-    at ``peer_rank * num_prefetch_experts``.  The valid range is the
-    storage range capped at ``num_experts_total`` (the model's total
-    expert count), which truncates any padding on the tail rank.
-
-    All ranks deterministically compute the same ``PeerRanges`` from the
-    shared ``DwdpConfig``, so no allgather is required.
-    """
-    ranges: PeerRanges = []
-    for peer_rank in range(dwdp_size):
-        start = peer_rank * num_prefetch_experts
-        end_capped = min(start + num_experts_per_worker, num_experts_total)
-        ranges.append((start, end_capped))
-    return ranges
+# How an ``ExpertPartition`` was made; see its docstring.
+PartitionKind = Literal["balanced", "uniform", "redundant", "capped", "custom"]
 
 
 def lookup_owner(expert_id: int, peer_ranges: PeerRanges) -> int:
-    """Return the lowest peer rank whose valid range contains ``expert_id``.
+    """Return the lowest peer rank whose range contains ``expert_id``.
 
-    For uniform partition this is equivalent to
-    ``expert_id // (num_experts_total // dwdp_size)``.  For redundancy
+    Without overlap that is the one rank storing it.  For redundancy
     (overlapping ranges) the first-match policy picks the lowest-rank
     owner, matching the IPC implementation's behavior so reads of the
     same expert id are deterministic across peers.
 
     Raises:
-        ValueError: If no peer's valid range contains ``expert_id``.
-            This is impossible when the partition passes the coverage
-            check ``(dwdp_size - 1) * stride + size >= num_experts``.
+        ValueError: If no peer's range contains ``expert_id``.  The ranges
+            of an ``ExpertPartition`` cover every expert, so this never
+            happens for them.
     """
     for peer_rank, (start, end) in enumerate(peer_ranges):
         if start <= expert_id < end:
             return peer_rank
     raise ValueError(f"expert_id={expert_id} not owned by any peer in peer_ranges={peer_ranges}")
+
+
+_BALANCED_HINT = (
+    "Leave num_experts_per_worker and num_prefetch_experts both at 0 for the balanced partition, "
+    "which stores every expert once on any dwdp_size."
+)
+
+
+@dataclass(frozen=True)
+class ExpertPartition:
+    """Which routed experts each DWDP rank stores: one contiguous range per rank, every MoE layer.
+
+    ``ranges[r] == (start, end)``: rank ``r`` stores experts ``[start, end)`` in rows
+    ``0 .. end - start - 1`` of its expert weights, allocates exactly those rows and exports them
+    in its handles.  Every rank computes the same partition (``from_config``) from
+    ``DwdpConfig``, ``dwdp_size`` and the model's expert count; it is the only source of any
+    rank's range for ``DwdpManager``, ``MoE._init_dwdp_expert_layout``, ``setup_dwdp`` and the
+    transport.  The ranges ascend, the first starts at 0, the last ends at ``num_experts`` and
+    none starts after the previous one ends, so every expert has an owner: ``lookup_owner``
+    picks the lowest rank storing it.
+
+    Kinds:
+
+    * ``balanced`` (both config fields 0): with ``divmod(num_experts, dwdp_size) == (base,
+      rem)``, ranks below ``rem`` store ``base + 1`` experts and the others ``base``, as
+      ``_compute_ep_partition`` splits EP ranks.  No expert is stored twice.
+    * ``uniform``, ``redundant`` and ``capped`` (``strided``, both fields set): rank ``r`` stores
+      ``num_experts_per_worker`` experts from ``r * num_prefetch_experts``, capped at
+      ``num_experts``.
+    * ``custom`` (``from_counts``): contiguous ranges of given counts, for tests and tools.
+
+    Attributes:
+        num_experts: Routed experts of every MoE layer.
+        ranges: ``(start, end)`` per DWDP rank.
+        kind: How the ranges were made.
+    """
+
+    num_experts: int
+    ranges: Tuple[PeerRange, ...]
+    kind: PartitionKind
+
+    def __post_init__(self) -> None:
+        if self.num_experts <= 0:
+            raise ValueError(f"[DWDP] num_experts must be positive, got {self.num_experts}")
+        if not self.ranges:
+            raise ValueError("[DWDP] an expert partition needs at least one rank")
+        prev_start, prev_end = 0, 0
+        for rank, (start, end) in enumerate(self.ranges):
+            if not 0 <= start < end <= self.num_experts:
+                raise ValueError(
+                    f"[DWDP] rank {rank} stores experts [{start}, {end}), which is empty or not "
+                    f"within [0, {self.num_experts})"
+                )
+            if rank == 0 and start != 0:
+                raise ValueError(
+                    f"[DWDP] rank 0 stores experts [{start}, {end}); experts [0, {start}) have "
+                    f"no owner"
+                )
+            if rank > 0 and (not prev_start < start <= prev_end or end <= prev_end):
+                raise ValueError(
+                    f"[DWDP] rank {rank} stores experts [{start}, {end}) after rank {rank - 1}'s "
+                    f"[{prev_start}, {prev_end}); the ranges must ascend without a gap"
+                )
+            prev_start, prev_end = start, end
+        if prev_end != self.num_experts:
+            raise ValueError(
+                f"[DWDP] the last rank's range ends at {prev_end}; experts "
+                f"[{prev_end}, {self.num_experts}) have no owner"
+            )
+
+    @classmethod
+    def balanced(cls, *, num_experts: int, dwdp_size: int) -> ExpertPartition:
+        """Floor or ceil of ``num_experts / dwdp_size`` per rank, the larger ones on the low ranks.
+
+        Raises:
+            ValueError: ``num_experts < dwdp_size``: a rank would store no expert.
+        """
+        if dwdp_size <= 0 or num_experts < dwdp_size:
+            raise ValueError(
+                f"[DWDP] cannot split {num_experts} routed experts over dwdp_size={dwdp_size} "
+                f"ranks: every rank must store at least one expert"
+            )
+        base, rem = divmod(num_experts, dwdp_size)
+        ranges = tuple(
+            (rank * base + min(rank, rem), (rank + 1) * base + min(rank + 1, rem))
+            for rank in range(dwdp_size)
+        )
+        return cls(num_experts=num_experts, ranges=ranges, kind="balanced")
+
+    @classmethod
+    def strided(
+        cls, *, num_experts: int, dwdp_size: int, size: int, stride: int
+    ) -> ExpertPartition:
+        """``size`` experts per rank, ``stride`` apart: the two strided ``DwdpConfig`` fields.
+
+        ``size`` is ``num_experts_per_worker`` and ``stride`` is ``num_prefetch_experts``.  Rank
+        ``r`` stores ``[r * stride, min(r * stride + size, num_experts))``.  Accepted:
+
+        * ``uniform``: ``stride == size`` and ``dwdp_size * size == num_experts``.
+        * ``redundant``: ``stride < size`` and ``(dwdp_size - 1) * stride + size ==
+          num_experts``; adjacent ranks both store ``size - stride`` experts, which the lower
+          rank serves.
+        * ``capped``: ``stride == size`` and ``(dwdp_size - 1) * size < num_experts < dwdp_size *
+          size``; the last rank stores the ``num_experts - (dwdp_size - 1) * size`` experts left
+          and allocates only those rows.
+
+        Raises:
+            ValueError: Any other combination: a value that is not positive, a stride larger
+                than the size (experts nobody stores), too few experts in total, overlapping
+                ranges past ``num_experts``, or a last rank left without experts.
+        """
+        if size <= 0 or stride <= 0:
+            raise ValueError(
+                f"[DWDP] num_experts_per_worker ({size}) and num_prefetch_experts ({stride}) "
+                f"must both be positive in a strided expert partition. {_BALANCED_HINT}"
+            )
+        if stride > size:
+            raise ValueError(
+                f"[DWDP] num_prefetch_experts ({stride}) must be <= num_experts_per_worker "
+                f"({size}): a stride larger than the range size leaves experts nobody stores. "
+                f"{_BALANCED_HINT}"
+            )
+        coverage = (dwdp_size - 1) * stride + size
+        if coverage == num_experts:
+            kind = "uniform" if stride == size else "redundant"
+        elif stride == size and (dwdp_size - 1) * size < num_experts < coverage:
+            kind = "capped"
+        else:
+            if coverage < num_experts:
+                problem = f"so experts [{coverage}, {num_experts}) have no owner"
+            elif stride < size:
+                problem = f"past the {num_experts} routed experts, with overlapping ranges"
+            else:
+                problem = f"and the last rank would store none of the {num_experts} routed experts"
+            raise ValueError(
+                f"[DWDP] num_experts_per_worker={size}, num_prefetch_experts={stride} on "
+                f"dwdp_size={dwdp_size}: the last rank's range ends at (dwdp_size - 1) * "
+                f"num_prefetch_experts + num_experts_per_worker = {coverage}, {problem}. A strided "
+                f"partition must end at {num_experts}, or use equal values and cut the last "
+                f"range short at {num_experts}. {_BALANCED_HINT}"
+            )
+        ranges = tuple(
+            (rank * stride, min(rank * stride + size, num_experts)) for rank in range(dwdp_size)
+        )
+        return cls(num_experts=num_experts, ranges=ranges, kind=kind)
+
+    @classmethod
+    def from_counts(cls, counts: Sequence[int]) -> ExpertPartition:
+        """Contiguous ranges of ``counts[r]`` experts each, from expert 0 (tests and tools)."""
+        ranges = []
+        start = 0
+        for count in counts:
+            ranges.append((start, start + count))
+            start += count
+        return cls(num_experts=start, ranges=tuple(ranges), kind="custom")
+
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        num_experts: int,
+        dwdp_size: int,
+        num_experts_per_worker: int,
+        num_prefetch_experts: int,
+    ) -> ExpertPartition:
+        """The partition ``DwdpConfig`` asks for, for a model with ``num_experts`` routed experts.
+
+        Both fields 0: ``balanced``; otherwise ``strided``, which needs both positive.
+
+        Raises:
+            ValueError: The config gives no valid partition of ``num_experts`` experts over
+                ``dwdp_size`` ranks.
+        """
+        if num_experts_per_worker == 0 and num_prefetch_experts == 0:
+            return cls.balanced(num_experts=num_experts, dwdp_size=dwdp_size)
+        return cls.strided(
+            num_experts=num_experts,
+            dwdp_size=dwdp_size,
+            size=num_experts_per_worker,
+            stride=num_prefetch_experts,
+        )
+
+    @property
+    def dwdp_size(self) -> int:
+        """Number of DWDP ranks."""
+        return len(self.ranges)
+
+    @property
+    def peer_ranges(self) -> PeerRanges:
+        """``ranges`` as the ``PeerRanges`` list ``lookup_owner`` and the copy plans take."""
+        return list(self.ranges)
+
+    def range_of(self, rank: int) -> PeerRange:
+        """``(start, end)`` of the experts ``rank`` stores."""
+        return self.ranges[rank]
+
+    def count_of(self, rank: int) -> int:
+        """Number of experts ``rank`` stores: the rows of its expert weights."""
+        start, end = self.ranges[rank]
+        return end - start
+
+    def describe(self) -> str:
+        """The kind and the per-rank counts, e.g. ``balanced, 8 x 75 + 4 x 74 of 896``.
+
+        Overlapping ranges add the extra copies: ``redundant, 12 x 82 of 896, 88 duplicate
+        copies``.
+        """
+        counts = [end - start for start, end in self.ranges]
+        groups = " + ".join(
+            f"{counts.count(count)} x {count}" for count in sorted(set(counts), reverse=True)
+        )
+        duplicates = sum(counts) - self.num_experts
+        extra = f", {duplicates} duplicate copies" if duplicates else ""
+        return f"{self.kind}, {groups} of {self.num_experts}{extra}"
+
+
+def handle_geometry(expert_bytes: int, start: int, end: int, granularity: int) -> Tuple[int, int]:
+    """``(phys_size, data_offset)`` of the handle that holds experts ``[start, end)`` of one weight.
+
+    The handle spans the ``granularity`` pages the experts' bytes touch, and they start
+    ``data_offset`` bytes into it.  A VMM handle maps only whole (offset 0 and its full size,
+    whatever its type), and an imported handle carries no size: the exporter allocates exactly
+    ``phys_size`` and every importer maps exactly ``phys_size``, computed from the exporter's
+    range.  ``PageAlignedLayout.compute`` gives the same ``mnnvl_size`` and ``data_offset``.
+    """
+    start_bytes = start * expert_bytes
+    page_start = _align_down(start_bytes, granularity)
+    page_end = _align_up(end * expert_bytes, granularity)
+    return page_end - page_start, start_bytes - page_start
 
 
 @dataclass(frozen=True)
@@ -232,11 +434,12 @@ class PageAlignedLayout:
       that each pool-backed region is an exact multiple of pool page handles,
       avoiding cuMemMap overlap between pool pages and the MNNVL handle.
 
-    When ``pool_granularity > granularity``, a padding region appears between
-    the pool-backed pre-region and the MNNVL region (``pre_padding`` bytes) and
-    between the MNNVL region and the pool-backed post-region (``post_padding``
-    bytes).  The tensor view must start at ``va_base + pre_padding`` so that
-    expert indices line up with the correct physical memory.
+    When ``pool_granularity > granularity``, ``pre_size`` is ``page_start``
+    rounded up: the first ``pre_padding`` bytes of the reservation (before
+    expert 0) are unused pool-backed space, and the tensor view must start at
+    ``va_base + pre_padding`` so that expert indices line up with the correct
+    physical memory.  Likewise the last ``post_padding`` bytes of the
+    reservation are unused.  The MNNVL region abuts both pool-backed regions.
 
     Attributes:
         expert_bytes: Bytes per single expert.
@@ -253,8 +456,8 @@ class PageAlignedLayout:
         mnnvl_size: VA bytes for MNNVL region (multiple of granularity).
         post_size: VA bytes for pool-backed post-region (multiple of
             pool_granularity).
-        pre_padding: Extra bytes at end of pre-region due to pool_granularity
-            rounding (pre_size - page_start).
+        pre_padding: Unused bytes at the start of the pre-region (before
+            expert 0) due to pool_granularity rounding (pre_size - page_start).
         post_padding: Extra bytes at end of post-region due to pool_granularity
             rounding.
         data_offset: local_start_bytes - page_start (same as leading_edge).
@@ -349,8 +552,9 @@ class PageAlignedLayout:
         mnnvl_size = page_end - page_start
 
         # Validate: mnnvl_size must not exceed the handle's physical size.
-        # On GB200, cuMemMap with fabric handles requires size == phys_size
-        # (partial mapping returns CUDA_ERROR_NOT_SUPPORTED).
+        # cuMemMap maps a handle only whole (offset 0, size == phys_size; any
+        # handle type, else CUDA_ERROR_NOT_SUPPORTED), and the transport
+        # allocates it with handle_geometry(), whose size is mnnvl_size.
         if mnnvl_size > handle_phys_size:
             raise ValueError(
                 f"mnnvl_size ({mnnvl_size}) exceeds handle_phys_size "

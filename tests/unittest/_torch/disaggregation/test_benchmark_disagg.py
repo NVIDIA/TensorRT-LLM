@@ -34,7 +34,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.error_classification import ErrorBudget
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler import RankState, RequestScheduler, ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 
 pytestmark = pytest.mark.cpu_only
@@ -739,7 +739,7 @@ class MockPadDummyExecutor:
         expected_num_active_requests: int = 1,
         num_fetch_requests: int = 0,
         benchmark_req_queues_size: int = 8,
-        tp_size: int = 1,
+        tp_size: int = 2,
     ):
         self.is_benchmark_disagg = is_benchmark_disagg
         self._benchmark_fill_phase_active = (
@@ -905,6 +905,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
         ex.active_requests = []
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -946,7 +947,13 @@ class TestBenchmarkFillAdmissionFlowControl:
 
         ex.dist = Mock()
         ex.dist.tp_size = tp_size
+        ex.adp_router = Mock()
         return ex
+
+    @staticmethod
+    def _admitted_cap(ex) -> int:
+        """``max_new_requests`` of the last ``ADPRouter.pop_requests`` call."""
+        return ex.adp_router.pop_requests.call_args.args[2]
 
     @staticmethod
     def _expected_ramp(tp_size: int, total_max: int) -> list:
@@ -961,22 +968,21 @@ class TestBenchmarkFillAdmissionFlowControl:
         return seq
 
     @pytest.mark.parametrize("tp_size", [1, 4, 32])
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_first_iter_caps_at_tp_size(self, mock_get_from_waiting_queue, tp_size):
+    def test_first_iter_caps_at_tp_size(self, tp_size):
         """Iter 0 of the ramp must still cap at tp_size — this is the
         load-bearing iter-0 burst protection (PR #12206 fail-fast)."""
         ex = self._make_executor(tp_size=tp_size)
         waiting_queue = Mock()
-        all_ranks_num_active_requests = [0] * tp_size
+        all_rank_states = [RankState(rank=r) for r in range(tp_size)]
 
         ex._pop_from_waiting_queue(
             waiting_queue,
             total_num_active_requests=0,
-            all_ranks_num_active_requests=all_ranks_num_active_requests,
+            all_rank_states=all_rank_states,
         )
 
-        mock_get_from_waiting_queue.assert_called_once()
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        ex.adp_router.pop_requests.assert_called_once()
+        max_new_requests = self._admitted_cap(ex)
 
         assert max_new_requests == tp_size, (
             "Iter 0 of the benchmark-fill admission ramp must cap at tp_size "
@@ -986,10 +992,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         assert ex._fill_admit_cap == tp_size
 
     @pytest.mark.parametrize("tp_size", [1, 4, 8, 32])
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_ramp_doubles_each_iter_and_saturates_at_total_max(
-        self, mock_get_from_waiting_queue, tp_size
-    ):
+    def test_ramp_doubles_each_iter_and_saturates_at_total_max(self, tp_size):
         """Each subsequent fill-phase iter doubles the admission cap, and the
         cap saturates at `total_max` (never exceeds the global capacity)."""
         ex = self._make_executor(tp_size=tp_size)
@@ -1002,9 +1005,9 @@ class TestBenchmarkFillAdmissionFlowControl:
             ex._pop_from_waiting_queue(
                 Mock(),
                 total_num_active_requests=0,
-                all_ranks_num_active_requests=[0] * tp_size,
+                all_rank_states=[RankState(rank=r) for r in range(tp_size)],
             )
-            _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+            max_new_requests = self._admitted_cap(ex)
             observed.append(max_new_requests)
 
         # The ramp matches tp_size, 2*tp_size, ..., total_max.
@@ -1018,19 +1021,18 @@ class TestBenchmarkFillAdmissionFlowControl:
         max_iters = (total_max // tp_size).bit_length() + 1
         assert len(expected) <= max_iters
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_no_fill_phase_uses_full_available_capacity(self, mock_get_from_waiting_queue):
+    def test_no_fill_phase_uses_full_available_capacity(self):
         ex = self._make_executor(fill_phase_active=False)
         waiting_queue = Mock()
-        all_ranks_num_active_requests = [0, 0, 0, 0]
+        all_rank_states = [RankState(rank=r) for r in range(4)]
 
         ex._pop_from_waiting_queue(
             waiting_queue,
             total_num_active_requests=0,
-            all_ranks_num_active_requests=all_ranks_num_active_requests,
+            all_rank_states=all_rank_states,
         )
 
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        max_new_requests = self._admitted_cap(ex)
 
         assert max_new_requests == ex.dist.tp_size * ex.max_num_active_requests
         assert ex._fill_admit_cap == 0, (
@@ -1038,8 +1040,7 @@ class TestBenchmarkFillAdmissionFlowControl:
             "untouched so a future fill phase starts the ramp from tp_size."
         )
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_ramp_state_resets_when_fill_phase_ends(self, mock_get_from_waiting_queue):
+    def test_ramp_state_resets_when_fill_phase_ends(self):
         """After the fill gate opens (`_fill_admit_cap` reset to 0 by
         `_check_benchmark_disagg_gate`), a *subsequent* fill phase starts
         the ramp from tp_size again rather than wherever the previous ramp
@@ -1051,7 +1052,7 @@ class TestBenchmarkFillAdmissionFlowControl:
             ex._pop_from_waiting_queue(
                 Mock(),
                 total_num_active_requests=0,
-                all_ranks_num_active_requests=[0] * 4,
+                all_rank_states=[RankState(rank=r) for r in range(4)],
             )
         assert ex._fill_admit_cap > 4
 
@@ -1065,14 +1066,32 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex._pop_from_waiting_queue(
             Mock(),
             total_num_active_requests=0,
-            all_ranks_num_active_requests=[0] * 4,
+            all_rank_states=[RankState(rank=r) for r in range(4)],
         )
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        max_new_requests = self._admitted_cap(ex)
         assert max_new_requests == 4
         assert ex._fill_admit_cap == 4
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_warmup_skips_throttle(self, mock_get_from_waiting_queue):
+    @pytest.mark.parametrize(
+        "fill_phase_active,is_warmup,kv_balance",
+        [(True, False, False), (False, True, False), (False, False, True)],
+    )
+    def test_kv_balanced_admission_is_off_in_fill_phase_and_warmup(
+        self, fill_phase_active, is_warmup, kv_balance
+    ):
+        """KV-balanced admission is off in the fill phase and warmup."""
+        ex = self._make_executor(tp_size=4, fill_phase_active=fill_phase_active)
+        ex._is_warmup = is_warmup
+
+        ex._pop_from_waiting_queue(
+            Mock(),
+            total_num_active_requests=0,
+            all_rank_states=[RankState(rank=r) for r in range(4)],
+        )
+
+        assert ex.adp_router.pop_requests.call_args.kwargs["kv_balance"] is kv_balance
+
+    def test_warmup_skips_throttle(self):
         """Warmup must bypass the slow-start ramp so warmup iters are not
         artificially throttled and `_fill_admit_cap` stays unchanged."""
         ex = self._make_executor(tp_size=4)
@@ -1081,10 +1100,10 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex._pop_from_waiting_queue(
             Mock(),
             total_num_active_requests=0,
-            all_ranks_num_active_requests=[0] * 4,
+            all_rank_states=[RankState(rank=r) for r in range(4)],
         )
 
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        max_new_requests = self._admitted_cap(ex)
         assert max_new_requests == ex.dist.tp_size * ex.max_num_active_requests
         assert ex._fill_admit_cap == 0
 
@@ -1299,6 +1318,7 @@ class TestFailFastDuringBenchmarkFill:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1682,6 +1702,7 @@ class TestFillPhaseEndToEnd:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1707,16 +1728,14 @@ class TestFillPhaseEndToEnd:
         # Phase 0: Fill-phase admission uses the real waiting-queue path and
         # pulls only tp_size requests per iteration, rather than the full
         # tp_size * max_batch_size queue.
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue"
-        ) as mock_get_from_waiting_queue:
-            ex._pop_from_waiting_queue(
-                waiting_queue=Mock(),
-                total_num_active_requests=0,
-                all_ranks_num_active_requests=[0] * self.TP_SIZE,
-            )
+        ex.adp_router = Mock()
+        ex._pop_from_waiting_queue(
+            waiting_queue=Mock(),
+            total_num_active_requests=0,
+            all_rank_states=[RankState(rank=r) for r in range(self.TP_SIZE)],
+        )
 
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        max_new_requests = ex.adp_router.pop_requests.call_args.args[2]
         assert max_new_requests == self.TP_SIZE
 
         # Phase 1: Fetching requests (gate should not open)

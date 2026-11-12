@@ -35,36 +35,39 @@ from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CacheTransceiverConfig, CalibConfig,
-                                          ContextChunkingPolicy,
+                                          CheckpointIOPolicy,
+                                          ContextChunkingPolicy, CpConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
-                                          DSparkDecodingConfig,
+                                          DSparkDecodingConfig, DwdpConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
                                           EncodeCudaGraphConfig,
-                                          ExecutorMemoryType,
-                                          ExtendedRuntimePerfKnobConfig,
-                                          KvCacheConfig, MambaStateConfig,
-                                          MoeConfig, MTPDecodingConfig,
-                                          MultimodalConfig,
+                                          ExecutorMemoryType, KvCacheConfig,
+                                          MambaStateConfig, MoeConfig,
+                                          MoeLoadBalancerConfig,
+                                          MoePerLayerDynamicLoadBalancerConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
                                           RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
-                                          SleepConfig, SpeculativeConfig,
-                                          StrictBaseModel, TorchCompileConfig,
-                                          TorchLlmArgs,
+                                          SleepConfig,
+                                          SparseKvCacheOffloadConfig,
+                                          SpeculativeConfig, StrictBaseModel,
+                                          TorchCompileConfig, TorchLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict,
                                           update_llm_args_with_extra_options)
@@ -74,6 +77,7 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
 from .test_llm import llama_model_path
@@ -104,14 +108,43 @@ def test_iter_perf_stats_interval_defaults_and_validation() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("policy",
-                         ["auto", "native", "rank_striped_read_ahead"])
+def test_checkpoint_format_accepts_builtin_and_custom_strings() -> None:
+    assert public_llmapi.CheckpointFormat is CheckpointFormat
+    # A built-in format string becomes the enum member with that value.
+    # "mistral" is not the member name MISTRAL, so this checks a value lookup.
+    args = TorchLlmArgs(model=llama_model_path, checkpoint_format="mistral")
+    assert args.checkpoint_format is CheckpointFormat.MISTRAL
+    assert json.loads(args.model_dump_json(include={"checkpoint_format"})) == {
+        "checkpoint_format": "mistral"
+    }
+    # A custom registered format stays a plain string.
+    args = TorchLlmArgs(model=llama_model_path,
+                        checkpoint_format="custom_format")
+    assert type(args.checkpoint_format) is str
+    assert args.checkpoint_format == "custom_format"
+    # A value that is not a string is still rejected.
+    with pytest.raises(ValidationError, match="checkpoint_format"):
+        TorchLlmArgs(model=llama_model_path, checkpoint_format=123)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("policy", list(CheckpointIOPolicy))
+@pytest.mark.parametrize("as_string", [False, True])
 def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
-        policy: str) -> None:
-    assert TorchLlmArgs(model=llama_model_path).checkpoint_io_policy == "auto"
-    args = TorchLlmArgs(model=llama_model_path, checkpoint_io_policy=policy)
-    assert args.checkpoint_io_policy == policy
-    assert args.checkpoint_format == "HF"
+        policy: CheckpointIOPolicy, as_string: bool) -> None:
+    assert public_llmapi.CheckpointIOPolicy is CheckpointIOPolicy
+    assert TorchLlmArgs(
+        model=llama_model_path).checkpoint_io_policy is CheckpointIOPolicy.AUTO
+    args = TorchLlmArgs(
+        model=llama_model_path,
+        checkpoint_io_policy=policy.value if as_string else policy)
+    assert args.checkpoint_io_policy is policy
+    assert json.loads(
+        args.model_dump_json(include={"checkpoint_io_policy"})) == {
+            "checkpoint_io_policy": policy.value
+        }
+    # The default checkpoint format is the enum member, not a plain string.
+    assert args.checkpoint_format is CheckpointFormat.HF
 
 
 @pytest.mark.cpu_only
@@ -252,6 +285,230 @@ moe_backend: TRTLLM
 
 
 @pytest.mark.cpu_only
+class TestMoeConfigPerLayerDynamicEplb:
+
+    @staticmethod
+    def _per_layer_dynamic() -> dict[str, object]:
+        return {"mode": "per_layer_dynamic", "num_slots": 72}
+
+    @pytest.mark.parametrize("backend", ["CUTLASS", "DEEPGEMM"])
+    def test_rejects_explicit_incompatible_backend(self, backend: str) -> None:
+        with pytest.raises(ValidationError,
+                           match=r"EPLB requires backend='MEGAMOE_CUTEDSL'"):
+            MoeConfig(backend=backend, load_balancer=self._per_layer_dynamic())
+
+    @pytest.mark.parametrize("backend", [None, "AUTO", "MEGAMOE_CUTEDSL"])
+    def test_resolves_auto_and_accepts_compatible_backend(
+            self, backend: str | None) -> None:
+        kwargs = {} if backend is None else {"backend": backend}
+
+        config = MoeConfig(load_balancer=self._per_layer_dynamic(), **kwargs)
+
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert config.backend == "MEGAMOE_CUTEDSL"
+        assert config.load_balancer.auxiliary_sms == 4
+        assert config.load_balancer.helper_slot_mode == "per_layer_resident"
+
+    @pytest.mark.parametrize(
+        "num_experts, message",
+        [
+            pytest.param(0, "must be positive", id="zero-experts"),
+            pytest.param(65, "must be divisible", id="non-divisible-experts"),
+            pytest.param(72, "must exceed", id="no-helper-capacity"),
+            pytest.param(80, "must exceed", id="negative-helper-capacity"),
+        ],
+    )
+    def test_validates_physical_slot_capacity_after_setup(
+            self, num_experts: int, message: str) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        config.setup(ep_rank=0, ep_size=8)
+
+        with pytest.raises(ValueError, match=message):
+            config.validate_expert_capacity(num_experts)
+
+    def test_accepts_positive_helper_capacity_after_setup(self) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        config.setup(ep_rank=0, ep_size=8)
+
+        config.validate_expert_capacity(num_experts=64)
+        assert config.num_local_slots == 9
+
+    def test_expert_capacity_requires_setup(self) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        with pytest.raises(ValueError, match=r"Call setup\(\)"):
+            config.validate_expert_capacity(num_experts=64)
+
+    def test_legacy_dictionary_defaults_to_standard_mode(self) -> None:
+        config = MoeConfig(
+            backend="CUTLASS",
+            load_balancer={
+                "num_slots": 64,
+                "layer_updates_per_iter": 2
+            },
+        )
+
+        assert isinstance(config.load_balancer, MoeLoadBalancerConfig)
+        assert config.load_balancer.mode == "standard"
+        assert config.load_balancer.layer_updates_per_iter == 2
+        assert config.backend == "CUTLASS"
+
+    @pytest.mark.parametrize("field", ["num_slots", "auxiliary_sms"])
+    def test_per_layer_dynamic_positive_fields(self, field: str) -> None:
+        values = self._per_layer_dynamic()
+        values[field] = 0
+        with pytest.raises(ValidationError, match=field):
+            MoeConfig(load_balancer=values)
+
+    @pytest.mark.parametrize("auxiliary_sms", [1, 8])
+    def test_per_layer_dynamic_accepts_other_auxiliary_sm_budgets(
+            self, auxiliary_sms: int) -> None:
+        values = self._per_layer_dynamic()
+        values["auxiliary_sms"] = auxiliary_sms
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.auxiliary_sms == auxiliary_sms
+
+    def test_per_layer_dynamic_rejects_more_than_fused_copy_sm_limit(
+            self) -> None:
+        values = self._per_layer_dynamic()
+        values["auxiliary_sms"] = 9
+        with pytest.raises(ValidationError, match="auxiliary_sms"):
+            MoeConfig(load_balancer=values)
+
+    @pytest.mark.parametrize("mode", ["per_layer_resident", "shared_banks"])
+    def test_per_layer_dynamic_accepts_helper_slot_modes(self,
+                                                         mode: str) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = mode
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.helper_slot_mode == mode
+
+    def test_per_layer_dynamic_rejects_unknown_helper_slot_mode(self) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = "per_layer"
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(load_balancer=values)
+
+    def test_standard_mode_rejects_helper_slot_mode(self) -> None:
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(backend="CUTLASS",
+                      load_balancer={
+                          "mode": "standard",
+                          "num_slots": 64,
+                          "helper_slot_mode": "shared_banks",
+                      })
+
+    def test_per_layer_dynamic_disables_decode_cuda_graph(self) -> None:
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": self._per_layer_dynamic()})
+        assert args.cuda_graph_config is None
+
+    def test_per_layer_dynamic_rejects_prefill_cuda_graph(self) -> None:
+        with pytest.raises(ValidationError, match="prefill CUDA graphs"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                moe_config={"load_balancer": self._per_layer_dynamic()})
+
+    def test_legacy_yaml_defaults_to_standard_mode(self,
+                                                   tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("num_slots: 64\nlayer_updates_per_iter: 2\n")
+
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": str(config_path)},
+        )
+
+        assert isinstance(args.moe_config.load_balancer, MoeLoadBalancerConfig)
+        assert args.moe_config.load_balancer.mode == "standard"
+
+    def test_per_layer_dynamic_yaml_sets_backend(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": str(config_path)},
+        )
+
+        assert isinstance(args.moe_config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert args.moe_config.backend == "MEGAMOE_CUTEDSL"
+
+    def test_per_layer_dynamic_yaml_is_typed_by_moe_config_before_llm_args(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+
+        config = MoeConfig(load_balancer=str(config_path))
+
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert config.backend == "MEGAMOE_CUTEDSL"
+
+    def test_per_layer_dynamic_yaml_configures_queue_before_cuda_init(
+            self, tmp_path: Path, monkeypatch) -> None:
+        from tensorrt_llm.llmapi._load_balance_env import \
+            configure_moe_launch_queues
+
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+        # The code under test writes os.environ. Seed the key first so that
+        # monkeypatch records the caller's state and removes "4x" on teardown;
+        # delenv alone records nothing when the key is absent.
+        monkeypatch.setenv("CUDA_SCALE_LAUNCH_QUEUES", "")
+        monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES")
+        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+
+        config = MoeConfig(load_balancer=str(config_path))
+        overrides = configure_moe_launch_queues(config, {"KEEP": "value"})
+
+        assert overrides == {
+            "KEEP": "value",
+            "CUDA_SCALE_LAUNCH_QUEUES": "4x",
+        }
+        assert config.load_balancer.mode == "per_layer_dynamic"
+        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+        assert configure_moe_launch_queues(config, overrides) == overrides
+
+    def test_standard_yaml_does_not_configure_launch_queues(
+            self, tmp_path: Path, monkeypatch) -> None:
+        from tensorrt_llm.llmapi._load_balance_env import \
+            configure_moe_launch_queues
+
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("num_slots: 64\nlayer_updates_per_iter: 2\n")
+        monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES", raising=False)
+        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+
+        config = MoeConfig(load_balancer=str(config_path))
+        original = {"KEEP": "value"}
+
+        assert configure_moe_launch_queues(config, original) is original
+        assert "CUDA_SCALE_LAUNCH_QUEUES" not in original
+
+    def test_yaml_resolution_preserves_missing_file_error(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "missing.yaml"
+
+        with pytest.raises(FileNotFoundError,
+                           match=r"MoE load balancer config file not found:"):
+            MoeConfig(load_balancer=str(config_path))
+
+    def test_yaml_resolution_preserves_invalid_file_error(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "invalid.yaml"
+        config_path.write_text("mode: per_layer_dynamic\n")
+
+        with pytest.raises(
+                ValidationError,
+                match=r"Failed to load MoE load balancer config file:"):
+            MoeConfig(load_balancer=str(config_path))
+
+
+@pytest.mark.cpu_only
 def test_rejection_sampling_allows_attention_dp(monkeypatch):
     """ADP (incl. ADP+LM-head-TP) supports rejection sampling.
 
@@ -297,7 +554,69 @@ def test_rejection_sampling_still_gated_on_context_parallel():
     with pytest.raises(ValueError, match="context parallelism"):
         TorchLlmArgs(model=llama_model_path,
                      context_parallel_size=2,
+                     cp_config=CpConfig(cp_type="HELIX"),
                      speculative_config=spec_cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cp_config",
+    [None,
+     CpConfig(),
+     CpConfig(cp_type="ULYSSES"),
+     CpConfig(cp_type="RING")],
+    ids=["no_cp_config", "default", "ulysses", "ring"])
+def test_context_parallelism_rejects_cp_config_other_than_helix(cp_config):
+    with pytest.raises(ValueError,
+                       match="supports context parallelism only with cp_type "
+                       "HELIX"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     context_parallel_size=2,
+                     cp_config=cp_config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "context_parallel_size,cp_config",
+    [(1, CpConfig()), (1, CpConfig(cp_type="RING")), (1, None),
+     (2, CpConfig(cp_type="HELIX"))],
+    ids=["one_rank_default", "one_rank_ring", "one_rank_no_cp_config", "helix"])
+def test_context_parallelism_accepts_supported_cp_config(
+        context_parallel_size, cp_config):
+    args = TorchLlmArgs(model="/tmp/dummy_model",
+                        context_parallel_size=context_parallel_size,
+                        cp_config=cp_config)
+    assert args.context_parallel_size == context_parallel_size
+    assert args.cp_config == cp_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cp_config",
+                         [CpConfig(), CpConfig(cp_type="RING")],
+                         ids=["default", "ring"])
+def test_single_cp_rank_mapping_carries_no_cp_config(cp_config):
+    args = TorchLlmArgs(model="/tmp/dummy_model",
+                        context_parallel_size=1,
+                        cp_config=cp_config)
+    mapping = args.parallel_config.to_mapping()
+    assert mapping.cp_size == 1
+    assert mapping.cp_config == {}
+    assert args._kv_cache_estimation_runs()
+
+
+@pytest.mark.cpu_only
+def test_context_parallelism_mapping_keeps_cp_config():
+    args = TorchLlmArgs(model="/tmp/dummy_model",
+                        context_parallel_size=2,
+                        cp_config=CpConfig(cp_type="HELIX",
+                                           tokens_per_block=32),
+                        kv_cache_config=KvCacheConfig(tokens_per_block=32))
+    mapping = args.parallel_config.to_mapping()
+    assert mapping.cp_config == {
+        "cp_type": CpType.HELIX,
+        "tokens_per_block": 32
+    }
+    assert not args._kv_cache_estimation_runs()
 
 
 @pytest.mark.cpu_only
@@ -1815,6 +2134,7 @@ class TestMultimodalEncoderCudaGraphConfig:
 class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().vision_gpu_normalize is False
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
@@ -1824,11 +2144,62 @@ class TestMultimodalConfig:
     def test_torch_llm_args_default_multimodal_config(self):
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.vision_gpu_normalize is False
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_vision_gpu_normalize_yaml(self, enabled: bool):
+        config = yaml.safe_load(
+            f"multimodal_config:\n  vision_gpu_normalize: {str(enabled).lower()}\n"
+        )
+        args = TorchLlmArgs(model=llama_model_path, **config)
+        assert args.multimodal_config.vision_gpu_normalize is enabled
+        dumped = args.multimodal_config.model_dump()
+        assert dumped["vision_gpu_normalize"] is enabled
+
+    @pytest.mark.parametrize("value", [None, "invalid", 2, [], {}])
+    def test_vision_gpu_normalize_rejects_invalid_values(self, value):
+        with pytest.raises(ValidationError):
+            MultimodalConfig(vision_gpu_normalize=value)
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("encoder_only", [False, True])
+    def test_vision_gpu_normalize_reaches_input_processor(
+            self, enabled: bool, encoder_only: bool):
+        from tensorrt_llm.llmapi.llm import BaseLLM
+
+        cls = public_llmapi.MultimodalEncoder if encoder_only else TorchLLM
+        llm = cls.__new__(cls)
+        llm.shutdown = lambda: None
+        llm.args = SimpleNamespace(
+            multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
+            trust_remote_code=True,
+            enable_tokenization_cache=False,
+        )
+        llm._hf_model_dir = "unused"
+        for method in ("_try_load_tokenizer", "_try_load_hf_model_config",
+                       "_capture_usage_startup",
+                       "_reject_token_encoder_config_without_buckets",
+                       "_try_load_generation_config",
+                       "_try_load_generation_config_explicit_values"):
+            setattr(llm, method, lambda *args, **kwargs: None)
+        module = "mm_encoder" if encoder_only else "llm"
+        with patch.object(BaseLLM, "_build_model"), patch(
+                "tensorrt_llm.llmapi.llm.check_quantization_compute_capability"
+        ), patch(
+                "tensorrt_llm.llmapi.llm.check_architecture_registered"), patch(
+                    f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                    side_effect=ValueError(
+                        "input processor boundary")) as factory:
+            with pytest.raises(ValueError, match="input processor boundary"):
+                llm._build_model()
+        kwargs = factory.call_args.kwargs
+        assert kwargs.get("vision_gpu_normalize", False) is enabled
+        assert ("vision_gpu_normalize" in kwargs) is enabled
 
     def test_disable_mm_encoder_disables_encoder_cache(self):
         multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
@@ -2099,6 +2470,48 @@ def test_SchedulerConfig_declaration() -> None:
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
     assert pybind_config.enable_prefix_aware_scheduling is False
+
+
+@pytest.mark.cpu_only
+def test_gen_preemption_config() -> None:
+    assert not SchedulerConfig().gen_preemption.enabled
+    merged = update_llm_args_with_extra_dict({"model": "dummy"},
+                                             yaml.safe_load("""
+scheduler_config:
+  gen_preemption:
+    target_output_tps: 32.5
+"""))
+    config = SchedulerConfig(**merged["scheduler_config"]).gen_preemption
+    assert config.target_output_tps == 32.5 and config.enabled
+    assert SchedulerConfig(gen_preemption={
+        "tpot_budget": 0.1
+    }).gen_preemption.enabled
+    for bad in ({
+            "target_output_tps": 0
+    }, {
+            "tpot_budget": 1.0
+    }, {
+            "tpot_budget": 0.1,
+            "target_output_tps": 40
+    }, {
+            "policy": "wait"
+    }):
+        with pytest.raises(ValidationError):
+            llm_args_mod.GenPreemptionConfig(**bad)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("parallel", [{
+    "pipeline_parallel_size": 2
+}, {
+    "tensor_parallel_size": 2,
+    "enable_attention_dp": True
+}])
+def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
+    on = SchedulerConfig(gen_preemption={"target_output_tps": 40})
+    with pytest.raises(ValueError, match="does not support"):
+        TorchLlmArgs(model=llama_model_path, scheduler_config=on, **parallel)
+    TorchLlmArgs(model=llama_model_path, **parallel)  # off: no restriction
 
 
 @pytest.mark.cpu_only
@@ -3376,21 +3789,6 @@ class TestStrictBaseModelArbitraryArgs:
                           non_existent_field="should_fail")
         assert "non_existent_field" in str(exc_info.value)
 
-    def test_extended_runtime_perf_knob_config_arbitrary_args(self):
-        """Test that ExtendedRuntimePerfKnobConfig rejects arbitrary arguments."""
-        # Valid arguments should work
-        config = ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                               cuda_graph_mode=False)
-        assert config.multi_block_mode == True
-        assert config.cuda_graph_mode == False
-
-        # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
-            ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                          bogus_setting="should_fail")
-        assert "bogus_setting" in str(exc_info.value)
-
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""
         # Valid arguments should work
@@ -3400,7 +3798,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
-        # The shared bounce capacity defaults to off (0), accepts a positive size, and rejects
+        # kv_cache_bounce_size_mb defaults to off (0), accepts a positive size, and rejects
         # negatives at the Pydantic boundary (ge=0).
         assert config.kv_cache_bounce_size_mb == 0
         assert CacheTransceiverConfig(
@@ -3408,24 +3806,18 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
-        # agent_bounce_buffer_enable defaults to the Python implementation (False); enabling the
-        # C++ transfer-agent implementation with a zero capacity is a contradiction.
+        # The deprecated agent_bounce_buffer_enable defaults to False and is
+        # ignored: True with a zero capacity validates.
         assert config.agent_bounce_buffer_enable is False
         assert config.agent_bounce_params is None
         assert CacheTransceiverConfig(
-            kv_cache_bounce_size_mb=512,
-            agent_bounce_buffer_enable=True).agent_bounce_buffer_enable is True
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="kv_cache_bounce_size_mb is 0"):
-            CacheTransceiverConfig(agent_bounce_buffer_enable=True)
+            agent_bounce_buffer_enable=True).kv_cache_bounce_size_mb == 0
 
         # Bounce is Python-transceiver-only: the pybind (C++ transceiver) config
         # carries no bounce fields at all. backend must be set: from_string(None)
         # is a pre-existing _to_pybind limit.
         pybind_config = CacheTransceiverConfig(
-            backend="NIXL",
-            kv_cache_bounce_size_mb=384,
-            agent_bounce_buffer_enable=True)._to_pybind()
+            backend="NIXL", kv_cache_bounce_size_mb=384)._to_pybind()
         assert not any("bounce" in attr for attr in dir(pybind_config))
 
         # Arbitrary arguments should be rejected
@@ -3438,7 +3830,6 @@ class TestStrictBaseModelArbitraryArgs:
         """agent_bounce_params coercion, key/consistency validation, pybind passthrough."""
         # Values are coerced to strings (YAML often yields ints/bools).
         config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
-                                        agent_bounce_buffer_enable=True,
                                         agent_bounce_params={
                                             "max_chunk_size": 4096,
                                             "enable_eager_gather": False
@@ -3448,12 +3839,17 @@ class TestStrictBaseModelArbitraryArgs:
             "enable_eager_gather": "False"
         }
 
-        # Params without the C++ agent implementation are a contradiction: they
-        # would be silently ignored, so validation rejects them outright.
+        # Params with bounce disabled (capacity 0) are a contradiction: they
+        # would be silently ignored, so validation rejects them outright. The
+        # deprecated flag does not change that.
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="agent_bounce_buffer_enable"):
+                           match="kv_cache_bounce_size_mb is 0"):
             CacheTransceiverConfig(
-                kv_cache_bounce_size_mb=512,
+                agent_bounce_params={"copy_stream_count": "2"})
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="kv_cache_bounce_size_mb is 0"):
+            CacheTransceiverConfig(
+                agent_bounce_buffer_enable=True,
                 agent_bounce_params={"copy_stream_count": "2"})
 
         # Unknown keys (here the env-var-style typo WITH the trailing _bytes) are
@@ -3462,7 +3858,6 @@ class TestStrictBaseModelArbitraryArgs:
                            match="max_chunk_size_bytes.*min_descriptor_count"):
             CacheTransceiverConfig(
                 kv_cache_bounce_size_mb=512,
-                agent_bounce_buffer_enable=True,
                 agent_bounce_params={"max_chunk_size_bytes": "4096"})
 
         # Non-dict input fails cleanly in the coercion validator, not with a bare
@@ -3470,8 +3865,39 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
                            match="must be a dict"):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
-                                   agent_bounce_buffer_enable=True,
                                    agent_bounce_params="max_chunk_size=4096")
+
+    def test_cache_transceiver_config_agent_bounce_buffer_enable_is_deprecated_noop(
+            self, monkeypatch):
+        """agent_bounce_buffer_enable is a deprecated no-op that warns only when True."""
+        warnings_seen = []
+        monkeypatch.setattr(
+            llm_args_mod.logger, "warning_once",
+            lambda message, key: warnings_seen.append((message, key)))
+
+        field = CacheTransceiverConfig.model_fields[
+            "agent_bounce_buffer_enable"]
+        assert field.json_schema_extra["status"] == "deprecated"
+
+        # True only warns: the config is otherwise identical to the flag-less one.
+        config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                                        agent_bounce_buffer_enable=True)
+        assert len(warnings_seen) == 1
+        message, key = warnings_seen[0]
+        assert "deprecated" in message
+        assert key == "cache_transceiver_config.agent_bounce_buffer_enable"
+        assert config.model_dump(
+            exclude={"agent_bounce_buffer_enable"}) == CacheTransceiverConfig(
+                kv_cache_bounce_size_mb=512).model_dump(
+                    exclude={"agent_bounce_buffer_enable"})
+        # Re-validating a full dump (as apply_model_defaults_to_llm_args does)
+        # and an explicit False stay silent.
+        warnings_seen.clear()
+        CacheTransceiverConfig(**CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=512).model_dump())
+        CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                               agent_bounce_buffer_enable=False)
+        assert warnings_seen == []
 
     def test_agent_bounce_param_keys_match_cpp_env_knobs(self):
         """AGENT_BOUNCE_PARAM_KEYS must mirror kEnvKnobs in BounceConfig.h (parsed here)."""
@@ -4144,7 +4570,6 @@ class TestPydanticBestPractices:
             "drafter",  # abstract base class type
             "resource_manager",  # abstract base class type
         ],
-        MoeConfig: ["load_balancer"],  # allows multiple types including dict
         RayPlacementConfig: ["placement_groups"],  # contains Ray-specific types
     }
 
@@ -4808,6 +5233,40 @@ sparse_attention_config:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("config_cls", [
+    llm_args_mod.DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+])
+class TestSparseOffloadIndexerDefault:
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("requested", [None, False, True])
+    def test_default_override_and_round_trip(
+        self,
+        config_cls: type[llm_args_mod.DeepSeekSparseAttentionConfig],
+        enabled: bool,
+        requested: bool | None,
+    ) -> None:
+        kwargs = {"enable_kv_cache_offload": enabled}
+        if requested is not None:
+            kwargs["use_cute_dsl_paged_mqa_logits"] = requested
+        expected = True if requested is None else requested
+        config = config_cls(**kwargs)
+
+        for resolved in (
+                config,
+                config_cls.model_validate_json(config.model_dump_json()),
+                config_cls.model_validate(
+                    config.model_dump(exclude_unset=True)),
+        ):
+            assert resolved.use_cute_dsl_paged_mqa_logits is expected
+            assert resolved.to_sparse_params(
+            ).use_cute_dsl_paged_mqa_logits is expected
+            assert resolved.to_sparse_metadata_params(
+            ).use_cute_dsl_paged_mqa_logits is expected
+
+
+@pytest.mark.cpu_only
 class TestDeepSeekV4SparseAttentionConfig:
 
     def test_zero_compress_ratios_are_normalized(self):
@@ -4866,6 +5325,54 @@ class TestDeepSeekV4SparseAttentionConfig:
         with pytest.raises(ValidationError, match="positive index_topk"):
             DeepSeekV4SparseAttentionConfig(index_topk=index_topk,
                                             enable_kv_cache_offload=True)
+
+    def test_kv_cache_offload_size_defaults_round_trip(self):
+        config = DeepSeekV4SparseAttentionConfig()
+
+        assert config.kv_cache_offload_config == SparseKvCacheOffloadConfig()
+        assert config.kv_cache_offload_config.gpu_cache_factor == 2.0
+        assert config.kv_cache_offload_config.host_history_size is None
+        assert config.get_kv_cache_offload_config() is None
+        # Defaults stay valid when a dump passes every field back explicitly.
+        DeepSeekV4SparseAttentionConfig(**config.model_dump())
+
+    def test_kv_cache_offload_sizes_round_trip(self):
+        config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True,
+                                                 kv_cache_offload_config={
+                                                     "gpu_cache_factor": 3.0,
+                                                     "host_history_size":
+                                                     1 << 30
+                                                 })
+
+        restored = DeepSeekV4SparseAttentionConfig.model_validate_json(
+            config.model_dump_json())
+
+        assert restored.get_kv_cache_offload_config(
+        ) == SparseKvCacheOffloadConfig(gpu_cache_factor=3.0,
+                                        host_history_size=1 << 30)
+
+    @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 0.5),
+                                              ("host_history_size", -1)])
+    def test_kv_cache_offload_sizes_reject_out_of_range(self, field, value):
+        with pytest.raises(ValidationError, match=field):
+            SparseKvCacheOffloadConfig(**{field: value})
+
+    @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 3.0),
+                                              ("host_history_size", 1 << 30)])
+    def test_kv_cache_offload_sizes_require_offload(self, field, value):
+        with pytest.raises(ValidationError,
+                           match="requires enable_kv_cache_offload"):
+            DeepSeekV4SparseAttentionConfig(
+                kv_cache_offload_config={field: value})
+
+    def test_only_offloading_configs_report_kv_cache_offload(self):
+        assert llm_args_mod.DeepSeekSparseAttentionConfig(
+        ).get_kv_cache_offload_config() is None
+        assert SkipSoftmaxAttentionConfig().get_kv_cache_offload_config(
+        ) is None
+        config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+        assert config.get_kv_cache_offload_config(
+        ) is config.kv_cache_offload_config
 
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):
@@ -5136,6 +5643,7 @@ class TestTransceiverRuntimeAutoResolution:
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
             context_parallel_size=2,
+            cp_config=CpConfig(cp_type="HELIX"),
             cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
         )
         _resolve_transceiver_runtime_auto(args)
@@ -5307,6 +5815,32 @@ class TestTransceiverRuntimeAutoResolution:
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
         assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
+    def test_model_loader_applies_defaults_from_architecture_override(
+            self, monkeypatch):
+        """Early config loading must include model_kwargs for class defaults."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        class _PreferFlashinferModel:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {"attn_backend": "FLASHINFER"}
+
+        monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
+                            "_resolve_class",
+                            staticmethod(lambda config: _PreferFlashinferModel))
+        fake_loader = self._fake_checkpoint_loader(["PplxDeciderForDecision"])
+        model_kwargs = {"architectures": ["PplxDeciderForDecision"]}
+        args = TorchLlmArgs(model="/tmp/dummy_model", model_kwargs=model_kwargs)
+
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+
+        assert fake_loader.load_config.call_args.kwargs[
+            "model_kwargs"] == model_kwargs
+        assert args.attn_backend == "FLASHINFER"
+
     @pytest.mark.parametrize("arch,expected", [
         ("ModelAForCausalLM", "CPP"),
         ("ModelBForCausalLM", "PYTHON"),
@@ -5469,3 +6003,416 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+class TestDSparkConfidenceScheduling:
+    """Config surface for DSpark confidence-scheduled verification."""
+
+    def _cfg(self, **kw):
+        from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+        kw.setdefault("max_draft_len", 5)
+        return DSparkDecodingConfig(**kw)
+
+    def _scheduled(self, **kw):
+        """Scheduling on with the required cost table."""
+        kw["enable_confidence_scheduling"] = True
+        kw.setdefault("confidence_cost_table_path", "/tmp/costs.json")
+        return self._cfg(**kw)
+
+    def test_defaults_are_off(self):
+        c = self._cfg()
+        assert c.enable_confidence_scheduling is False
+        assert c.confidence_min_predicted_gain == pytest.approx(0.04)
+        assert c.enable_fused_confidence_scheduler is True
+
+    def test_device_reranking_can_be_turned_off(self):
+        c = self._scheduled(enable_fused_confidence_scheduler=False)
+        assert c.enable_confidence_scheduling is True
+        assert c.enable_fused_confidence_scheduler is False
+
+    @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+    def test_device_reranking_needs_the_overlap_scheduler(
+            self, disable_overlap_scheduler):
+        from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+            _rank_dspark_on_host_without_overlap
+        c = self._scheduled()
+        _rank_dspark_on_host_without_overlap(c, disable_overlap_scheduler)
+        assert c.enable_fused_confidence_scheduler is (
+            not disable_overlap_scheduler)
+
+    def test_confidence_paths_are_ignored_when_scheduling_is_off(self):
+        # A static config copied from a dynamic one keeps working.
+        c = self._cfg(confidence_cost_table_path="/tmp/costs.json",
+                      confidence_calibration_path="/tmp/calibration.json")
+        assert c.enable_confidence_scheduling is False
+
+    def test_scheduling_requires_a_cost_table(self):
+        with pytest.raises(ValueError, match="confidence_cost_table_path"):
+            self._cfg(enable_confidence_scheduling=True)
+
+    def test_min_predicted_gain_must_be_non_negative(self):
+        with pytest.raises(ValidationError,
+                           match="confidence_min_predicted_gain"):
+            self._scheduled(confidence_min_predicted_gain=-0.01)
+
+    @pytest.mark.parametrize("field", [
+        "validate_confidence_artifact_freshness",
+        "confidence_sps_live_fingerprint_path",
+        "confidence_admission_receipt_path",
+        "confidence_admission_receipt_sha256",
+        "confidence_verify_len_tiers",
+    ])
+    def test_removed_fields_are_rejected(self, field):
+        with pytest.raises(ValidationError, match=field):
+            self._scheduled(**{field: None})
+
+    def test_physical_k1_resolves_confidence_scheduling_to_static(self):
+        c = self._scheduled(
+            max_draft_len=1,
+            confidence_calibration_path="/tmp/calibration.json",
+        )
+
+        assert c.enable_confidence_scheduling is False
+
+    def test_physical_k1_needs_no_confidence_artifacts(self):
+        c = self._cfg(max_draft_len=1, enable_confidence_scheduling=True)
+
+        assert c.enable_confidence_scheduling is False
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
+
+    def test_physical_k1_remains_valid_when_scheduling_is_off(self):
+        c = self._cfg(max_draft_len=1)
+        assert c.enable_confidence_scheduling is False
+        assert c.max_draft_len == 1
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
+
+    @staticmethod
+    def _environment(**overrides):
+        values = dict(
+            cuda_graph_config=SimpleNamespace(enable_padding=True),
+            moe_config=SimpleNamespace(load_balancer=None),
+            speculative_config=SimpleNamespace(
+                draft_is_embedded_in_target=True),
+            guided_decoding_backend=None,
+            enable_lora=False,
+            lora_config=None,
+            sparse_attention_config=None,
+            pipeline_parallel_size=1,
+            context_parallel_size=1,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_confidence_environment_rejects_standalone_dspark(self):
+        environment = self._environment(speculative_config=SimpleNamespace(
+            draft_is_embedded_in_target=False))
+        with pytest.raises(ValueError,
+                           match="only the embedded DeepSeek-V4 draft"):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({
+                "cuda_graph_config": None
+            }, "requires cuda_graph_config"),
+            (
+                {
+                    "cuda_graph_config": SimpleNamespace(enable_padding=False)
+                },
+                "enable_padding=True",
+            ),
+            ({
+                "guided_decoding_backend": "xgrammar"
+            }, "guided decoding"),
+            ({
+                "enable_lora": True
+            }, "does not yet support LoRA"),
+            ({
+                "pipeline_parallel_size": 2
+            }, "does not yet support pipeline parallelism"),
+            ({
+                "context_parallel_size": 2
+            }, "context_parallel_size=1"),
+            (
+                {
+                    "moe_config":
+                    SimpleNamespace(load_balancer=SimpleNamespace(
+                        mode="per_layer_dynamic"))
+                },
+                "per-layer dynamic EPLB",
+            ),
+            (
+                {
+                    "sparse_attention_config":
+                    SimpleNamespace(
+                        enable_heuristic_topk=True,
+                        use_cute_dsl_topk=False,
+                        use_cute_dsl_paged_mqa_logits=False,
+                    )
+                },
+                "enable_heuristic_topk",
+            ),
+            (
+                {
+                    "sparse_attention_config":
+                    SimpleNamespace(
+                        enable_heuristic_topk=False,
+                        use_cute_dsl_topk=True,
+                        use_cute_dsl_paged_mqa_logits=False,
+                    )
+                },
+                "use_cute_dsl_topk",
+            ),
+            (
+                {
+                    "speculative_config":
+                    SimpleNamespace(draft_is_embedded_in_target=True,
+                                    acceptance_rate_window_size=16,
+                                    acceptance_rate_threshold=0.3)
+                },
+                "acceptance-rate gate",
+            ),
+        ],
+    )
+    def test_confidence_environment_rejects_unsupported_runtime_combinations(
+            self, overrides, message):
+        environment = self._environment(**overrides)
+        with pytest.raises(ValueError, match=message):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    @pytest.mark.parametrize("mode", [None, "standard"])
+    def test_confidence_environment_accepts_padded_cuda_graphs(self, mode):
+        load_balancer = None if mode is None else SimpleNamespace(mode=mode)
+        TorchLlmArgs._validate_dspark_confidence_environment(
+            self._environment(moe_config=SimpleNamespace(
+                load_balancer=load_balancer)))
+
+
+@pytest.mark.cpu_only
+class TestServeGracefulShutdownTimeout:
+    """serve_graceful_shutdown_timeout_s."""
+
+    def test_the_default_waits_for_every_handler(self) -> None:
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert args.serve_graceful_shutdown_timeout_s is None
+
+    @pytest.mark.parametrize("timeout,accepted", [(30, True), (0, False),
+                                                  (-1, False)])
+    def test_the_graceful_shutdown_timeout_is_positive(self, timeout: int,
+                                                       accepted: bool) -> None:
+        if accepted:
+            args = TorchLlmArgs(model="/tmp/dummy_model",
+                                serve_graceful_shutdown_timeout_s=timeout)
+            assert args.serve_graceful_shutdown_timeout_s == timeout
+            return
+        with pytest.raises(ValidationError,
+                           match="serve_graceful_shutdown_timeout_s"):
+            TorchLlmArgs(model="/tmp/dummy_model",
+                         serve_graceful_shutdown_timeout_s=timeout)
+
+
+@pytest.mark.cpu_only
+class TestDwdpConfigModes:
+    """DwdpConfig: expert DWDP, dense DWDP or both, and the settings that fit the choice."""
+
+    def test_the_defaults_keep_expert_dwdp_alone(self) -> None:
+        config = DwdpConfig()
+        assert (config.enable_experts, config.enable_dense,
+                config.copy_mode) == (True, False, None)
+
+    @pytest.mark.parametrize("fields", [
+        dict(enable_dense=True),
+        dict(enable_experts=False, enable_dense=True),
+        dict(enable_experts=False, enable_dense=True, copy_mode="gather"),
+        dict(contention_opt=True, copy_mode="batched"),
+        dict(copy_mode="gather", gather_kernel="tma"),
+        dict(enable_experts=False,
+             enable_dense=True,
+             copy_mode="gather",
+             gather_kernel="register"),
+    ],
+                             ids=[
+                                 "expert+dense", "dense-only",
+                                 "dense-only-gather", "contention-opt-batched",
+                                 "gather-tma", "dense-only-gather-register"
+                             ])
+    def test_accepted_combinations(self, fields: dict) -> None:
+        DwdpConfig(**fields)
+
+    def test_nothing_to_distribute_is_rejected(self) -> None:
+        with pytest.raises(ValidationError,
+                           match="enable_experts and enable_dense are both"):
+            DwdpConfig(enable_experts=False)
+
+    @pytest.mark.parametrize("fields", [
+        dict(dwdp_size=4),
+        dict(num_groups=2),
+        dict(num_experts_per_worker=8, num_prefetch_experts=8),
+        dict(contention_opt=True),
+        dict(num_prefetch_slots=3),
+    ],
+                             ids=lambda fields: ",".join(fields))
+    def test_expert_fields_need_expert_dwdp(self, fields: dict) -> None:
+        """Without expert DWDP the expert fields keep their defaults."""
+        with pytest.raises(
+                ValidationError,
+                match=f"{next(iter(fields))}=.* configure expert DWDP, but "
+                "enable_experts=False turns it off"):
+            DwdpConfig(enable_experts=False, enable_dense=True, **fields)
+
+    @pytest.mark.parametrize("copy_mode", ["per_slice", "gather"])
+    def test_contention_opt_needs_batched_copies(self, copy_mode: str) -> None:
+        with pytest.raises(ValidationError,
+                           match="contention_opt=True selects batched copies"):
+            DwdpConfig(contention_opt=True, copy_mode=copy_mode)
+
+    def test_copy_mode_takes_the_three_transfers_only(self) -> None:
+        with pytest.raises(ValidationError, match="copy_mode"):
+            DwdpConfig(copy_mode="fast")
+
+    @pytest.mark.parametrize("copy_mode", [None, "per_slice", "batched"])
+    def test_gather_kernel_needs_the_gather(self,
+                                            copy_mode: str | None) -> None:
+        with pytest.raises(ValidationError,
+                           match="gather_kernel selects the kernel of the SM "
+                           f"gather, but copy_mode={copy_mode!r}"):
+            DwdpConfig(copy_mode=copy_mode, gather_kernel="tma")
+
+    def test_gather_kernel_takes_register_or_tma_only(self) -> None:
+        with pytest.raises(ValidationError, match="gather_kernel"):
+            DwdpConfig(copy_mode="gather", gather_kernel="fast")
+
+
+_DWDP_EXPERT = dict(dwdp_size=16)
+_DWDP_ATTACHED = dict(dwdp_size=16, enable_dense=True)
+_DWDP_STANDALONE = dict(enable_experts=False, enable_dense=True)
+_ATTENTION_DP = dict(tensor_parallel_size=16, enable_attention_dp=True)
+
+
+@pytest.mark.cpu_only
+class TestDwdpLaunch:
+    """TorchLlmArgs.validate_dwdp_launch: what DWDP rules out in the arguments.
+
+    Expert DWDP needs a DWDP group of complete model replicas without CUDA
+    graphs; dense DWDP runs attached to it (tensor parallel size 1, the overlap
+    scheduler off) or standalone on an attention-DP instance, and needs eager
+    execution without the features it rules out.
+    """
+
+    @staticmethod
+    def _check(dwdp: dict, **fields: Any) -> None:
+        """Run the validator alone on a launch's arguments, applied unvalidated."""
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            skip_tokenizer_init=True,
+                            cuda_graph_config=None,
+                            disable_overlap_scheduler=True)
+        args.model_copy(update={
+            "dwdp_config": DwdpConfig(**dwdp),
+            **fields
+        }).validate_dwdp_launch()
+
+    def test_building_the_arguments_runs_it(self) -> None:
+        """CUDA graphs, on by default, refuse DWDP when the arguments are built."""
+        with pytest.raises(ValidationError,
+                           match="DWDP does not support CUDA graphs"):
+            TorchLlmArgs(model="/tmp/dummy_model",
+                         skip_tokenizer_init=True,
+                         dwdp_config=DwdpConfig(**_DWDP_ATTACHED))
+
+    @pytest.mark.parametrize(("dwdp", "fields"), [
+        (_DWDP_EXPERT, {}),
+        (_DWDP_EXPERT, _ATTENTION_DP),
+        (_DWDP_EXPERT, dict(disable_overlap_scheduler=False)),
+        (_DWDP_ATTACHED, {}),
+        (_DWDP_STANDALONE, _ATTENTION_DP),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP,
+                                disable_overlap_scheduler=False)),
+    ],
+                             ids=[
+                                 "expert", "expert-attention_dp",
+                                 "expert-overlap_scheduler", "attached",
+                                 "standalone", "standalone-overlap_scheduler"
+                             ])
+    def test_accepted_launches(self, dwdp: dict, fields: dict) -> None:
+        self._check(dwdp, **fields)
+
+    @pytest.mark.parametrize(("dwdp", "fields", "error"), [
+        (dict(dwdp_size=1), {}, "DWDP requires dwdp_size > 1, got 1."),
+        (dict(dwdp_size=1,
+              enable_dense=True), {}, "DWDP requires dwdp_size > 1, got 1."),
+        (_DWDP_EXPERT, dict(pipeline_parallel_size=2),
+         "pipeline and context parallelism are not supported"),
+        (_DWDP_EXPERT, dict(context_parallel_size=2),
+         "pipeline and context parallelism are not supported"),
+        (_DWDP_EXPERT, dict(tensor_parallel_size=2),
+         "use tensor_parallel_size=1 (disaggregated context worker) or "
+         "enable_attention_dp=True (aggregated serving)"),
+        (_DWDP_EXPERT, dict(cuda_graph_config=CudaGraphConfig()),
+         "DWDP does not support CUDA graphs"),
+    ],
+                             ids=[
+                                 "dwdp_size", "attached-dwdp_size",
+                                 "pipeline_parallel", "context_parallel",
+                                 "tensor_parallel", "cuda_graphs"
+                             ])
+    def test_expert_dwdp_needs_whole_replicas_without_cuda_graphs(
+            self, dwdp: dict, fields: dict, error: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(error)):
+            self._check(dwdp, **fields)
+
+    @pytest.mark.parametrize(("dwdp", "fields", "error"), [
+        (_DWDP_ATTACHED, _ATTENTION_DP,
+         "this launch has expert DWDP with tensor_parallel_size=16"),
+        (_DWDP_ATTACHED, dict(disable_overlap_scheduler=False),
+         "this launch has expert DWDP with disable_overlap_scheduler=False"),
+        (_DWDP_STANDALONE, dict(tensor_parallel_size=16),
+         "this launch has no expert DWDP and enable_attention_dp=False"),
+        (_DWDP_STANDALONE, dict(enable_attention_dp=True),
+         "this launch has no expert DWDP and tensor_parallel_size=1"),
+        (_DWDP_STANDALONE,
+         dict(**_ATTENTION_DP, cuda_graph_config=CudaGraphConfig()),
+         "requires cuda_graph_config=None, but cuda_graph_config is set"),
+        (_DWDP_ATTACHED, dict(torch_compile_config=TorchCompileConfig()),
+         "requires torch_compile_config=None, but torch_compile_config is set"),
+        (_DWDP_STANDALONE,
+         dict(**_ATTENTION_DP,
+              prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE),
+         "requires prefill_cuda_graph_backend='disabled', but "
+         "prefill_cuda_graph_backend='breakable'"),
+        (_DWDP_ATTACHED, dict(sleep_config=SleepConfig()),
+         "requires sleep_config=None, but sleep_config is set"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, lora_config=LoraConfig()),
+         "requires lora_config=None, but lora_config is set"),
+        (_DWDP_ATTACHED,
+         dict(speculative_config=MTPDecodingConfig(max_draft_len=1)),
+         "requires speculative_config=None, but speculative_config is set"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, enable_locality_domains=True),
+         "requires enable_locality_domains=False, but "
+         "enable_locality_domains=True"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, pipeline_parallel_size=2),
+         "requires pipeline_parallel_size=1, but pipeline_parallel_size=2"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, context_parallel_size=2),
+         "requires context_parallel_size=1, but context_parallel_size=2"),
+    ],
+                             ids=[
+                                 "attached-tensor_parallel",
+                                 "attached-overlap_scheduler",
+                                 "standalone-without_attention_dp",
+                                 "standalone-tensor_parallel_1",
+                                 "cuda_graph_config", "torch_compile_config",
+                                 "prefill_cuda_graph_backend", "sleep_config",
+                                 "lora_config", "speculative_config",
+                                 "enable_locality_domains", "pipeline_parallel",
+                                 "context_parallel"
+                             ])
+    def test_dense_dwdp_requirements(self, dwdp: dict, fields: dict,
+                                     error: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(error)) as raised:
+            self._check(dwdp, **fields)
+        message = str(raised.value)
+        assert message.startswith("Dense DWDP (dwdp_config.enable_dense) ")
+        assert message.endswith("Change the launch configuration or set "
+                                "dwdp_config.enable_dense=False.")
