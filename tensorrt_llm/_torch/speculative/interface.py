@@ -2787,8 +2787,8 @@ class SpecWorkerBase(nn.Module, ABC):
                     target_probs,
                     seed,
                     offset,
-                    slot_ids=spec_metadata.batch_slot_ids[num_contexts:
-                                                          batch_size],
+                    slot_ids=spec_metadata.
+                    batch_slot_ids[num_contexts:batch_size],
                     dummy_slot=spec_metadata.dummy_slot_row,
                     token_level=rejection_sampling_one_model)
             else:
