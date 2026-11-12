@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CuteDSL MegaMoE NVFP4 custom op + TunableRunner.
+"""CuteDSL MegaMoE custom op + TunableRunner (NVFP4 and unquantized BF16).
 
 Wraps the architecture-specific MegaMoE kernel (see
 ``tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/``) into the
 standard TRT-LLM CuteDSL op pattern used by
-``cute_dsl_custom_ops.py``:
+``cute_dsl_custom_ops.py``. The op's ``quant_kind`` argument names the
+kernel's ``QuantKind``: ``"nvfp4"`` (block-scaled, every SM the op supports)
+or ``"bf16"`` (no scale factors anywhere, SM100/SM103 only):
 
 * :class:`Sm100MegaMoENvfp4Runner` is the historically named
   architecture-dispatching :class:`TunableRunner` that
@@ -37,7 +39,7 @@ import dataclasses
 import functools
 import math
 import weakref
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -52,6 +54,7 @@ from tensorrt_llm._torch.autotuner import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import (
+    ActivationType,
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
@@ -68,15 +71,249 @@ _SUPPORTED_MMA_TILE_M = (128, 256)
 _SUPPORTED_MMA_TILE_N = (64, 128, 256)
 
 
+class _MegaMoEOperandFormat(NamedTuple):
+    """What the op ABI carries for one ``QuantKind``."""
+
+    # Bits per dispatched activation element.
+    activation_bits: int
+    # Activation and weight block scale factors (``QuantKind.is_block_scaled``).
+    block_scaled: bool
+    # Per-expert ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const``
+    # (``QuantKind.uses_global_scale``).
+    global_scale: bool
+
+
+# The ``QuantKind`` values (kernels/cutedsl_megamoe/quant_def.py) this op
+# launches. Restated here rather than read off ``QuantKind`` so the backend can
+# size its staging and symmetric buffers without importing the Cutlass DSL;
+# test_megamoe_cute_dsl_bf16.py checks the two agree. The kernel package defines
+# more kinds (mxfp4, mxfp8) that no backend weight method produces yet, so they
+# are not launchable here.
+_MEGAMOE_OPERAND_FORMATS: Dict[str, _MegaMoEOperandFormat] = {
+    "nvfp4": _MegaMoEOperandFormat(activation_bits=4, block_scaled=True, global_scale=True),
+    "bf16": _MegaMoEOperandFormat(activation_bits=16, block_scaled=False, global_scale=False),
+}
+
+
+class _MegaMoEExpertActivation(NamedTuple):
+    """What the kernel runs for one TRT-LLM ``ActivationType``."""
+
+    # The ``ExpertActivation`` value (kernels/cutedsl_megamoe/activation_def.py).
+    kernel_value: str
+    # FC1 holds [gate, up] row pairs, so expand == 2 * intermediate; a
+    # non-gated kind has one FC1 row per feature, so expand == intermediate.
+    gated: bool
+
+
+# The TRT-LLM activations the kernel runs, restated like
+# ``_MEGAMOE_OPERAND_FORMATS`` so the op resolves an activation without
+# importing the Cutlass DSL; test_megamoe_cute_dsl_bf16.py checks the table
+# against the kernel's ``ExpertActivation``. SwigluBias is MiniMax's bias-free
+# package, which the kernel runs as swiglu with swiglu_alpha / swiglu_beta.
+_MEGAMOE_EXPERT_ACTIVATIONS: Dict[ActivationType, _MegaMoEExpertActivation] = {
+    ActivationType.Swiglu: _MegaMoEExpertActivation(kernel_value="swiglu", gated=True),
+    ActivationType.SwigluBias: _MegaMoEExpertActivation(kernel_value="swiglu", gated=True),
+    ActivationType.SiTu: _MegaMoEExpertActivation(kernel_value="situ", gated=True),
+    ActivationType.Relu2: _MegaMoEExpertActivation(kernel_value="relu2", gated=False),
+}
+
+# BF16 tiles K at 64 elements: one 128-byte SMEM swizzle row, i.e. four K=16
+# ``kind::f16`` MMAs per k-tile, the same MMA count as a block-scaled K=256 tile.
+# At K=256 one BF16 A+B stage would cost 128 KB of SMEM and leave room for a
+# single pipeline stage.
+_BF16_MMA_TILE_K = 64
+
+
 __all__ = [
     "IS_MEGAMOE_OP_AVAILABLE",
     "MEGAMOE_OP_UNAVAILABLE_REASON",
     "default_megamoe_tactic",
     "enumerate_megamoe_candidate_tactics",
+    "megamoe_activation_bytes_per_row",
     "megamoe_activation_sf_bytes_per_row",
+    "megamoe_quant_kind_is_block_scaled",
     "validate_megamoe_tactic",
     "synthesize_profiling_topk",
 ]
+
+
+def _megamoe_operand_format(quant_kind: str) -> _MegaMoEOperandFormat:
+    try:
+        return _MEGAMOE_OPERAND_FORMATS[quant_kind]
+    except KeyError:
+        raise ValueError(
+            f"MegaMoE quant_kind must be one of {sorted(_MEGAMOE_OPERAND_FORMATS)}, "
+            f"got {quant_kind!r}."
+        ) from None
+
+
+def megamoe_quant_kind_is_block_scaled(quant_kind: str) -> bool:
+    """Whether ``quant_kind`` carries block scale factors (activation SF, weight SF).
+
+    Mirrors ``QuantKind.is_block_scaled``: an unscaled kind has no SF tensor
+    anywhere in the op ABI, so callers pass ``None`` for every one of them.
+    """
+    return _megamoe_operand_format(quant_kind).block_scaled
+
+
+def megamoe_activation_bytes_per_row(hidden_size: int, quant_kind: str = "nvfp4") -> int:
+    """Return the byte width of one token row of the dispatched activation.
+
+    The kernel pulls a peer's token as ``hidden * bits / 8`` contiguous bytes
+    starting at ``src_token * bytes_per_token`` (``bytes_per_token`` in
+    token_comm.py), so the staging and symmetric activation buffers must use
+    exactly this row stride: ``hidden // 2`` for nvfp4 (two fp4 per byte) and
+    ``hidden * 2`` for bf16.
+    """
+    bits = _megamoe_operand_format(quant_kind).activation_bits
+    if hidden_size <= 0 or hidden_size * bits % 8 != 0:
+        raise ValueError(
+            f"hidden_size must be positive and fill whole bytes at {bits} bits per element, got {hidden_size}"
+        )
+    return hidden_size * bits // 8
+
+
+def _check_megamoe_quant_kind(quant_kind: str, sm_version: int) -> None:
+    """Raise unless the op has a kernel for ``quant_kind`` on ``sm_version``."""
+    if not megamoe_quant_kind_is_block_scaled(quant_kind) and sm_version == 107:
+        # The Rubin mega / genphase mainloops are block-scaled only.
+        raise ValueError(f"MegaMoE {quant_kind} has no SM107 kernel; it runs on SM100 and SM103.")
+
+
+def _megamoe_expert_activation_is_gated(expert_activation: str) -> bool:
+    """Whether the kernel ``ExpertActivation`` value reads FC1 as [gate, up] row pairs."""
+    for entry in _MEGAMOE_EXPERT_ACTIVATIONS.values():
+        if entry.kernel_value == expert_activation:
+            return entry.gated
+    kernel_values = sorted({entry.kernel_value for entry in _MEGAMOE_EXPERT_ACTIVATIONS.values()})
+    raise ValueError(
+        f"MegaMoE expert_activation must be one of {kernel_values}, got {expert_activation!r}."
+    )
+
+
+def _resolve_megamoe_expert_activation(
+    activation_type: Optional[int],
+    *,
+    quant_kind: str,
+    intermediate_size_per_partition: int,
+    expand_intermediate_size_per_partition: int,
+    gate_up_clamp: Optional[float],
+    swiglu_alpha: Optional[float],
+    swiglu_beta: Optional[float],
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+) -> _MegaMoEExpertActivation:
+    """The kernel activation ``activation_type`` runs, checked against the problem.
+
+    ``None`` keeps the contract from before the op took ``activation_type``:
+    the SiTU betas select SiTU, and anything else runs SwiGLU. A given value
+    is authoritative, and the FC1 extent, the activation constants and
+    ``quant_kind`` must fit it. This runs before any kernel or tactic is
+    built, because the kernel derives FC2's K from FC1's row count and the
+    kind: a gated kernel over a non-gated FC1 (or the reverse) would run and
+    read the wrong extents instead of failing.
+    """
+    situ_betas = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
+    if activation_type is None:
+        has_situ_beta = any(beta is not None for beta in situ_betas.values())
+        kind = ActivationType.SiTu if has_situ_beta else ActivationType.Swiglu
+    else:
+        try:
+            kind = ActivationType(activation_type)
+        except ValueError:
+            raise ValueError(
+                f"MegaMoE activation_type must be an ActivationType value, got {activation_type!r}."
+            ) from None
+    expert_activation = _MEGAMOE_EXPERT_ACTIVATIONS.get(kind)
+    if expert_activation is None:
+        supported = ", ".join(sorted(k.name for k in _MEGAMOE_EXPERT_ACTIVATIONS))
+        raise ValueError(f"MegaMoE does not run {kind.name}; supported activations: {supported}.")
+    if not expert_activation.gated:
+        # The non-gated FC1 epilogue stores an unquantized intermediate only.
+        if megamoe_quant_kind_is_block_scaled(quant_kind):
+            raise ValueError(
+                f"MegaMoE {kind.name} has no {quant_kind} kernel; it runs on quant_kind 'bf16'."
+            )
+        constants = {
+            "gate_up_clamp": gate_up_clamp,
+            "swiglu_alpha": swiglu_alpha,
+            "swiglu_beta": swiglu_beta,
+            **situ_betas,
+        }
+        given = sorted(name for name, value in constants.items() if value is not None)
+        if given:
+            raise ValueError(
+                f"MegaMoE {kind.name} takes no activation constants, so {given} must be None."
+            )
+    elif expert_activation.kernel_value == "situ":
+        missing = sorted(name for name, value in situ_betas.items() if value is None)
+        if missing:
+            raise ValueError(
+                f"MegaMoE SiTu requires situ_beta and situ_linear_beta; got None for {missing}."
+            )
+    else:
+        given = sorted(name for name, value in situ_betas.items() if value is not None)
+        if given:
+            raise ValueError(
+                f"MegaMoE {kind.name} takes no SiTU constants, so {given} must be None."
+            )
+    rows_per_feature = 2 if expert_activation.gated else 1
+    if expand_intermediate_size_per_partition != rows_per_feature * intermediate_size_per_partition:
+        layout = "[gate, up] row pairs" if expert_activation.gated else "one row per feature"
+        raise ValueError(
+            f"MegaMoE {kind.name} reads FC1 as {layout}, so "
+            f"expand_intermediate_size_per_partition must be {rows_per_feature} * "
+            f"intermediate_size_per_partition ({rows_per_feature * intermediate_size_per_partition}); "
+            f"got {expand_intermediate_size_per_partition}."
+        )
+    return expert_activation
+
+
+def _check_megamoe_operand_set(
+    quant_kind: str,
+    *,
+    activation_sf: Optional[torch.Tensor],
+    fc1_weight_sf: Optional[torch.Tensor],
+    fc2_weight_sf: Optional[torch.Tensor],
+    fc1_alpha: Optional[torch.Tensor],
+    fc2_alpha: Optional[torch.Tensor],
+    fc1_norm_const: Optional[torch.Tensor],
+) -> None:
+    """Raise unless the op's optional operands are exactly the ones ``quant_kind`` takes.
+
+    A block-scaled kind needs its three scale-factor tensors, and a kind with a
+    global scale its per-expert ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const``:
+    the kernel accepts a missing scalar and then skips that rescale, so a dropped
+    one must fail here rather than run unscaled. An unscaled kind takes none of
+    the six.
+    """
+    operand_format = _megamoe_operand_format(quant_kind)
+    scale_factors = {
+        "activation_sf": activation_sf,
+        "fc1_weight_sf": fc1_weight_sf,
+        "fc2_weight_sf": fc2_weight_sf,
+    }
+    global_scales = {
+        "fc1_alpha": fc1_alpha,
+        "fc2_alpha": fc2_alpha,
+        "fc1_norm_const": fc1_norm_const,
+    }
+    required = {
+        **(scale_factors if operand_format.block_scaled else {}),
+        **(global_scales if operand_format.global_scale else {}),
+    }
+    missing = [name for name, operand in required.items() if operand is None]
+    if missing:
+        raise ValueError(f"MegaMoE {quant_kind} requires {missing}; got None.")
+    if not operand_format.block_scaled:
+        given = [
+            name
+            for name, operand in {**scale_factors, **global_scales}.items()
+            if operand is not None
+        ]
+        if given:
+            raise ValueError(f"MegaMoE {quant_kind} has no scale factors, so {given} must be None.")
+
 
 # Set to ``True`` if every symbol the op registration needs imports
 # cleanly. ``False`` keeps the op unregistered so callers fall back via
@@ -392,6 +629,24 @@ _DEFAULT_TACTIC_PREFILL_ATOMIC: Tuple = (
 )
 
 
+def _megamoe_tactic_with_mma_tile_k(tactic: Tuple, mma_tile_k: int) -> Tuple:
+    """Return ``tactic`` with its MMA tile K replaced by ``mma_tile_k``.
+
+    The tile K is fixed by the quant kind (BF16 tiles K at
+    ``_BF16_MMA_TILE_K``), not a free perf knob, so the BF16 tactics are the
+    block-scaled ones with that one field changed. ``tactic`` is returned as
+    is when it already has that K, so block-scaled callers see their tuples
+    unchanged.
+    """
+    fields = list(_unpack_tactic(tactic))
+    mma_tiler = list(fields[0])
+    if mma_tiler[2] == mma_tile_k:
+        return tactic
+    mma_tiler[2] = mma_tile_k
+    fields[0] = mma_tiler
+    return tuple(fields)
+
+
 def default_megamoe_tactic(num_tokens: int) -> Tuple:
     """Deterministic token-bucket fallback when no shape-tuned default
     exists; never profiled by the autotuner."""
@@ -692,8 +947,10 @@ def _megamoe_problem_key(
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
     helper_expert_count: int = 0,
+    quant_kind: str = "nvfp4",
+    expert_activation: str = "swiglu",
 ) -> Tuple:
-    return (
+    key = (
         int(sm_version),
         int(world_size),
         int(num_topk),
@@ -714,6 +971,31 @@ def _megamoe_problem_key(
         # The helper count changes generated code and must be part of its cache key.
         int(helper_expert_count),
     )
+    # Different quant kinds are different kernels with different workspaces,
+    # so they must never share a cache entry. Only a kind other than nvfp4 is
+    # appended: the NVFP4 key stays the one persisted AutoTuner caches and
+    # ``_SM107_DSV4_PRO_DEFAULT_TACTICS`` were recorded under. Appended last,
+    # so the positional reads in ``_default_megamoe_tactic_for_key`` keep
+    # their indices.
+    #
+    # A non-gated activation runs another FC1 epilogue, so it appends its kind
+    # after the quant kind, which it then always carries: position 18 (right
+    # after the helper count) stays the quant kind. (Its expand == intermediate
+    # already sets the key apart; the token keeps that from being implicit.)
+    # The gated kinds keep the keys they had, which their constants tell apart.
+    activation_token = (
+        None if _megamoe_expert_activation_is_gated(expert_activation) else str(expert_activation)
+    )
+    if quant_kind != "nvfp4" or activation_token is not None:
+        key += (str(quant_kind),)
+    if activation_token is not None:
+        key += (activation_token,)
+    return key
+
+
+def _megamoe_problem_key_quant_kind(problem_key: Tuple) -> str:
+    """The ``quant_kind`` a ``_megamoe_problem_key`` was built for."""
+    return problem_key[18] if len(problem_key) > 18 else "nvfp4"
 
 
 def _default_megamoe_tactic_for_problem(
@@ -725,7 +1007,18 @@ def _default_megamoe_tactic_for_problem(
     in_kernel_fc2_reduce: bool,
     combine_format: str,
     shape_tuned_tactic: Optional[Tuple] = None,
+    quant_kind: str = "nvfp4",
 ) -> Tuple:
+    if not megamoe_quant_kind_is_block_scaled(quant_kind):
+        _check_megamoe_quant_kind(quant_kind, sm_version)
+        # BF16 runs only the Blackwell kernel, so none of the SM107 tables
+        # apply: the Blackwell token buckets with the BF16 MMA tile K.
+        tactic = (
+            _MEGAMOE_NONBULK_STANDALONE_TACTIC
+            if combine_format != "bf16" or in_kernel_fc2_reduce
+            else default_megamoe_tactic(num_tokens)
+        )
+        return _megamoe_tactic_with_mma_tile_k(tactic, _BF16_MMA_TILE_K)
     if combine_format != "bf16":
         return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
     bucket = _sm107_tactic_bucket(max_tokens_per_rank) if sm_version == 107 else None
@@ -752,6 +1045,7 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
         shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
+        quant_kind=_megamoe_problem_key_quant_kind(problem_key),
     )
 
 
@@ -764,7 +1058,11 @@ def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
         auto_hint_tactic = list(tactic)
         auto_hint_tactic[3] = ("phase_interleave", None)
         candidates.append(tuple(auto_hint_tactic))
-    nonbulk_tactic = _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    # The fallback keeps the heuristic's MMA tile K, which the quant kind fixes:
+    # a BF16 kernel cannot be built at the block-scaled K=256.
+    nonbulk_tactic = _megamoe_tactic_with_mma_tile_k(
+        _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC), tactic[0][2]
+    )
     if nonbulk_tactic not in candidates:
         candidates.append(nonbulk_tactic)
     return tuple(candidates)
@@ -894,12 +1192,32 @@ def _construct_megamoe_kernel(
     )
 
     local_experts, intermediate_gateup_size, hidden_size = common["static_expert_shape"]
+    quant_kind = str(common["quant_kind"])
+    expert_activation = str(common["expert_activation"])
+    gated = _megamoe_expert_activation_is_gated(expert_activation)
+    if sm_version == 107 and not gated:
+        # The Rubin kernels do not read ``expert_activation`` and would run the
+        # gated epilogue. Unreachable through the op today (a non-gated kind is
+        # bf16-only, which has no SM107 kernel); kept so it cannot regress.
+        raise ValueError(
+            f"MegaMoE {expert_activation} has no SM107 kernel; it runs on SM100 and SM103."
+        )
+    kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
+    if not gated and "expert_activation" not in kernel_cls.problem_desc_require():
+        # ``Desc.validate`` checks only the fields a kernel declares, so one that
+        # does not declare this (a re-import of the kernel package without the
+        # non-gated FC1 epilogue) would drop it and run the gated epilogue over
+        # FC1 rows that are not [gate, up] pairs, with half of FC2's K.
+        raise ValueError(
+            f"MegaMoE {expert_activation}: {kernel_cls.__name__} does not take "
+            "expert_activation and would run the gated epilogue."
+        )
     problem_desc = ProblemDesc(
         {
             "expert_count": int(local_experts) * int(common["world_size"]),
             "intermediate_gateup_size": int(intermediate_gateup_size),
             "hidden_size": int(hidden_size),
-            "quant_kind": "nvfp4",
+            "quant_kind": quant_kind,
             "a_major_mode": OperandMajorMode.K,
             "b_major_mode": OperandMajorMode.K,
             "combine_format": CombineFormat.parse(combine_format),
@@ -908,6 +1226,7 @@ def _construct_megamoe_kernel(
             "swiglu_beta": common["swiglu_beta"],
             "situ_beta": common["situ_beta"],
             "situ_linear_beta": common["situ_linear_beta"],
+            "expert_activation": expert_activation,
             "world_size": int(common["world_size"]),
             "topk": int(common["num_topk"]),
             "topk_index_dtype": cutlass.Int32 if sm_version == 107 else cutlass.Int64,
@@ -942,7 +1261,7 @@ def _construct_megamoe_kernel(
             mma_instruction_mnk=(
                 mma_tiler[0],
                 mma_tiler[1],
-                QuantKind.nvfp4.instruction_k("2x"),
+                QuantKind(quant_kind).instruction_k("2x"),
             ),
             mma_k_mode="2x",
         )
@@ -967,7 +1286,6 @@ def _construct_megamoe_kernel(
             return construct(RubinInferenceGenphaseMegaMoE), None
         except (ValueError, TypeError, NotImplementedError) as exc:
             rejection = exc
-    kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
     return construct(kernel_cls), rejection
 
 
@@ -999,12 +1317,15 @@ def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
     return pad_up(ceil_div(hidden_size, 16), 4)
 
 
-def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
+def validate_megamoe_tactic(
+    tactic: Tuple, sm_version: int = 100, quant_kind: str = "nvfp4"
+) -> None:
     """Validate a tactic tuple against the kernel-side constraints
     (see the tactic-representation comment block above). Raises
     ``ValueError`` with a clear message on failure; the caller
     (``get_valid_tactics`` / ``forward``) catches and filters.
     """
+    _check_megamoe_quant_kind(quant_kind, sm_version)
     if (not isinstance(tactic, tuple)) or len(tactic) not in {
         _TACTIC_LEN,
         _TACTIC_LEN_V4,
@@ -1040,7 +1361,13 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         raise ValueError(
             f"mma_tiler_mnk[1]={mma_tiler[1]} not in SupportedMmaTileN={_SUPPORTED_MMA_TILE_N}"
         )
-    if mma_tiler[2] % (_NVFP4_BLOCK_SIZE * 4) != 0:
+    if not megamoe_quant_kind_is_block_scaled(quant_kind):
+        if mma_tiler[2] % _BF16_MMA_TILE_K != 0:
+            raise ValueError(
+                f"{quant_kind} mma_tiler_mnk[2]={mma_tiler[2]} must be a multiple of "
+                f"{_BF16_MMA_TILE_K} (one 128-byte SMEM row of four K=16 MMAs)."
+            )
+    elif mma_tiler[2] % (_NVFP4_BLOCK_SIZE * 4) != 0:
         raise ValueError(
             f"mma_tiler_mnk[2]={mma_tiler[2]} must be a multiple of "
             f"{_NVFP4_BLOCK_SIZE * 4} (= sf_vec_size * 4); see kernel_fc12 "
@@ -1201,13 +1528,14 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         # every candidate in this function and simply drops what fails. The
         # kernel-side copy stays as the backstop for hand-supplied tactics.
         #
-        # Two of the kernel's nine conditions are not tactic-local and are not
-        # re-checked here:
-        #   quant_kind == nvfp4     -- this op's ProblemDesc hardcodes nvfp4.
+        # quant_kind == nvfp4 is not tactic-local but comes in as an argument.
+        # One of the kernel's nine conditions is not re-checked here:
         #   not reduce_topk_in_kernel -- implied transitively: token_tile
         #     requires use_bulk_fc2_store, and get_valid_tactics already drops
         #     every bulk candidate when in_kernel_fc2_reduce is set.
         unmet = []
+        if quant_kind != "nvfp4":
+            unmet.append(f"quant_kind={quant_kind!r} (need 'nvfp4')")
         if work_id_mode != "atomic_counter":
             unmet.append(f"work_id_mode={work_id_mode!r} (need 'atomic_counter')")
         if token_back_mode not in ("standalone_warps", "reuse_dispatch_warps"):
@@ -1269,6 +1597,7 @@ def _expand_megamoe_ready_tactics(
 def enumerate_megamoe_candidate_tactics(
     num_tokens: int,
     sm_version: int = 100,
+    quant_kind: str = "nvfp4",
     *,
     load_balance: bool = False,
 ) -> List[Tuple]:
@@ -1277,7 +1606,25 @@ def enumerate_megamoe_candidate_tactics(
     Cartesian product over the curated dimension ranges, filtered through
     ``validate_megamoe_tactic``. ``epi_flag_batch`` is fixed per token
     bucket (see ``_epi_flag_batch_for_tokens``).
+
+    An unscaled kind (bf16) gets the same space with its own MMA tile K: the
+    geometries and host knobs do not depend on the operand format, the tile K
+    does (see ``_BF16_MMA_TILE_K``). The ``token_tile`` READY granularity is
+    NVFP4-only (see ``validate_megamoe_tactic``), so it is left out.
     """
+    if not megamoe_quant_kind_is_block_scaled(quant_kind):
+        _check_megamoe_quant_kind(quant_kind, sm_version)
+        candidates = [
+            _megamoe_tactic_with_mma_tile_k(tactic, _BF16_MMA_TILE_K)
+            for tactic in enumerate_megamoe_candidate_tactics(
+                num_tokens, sm_version=sm_version, load_balance=load_balance
+            )
+            if _unpack_tactic(tactic)[10] == _DEFAULT_TOKEN_BACK_READY_GRANULARITY
+        ]
+        for tactic in candidates:
+            validate_megamoe_tactic(tactic, sm_version=sm_version, quant_kind=quant_kind)
+        return candidates
+
     epi_flag_batch = _epi_flag_batch_for_tokens(num_tokens)
 
     if sm_version == 107:
@@ -1688,14 +2035,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
         """
 
         base_buf: torch.Tensor
-        activation: torch.Tensor  # (max_T, hidden // 2) uint8 (NVFP4 packed)
+        # (max_T, megamoe_activation_bytes_per_row(hidden, quant_kind)) uint8:
+        # hidden // 2 for NVFP4 packed, hidden * 2 for bf16.
+        activation: torch.Tensor
         # Row stride MUST equal kernel's ``sf_uint32_per_token * 4 ==
         # ceil(hidden / 64) * 4 == megamoe_activation_sf_bytes_per_row(hidden)``;
         # ``hidden // 16`` is short by 2 bytes for hidden % 64 != 0
         # (1568, 1632, 2080, ...) and triggers a host copy_ shape
         # mismatch in the backend's ``_stage_inputs``. See dispatch
         # kernel sf_addr formula in dispatch_kernel.py.
-        activation_sf: torch.Tensor  # (max_T, sf_bytes_per_row) uint8 (FP8 SF)
+        # (max_T, sf_bytes_per_row) uint8 (FP8 SF); None for an unscaled kind.
+        activation_sf: Optional[torch.Tensor]
         topk_weights: torch.Tensor  # (max_T, num_topk) float32
         # (max_T, 1, hidden): both reduction forms collapse the top-k axis in-op.
         combine_output: torch.Tensor
@@ -1710,9 +2060,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         The provider is bound to a ProcessGroup (the EP sub-world the
         kernel exchanges over) and a layout key (hidden, num_topk,
-        max_tokens_per_rank, output_dtype, shared_workspace_bytes). It
-        survives across MoE layers with identical layouts so the
-        expensive ``torch_symm_mem.rendezvous`` collective only runs
+        max_tokens_per_rank, output_dtype, shared_workspace_bytes,
+        quant_kind). It survives across MoE layers with identical layouts
+        so the expensive ``torch_symm_mem.rendezvous`` collective only runs
         once per build.
 
         ``MegaMoECuteDsl.create_weights`` constructs the provider via
@@ -1740,6 +2090,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             num_topk: int,
             output_dtype: torch.dtype,
             shared_workspace_bytes: int,
+            quant_kind: str = "nvfp4",
         ) -> None:
             if not (dist.is_available() and dist.is_initialized()):
                 raise RuntimeError("MegaMoeSymmMemProvider requires torch.distributed initialized.")
@@ -1763,20 +2114,28 @@ if IS_MEGAMOE_OP_AVAILABLE:
             self.max_tokens_per_rank = int(max_tokens_per_rank)
             self.num_topk = int(num_topk)
             self.output_dtype = output_dtype
+            self.quant_kind = str(quant_kind)
             # Kernel output is unified (T, hidden), so the symmetric combine
             # region is (max_T, 1, hidden). combine_k MUST match the kernel
             # ``combine_output`` shape or the region is silently corrupted.
             self.combine_k = 1
 
             # Region byte sizes (worst case across launches; staging
-            # writes only the live ``T`` rows). NVFP4 packs 2 elems / byte
-            # along K so activation rows are hidden // 2 bytes. The SF
-            # row width matches the kernel's TMA load expectation
-            # ``round_up(ceil(hidden / 16), 4)`` -- naive ``hidden // 16``
-            # under-allocates by 2 bytes when ``hidden % 64 != 0`` (e.g.
-            # 1568, 1632, 2080).
-            act_bytes_per_row = hidden_size // 2
-            sf_bytes_per_row = megamoe_activation_sf_bytes_per_row(hidden_size)
+            # writes only the live ``T`` rows). Activation rows are the quant
+            # kind's wire bytes (NVFP4 packs 2 elems / byte along K, so
+            # hidden // 2; bf16 is hidden * 2). The SF row width matches the
+            # kernel's TMA load expectation ``round_up(ceil(hidden / 16), 4)``
+            # -- naive ``hidden // 16`` under-allocates by 2 bytes when
+            # ``hidden % 64 != 0`` (e.g. 1568, 1632, 2080). An unscaled kind
+            # has no SF leg, so its SF region is empty.
+            act_bytes_per_row = megamoe_activation_bytes_per_row(hidden_size, self.quant_kind)
+            sf_bytes_per_row = (
+                megamoe_activation_sf_bytes_per_row(hidden_size)
+                if megamoe_quant_kind_is_block_scaled(self.quant_kind)
+                else 0
+            )
+            self._act_bytes_per_row = act_bytes_per_row
+            self._sf_bytes_per_row = sf_bytes_per_row
             topkw_bytes_per_row = num_topk * 4  # float32
             combine_bytes_per_row = self.combine_k * hidden_size * output_dtype.itemsize
 
@@ -1870,13 +2229,18 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # ``quantize_input`` output: kernel reads
             # ``ceil(hidden / 64) * 4`` FP8 bytes per token via the
             # ``sf_addr`` formula in dispatch_kernel.py. ``hidden // 16``
-            # under-allocates by 2 bytes when hidden % 64 != 0.
-            sf_bytes_per_row = megamoe_activation_sf_bytes_per_row(hidden)
+            # under-allocates by 2 bytes when hidden % 64 != 0. Both widths
+            # are the ones ``__init__`` sized the regions with.
+            sf_bytes_per_row = self._sf_bytes_per_row
             return MegaMoeSymmRegions(
                 base_buf=self._buf,
-                activation=self._region_view("activation", (max_t, hidden // 2), torch.uint8),
-                activation_sf=self._region_view(
-                    "activation_sf", (max_t, sf_bytes_per_row), torch.uint8
+                activation=self._region_view(
+                    "activation", (max_t, self._act_bytes_per_row), torch.uint8
+                ),
+                activation_sf=(
+                    self._region_view("activation_sf", (max_t, sf_bytes_per_row), torch.uint8)
+                    if sf_bytes_per_row
+                    else None
                 ),
                 topk_weights=self._region_view("topk_weights", (max_t, top_k), torch.float32),
                 combine_output=self._region_view(
@@ -1902,11 +2266,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
         output_dtype: torch.dtype,
         combine_format: str,
         shared_workspace_bytes: int,
+        quant_kind: str = "nvfp4",
     ) -> MegaMoeSymmMemProvider:
         """Return a cached provider for (group, layout). The cache is
         keyed on the group ``group_name`` plus every layout knob that
         affects allocation size so two MoE layers with the same shape
-        share the same symmetric buffer.
+        share the same symmetric buffer. ``quant_kind`` is one of them: it
+        sets the activation row width and whether there is an SF region.
 
         First call from each rank performs the (collective)
         ``torch_symm_mem.rendezvous``; subsequent calls return the
@@ -1926,6 +2292,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             str(output_dtype),
             str(combine_format),
             int(shared_workspace_bytes),
+            str(quant_kind),
         )
         cached = _MEGAMOE_SYMM_PROVIDER_CACHE.get(cache_key)
         if cached is not None:
@@ -1939,6 +2306,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             num_topk=num_topk,
             output_dtype=output_dtype,
             shared_workspace_bytes=shared_workspace_bytes,
+            quant_kind=quant_kind,
         )
         _MEGAMOE_SYMM_PROVIDER_CACHE[cache_key] = provider
         return provider
@@ -1969,6 +2337,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         output_dtype: torch.dtype,
         combine_format: str,
         shared_workspace_bytes: int,
+        quant_kind: str = "nvfp4",
     ):
         """Return a cached, transient symmetric scratch provider used ONLY for
         AutoTuner profiling; ``None`` for single-rank."""
@@ -1987,6 +2356,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             str(output_dtype),
             str(combine_format),
             int(shared_workspace_bytes),
+            str(quant_kind),
         )
         cached = _MEGAMOE_PROFILING_SCRATCH_CACHE.get(cache_key)
         if cached is not None:
@@ -2000,6 +2370,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             num_topk=num_topk,
             output_dtype=output_dtype,
             shared_workspace_bytes=shared_workspace_bytes,
+            quant_kind=quant_kind,
         )
         _MEGAMOE_PROFILING_SCRATCH_CACHE[cache_key] = provider
         return provider
@@ -2087,10 +2458,27 @@ if IS_MEGAMOE_OP_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
+        quant_kind: str = "nvfp4",
+        activation_type: Optional[int] = None,
     ) -> Tuple[int, bool]:
-        """Probe workspace size and direct-input support of the default kernel."""
+        """Probe workspace size and direct-input support of the default kernel.
+
+        ``activation_type`` resolves as in the op (None keeps the legacy
+        SiTU-or-SwiGLU inference), so the probe sizes the kernel that runs.
+        """
 
         sm_version = get_sm_version()
+        expert_activation = _resolve_megamoe_expert_activation(
+            activation_type,
+            quant_kind=quant_kind,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
+            gate_up_clamp=gate_up_clamp,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        ).kernel_value
         use_default_tactic = tactic is None
         if use_default_tactic:
             problem_key = _megamoe_problem_key(
@@ -2111,6 +2499,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 situ_linear_beta=situ_linear_beta,
                 in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 combine_format=combine_format,
+                quant_kind=quant_kind,
+                expert_activation=expert_activation,
             )
             tactic = _default_megamoe_tactic_for_key(
                 problem_key,
@@ -2118,7 +2508,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
 
         def build(candidate: Tuple):
-            validate_megamoe_tactic(candidate, sm_version=sm_version)
+            validate_megamoe_tactic(candidate, sm_version=sm_version, quant_kind=quant_kind)
             (
                 mma_tiler,
                 cluster_shape,
@@ -2185,6 +2575,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
                 situ_beta=(None if situ_beta is None else float(situ_beta)),
                 situ_linear_beta=(None if situ_linear_beta is None else float(situ_linear_beta)),
+                quant_kind=str(quant_kind),
+                expert_activation=expert_activation,
                 **_LOCKED_KERNEL_KWARGS,
             )
             probe, _ = _construct_megamoe_kernel(
@@ -2199,9 +2591,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             allow_fallback=use_default_tactic,
             build=build,
         )
-        # The probe MUST build the SAME kernel that runs (same combine_format):
-        # otherwise the provider carves an undersized shared region and the
-        # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
+        # The probe MUST build the SAME kernel that runs (same combine_format,
+        # quant_kind and activation): otherwise the provider carves an
+        # undersized shared region and the combine staging writes OOB
+        # (single-rank IMA; EP>1 looks like a hang).
         _, shared_bytes = probe.get_workspace_sizes()
         return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
 
@@ -2215,10 +2608,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
         return shapes[0][0]
 
     class Sm100MegaMoENvfp4Runner(TunableRunner):
-        """TunableRunner for the MegaMoE CuteDSL NVFP4 kernels.
+        """TunableRunner for the MegaMoE CuteDSL kernels.
 
         The class name is retained for internal cache and test compatibility;
-        construction dispatches to the active SM100/SM103/SM107 kernel.
+        construction dispatches to the active SM100/SM103/SM107 kernel,
+        ``quant_kind`` selects its operand format (NVFP4, or unquantized
+        BF16 on SM100/SM103), and ``activation_type`` its activation, resolved
+        as the op documents.
 
         Owns a process-global ``kernel_cache`` keyed on the full
         ``(static_shape + tactic)`` tuple so multiple MoE layers with
@@ -2258,12 +2654,24 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format: str = "bf16",
             tactic_autotune: bool = False,
             helper_expert_count: int = 0,
+            quant_kind: str = "nvfp4",
+            activation_type: Optional[int] = None,
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
-                raise ValueError(
-                    f"MegaMoE NVFP4 requires SM100, SM103, or SM107; got SM{sm_version}."
-                )
+                raise ValueError(f"MegaMoE requires SM100, SM103, or SM107; got SM{sm_version}.")
+            _check_megamoe_quant_kind(quant_kind, sm_version)
+            expert_activation = _resolve_megamoe_expert_activation(
+                activation_type,
+                quant_kind=quant_kind,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
+                gate_up_clamp=gate_up_clamp,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
             if num_experts_per_rank <= 0:
                 raise ValueError(
                     f"num_experts_per_rank must be positive, got {num_experts_per_rank}"
@@ -2271,7 +2679,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             if max_tokens_per_rank <= 0:
                 raise ValueError(f"max_tokens_per_rank must be positive, got {max_tokens_per_rank}")
             if output_dtype != torch.bfloat16:
-                raise ValueError(f"MegaMoE NVFP4 only supports bfloat16 output; got {output_dtype}")
+                raise ValueError(f"MegaMoE only supports bfloat16 output; got {output_dtype}")
             self.sm_version = int(sm_version)
             self.world_size = int(world_size)
             self.local_rank = int(local_rank)
@@ -2287,6 +2695,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Codegen-time modes: they change the generated kernel, so they are
             # part of ``unique_id`` (compile + workspace cache key), never
             # per-call runtime kwargs.
+            self.quant_kind = str(quant_kind)
+            # The kernel's ``ExpertActivation`` value; a non-gated kind keys
+            # unique_id() on its own (see ``_megamoe_problem_key``).
+            self.expert_activation = expert_activation.kernel_value
             self.apply_topk_in_fc1 = bool(apply_topk_in_fc1)
             self.swiglu_alpha = None if swiglu_alpha is None else float(swiglu_alpha)
             self.swiglu_beta = None if swiglu_beta is None else float(swiglu_beta)
@@ -2353,6 +2765,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
                 helper_expert_count=self.helper_expert_count,
+                quant_kind=self.quant_kind,
+                expert_activation=self.expert_activation,
             )
 
         def get_valid_tactics(
@@ -2366,6 +2780,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             candidates = enumerate_megamoe_candidate_tactics(
                 num_tokens,
                 sm_version=self.sm_version,
+                quant_kind=self.quant_kind,
                 load_balance=self.helper_expert_count > 0,
             )
             # Form-B remains non-bulk. FP4 only rejects peer UBLK; local TMA
@@ -2386,6 +2801,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 apply_topk_in_fc1=self.apply_topk_in_fc1,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
+                quant_kind=self.quant_kind,
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
@@ -2457,9 +2873,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 act.copy_(inputs[0].view(torch.uint8))
                 inputs[0] = act.view(inputs[0].dtype)
 
-                sf = scratch.activation_sf[:m]
-                sf.fill_(0x38)  # raw byte == FP8 1.0
-                inputs[1] = sf if inputs[1].dtype == torch.uint8 else sf.view(inputs[1].dtype)
+                # An unscaled kind (bf16) has neither a scratch SF region nor
+                # an activation_sf input.
+                if scratch.activation_sf is not None and inputs[1] is not None:
+                    sf = scratch.activation_sf[:m]
+                    sf.fill_(0x38)  # raw byte == FP8 1.0
+                    inputs[1] = sf if inputs[1].dtype == torch.uint8 else sf.view(inputs[1].dtype)
 
                 w = scratch.topk_weights[:m]
                 w.fill_(1.0)
@@ -2491,7 +2910,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             Constraints chain activation_sf / topk_idx / topk_weights /
             combine_output to the activation token count, so the
             autotuner does not double-enumerate tile sizes for
-            independent token axes.
+            independent token axes. A ``None`` input (bf16's activation_sf)
+            profiles as a static empty shape and its constraint is skipped.
 
             Built once per runner and NEVER shared across runners:
             ``inputs_pre_hook`` is bound to THIS runner's ``_profiling_scratch``;
@@ -2541,7 +2961,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             return config
 
         def _build_kernel_once(self, tactic: Tuple):
-            validate_megamoe_tactic(tactic, sm_version=self.sm_version)
+            validate_megamoe_tactic(tactic, sm_version=self.sm_version, quant_kind=self.quant_kind)
             cached = self.__class__.kernel_cache.get(self._tactic_cache_key(tactic))
             if cached is not None:
                 return cached[1]
@@ -2611,6 +3031,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
                 helper_expert_count=self.helper_expert_count,
+                quant_kind=self.quant_kind,
+                expert_activation=self.expert_activation,
                 **_LOCKED_KERNEL_KWARGS,
             )
             kernel, rejection = _construct_megamoe_kernel(
@@ -2901,15 +3323,20 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # present K stride-1 via a transpose VIEW (DLPack carries the
             # strides); do NOT ``.contiguous()``.
             output_activation = combine_output.reshape(combine_output.shape[0], self.hidden_size)
+            # An unscaled kind passes None for the three SF operands (the op
+            # checked they are None) and leaves out the per-expert scalars,
+            # which the kernel only declares for a kind with a global scale.
             if buffer_cache is None:
                 cute_activation = _to_cute(activation)
-                cute_activation_sf = _to_cute(activation_sf)
+                cute_activation_sf = None if activation_sf is None else _to_cute(activation_sf)
                 cute_topk_weights = _to_cute(topk_weights)
                 cute_output = _to_cute(output_activation)
                 cute_topk_idx = _to_cute(topk_idx)
             else:
                 cute_activation = _to_cute_cached(buffer_cache, activation)
-                cute_activation_sf = _to_cute_cached(buffer_cache, activation_sf)
+                cute_activation_sf = (
+                    None if activation_sf is None else _to_cute_cached(buffer_cache, activation_sf)
+                )
                 cute_topk_weights = _to_cute_cached(buffer_cache, topk_weights)
                 # Its live rows change per iteration, not between the layers of one.
                 cute_output = _to_cute_slot(buffer_cache, "output_activation", output_activation)
@@ -2919,17 +3346,21 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 activation=cute_activation,
                 activation_sf=cute_activation_sf,
                 fc1_weight=_to_cute_w(fc1_weight.transpose(1, 2)),
-                fc1_weight_sf=_to_cute_w(fc1_weight_sf),
+                fc1_weight_sf=None if fc1_weight_sf is None else _to_cute_w(fc1_weight_sf),
                 fc2_weight=_to_cute_w(fc2_weight.transpose(1, 2)),
-                fc2_weight_sf=_to_cute_w(fc2_weight_sf),
-                fc1_alpha=_to_cute_w(fc1_alpha, assumed_align=4),
-                fc2_alpha=_to_cute_w(fc2_alpha, assumed_align=4),
-                fc1_norm_const=_to_cute_w(fc1_norm_const, assumed_align=4),
+                fc2_weight_sf=None if fc2_weight_sf is None else _to_cute_w(fc2_weight_sf),
                 output_activation=cute_output,
                 local_workspace=_to_cute_ptr_cached(local_workspace),
                 shared_workspace=_to_cute_ptr_cached(shared_workspace),
                 stream=_current_cu_stream(),
             )
+            for scalar_name, scalar in (
+                ("fc1_alpha", fc1_alpha),
+                ("fc2_alpha", fc2_alpha),
+                ("fc1_norm_const", fc1_norm_const),
+            ):
+                if scalar is not None:
+                    runtime_kwargs[scalar_name] = _to_cute_w(scalar, assumed_align=4)
             runtime_kwargs.update(
                 topk_indices=cute_topk_idx,
                 topk_scores=cute_topk_weights,
@@ -2998,6 +3429,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format,
         tactic_autotune,
         helper_expert_count,
+        quant_kind="nvfp4",
+        activation_type=None,
     ):
         """Reuse a runner by its complete constructor key.
 
@@ -3023,6 +3456,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            quant_kind,
+            activation_type,
         )
 
         def _make():
@@ -3046,6 +3481,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 combine_format=combine_format,
                 tactic_autotune=tactic_autotune,
                 helper_expert_count=helper_expert_count,
+                quant_kind=quant_kind,
+                activation_type=activation_type,
             )
 
         # A runner that may profile owns profiling scratch, so tuning-mode calls
@@ -3067,16 +3504,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
     def run_cute_dsl_megamoe_nvfp4_blackwell(
         activation: torch.Tensor,
-        activation_sf: torch.Tensor,
+        activation_sf: Optional[torch.Tensor],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         fc1_weight: torch.Tensor,
-        fc1_weight_sf: torch.Tensor,
+        fc1_weight_sf: Optional[torch.Tensor],
         fc2_weight: torch.Tensor,
-        fc2_weight_sf: torch.Tensor,
-        fc1_alpha: torch.Tensor,
-        fc2_alpha: torch.Tensor,
-        fc1_norm_const: torch.Tensor,
+        fc2_weight_sf: Optional[torch.Tensor],
+        fc1_alpha: Optional[torch.Tensor],
+        fc2_alpha: Optional[torch.Tensor],
+        fc1_norm_const: Optional[torch.Tensor],
         combine_output: torch.Tensor,
         shared_workspace: torch.Tensor,
         world_size: int,
@@ -3106,14 +3543,25 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        quant_kind: str = "nvfp4",
+        activation_type: Optional[int] = None,
     ) -> None:
-        """Run the fused MegaMoE CuteDSL NVFP4 kernel.
+        """Run the fused MegaMoE CuteDSL kernel on ``quant_kind`` operands.
 
         Inputs are pre-staged by the caller (the ``MegaMoECuteDsl``
         backend in ``mega_moe_cute_dsl.py``). ``tactic_autotune=True``
         (``MEGAMOE_TACTIC_AUTOTUNE=1`` bench opt-in) picks the tactic via
         AutoTuner per call; the default selects an architecture- and
         problem-specific tactic without profiling.
+
+        ``quant_kind`` is the kernel ``QuantKind`` of the operands.
+        ``"nvfp4"`` takes NVFP4 activation / weights with their FP8 block
+        scales and the per-expert ``fc1_alpha`` / ``fc2_alpha`` /
+        ``fc1_norm_const``. ``"bf16"`` (SM100/SM103) takes a bf16 ``(T,
+        hidden)`` activation and bf16 weights ``fc1_weight`` ``(experts,
+        expand_intermediate, hidden)`` and ``fc2_weight`` ``(experts, hidden,
+        intermediate)``, and every scale-factor and per-expert scalar argument
+        must be ``None``.
 
         ``shared_workspace`` MUST be a symmetric-heap tensor for
         ``world_size > 1`` (use :class:`MegaMoeSymmMemProvider`); a
@@ -3129,15 +3577,56 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ``(T, 1, hidden)``. Perf knobs come from the tactic, not op
         arguments.
 
-        ``act_alpha`` / ``act_beta`` select the activation: both None
-        runs SwiGLU, both set runs SiTU with the gate-side and linear-side
-        soft-caps, respectively. They are codegen-time constants.
+        ``activation_type`` is the TRT-LLM ``ActivationType`` the experts
+        run. The gated kinds read FC1 as [gate, up] row pairs, so their
+        ``expand_intermediate_size_per_partition`` is twice
+        ``intermediate_size_per_partition``: Swiglu, SwigluBias (bias-free,
+        with ``swiglu_alpha`` / ``swiglu_beta``) and SiTu (``act_alpha`` /
+        ``act_beta`` are its gate-side and linear-side soft-caps). The
+        non-gated Relu2 (``quant_kind="bf16"`` only) takes no constants and
+        one FC1 row per feature, so the two extents are equal. ``None`` keeps
+        the original contract: ``act_alpha`` / ``act_beta`` set runs SiTU,
+        both None runs SwiGLU. The activation and its constants are
+        codegen-time constants, checked against each other and against the
+        FC1 extent before any kernel is built.
         """
         sm_version = get_sm_version()
         if sm_version not in (100, 103, 107):
-            raise RuntimeError(
-                f"MegaMoE NVFP4 requires SM100, SM103, or SM107; got SM{sm_version}."
-            )
+            raise RuntimeError(f"MegaMoE requires SM100, SM103, or SM107; got SM{sm_version}.")
+        # Checked here, before any kernel is built, so a caller that staged the
+        # wrong operand set gets the argument names rather than a trace-time
+        # dtype error from inside the kernel, or an unscaled result.
+        _check_megamoe_operand_set(
+            quant_kind,
+            activation_sf=activation_sf,
+            fc1_weight_sf=fc1_weight_sf,
+            fc2_weight_sf=fc2_weight_sf,
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=fc1_norm_const,
+        )
+        # The kernel rebuilds the weight views from the problem's extents with
+        # the caller's strides and does not check the shapes it is handed, so
+        # a bf16 weight laid out for another activation (a gated FC1 for
+        # Relu2, or the reverse) would be read wrong rather than fail.
+        if not megamoe_quant_kind_is_block_scaled(quant_kind):
+            for name, weight, expected_shape in (
+                (
+                    "fc1_weight",
+                    fc1_weight,
+                    (num_experts_per_rank, expand_intermediate_size_per_partition, hidden_size),
+                ),
+                (
+                    "fc2_weight",
+                    fc2_weight,
+                    (num_experts_per_rank, hidden_size, intermediate_size_per_partition),
+                ),
+            ):
+                if tuple(weight.shape) != expected_shape:
+                    raise ValueError(
+                        f"MegaMoE {quant_kind} expects {name} of shape {expected_shape}; "
+                        f"got {tuple(weight.shape)}."
+                    )
 
         # Live-token trim: TopkReduce sizes its grid from THIS tensor's dim0,
         # so slicing to the live count skips dead reduce rows. Negative or
@@ -3167,6 +3656,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            quant_kind,
+            activation_type,
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.
@@ -3273,16 +3764,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
     @torch.library.register_fake("trtllm::cute_dsl_megamoe_nvfp4_blackwell")
     def _(
         activation: torch.Tensor,
-        activation_sf: torch.Tensor,
+        activation_sf: Optional[torch.Tensor],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         fc1_weight: torch.Tensor,
-        fc1_weight_sf: torch.Tensor,
+        fc1_weight_sf: Optional[torch.Tensor],
         fc2_weight: torch.Tensor,
-        fc2_weight_sf: torch.Tensor,
-        fc1_alpha: torch.Tensor,
-        fc2_alpha: torch.Tensor,
-        fc1_norm_const: torch.Tensor,
+        fc2_weight_sf: Optional[torch.Tensor],
+        fc1_alpha: Optional[torch.Tensor],
+        fc2_alpha: Optional[torch.Tensor],
+        fc1_norm_const: Optional[torch.Tensor],
         combine_output: torch.Tensor,
         shared_workspace: torch.Tensor,
         world_size: int,
@@ -3312,5 +3803,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        quant_kind: str = "nvfp4",
+        activation_type: Optional[int] = None,
     ) -> None:
         return None

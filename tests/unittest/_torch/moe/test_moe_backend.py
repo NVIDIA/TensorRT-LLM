@@ -3826,6 +3826,173 @@ def test_fused_comm_forward_returns_what_the_caller_reduces(
             assert not output.any()
 
 
+class _ReusedOutputFusedCommBackend:
+    """A fused-comm backend that hands back its output the way MegaMoE-CuteDSL does.
+
+    Every launch writes its rows into one persistent buffer and returns a view
+    of them, so each launch overwrites the rows an earlier launch returned. A
+    token's result depends only on its own activation and routing, so a
+    chunked forward must reproduce ``expected`` over all the tokens at once.
+    """
+
+    # Like MegaMoE-CuteDSL it does not declare run_moe_reuses_buffers: FusedCommMoEScheduler refuses
+    # such a backend, and the copy of every non-final chunk is what makes this one safe.
+    input_requirement = MoEInputRequirement()
+
+    def __init__(self, max_num_tokens: int, hidden_size: int) -> None:
+        self.output_buffer = torch.zeros(max_num_tokens, hidden_size, dtype=torch.bfloat16)
+        self.launch_num_tokens: List[int] = []
+
+    @staticmethod
+    def expected(
+        x: torch.Tensor, token_selected_experts: torch.Tensor, token_final_scales: torch.Tensor
+    ) -> torch.Tensor:
+        scale = (token_final_scales * (token_selected_experts + 1)).sum(dim=1, keepdim=True)
+        return (x.float() * scale).to(torch.bfloat16)
+
+    def quantize_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        return x, None
+
+    def run_moe(self, ctx: MoERunContext) -> torch.Tensor:
+        num_tokens = ctx.x.shape[0]
+        self.launch_num_tokens.append(num_tokens)
+        rows = self.output_buffer[:num_tokens]
+        rows.copy_(self.expected(ctx.x, ctx.token_selected_experts, ctx.token_final_scales))
+        return rows
+
+
+def _chunking_fused_comm_scheduler(
+    backend: _ReusedOutputFusedCommBackend,
+    *,
+    ep_size: int,
+    ep_rank: int,
+    moe_max_num_tokens: int,
+    num_experts: int,
+    top_k: int,
+) -> FusedCommMoEScheduler:
+    """The scheduler over the ConfigurableMoE state a forward reads: attention DP
+    across the EP ranks, no load balancer, one repeat."""
+    use_dp = ep_size > 1
+    moe = SimpleNamespace(
+        backend=backend,
+        mapping=Mapping(
+            world_size=ep_size,
+            rank=ep_rank,
+            tp_size=ep_size,
+            moe_tp_size=1,
+            moe_ep_size=ep_size,
+            enable_attention_dp=use_dp,
+        ),
+        parallel_size=ep_size,
+        use_dp=use_dp,
+        reduce_results=False,
+        accepts_global_routed_output=False,
+        moe_max_num_tokens=moe_max_num_tokens,
+        split_chunk=lambda num_tokens, num_chunks: ConfigurableMoE.split_chunk(
+            None, num_tokens, num_chunks
+        ),
+        repeat_idx=0,
+        repeat_count=1,
+        apply_router_weight_on_input=False,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=top_k, force_enable_pytorch_op=True),
+        layer_idx=0,
+        layer_load_balancer=None,
+        num_slots=num_experts,
+        _load_balancer_uses_replica_plan=lambda: False,
+        _load_balancer_start_wait_gpu_stage=lambda is_first_call: None,
+        _load_balancer_start_set_cpu_stage=lambda is_last_call: None,
+        _load_balancer_done_set_cpu_stage=lambda is_last_call: None,
+        _maybe_get_perfect_router_expert_ids=lambda token_selected_experts: token_selected_experts,
+    )
+    return FusedCommMoEScheduler(moe)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "all_rank_num_tokens, ep_rank, launches",
+    [
+        pytest.param([5], 0, [3, 2], id="ep1-two_chunks"),
+        pytest.param([7], 0, [3, 2, 2], id="ep1-three_chunks"),
+        pytest.param([7, 2], 0, [3, 2, 2], id="ep2-largest_rank"),
+        # The last chunk of this rank is empty, its peer's is not.
+        pytest.param([7, 2], 1, [1, 1, 0], id="ep2-small_rank"),
+        pytest.param([7, 0], 1, [0, 0, 0], id="ep2-zero_token_rank"),
+    ],
+)
+def test_fused_comm_chunks_survive_a_backend_that_reuses_its_output(
+    all_rank_num_tokens: List[int], ep_rank: int, launches: List[int]
+) -> None:
+    """Every chunk's output but the last is copied before the next chunk launches.
+
+    The backend returns each launch's rows as a view of one buffer, as
+    MegaMoE-CuteDSL returns rows of the combine region every launch in a bucket
+    reuses. ``moe_max_num_tokens`` 3 splits the largest rank into two or three
+    chunks of uneven size; under attention DP every rank's input is padded to
+    the largest rank, and every rank launches every chunk, its empty ones too.
+    """
+    hidden_size, num_experts, top_k, moe_max_num_tokens = 8, 4, 2, 3
+    ep_size = len(all_rank_num_tokens)
+    num_tokens = all_rank_num_tokens[ep_rank]
+    generator = torch.Generator().manual_seed(ep_rank)
+    padded_tokens = max(all_rank_num_tokens)
+    x = torch.randn(padded_tokens, hidden_size, generator=generator).to(torch.bfloat16)
+    router_logits = torch.randn(padded_tokens, num_experts, generator=generator)
+    backend = _ReusedOutputFusedCommBackend(moe_max_num_tokens, hidden_size)
+    scheduler = _chunking_fused_comm_scheduler(
+        backend,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        moe_max_num_tokens=moe_max_num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+
+    output = scheduler.forward(
+        x,
+        router_logits,
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=all_rank_num_tokens if ep_size > 1 else None,
+        use_dp_padding=None,
+        input_ids=None,
+    )
+
+    assert backend.launch_num_tokens == launches
+    token_selected_experts, token_final_scales = scheduler.moe.routing_method.apply(
+        router_logits[:num_tokens]
+    )
+    expected = backend.expected(x[:num_tokens], token_selected_experts, token_final_scales)
+    assert output.shape == expected.shape
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_single_chunk_hands_back_the_backend_output() -> None:
+    """One chunk is returned as the backend produced it, without a copy."""
+    hidden_size, num_experts, top_k, num_tokens = 8, 4, 2, 3
+    backend = _ReusedOutputFusedCommBackend(num_tokens, hidden_size)
+    scheduler = _chunking_fused_comm_scheduler(
+        backend,
+        ep_size=1,
+        ep_rank=0,
+        moe_max_num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    output = scheduler.forward(
+        torch.randn(num_tokens, hidden_size).to(torch.bfloat16),
+        torch.randn(num_tokens, num_experts),
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
+        use_dp_padding=None,
+        input_ids=None,
+    )
+
+    assert backend.launch_num_tokens == [num_tokens]
+    assert output.data_ptr() == backend.output_buffer.data_ptr()
+
+
 @pytest.mark.cpu_only
 def test_fused_comm_forward_refuses_a_backend_that_reuses_its_buffers() -> None:
     """``_run_chunks`` keeps the tensor each chunk returned, so a backend whose

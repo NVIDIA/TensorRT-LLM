@@ -1223,8 +1223,19 @@ class FusedCommMoEScheduler(MoEScheduler):
        so peers can cross the in-kernel NVLink barrier.
     8. No external Communication.dispatch / Communication.combine.
     9. No multi-stream chunk overlap.
-    10. Reject a backend declaring ``input_requirement.run_moe_reuses_buffers``:
-        chunk outputs are kept, never copied, so such a backend would alias.
+    10. Copy every chunk's output except the last before the next chunk
+        launches: a backend may return a view of a persistent workspace that
+        later MoE launches rewrite. MegaMoE-CuteDSL returns rows of its
+        bucket's combine region, which at EP > 1 every layer with the same
+        layout shares and a zero-token launch may rewrite whole. A copy on the
+        current stream suffices there: local writers queue behind it, and
+        peers write the region only for tokens this rank has published, which
+        each launch does in its first kernel, a non-PDL token-comm kernel that
+        starts after the copy. The only chunk of a single-chunk forward is not
+        copied, so callers must consume the output before the next MoE launch.
+    11. Reject a backend declaring ``input_requirement.run_moe_reuses_buffers``:
+        the output of the last (or only) chunk is returned uncopied, so such a
+        backend would still alias it.
 
     ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
     after this scheduler returns. The scheduler must not rotate
@@ -1274,17 +1285,16 @@ class FusedCommMoEScheduler(MoEScheduler):
                 "quantization happens in backend.quantize_input."
             )
 
-        # ``run_moe_reuses_buffers`` is an external-comm promise today: this
-        # scheduler already runs its chunks on one stream, but ``_run_chunks``
-        # keeps the tensor each chunk returned, so a backend whose next call
-        # overwrites it would hand ``torch.cat`` the same storage num_chunks
-        # times -- the last chunk's rows, silently, for every chunk. Refuse the
-        # combination rather than honour half of it.
+        # ``run_moe_reuses_buffers`` is an external-comm promise today (class
+        # invariant 11): ``_run_chunks`` copies every chunk but the last
+        # (invariant 10), but the last (or only) chunk's tensor is returned as
+        # is, so a backend whose next call overwrites it would still alias the
+        # caller's output. Refuse the combination rather than honour half of it.
         if self.moe.backend.input_requirement.run_moe_reuses_buffers:
             raise NotImplementedError(
                 f"{type(self.moe.backend).__name__} declares "
                 "run_moe_reuses_buffers; the fused-comm (MegaMoE) scheduler "
-                "does not copy chunk outputs and cannot drive it."
+                "returns the last chunk's output uncopied and cannot drive it."
             )
 
         x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta = (
@@ -1458,6 +1468,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         ``real_local == 0`` (this rank has no tokens but peers do): class
         invariant 7 says launch every chunk on every EP rank so the in-kernel
         NVLink barrier (SymmBuffer collective) can synchronize.
+
+        Every chunk's output but the last is copied before the next chunk
+        launches (class invariant 10).
         """
         moe = self.moe
         outputs: List[torch.Tensor] = []
@@ -1497,6 +1510,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 routing_aux=routing_aux_chunk,
             )
             row_offset += x_chunk.shape[0]
+            if idx_chunk < num_chunks - 1:
+                # Class invariant 10: a later launch may rewrite these rows.
+                out_chunk = out_chunk.clone()
             outputs.append(out_chunk)
         return outputs
 

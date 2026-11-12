@@ -288,6 +288,7 @@ def _create_model_config(
     num_slots=-1,
     layer_updates_per_iter=-1,
     max_num_tokens=None,
+    moe_max_num_tokens=None,
 ):
     """Create PretrainedConfig and ModelConfig for MoE testing."""
     pretrained_config = PretrainedConfig()
@@ -323,6 +324,8 @@ def _create_model_config(
     )
     if max_num_tokens is not None:
         kwargs["max_num_tokens"] = max_num_tokens
+    if moe_max_num_tokens is not None:
+        kwargs["moe_max_num_tokens"] = moe_max_num_tokens
 
     return ModelConfig(**kwargs)
 
@@ -497,6 +500,8 @@ def _test_moe_worker(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    moe_max_num_tokens: Optional[int] = None,
+    allow_backend_degradation: bool = True,
 ):
     """
     Test MoE module worker function.
@@ -516,6 +521,10 @@ def _test_moe_worker(
         swiglu_limit: SwiGLU limit parameter (default=inf, non-gptoss)
         bias_dtype: Data type for routing bias (default: same as dtype).
                     Use torch.float32 to test fp32 bias plumbing.
+        moe_max_num_tokens: Tokens per rank of one MoE launch; a forward over
+                            more runs in chunks (default: ModelConfig's).
+        allow_backend_degradation: Whether ``create_moe`` may fall back from
+                                   ``moe_backend`` to another backend.
     """
     try:
         _test_moe_worker_impl(
@@ -535,6 +544,8 @@ def _test_moe_worker(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             bias_dtype=bias_dtype,
+            moe_max_num_tokens=moe_max_num_tokens,
+            allow_backend_degradation=allow_backend_degradation,
         )
     except Exception:
         traceback.print_exc()
@@ -558,6 +569,8 @@ def _test_moe_worker_impl(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    moe_max_num_tokens: Optional[int] = None,
+    allow_backend_degradation: bool = True,
 ):
     """Actual implementation of _test_moe_worker."""
     # Default routing logits dtype to model dtype if not specified
@@ -659,6 +672,7 @@ def _test_moe_worker_impl(
             num_slots=num_slots,
             layer_updates_per_iter=layer_updates_per_iter,
             max_num_tokens=test_max_num_tokens,
+            moe_max_num_tokens=moe_max_num_tokens,
         )
 
         # Create MoE load balancer
@@ -692,8 +706,11 @@ def _test_moe_worker_impl(
                     else DEFAULT_MOE_ACTIVATION
                 ),
                 weight_loading_mode=weight_loading_mode,
+                allow_backend_degradation=allow_backend_degradation,
             ) as fused_moe,
         ):
+            if moe_max_num_tokens is not None:
+                assert fused_moe.moe_max_num_tokens == moe_max_num_tokens
             # Direct construction: no host post-init to allocate for us, and
             # the branch below reads the backend's quant_method shapes.
             fused_moe.create_weights()
@@ -1216,7 +1233,7 @@ def should_skip_MegaMoECuteDsl(
     """Check MegaMoECuteDsl constraints for module-level multi-GPU tests.
 
     Mirrors :func:`should_skip_MegaMoEDeepGemm` but applies to the
-    NVFP4 CuteDSL variant: the kernel owns cross-rank exchange via
+    CuteDSL leaves (NVFP4, unquantized BF16): the kernel owns cross-rank exchange via
     ``MegaMoeSymmMemProvider``, so any forced host comm method is
     rejected. Multi-GPU coverage is limited to EP-shard routing
     (``DEP`` / ``TEP``) and routing methods exercised elsewhere in
@@ -1639,6 +1656,43 @@ def test_configurable_moe_single_gpu(
     )
 
 
+@pytest.mark.parametrize(
+    "seq_len, moe_max_num_tokens",
+    [
+        pytest.param(301, 256, id="2_chunks"),
+        pytest.param(600, 256, id="3_chunks"),
+    ],
+)
+def test_configurable_moe_single_gpu_megamoe_cutedsl_chunked(seq_len: int, moe_max_num_tokens: int):
+    """NVFP4 MegaMoE CuteDSL over more tokens than ``moe_max_num_tokens``.
+
+    The forward runs as ceil(seq_len / moe_max_num_tokens) launches that the
+    scheduler concatenates after the last one, while every launch of the leaf
+    returns rows of the combine buffer the next launch rewrites. No backend
+    degradation, so the layer is MegaMoE's or the test fails.
+    """
+    backend_type = MoeBackendType.MEGAMOE_CUTEDSL
+    model_config = MoeModelConfig(num_experts=8, top_k=2, hidden_size=512, intermediate_size=512)
+    skip_reason = get_quick_skip_reason(
+        backend_type,
+        QuantAlgo.NVFP4,
+        torch.bfloat16,
+        model_config,
+        routing_method_cls=RenormalizeMoeRoutingMethod,
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+    _test_moe_worker(
+        moe_backend=backend_type.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.NVFP4,
+        model_config=model_config,
+        seq_len=seq_len,
+        moe_max_num_tokens=moe_max_num_tokens,
+        allow_backend_degradation=False,
+    )
+
+
 # ============================================================================
 # FP32 Routing Bias Tests
 # ============================================================================
@@ -1796,6 +1850,14 @@ MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
 MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
     quant_algo=QuantAlgo.NVFP4,
+    parallel_modes=MEGAMOE_PARALLEL_MODES,
+    comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
+    should_skip_fn=should_skip_MegaMoECuteDsl,
+)
+# The unquantized BF16 leaf of the same backend (SM100/SM103).
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
+    backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
+    quant_algo=None,
     parallel_modes=MEGAMOE_PARALLEL_MODES,
     comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
     should_skip_fn=should_skip_MegaMoECuteDsl,
@@ -2250,7 +2312,9 @@ def _generate_megamoe_eplb_test_params(
     shared-staging tensors registered by their quantization method, so slot
     migration replaces all derived state atomically alongside the raw
     weights + scales. Only the backend/quant enum and capability skip hook
-    differ between DeepGemm (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4).
+    differ between DeepGemm (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4, and
+    unquantized BF16, whose kernel reads the standard ``w3_w1_weight`` /
+    ``w2_weight`` the unquantized method stages for migration).
 
     The comm method is hardcoded to the ``IGNORE`` sentinel: the fused
     kernel owns dispatch/combine, so the harness must pop
@@ -2354,6 +2418,12 @@ EPLB_TEST_PARAMS = (
     + _generate_megamoe_eplb_test_params(
         backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
         quant_algo=QuantAlgo.NVFP4,
+        should_skip_fn=should_skip_MegaMoECuteDsl,
+    )
+    # The unquantized BF16 leaf declares EPLB support too (SM100/SM103).
+    + _generate_megamoe_eplb_test_params(
+        backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
+        quant_algo=None,
         should_skip_fn=should_skip_MegaMoECuteDsl,
     )
 )
