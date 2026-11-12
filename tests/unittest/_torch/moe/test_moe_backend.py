@@ -59,6 +59,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
+    RenormalizeNaiveMoeRoutingMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
@@ -1268,7 +1269,7 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
         ({"activation_type": ActivationType.Silu}, True),
         ({"model_configs": [MoeModelConfig(64, 4, 2048, 1408)]}, True),
         ({"model_configs": [MoeModelConfig(60, 8, 2048, 1408)]}, True),
-        ({"routing_methods": [DeepSeekV3MoeRoutingMethod]}, True),
+        ({"routing_methods": [RenormalizeNaiveMoeRoutingMethod]}, True),
     ],
     ids=[
         "restored",
@@ -1277,7 +1278,7 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
         "silu",
         "more-experts",
         "larger-top-k",
-        "deepseek-routing",
+        "renormalize-naive-routing",
     ],
 )
 def test_trtllm_nvfp4_seq8_skip(
@@ -1301,7 +1302,23 @@ def test_trtllm_nvfp4_seq8_skip(
     params.update(overrides)
     configs = list(iter_base_test_configs(**params))
     assert len(configs) == 1
-    assert (configs[0][-2] is not None) == expected_skip
+    (
+        _swiglu_alpha,
+        _swiglu_beta,
+        _swiglu_limit,
+        _model_config,
+        _seq_len,
+        _dtype,
+        _backend_type,
+        _quant_algo,
+        _routing_method_cls,
+        skip_reason,
+        _base_test_id,
+    ) = configs[0]
+    if expected_skip:
+        assert skip_reason is not None and "seq_len=8" in skip_reason
+    else:
+        assert skip_reason is None
 
 
 def should_skip_gptoss(

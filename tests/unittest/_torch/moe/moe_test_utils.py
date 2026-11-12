@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     SimpleActivation,
@@ -307,7 +307,6 @@ def should_skip_trtllm(
         from tensorrt_llm._torch.moe.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
             Llama4RenormalizeMoeRoutingMethod,
-            RenormalizeMoeRoutingMethod,
         )
 
         # Llama4 routing only supports top_k=1
@@ -436,24 +435,25 @@ def should_skip_trtllm(
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
-        # NVFP4 flaky tactic failures with large model configs at seq=8.
+        # Keep the NVFP4 seq=8 skips tracked by https://nvbugs/5979443,
+        # except for the single-GPU Relu2 regression configuration below.
+        is_relu2_regression_case = (
+            model_config == MoeModelConfig(60, 4, 2048, 1408)
+            and dtype == torch.bfloat16
+            and activation_type == ActivationType.Relu2
+            and routing_method_cls is RenormalizeMoeRoutingMethod
+            and not swiglu_gptoss_style
+            and moe_tp_size == 1
+            and parallel_mode is None
+            and comm_method is None
+        )
         if (
             num_experts >= 60
             and model_config.top_k >= 4
             and model_config.hidden_size >= 2048
             and model_config.intermediate_size >= 1408
             and seq_len == 8
-            and not (
-                model_config == MoeModelConfig(60, 4, 2048, 1408)
-                and dtype == torch.bfloat16
-                and activation_type == ActivationType.Relu2
-                and routing_method_cls is not None
-                and routing_method_cls == RenormalizeMoeRoutingMethod
-                and not swiglu_gptoss_style
-                and moe_tp_size == 1
-                and parallel_mode is None
-                and comm_method is None
-            )
+            and not is_relu2_regression_case
         ):
             return (
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
