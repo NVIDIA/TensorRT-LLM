@@ -899,10 +899,10 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready() -> None:
         kernel,
         (
             "schedulerRole(p);",
-            "trapLaunch(p, role.reason, role.detail);",
+            "trapLaunch(p, role.reason, role.detailName, role.detail);",
             "__syncthreads();",
             "firstFailedStatus(p.status)",
-            'trapLaunch(p, "status word set before route release", word);',
+            'trapLaunch(p, "status word set before route release", "status word", word);',
             '"red.release.sys.global.add.u64 [%0], 1;" ::"l"(p.routeCounter)',
             "relayCopy(p)",
             "completeLaunch(p);",
@@ -919,14 +919,14 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready() -> None:
         (
             "last = moeRebalanceArriveLastCta(p.completedCtas);",
             "firstFailedStatus(p.status)",
-            'trapLaunch(p, "status word set before READY", failedWord);',
+            'trapLaunch(p, "status word set before READY", "status word", failedWord);',
             "moeRebalancePublishReady(reinterpret_cast<std::uint64_t>(p.readyFlagMc), p.readyValue);",
             "p.counters[kHaloRCounterLaunches] += 1;",
         ),
     )
     # Every scheduler wait that times out fails the launch instead of routing home.
     role = _function_body(kernel_source, "RoleResult mapRoutes(")
-    assert role.count('return RoleResult{.reason = "') == 3
+    assert len(re.findall(r'return RoleResult\{\s*\.reason = "', role)) == 3
     prepare = _function_body(
         kernel_source, "MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch("
     )
@@ -949,7 +949,8 @@ def test_every_scheduler_role_failure_traps_the_launch() -> None:
     """
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
     reasons = re.findall(
-        r'return RoleResult\{\.reason = "([^"]+)", \.detail = [^}]+\};', kernel_source
+        r'return RoleResult\{\s*\.reason = "([^"]+)",\s*\.detailName = [^,]+,\s*\.detail = [^}]+\};',
+        kernel_source,
     )
     assert sorted(reasons) == sorted(
         [
@@ -970,7 +971,7 @@ def test_every_scheduler_role_failure_traps_the_launch() -> None:
     _assert_in_order(
         role,
         (
-            'return RoleResult{.reason = "grid rendezvous timeout", .detail = 0};',
+            'return RoleResult{.reason = "grid rendezvous timeout", .detailName = nullptr, .detail = 0};',
             "return blockIdx.x == 0 ? planAndPublish(p, epoch) : mapRoutes(p, epoch);",
         ),
     )
@@ -978,7 +979,8 @@ def test_every_scheduler_role_failure_traps_the_launch() -> None:
     # The kernel traps on any failure and returns before the route release.
     kernel = _function_body(kernel_source, "void haloRFusedKernel(")
     assert re.search(
-        r"if \(role\.reason != nullptr\)\s*\{\s*trapLaunch\(p, role\.reason, role\.detail\);\s*return;\s*\}",
+        r"if \(role\.reason != nullptr\)\s*\{\s*"
+        r"trapLaunch\(p, role\.reason, role\.detailName, role\.detail\);\s*return;\s*\}",
         kernel,
     )
     trap = _function_body(kernel_source, "void trapLaunch(")
@@ -1473,13 +1475,19 @@ def test_kernel_drains_ready_before_the_exchange_within_one_bound() -> None:
         publish,
         (
             "long long const start = clock64();",
-            "missingReady = drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles);",
+            "latePeer = drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles);",
             "exchangeCycles = elapsed < p.spinCycles ? p.spinCycles - elapsed : 1;",
-            'return RoleResult{.reason = "READY drain timeout", .detail = missingReady};',
+            '.reason = "READY drain timeout", .detailName = "first missing peer rank", .detail = latePeer};',
             "exchange_counts(",
             "epoch, exchangeCycles, p.status)",
+            # Only a failed exchange looks for the late peer; the success path is unchanged.
+            "latePeer = firstLateExchangePeer(p, epoch);",
+            '.detailName = latePeer >= 0 ? "first late peer rank" : nullptr,',
         ),
     )
+    assert kernel_source.count("firstLateExchangePeer(p, epoch)") == 1
+    # The late-peer report adds no static shared memory, which would shrink the relay's slots.
+    assert publish.count("__shared__") == 4
     # Every launch drains, whatever its epoch: the row starts at 1, and the epoch wraps.
     assert "epoch > 1" not in publish
     drain = _function_body(kernel_source, "int drainReadyRow(")

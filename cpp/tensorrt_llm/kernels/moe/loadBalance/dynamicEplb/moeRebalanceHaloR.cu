@@ -25,8 +25,8 @@
 //     publishes the plan only once it is complete, and the grid rendezvous already proved every CTA resident.
 //   - A failing CTA traps before it releases its routes: every timeout and any nonzero status word, which also
 //     catches the invalid routes and unmappable slots that the route passes record and continue past. The route
-//     consumer therefore never passes its wait for a failed launch, and the last CTA, which re-checks the status words
-//     before it publishes READY, publishes nothing.
+//     consumer therefore never passes its wait for a failed launch, and the trap faults the context, so no READY is
+//     published. A trapped CTA never joins the completion chain, so no last CTA is elected for a failed launch.
 //   - READY and the route counter take constant values (moeRebalanceHaloR.h), so a captured launch replays exactly.
 
 #include "tensorrt_llm/common/assert.h"
@@ -111,21 +111,32 @@ struct DeviceWarp
     }
 };
 
-//! Why a CTA's scheduler role failed, uniform across the CTA; `reason` is null on success.
+//! Why a CTA's scheduler role failed, uniform across the CTA; `reason` is null on success. `detailName` says what
+//! `detail` is (a peer rank or an epoch), or is null when the failure has no detail.
 struct RoleResult
 {
     char const* reason;
+    char const* detailName;
     int detail;
 };
 
-//! Thread 0 reports why this launch fails and traps, which faults the context. The calling CTA has not released its
-//! routes and publishes no READY.
-__device__ __noinline__ void trapLaunch(MoeRebalanceHaloRParams const& p, char const* reason, int detail)
+//! Thread 0 reports why this launch fails and traps, which faults the context, so this rank publishes no READY for the
+//! launch. `detailName` says what `detail` is, or is null when there is none.
+__device__ __noinline__ void trapLaunch(
+    MoeRebalanceHaloRParams const& p, char const* reason, char const* detailName, int detail)
 {
     if (threadIdx.x == 0)
     {
-        printf("HALO-R rank %d CTA %d: %s (%d); no routes or READY are published\n", p.localRank,
-            static_cast<int>(blockIdx.x), reason, detail);
+        if (detailName != nullptr)
+        {
+            printf("HALO-R rank %d CTA %d: %s (%s %d); this rank publishes no READY for the launch\n", p.localRank,
+                static_cast<int>(blockIdx.x), reason, detailName, detail);
+        }
+        else
+        {
+            printf("HALO-R rank %d CTA %d: %s; this rank publishes no READY for the launch\n", p.localRank,
+                static_cast<int>(blockIdx.x), reason);
+        }
         asm volatile("trap;" ::: "memory");
     }
 }
@@ -213,6 +224,21 @@ __device__ int drainReadyRow(std::uint64_t* row, int ep, long long start, unsign
     return -1;
 }
 
+//! Thread 0 of CTA 0, after a failed count exchange only: the first rank whose arrival for `epoch` this rank has not
+//! seen yet, or -1 when every arrival has landed since the exchange gave up.
+__device__ int firstLateExchangePeer(MoeRebalanceHaloRParams const& p, Epoch epoch)
+{
+    int* arrivals = reinterpret_cast<int*>(p.peerBases[p.localRank]);
+    for (int rank = 0; rank < p.ep; ++rank)
+    {
+        if (epoch_before(load_relaxed_system(arrivals + rank), epoch))
+        {
+            return rank;
+        }
+    }
+    return -1;
+}
+
 //! CTA 0: READY drain, count exchange, plan, plan publication and route prefix. The drain and the exchange share one
 //! spin bound.
 __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch)
@@ -222,25 +248,34 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     int* histogram = counts + p.ep * p.experts;
     int* quota = histogram + p.experts;
     auto* scratch = reinterpret_cast<haloR::PlannerScratch*>(quota + haloR::kMaxHaloRBroadcasts * p.ep);
-    __shared__ int missingReady;
+    __shared__ int latePeer;
     __shared__ unsigned long long exchangeCycles;
 
     if (threadIdx.x == 0)
     {
         long long const start = clock64();
-        missingReady = drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles);
+        latePeer = drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles);
         auto const elapsed = static_cast<unsigned long long>(clock64() - start);
         exchangeCycles = elapsed < p.spinCycles ? p.spinCycles - elapsed : 1;
     }
     __syncthreads();
-    if (missingReady >= 0)
+    if (latePeer >= 0)
     {
-        return RoleResult{.reason = "READY drain timeout", .detail = missingReady};
+        return RoleResult{.reason = "READY drain timeout", .detailName = "first missing peer rank", .detail = latePeer};
     }
     if (!exchange_counts(reinterpret_cast<unsigned long long const*>(p.peerBases), p.partial, shared, p.ep, p.experts,
             p.localRank, static_cast<int>(gridDim.x), epoch, exchangeCycles, p.status))
     {
-        return RoleResult{.reason = "count exchange timeout", .detail = static_cast<int>(epoch)};
+        // The drain's shared result is free again: no static shared memory is added, which would shrink the relay ring.
+        if (threadIdx.x == 0)
+        {
+            latePeer = firstLateExchangePeer(p, epoch);
+        }
+        __syncthreads();
+        // -1: every arrival landed after the exchange gave up, so no peer is named.
+        return RoleResult{.reason = "count exchange timeout",
+            .detailName = latePeer >= 0 ? "first late peer rank" : nullptr,
+            .detail = latePeer};
     }
     for (int expert = threadIdx.x; expert < p.experts; expert += blockDim.x)
     {
@@ -293,7 +328,7 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     {
         store_release_device(p.gridSync + 2, epoch);
     }
-    return RoleResult{.reason = nullptr, .detail = 0};
+    return RoleResult{.reason = nullptr, .detailName = nullptr, .detail = 0};
 }
 
 //! A worker CTA: stable ordinals, the home slot of every unselected route and, once the prefix is published, the slot
@@ -305,24 +340,26 @@ __device__ RoleResult mapRoutes(MoeRebalanceHaloRParams const& p, Epoch epoch)
     if (!stable_worker_ordinal_pass(
             p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, p.spinCycles))
     {
-        return RoleResult{.reason = "worker rendezvous timeout", .detail = static_cast<int>(epoch)};
+        return RoleResult{
+            .reason = "worker rendezvous timeout", .detailName = "epoch", .detail = static_cast<int>(epoch)};
     }
     int* expertLut = worker_expert_lut(p.experts);
     prepare_worker_default_slots(expertLut, p.ep, p.experts, p.helpers);
     __shared__ int planReady;
     if (!wait_for_plan_epoch(p.plan, epoch, p.spinCycles, p.status, &planReady))
     {
-        return RoleResult{.reason = "plan wait timeout", .detail = static_cast<int>(epoch)};
+        return RoleResult{.reason = "plan wait timeout", .detailName = "epoch", .detail = static_cast<int>(epoch)};
     }
     prepare_worker_selected_experts(expertLut, p.plan);
     pre_materialize_and_compact_worker_routes(
         p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, epoch);
     if (!wait_for_plan_epoch(p.gridSync + 2, epoch, p.spinCycles, p.status, &planReady))
     {
-        return RoleResult{.reason = "route prefix wait timeout", .detail = static_cast<int>(epoch)};
+        return RoleResult{
+            .reason = "route prefix wait timeout", .detailName = "epoch", .detail = static_cast<int>(epoch)};
     }
     materializeSelectedRoutes(p, worker, workers, epoch);
-    return RoleResult{.reason = nullptr, .detail = 0};
+    return RoleResult{.reason = nullptr, .detailName = nullptr, .detail = 0};
 }
 
 //! Phase 1. Every return is uniform across the CTA.
@@ -338,7 +375,7 @@ __device__ RoleResult schedulerRole(MoeRebalanceHaloRParams const& p)
     Epoch epoch;
     if (!grid_rendezvous(p.gridSync, static_cast<int>(gridDim.x), p.spinCycles, p.status, &epoch))
     {
-        return RoleResult{.reason = "grid rendezvous timeout", .detail = 0};
+        return RoleResult{.reason = "grid rendezvous timeout", .detailName = nullptr, .detail = 0};
     }
     return blockIdx.x == 0 ? planAndPublish(p, epoch) : mapRoutes(p, epoch);
 }
@@ -411,7 +448,7 @@ __device__ void completeLaunch(MoeRebalanceHaloRParams const& p)
     }
     if (failedWord >= 0)
     {
-        trapLaunch(p, "status word set before READY", failedWord);
+        trapLaunch(p, "status word set before READY", "status word", failedWord);
         return;
     }
     ReceiverCounts const counts = recordResidency(p);
@@ -440,7 +477,7 @@ __global__ __launch_bounds__(kFusedThreads, 1) void haloRFusedKernel(MoeRebalanc
     RoleResult const role = schedulerRole(p);
     if (role.reason != nullptr)
     {
-        trapLaunch(p, role.reason, role.detail);
+        trapLaunch(p, role.reason, role.detailName, role.detail);
         return;
     }
 
@@ -452,7 +489,7 @@ __global__ __launch_bounds__(kFusedThreads, 1) void haloRFusedKernel(MoeRebalanc
         int const word = firstFailedStatus(p.status);
         if (word >= 0)
         {
-            trapLaunch(p, "status word set before route release", word);
+            trapLaunch(p, "status word set before route release", "status word", word);
         }
         else
         {
@@ -509,8 +546,9 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
     // balanced target, ceil(total / ep), and each rank routes at most routeCapacity rows, so rows never exceed
     // routeCapacity.
     TLLM_CHECK_WITH_INFO(static_cast<long long>(params.routeCapacity) < haloR::kMaxCandidateRows,
-        "HALO-R route capacity %d (max_num_tokens x top_k per rank) overflows the planner's candidate keys",
-        params.routeCapacity);
+        "HALO-R route capacity %d (max_num_tokens x top_k per rank) must be below 2^24 (%lld), the row limit of the "
+        "planner's candidate keys",
+        params.routeCapacity, haloR::kMaxCandidateRows);
     TLLM_CHECK_WITH_INFO(params.planes >= 1 && params.planes <= haloR::kRelayMaxPlanes,
         "HALO-R relay supports 1 to %d weight planes, got %d", haloR::kRelayMaxPlanes, params.planes);
     TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(params.readyFlags) % sizeof(std::uint64_t) == 0

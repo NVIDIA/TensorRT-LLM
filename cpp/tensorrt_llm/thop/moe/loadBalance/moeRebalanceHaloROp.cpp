@@ -85,7 +85,9 @@ T* checkedPointer(std::int64_t value, char const* name)
 //! triggers once every CTA has begun (CUDA may delay it to the kernel's end); waiting for it first makes the kernel
 //! precede the wait in every schedule, and the relay can still overlap MAIN's work after the route release.
 //!
-//! A CUDA error in any call poisons the context: every later call fails with it, and the owner rebuilds the group.
+//! A CUDA error in any call poisons the context: every later call fails with it. Nothing recovers a poisoned context
+//! in place; HALO-R runs again only on a new state, and after a kernel trap, which faults the CUDA context, only in a
+//! new process.
 class MoeRebalanceHaloRState : public torch::CustomClassHolder
 {
 public:
@@ -105,15 +107,16 @@ public:
         int const routeCapacity = checkedInt(routeCapacityValue, "route_capacity");
         int const ctas = checkedInt(ctasValue, "ctas");
         TORCH_CHECK(ep >= kernels::kHaloRMinEp && ep <= kernels::haloR::kMaxRanks, "ep must be in [",
-            kernels::kHaloRMinEp, ", ", kernels::haloR::kMaxRanks, "]");
+            kernels::kHaloRMinEp, ", ", kernels::haloR::kMaxRanks, "], got ", ep);
         TORCH_CHECK(experts > 0 && experts <= kPlanFieldStride && experts % ep == 0,
-            "experts must be positive, no greater than ", kPlanFieldStride, ", and divisible by ep");
+            "experts must be positive, no greater than ", kPlanFieldStride, ", and divisible by ep (", ep, "), got ",
+            experts);
         TORCH_CHECK(helpers >= 1 && helpers <= kernels::haloR::kMaxHelperSlots, "helpers must be in [1, ",
-            kernels::haloR::kMaxHelperSlots, "]");
+            kernels::haloR::kMaxHelperSlots, "], got ", helpers);
         TORCH_CHECK(ctas >= kernels::kHaloRMinCtas && ctas <= kernels::kHaloRMaxCtas, "ctas must be in [",
-            kernels::kHaloRMinCtas, ", ", kernels::kHaloRMaxCtas, "]");
+            kernels::kHaloRMinCtas, ", ", kernels::kHaloRMaxCtas, "], got ", ctas);
         TORCH_CHECK(topk > 0 && routeCapacity > 0 && routeCapacity % topk == 0,
-            "route_capacity must be a positive multiple of topk");
+            "route_capacity must be a positive multiple of topk (", topk, "), got ", routeCapacity);
         TORCH_CHECK(copyStream != 0, "copy_stream must be a non-default CUDA stream");
         int const planes = checkedInt(relayPlaneBytes.numel(), "planes");
 

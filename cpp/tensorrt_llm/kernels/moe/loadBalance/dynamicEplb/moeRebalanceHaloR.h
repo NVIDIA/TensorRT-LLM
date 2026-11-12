@@ -72,9 +72,12 @@ enum MoeRebalanceHaloRCounter : int
 //!   4. Completion. The last CTA to finish its copies records the plan's helper experts in the residency table and
 //!      publishes `readyValue` into this rank's READY cell on every rank.
 //!
-//! A failure before the route release traps before the failing CTA releases its routes, so a consumer never reads
-//! routes of a failed launch. A failure after it, in the relay or at completion, traps before READY, so no READY is
-//! published for the launch.
+//! Every failure check runs before the route release: a failing CTA traps before it releases its routes, so a consumer
+//! never reads routes of a failed launch, and the trap faults the context, so no READY is published for the launch.
+//! The relay and the completion have no failure checks of their own; a fault in a copy faults the context too. The
+//! last CTA re-checks the status words before READY, but every word is set by a scheduler-role pass, so the CTA that
+//! sets it traps first (at its role failure or at its pre-release check) and never joins the completion chain: no
+//! last CTA is elected, and the re-check never sees a set word.
 //!
 //! READY and the route counter take constant values, so that a captured launch replays without host bookkeeping:
 //! every launch publishes READY 1 and first waits for every rank's previous READY in this rank's row and zeroes it.
