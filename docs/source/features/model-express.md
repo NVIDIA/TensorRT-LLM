@@ -141,8 +141,9 @@ identity and layout. FP8 and GPTQ variants fall back. Qwen3.5-122B-A10B shares
 the identity and the per-layer tensor layout, so it qualifies wherever TP=2 holds
 its roughly 234 GiB of BF16 weights, which takes GPUs with more than about 120 GiB
 of memory each, such as B200 or B300; the Qwen3.5-35B-A3B rows exercise that
-layout and no row loads the 122B. Qwen3.5-397B-A17B does not fit at TP=2 or
-below on any current GPU, so it falls back at the TP constraint. The text-only
+layout and no row loads the 122B. Qwen3.5-397B-A17B shares the identity too,
+but its BF16 weights need TP greater than 2 on every current GPU, and a
+deployment at TP greater than 2 falls back at the TP constraint. The text-only
 `Qwen3_5MoeForCausalLM` root is a different identity and falls back. The profile
 pins the CUTLASS MoE backend, which `moe_config.backend: AUTO` selects for BF16
 weights, and admits MoE TP=2 and MoE EP=2 at TP=2 like the Qwen3 MoE profile.
