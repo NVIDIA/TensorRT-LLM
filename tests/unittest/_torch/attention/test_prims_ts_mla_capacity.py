@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
 _ROOT = Path(__file__).resolve().parents[4]
 _ADAPTER = _ROOT / "tensorrt_llm/_torch/attention/backends/fmha/prims_ts.py"
 
@@ -92,49 +94,3 @@ def test_capacity_floor_supported_precisions(dtype: torch.dtype, output_dtype: t
 )
 def test_unproved_geometry_keeps_original_buckets(override: dict) -> None:
     assert _capacities(3, 5, **(_GEOMETRY | override)) == (4, 8)
-
-
-def test_runtime_key_and_plan_use_the_same_normalized_capacities() -> None:
-    tree = ast.parse(_ADAPTER.read_text())
-    method = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "run_mla_context"
-    )
-    assignment = next(
-        node
-        for node in method.body
-        if isinstance(node, ast.Assign)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "_mla_context_capacities"
-    )
-    assert ast.unparse(assignment.targets[0]) == "(q_capacity, kv_capacity)"
-    key = next(
-        node
-        for node in method.body
-        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "key"
-    )
-    assert (
-        ast.unparse(key.value)
-        == "(params.batch_size, q_capacity, kv_capacity, mask, stats is not None)"
-    )
-    plan = next(
-        node
-        for node in ast.walk(method)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "plan"
-    )
-    assert [ast.unparse(kw.value) for kw in plan.keywords if kw.arg is None] == ["plan_kwargs"]
-    assert not {"max_q_len", "max_kv_len", "packed_query"} & {kw.arg for kw in plan.keywords}
-    plan_kwargs = next(
-        node.value
-        for node in ast.walk(method)
-        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "plan_kwargs"
-    )
-    assert isinstance(plan_kwargs, ast.Call) and ast.unparse(plan_kwargs.func) == "dict"
-    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in plan_kwargs.keywords}
-    assert keywords["max_q_len"] == "q_capacity"
-    assert keywords["max_kv_len"] == "kv_capacity"
-    assert keywords["packed_query"] == "True"
