@@ -23,7 +23,10 @@ ABI (all tensors CUDA, on the same device; ``T`` and the table length are runtim
       cos_sin    fp32  [max_pos, 64] contiguous, 16 B aligned: ``[cos(32) | sin(32)]``
                                      per position (the indexer rope table, theta
                                      already applied)
-      wq         fp32  [T, 32]       contiguous (the packed raw head weights)
+      wq         fp32  [T, 32]       contiguous (the packed raw head weights), or with
+                                     ``wq_pitch=160`` the head-weight columns of the
+                                     context indexer projection's fp32 [T, 160] output
+                                     (stride (160, 1)), read in place
       c          float               ``idx_weight_scale = Di**-0.5 * Hi**-0.5``
     outputs (caller-owned, ``out=`` style, must not alias any input)
       q_fp8      e4m3  [T, 32, 128]  contiguous, 16 B aligned: ``[pe | nope]`` codes
@@ -71,7 +74,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 _WARP_SIZE = 32
 _NUM_HEADS = 32
@@ -103,6 +106,8 @@ class QSideFusedConfig:
     use_ue8m0: bool = True
     rows_per_block: int = _DEFAULT_ROWS_PER_BLOCK
     use_pdl: bool = False
+    #: Row pitch of ``wq`` in fp32 elements: 32 (packed) or the projection output's 160.
+    wq_pitch: int = _NUM_HEADS
 
     def __post_init__(self) -> None:
         if self.rows_per_block not in _ALLOWED_ROWS_PER_BLOCK:
@@ -118,7 +123,8 @@ class QSideFusedConfig:
     @property
     def kernel_name(self) -> str:
         mode = "neox" if self.is_neox else "interleave"
-        return f"{KERNEL_NAME_PREFIX}_{mode}_rpb{self.rows_per_block}_pdl{int(self.use_pdl)}"
+        name = f"{KERNEL_NAME_PREFIX}_{mode}_rpb{self.rows_per_block}_pdl{int(self.use_pdl)}"
+        return name if self.wq_pitch == _NUM_HEADS else f"{name}_wq{self.wq_pitch}"
 
 
 _COMPILE_CACHE: dict[tuple[int, QSideFusedConfig], Callable] = {}
@@ -192,6 +198,7 @@ def indexer_q_side_fused_kernel(
     USE_UE8M0: cutlass.Constexpr[bool],
     ROWS_PER_BLOCK: cutlass.Constexpr[int],
     USE_PDL: cutlass.Constexpr[bool],
+    WQ_PITCH: cutlass.Constexpr[int],
 ) -> None:
     """Rope the PE half, quantise ``[pe | nope]`` to E4M3, finalise the head weight.
 
@@ -200,6 +207,51 @@ def indexer_q_side_fused_kernel(
     """
     block, _, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
+
+    if cutlass.const_expr(USE_PDL):
+        # Nothing above touches global memory; every thread waits before its first
+        # load of the predecessor GEMM's output (no CTA barrier on this path).
+        cute.arch.griddepcontrol_wait()
+
+    indexer_q_side_rows(
+        block,
+        tidx,
+        q,
+        position_ids,
+        cos_sin,
+        wq,
+        q_fp8,
+        weights,
+        rows,
+        weight_scale_factor,
+        IS_NEOX,
+        USE_UE8M0,
+        ROWS_PER_BLOCK,
+        WQ_PITCH,
+    )
+
+
+@cute.jit
+def indexer_q_side_rows(
+    block: cutlass.Int32,
+    tidx: cutlass.Int32,
+    q: cute.Tensor,
+    position_ids: cute.Tensor,
+    cos_sin: cute.Tensor,
+    wq: cute.Tensor,
+    q_fp8: cute.Tensor,
+    weights: cute.Tensor,
+    rows: cutlass.Int32,
+    weight_scale_factor: cutlass.Float32,
+    IS_NEOX: cutlass.Constexpr[bool],
+    USE_UE8M0: cutlass.Constexpr[bool],
+    ROWS_PER_BLOCK: cutlass.Constexpr[int],
+    WQ_PITCH: cutlass.Constexpr[int],
+) -> None:
+    """Thread ``tidx`` of CTA ``block``'s share of the kernel (its whole body, callable from
+    another kernel at a block offset): eight lanes per (token, head) row, ``ROWS_PER_BLOCK``
+    rows per CTA. Reads only after the caller's PDL wait. ``WQ_PITCH``: ``wq``'s row pitch,
+    32 (packed head weights) or 160 (read in place from the context indexer projection)."""
     warp_in_block = tidx // cutlass.Int32(_WARP_SIZE)
     lane = tidx % cutlass.Int32(_WARP_SIZE)
     row_in_warp = lane // cutlass.Int32(_LANES_PER_ROW)
@@ -209,11 +261,6 @@ def indexer_q_side_fused_kernel(
         + warp_in_block * cutlass.Int32(_ROWS_PER_WARP)
         + row_in_warp
     )
-
-    if cutlass.const_expr(USE_PDL):
-        # Nothing above touches global memory; every thread waits before its first
-        # load of the predecessor GEMM's output (no CTA barrier on this path).
-        cute.arch.griddepcontrol_wait()
 
     if row < rows:
         pe_col = lane_in_row * cutlass.Int32(_VALUES_PER_LANE)
@@ -384,7 +431,12 @@ def indexer_q_side_fused_kernel(
         if lane_in_row == cutlass.Int32(0):
             # Two separately rounded fp32 products, left-associated, as the forward's
             # ``mul(mul(wq, q_scale), c)``.
-            raw_weight = (wq.iterator + row).load()
+            if cutlass.const_expr(WQ_PITCH == _NUM_HEADS):
+                raw_weight = (wq.iterator + row).load()
+            else:
+                raw_weight = (
+                    wq.iterator + token * cutlass.Int32(WQ_PITCH) + (row - token * _NUM_HEADS)
+                ).load()
             product = raw_weight * scale
             (weights.iterator + row).store(product * weight_scale_factor)
 
@@ -404,6 +456,7 @@ def _launch_indexer_q_side_fused(
     USE_UE8M0: cutlass.Constexpr[bool],
     ROWS_PER_BLOCK: cutlass.Constexpr[int],
     USE_PDL: cutlass.Constexpr[bool],
+    WQ_PITCH: cutlass.Constexpr[int],
 ) -> None:
     rows = num_tokens * cutlass.Int32(_NUM_HEADS)
     threads = ROWS_PER_BLOCK // _ROWS_PER_WARP * _WARP_SIZE
@@ -420,6 +473,7 @@ def _launch_indexer_q_side_fused(
         USE_UE8M0,
         ROWS_PER_BLOCK,
         USE_PDL,
+        WQ_PITCH,
     ).launch(
         grid=(cute.ceil_div(rows, ROWS_PER_BLOCK), 1, 1),
         block=(threads, 1, 1),
@@ -435,6 +489,7 @@ def compile_indexer_q_side_fused(
     rows_per_block: int = _DEFAULT_ROWS_PER_BLOCK,
     *,
     use_pdl: bool = False,
+    wq_pitch: int = _NUM_HEADS,
 ) -> Callable:
     """Compile (or fetch) one specialisation; allocates no GPU tensors.
 
@@ -447,6 +502,7 @@ def compile_indexer_q_side_fused(
         use_ue8m0=bool(use_ue8m0),
         rows_per_block=int(rows_per_block),
         use_pdl=bool(use_pdl),
+        wq_pitch=int(wq_pitch),
     )
     key = (int(device_id), config)
     cached = _COMPILE_CACHE.get(key)
@@ -469,9 +525,14 @@ def compile_indexer_q_side_fused(
         stride_order=(1, 0),
         assumed_align=_FP32_VEC_BYTES,
     )
-    fake_wq = make_fake_compact_tensor(
-        cutlass.Float32, (sym_tokens, _NUM_HEADS), stride_order=(1, 0), assumed_align=4
-    )
+    if config.wq_pitch == _NUM_HEADS:
+        fake_wq = make_fake_compact_tensor(
+            cutlass.Float32, (sym_tokens, _NUM_HEADS), stride_order=(1, 0), assumed_align=4
+        )
+    else:
+        fake_wq = make_fake_tensor(
+            cutlass.Float32, (sym_tokens, _NUM_HEADS), stride=(config.wq_pitch, 1), assumed_align=4
+        )
     fake_q_fp8 = make_fake_compact_tensor(
         cutlass.Float8E4M3FN,
         (sym_tokens, _NUM_HEADS, _HEAD_DIM),
@@ -497,6 +558,7 @@ def compile_indexer_q_side_fused(
         config.use_ue8m0,
         config.rows_per_block,
         config.use_pdl,
+        config.wq_pitch,
         options="--enable-tvm-ffi",
     )
     _COMPILE_CACHE[key] = compiled
@@ -534,6 +596,7 @@ def validate_abi(
     wq: torch.Tensor,
     q_fp8_out: torch.Tensor,
     weights_out: torch.Tensor,
+    wq_pitch: int = _NUM_HEADS,
 ) -> int:
     """Fail closed on every host-checkable property of the ABI; returns ``T``.
 
@@ -550,7 +613,19 @@ def validate_abi(
     _require(q, "q", torch.bfloat16, (num_tokens, _NUM_HEADS, _HEAD_DIM), _BF16_VEC_BYTES)
     _require(position_ids, "position_ids", torch.int32, (num_tokens,), 4)
     _require(cos_sin, "cos_sin", torch.float32, tuple(cos_sin.shape), _FP32_VEC_BYTES)
-    _require(wq, "wq", torch.float32, (num_tokens, _NUM_HEADS), 4)
+    if wq_pitch == _NUM_HEADS:
+        _require(wq, "wq", torch.float32, (num_tokens, _NUM_HEADS), 4)
+    elif (
+        not wq.is_cuda
+        or wq.dtype != torch.float32
+        or tuple(wq.shape) != (num_tokens, _NUM_HEADS)
+        or (num_tokens > 1 and tuple(wq.stride()) != (wq_pitch, 1))
+        or wq.data_ptr() % 4
+    ):
+        raise ValueError(
+            f"wq must be a CUDA fp32 [{num_tokens}, {_NUM_HEADS}] view with stride "
+            f"({wq_pitch}, 1), got {wq.dtype} {tuple(wq.shape)} stride {tuple(wq.stride())}"
+        )
     _require(
         q_fp8_out,
         "q_fp8_out",
@@ -598,6 +673,7 @@ def indexer_q_side_fused(
     rows_per_block: int = _DEFAULT_ROWS_PER_BLOCK,
     use_pdl: bool = False,
     validate: bool = True,
+    wq_pitch: int = _NUM_HEADS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Enqueue the fused q-side kernel on the current stream of ``q``'s device.
 
@@ -607,7 +683,7 @@ def indexer_q_side_fused(
     ``use_pdl`` must describe it.
     """
     if validate:
-        num_tokens = validate_abi(q, position_ids, cos_sin, wq, q_fp8_out, weights_out)
+        num_tokens = validate_abi(q, position_ids, cos_sin, wq, q_fp8_out, weights_out, wq_pitch)
     else:
         num_tokens = int(q.shape[0])
     if compiled_fn is None:
@@ -617,6 +693,7 @@ def indexer_q_side_fused(
             use_ue8m0=use_ue8m0,
             rows_per_block=rows_per_block,
             use_pdl=use_pdl,
+            wq_pitch=wq_pitch,
         )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     compiled_fn(

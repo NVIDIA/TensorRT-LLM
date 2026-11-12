@@ -804,6 +804,22 @@ def mtp_moe_grouped_gemm_finalize_fusion_kernel(
             work_tile, sched_full_phase = sched_load_work_tile(
                 s_work_tile, sched_full_mbar_ptr, sched_empty_mbar_ptr, sched_full_phase
             )
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so the
+        # MMA warp's last `num_ab_stage` commit-arrives are awaited here (as cutlass's
+        # PipelineTmaUmma.producer_tail). Nothing orders them against the accumulator commits
+        # the epilogue waits for, and an arrive still in flight at exit lands in the shared
+        # memory of the next CTA on this SM.
+        for _ in cutlass.range_constexpr(num_ab_stage):
+            while not prims.mbarrier_try_wait_parity(
+                ab_empty_mbar_ptr.subview(ab_stage_idx),
+                ab_mbar_empty_phase_bit,
+                time_limit=10_000_000,
+            ):
+                pass
+            ab_stage_idx = ab_stage_idx + 1
+            if ab_stage_idx == num_ab_stage:
+                ab_stage_idx = 0
+                ab_mbar_empty_phase_bit = ab_mbar_empty_phase_bit ^ 1
 
     # =========================================================================
     # MMA warp (warp 4): TMEM alloc, tcgen05.mma compute
