@@ -106,12 +106,16 @@ def test_checkpoint_private_permit_is_single_use(executor_queue, legacy):
                      sampling_config=SamplingConfig())
     if legacy:
         native.py_checkpoint_validation_token = "private"
+        native.py_prompt_trimmed_prefix = 1
         request = ExecutorRequest.adapt(native)
     else:
         request = ExecutorRequest(
-            native, PythonRequestInputs(checkpoint_validation_token="private"))
+            native,
+            PythonRequestInputs(checkpoint_validation_token="private",
+                                prompt_trimmed_prefix=1))
     request = pickle.loads(pickle.dumps(request))
     assert request.py_checkpoint_validation_token == "private"
+    assert request.py_prompt_trimmed_prefix == 1
     with pytest.raises(RuntimeError):
         executor_queue.enqueue_requests([request, request])
     with patch.object(executor_queue, "_generate_child_request_ids"):
@@ -137,10 +141,35 @@ def test_memory_completion_cannot_clear_checkpoint_gate(executor_queue):
 def test_checkpoint_failure_cannot_be_activated(executor_queue):
     """A failed native transition requires host cleanup, not an activation retry."""
     executor_queue.close_checkpoint_admission("source")
-    executor_queue.fail_sleep_wakeup_transition()
+    executor_queue.fail_checkpoint()
     with pytest.raises(RuntimeError):
         executor_queue.open_checkpoint_admission("source")
     assert not executor_queue.can_enqueue_request()
+
+
+@pytest.mark.parametrize("first", ["checkpoint", "sleep_wakeup"])
+def test_failure_reason_survives_repeated_cleanup(
+        executor_queue: ExecutorRequestQueue, first: str) -> None:
+    """Later cleanup must not relabel the operation that first failed admission.
+
+    Args:
+        executor_queue: Real request queue with an isolated distributed boundary.
+        first: Failure category that owns the permanent admission latch.
+    """
+    failures = {
+        "checkpoint": executor_queue.fail_checkpoint,
+        "sleep_wakeup": executor_queue.fail_sleep_wakeup_transition,
+    }
+    failures[first]()
+    for fail in failures.values():
+        fail()
+    assert executor_queue.get_memory_status() == (RequestAdmissionState.FAILED,
+                                                  frozenset(), first)
+    executor_queue.abort_sleep_transition()
+    executor_queue.abort_wakeup_transition()
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match=rf"admission is failed \({first}\)"):
+        executor_queue.enqueue_request(Mock())
 
 
 def test_enqueue_requests(executor_queue):
@@ -296,6 +325,7 @@ def test_memory_status_snapshot_tracks_partial_restore(executor_queue):
     assert executor_queue.get_memory_status() == (
         RequestAdmissionState.RUNNING,
         frozenset(),
+        None,
     )
 
     executor_queue.begin_sleep_transition(["model", "kv_cache"])
@@ -303,6 +333,7 @@ def test_memory_status_snapshot_tracks_partial_restore(executor_queue):
     assert executor_queue.get_memory_status() == (
         RequestAdmissionState.PARKED,
         frozenset({"model", "kv_cache"}),
+        None,
     )
 
     executor_queue.begin_wakeup_transition(["kv_cache"])
@@ -310,6 +341,7 @@ def test_memory_status_snapshot_tracks_partial_restore(executor_queue):
     assert executor_queue.get_memory_status() == (
         RequestAdmissionState.PARKED,
         frozenset({"model"}),
+        None,
     )
 
 

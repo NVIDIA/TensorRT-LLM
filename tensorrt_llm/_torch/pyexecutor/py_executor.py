@@ -3060,10 +3060,12 @@ class PyExecutor:
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
     def get_memory_status(self) -> dict[str, object]:
-        state, parked_tags = self.executor_request_queue.get_memory_status()
+        state, parked_tags, failure_reason = self.executor_request_queue.get_memory_status(
+        )
         return {
             "state": state.value,
             "parked_tags": sorted(parked_tags),
+            "failure_reason": failure_reason,
         }
 
     def get_request_admission_state(self) -> RequestAdmissionState:
@@ -8245,7 +8247,10 @@ class PyExecutor:
                         control_id,
                         "Scheduler drain timed out.",
                         release_active=True)
-                self.executor_request_queue.fail_sleep_wakeup_transition()
+                if owner:
+                    self.executor_request_queue.fail_checkpoint()
+                else:
+                    self.executor_request_queue.fail_sleep_wakeup_transition()
                 raise TimeoutError(
                     "Timed out draining the scheduler for control.")
             try:

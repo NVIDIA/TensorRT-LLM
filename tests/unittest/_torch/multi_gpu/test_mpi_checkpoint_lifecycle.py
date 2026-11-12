@@ -8,6 +8,7 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor.checkpoint import (
+    AbortCheckpointRequest,
     ActivateRequest,
     CheckpointContext,
     CheckpointLifecycle,
@@ -15,15 +16,19 @@ from tensorrt_llm.executor.checkpoint import (
     HostRestoreAttestation,
     PrepareCaptureRequest,
     ValidateRuntimeRequest,
+    checkpoint_probe_sampling_params,
 )
-from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.serve.checkpoint import ExecutorCheckpointBackend
 
 
 @pytest.mark.gpu2
 @pytest.mark.timeout(600, method="thread")
-@pytest.mark.parametrize("tp", [1, 2])
-@pytest.mark.parametrize("stop_at", ["capture_safe", "runtime_ready", "serving"])
+@pytest.mark.parametrize(
+    ("tp", "stop_at"),
+    [(tp, stop_at) for tp in (1, 2) for stop_at in ("capture_safe", "runtime_ready", "serving")]
+    + [(2, "abort_after_validation")],
+)
 def test_mpi_resident_checkpoint_lifecycle(tp: int, stop_at: str, monkeypatch) -> None:
     """Exercise real rank drain, private graph replay and explicit activation.
 
@@ -55,7 +60,7 @@ def test_mpi_resident_checkpoint_lifecycle(tp: int, stop_at: str, monkeypatch) -
         env_overrides=environment,
     ) as llm:
         prompt = [1, 2, 3, 4]
-        sampling = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True, end_id=-1, pad_id=0)
+        sampling = checkpoint_probe_sampling_params(8)
         reference = list(llm.generate([prompt], sampling)[0].outputs[0].token_ids)
         lifecycle = CheckpointLifecycle(ExecutorCheckpointBackend(llm))
         initial = lifecycle.get_lifecycle_status()
@@ -99,6 +104,25 @@ def test_mpi_resident_checkpoint_lifecycle(tp: int, stop_at: str, monkeypatch) -
         assert all("warmed_graph_replayed" in item.checks for item in validated.rank_results)
         assert not lifecycle.get_lifecycle_status().readiness.admission_open
         if stop_at == "runtime_ready":
+            return
+        if stop_at == "abort_after_validation":
+            abort_context = restored.model_copy(
+                update={"operation_id": "abort", "expected_state_version": validated.state_version}
+            )
+            aborted = lifecycle.abort_operation(
+                AbortCheckpointRequest(context=abort_context, reason="native abort test")
+            )
+            assert aborted.status == "completed", aborted.error
+            assert {item.rank for item in aborted.rank_results} == set(range(tp))
+            assert all("progression_stopped" in item.checks for item in aborted.rank_results)
+            status = lifecycle.get_lifecycle_status()
+            assert status.stage == "aborted"
+            assert not status.readiness.admission_open
+            assert not status.readiness.serving_ready
+            with pytest.raises(
+                RuntimeError, match="Cannot enqueue requests while executor admission is failed"
+            ):
+                llm.generate([prompt], sampling)
             return
         active = restored.model_copy(
             update={"operation_id": "activate", "expected_state_version": validated.state_version}

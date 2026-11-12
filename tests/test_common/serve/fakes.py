@@ -33,6 +33,7 @@ with a self-test, not as a private fake in its own test file.
 import asyncio
 import collections
 import itertools
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Optional, Sequence, Union
@@ -53,6 +54,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 __all__ = [
     "FAKE_CHAT_TEMPLATE",
     "FakeAsyncLLM",
+    "FakeCheckpointExecutor",
     "FakeEncodeOnlyLLM",
     "FakeEncoderExecutor",
     "FakeExecutor",
@@ -144,6 +146,7 @@ class FakeLlmArgs:
     encode_only: bool = False
     sleep_config: Any = None
     num_serve_frontends: int = 1
+    env_overrides: dict[str, str] | None = None
     max_beam_width: int = 1
     reasoning_parser: Optional[str] = None  # chat, completions, Responses
     gather_generation_logits: bool = False  # to_sampling_params in chat and completions
@@ -171,6 +174,50 @@ class FakeExecutor:
 
     def shutdown(self) -> None:
         self.doing_shutdown = True
+
+
+class FakeCheckpointExecutor(FakeExecutor):
+    """Supply startup profile evidence, not native lifecycle mutations, on CPU."""
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        non_block: bool = False,
+        unique_reply_rank: int | None = None,
+        target_ranks: int | list[int] | None = None,
+    ) -> list:
+        """Return the fixed profile used to construct checkpoint HTTP routes.
+
+        Args:
+            method: Only the read-only checkpoint profile query is supported.
+            args: Empty profile-query arguments.
+            kwargs: Empty profile-query keyword arguments.
+            non_block: Whether to return a completed future as the RPC bridge does.
+            unique_reply_rank: Optional rank-zero reply selection.
+            target_ranks: Optional rank-zero target selection.
+
+        Returns:
+            One profile, wrapped in a future for a nonblocking call.
+
+        Raises:
+            NotImplementedError: If a test attempts native mutations or other ranks.
+        """
+        if (
+            method != "checkpoint_profile"
+            or args
+            or kwargs
+            or unique_reply_rank not in (None, 0)
+            or target_ranks not in (None, 0, [0])
+        ):
+            raise NotImplementedError("The fake only supports the rank-zero checkpoint profile.")
+        profile = {"profile_digest": "a" * 64, "cohort_digest": "b" * 64, "ranks": [0]}
+        if non_block:
+            future = Future()
+            future.set_result(profile)
+            return [future]
+        return [profile]
 
 
 class FakeEncoderExecutor:

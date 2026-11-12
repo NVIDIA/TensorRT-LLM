@@ -1823,7 +1823,11 @@ def serve(
         # VisualGen reports no startup error category or startup state.
         _mark_visual_gen()
     logger.set_level(log_level)
-    if enable_checkpoint_mode and (backend != "pytorch" or grpc):
+    if enable_checkpoint_mode and enable_sleep_mode:
+        raise click.UsageError(
+            "--enable_checkpoint_mode and --enable_sleep_mode cannot be combined. "
+            "Resident checkpoint mode does not release memory.")
+    if enable_checkpoint_mode and grpc:
         raise click.UsageError(
             "--enable_checkpoint_mode requires the PyTorch HTTP server.")
     if enable_checkpoint_mode and any(
@@ -2030,8 +2034,13 @@ def serve(
                         f"Checkpoint mode overrides {key}: {previous} -> {value}."
                     )
                 overrides[key] = value
-                os.environ[key] = value
             llm_args["env_overrides"] = overrides
+        else:
+            from tensorrt_llm.executor.checkpoint import checkpoint_enabled
+            if checkpoint_enabled(llm_args.get("env_overrides")):
+                raise click.UsageError(
+                    "Native checkpoint controls require --enable_checkpoint_mode."
+                )
 
         _resolve_default_num_serve_frontends(
             llm_args,
