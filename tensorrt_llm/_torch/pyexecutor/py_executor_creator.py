@@ -53,7 +53,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
-                    instantiate_sampler, is_disagg_enabled, is_mla)
+                    instantiate_sampler, is_agg_helix, is_disagg_enabled,
+                    is_mla)
 from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -279,6 +280,35 @@ def _check_dense_dwdp_launch(llm_args: TorchLlmArgs) -> Optional[DenseMode]:
     if dwdp_config is not None and dwdp_config.enable_dense:
         return validate_dense_gate(llm_args)
     return None
+
+
+_AGG_HELIX_SPARSE_ERROR = (
+    "Aggregated Helix context parallelism supports dense MLA only. Every sparse "
+    "attention algorithm is rejected, including skip_softmax: it keeps dense MLA "
+    "but is not yet supported with aggregated Helix. Helix with sparse attention "
+    "requires disaggregated serving.")
+
+
+def _validate_agg_helix_args(llm_args: TorchLlmArgs) -> None:
+    """Reject aggregated Helix settings that are known before weights load.
+
+    The checks that need the loaded model (MLA architecture, sparse attention
+    supplied by the checkpoint, and the engine's chunked-prefill and KV cache
+    manager choices) run again after the model engine is built.
+    """
+    if get_sm_version() < 100:
+        raise NotImplementedError(
+            "Aggregated Helix context parallelism requires SM100 or newer.")
+    if getattr(llm_args.sparse_attention_config, "algorithm", None) is not None:
+        raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
+    if not llm_args.enable_chunked_prefill:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires chunked prefill; "
+            "set enable_chunked_prefill=True.")
+    if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires KVCacheManagerV2; "
+            "set kv_cache_config.use_kv_cache_manager_v2=True.")
 
 
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
@@ -797,15 +827,6 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
-    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
-    if (mapping.has_cp_helix()
-            and not is_disagg_enabled(cache_transceiver_config)
-            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
-        raise NotImplementedError(
-            "Helix context parallelism is supported only on disaggregated "
-            "generation servers; aggregated serving with Helix is not "
-            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
-            "development only).")
     if (is_decode_only(llm_args.sparse_attention_config)
             and not is_disagg_enabled(cache_transceiver_config)):
         raise NotImplementedError(
@@ -813,6 +834,8 @@ def _create_py_executor(
             "servers: it admits one input token per request per step, so it "
             "cannot serve context requests. Set cache_transceiver_config, or "
             "disable sparse_attention_config.enable_kv_cache_offload.")
+    if is_agg_helix(mapping, cache_transceiver_config):
+        _validate_agg_helix_args(llm_args)
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -993,6 +1016,16 @@ def _create_py_executor(
 
     # Resolve this before cache reuse and cache manager selection consume it.
     resolve_cache_transceiver_config(cache_transceiver_config)
+
+    if is_agg_helix(mapping, cache_transceiver_config):
+        if not is_mla(model_engine.model.model_config.pretrained_config):
+            raise NotImplementedError(
+                "Aggregated Helix context parallelism supports MLA models only."
+            )
+        # The checkpoint can supply a sparse attention config that llm_args
+        # does not carry.
+        if getattr(sparse_attention_config, "algorithm", None) is not None:
+            raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
 
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = model_engine.max_num_seq_slots

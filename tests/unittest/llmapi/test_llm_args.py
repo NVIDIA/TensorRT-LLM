@@ -617,7 +617,8 @@ def test_context_parallelism_mapping_keeps_cp_config():
         "cp_type": CpType.HELIX,
         "tokens_per_block": 32
     }
-    assert not args._kv_cache_estimation_runs()
+    # Aggregated Helix (no cache transceiver) profiles a forward to size KV.
+    assert args._kv_cache_estimation_runs()
 
 
 @pytest.mark.cpu_only

@@ -10219,8 +10219,9 @@ class PyExecutor:
             # The dummy only needs a non-empty context request to enter the
             # context lifecycle and collectives. max_num_tokens is a batch-wide
             # scheduling limit; using it as one synthetic prompt performs a
-            # full max-sized prefill on every idle ADP rank. Helix raises this
-            # minimum to two tokens in the KV manager and capacity check.
+            # full max-sized prefill on every idle ADP rank. Under Helix the
+            # capacity check budgets two tokens for any dummy, while
+            # KVCacheManagerV2 raises only generation dummies to two.
             token_nums = [1]
 
         if not self._has_adp_dummy_kv_capacity(token_nums):
