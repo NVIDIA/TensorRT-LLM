@@ -273,6 +273,10 @@ def _fp8_speculation_refused(spec_config: Optional[DecodingBaseConfig]) -> list[
         "a dynamic draft tree": spec_config.use_dynamic_tree,
         # max_concurrency is translated into a draft-length schedule.
         "a draft-length schedule": spec_config.draft_len_schedule is not None,
+        # The executor builds this gate under the same condition; once it trips, every later
+        # step runs with no drafts.
+        "the acceptance-rate gate": bool(spec_config.acceptance_rate_window_size)
+        and spec_config.acceptance_rate_threshold is not None,
         "rejection sampling": spec_config.use_rejection_sampling,
         "relaxed acceptance": spec_config.use_relaxed_acceptance_for_thinking,
         "a separate speculative checkpoint": spec_config.speculative_model is not None,

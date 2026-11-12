@@ -281,6 +281,10 @@ def test_fp8_target_is_built_only_when_modeling_v2_is_set():
         (_mtp3(moe_backend="CUTLASS"), "draft MoE backend CUTLASS"),
         (_mtp3(draft_len_schedule={8: 3, 32: 2}), "a draft-length schedule"),
         (MTPDecodingConfig(max_draft_len=3, max_concurrency=16), "a draft-length schedule"),
+        (
+            _mtp3(acceptance_rate_window_size=8, acceptance_rate_threshold=0.3),
+            "the acceptance-rate gate",
+        ),
         (_mtp3(use_rejection_sampling=True), "rejection sampling"),
         (_mtp3(use_relaxed_acceptance_for_thinking=True), "relaxed acceptance"),
         (
@@ -300,6 +304,7 @@ def test_fp8_target_is_built_only_when_modeling_v2_is_set():
         "draft-moe-backend",
         "draft-length-schedule",
         "max-concurrency",
+        "acceptance-rate-gate",
         "rejection-sampling",
         "relaxed-acceptance",
         "eagle3",
@@ -308,6 +313,17 @@ def test_fp8_target_is_built_only_when_modeling_v2_is_set():
 )
 def test_fp8_drafter_options_it_does_not_build_are_declined(spec_config, missed):
     _fp8_declined(_fp8_config(spec_config), _fp8_llm_args, missed)
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [dict(acceptance_rate_window_size=8), dict(acceptance_rate_threshold=0.3)],
+    ids=["window-only", "threshold-only"],
+)
+def test_fp8_half_set_acceptance_rate_gate_is_admitted(gate):
+    """The executor builds the gate only when both fields are set; one alone changes nothing."""
+    llm_args = _fp8_llm_args("require")
+    assert _qualified(modeling_v2_resolve(_fp8_config(_mtp3(**gate)), llm_args)) == _FP8
 
 
 @pytest.mark.parametrize(
