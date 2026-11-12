@@ -755,7 +755,7 @@ class CompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        if self.logprobs:
+        if self.logprobs is not None:
             if backend == "pytorch" or gather_generation_logits:
                 sampling_logprobs = self.logprobs
             elif self.logprobs > 1:
