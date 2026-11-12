@@ -1345,6 +1345,31 @@
           "quant_config": {
             "allOf": [
               {
+                "else": {
+                  "properties": {
+                    "config_groups": {
+                      "additionalProperties": {
+                        "properties": {
+                          "weights": {
+                            "properties": {
+                              "dynamic": {
+                                "const": true
+                              }
+                            },
+                            "required": [
+                              "dynamic"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "weights"
+                        ],
+                        "type": "object"
+                      }
+                    }
+                  }
+                },
                 "if": {
                   "properties": {
                     "config_groups": {
