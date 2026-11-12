@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunnerConfig,
     EncoderKeyType,
 )
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.utils import torch_multi_arange, with_model_extra_attrs
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (
@@ -42,6 +43,9 @@ from tensorrt_llm.llmapi.llm_args import (
     ENCODER_RUNNER_MANAGED_INPUTS,
     EncodeCudaGraphConfig,
     EncodeExtraInputSpec,
+    PrefillCudaGraphBackend,
+    TorchCompileConfig,
+    TorchLlmArgs,
     validate_token_encoder_bucket_config,
 )
 from tensorrt_llm.logger import logger
@@ -57,7 +61,13 @@ from ..cuda_graph import (
 from ..input_buffers import InputBuffers
 from ..metadata import build_attention_metadata
 from ..model_call import ModelCaller
-from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerConfig
+from .interface import (
+    PackedInputs,
+    PreparedInputs,
+    RunnerConfig,
+    ScheduledInputs,
+    ScheduledModelRunner,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -216,40 +226,6 @@ class EncoderConfig(RunnerConfig):
             extra_model_inputs=(
                 list(graph_config.extra_model_inputs) if graph_config is not None else []
             ),
-        )
-
-
-@dataclass(frozen=True)
-class EncoderRunnerConfig(EncoderConfig):
-    """Configuration for the EncoderOnly model runner."""
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        model: nn.Module,
-        mapping: Mapping,
-        graph_config: EncodeCudaGraphConfig | None,
-        max_batch_size: int,
-        max_num_tokens: int,
-        max_seq_len: int,
-        max_beam_width: int,
-        without_logits: bool,
-        attention_backend: type[AttentionBackend],
-        enable_autotuner: bool,
-    ) -> Self:
-        return super().create(
-            model=model,
-            mapping=mapping,
-            graph_config=graph_config,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            max_beam_width=max_beam_width,
-            without_logits=without_logits,
-            attention_backend=attention_backend,
-            enable_autotuner=enable_autotuner,
-            is_encoder_decoder=False,
         )
 
 
@@ -561,17 +537,18 @@ class EncoderMixin:
         self._encoder_cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
 
 
-class EncoderRunner(EncoderMixin, PackedModelRunner):
-    """Run the direct EncodeOnly model contract.
+class EncoderRunner(EncoderMixin, ScheduledModelRunner):
+    """Run token encoder models through one execution core with two entry points.
 
-    This runner deliberately knows nothing about ``LlmRequest``, decoder
-    state, cross attention, or cross-KV resources.
+    ``forward`` runs scheduled requests by packing them into the view that
+    ``forward_packed`` runs for a batch its caller already packed. The runner
+    knows nothing about decoder state, cross attention, or cross-KV resources.
     """
 
     def __init__(
         self,
         model: nn.Module,
-        config: EncoderRunnerConfig,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
@@ -598,6 +575,53 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             attention_runtime_features=attention_runtime_features,
         )
         self._attn_metadata: AttentionMetadata | None = None
+
+    @classmethod
+    def create(
+        cls,
+        model: nn.Module,
+        *,
+        llm_args: TorchLlmArgs,
+        mapping: Mapping,
+        dist: Distributed | None,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        max_beam_width: int,
+        model_caller: ModelCaller,
+        attention_backend: type[AttentionBackend],
+        attention_runtime_features: AttentionRuntimeFeatures,
+        moe_load_balancer: MoeLoadBalancer | None = None,
+    ) -> Self:
+        """Build the runner for ``llm_args``.
+
+        Encoder CUDA graphs come only from an ``EncodeCudaGraphConfig`` given as
+        ``cuda_graph_config``; ``encoder_cuda_graph_config`` belongs to
+        encoder-decoder models.
+        """
+        graph_config = llm_args.cuda_graph_config
+        config = EncoderConfig.create(
+            model=model,
+            mapping=mapping,
+            graph_config=graph_config if isinstance(graph_config, EncodeCudaGraphConfig) else None,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            max_beam_width=max_beam_width,
+            without_logits=False,
+            attention_backend=attention_backend,
+            enable_autotuner=llm_args.enable_autotuner,
+            is_encoder_decoder=False,
+        )
+        return cls(
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            model_caller=model_caller,
+            attention_runtime_features=attention_runtime_features,
+        )
 
     def _setup_attention_metadata(self) -> AttentionMetadata:
         if self._attn_metadata is None:
@@ -931,23 +955,33 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
-    def warmup(self) -> None:
+    def warmup(self, resource_manager: ResourceManager | None = None) -> None:
+        if resource_manager is not None:
+            kv_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            )
+            assert kv_cache_manager is None, (
+                "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
+            )
         AutoTuner.get()
         max_shape = (
             self._config.max_batch_size,
             self._config.max_num_tokens,
             self._config.max_seq_len,
         )
-        warmup_shapes = list(
-            dict.fromkeys(
-                [
-                    (1, 1, 1),
-                    max_shape,
-                    (1, 2, 2),
-                ]
+        warmup_shapes = [
+            shape
+            for shape in dict.fromkeys([(1, 1, 1), max_shape, (1, 2, 2)])
+            if all(dim <= limit for dim, limit in zip(shape, max_shape))
+        ]
+        nested_outputs = self._run_warmup_shapes(warmup_shapes)
+        graph_runner = self._encoder_cuda_graph_runner
+        if nested_outputs and graph_runner.enabled:
+            logger.warning(
+                f"{type(self._model).__name__} returns nested tensor outputs, which encoder "
+                "CUDA graphs cannot capture; running it eagerly."
             )
-        )
-        self._run_warmup_shapes(warmup_shapes)
+            graph_runner.enabled = False
         gc.collect()
         torch.cuda.empty_cache()
         self._run_autotuner_warmup()
@@ -983,7 +1017,9 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             model_inputs=model_inputs or None,
         )
 
-    def _run_warmup_shapes(self, shapes: list[tuple[int, int, int]]) -> None:
+    def _run_warmup_shapes(self, shapes: list[tuple[int, int, int]]) -> bool:
+        """Run eager forwards at ``shapes``; return whether any output was a nested tensor."""
+        nested_outputs = False
         with cuda_graph_disabled(self._encoder_cuda_graph_runner):
             for batch_size, num_tokens, max_seq_len in shapes:
                 sequence_lengths = self._encoder_cuda_graph_runner.build_capture_sequence_lengths(
@@ -1000,8 +1036,12 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
                     with discard_nccl_window_tensor_outputs(
                         (self._buffers.input_ids_cuda, prepared.kwargs)
                     ):
-                        self._execute_prepared(prepared)
+                        outputs = self._execute_prepared(prepared)
                     torch.cuda.synchronize()
+                    nested_outputs |= any(
+                        isinstance(value, torch.Tensor) and value.is_nested
+                        for value in outputs.values()
+                    )
                 except torch.OutOfMemoryError:
                     if self._is_distributed_forward():
                         raise
@@ -1011,6 +1051,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
                         "Skipping."
                     )
                     torch.cuda.empty_cache()
+        return nested_outputs
 
     def _run_autotuner_warmup(self) -> None:
         if not self._encoder_config.enable_autotuner:
@@ -1060,6 +1101,11 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         outputs: dict[str, Any] = {}
         for name, value in graph_outputs.items():
             if isinstance(value, torch.Tensor):
+                if value.is_nested:
+                    raise ValueError(
+                        f"Encoder CUDA graphs require dense outputs, but {name!r} is a "
+                        "nested tensor; remove cuda_graph_config for this model."
+                    )
                 if name == "logits":
                     value = value[: len(prepared.sequence_lengths)]
                 outputs[name] = value.clone()
@@ -1069,7 +1115,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
-    def forward(
+    def forward_packed(
         self,
         inputs: PackedInputs,
     ) -> dict[str, Any]:
@@ -1077,6 +1123,47 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         prepared = self._prepare_inputs(inputs)
         return self._execute_prepared(
             prepared,
+            gather_context_logits=inputs.gather_context_logits,
+        )
+
+    def forward(
+        self,
+        inputs: ScheduledInputs,
+        *,
+        resource_manager: ResourceManager,
+        is_dummy: bool = False,
+    ) -> dict[str, Any]:
+        """Execute scheduled requests by packing them for ``forward_packed``."""
+        del resource_manager, is_dummy
+        return self.forward_packed(self._pack_scheduled(inputs))
+
+    def _pack_scheduled(self, inputs: ScheduledInputs) -> PackedInputs:
+        requests = inputs.batch.context_requests
+        input_ids: list[int] = []
+        sequence_lengths: list[int] = []
+        for request in requests:
+            if request.py_multimodal_data is not None:
+                raise ValueError(
+                    "Scheduled requests to a non-generation model cannot carry multimodal inputs."
+                )
+            prompt_tokens = request.get_tokens(0)
+            input_ids.extend(prompt_tokens)
+            sequence_lengths.append(len(prompt_tokens))
+            request.py_batch_idx = request.py_seq_slot
+
+        model_inputs: dict[str, Any] = {}
+        if any(request.py_position_ids is not None for request in requests):
+            position_ids: list[int] = []
+            for request, sequence_length in zip(requests, sequence_lengths):
+                if request.py_position_ids is None:
+                    position_ids.extend(range(sequence_length))
+                else:
+                    position_ids.extend(request.py_position_ids)
+            model_inputs["position_ids"] = position_ids
+        return PackedInputs(
+            input_ids,
+            sequence_lengths,
+            model_inputs=model_inputs,
             gather_context_logits=inputs.gather_context_logits,
         )
 
@@ -1099,3 +1186,38 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         if not isinstance(outputs, dict):
             outputs = {"logits": outputs}
         return outputs
+
+
+def resolve_scheduled_encoder_args(llm_args: TorchLlmArgs) -> TorchLlmArgs:
+    """Reject or drop the settings a scheduled non-generation model cannot honor."""
+    graph_config = llm_args.cuda_graph_config
+    if isinstance(graph_config, EncodeCudaGraphConfig) and graph_config.extra_model_inputs:
+        raise ValueError(
+            "cuda_graph_config.extra_model_inputs can only be supplied through LLM.encode(); "
+            "scheduled requests to a non-generation model cannot provide them."
+        )
+    if llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED:
+        return llm_args
+    update: dict[str, Any] = {"prefill_cuda_graph_backend": PrefillCudaGraphBackend.DISABLED}
+    # Choosing piecewise fills in a default TorchCompileConfig, which would compile for nothing.
+    drops_compile = llm_args.torch_compile_config == TorchCompileConfig()
+    if drops_compile:
+        update["torch_compile_config"] = None
+    graph_setting = (
+        "multimodal_config.encoder_cuda_graph"
+        if llm_args.mm_encoder_only
+        else "cuda_graph_config=EncodeCudaGraphConfig(...)"
+    )
+    logger.warning(
+        f"prefill_cuda_graph_backend={llm_args.prefill_cuda_graph_backend.value!r} is ignored "
+        "for non-generation models, which use encoder CUDA graphs "
+        f"({graph_setting}) instead"
+        + (
+            "; the default torch_compile_config is dropped with it, so the model runs eagerly."
+            if drops_compile
+            else "; torch_compile_config still applies, without piecewise CUDA graphs."
+            if llm_args.torch_compile_config is not None
+            else "."
+        )
+    )
+    return llm_args.model_copy(update=update)

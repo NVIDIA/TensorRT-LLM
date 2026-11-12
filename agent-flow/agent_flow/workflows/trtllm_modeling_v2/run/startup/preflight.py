@@ -37,6 +37,7 @@ from ...checks.runtime_evidence import reports_unsupported_architecture
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ...infra.compute.environment import RunEnvironment, resolve_environment, scheduler_owns_devices
+from ...infra.compute.sessions import GATE_ROLES, sessions_from_task
 from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
 from ...spec.derive import hybrid_marker
@@ -520,7 +521,7 @@ def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
             [
                 int(session.get("nodes", 1))
                 for session in sessions
-                if session.get("role", "any") in ("gates", "any")
+                if session.get("role", "any") in GATE_ROLES
             ]
             or [1]
         )
@@ -552,11 +553,7 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     disaggregated test's ``accuracy.disagg.timeout``, and a boot's or an acceptance leg's
     the longest ``timeout`` ``accuracy.boot`` or ``accuracy.acceptance`` declares.
     """
-    from ...infra.compute.sessions import sessions_from_task
-
-    sessions = [
-        s for s in sessions_from_task(task_data) if s.role in ("gates", "any") and s.time_limit_s
-    ]
+    sessions = [s for s in sessions_from_task(task_data) if s.role in GATE_ROLES and s.time_limit_s]
     if not sessions:
         return []
     budget = int(max(s.time_limit_s for s in sessions))

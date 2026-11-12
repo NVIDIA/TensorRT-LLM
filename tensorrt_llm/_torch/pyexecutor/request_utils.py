@@ -5,9 +5,10 @@
 
 import os
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    from .executor_request_queue import RequestQueueItem
     from .scheduler import WaitingQueue
 
 import numpy as np
@@ -18,9 +19,6 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
-
-# Type alias for request queue items (to avoid circular import)
-# The actual RequestQueueItem class is defined in executor_request_queue.py
 
 
 def get_num_child_requests(request: ExecutorRequest) -> int:
@@ -34,52 +32,6 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
     """
     sampling_config = request.sampling_config
     return 0 if sampling_config.beam_width > 1 else (sampling_config.num_return_sequences or 1) - 1
-
-
-def collect_py_objects_from_requests(
-    requests: List, attribute_name: str, include_none: bool = False, *, allow_missing: bool = False
-) -> Optional[Tuple[str, Dict]]:
-    """Collect Python-only objects from requests.
-
-    Args:
-        requests: List of RequestQueueItem objects.
-        attribute_name: Name of the attribute to collect.
-        include_none: Include requests whose attribute value is None. When
-            enabled, the source request must have the attribute unless
-            allow_missing is True.
-        allow_missing: Skip absent attributes when include_none is enabled.
-
-    Returns:
-        Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
-    """
-    req_id_to_obj = {}
-    for item in requests:
-        if not item.is_normal_request:
-            continue
-        if item.request:
-            if include_none:
-                if allow_missing and not hasattr(item.request, attribute_name):
-                    continue
-                req_id_to_obj[item.id] = getattr(item.request, attribute_name)
-            else:
-                obj = getattr(item.request, attribute_name, None)
-                if obj is not None:
-                    req_id_to_obj[item.id] = obj
-    return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
-
-
-def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> None:
-    """Attach Python-only objects to each request.
-
-    Args:
-        requests: List of RequestQueueItem objects.
-        py_request_objects: Tuple of (attribute_name, dict) pairs.
-    """
-    for attr_name, req_obj_dict in py_request_objects:
-        for item in requests:
-            if item.request:
-                if item.id in req_obj_dict:
-                    setattr(item.request, attr_name, req_obj_dict[item.id])
 
 
 def derive_attention_dp_per_rank_request_cap(
@@ -110,7 +62,9 @@ def derive_attention_dp_per_rank_request_cap(
 
 
 def can_process_attention_dp_request(
-    req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
+    req_item: "RequestQueueItem",
+    all_ranks_num_active_requests: list[int],
+    max_num_active_requests: int,
 ) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
@@ -142,8 +96,8 @@ def get_from_waiting_queue(
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
-    all_ranks_num_active_requests: Optional[List[int]] = None,
-) -> List:
+    all_ranks_num_active_requests: Optional[list[int]] = None,
+) -> list["RequestQueueItem"]:
     """Get requests from the waiting queue.
 
     Args:
@@ -199,7 +153,7 @@ def get_from_waiting_queue(
 
 def partition_context_for_helix(
     input_token_ids: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
-) -> Tuple[List[int], List[int], int, int]:
+) -> tuple[list[int], list[int], int, int]:
     """Partition context for Helix CP.
 
     Only this rank's ~input_len / cp_size tokens are turned into Python ints.
@@ -254,8 +208,8 @@ def partition_context_for_helix(
 
 
 def merge_requests_to_llm_requests(
-    new_requests: List, exclude_last_generation_logits: bool
-) -> List[LlmRequest]:
+    new_requests: list["RequestQueueItem"], exclude_last_generation_logits: bool
+) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests (basic case without CP).
 
     Args:
@@ -277,12 +231,12 @@ def merge_requests_to_llm_requests(
 
 
 def merge_helix_requests(
-    new_requests: List,
+    new_requests: list["RequestQueueItem"],
     cp_rank: int,
     cp_size: int,
     tokens_per_block: int,
     exclude_last_generation_logits: bool,
-) -> List[LlmRequest]:
+) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
     Note: Helix parallelism is a decode-only feature run with disaggregated serving.
@@ -324,17 +278,19 @@ def merge_helix_requests(
 
 @nvtx_range("merge_requests")
 def merge_requests(
-    new_requests: List,
+    new_requests: list["RequestQueueItem"],
     cp_config: dict,
     cp_rank: int,
     cp_size: int,
     exclude_last_generation_logits: bool,
     is_disagg: bool,
-) -> List[LlmRequest]:
+) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
     This is a router function that dispatches to the appropriate merge function
-    based on the CP (Context Parallelism) configuration.
+    based on the CP (Context Parallelism) configuration. A cp_type other than
+    HELIX takes effect only with context parallelism on (cp_size > 1); with a
+    single CP rank, requests are merged as without CP.
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -351,7 +307,7 @@ def merge_requests(
         List of LlmRequest objects.
 
     Raises:
-        NotImplementedError: If cp_type is not supported.
+        NotImplementedError: If cp_size > 1 and cp_type is not supported.
     """
     if "cp_type" in cp_config:
         cp_type = cp_config["cp_type"]
@@ -365,7 +321,7 @@ def merge_requests(
                     exclude_last_generation_logits=exclude_last_generation_logits,
                 )
             return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
-        else:
+        elif cp_size > 1:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
     return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
@@ -379,7 +335,7 @@ class RequestBroadcaster:
         dist: Distributed,
         hang_detector: HangDetector,
         sync_clock: bool = False,
-    ):
+    ) -> None:
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
@@ -392,9 +348,9 @@ class RequestBroadcaster:
         self.rank0_aux: Optional[float] = None
 
     def broadcast(
-        self, new_requests: List, prefer_cpu: bool = False
-    ) -> Tuple[List, Optional[Tuple]]:
-        """Broadcast requests and Python objects across ranks.
+        self, new_requests: list["RequestQueueItem"], prefer_cpu: bool = False
+    ) -> list["RequestQueueItem"]:
+        """Broadcast self-contained request envelopes across ranks.
 
         Args:
             new_requests: Requests fetched on rank 0 (ignored on other ranks).
@@ -414,23 +370,15 @@ class RequestBroadcaster:
             request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
 
         if request_count == 0:
-            return [], None
+            return []
 
         if self.dist.rank == 0:
-            py_request_objects = self._collect_py_objects(new_requests)
-        else:
-            py_request_objects = None
-
-        if self.dist.rank == 0:
-            # Preserve original `new_requests` on rank 0
-            _ = self._broadcast_requests(new_requests, py_request_objects)
+            # Preserve the original envelopes on rank 0.
+            self._broadcast_requests(new_requests)
         else:
             with self.hang_detector.pause():
-                new_requests, py_request_objects = self._broadcast_requests(
-                    new_requests, py_request_objects
-                )
-
-        return new_requests, py_request_objects
+                new_requests = self._broadcast_requests(new_requests)
+        return new_requests
 
     def _single_round(self, prefer_cpu: bool) -> bool:
         """Whether the count probe + payload pair collapses into one collective.
@@ -450,8 +398,10 @@ class RequestBroadcaster:
         )
 
     @nvtx_range("broadcast_requests")
-    def _broadcast_single_round(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
-        """One collective: rank 0 sends (requests, py objects) or "nothing".
+    def _broadcast_single_round(
+        self, new_requests: list["RequestQueueItem"]
+    ) -> list["RequestQueueItem"]:
+        """One collective: rank 0 sends request envelopes or "nothing".
 
         Empty iterations cost one size exchange instead of the count probe's
         two collectives; iterations with new requests cost two collectives
@@ -463,14 +413,14 @@ class RequestBroadcaster:
         """
         payloads = None
         if self.dist.rank == 0 and new_requests:
-            payloads = (new_requests, self._collect_py_objects(new_requests))
+            payloads = new_requests
         with self.hang_detector.pause():
             received = self.dist.broadcast_or_none(payloads, root=0)
         if received is None:
-            return [], None
+            return []
         if self.dist.rank == 0:
             # Preserve the original objects on rank 0.
-            return new_requests, payloads[1]
+            return new_requests
         return received
 
     def _broadcast_request_count(self, request_count: int, prefer_cpu: bool = False) -> int:
@@ -486,7 +436,7 @@ class RequestBroadcaster:
             self.rank0_aux = None if header[2] < 0 else header[2] / 1e6
         return header[0]
 
-    def _broadcast_header(self, header: List[int], prefer_cpu: bool = False) -> List[int]:
+    def _broadcast_header(self, header: list[int], prefer_cpu: bool = False) -> list[int]:
         """Broadcast rank 0's header using the same PP route as requests."""
         if self.dist.world_size == 1:
             return header
@@ -512,43 +462,12 @@ class RequestBroadcaster:
 
         return header
 
-    def _collect_py_objects(self, new_requests: List) -> Tuple:
-        """Collect Python-only objects from requests."""
-        py_objects = [
-            collect_py_objects_from_requests(new_requests, attribute_name)
-            for attribute_name in (
-                "py_logits_post_processors",
-                "py_multimodal_data",
-                "py_scheduling_params",
-                "py_num_logprobs",
-                "py_disaggregated_params",
-                "py_lora_path",
-                "py_lora_ckpt_source",
-                "py_logprobs_mode",
-                "py_logprobs_simple_format",
-                "py_return_routed_experts",
-                "py_arrival_time",
-                "py_kv_hints",
-            )
-        ]
-        py_objects.extend(
-            [
-                collect_py_objects_from_requests(
-                    new_requests, "py_conversation_params", include_none=True
-                ),
-                collect_py_objects_from_requests(
-                    new_requests, "py_original_end_id", include_none=True, allow_missing=True
-                ),
-            ]
-        )
-        return tuple(filter(None, py_objects))
-
     @nvtx_range("broadcast_requests")
     def _broadcast_requests(
-        self, new_requests: List, py_request_objects
-    ) -> Tuple[List, Optional[Dict]]:
-        """Broadcast requests across pipeline stages."""
-        payloads = (new_requests, py_request_objects)
+        self, new_requests: list["RequestQueueItem"]
+    ) -> list["RequestQueueItem"]:
+        """Broadcast request envelopes across pipeline stages."""
+        payloads = new_requests
 
         if self.dist.world_size == 1:
             return payloads

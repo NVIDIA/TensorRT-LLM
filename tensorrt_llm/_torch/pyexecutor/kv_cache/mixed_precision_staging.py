@@ -115,8 +115,12 @@ class MixedPrecisionKVStaging:
         max_pages = -(-self.max_seq_len // self.block_size)
         # Context forwards, the only ones that restore, never run in a captured graph.
         pending = manager.mixed_precision_restore_requests
-        restore_rows = [row for row, request_id in enumerate(request_ids) if request_id in pending]
-        pending.difference_update(request_ids[row] for row in restore_rows)
+        restore_rows = []
+        if pending:
+            restore_rows = [
+                row for row, request_id in enumerate(request_ids) if request_id in pending
+            ]
+            pending.difference_update(request_ids[row] for row in restore_rows)
         self.page_tables = {}
         self.restores = {}
         for layer_idx in self.pools:

@@ -255,9 +255,7 @@ def test_optimized_two_pool_prefill_and_decode(
                     cache = manager.kv_cache_map[request_id]
                     assert cache.resize(None, begin)
                     cache.suspend()
-                    assert cache.resume(
-                        torch.cuda.current_stream().cuda_stream, is_decoding=not context
-                    )
+                    assert cache.resume(torch.cuda.current_stream().cuda_stream)
                     assert cache.resize(end)
                     manager._restore_page_index_bufs(request_id, cache)
             history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
@@ -407,7 +405,7 @@ def test_mixed_precision_public_options():
 
     assert KvCacheConfig().mixed_precision_kv is None
     config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
-    assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256, False, False)
+    assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256)
     assert config.mixed_precision_first_n == config.mixed_precision_last_n == 256
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
@@ -481,7 +479,7 @@ def test_mixed_precision_public_options():
         (
             {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page"}},
             ValueError,
-            "single-beam",
+            "kv_cache_compression_config",
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
         ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse attention"),
@@ -553,27 +551,52 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
     assert target.mixed_precision_kv is not None
 
 
+def _draft_replay_metadata(cls):
+    """A metadata stand-in with the real draft-swap bookkeeping and the class's draft hook, for
+    prepare_attn_metadata_for_draft_replay with a separate draft manager."""
+    metadata = Mock(spec=cls)
+    metadata.enable_flash_mla = False
+    metadata.kv_cache_manager = Mock(name="target_kv_cache_manager")
+    metadata.draft_kv_cache_block_offsets = torch.zeros(1, dtype=torch.int32)
+    metadata.prepare_for_draft_forward = lambda: cls.prepare_for_draft_forward(metadata)
+    metadata.draft_replay_swapped_attrs = {}
+    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+        setattr(metadata, helper, partial(getattr(TrtllmAttentionMetadata, helper), metadata))
+    return metadata
+
+
+_DRAFT_MANAGER = SimpleNamespace(host_kv_cache_block_offsets=torch.zeros(1, dtype=torch.int32))
+
+
 @pytest.mark.cpu_only
-def test_dsa_draft_forward_uses_draft_mixed_precision_high_table():
-    """A mixed DSA draft manager's MTP layers read its own mixed-precision high page table."""
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
+def test_draft_replay_uses_the_draft_manager_mixed_precision_tables():
+    """A draft forward on a separate draft manager reads that manager's mixed-precision high page
+    table, block-offset copy and last-N restore plan (None when its layers take no mixed
+    precision)."""
+    from tensorrt_llm._torch.speculative.interface import (
+        prepare_attn_metadata_for_draft_replay,
+        restore_attn_metadata_after_draft_replay,
     )
 
-    metadata = Mock()
-    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
-    metadata.draft_replay_swapped_attrs = {}
-    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
-    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
-    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
-    target, draft = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
-    metadata.mixed_precision_high_block_table = target
-    metadata.draft_mixed_precision_high_block_table = draft
+    metadata = _draft_replay_metadata(TrtllmAttentionMetadata)
+    target_table, draft_table = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
+    metadata.mixed_precision_high_block_table = target_table
+    metadata.draft_mixed_precision_high_block_table = draft_table
+    target_offsets = torch.zeros((1, 2, 2, 4), dtype=torch.int32)
+    metadata.mixed_precision_low_block_offsets = target_offsets
+    metadata.draft_mixed_precision_low_block_offsets = None
+    target_restore, draft_restore = object(), object()
+    metadata.mixed_precision_high_restore_spans = target_restore
+    metadata.draft_mixed_precision_high_restore_spans = draft_restore
 
-    DSAtrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
-    assert metadata.mixed_precision_high_block_table is draft
-    metadata.restore_draft_swaps()
-    assert metadata.mixed_precision_high_block_table is target
+    saved = prepare_attn_metadata_for_draft_replay(metadata, _DRAFT_MANAGER)
+    assert metadata.mixed_precision_high_block_table is draft_table
+    assert metadata.mixed_precision_low_block_offsets is None
+    assert metadata.mixed_precision_high_restore_spans is draft_restore
+    restore_attn_metadata_after_draft_replay(metadata, saved)
+    assert metadata.mixed_precision_high_block_table is target_table
+    assert metadata.mixed_precision_low_block_offsets is target_offsets
+    assert metadata.mixed_precision_high_restore_spans is target_restore
 
 
 @pytest.mark.cpu_only
@@ -595,6 +618,29 @@ def test_draft_forward_swaps_in_draft_staging():
     assert metadata.mixed_precision_staging is draft
     metadata.restore_draft_swaps()
     assert metadata.mixed_precision_staging is target
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_mixed_precision_high_row_indices_point_at_the_high_pool():
+    """Held positions point at the mixed-precision high pool's rows; released pages keep pool rows."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        mixed_precision_high_row_indices,
+    )
+
+    manager = SimpleNamespace(
+        layer_offsets={3: 0},
+        mixed_precision_high_layer_offsets={0: 1},
+        _mixed_precision_rows_per_page=lambda local: 4,
+    )
+    table = torch.tensor([[8, -1, 12]], dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(kv_cache_manager=manager, mixed_precision_high_block_table=table)
+    attention = SimpleNamespace(layer_idx=3)
+    topk = torch.tensor([[0, 5, 9, -1]], dtype=torch.int32, device="cuda")
+    pool_rows = torch.tensor([[100, 101, 102, -1]], dtype=torch.int32, device="cuda")
+    requests = torch.zeros(1, dtype=torch.int32, device="cuda")
+    rows = mixed_precision_high_row_indices(metadata, attention, topk, pool_rows, requests)
+    # High page 8 holds position 0 at row 8 * 4 + 1 * 4 + 0; the high pool released block 1.
+    assert rows is pool_rows and rows.tolist() == [[36, 101, 53, -1]]
 
 
 @pytest.mark.cpu_only
@@ -806,24 +852,51 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
         draft.shutdown()
 
 
-def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloat16"):
-    """A one-layer BF16 cache; mixed precision keeps one page at each end in the high pool."""
+class _ColdPageProvider:
+    """Cold-page codec provider stand-in: the manager reads only its first/last-N window."""
+
+    config = SimpleNamespace(algorithm="quantization_for_cold_page")
+
+    def __init__(self, first_n: int, last_n: int):
+        self.mixed_precision_high_window = (first_n, last_n)
+
+    def create_cold_page_codec(self, cache_config, **kwargs):
+        return None
+
+
+def _small_manager(
+    block: int,
+    mapping: Mapping,
+    dtype: str = "mixed_nvfp4_bfloat16",
+    layout: str = "gqa",
+    num_layers: int = 1,
+):
+    """A BF16 cache of `num_layers` layers; mixed precision ("mixed_*", or "cold" for the cold-page
+    window) keeps one page at each end in the high pool. "mla" is a single latent KV head of 576
+    (K only)."""
     mixed = (
         dict(mixed_precision_first_n=block, mixed_precision_last_n=block, pool_ratio=[0.75, 0.25])
         if dtype.startswith("mixed_")
         else {}
     )
+    cold = dtype == "cold"
     return KVCacheManagerV2(
-        KvCacheConfig(max_tokens=65536, enable_block_reuse=True, dtype=dtype, **mixed),
-        CacheType.SELF,
-        num_layers=1,
-        num_kv_heads=2,
-        head_dim=64,
+        KvCacheConfig(
+            max_tokens=65536,
+            enable_block_reuse=True,
+            dtype="auto" if cold else dtype,
+            **(dict(pool_ratio=[0.75, 0.25]) if cold else mixed),
+        ),
+        CacheType.SELFKONLY if layout == "mla" else CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=1 if layout == "mla" else 2,
+        head_dim=576 if layout == "mla" else 64,
         tokens_per_block=block,
         max_seq_len=1024,
         max_batch_size=2,
         mapping=mapping,
         dtype=DataType.BF16,
+        cold_page_codec_provider=_ColdPageProvider(block, block) if cold else None,
     )
 
 
@@ -883,33 +956,92 @@ def test_mixed_precision_llm_args_accept_supported_features(overrides):
 @pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
 @pytest.mark.cpu_only
 def test_draft_forward_hides_mixed_precision_high_rows(backend):
-    """A draft manager without a mixed-precision high pool skips its writes and reads."""
+    """A draft manager without a mixed-precision high pool skips its writes, reads and restores."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
         DeepseekV4TrtllmAttentionMetadata,
     )
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
     )
+    from tensorrt_llm._torch.speculative.interface import (
+        prepare_attn_metadata_for_draft_replay,
+        restore_attn_metadata_after_draft_replay,
+    )
 
     cls = {"dsa": DSAtrtllmAttentionMetadata, "deepseek_v4": DeepseekV4TrtllmAttentionMetadata}[
         backend
     ]
-    metadata = Mock()
-    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    metadata = _draft_replay_metadata(cls)
+    # The property reads this class flag; a Mock attribute would be truthy.
+    metadata.mixed_precision_block_offsets_redirect = cls.mixed_precision_block_offsets_redirect
     metadata.draft_sliding_block_tables = None
     metadata.draft_mixed_precision_high_block_table = None
-    metadata.draft_replay_swapped_attrs = {}
-    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
-    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
-    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
     table = torch.full((2, 4), -1, dtype=torch.int32)
     metadata.mixed_precision_high_block_table = table
+    # The target restores high rows in this forward; the draft manager restores none.
+    plan = object()
+    metadata.mixed_precision_high_restore = plan
+    metadata.draft_mixed_precision_high_restore = None
 
-    assert cls.prepare_for_draft_forward(metadata) is None
+    saved = prepare_attn_metadata_for_draft_replay(metadata, _DRAFT_MANAGER)
     assert cls.has_mixed_precision_high_rows.fget(metadata) is False
-    metadata.restore_draft_swaps()
+    assert metadata.mixed_precision_high_restore is None
+    restore_attn_metadata_after_draft_replay(metadata, saved)
     assert metadata.mixed_precision_high_block_table is table
+    assert metadata.mixed_precision_high_restore is plan
     assert cls.has_mixed_precision_high_rows.fget(metadata) is True
+
+
+@pytest.mark.cpu_only
+def test_high_rows_is_sparse_only_and_dense_reports_the_redirect():
+    """The dense metadata has no high-rows property and reports the block-offset redirect; the sparse
+    metadata reports high rows and no redirect. The MLA write path keys the sparse row store on the
+    former, so it never runs for dense MLA models."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata,
+    )
+
+    table = torch.full((2, 4), -1, dtype=torch.int32)
+    assert not hasattr(TrtllmAttentionMetadata, "has_mixed_precision_high_rows")
+    dense = Mock(spec=TrtllmAttentionMetadata)
+    dense.mixed_precision_block_offsets_redirect = True
+    dense.mixed_precision_high_block_table = table
+    assert TrtllmAttentionMetadata.redirects_mixed_precision_block_offsets.fget(dense) is True
+    sparse = Mock(spec=DSAtrtllmAttentionMetadata)
+    sparse.mixed_precision_block_offsets_redirect = False
+    sparse.mixed_precision_high_block_table = table
+    assert DSAtrtllmAttentionMetadata.has_mixed_precision_high_rows.fget(sparse) is True
+    assert DSAtrtllmAttentionMetadata.redirects_mixed_precision_block_offsets.fget(sparse) is False
+    sparse.mixed_precision_high_block_table = None
+    assert DSAtrtllmAttentionMetadata.has_mixed_precision_high_rows.fget(sparse) is False
+
+
+@pytest.mark.cpu_only
+def test_cold_page_copy_back_runs_only_for_layers_with_a_high_layer():
+    """Only a layer that has a high layer restores its fresh last-N rows and copies its rows back; a
+    layer without one (a sliding-window layer of the same model) runs the staging context untouched."""
+    metadata = Mock(spec=TrtllmAttentionMetadata)
+    # A Mock attribute would be truthy on its own; set the property's value explicitly.
+    metadata.redirects_mixed_precision_block_offsets = True
+    metadata.kv_cache_manager = Mock(layer_offsets={0: 0, 1: 1}, mixed_precision_high_layers={0: 2})
+    metadata._layer_takes_mixed_precision = partial(
+        TrtllmAttentionMetadata._layer_takes_mixed_precision, metadata
+    )
+    backend = "tensorrt_llm._torch.attention.backends.trtllm"
+    with (
+        patch(f"{backend}.restore_mixed_precision_high_rows_from_low") as restore,
+        patch(f"{backend}.store_mixed_precision_low_rows") as store,
+    ):
+        with TrtllmAttentionMetadata.mixed_precision_kv_staging(metadata, 0):
+            pass
+        restore.assert_called_once_with(metadata, 0)
+        store.assert_called_once_with(metadata, 0)
+        restore.reset_mock()
+        store.reset_mock()
+        with TrtllmAttentionMetadata.mixed_precision_kv_staging(metadata, 1):
+            pass
+        restore.assert_not_called()
+        store.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -1042,7 +1174,7 @@ def test_staging_covers_allocated_capacity(backend):
         manager.shutdown()
 
 
-@pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16"])
+@pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16", "cold"])
 def test_steady_decode_step_skips_mixed_precision(dtype):
     """The steady MTP decode shortcut stands in for prepare() only without mixed precision."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
@@ -1123,6 +1255,32 @@ def _nvfp4_read(data_pool, scale_pool, pool_rows, head_dim, residual_dim, scale)
     return rows
 
 
+def _restore_case(rows_per_page, head_dim):
+    """Request 1 restores rows 2-4: rows 2-3 sit in its block 1 (pool page 0), row 4 in its block 2
+    (pool page 3); its high pages are 2 and 3 (page 0 holds its sink).
+
+    Returns the restore plan, the high page table, the block table, and a high pool
+    [pages, kv, rows, heads, width] filled with a sentinel no restored row equals.
+    """
+    plan = (
+        torch.tensor([1, 1, 1], dtype=torch.int32, device="cuda"),
+        torch.tensor([2, 3, 4], dtype=torch.int32, device="cuda"),
+    )
+    high_table = torch.tensor([[1, -1, -1], [0, 2, 3]], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor([[4, -1, -1], [2, 0, 3]], dtype=torch.int32, device="cuda")
+    high = torch.full(
+        (4, 1, rows_per_page, 1, head_dim), 448.0, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    return plan, high_table, block_table, high
+
+
+def _expected_high(high, restored):
+    """The sentinel high pool with `restored` at rows 2, 3 (high page 2) and row 4 (high page 3)."""
+    expected = torch.full_like(high, 448.0).view(torch.uint8)
+    expected[[2, 2, 3], 0, [0, 1, 0]] = restored.view(torch.uint8)
+    return expected
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="NVFP4 MLA gather requires Blackwell",
@@ -1136,12 +1294,7 @@ def test_dsa_restore_fills_fresh_high_rows_from_the_pool():
     host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
     host_pool_pointers[0, 0, 0] = data_pool.data_ptr()
     host_pool_pointers[0, 0, 1] = scale_pool.data_ptr()
-
-    # High pool [pages, kv, tokens, heads, width]; no pool row decodes to the sentinel.
-    sentinel = 448.0
-    high = torch.full(
-        (4, 1, tokens_per_block, 1, head_dim), sentinel, dtype=torch.float8_e4m3fn, device="cuda"
-    )
+    plan, high_table, block_table, high = _restore_case(tokens_per_block, head_dim)
     manager = SimpleNamespace(
         head_dim=head_dim,
         mla_kv_cache_residual_dim=residual_dim,
@@ -1149,20 +1302,11 @@ def test_dsa_restore_fills_fresh_high_rows_from_the_pool():
         mixed_precision_high_layers={0: 1},
         _get_mixed_precision_buffers=lambda *args: high,
     )
-    # Context request 1 restores positions 2-4: its block 1 sits in pool block 0, block 2 in
-    # pool block 3; its high pages are 2 and 3 (page 0 holds its sink).
     metadata = SimpleNamespace(
         kv_cache_manager=manager,
-        mixed_precision_high_restore=(
-            torch.tensor([1, 1, 1], dtype=torch.int32, device="cuda"),
-            torch.tensor([2, 3, 4], dtype=torch.int32, device="cuda"),
-        ),
-        mixed_precision_high_block_table=torch.tensor(
-            [[1, -1, -1], [0, 2, 3]], dtype=torch.int32, device="cuda"
-        ),
-        _cached_block_table_ctx=torch.tensor(
-            [[4, -1, -1], [2, 0, 3]], dtype=torch.int32, device="cuda"
-        ),
+        mixed_precision_high_restore=plan,
+        mixed_precision_high_block_table=high_table,
+        _cached_block_table_ctx=block_table,
         _cached_tokens_per_block=tokens_per_block,
         _cached_num_pool_tokens=num_pool_tokens,
         host_kv_cache_pool_pointers=host_pool_pointers,
@@ -1172,11 +1316,9 @@ def test_dsa_restore_fills_fresh_high_rows_from_the_pool():
     owner = SimpleNamespace(layer_idx=0, _nvfp4_mla_kv_scale_quant_orig=scale)
     DSATrtllmAttention._restore_mixed_precision_high_rows(owner, metadata, 0, 1, 0)
 
-    expected = torch.full_like(high, sentinel).view(torch.uint8)
-    # Positions 2, 3 -> pool rows 0, 1 -> high page 2; position 4 -> pool row 6 -> high page 3.
+    # Positions 2, 3 -> pool rows 0, 1; position 4 -> pool row 6.
     read = _nvfp4_read(data_pool, scale_pool, [0, 1, 6], head_dim, residual_dim, scale)
-    expected[[2, 2, 3], 0, [0, 1, 0]] = read.view(torch.uint8)
-    assert torch.equal(high.view(torch.uint8), expected)
+    assert torch.equal(high.view(torch.uint8), _expected_high(high, read))
 
 
 @pytest.mark.skipif(
@@ -1193,11 +1335,7 @@ def test_deepseek_v4_restore_fills_fresh_high_rows_from_the_pool(residual_dim):
     ratio, tokens_per_block, head_dim, num_pool_tokens = 4, 8, 512, 12
     rows_per_page, row_bytes = tokens_per_block // ratio, (head_dim + residual_dim) // 2
     data_pool, scale_pool = _nvfp4_pool(num_pool_tokens, head_dim + residual_dim)
-
-    sentinel = 448.0
-    high = torch.full(
-        (4, 1, rows_per_page, 1, head_dim), sentinel, dtype=torch.float8_e4m3fn, device="cuda"
-    )
+    plan, high_table, block_table, high = _restore_case(rows_per_page, head_dim)
     manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         nvfp4_residual_dim=residual_dim,
@@ -1205,39 +1343,241 @@ def test_deepseek_v4_restore_fills_fresh_high_rows_from_the_pool(residual_dim):
         mixed_precision_high_layers={0: 1},
         _get_mixed_precision_buffers=lambda *args: high,
     )
-    # Request 1 restores compressed rows 2-4: rows 2-3 sit in its compressed block 1 (pool
-    # page 0), row 4 in block 2 (pool page 3). Its high pages are 2 and 3.
     metadata = SimpleNamespace(
-        kv_cache_manager=manager,
-        mixed_precision_high_block_table={
-            ratio: torch.tensor([[1, -1, -1], [0, 2, 3]], dtype=torch.int32, device="cuda")
-        },
-    )
-    plan = (
-        torch.tensor([1, 1, 1], dtype=torch.int32, device="cuda"),
-        torch.tensor([2, 3, 4], dtype=torch.int32, device="cuda"),
+        kv_cache_manager=manager, mixed_precision_high_block_table={ratio: high_table}
     )
     scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
     owner = SimpleNamespace(
         compress_ratio=ratio, head_dim=head_dim, layer_idx=0, _nvfp4_compress_scale_quant_orig=scale
     )
-    block_table_compressed = torch.tensor(
-        [[4, -1, -1], [2, 0, 3]], dtype=torch.int32, device="cuda"
-    )
     # This layer's rows start 2 rows into the pool.
     DeepseekV4TrtllmAttention._restore_mixed_precision_high_rows(
-        owner,
-        metadata,
-        plan,
-        data_pool,
-        scale_pool,
-        num_pool_tokens,
-        2 * row_bytes,
-        block_table_compressed,
+        owner, metadata, plan, data_pool, scale_pool, num_pool_tokens, 2 * row_bytes, block_table
     )
 
-    expected = torch.full_like(high, sentinel).view(torch.uint8)
-    # Rows 2, 3 -> pool rows 2, 3 -> high page 2; row 4 -> pool row 2 + 3 * 2 = 8 -> high page 3.
+    # Rows 2, 3 -> pool rows 2, 3; row 4 -> pool row 2 + 3 * 2 = 8.
     read = _nvfp4_read(data_pool, scale_pool, [2, 3, 8], head_dim, residual_dim, scale)
-    expected[[2, 2, 3], 0, [0, 1, 0]] = read.view(torch.uint8)
-    assert torch.equal(high.view(torch.uint8), expected)
+    assert torch.equal(high.view(torch.uint8), _expected_high(high, read))
+
+
+@pytest.mark.parametrize("num_layers", (1, 2))
+@pytest.mark.parametrize("layout", ("gqa", "mla"))
+def test_cold_page_window_redirects_dense_block_offsets(layout, num_layers):
+    """TRTLLM block offsets of the held blocks point at the high layer's blocks of the same pages;
+    after attention the step's rows come back to the layer's own blocks. GQA has K and V blocks,
+    dense MLA one latent block per page; with two layers, each layer's own blocks of a page."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision KV requires Blackwell")
+    from tensorrt_llm._torch.attention.backends.mixed_precision_rows import (
+        store_mixed_precision_low_rows,
+    )
+
+    block, cached = 32, 4 * 32 + 5
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = _small_manager(block, mapping, "cold", layout, num_layers)
+    try:
+        # A decode request with 133 cached tokens writes one: the high pool holds the first block
+        # (first_n) and the last two (last_n + 1 tokens); the window released blocks 1 and 2.
+        manager.add_dummy_requests([0], [cached + 1], is_gen=True)
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=2,
+            max_num_sequences=2,
+            kv_cache_manager=manager,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            num_contexts=0,
+            request_ids=[0],
+            prompt_lens=[cached],
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+            kv_layout="HND",
+            mapping=mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+        )
+        metadata.prepare()
+        blocks = -(-(cached + 1) // block)
+        kv_factor = manager.kv_factor
+        # The layers share the pool and its block-offset table; an offset counts blocks from
+        # the layer's own base, so one table addresses every layer's blocks.
+        delta, kv_offset = manager.mixed_precision_high_block_deltas[0], int(manager.kv_offset[0])
+        offsets = metadata.kv_cache_block_offsets[0, 0, :, :blocks].tolist()
+        kept = metadata.mixed_precision_low_block_offsets[0, 0, :, :blocks].tolist()
+        # The MTP draft step corrects the query length (one new token) but not the metadata's
+        # separate KV-length copy, which under CUDA graphs still says two; the copy back follows
+        # the query length, so token 4 of the layer's block must stay untouched below.
+        metadata.seq_lens_kv = torch.tensor([2], dtype=torch.int32)
+        assert int(metadata.seq_lens_kv_cuda[0]) == 2 and int(metadata.seq_lens_cuda[0]) == 1
+        torch.manual_seed(0)
+        for layer_idx in range(num_layers):
+            pages = torch.full((2, 1, blocks), -1, dtype=torch.int32)
+            manager.fill_mixed_precision_page_tables([0], layer_idx, pages.numpy())
+            low, high = pages[0, 0].tolist(), pages[1, 0].tolist()
+            assert metadata.mixed_precision_high_block_table[0, :blocks].tolist() == high
+            held = [i for i, page in enumerate(high) if page >= 0]
+            assert held == [0, 3, 4]
+            for kv in range(kv_factor):
+                assert kept[kv] == [page * kv_factor + kv * kv_offset for page in low]
+                assert offsets[kv] == [
+                    (high[i] * kv_factor + delta if i in held else low[i] * kv_factor)
+                    + kv * kv_offset
+                    for i in range(blocks)
+                ]
+            # The redirected offsets address the high layer's blocks of those pages (HND: a block
+            # is heads x tokens rows of one head's bytes), counted from the layer's own blocks.
+            low_pool = manager.get_buffers(layer_idx, "HND", mixed_precision_pool="low")
+            high_pool = manager.get_buffers(layer_idx, "HND", mixed_precision_pool="high")
+            rows = low_pool.view(-1, low_pool.shape[4])
+            heads = high_pool.shape[2]
+            for i in held:
+                for kv in range(kv_factor):
+                    assert (
+                        rows[offsets[kv][i] * heads * block].data_ptr()
+                        == high_pool[high[i], kv].data_ptr()
+                    )
+            # Attention wrote this step's token (position 133: block 4, token 5) into the high
+            # layer; the copy back fills that token of every head in the layer's block and nothing
+            # else. Both views cover the shared pool, so only the layer's own pages take the
+            # sentinel.
+            for page in low:
+                low_pool[page].fill_(7)
+            written = torch.randn(kv_factor, heads, high_pool.shape[4], device="cuda").to(
+                torch.bfloat16
+            )
+            high_pool[high[4], :, :, 5].copy_(written)
+            high_pool[high[4], :, :, 4].fill_(1.0)
+            store_mixed_precision_low_rows(metadata, layer_idx)
+            torch.cuda.synchronize()
+            assert torch.equal(low_pool[low[4], :, :, 5].view(torch.bfloat16), written)
+            assert (low_pool[low[4], :, :, 4] == 7).all() and (low_pool[low[3]] == 7).all()
+            assert (low_pool[low[0]] == 7).all()
+    finally:
+        manager.shutdown()
+
+
+def test_cold_page_window_restores_fresh_high_blocks_from_the_layer():
+    """A restoring context request's cached tokens in its high blocks after the sinks are copied
+    from the layer's own blocks, once, before attention reads them; nothing else changes."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision KV requires Blackwell")
+    from tensorrt_llm._torch.attention.backends.mixed_precision_rows import (
+        restore_mixed_precision_high_rows_from_low,
+    )
+
+    block, cached = 32, 4 * 32 + 5
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = _small_manager(block, mapping, "cold")
+    try:
+        # A context request with 133 cached tokens adds 32. Its high blocks are all fresh, so the
+        # cached tokens after the sink block, 32-132, are restored.
+        manager.add_dummy_requests([0], [cached + block], is_gen=False)
+        manager.mixed_precision_restore_requests.add(0)
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=block,
+            max_num_sequences=2,
+            kv_cache_manager=manager,
+            seq_lens=torch.tensor([block], dtype=torch.int32),
+            num_contexts=1,
+            request_ids=[0],
+            prompt_lens=[cached + block],
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+            kv_layout="HND",
+            mapping=mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+        )
+        metadata.prepare()
+        assert not manager.mixed_precision_restore_requests
+        ends, counts, max_count = metadata.mixed_precision_high_restore_spans
+        assert ends.tolist() == [cached] and counts.tolist() == [cached - block]
+        assert max_count == cached - block
+
+        blocks = -(-(cached + block) // block)
+        pages = torch.full((2, 1, blocks), -1, dtype=torch.int32)
+        manager.fill_mixed_precision_page_tables([0], 0, pages.numpy())
+        low, high = pages[0, 0].tolist(), pages[1, 0].tolist()
+        assert all(page >= 0 for page in high)
+        # HND: [pages, K/V, heads, tokens, width]; the low view counts bytes.
+        low_pool = manager.get_buffers(0, "HND", mixed_precision_pool="low")
+        high_pool = manager.get_buffers(0, "HND", mixed_precision_pool="high")
+        torch.manual_seed(0)
+        for page in low:
+            low_pool[page].copy_(torch.randint_like(low_pool[page], 0, 120))
+        for page in high:
+            high_pool[page].fill_(7.0)
+        expected = [high_pool[page].clone() for page in high]
+        for i in (1, 2, 3):
+            expected[i] = low_pool[low[i]].view(torch.bfloat16).clone()
+        expected[4][:, :, :5] = low_pool[low[4], :, :, :5].view(torch.bfloat16)
+        restore_mixed_precision_high_rows_from_low(metadata, 0)
+        torch.cuda.synchronize()
+        for i, page in enumerate(high):
+            assert torch.equal(high_pool[page], expected[i]), i
+        # The request restored once: the next forward plans nothing.
+        metadata.prepare()
+        assert metadata.mixed_precision_high_restore_spans is None
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_dsa_cold_page_window_restore_copies_the_layer_rows():
+    """With the cold-page window, restored high rows are the layer's own pool rows, bit for bit;
+    other rows stay."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
+
+    tokens_per_block, num_pool_rows, head_dim = 2, 10, 576
+    pool = torch.randint(0, 120, (num_pool_rows, 1, head_dim), dtype=torch.uint8, device="cuda")
+    plan, high_table, block_table, high = _restore_case(tokens_per_block, head_dim)
+    manager = SimpleNamespace(
+        layer_offsets={0: 0},
+        mixed_precision_high_layers={0: 1},
+        mixed_precision_high_dtype=DataType.FP8,
+        get_primary_pool_page_index_params=lambda layer: (1, 0),
+        _get_mixed_precision_buffers=lambda *args: high,
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        mixed_precision_high_restore=plan,
+        mixed_precision_high_block_table=high_table,
+        _ensure_pool_view_cached=lambda: None,
+        _cached_block_table_ctx=block_table,
+        _cached_tokens_per_block=tokens_per_block,
+        _cached_pool_view=pool,
+    )
+    DSATrtllmAttention._restore_mixed_precision_high_rows_from_pool(
+        SimpleNamespace(layer_idx=0), metadata, 0
+    )
+
+    # Positions 2, 3 -> pool rows 0, 1; position 4 -> pool row 6.
+    assert torch.equal(high.view(torch.uint8), _expected_high(high, pool[[0, 1, 6]]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_deepseek_v4_cold_page_window_restore_copies_the_layer_rows():
+    """With the cold-page window, restored compressed high rows are the layer's own compressed rows,
+    bit for bit; other rows stay."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
+        DeepseekV4TrtllmAttention,
+    )
+
+    ratio, tokens_per_block, head_dim = 4, 8, 512
+    rows_per_page = tokens_per_block // ratio
+    own = torch.randint(0, 120, (5, rows_per_page, head_dim), dtype=torch.uint8, device="cuda")
+    plan, high_table, block_table, high = _restore_case(rows_per_page, head_dim)
+    manager = SimpleNamespace(
+        tokens_per_block=tokens_per_block,
+        layer_offsets={0: 0},
+        mixed_precision_high_layers={0: 1},
+        mixed_precision_high_dtype=DataType.FP8,
+        get_buffers=lambda layer_idx, attn_type: own.view(torch.float8_e4m3fn),
+        _get_mixed_precision_buffers=lambda *args: high,
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager, mixed_precision_high_block_table={ratio: high_table}
+    )
+    DeepseekV4TrtllmAttention._restore_mixed_precision_high_rows_from_pool(
+        SimpleNamespace(compress_ratio=ratio, layer_idx=0), metadata, plan, block_table
+    )
+
+    # Rows 2, 3 -> own page 0, rows 0 and 1; row 4 -> own page 3, row 0.
+    restored = own[[0, 0, 3], [0, 1, 0]][:, None]
+    assert torch.equal(high.view(torch.uint8), _expected_high(high, restored))

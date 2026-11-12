@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Mixed-precision high pool for sparse MLA backends that keep the history in an NVFP4 pool.
+"""Mixed-precision high pool of the sparse MLA backends and the cold-page window.
 
-Each new token is also written to the mixed-precision high pool. After the top-k gather, rows
-the mixed-precision high pool still holds overwrite the dequantized rows in the FP8 scratch.
-Mixed-precision high page table: a page index if the token is held there, else -1.
+New tokens are written to the high pool as well; with an NVFP4 history its rows overwrite the
+dequantized scratch after the top-k gather, with a plain history (cold-page window) the held
+positions are read from its rows in place. High page table: the page index if held, else -1.
 """
 
 from typing import TYPE_CHECKING
@@ -13,6 +13,8 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+from ..mixed_precision_rows import copy_rows
 
 if TYPE_CHECKING:
     from ..trtllm import TrtllmAttention
@@ -75,32 +77,6 @@ def _store_mixed_precision_high_rows_kernel(
         )
 
 
-@triton.jit
-def _copy_rows(
-    kv_cache_ptr,
-    slot,
-    scratch_ptr,
-    scratch_row,
-    valid,
-    scale_ptr,
-    APPLY_SCALE: tl.constexpr,
-    ROW_WIDTH: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    """Copy mixed-precision high pool rows `slot` to scratch rows `scratch_row` (FP8)."""
-    src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
-    dst = scratch_ptr + scratch_row.to(tl.int64)[:, None] * ROW_WIDTH
-    if APPLY_SCALE:
-        scale = tl.load(scale_ptr)
-    for start in range(0, ROW_WIDTH, BLOCK_W):
-        cols = start + tl.arange(0, BLOCK_W)
-        mask = valid[:, None] & (cols < ROW_WIDTH)[None, :]
-        row = tl.load(src + cols[None, :], mask=mask)
-        if APPLY_SCALE:
-            row = row.to(tl.float32) * scale
-        tl.store(dst + cols[None, :], row.to(scratch_ptr.dtype.element_ty), mask=mask)
-
-
 # The epoch changes every call: keep it out of the specialization key.
 @triton.jit(do_not_specialize=["claim_epoch"])
 def _overlay_mixed_precision_high_rows_kernel(
@@ -149,7 +125,7 @@ def _overlay_mixed_precision_high_rows_kernel(
         current = tl.load(claim_ptr + scratch_row, mask=valid, other=0)
         tl.store(claim_ptr + scratch_row, record, mask=valid & (current != record))
         return
-    _copy_rows(
+    copy_rows(
         kv_cache_ptr,
         slot,
         scratch_ptr,
@@ -180,7 +156,7 @@ def _copy_recorded_rows_kernel(
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     recorded = tl.load(claim_ptr + rows, mask=rows < scratch_rows, other=0)
     valid = (rows < scratch_rows) & ((recorded >> 32) == claim_epoch.to(tl.int64))
-    _copy_rows(
+    copy_rows(
         kv_cache_ptr,
         recorded & 0xFFFFFFFF,
         scratch_ptr,
@@ -510,6 +486,15 @@ def take_mixed_precision_high_restore(
     A context request that reused a prefix without the high-precision copy of its last N tokens
     holds fresh high pages there; this forward fills them from the low pool before anything reads
     them. The requests are taken from `manager`, so each restores once.
+
+    Args:
+        metadata: The attention metadata of the step; its context requests come first.
+        manager: The KV cache manager the requests restore in (the target's or the draft's).
+        cached_token_lens: `[num_seqs]` host int32: the cached tokens of each batch row.
+
+    Returns:
+        One `(batch row, first token, end token)` per restoring request: its tokens
+        `[first token, end token)` are restored.
     """
     pending = manager.mixed_precision_restore_requests
     if not pending or metadata.num_contexts == 0:
@@ -542,6 +527,15 @@ def mixed_precision_high_restore_rows(
 
     A DeepSeek-V4 compressed row exists once all of its tokens are cached. A fresh page starts on a
     block boundary, a multiple of every compression ratio.
+
+    Args:
+        spans: `(batch row, first token, end token)` per request, as
+            `take_mixed_precision_high_restore` returns them.
+        tokens_per_row: The tokens of one cache row: 1, or the DeepSeek-V4 compression ratio.
+
+    Returns:
+        `(requests, positions)`, both `[num_rows]` int32 on the current CUDA device: the batch row
+        and the row position of each row to restore; None if `spans` cover no whole row.
     """
     requests, positions = [], []
     for row, start, end in spans:
@@ -567,6 +561,14 @@ def restore_mixed_precision_high_rows(
     """Store `rows`, decoded from the low pool as the read decodes them, at `(request, position)`.
 
     The FP8 high pool holds rows as the FP8 scratch does, so they are copied without a scale.
+
+    Args:
+        owner: The attention layer whose mixed-precision high pool receives the rows.
+        metadata: The sparse attention metadata of the step.
+        rows: `[num_rows, ...]` in the high pool's dtype; each flattens to one high pool row.
+        requests: `[num_rows]` int32 on the GPU: the batch row of each row.
+        positions: `[num_rows]` int32 on the GPU: the position of each row, a compressed row
+            position under DeepSeek-V4.
     """
     kv_cache, block_table = _mixed_precision_high_pool(metadata, owner)
     if kv_cache is None:
@@ -594,3 +596,49 @@ def restore_mixed_precision_high_rows(
         ROPE_DIM=0,
         BLOCK_SIZE=max(16, triton.next_power_of_2(row_width)),
     )
+
+
+def mixed_precision_high_row_indices(
+    metadata: "DSAtrtllmAttentionMetadata",
+    attention: "TrtllmAttention",
+    topk_indices: torch.Tensor,
+    topk_indices_global: torch.Tensor,
+    requests: torch.Tensor,
+) -> torch.Tensor:
+    """Point the selected positions the mixed-precision high pool holds at its rows, in place.
+
+    Args:
+        metadata: The sparse attention metadata of the step.
+        attention: The calling attention layer; its `layer_idx` selects the layer's high layer
+            (and its `compress_ratio` the page table under DeepSeek-V4).
+        topk_indices: `[num_rows, topk]` int32 with stride-1 rows: the selected KV positions of
+            each query row, -1 for none.
+        topk_indices_global: `[num_rows, topk]` int32 with stride-1 rows: those positions' pool
+            rows, rewritten in place.
+        requests: `[num_rows]` int32: the batch index of each query row.
+
+    Returns:
+        `topk_indices_global`.
+    """
+    block_table = metadata.mixed_precision_high_block_table
+    if isinstance(block_table, dict):
+        # DeepSeek-V4: one page table per compression ratio.
+        block_table = block_table.get(attention.compress_ratio)
+    if block_table is None:
+        return topk_indices_global
+    manager = metadata.kv_cache_manager
+    local = manager.layer_offsets[attention.layer_idx]
+    layer_offset = manager.mixed_precision_high_layer_offsets.get(local)
+    if layer_offset is None:
+        # No mixed-precision high pool (e.g. an Eagle3 drafter layer): a plain cache.
+        return topk_indices_global
+    num_rows, topk = topk_indices.shape
+    if num_rows == 0 or topk == 0:
+        return topk_indices_global
+    assert topk_indices.stride(1) == 1
+    rows_per_page = manager._mixed_precision_rows_per_page(local)
+    # The page table already carries the page scale, so a page is one block of rows.
+    high_rows = torch.ops.trtllm.convert_req_index_to_global(
+        requests, block_table, topk_indices, rows_per_page, topk, rows_per_page, layer_offset
+    )
+    return torch.where(high_rows >= 0, high_rows, topk_indices_global, out=topk_indices_global)

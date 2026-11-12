@@ -37,7 +37,7 @@ Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](http
 
 When CDMM mode is off, GPU memory is exposed as NUMA nodes, so no additional prerequisites are required.
 
-When CDMM mode is on, GPU memory doesn't exist in NUMA nodes. In that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed.
+When CDMM mode is on, GPU memory doesn't exist in NUMA nodes. In that case, online EPLB uses [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) when it is installed. Without GDRCopy, online EPLB falls back to CUDA managed memory that the host accesses directly over the coherent NVLink-C2C link; this works on hardware-coherent platforms such as GB200/GB300, while other platforms still require GDRCopy.
 
 When GDRCopy is installed and the kernel module is loaded, you should be able to see the device file `/dev/gdrdrv` and kernel module `gdrdrv` by `lsmod`. The device file needs to be mapped into the container.
 

@@ -105,7 +105,7 @@ def test_rendered_image_request_reaches_the_engine_marked_templated(tmp_path):
 
     def generate_async(*, inputs, **kwargs):
         captured["inputs"] = inputs
-        return SimpleNamespace(prompt_token_ids=[7, 11], finished=True)
+        return SimpleNamespace(request_id=1, prompt_token_ids=[7, 11], finished=True)
 
     tokenizer = _StubTokenizer()
     server = make_stub_openai_server(

@@ -1416,6 +1416,52 @@ class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+def test_v1_deprecation_warning_is_emitted_once(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm.logger import logger
+
+    impl = MagicMock()
+    impl.get_block_pool_pointers.return_value = torch.empty(0)
+    impl.get_block_scale_pool_pointers.return_value = torch.empty(0)
+    impl.get_layer_to_pool_mapping.return_value = [0]
+    impl.num_pools = 1
+    impl.max_blocks_per_seq = 1
+    constructor = MagicMock(return_value=impl)
+    emitted = MagicMock()
+    monkeypatch.setattr(logger, "_appeared_keys", set())
+    monkeypatch.setattr(logger, "log", emitted)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp",
+        constructor)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (1 << 30, 2 << 30))
+
+    for _ in range(2):
+        manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=64,
+                                          use_kv_cache_manager_v2=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(),
+            execution_stream=SimpleNamespace(cuda_stream=0),
+        )
+        manager.shutdown()
+
+    warnings = [
+        call for call in emitted.call_args_list
+        if call.args[0] == logger.WARNING
+        and "KV cache manager V1 (KVCacheManager) is deprecated" in call.args[1]
+    ]
+    assert len(warnings) == 1
+    assert constructor.call_count == 2
+
+
+@pytest.mark.cpu_only
 class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
@@ -1655,7 +1701,7 @@ class TestRequestBudget(unittest.TestCase):
         req = self._make_request(prompt_len=200, max_new_tokens=5, beam_width=4)
         with self.assertRaisesRegex(
                 ValueError, "KV_CACHE_MANAGER requires 29 KV cache blocks.*"
-                "GPU-primary capacity of 8"):
+                "capacity of 8"):
             executor._validate_request_budget(req)
 
         # shared(2) + per_beam(2) * beam(2) = 6, so it fits.

@@ -1822,7 +1822,10 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                                         << cutlass.Uint32(scale_byte_idx * 8)
                                     )
                         else:
-                            cute.autovec_copy(tCrSFC, tCgSFC)
+                            # Cluster-padded and partial N tiles can reach past the SF tensor.
+                            if sfc_subtile_idx_mn[0] < cute.size(tCgSFC_mn, mode=[3]):
+                                if sfc_subtile_idx_mn[1] < cute.size(tCgSFC_mn, mode=[4]):
+                                    cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type

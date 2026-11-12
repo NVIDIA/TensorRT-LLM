@@ -24,6 +24,11 @@ from ..mixed_precision_high_rows import (
     mixed_precision_high_restore_rows,
     take_mixed_precision_high_restore,
 )
+from ..offload import (
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+    get_sparse_offload_metadata_layers,
+)
 from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -48,7 +53,6 @@ _INDEXER_LOGITS_DTYPE = torch.float32
 _MAX_RADIX_BLOCKS_PER_ROW = 10
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
@@ -99,9 +103,8 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
-    # Mixed-precision high page tables; -1 = not in the high pool.
-    mixed_precision_high_block_table = None
-    draft_mixed_precision_high_block_table = None
+    # Sparse attention redirects the selected rows of the mixed-precision high pool itself.
+    mixed_precision_block_offsets_redirect: ClassVar[bool] = False
     # (batch rows, positions) of the fresh last-N high rows this forward restores, or None.
     mixed_precision_high_restore = None
     draft_mixed_precision_high_restore = None
@@ -193,6 +196,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Query tokens per generation request for a uniform runtime tier. Zero
     # falls back to the static draft-token ceiling.
     runtime_tokens_per_gen_step: int = 0
+
+    @property
+    def has_mixed_precision_high_rows(self) -> bool:
+        """Whether this batch reads and writes the selected rows of a mixed-precision high layer
+        through the high page table (the sparse backends' way; dense attention redirects block
+        offsets instead)."""
+        return self.mixed_precision_high_block_table is not None
 
     @property
     def is_ragged_verify(self) -> bool:
@@ -391,42 +401,102 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+        self._init_dsa_sparse_offload_state()
+
+    def _offloads_dsa_latent(self) -> bool:
+        """Whether attention reads a DSA cache manager's MLA latent through the offload arena."""
+        return self.sparse_metadata_params.enable_kv_cache_offload and is_dsa_cache_manager(
+            self.kv_cache_manager
+        )
+
+    def _init_dsa_sparse_offload_state(self) -> None:
+        """Validate the fixed offload configuration and allocate its persistent state.
+
+        Besides the shared offload state, the MLA latent writer gets a one-token
+        page table [1, B, 2, 1] and per-token write slots [B]: the writer stores
+        each request's new latent row at its arena write row through them. An
+        NVFP4 latent is dequantized for attention into the state's FP8 scratch.
+        """
+        self.sparse_offload_state: Optional[SparseOffloadState] = None
+        self.sparse_latent_block_offsets: Optional[torch.Tensor] = None
+        self.sparse_latent_write_slots: Optional[torch.Tensor] = None
+        self.sparse_offload_attn_indices: Optional[torch.Tensor] = None
+        self.sparse_offload_stream: Optional[torch.cuda.Stream] = None
+        self.sparse_offload_write_pending: Optional[int] = None
+        self.sparse_offload_fetch_pending: Optional[int] = None
+        self.sparse_offload_next_shared_layer: dict[int, int] = {}
+        if not self._offloads_dsa_latent():
+            return
+        self.sparse_offload_stream = torch.cuda.Stream()
+        self.sparse_offload_start_event = torch.cuda.Event()
+        self.sparse_offload_write_event = torch.cuda.Event()
+        self.sparse_offload_fetch_event = torch.cuda.Event()
+        manager = self.kv_cache_manager
+        layers = get_sparse_offload_metadata_layers(self)
+        local_layers = manager.pp_layers
+        indexer_mask = manager.indexer_k_cache_local_layer_mask
+        self.sparse_offload_next_shared_layer = {
+            previous: following
+            for previous, following, has_indexer in zip(
+                local_layers, local_layers[1:], indexer_mask[1:]
+            )
+            if not has_indexer and previous in layers and following in layers
+        }
+        batch = manager.max_batch_size
+
+        def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return self.get_empty(
+                self.cuda_graph_buffers,
+                shape,
+                dtype=dtype,
+                cache_name=f"dsa_sparse_offload_{name}",
+                capture_graph=self.is_cuda_graph,
+            )
+
+        # Native fetch always processes every Batch row, including for smaller
+        # graph profiles. Its selection width is fixed by the layer's sparse_cache.
+        self.sparse_offload_state = allocate_sparse_offload_state(
+            allocate,
+            layers,
+            max_batch_size=batch,
+            topk=self.sparse_mla_topk,
+            nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
+        )
+        self.sparse_latent_block_offsets = allocate(
+            "latent_block_offsets", (1, batch, 2, 1), torch.int32
+        )
+        self.sparse_latent_block_offsets.fill_(-1)
+        self.sparse_latent_write_slots = allocate("latent_write_slots", (batch,), torch.int32)
+        self.sparse_latent_write_slots.fill_(-1)
+        self.sparse_offload_attn_indices = allocate(
+            "attn_indices", (batch, self.sparse_mla_topk), torch.int32
+        )
+
+    def _validate_dsa_sparse_offload_batch(self) -> None:
+        """Reject batches offload cannot run, on the host before any model writes.
+
+        An offloading worker only decodes, one query token per request.
+        """
+        self.sparse_offload_state.prepared = False
+        if self.num_contexts:
+            raise NotImplementedError(
+                "Sparse KV cache offload runs decode batches only; context requests reach "
+                "an offloading worker through disaggregated KV transfer"
+            )
+        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
+            raise ValueError("Sparse offload batch validation requires host sequence lengths")
+        if not torch.equal(self.seq_lens, self.seq_lens_kv) or not torch.all(self.seq_lens == 1):
+            raise NotImplementedError("Sparse offload decode requires one query per request")
 
     def _has_mixed_precision_staging(self) -> bool:
         # No staging: attention reads the gather's FP8 scratch.
         return False
 
-    @property
-    def has_mixed_precision_high_rows(self) -> bool:
-        """Whether this backend writes and reads a mixed-precision high pool."""
-        return self.mixed_precision_high_block_table is not None
-
-    def _fill_mixed_precision_high_block_table(
-        self, manager: "KVCacheManagerV2", high_layer: int, high_table: torch.Tensor
-    ) -> None:
-        """Refresh a mixed-precision high page table over its full width; the rest stay -1.
-
-        The MTP draft loop writes past this step's kv lengths, so every column a request
-        has allocated must be current.
-        """
-        table = torch.full(
-            (self.num_seqs, high_table.shape[1]), -1, dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        manager._fill_page_table(high_layer, self.request_ids, table.numpy())
-        high_table[: self.num_seqs].copy_(table, non_blocking=True)
-
-    def _fill_mixed_precision_high_block_tables(self) -> None:
-        for manager, high_table in (
-            (self.kv_cache_manager, self.mixed_precision_high_block_table),
-            (self.draft_kv_cache_manager, self.draft_mixed_precision_high_block_table),
-        ):
-            if high_table is not None:
-                # All layers share one mixed-precision high pool, so one table serves them all.
-                high_layer = next(iter(manager.mixed_precision_high_layers.values()))
-                self._fill_mixed_precision_high_block_table(manager, high_layer, high_table)
-
     def prepare(self):
         self._validate_ragged_verification()
+        if self.sparse_offload_state is not None:
+            self._validate_dsa_sparse_offload_batch()
+            self.kv_cache_manager.prepare_sparse_batch(self.request_ids)
         super().prepare()
         self._invalidate_pool_view_cache()
 
@@ -460,7 +530,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # For indexer k cache
         self.prepare_for_indexer_k_cache()
-        self._fill_mixed_precision_high_block_tables()
         # Restoring requests fill their fresh last-N high rows in this forward; MTP layers on the
         # draft manager restore their own.
         if self.mixed_precision_high_block_table is not None:
@@ -480,6 +549,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
 
+        if self.sparse_offload_state is not None:
+            self.kv_cache_manager.prepare_sparse_offload(
+                self.sparse_offload_state, self.request_ids, beam_width=self.beam_width
+            )
+
     def _prepare_device_window_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
         """Bound host-side KV extents until device-selected windows are installed."""
         if self.device_windows_mode and self.is_ragged_verify:
@@ -491,10 +565,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
-        # MTP layers on the draft manager use its mixed-precision high page table.
-        self.swap_for_draft(
-            "mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table
-        )
         self.swap_for_draft("mixed_precision_high_restore", self.draft_mixed_precision_high_restore)
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
@@ -1007,6 +1077,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.nvfp4_mla_compact_indices = None
         if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
             return
+        if self._offloads_dsa_latent():
+            # Offloaded rows are dequantized into the offload state's scratch instead.
+            return
 
         # MTP verifies the current token and max_draft_tokens draft tokens for
         # every generation request. Each query row has its own TopK selection,
@@ -1189,23 +1262,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # Mixed-precision high page table; -1 = not in the high pool.
-        if getattr(self.kv_cache_manager, "mixed_precision_high_layers", None):
-            self.mixed_precision_high_block_table = self.get_empty(
-                self.cuda_graph_buffers,
-                [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
-                cache_name="mixed_precision_high_block_table",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
-        if getattr(self.draft_kv_cache_manager, "mixed_precision_high_layers", None):
-            self.draft_mixed_precision_high_block_table = self.get_empty(
-                self.cuda_graph_buffers,
-                [self.max_num_sequences, self.draft_kv_cache_manager.max_blocks_per_seq],
-                cache_name="draft_mixed_precision_high_block_table",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
         if is_dsa_cache_manager(self.draft_kv_cache_manager):
             self.draft_block_table = self.get_empty(
                 self.cuda_graph_buffers,
