@@ -10,7 +10,9 @@ import torch
 import tensorrt_llm._torch.distributed as distributed
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.speculative import interface
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
@@ -31,9 +33,12 @@ def test_default_target_logits_are_the_logits_processors():
     logits = torch.randn(3, 16)
     processor = _RecordingLogitsProcessor(logits)
     hidden, lm_head, attn_metadata = torch.randn(3, 8), object(), object()
+    # A worker without a vocab-parallel path: the metadata is not even read.
+    worker = object.__new__(Eagle3OneModelWorker)
+    SpecWorkerBase.__init__(worker)
 
     out = SpecWorkerBase.target_logits(
-        object(), hidden, lm_head, processor, attn_metadata, object(), object()
+        worker, hidden, lm_head, processor, attn_metadata, object(), object()
     )
 
     assert out is logits
@@ -196,36 +201,50 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     ],
 )
 def test_mtp_eagle_target_logits_are_sharded_for_greedy_batches(
-    greedy, temperature_only, penalty, has_exchange, rows, sharded
+    greedy, temperature_only, penalty, has_exchange, rows, sharded, monkeypatch
 ):
+    """The fast-path MTP-Eagle worker (key exchange built, temperature-only
+    variant captured) keeps its shard decisions now that they live in
+    SpecWorkerBase.target_logits."""
     head_calls = []
 
     class Head:
         tp_mode, gather_output, padding_size = TensorParallelMode.COLUMN, True, 0
+        mapping = SimpleNamespace(tp_size=8, tp_rank=0, enable_attention_dp=False)
 
         def __call__(self, hidden_states, gather_output=True):
             head_calls.append(gather_output)
             return hidden_states
 
+    # The shard is lm_head(x, gather_output=False) only for a gathered,
+    # evenly vocab-sharded LMHead under the plain logits processor.
+    monkeypatch.setattr(interface, "is_vocab_sharded_lm_head", lambda head: isinstance(head, Head))
+    processor_calls = []
+    monkeypatch.setattr(
+        LogitsProcessor, "forward", lambda self, *args: processor_calls.append(args) or "gathered"
+    )
+
     worker = object.__new__(Eagle3OneModelWorker)
-    worker.key_exchange = SimpleNamespace(MAX_ROWS=8) if has_exchange else None
-    worker._samples_sharded_target = has_exchange
+    SpecWorkerBase.__init__(worker)
+    worker.key_exchange = SimpleNamespace(MAX_ROWS=8, transport="IPC") if has_exchange else None
+    worker._samples_sharded_temperature = has_exchange
+    worker._target_head_mapping = Head.mapping
     worker.guided_decoder = worker._d2t = None
-    worker.mapping = SimpleNamespace(tp_size=8, tp_rank=0, enable_attention_dp=False)
+    worker.spec_config = SimpleNamespace(use_relaxed_acceptance_for_thinking=False)
+    worker.mapping = Head.mapping
     metadata = SimpleNamespace(
         is_all_greedy_sample=greedy,
         temperature_only=temperature_only,
         enable_penalty=penalty,
-        sharded_target_logits=None,
+        sharded_target_logits=False,
     )
     hidden = torch.zeros(rows, 2)
-    processor = _RecordingLogitsProcessor("gathered")
 
-    out = worker.target_logits(hidden, Head(), processor, None, metadata, None)
+    out = worker.target_logits(hidden, Head(), LogitsProcessor(), None, metadata, None)
 
     assert metadata.sharded_target_logits is sharded
     if sharded:
-        assert out is hidden and head_calls == [False] and processor.calls == []
+        assert out is hidden and head_calls == [False] and processor_calls == []
     else:
         assert out == "gathered" and head_calls == []
 
@@ -233,11 +252,20 @@ def test_mtp_eagle_target_logits_are_sharded_for_greedy_batches(
 @pytest.mark.parametrize("sharded", [True, False])
 def test_mtp_eagle_skipped_drafting_keeps_the_shard_marker(sharded):
     """A dynamic draft length of 0 skips drafting; sharded target logits still carry the marker the engine
-    gathers on before a logits post-processor sees them."""
+    gathers on before a logits post-processor sees them (set by SpecWorkerBase.forward for every worker)."""
     worker = object.__new__(Eagle3OneModelWorker)
     worker.skip_drafting = lambda *args: {"logits": "shard"}
     metadata = SimpleNamespace(runtime_draft_len=0, sharded_target_logits=sharded)
 
-    out = worker._forward_impl(None, None, None, "shard", None, metadata, None)
+    out = Eagle3OneModelWorker.forward(
+        worker,
+        None,
+        None,
+        None,
+        "shard",
+        attn_metadata=None,
+        spec_metadata=metadata,
+        draft_model=None,
+    )
 
     assert out.get("logits_vocab_shard", False) is sharded

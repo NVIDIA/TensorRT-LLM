@@ -9,6 +9,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 
 from ..attention.backends import AttentionMetadata
+from ..modules.bf16_draft_head import is_plain_mtp_shared_head
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -253,6 +254,8 @@ class MTPSpecMetadata(SpecMetadata):
 
 class MTPWorker(SpecWorkerBase):
 
+    verifies_on_target_shard = True
+
     def __init__(self,
                  spec_config: "MTPDecodingConfig",
                  model_config=None,
@@ -278,6 +281,22 @@ class MTPWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _verifies_target_by_argmax(self) -> bool:
+        # Relaxed acceptance reads the target's top-k distribution and the
+        # THOP kernel the full-vocab logits.
+        return (not self.spec_config.use_relaxed_acceptance_for_thinking
+                and not self.is_thop)
+
+    def _fused_draft_lm_head(self, draft_model):
+        # Every MTP layer's shared head must be a plain projection of its
+        # last-token rows by the shared LM head.
+        mtp_layers = getattr(draft_model, "mtp_layers", None)
+        if not mtp_layers or not all(
+                is_plain_mtp_shared_head(layer.shared_head)
+                for layer in mtp_layers):
+            return None
+        return getattr(draft_model, "lm_head", None)
 
     def _commit_target_mamba_states(
         self,
@@ -485,17 +504,27 @@ class MTPWorker(SpecWorkerBase):
                 hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                           **draft_inputs)
 
-                logits = mtp_layer.shared_head(hidden_states,
-                                               draft_model.lm_head,
-                                               attn_metadata).float()
-                if self.guided_decoder is not None:
-                    self.guided_decoder.execute_draft_batch(logits,
-                                                            draft_step=i)
+                fused_draft_head = self._fused_draft_head_for(
+                    batch_size, spec_metadata)
+                if fused_draft_head is not None:
+                    # The shared head's input rows (each request's last
+                    # token) through the fused shard GEMV + argmax + exchange.
+                    new_draft_token = self._fused_draft_tokens(
+                        fused_draft_head,
+                        mtp_layer.shared_head.get_last_token_states(
+                            hidden_states, attn_metadata))
+                else:
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata).float()
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.execute_draft_batch(logits,
+                                                                draft_step=i)
 
-                new_draft_token = self.sample_draft_tokens(logits,
-                                                           spec_metadata,
-                                                           batch_size,
-                                                           draft_step=i)
+                    new_draft_token = self.sample_draft_tokens(logits,
+                                                               spec_metadata,
+                                                               batch_size,
+                                                               draft_step=i)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
                 input_ids = draft_inputs["input_ids"]

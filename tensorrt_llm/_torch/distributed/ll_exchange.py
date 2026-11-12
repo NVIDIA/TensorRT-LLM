@@ -38,7 +38,7 @@ nodes of one NVLink domain. Without either, ``create`` returns None and callers 
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -456,10 +456,10 @@ class TPKeyExchange:
         )
         self._ticket = torch.zeros(num_channels, dtype=torch.int32, device=device)
         self._num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        table = [
+        self._peer_table = [
             [p + c * self.channel_bytes for p in buffers.peer_ptrs] for c in range(num_channels)
         ]
-        self._peers = torch.tensor(table, dtype=torch.int64, device=device)
+        self._peers = torch.tensor(self._peer_table, dtype=torch.int64, device=device)
         from ..flashinfer_utils import get_env_enable_pdl
 
         self._pdl = get_env_enable_pdl()
@@ -496,6 +496,15 @@ class TPKeyExchange:
         if buffers is None:
             return None
         return cls(mapping.tp_rank, mapping.tp_size, buffers, num_channels, max_rows)
+
+    def channel_protocol_args(self, channel: int) -> Tuple[torch.Tensor, List[int], int]:
+        """What a kernel that runs this exchange's protocol itself needs for ``channel``
+        (``trtllm::lm_head_argmax``): the channel's epoch counter (int32 [1] view), every rank's
+        receive region of the channel (addresses, by rank) and the packets per rank and slot. Such a
+        kernel shares the channel with the launches here, in any order every rank follows."""
+        if not 0 <= channel < self.num_channels:
+            raise ValueError(f"channel {channel} out of range [0, {self.num_channels})")
+        return self._state[channel : channel + 1], list(self._peer_table[channel]), self._words
 
     def _check(self, m: int, channel: int):
         if not 1 <= m <= self.MAX_ROWS:
@@ -1329,9 +1338,37 @@ def get_tp_group_exchange(
 _EXCHANGES: Dict[tuple, Optional[TPKeyExchange]] = {}
 
 
+def _agree_on_key_exchange(mapping, ex: Optional[TPKeyExchange]) -> Optional[TPKeyExchange]:
+    """``ex`` where every rank of the TP group built its exchange, else None on every rank (collective).
+
+    A caller picks the exchange or the NCCL path per rank from whether it has one, so the ranks must agree:
+    the peer allocation is agreed inside ``_PeerBuffers.create``, but the rest of the setup can still fail
+    on one rank only. Setups that return None on every rank before any collective step (an unsupported
+    group, MPI disabled) skip the agreement."""
+    from tensorrt_llm._utils import mpi_disabled
+
+    if (
+        mapping.tp_size not in (2, 4, 8, 16)
+        or mapping.enable_attention_dp
+        or mapping.has_pp()
+        or mapping.cp_size > 1
+        or mpi_disabled()
+    ):
+        return ex
+    from .mnnvl_memory import TpMnnvlMemory
+
+    if all(TpMnnvlMemory.get_comm(mapping).allgather(ex is not None)):
+        return ex
+    if ex is not None:
+        logger.warning("[TPKeyExchange] setup failed on another rank of the TP group, keeping NCCL")
+        ex.close()
+    return None
+
+
 def create_tp_key_exchange(mapping, max_rows: int) -> Optional[TPKeyExchange]:
     """Build the TP group's exchange for launches of up to ``max_rows`` keys (collective: every rank of the group
-    calls it in step, outside CUDA-graph capture); None where unsupported. A second call returns the first one's."""
+    calls it in step, outside CUDA-graph capture); None where unsupported, then on every rank of the group. A
+    second call returns the first one's."""
     key = (tuple(mapping.tp_group), mapping.tp_rank, torch.cuda.current_device())
     if key not in _EXCHANGES:
         try:
@@ -1339,6 +1376,7 @@ def create_tp_key_exchange(mapping, max_rows: int) -> Optional[TPKeyExchange]:
         except (RuntimeError, ValueError) as e:  # callers keep the NCCL all-gather
             logger.warning(f"[TPKeyExchange] setup failed, keeping NCCL all-gather: {e}")
             ex = None
+        ex = _agree_on_key_exchange(mapping, ex)
         _EXCHANGES[key] = ex
         logger.info(
             f"[TPKeyExchange] tp_size={mapping.tp_size} rank={mapping.tp_rank}: "

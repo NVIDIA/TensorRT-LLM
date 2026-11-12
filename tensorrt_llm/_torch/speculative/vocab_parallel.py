@@ -25,6 +25,8 @@ to the lowest global index). The selected ids are therefore bit-identical to
 Consumers:
 
 * :meth:`VocabParallelHead.argmax` -- greedy target tokens.
+* :func:`shard_argmax` -- greedy target tokens of the stock one-model
+  speculative workers where the TP key exchange cannot take the rows.
 * :meth:`VocabParallelHead.sample` -- temperature-only sampling through the
   Gumbel-max trick: ``argmax(logits / T + G)`` with standard Gumbel noise ``G``
   is a draw from ``softmax(logits / T)``, exact up to the 23-bit uniform
@@ -47,6 +49,7 @@ shapes depend only on ``(rows, shard width)`` and nothing synchronizes with the
 host, so every path is CUDA-graph capturable.
 """
 
+import os
 from typing import NamedTuple, Optional
 
 import torch
@@ -77,6 +80,41 @@ _TARGET_PROGRAMS = 256
 # They are not specialized: a specialization flips when a value becomes 1 or a
 # multiple of 16 and would compile a kernel variant mid-serving.
 _PAIR_LAYOUT_ARGS = ["stride_out", "slot0", "zero_lo", "zero_hi"]
+
+# "0" turns off the vocab-parallel greedy argmax of the stock one-model
+# speculative workers (SpecWorkerBase.enable_vocab_parallel_argmax), which
+# restores the behaviour before it: the gathered target logits, except on the
+# models that take the speculative fast paths, whose workers already selected
+# their greedy and temperature-only target tokens from the shard.
+VOCAB_PARALLEL_ARGMAX_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_ARGMAX"
+
+
+def vocab_parallel_argmax_enabled() -> bool:
+    """Whether the stock one-model speculative workers take their greedy
+    tokens from vocab-sharded logits (``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX``,
+    default on)."""
+    return os.environ.get(VOCAB_PARALLEL_ARGMAX_ENV_VAR, "1").strip() != "0"
+
+
+def _gathers_even_vocab_shards(lm_head: LMHead) -> bool:
+    mapping = lm_head.mapping
+    return (
+        mapping.tp_size > 1
+        and not mapping.enable_attention_dp
+        and lm_head.tp_mode == TensorParallelMode.COLUMN
+        and lm_head.gather_output
+        and lm_head.padding_size == 0
+        and lm_head.gather_output_sizes is None
+        and lm_head.num_embeddings < _MAX_VOCAB
+    )
+
+
+def is_vocab_sharded_lm_head(lm_head: torch.nn.Module) -> bool:
+    """Whether ``lm_head(x, gather_output=False)`` is this rank's contiguous
+    vocab shard of ``lm_head(x)``: a gathered, evenly vocab-sharded TP
+    ``LMHead`` (plain TP, no attention DP, no vocab padding) whose vocab ids
+    are exact in float32. Subclasses (an ``Embedding``) do not qualify."""
+    return type(lm_head) is LMHead and _gathers_even_vocab_shards(lm_head)
 
 
 @triton.jit
@@ -557,6 +595,18 @@ def tp_pair_exchange(mapping: Mapping, strategy: AllReduceStrategy) -> _PairExch
     )
 
 
+def shard_argmax(
+    local: torch.Tensor,
+    col_base: int,
+    exchange: _PairExchange,
+    out_dtype: torch.dtype = torch.int64,
+) -> torch.Tensor:
+    """Global argmax over the vocab of shard logits ``local`` ``[rows, shard]``
+    (unit vocab stride) whose column 0 is global vocab id ``col_base``: the
+    ids ``torch.argmax`` gives on the gathered logits."""
+    return _select_tokens(_local_argmax_kernel, local, (), col_base, exchange, out_dtype)
+
+
 def markov_chain_logits(
     base_logits: torch.Tensor,
     first_prev_tokens: torch.Tensor,
@@ -641,18 +691,10 @@ class VocabParallelHead:
         noise in 4-column groups of the global vocab) and the vocab below
         ``2**24`` (indices travel as float32).
         """
-        if not isinstance(lm_head, LMHead):
-            return False
-        mapping = lm_head.mapping
         return (
-            mapping.tp_size > 1
-            and not mapping.enable_attention_dp
-            and lm_head.tp_mode == TensorParallelMode.COLUMN
-            and lm_head.gather_output
-            and lm_head.padding_size == 0
-            and lm_head.gather_output_sizes is None
+            isinstance(lm_head, LMHead)
+            and _gathers_even_vocab_shards(lm_head)
             and lm_head.out_features % 4 == 0
-            and lm_head.num_embeddings < _MAX_VOCAB
         )
 
     def local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -670,9 +712,7 @@ class VocabParallelHead:
 
     def argmax(self, local: torch.Tensor, out_dtype: torch.dtype = torch.int64) -> torch.Tensor:
         """Global argmax over the vocab of shard logits ``[rows, shard]``."""
-        return _select_tokens(
-            _local_argmax_kernel, local, (), self.col_base, self._exchange, out_dtype
-        )
+        return shard_argmax(local, self.col_base, self._exchange, out_dtype)
 
     def sample(
         self,

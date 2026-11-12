@@ -111,6 +111,7 @@ add_th_common_family(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
+  lmHeadArgmaxOp.cpp
   tinygemm2.cpp)
 
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
