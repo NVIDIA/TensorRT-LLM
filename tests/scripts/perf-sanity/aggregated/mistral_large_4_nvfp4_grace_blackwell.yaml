@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# DSpark uses 1.772 accepted draft tokens on average (total acceptance length 2.772).
+metadata:
+  model_name: mistral_large_4_nvfp4
+  precision: fp4
+  model_dir_name: Mistral-Large-4-1T-A52B-NVFP4
+  supported_gpus:
+  - GB300
+  benchmark_type: 8k1k
+hardware:
+  gpus_per_node: 4
+server_configs:
+- name: mistral_large_4_nvfp4_tp4_dspark3_con1_8k1k
+  server_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.772
+  gpus: 4
+  checkpoint_format: mistral
+  modeling_v2: require
+  tensor_parallel_size: 4
+  moe_tensor_parallel_size: 4
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  enable_attention_dp: false
+  max_batch_size: 1
+  max_num_tokens: 16384
+  max_seq_len: 32768
+  enable_chunked_prefill: true
+  print_iter_log: true
+  stream_interval: 1
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 1
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.85
+    dtype: fp8_ds_mla
+  speculative_config:
+    decoding_type: DSpark
+    max_draft_len: 3
+    speculative_model: Mistral-Large-4-1T-A52B-NVFP4
+  client_configs:
+  - name: con1_iter10_8k1k
+    concurrency: 1
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: mistral_large_4_nvfp4_tp4_dspark3_con16_8k1k
+  server_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.772
+  gpus: 4
+  checkpoint_format: mistral
+  modeling_v2: require
+  tensor_parallel_size: 4
+  moe_tensor_parallel_size: 4
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  enable_attention_dp: false
+  max_batch_size: 16
+  max_num_tokens: 16384
+  max_seq_len: 32768
+  enable_chunked_prefill: true
+  print_iter_log: true
+  stream_interval: 1
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 16
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.85
+    dtype: fp8_ds_mla
+  speculative_config:
+    decoding_type: DSpark
+    max_draft_len: 3
+    speculative_model: Mistral-Large-4-1T-A52B-NVFP4
+  client_configs:
+  - name: con16_iter10_8k1k
+    concurrency: 16
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
