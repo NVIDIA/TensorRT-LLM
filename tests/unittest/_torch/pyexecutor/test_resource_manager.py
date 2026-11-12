@@ -1191,10 +1191,9 @@ class TestResourceManager(unittest.TestCase):
 
     def test_beam_dummy_shares_full_blocks_and_copies_the_partial_one(
             self) -> None:
-        """A width-four dummy shares its full prompt blocks across the beams
-        and gives each beam its own copy of a partial last block: 16 tokens
-        need two blocks, 17 tokens need six. With fewer free blocks V1
-        returns None without allocating, as for an empty pool."""
+        """At width four, full prompt blocks are shared and the partial last
+        block is copied per beam: 16 tokens need two blocks, 17 need six.
+        With too few free blocks V1 returns None without allocating."""
         kv_cache_manager = self._beam_dummy_manager(total_blocks=8,
                                                     max_batch_size=2)
         try:
@@ -1280,13 +1279,9 @@ class TestResourceManager(unittest.TestCase):
             kv_cache_manager.shutdown()
 
     def test_v2_beam_dummy_supplies_a_block_table_row_per_beam(self) -> None:
-        """TRTLLM attention copies ``beam_width`` block-table rows for every
-        generation request and sizes the copy by the rows the batch exposes
-        (``AttentionMetadata.num_seqs``). A width-four V2 generation dummy
-        fills four rows, each beam with its own tail block. A width-one
-        dummy exposes one row while the width-four copy builds four, the
-        mismatch a narrow attention-DP padding dummy used to reach, and the
-        row-count assertion fires."""
+        """Attention copies ``beam_width`` block-table rows per generation
+        request: a width-four V2 dummy supplies four rows, each with its own
+        tail block, while a width-one dummy trips the row-count assertion."""
         kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=256, enable_block_reuse=False),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,

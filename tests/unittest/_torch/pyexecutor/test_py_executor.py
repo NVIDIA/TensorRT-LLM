@@ -4240,10 +4240,9 @@ def test_pad_empty_batch_dummy_is_one_block_wide(
 def test_pad_empty_batch_lands_under_beam_search_with_fewer_free_blocks_than_beams(
     free_blocks: int,
 ) -> None:
-    # A starved beam-search rank holds fewer free blocks than beams. A width-W
-    # generation dummy would be refused on every iteration, and `_can_queue`
-    # would veto the forward fleet-wide until something frees KV cache; the
-    # one-block context dummy has to land instead.
+    # A starved beam-search rank has fewer free blocks than beams: a width-W
+    # generation dummy would be refused every iteration and stall the fleet,
+    # so the one-block context dummy has to land instead.
     stub, scheduled_batch = _unfittable_rank(max_beam_width=4)
     tokens_per_block = stub.kv_cache_manager.tokens_per_block
     stub.kv_cache_manager.get_num_available_tokens.side_effect = (

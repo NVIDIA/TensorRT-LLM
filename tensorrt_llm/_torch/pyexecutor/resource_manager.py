@@ -1480,10 +1480,9 @@ class KVCacheManager(BaseResourceManager):
         without changing the ``max_num_draft_tokens`` proposal length.
 
         Returns:
-            Requests in ``request_ids`` order, or ``None`` if, at entry, the
-            target cache has no free block or, for ``max_beam_width > 1`` on a
-            self-attention cache, fewer free blocks than the beams need;
-            nothing is allocated then. Allocation exceptions trigger an
+            Requests in ``request_ids`` order, or ``None`` (nothing allocated)
+            if the target cache has no free block, or too few for the beams of
+            a self-attention cache. Allocation exceptions trigger an
             attempt to release all sequences registered by this call, then
             propagate (a cleanup exception takes precedence if cleanup fails).
 
@@ -1497,13 +1496,9 @@ class KVCacheManager(BaseResourceManager):
         if available_blocks < 1:
             return None
 
-        # Resolve each dummy's token count once, so that the capacity check,
-        # the native allocation and the generation state below agree. Here
-        # 1+max_num_draft_tokens is used to extend the prompt length to a
-        # non-zero number to skip illegal memory access issue in MLA kernel
-        # during warmup. Helix active rank sets past_seen_token_num =
-        # seqlen_this_rank_cp - 1 in _pack_generation_requests; need
-        # token_num >= 2 so that doesn't go negative.
+        # Resolve token counts once so the capacity check, the allocation and
+        # the generation state agree. 1 + max_num_draft_tokens keeps warmup
+        # prompts non-empty (MLA); Helix needs >= 2 (past_seen_token_num >= 0).
         resolved_token_nums = []
         for i in range(len(request_ids)):
             token_num = (token_nums[i] if token_nums is not None else 1 +
@@ -1514,15 +1509,9 @@ class KVCacheManager(BaseResourceManager):
 
         beam_width = max_beam_width
         if beam_width > 1 and self.kv_cache_type != CacheTypeCpp.CROSS:
-            # In a self-attention cache each beam owns a copy of the partial
-            # last block and its new tokens, so a beam dummy can need several
-            # blocks. Report the shortage like the check above instead of
-            # failing the native allocation. Cross blocks are shared by every
-            # beam (isShareLastContextBlock in kvCacheManager.cpp), so a cross
-            # dummy needs only its shared blocks and keeps the one-block check.
-            # Only the target cache is counted: speculative decoding requires
-            # beam width 1 (SpecSampler asserts it), so a draft cache never
-            # receives beam dummies.
+            # Each beam owns its partial last block, so a beam dummy may need
+            # several blocks. Cross caches share blocks across beams, and draft
+            # caches never get beams (SpecSampler requires beam width one).
             new_tokens = self.num_extra_kv_tokens + (_kv_draft if is_gen else 0)
             needed_blocks = sum(
                 self._num_blocks_to_completion(token_num, new_tokens,
