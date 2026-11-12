@@ -255,6 +255,18 @@ class TestExaoneMoe(unittest.TestCase):
                                 else:
                                     self.assertIsNotNone(baseline)
                                     # Cached prefix rows are omitted from context logits.
+                                    max_abs_delta = (
+                                        (logits.float() - baseline[reused:].float())
+                                        .abs()
+                                        .max()
+                                        .item()
+                                    )
+                                    print(
+                                        f"KV prefix reuse: prefix_len={prefix_len}, "
+                                        f"partial_reuse={partial_reuse}, max_abs_delta={max_abs_delta}, "
+                                        "atol=0.01, rtol=0.01",
+                                        flush=True,
+                                    )
                                     torch.testing.assert_close(
                                         logits, baseline[reused:], atol=1e-2, rtol=1e-2
                                     )
