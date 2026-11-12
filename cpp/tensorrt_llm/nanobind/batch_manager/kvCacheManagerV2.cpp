@@ -1505,6 +1505,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("total", &kv::StorageStatistics::total)
         .def_ro("free", &kv::StorageStatistics::free)
         .def_ro("evictable", &kv::StorageStatistics::evictable)
+        .def_ro("retained_copies", &kv::StorageStatistics::retainedCopies)
         .def_prop_ro("available", &kv::StorageStatistics::available)
         .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
 
@@ -1755,13 +1756,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string, int, bool, bool>(), nb::arg("quota"), nb::arg("path"),
-            nb::arg("num_io_threads") = 0, nb::arg("keep_copy_after_restore") = false, nb::arg("write_through") = false)
+        .def(nb::init<size_t, std::string, int, bool, bool, float>(), nb::arg("quota"), nb::arg("path"),
+            nb::arg("num_io_threads") = 0, nb::arg("keep_copy_after_restore") = false, nb::arg("write_through") = false,
+            nb::arg("protected_copy_fraction") = 1.0F)
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
         .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
         .def_rw("keep_copy_after_restore", &kv::DiskCacheTierConfig::keepCopyAfterRestore)
         .def_rw("write_through", &kv::DiskCacheTierConfig::writeThrough)
+        .def_rw("protected_copy_fraction", &kv::DiskCacheTierConfig::protectedCopyFraction)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -2332,6 +2335,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
         nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");
+    mIntrospection.def(
+        "delay_background_disk_writes_for_testing",
+        [](double seconds) { kv::delayBackgroundDiskWritesForTesting(seconds); }, nb::arg("seconds"),
+        "The async disk I/O pool starts a background write piece only once it has been queued for `seconds`.");
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
 
@@ -2794,6 +2801,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             counters["retained"] = c.retained;
             counters["created"] = c.created;
             counters["reused"] = c.reused;
+            counters["reused_pending"] = c.reusedPending;
             counters["reclaimed"] = c.reclaimed;
             counters["dropped"] = c.dropped;
             counters["write_through_pages"] = c.writeThroughPages;

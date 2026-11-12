@@ -222,9 +222,11 @@ namespace
 // transfer spreads over several workers and a read never waits long behind a write piece.
 constexpr ssize_t kDiskIoChunkBytes = ssize_t{4} << 20;
 
-// Background (write-through) bytes issued but not yet written are capped. A required write can end up waiting for a
-// background one (an eviction that takes a written-through copy's slot back waits for that copy's write), so the cap
-// bounds that wait: 1 GiB is well under a second of NVMe write bandwidth.
+// Background (write-through) bytes issued but not yet written are capped, so write-through cannot build up a backlog.
+// An eviction can take back the slot of a copy whose write is still running; it then waits for that write instead of
+// writing the page again, and promotes the write's remaining pieces to required writes
+// (promoteBackgroundDiskWrites). The cap also bounds how much is ahead of a promoted piece: 1 GiB is well under a
+// second of NVMe write bandwidth.
 constexpr size_t kMaxBackgroundDiskWriteBytes = size_t{1} << 30;
 
 // Pieces are served reads first, then required writes, then background writes. A piece that has waited longer than
@@ -235,7 +237,9 @@ constexpr auto kBackgroundWriteMaxWait = std::chrono::milliseconds(100);
 
 std::atomic<size_t> gAsyncDiskIoThreads{0};
 std::atomic<size_t> gBackgroundDiskWriteBytes{0};
-thread_local bool tBackgroundDiskWrites = false;
+// Non-null while a BackgroundDiskWriteScope is alive on this thread: host-to-disk copies are background writes and are
+// recorded here.
+thread_local BackgroundDiskWrites* tBackgroundDiskWrites = nullptr;
 
 // Completion flags: a ring of words in pinned, device-mapped host memory. Transfer t uses word t % kNumCompletionFlags
 // and is complete once the word is >= t.
@@ -318,6 +322,7 @@ struct DiskTransfer
 
     bool isRead = false;
     size_t backgroundBytes = 0; // nonzero for a background write: its share of gBackgroundDiskWriteBytes
+    bool promoted = false;      // a background write served as a required one (promoteBackgroundDiskWrites); pool lock
     std::vector<Task<MemAddress, DiskAddress>> reads;
     std::vector<Task<DiskAddress, MemAddress>> writes;
     ssize_t numBytes = 0;
@@ -408,6 +413,15 @@ public:
         return started;
     }
 
+    void delayBackground(std::chrono::steady_clock::duration delay)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mBackgroundDelay = delay;
+        }
+        mCv.notify_all();
+    }
+
     void waitIdle()
     {
         std::unique_lock<std::mutex> lock(mMutex);
@@ -432,7 +446,9 @@ public:
         {
             std::lock_guard<std::mutex> lock(mMutex);
             mInFlight += numPieces;
-            auto& queue = transfer->isRead ? mReads : (transfer->backgroundBytes != 0 ? mBackground : mWrites);
+            auto& queue = transfer->isRead
+                ? mReads
+                : (transfer->backgroundBytes != 0 && !transfer->promoted ? mBackground : mWrites);
             auto const queued = std::chrono::steady_clock::now();
             for (size_t task = 0; task < transfer->numTasks(); ++task)
             {
@@ -446,6 +462,46 @@ public:
         mCv.notify_all();
     }
 
+    //! Serves the queued pieces of a background write as required writes, and the rest of them once submitted.
+    void promote(std::shared_ptr<DiskTransfer> const& transfer) noexcept
+    {
+        bool moved = false;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            if (transfer->promoted)
+            {
+                return;
+            }
+            transfer->promoted = true;
+            // At most kMaxBackgroundDiskWriteBytes / kDiskIoChunkBytes (256) pieces are queued here, so a scan is
+            // cheap.
+            for (auto it = mBackground.begin(); it != mBackground.end();)
+            {
+                if (it->transfer != transfer)
+                {
+                    ++it;
+                    continue;
+                }
+                try
+                {
+                    mWrites.push_back(std::move(*it));
+                }
+                catch (std::exception const&)
+                {
+                    break; // out of memory: the remaining pieces stay background writes, which still run
+                }
+                it = mBackground.erase(it);
+                moved = true;
+            }
+        }
+        // Workers may be asleep while the queued background pieces may not start yet, so wake them for the promoted
+        // ones.
+        if (moved)
+        {
+            mCv.notify_all();
+        }
+    }
+
 private:
     struct Piece
     {
@@ -456,13 +512,23 @@ private:
         std::chrono::steady_clock::time_point queued;
     };
 
-    // Called with mMutex held and at least one queue nonempty.
-    std::deque<Piece>& nextQueue()
+    // Testing only: a background piece may start once it has been queued for mBackgroundDelay.
+    [[nodiscard]] bool backgroundReady(std::chrono::steady_clock::time_point now) const noexcept
+    {
+        return !mBackground.empty() && now - mBackground.front().queued >= mBackgroundDelay;
+    }
+
+    [[nodiscard]] bool hasWork(std::chrono::steady_clock::time_point now) const noexcept
+    {
+        return !mReads.empty() || !mWrites.empty() || backgroundReady(now);
+    }
+
+    // Called with mMutex held and hasWork(now).
+    std::deque<Piece>& nextQueue(std::chrono::steady_clock::time_point now)
     {
         bool const readsWaiting = !mReads.empty();
         if (!readsWaiting || !mServedAgedPiece)
         {
-            auto const now = std::chrono::steady_clock::now();
             auto const overdue = [now](std::deque<Piece> const& queue, auto maxWait)
             { return !queue.empty() && now - queue.front().queued >= maxWait; };
             if (overdue(mWrites, kRequiredWriteMaxWait))
@@ -470,7 +536,7 @@ private:
                 mServedAgedPiece = readsWaiting;
                 return mWrites;
             }
-            if (overdue(mBackground, kBackgroundWriteMaxWait))
+            if (backgroundReady(now) && overdue(mBackground, kBackgroundWriteMaxWait))
             {
                 mServedAgedPiece = readsWaiting;
                 return mBackground;
@@ -481,7 +547,7 @@ private:
         {
             return mReads;
         }
-        return !mWrites.empty() ? mWrites : mBackground;
+        return !mWrites.empty() || !backgroundReady(now) ? mWrites : mBackground;
     }
 
     void run()
@@ -491,8 +557,21 @@ private:
             Piece piece;
             {
                 std::unique_lock<std::mutex> lock(mMutex);
-                mCv.wait(lock, [this] { return !mReads.empty() || !mWrites.empty() || !mBackground.empty(); });
-                auto& queue = nextQueue();
+                auto now = std::chrono::steady_clock::now();
+                while (!hasWork(now))
+                {
+                    if (mBackground.empty())
+                    {
+                        mCv.wait(lock);
+                    }
+                    else
+                    {
+                        // Only with a testing delay: wake when the oldest background piece may start.
+                        mCv.wait_until(lock, mBackground.front().queued + mBackgroundDelay);
+                    }
+                    now = std::chrono::steady_clock::now();
+                }
+                auto& queue = nextQueue(now);
                 piece = std::move(queue.front());
                 queue.pop_front();
             }
@@ -520,11 +599,12 @@ private:
     std::mutex mMutex;
     std::condition_variable mCv;
     std::condition_variable mIdleCv;
-    size_t mInFlight = 0;          // pieces queued or running
-    bool mServedAgedPiece = false; // the last piece jumped the queue while reads were waiting
-    std::deque<Piece> mReads;      // restores: on the critical path
-    std::deque<Piece> mWrites;     // required evictions to disk
-    std::deque<Piece> mBackground; // write-through copies
+    size_t mInFlight = 0;                                    // pieces queued or running
+    bool mServedAgedPiece = false;                           // the last piece jumped the queue while reads were waiting
+    std::chrono::steady_clock::duration mBackgroundDelay{0}; // testing only: delayBackgroundDiskWritesForTesting
+    std::deque<Piece> mReads;                                // restores: on the critical path
+    std::deque<Piece> mWrites;                               // required evictions to disk
+    std::deque<Piece> mBackground;                           // write-through copies
 };
 
 // Set once by configureAsyncDiskIo, before gAsyncDiskIoThreads. Intentionally leaked: detached workers may
@@ -535,6 +615,16 @@ DiskIoPool& diskIoPool()
 {
     return *gDiskIoPool.load(std::memory_order_acquire);
 }
+
+} // namespace
+
+struct BackgroundDiskWrites
+{
+    std::vector<std::weak_ptr<DiskTransfer>> transfers;
+};
+
+namespace
+{
 
 struct DiskLaunch
 {
@@ -643,13 +733,46 @@ bool asyncDiskIoEnabled() noexcept
 
 BackgroundDiskWriteScope::BackgroundDiskWriteScope() noexcept
     : mPrevious(tBackgroundDiskWrites)
+    , mWrites(new(std::nothrow) BackgroundDiskWrites)
 {
-    tBackgroundDiskWrites = true;
+    // Without the record (out of memory) the writes are still background writes; they just cannot be promoted.
+    static thread_local BackgroundDiskWrites unrecorded;
+    tBackgroundDiskWrites = mWrites ? mWrites.get() : &unrecorded;
 }
 
 BackgroundDiskWriteScope::~BackgroundDiskWriteScope()
 {
+    if (!mWrites)
+    {
+        tBackgroundDiskWrites->transfers.clear();
+    }
     tBackgroundDiskWrites = mPrevious;
+}
+
+std::shared_ptr<BackgroundDiskWrites const> BackgroundDiskWriteScope::takeWrites()
+{
+    if (!mWrites || mWrites->transfers.empty())
+    {
+        return nullptr;
+    }
+    auto taken = std::make_shared<BackgroundDiskWrites>(std::move(*mWrites));
+    mWrites->transfers.clear();
+    return taken;
+}
+
+void promoteBackgroundDiskWrites(BackgroundDiskWrites const& writes) noexcept
+{
+    if (!asyncDiskIo())
+    {
+        return;
+    }
+    for (auto const& weak : writes.transfers)
+    {
+        if (auto transfer = weak.lock())
+        {
+            diskIoPool().promote(transfer);
+        }
+    }
 }
 
 size_t backgroundDiskWriteBudget() noexcept
@@ -678,6 +801,15 @@ bool consumeFailedDiskWrite(int fd, ssize_t pos) noexcept
 void injectDiskWriteFailuresForTesting(uint64_t count) noexcept
 {
     gInjectedWriteFailures.store(count, std::memory_order_relaxed);
+}
+
+void delayBackgroundDiskWritesForTesting(double seconds) noexcept
+{
+    if (asyncDiskIo())
+    {
+        diskIoPool().delayBackground(std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(seconds > 0 ? seconds : 0.0)));
+    }
 }
 
 void waitForDiskIo() noexcept
@@ -757,10 +889,18 @@ CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_
     {
         auto transfer = std::make_shared<DiskTransfer>();
         transfer->isRead = false;
-        if (tBackgroundDiskWrites)
+        if (tBackgroundDiskWrites != nullptr)
         {
             transfer->backgroundBytes = static_cast<size_t>(numBytes) * tasks.size();
             gBackgroundDiskWriteBytes.fetch_add(transfer->backgroundBytes, std::memory_order_relaxed);
+            try
+            {
+                tBackgroundDiskWrites->transfers.push_back(transfer);
+            }
+            catch (std::exception const&)
+            {
+                // Out of memory: the write cannot be promoted later, but it still runs as a background write.
+            }
         }
         transfer->writes = std::move(tasks);
         transfer->numBytes = numBytes;

@@ -159,6 +159,10 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: writeThrough requires numIoThreads > 0");
     }
+    if (!(protectedCopyFraction >= 0.0F && protectedCopyFraction <= 1.0F)) // also rejects NaN
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: protectedCopyFraction must be between 0 and 1");
+    }
 }
 
 namespace

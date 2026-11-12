@@ -96,6 +96,7 @@ class KvCacheConfigV2:
     disk_io_threads: int = 0
     disk_keep_copy_after_restore: bool = False
     disk_write_through: bool = False
+    disk_protected_copy_fraction: float = 1.0
     cross_kv_cache_fraction: Optional[float] = None
     cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0

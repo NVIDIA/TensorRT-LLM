@@ -75,6 +75,15 @@ def inject_disk_write_failures_for_testing(count: int) -> None:
     _cpp().inject_disk_write_failures_for_testing(count)
 
 
+def delay_background_disk_writes_for_testing(seconds: float) -> None:
+    """The async disk I/O pool starts a background (write-through) write piece only once it has been queued for
+    ``seconds`` (0: no delay).
+
+    A piece promoted to a required write is not delayed.
+    """
+    _cpp().delay_background_disk_writes_for_testing(seconds)
+
+
 def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]) -> Any:
     """Create the private native padding codec used by cold-tier end-to-end tests."""
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)

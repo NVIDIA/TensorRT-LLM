@@ -115,6 +115,13 @@ struct DiskCacheTierConfig
     //! and required writes. Requires numIoThreads > 0 and a host tier right above this disk tier.
     bool writeThrough = false;
 
+    //! Share of this tier's slots, 0 to 1, that retained copies (from keepCopyAfterRestore or writeThrough) may hold
+    //! ahead of pages whose only copy is on disk. When the tier runs short, copies beyond the share are released
+    //! before any of those pages is evicted, and write-through creates no copy beyond it. Copies within the share are
+    //! released only for what evicting those pages cannot cover. 1 favors saving writes (write-bound deployments); a
+    //! lower value keeps more distinct pages on disk (capacity-bound deployments).
+    float protectedCopyFraction = 1.0F;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;

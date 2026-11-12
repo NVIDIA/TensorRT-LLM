@@ -711,6 +711,11 @@
       "path": "kv_cache_config.disk_prefetch_num_reqs"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.disk_protected_copy_fraction"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.disk_write_through"

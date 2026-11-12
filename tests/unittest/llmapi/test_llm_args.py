@@ -2042,6 +2042,7 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     assert default.disk_io_threads == 0
     assert default.disk_keep_copy_after_restore is False
     assert default.disk_write_through is False
+    assert default.disk_protected_copy_fraction == 1.0
 
     config = KvCacheConfig(disk_cache_size=2048,
                            disk_cache_path=str(tmp_path),
@@ -2084,12 +2085,28 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     with pytest.raises(ValidationError):
         KvCacheConfig(disk_io_threads=-1)
 
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=4,
+                           disk_write_through=True,
+                           disk_protected_copy_fraction=0.25)
+    assert config.disk_protected_copy_fraction == 0.25
+    for fraction in (-0.1, 1.5):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, disk_protected_copy_fraction=fraction)
+    with pytest.raises(
+            ValidationError,
+            match="disk_protected_copy_fraction requires disk_cache_size"):
+        KvCacheConfig(disk_protected_copy_fraction=0.5)
+    # Without retained copies it only warns: there is nothing for it to limit.
+    KvCacheConfig(**disk, disk_protected_copy_fraction=0.5)
+
     from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskCacheTierConfig
 
     tier = DiskCacheTierConfig(2048, str(tmp_path))
     assert tier.num_io_threads == 0
     assert tier.keep_copy_after_restore is False
     assert tier.write_through is False
+    assert tier.protected_copy_fraction == 1.0
     tier.validate()
 
     tier = DiskCacheTierConfig(2048,
@@ -2112,6 +2129,15 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     with pytest.raises(ValueError,
                        match="numIoThreads must be between 0 and 256"):
         DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=257).validate()
+    DiskCacheTierConfig(2048, str(tmp_path),
+                        protected_copy_fraction=0.0).validate()
+    for fraction in (-0.5, 1.5, float("nan")):
+        with pytest.raises(
+                ValueError,
+                match="protectedCopyFraction must be between 0 and 1"):
+            DiskCacheTierConfig(2048,
+                                str(tmp_path),
+                                protected_copy_fraction=fraction).validate()
     DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=256).validate()
 
 

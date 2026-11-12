@@ -406,8 +406,14 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   (`takeRetainedCopy`), a full last level drops LRU disk-only pages before
   reclaiming copies, `adjustCacheLevel` releases only the copies of pool groups
   that shrink, and `~Page` calls `onPageDestroyed` before its slot is released.
-  Only full committed pages get copies (`hasFinalContent`). A copy is reusable
-  only after its write completed without error (`validateRetainedCopy`).
+  Copies beyond the tier's `protectedCopyFraction` share are released before
+  any disk-only page, and write-through creates none beyond it
+  (`protectedCopyShare`). Only full committed pages get copies
+  (`hasFinalContent`). A copy is reusable while its write is in flight or after
+  it completed without error (`validateRetainedCopy`); taking back an in-flight
+  copy promotes its write-through to a required write
+  (`promoteBackgroundDiskWrites`) and counts `reused_pending`. Storage
+  statistics report copies as `retainedCopies`, not as `evictable`.
   `disk_copy_counters` keeps `retained == created - reused - reclaimed - dropped`
   with one disk tier; tests assert it.
 - A write-through copy reads the host page while its write is in flight, and its

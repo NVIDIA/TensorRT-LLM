@@ -4787,8 +4787,12 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
         1: (1, 64, "attention"),
     }
     secondary_stats_by_level = [
-        [SimpleNamespace(total=7, available=2, evictable=1, slot_sizes=(4096,))],
-        [SimpleNamespace(total=11, available=5, evictable=3, slot_sizes=(4096,))],
+        [SimpleNamespace(total=7, available=2, evictable=1, retained_copies=0, slot_sizes=(4096,))],
+        [
+            SimpleNamespace(
+                total=11, available=5, evictable=3, retained_copies=2, slot_sizes=(4096,)
+            )
+        ],
     ]
     secondary_peak_stats_by_level = [
         [SimpleNamespace(available=1, unavailable=6, evictable=2)],
@@ -4810,6 +4814,7 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     assert cold_group.stats.secondary_free_num_blocks == 7
     assert cold_group.stats.secondary_used_num_blocks == 11
     assert cold_group.stats.secondary_evictable_num_blocks == 4
+    assert cold_group.stats.secondary_retained_copy_num_blocks == 2
     assert cold_group.stats.secondary_peak_free_num_blocks == 5
     assert cold_group.stats.secondary_peak_used_num_blocks == 13
     assert cold_group.stats.secondary_peak_evictable_num_blocks == 5

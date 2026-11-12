@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 
 #include <cuda.h>
+#include <memory>
 #include <sys/types.h>
 #include <vector>
 
@@ -43,8 +44,16 @@ void configureAsyncDiskIo(size_t numThreads) noexcept;
 //! Testing only: make the next \p count disk write pieces fail without writing.
 void injectDiskWriteFailuresForTesting(uint64_t count) noexcept;
 
+//! Testing only: the async I/O pool starts a background write piece only once it has been queued for \p seconds (0:
+//! no delay). Promoted pieces are required writes and are not delayed.
+void delayBackgroundDiskWritesForTesting(double seconds) noexcept;
+
 //! Whether host <-> disk copies run on the async I/O pool (configureAsyncDiskIo started it).
 [[nodiscard]] bool asyncDiskIoEnabled() noexcept;
+
+//! Background writes issued in one BackgroundDiskWriteScope on the async I/O pool. It does not keep them alive: once a
+//! write has finished, it is gone from here.
+struct BackgroundDiskWrites;
 
 //! While an instance is alive, host-to-disk copies issued by this thread are background writes. The I/O pool serves
 //! them after reads and required writes. Write-through copies use this: they only save a later write.
@@ -56,9 +65,17 @@ public:
     BackgroundDiskWriteScope(BackgroundDiskWriteScope const&) = delete;
     BackgroundDiskWriteScope& operator=(BackgroundDiskWriteScope const&) = delete;
 
+    //! The background writes issued so far in this scope, or null if there are none (no async I/O pool).
+    [[nodiscard]] std::shared_ptr<BackgroundDiskWrites const> takeWrites();
+
 private:
-    bool mPrevious;
+    BackgroundDiskWrites* mPrevious;
+    std::unique_ptr<BackgroundDiskWrites> mWrites;
 };
+
+//! A required write now depends on \p writes (an eviction takes their disk slots back), so serve their pieces not
+//! yet started as required writes instead of background ones.
+void promoteBackgroundDiskWrites(BackgroundDiskWrites const& writes) noexcept;
 
 //! Bytes of background writes that may still be issued: 0 without the async I/O pool, otherwise what is left under
 //! a process-wide cap on background bytes issued and not yet written.

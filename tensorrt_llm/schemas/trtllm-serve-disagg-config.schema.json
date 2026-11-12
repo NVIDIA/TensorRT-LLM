@@ -5105,6 +5105,15 @@
           "title": "Disk Prefetch Num Reqs",
           "type": "integer"
         },
+        "disk_protected_copy_fraction": {
+          "default": 1.0,
+          "description": "Share of the disk cache that the copies kept by `disk_keep_copy_after_restore` and `disk_write_through` may hold ahead of blocks stored only on disk. When the disk is full, copies beyond this share are dropped before any of those blocks, and write-through makes no copy beyond it. 1.0 keeps copies ahead of all of them, which saves the most writes; lower values keep more distinct blocks on disk when disk capacity, not write bandwidth, limits reuse. Only used by KV cache manager v2 with a disk cache.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Disk Protected Copy Fraction",
+          "type": "number"
+        },
         "disk_write_through": {
           "default": false,
           "description": "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its later host-to-disk eviction writes nothing. Copies use free disk space only and are written after restores and evictions. Requires `disk_io_threads` > 0. Only used by KV cache manager v2 with a disk cache.",
