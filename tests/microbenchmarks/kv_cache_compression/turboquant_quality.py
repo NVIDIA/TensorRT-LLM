@@ -93,6 +93,8 @@ class _Codec:
     def _call(self, method, dst, src):
         pairs = torch.stack([torch.as_tensor(dst), torch.as_tensor(src)], 1).to(torch.int32)
         pairs = pairs.to(self.device)
+        # The codec runs on its own stream: order it after the hot-buffer writes.
+        self.stream.wait_stream(torch.cuda.current_stream())
         method(
             self.state,
             0,
@@ -104,15 +106,22 @@ class _Codec:
         self.stream.synchronize()
 
     def round_trips(self, values, trips):
-        """NMSE after each of ``trips`` round trips of ``values`` [PAGES, HEADS, TOKENS, DIM]."""
-        for tensor in self.hot.values():
-            tensor[:PAGES] = values.to(torch.bfloat16)
+        """NMSE after each of ``trips`` round trips of ``values`` [PAGES, HEADS, TOKENS, DIM].
+
+        K holds ``values`` and V the same vectors in another Page order, so that a decoder that
+        mixes up the buffers shows; the NMSE is over the K and V vectors together.
+        """
+        source = {"k": values.to(torch.bfloat16), "v": values.roll(1, 0).to(torch.bfloat16)}
+        for role, tensor in self.hot.items():
+            tensor[:PAGES] = source[role]
         pages, low, high = torch.arange(PAGES), torch.arange(PAGES), torch.arange(PAGES) + PAGES
         errors = []
         for trip in range(trips):
             self._call(self.manager.encode_cold_pages, pages, low if trip == 0 else high)
             self._call(self.manager.decode_cold_pages, high, pages)
-            errors.append(_nmse(values.to(torch.bfloat16), self.hot["k"][PAGES:]))
+            reference = torch.cat([source[role] for role in "kv"])
+            decoded = torch.cat([self.hot[role][PAGES:] for role in "kv"])
+            errors.append(_nmse(reference, decoded))
         return errors
 
 

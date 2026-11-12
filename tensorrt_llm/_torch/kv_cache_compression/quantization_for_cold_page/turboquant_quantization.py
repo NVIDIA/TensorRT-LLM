@@ -35,6 +35,7 @@ _MAX_PIECES = 4
 _MAX_INSTANCE_WIDTH = 512
 _INSTANCE_WIDTH = 256
 _BIT_PLANES = {1: (1, 0), 2: (2, 0), 3: (2, 1), 4: (4, 0)}
+_LUT_STRIDE = 16  # fp32 entries per codebook in the kernels' centroid table (LUT_STRIDE)
 _MODES = {"mse": 0, "prod": 1, "fractional": 2}
 # A 64-bit stand-in for the KVCM addresses when kernels are compiled ahead of use.
 _ADDRESS = 1 << 40
@@ -46,6 +47,20 @@ def _align(value: int) -> int:
 
 def _next_power_of_two(value: int) -> int:
     return 1 << max(value - 1, 0).bit_length()
+
+
+def _centroid_table(constants: dict[str, Any], device: torch.device) -> torch.Tensor:
+    """The kernels' centroid table: signed codebooks 0 and 1 in code order, fp32.
+
+    Built from the positive centroids of the CB constants and their negations, so a lookup returns
+    exactly the value the symmetric codebook gives a code.
+    """
+    table = torch.zeros(2, _LUT_STRIDE, dtype=torch.float32)
+    for row, name in enumerate("01"):
+        half = 1 << (constants[f"BITS{name}"] - 1)
+        positive = torch.tensor(constants[f"CB{name}"][7 : 7 + half], dtype=torch.float32)
+        table[row, : 2 * half] = torch.cat((-positive.flip(0), positive))
+    return table.to(device)
 
 
 def _power_of_two_pieces(width: int) -> tuple[int, ...]:
@@ -156,13 +171,22 @@ class _TurboQuantGeometry:
         offsets["end"] = cursor
         return offsets
 
-    def kernel_constants(self, encode: bool) -> dict[str, Any]:
-        """Compile-time arguments of the encode or decode kernel for this geometry."""
+    def kernel_constants(
+        self, encode: bool, capability: tuple[int, int] = (0, 0)
+    ) -> dict[str, Any]:
+        """Compile-time arguments of the encode or decode kernel for this geometry.
+
+        ``capability`` is the GPU's compute capability; the launch shapes measured on SM100-family
+        GPUs apply only there. Decode constants carry ``COLS``, the output columns accumulated at
+        a time by single-instance passes (0: the whole instance), and ``COLS_IN_PARALLEL``, whether
+        separate programs take those column blocks; ``decode_passes`` turns them into launches.
+        """
         import triton.language as tl
 
         pieces = self.pieces
         chunk = min(min(width & -width for width in self.instances), 128)
         pages_per_tile, rows_pad = 1, self.rows
+        launch: dict[str, int] = {}
         if self.mode == "fractional":
             block_m = max(16, _next_power_of_two(self.tokens_per_page))
             tile_rows = self.tokens_per_page
@@ -184,6 +208,8 @@ class _TurboQuantGeometry:
                 block_m = 64
             else:
                 block_m = 32
+            launch = self._wide_mse_launch(encode, accumulated, capability)
+            block_m = launch.pop("block_m", block_m)
             tile_rows = block_m
             if self.rows < block_m:
                 rows_pad = _next_power_of_two(self.rows)
@@ -210,7 +236,9 @@ class _TurboQuantGeometry:
                 + positive_centroids
                 + [0.0] * (8 - len(positive_centroids))
             )
-        return dict(
+        cols = launch.pop("cols", 0)
+        cols_in_parallel = launch.pop("cols_in_parallel", False)
+        constants = dict(
             ELEM=(tl.float16, tl.bfloat16, tl.float8e4nv)[self.runtime_type],
             N=self.width,
             STRIDE=self.stride,
@@ -242,10 +270,71 @@ class _TurboQuantGeometry:
             OFF_RAW=regions["raw"],
             RAW=self.raw_elements,
             RAW_BLOCK=_next_power_of_two(max(self.raw_elements, 1)),
-            num_warps=4 if block_m * self.width <= 4096 and self.mode != "prod" else 8,
-            # Wide rows keep their pieces resident; pipelining their matrix tiles would not fit.
-            num_stages=1 if self.width > 256 else 2,
+            **{
+                "num_warps": 4 if block_m * self.width <= 4096 and self.mode != "prod" else 8,
+                # Wide rows keep their pieces resident; pipelining their matrix tiles would not fit.
+                "num_stages": 1 if self.width > 256 else 2,
+                **launch,
+            },
         )
+        if not encode:
+            constants["COLS"] = cols
+            constants["COLS_IN_PARALLEL"] = cols_in_parallel
+        return constants
+
+    def decode_passes(
+        self, cols: int, cols_in_parallel: bool = False
+    ) -> tuple[tuple[int, int, int], ...]:
+        """(PASS, COL_BLOCKS, SPLIT) of every decode launch of a row.
+
+        Blocked rows decode one instance per pass. With ``cols``, an mse pass that decodes a single
+        instance wider than ``cols`` accumulates its output columns in COL_BLOCKS blocks of
+        ``cols``: one after another in the program that read the codes, or, with
+        ``cols_in_parallel``, in SPLIT = COL_BLOCKS programs per row tile, which read the codes
+        COL_BLOCKS times (from L2 for codes in device memory, over the host link otherwise).
+        """
+        if self.blocked:
+            passes = range(len(self.instances))
+        else:
+            passes = (-1,)
+        single = self.blocked == 2 or (self.blocked == 0 and len(self.pieces) == 1)
+        out = []
+        for decode_pass in passes:
+            width = self.pieces[decode_pass] if self.blocked == 2 else self.width
+            blocks = 1
+            if cols and single and self.mode == "mse" and width > cols:
+                blocks = width // cols
+            out.append((decode_pass, blocks, blocks if cols_in_parallel else 1))
+        return tuple(out)
+
+    def _wide_mse_launch(
+        self, encode: bool, accumulated: int, capability: tuple[int, int]
+    ) -> dict[str, int]:
+        """Tiles, warps, stages, register cap and decode column split of mse rows wider than 256.
+
+        Measured on GB300 (SM103) and used on SM100-family GPUs only; other GPUs keep the generic
+        shapes. MLA latents (576 values, three instances) and DeepSeek-V4 CSA rows (448) encode
+        fastest with 64-row tiles of 8 warps capped at 128 registers, so that two programs share
+        an SM; blocked rows also pipeline their matrix tiles. Decoding takes 128-row tiles; a
+        single instance wider than 448 (512 values) accumulates its output columns in two blocks
+        of 256, whose accumulators fit tensor memory. Splitting the columns over programs instead
+        is faster with cold pages in device memory but reads the codes over the host link twice.
+        """
+        if self.mode != "mse" or self.width <= 256 or capability[0] != 10:
+            return {}
+        if encode:
+            if self.blocked == 2:
+                return dict(block_m=64, num_warps=8, num_stages=2, maxnreg=128)
+            if accumulated <= 448:
+                return dict(block_m=64, num_warps=8, num_stages=1, maxnreg=128)
+            return {}
+        if self.blocked == 2:
+            return dict(block_m=128, num_warps=4, num_stages=1)
+        if accumulated <= 448:
+            return dict(block_m=128, num_warps=8, num_stages=1)
+        if len(self.pieces) == 1:
+            return dict(block_m=128, num_warps=8, num_stages=1, cols=256)
+        return dict(block_m=32, num_warps=8, num_stages=2)
 
     @staticmethod
     def grid(constants: dict[str, Any], num_pages: int) -> tuple[int, int]:
@@ -270,6 +359,8 @@ class _TurboQuantLaunch:
     encode_kernel: Any = None
     """Kernels compiled at configure time and launched without the JIT dispatcher."""
     decode_kernels: tuple = ()
+    decode_splits: tuple = ()
+    """Programs per row tile of every decode kernel (SPLIT)."""
     copy: bool = False
 
 
@@ -610,14 +701,22 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             dtype=torch.int64,
             device=device,
         )
+        capability = torch.cuda.get_device_capability(device)
+        encode_constants = dict(geometry.kernel_constants(True, capability), PASS=-1)
+        decode_constants = geometry.kernel_constants(False, capability)
+        passes = geometry.decode_passes(
+            decode_constants.pop("COLS"), decode_constants.pop("COLS_IN_PARALLEL")
+        )
+        centroids = _centroid_table(encode_constants, device)
         launch = _TurboQuantLaunch(
             num_buffers=len(entries),
             table=table,
-            encode_args=(table, encode_w, encode_s),
-            decode_args=(table, decode_w, decode_s),
-            encode_constants=dict(geometry.kernel_constants(encode=True), PASS=-1),
-            decode_constants=geometry.kernel_constants(encode=False),
+            encode_args=(table, encode_w, encode_s, centroids),
+            decode_args=(table, decode_w, decode_s, centroids),
+            encode_constants=encode_constants,
+            decode_constants=decode_constants,
             hot_base=hot_base,
+            decode_splits=tuple(split for _, _, split in passes),
         )
         # Compile now: configure() runs at KVCM construction, not on migration. The pointer
         # arguments are compiled for 16-byte aligned addresses, which every launch checks.
@@ -633,9 +732,9 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 *sample,
                 *launch.decode_args,
                 grid=(1, 1, 1),
-                **dict(launch.decode_constants, PASS=decode_pass),
+                **dict(launch.decode_constants, PASS=decode_pass, COL_BLOCKS=blocks, SPLIT=split),
             )
-            for decode_pass in (range(len(geometry.instances)) if geometry.blocked else (-1,))
+            for decode_pass, blocks, split in passes
         )
         # Load the modules now, so that an unsupported geometry fails here, not in a migration.
         for kernel in (launch.encode_kernel, *launch.decode_kernels):
@@ -715,8 +814,9 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             constants = launch.encode_constants if encode else launch.decode_constants
             page_programs, tiles = _TurboQuantGeometry.grid(constants, num_pages)
             args = launch.encode_args if encode else launch.decode_args
-            for kernel in kernels:
-                kernel[(page_programs, launch.num_buffers, tiles)](
+            splits = (1,) if encode else launch.decode_splits
+            for kernel, split in zip(kernels, splits):
+                kernel[(page_programs * split, launch.num_buffers, tiles)](
                     page_indices,
                     cold_base,
                     metadata.cold_page_bytes,

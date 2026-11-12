@@ -42,7 +42,7 @@ def _create(
     config: ColdPageQuantizationCompressionConfig,
     *,
     active_kv_quant: QuantConfig | None = None,
-    estimating_kv_cache: bool = False,
+    kv_dtype: str = "auto",
 ) -> tuple[object, PretrainedConfig]:
     pretrained_config = PretrainedConfig(num_hidden_layers=2, num_key_value_heads=2, head_dim=128)
     pretrained_config.model_type = "llama"
@@ -58,8 +58,7 @@ def _create(
     manager = util_mod.create_kv_cache_compression_manager(
         config,
         model_engine=model_engine,
-        kv_cache_config=SimpleNamespace(enable_block_reuse=True),
-        estimating_kv_cache=estimating_kv_cache,
+        kv_cache_config=SimpleNamespace(enable_block_reuse=True, dtype=kv_dtype),
     )
     return manager, pretrained_config
 
@@ -87,11 +86,13 @@ def test_defaults_and_dumps_keep_each_format_to_its_own_options() -> None:
         "algorithm": "quantization_for_cold_page",
         "quant": "turboquant",
         "skip_rope_quantization": False,
+        "mixed_precision_first_n": 0,
+        "mixed_precision_last_n": 0,
         "turboquant_bits": 4.0,
         "turboquant_mode": "mse",
         "turboquant_seed": 5,
     }
-    # NVFP4 stays the default format, and its dump is what it was before TurboQuant.
+    # NVFP4 stays the default format, and its dump holds only the shared and the NVFP4 options.
     nvfp4 = ColdPageQuantizationCompressionConfig()
     assert nvfp4.model_dump() == {
         "algorithm": "quantization_for_cold_page",
@@ -99,6 +100,8 @@ def test_defaults_and_dumps_keep_each_format_to_its_own_options() -> None:
         "skip_rope_quantization": False,
         "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
+        "mixed_precision_first_n": 0,
+        "mixed_precision_last_n": 0,
     }
     assert ColdPageQuantizationCompressionConfig.model_validate(nvfp4.model_dump()) == nvfp4
 
@@ -199,10 +202,26 @@ def test_factory_builds_the_turboquant_provider() -> None:
     assert manager.pretrained_config is pretrained_config
 
 
-def test_factory_skips_estimation_and_rejects_an_active_nvfp4_kv_cache() -> None:
-    assert _create(_turboquant(), estimating_kv_cache=True)[0] is None
+def test_factory_rejects_an_active_nvfp4_kv_cache() -> None:
     with pytest.raises(ValueError, match="the active KV cache uses NVFP4"):
         _create(_turboquant(), active_kv_quant=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4))
+
+
+@pytest.mark.parametrize("sm_version", (80, 86, 89, 90))
+@pytest.mark.parametrize("source", ("kv_cache_config", "checkpoint"))
+def test_an_fp8_active_kv_cache_needs_compute_capability_8_9(monkeypatch, sm_version, source):
+    monkeypatch.setattr(util_mod, "get_sm_version", lambda: sm_version)
+    if source == "kv_cache_config":
+        options = dict(kv_dtype="fp8")
+    else:
+        options = dict(active_kv_quant=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8))
+    if sm_version >= 89:
+        assert _create(_turboquant(), **options)[0] is not None
+    else:
+        with pytest.raises(UnsupportedError, match="compute capability 8.9 or newer"):
+            _create(_turboquant(), **options)
+        # FP16 and BF16 KV caches stay supported there.
+        assert _create(_turboquant())[0] is not None
 
 
 @pytest.mark.parametrize("sm_version", (-1, 75, 80, 90, 103, 120))
