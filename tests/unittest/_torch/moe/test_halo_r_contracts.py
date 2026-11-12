@@ -1059,7 +1059,7 @@ def test_kernel_skips_resident_receivers_and_records_residency_before_ready() ->
         (
             "haloR::relayNeedMask(",
             "p.residency, p.helpers);",
-            "haloR::relayDestinationIndex(need, p.localRank, &destinations);",
+            "haloR::relayDestinationIndex(need, p.localRank, &destinationCount);",
             "work->need[entries] = need;",
         ),
     )

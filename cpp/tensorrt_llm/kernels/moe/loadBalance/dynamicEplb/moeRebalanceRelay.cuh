@@ -63,9 +63,9 @@ struct RelayWork
 {
     int entries;
     int broadcast[haloR::kMaxHaloRBroadcasts];
-    unsigned need[haloR::kMaxHaloRBroadcasts]; //!< The broadcast's need set N_b, the receivers it stores into.
+    unsigned need[haloR::kMaxHaloRBroadcasts];        //!< The broadcast's need set N_b, the receivers it stores into.
     int prefix[haloR::kMaxHaloRBroadcasts + 1];
-    int destinations[haloR::kMaxHaloRBroadcasts];
+    int destinationCount[haloR::kMaxHaloRBroadcasts]; //!< |need[b]|, the receivers that split the broadcast.
     int index[haloR::kMaxHaloRBroadcasts];
     long long slices;
     unsigned long long planeBytes[haloR::kRelayMaxPlanes];
@@ -168,18 +168,18 @@ __device__ void prepareRelayWork(MoeRebalanceHaloRParams const& p, RelayWork* wo
     {
         unsigned const need = haloR::relayNeedMask(static_cast<unsigned>(masks[b]), static_cast<unsigned>(lowMasks[b]),
             static_cast<unsigned>(highMasks[b]), experts[b], p.residency, p.helpers);
-        int destinations = 0;
-        int const index = haloR::relayDestinationIndex(need, p.localRank, &destinations);
+        int destinationCount = 0;
+        int const index = haloR::relayDestinationIndex(need, p.localRank, &destinationCount);
         if (index < 0)
         {
             continue;
         }
         work->broadcast[entries] = b;
         work->need[entries] = need;
-        work->destinations[entries] = destinations;
+        work->destinationCount[entries] = destinationCount;
         work->index[entries] = index;
         work->prefix[entries + 1]
-            = work->prefix[entries] + static_cast<int>(haloR::relaySliceCount(work->slices, destinations, index));
+            = work->prefix[entries] + static_cast<int>(haloR::relaySliceCount(work->slices, destinationCount, index));
         ++entries;
     }
     work->entries = entries;
@@ -236,7 +236,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
     {
         long long k;
         int const entry = haloR::relayLocateItem(work.prefix, work.entries, first + n * stride, &k);
-        long long const slice = haloR::relaySliceOf(k, work.destinations[entry], work.index[entry]);
+        long long const slice = haloR::relaySliceOf(k, work.destinationCount[entry], work.index[entry]);
         int plane = 0;
         unsigned long long offset = 0;
         unsigned long long bytes = 0;

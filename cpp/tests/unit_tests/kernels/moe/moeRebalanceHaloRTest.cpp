@@ -356,18 +356,18 @@ TEST(MoeRebalanceRelayWorkTest, DestinationsPartitionEverySlice)
     std::vector<int> copies(slices, 0);
     for (int rank = 0; rank < 32; ++rank)
     {
-        int destinations = 0;
-        int const index = haloR::relayDestinationIndex(mask, rank, &destinations);
-        EXPECT_EQ(destinations, 3);
+        int destinationCount = 0;
+        int const index = haloR::relayDestinationIndex(mask, rank, &destinationCount);
+        EXPECT_EQ(destinationCount, 3);
         if (index < 0)
         {
-            EXPECT_EQ(haloR::relaySliceCount(slices, destinations, index), 0);
+            EXPECT_EQ(haloR::relaySliceCount(slices, destinationCount, index), 0);
             continue;
         }
-        long long const count = haloR::relaySliceCount(slices, destinations, index);
+        long long const count = haloR::relaySliceCount(slices, destinationCount, index);
         for (long long k = 0; k < count; ++k)
         {
-            ++copies[haloR::relaySliceOf(k, destinations, index)];
+            ++copies[haloR::relaySliceOf(k, destinationCount, index)];
         }
     }
     for (int count : copies)
@@ -438,10 +438,10 @@ TEST(MoeRebalanceRelayWorkTest, NeedSetsSplitEverySliceOverTheReceiversThatNeedI
         std::vector<int> pulls(slices, 0);
         for (int rank = 0; rank < ep; ++rank)
         {
-            int destinations = 0;
-            int const index = haloR::relayDestinationIndex(need, rank, &destinations);
-            ASSERT_EQ(destinations, members);
-            long long const count = haloR::relaySliceCount(slices, destinations, index);
+            int destinationCount = 0;
+            int const index = haloR::relayDestinationIndex(need, rank, &destinationCount);
+            ASSERT_EQ(destinationCount, members);
+            long long const count = haloR::relaySliceCount(slices, destinationCount, index);
             if (!((need >> rank) & 1U))
             {
                 ASSERT_EQ(index, -1);
@@ -449,7 +449,7 @@ TEST(MoeRebalanceRelayWorkTest, NeedSetsSplitEverySliceOverTheReceiversThatNeedI
             }
             for (long long k = 0; k < count; ++k)
             {
-                ++pulls[haloR::relaySliceOf(k, destinations, index)];
+                ++pulls[haloR::relaySliceOf(k, destinationCount, index)];
             }
         }
         for (long long slice = 0; slice < slices; ++slice)

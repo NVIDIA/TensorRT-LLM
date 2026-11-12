@@ -81,16 +81,16 @@ TLLM_HALO_R_HOST_DEVICE inline int relayDestinationIndex(unsigned destinationMas
     return ((destinationMask >> rank) & 1U) ? before : -1;
 }
 
-//! Number of slices j in [0, slices) with j mod destinations == index.
-TLLM_HALO_R_HOST_DEVICE inline long long relaySliceCount(long long slices, int destinations, int index)
+//! Number of slices j in [0, slices) with j mod destinationCount == index.
+TLLM_HALO_R_HOST_DEVICE inline long long relaySliceCount(long long slices, int destinationCount, int index)
 {
-    return (index < 0 || destinations <= 0 || index >= slices) ? 0 : (slices - 1 - index) / destinations + 1;
+    return (index < 0 || destinationCount <= 0 || index >= slices) ? 0 : (slices - 1 - index) / destinationCount + 1;
 }
 
 //! The k-th slice owned by destination `index`.
-TLLM_HALO_R_HOST_DEVICE inline long long relaySliceOf(long long k, int destinations, int index)
+TLLM_HALO_R_HOST_DEVICE inline long long relaySliceOf(long long k, int destinationCount, int index)
 {
-    return static_cast<long long>(index) + k * static_cast<long long>(destinations);
+    return static_cast<long long>(index) + k * static_cast<long long>(destinationCount);
 }
 
 TLLM_HALO_R_HOST_DEVICE inline long long relayPlaneSlices(unsigned long long bytes)
