@@ -3,7 +3,7 @@
 """GEN preemption policy, startup prerequisites, and resident-state regressions."""
 
 import math
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -426,11 +426,14 @@ def drafter(kind, num_slots=4):
 
 
 def executor_for_preemption(p, reqs, scheduler):
-    return SimpleNamespace(
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = SimpleNamespace(
         _gen_preemption=p,
         scheduler=scheduler,
         active_requests=reqs,
         inflight_req_ids=set(),
+        canceled_req_ids=[],
         kv_cache_manager=Mock(spec=[]),
         kv_cache_transceiver=None,
         is_encoder_decoder=False,
@@ -439,6 +442,10 @@ def executor_for_preemption(p, reqs, scheduler):
         _cap_context_by_total_kv_len=lambda requests: requests,
         _maybe_record_hang_diagnostic_phase=Mock(),
     )
+    executor._cancelled_disagg_model_request_ids = MethodType(
+        PyExecutor._cancelled_disagg_model_request_ids, executor
+    )
+    return executor
 
 
 @pytest.mark.parametrize("kind", ["dflash", "dspark"])
