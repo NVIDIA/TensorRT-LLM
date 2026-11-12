@@ -266,9 +266,12 @@ l0_b200:
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp8_quant.py
   - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul.py
   - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp8_quant.py
+  - unittest/_torch/kernels/fused_ops/test_soft_cap_logits.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
+  - unittest/_torch/modeling/test_gemma4_fused_ops.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_swiglu_nvfp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py

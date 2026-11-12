@@ -32,7 +32,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -60,10 +60,12 @@ from ..kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
     rmsnorm_residual_add_scale,
 )
+from ..kernels.fused_ops.soft_cap_logits import soft_cap_logits
 from ..model_config import KVCacheLayerSpec, ModelConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
+from ..modules.embedding import Embedding, embedding_gather
 from ..modules.gated_mlp import GatedMLP
+from ..modules.gemma4.clustered_logits import clustered_logits
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import (
     FP8QDQLinearMethod,
@@ -204,9 +206,19 @@ class Gemma4TextScaledWordEmbedding(Embedding):
         if embed_scale is None:
             embed_scale = math.sqrt(hidden_size)
         self.embed_scale = torch.tensor(embed_scale, dtype=self.dtype)
+        # The scale as rounded to the table dtype, for the gather kernel's fused multiply.
+        self._embed_scale_value = float(self.embed_scale)
 
     @torch.inference_mode()
     def forward(self, input_ids):
+        if (
+            self.tp_size == 1
+            and input_ids.is_cuda
+            and self.weight.dim() == 2
+            and self.weight.is_contiguous()
+            and self.weight.dtype in (torch.bfloat16, torch.float16)
+        ):
+            return embedding_gather(input_ids, self.weight, self._embed_scale_value)
         return super().forward(input_ids) * self.embed_scale
 
 
@@ -1357,6 +1369,8 @@ class Gemma4TextModel(DecoderModel):
         config = self.model_config
         pretrained = config.pretrained_config
         self.hidden_size = pretrained.hidden_size
+        # The LM head runs trtllm::cublas_mm, whose SM120 algo table covers the tied lm_head shape.
+        self.use_custom_cublas_mm = get_sm_version() == 120
 
         # Under AttentionDP, each rank runs the full sequence locally so the
         # embedding must be replicated (tp_size=1 effectively); otherwise
@@ -1755,15 +1769,18 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         spec_metadata: SpecMetadata,
         resource_manager,
     ) -> torch.Tensor:
-        logits = self.logits_processor.forward(
-            output[spec_metadata.gather_ids],
-            self.lm_head,
-            attn_metadata,
-            True,
-        )
-        if self.config.final_logit_softcapping is not None:
-            cap = self.config.final_logit_softcapping
-            logits = torch.tanh(logits / cap) * cap
+        cap = self.config.final_logit_softcapping
+        if cap is not None:
+            # One pass casts the LM head output to fp32 and soft-caps it (bit-identical to
+            # tanh(logits.float() / cap) * cap).
+            logits = soft_cap_logits(self.lm_head(output[spec_metadata.gather_ids]), 1.0, cap)
+        else:
+            logits = self.logits_processor.forward(
+                output[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
 
         spec_input_ids = input_ids if input_ids is not None else orig_input_ids
         spec_position_ids = position_ids
@@ -1959,9 +1976,39 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         ).squeeze(1)
         return selected_logits.masked_fill(~is_local, 0)
 
+    def _fused_logits_applicable(self, hidden_states: torch.Tensor, lm_head: nn.Module) -> bool:
+        weight = lm_head.weight
+        powers_of_two = all(
+            n > 0 and n & (n - 1) == 0
+            for n in (self.hidden_size, self.num_centroids, self.vocab_size_per_centroid)
+        )
+        return (
+            powers_of_two
+            and not (lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.tp_size > 1)
+            and hidden_states.is_cuda
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == weight.dtype == torch.bfloat16
+            and hidden_states.stride(-1) == 1
+            and weight.dim() == 2
+            and weight.shape[0] == self.vocab_size
+            and weight.stride(-1) == 1
+            and not is_torch_compiling()
+        )
+
     @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
         centroid_logits = self.centroids(hidden_states)
+        if self._fused_logits_applicable(hidden_states, lm_head):
+            # Fused top-k clusters + logits, written straight into fp32 full-vocabulary logits.
+            return clustered_logits(
+                hidden_states,
+                lm_head.weight,
+                self.token_ordering,
+                centroid_logits,
+                self.centroid_intermediate_top_k,
+                self.vocab_size_per_centroid,
+                torch.finfo(hidden_states.dtype).min,
+            )
         _, top_k_indices = torch.topk(
             centroid_logits,
             k=self.centroid_intermediate_top_k,
@@ -2070,6 +2117,9 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         positions = position_ids.squeeze(0) if position_ids.ndim == 2 else position_ids
+        if positions.shape[0] == attn_metadata.num_seqs:
+            # One token per sequence: each position is already its sequence's last.
+            return positions.unsqueeze(0)
         seq_lens = attn_metadata.seq_lens_cuda[: attn_metadata.num_seqs]
         last_token_indices = torch.cumsum(seq_lens, dim=0, dtype=torch.long) - 1
         return torch.repeat_interleave(
