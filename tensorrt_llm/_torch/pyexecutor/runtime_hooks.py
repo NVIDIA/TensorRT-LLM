@@ -155,18 +155,10 @@ class HybridCachePolicy:
     """Recurrent-state cache policies a hybrid (recurrent + attention) model may opt into.
 
     The engine passes them to the model's V2 hybrid cache manager
-    (``MambaHybridCacheManagerV2``) and its scheduler when it builds them. They
-    change which recurrent-state snapshots exist and when a context step runs,
-    never what a forward computes.
+    (``MambaHybridCacheManagerV2``) when it builds it. They change how
+    recurrent-state pages are kept and uploaded, never what a forward computes.
     """
 
-    # Step alignment, in tokens, at which the model's recurrent prefill can store a
-    # recurrent-state snapshot inside a context step (into a pending V2 SSM page the
-    # manager hands out through ``get_kda_midchunk_snapshots``). A context request
-    # then prefills through its last snapshot point in one step instead of splitting
-    # the step there, and passes one other snapshot point per step. 0: no mid-chunk
-    # snapshots. Read by KimiK3HybridCacheManager.
-    kda_midchunk_snapshot_alignment: int = 0
     # Context requests whose prompt is shorter than this many tokens commit their
     # recurrent-state pages (live state and snapshots) at the lowest eviction
     # priority; attention pages keep theirs. A snapshot is reusable only at its exact
