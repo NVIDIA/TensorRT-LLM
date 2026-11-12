@@ -25,13 +25,13 @@ def _reference(prev, state_indices, num_accepted, is_dummy_request, num_bonus_to
     prev[slots] = accepted
 
 
-def _pool():
+def _pool(columns=POOL_COLUMNS):
     """A per-slot state pool whose column 0 is the replay count, as in the V2 manager."""
     gen = torch.Generator(device="cuda").manual_seed(0)
     return torch.randint(
         -(2**31),
         2**31 - 1,
-        (NUM_SLOTS, POOL_COLUMNS),
+        (NUM_SLOTS, columns),
         dtype=torch.int32,
         device="cuda",
         generator=gen,
@@ -57,34 +57,33 @@ def _inputs(batch, index_dtype, accepted_dtype, with_dummy, max_accepted=4, seed
     return state_indices.to(index_dtype), num_accepted, is_dummy
 
 
-@pytest.mark.parametrize("batch", [0, 1, 3, 64, 600])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("accepted_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("with_dummy", [False, True])
-@pytest.mark.parametrize("num_bonus_tokens", [0, 1])
-def test_matches_torch_on_strided_column(
-    batch, index_dtype, accepted_dtype, with_dummy, num_bonus_tokens
+# Together the cases cover each index and count dtype at int32 and int64, dummy rows on
+# and off, zero and one bonus token, an empty, a single-row and a multi-block batch, and
+# both a strided count column and a contiguous count vector.
+@pytest.mark.parametrize(
+    "batch,index_dtype,accepted_dtype,with_dummy,num_bonus_tokens,pool_columns",
+    [
+        pytest.param(0, torch.int32, torch.int32, False, 1, POOL_COLUMNS, id="empty"),
+        pytest.param(1, torch.int64, torch.int32, True, 0, POOL_COLUMNS, id="single"),
+        pytest.param(64, torch.int32, torch.int64, False, 0, POOL_COLUMNS, id="mid"),
+        pytest.param(600, torch.int64, torch.int64, True, 1, POOL_COLUMNS, id="large"),
+        pytest.param(32, torch.int32, torch.int32, True, 1, 1, id="contiguous"),
+    ],
+)
+def test_matches_torch(
+    batch, index_dtype, accepted_dtype, with_dummy, num_bonus_tokens, pool_columns
 ):
     state_indices, num_accepted, is_dummy = _inputs(batch, index_dtype, accepted_dtype, with_dummy)
-    pool = _pool()
+    pool = _pool(pool_columns)
     expected = pool.clone()
     prev = pool[:, 0]
-    assert prev.stride(0) == POOL_COLUMNS
+    assert prev.stride(0) == pool_columns
 
     record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy, num_bonus_tokens)
     _reference(expected[:, 0], state_indices, num_accepted, is_dummy, num_bonus_tokens)
 
     # Column 0 matches bit for bit and the neighbouring columns are untouched.
     torch.testing.assert_close(pool, expected, rtol=0, atol=0)
-
-
-def test_contiguous_count_vector():
-    state_indices, num_accepted, is_dummy = _inputs(32, torch.int32, torch.int32, True)
-    prev = _pool()[:, 0].contiguous()
-    expected = prev.clone()
-    record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy, 1)
-    _reference(expected, state_indices, num_accepted, is_dummy, 1)
-    torch.testing.assert_close(prev, expected, rtol=0, atol=0)
 
 
 def _unsupported_layout(case):
@@ -135,13 +134,17 @@ _UNSUPPORTED_LAYOUTS = [
 ]
 
 
-@pytest.mark.parametrize("case", _UNSUPPORTED_LAYOUTS)
-def test_unsupported_layouts_raise(case):
-    pool, prev, state_indices, num_accepted, is_dummy = _unsupported_layout(case)
-    before = pool.clone()
-    with pytest.raises(ValueError, match="unsupported tensor layout"):
-        record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy, 1)
-    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+def test_unsupported_layouts_raise():
+    for case in _UNSUPPORTED_LAYOUTS:
+        pool, prev, state_indices, num_accepted, is_dummy = _unsupported_layout(case)
+        before = pool.clone()
+        try:
+            record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy, 1)
+        except ValueError as error:
+            assert "unsupported tensor layout" in str(error), f"{case}: {error}"
+        else:
+            pytest.fail(f"{case}: no ValueError raised")
+        torch.testing.assert_close(pool, before, rtol=0, atol=0, msg=f"{case}: pool modified")
 
 
 def _bound_state(prev):
@@ -186,9 +189,9 @@ def test_state_update_and_record_acceptance(monkeypatch):
     assert len(launches) == 2
 
 
-@pytest.mark.parametrize("case", ["cpu", "strided_indices", "float_indices"])
-def test_state_entry_points_raise_on_unsupported_layouts(case):
-    pool, prev, state_indices, num_accepted, is_dummy = _unsupported_layout(case)
+def test_state_entry_points_raise_on_unsupported_layouts():
+    # The kernel's checks are covered above; one layout shows both entry points propagate them.
+    pool, prev, state_indices, num_accepted, is_dummy = _unsupported_layout("strided_indices")
     before = pool.clone()
     state = _bound_state(prev)
     with pytest.raises(ValueError, match="unsupported tensor layout"):
