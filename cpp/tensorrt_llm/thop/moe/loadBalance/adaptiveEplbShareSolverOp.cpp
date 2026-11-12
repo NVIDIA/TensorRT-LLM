@@ -24,6 +24,12 @@
 // every step runs the max flow. Copies of an expert on one GPU share its rows there evenly; an expert without rows or
 // on one GPU keeps the even split over its copies.
 //
+// With the costs of the decision's time model, the op minimizes the busiest GPU's modeled time instead: the max flow
+// takes every GPU's rows held alone as their modeled time over the time of one more row, plus the read of every copy
+// of a replicated expert there; then, while the busiest GPU can shed time, a replicated expert's rows on it move to
+// another GPU holding it, all of them (its copies stop reading weights) or those above its copies' last full tile,
+// whichever move leaves the larger of the two GPUs' times smallest, as long as that is below the busiest GPU's time.
+//
 // Every floating-point operation runs in a fixed order, so every EP rank, running the same binary on the same rows,
 // computes the same shares.
 
@@ -424,9 +430,10 @@ private:
     std::vector<int> mRankEdges;
 };
 
-//! The shares of one layer (see the file comment); slotsOf lists every expert's slots in ascending order.
+//! The shares of one layer (see the file comment); slotsOf lists every expert's slots in ascending order. offset adds
+//! its positive entries to the rows every GPU holds alone (none when empty).
 std::vector<double> rowsBalancedShares(std::vector<double> const& load, std::vector<std::vector<int>> const& slotsOf,
-    int numRanks, int localSlots, int numSlots)
+    int numRanks, int localSlots, int numSlots, std::vector<double> const& offset)
 {
     std::vector<double> shares(numSlots, 0.0);
     std::vector<double> fixed(numRanks, 0.0);
@@ -460,6 +467,10 @@ std::vector<double> rowsBalancedShares(std::vector<double> const& load, std::vec
         rows.push_back(n);
         ranks.push_back(std::move(held));
         experts.push_back(e);
+    }
+    for (size_t r = 0; r < offset.size(); ++r)
+    {
+        fixed[r] += offset[r] > 0.0 ? offset[r] : 0.0;
     }
     if (rows.empty())
     {
@@ -512,14 +523,211 @@ std::vector<double> rowsBalancedShares(std::vector<double> const& load, std::vec
     return shares;
 }
 
+//! The time model's costs in us: a copy's weight read, a tile beyond its first, a row, a tile beyond the first of the
+//! GPU's busiest copy; and the rows of a tile. The model's scale multiplies every GPU alike, so it is left out.
+struct TimeCosts
+{
+    double read;
+    double tile;
+    double row;
+    double hot;
+    double tileRows;
+};
+
+//! Rows of an expert on one GPU, split evenly over its copies there.
+struct Holding
+{
+    int rank;
+    int expert;
+    int copies;
+    double rows;
+};
+
+//! Modeled time of a GPU's holdings (indices into all), the rows of holding changed plus delta.
+double gpuTime(std::vector<Holding> const& all, std::vector<int> const& mine, TimeCosts const& c, int changed = -1,
+    double delta = 0.0)
+{
+    double t = 0.0;
+    double top = 0.0;
+    for (int const h : mine)
+    {
+        double const y = h == changed ? all[h].rows + delta : all[h].rows;
+        if (!(y > 0.0))
+        {
+            continue;
+        }
+        double const k = all[h].copies;
+        double const q = std::ceil(y / k / c.tileRows);
+        t += c.read * k + c.tile * k * std::max(q - 1.0, 0.0) + c.row * y;
+        top = std::max(top, q);
+    }
+    return t + c.hot * std::max(top - 1.0, 0.0);
+}
+
+//! Holdings of every expert with rows on every GPU, in slot order, and the indices per GPU and per expert.
+std::vector<Holding> holdingsOf(std::vector<double> const& load, int64_t const* layout, int numSlots, int localSlots,
+    std::vector<double> const& shares, std::vector<std::vector<int>>& perRank, std::vector<std::vector<int>>& perExpert)
+{
+    std::vector<Holding> all;
+    for (int s = 0; s < numSlots; ++s)
+    {
+        int const e = static_cast<int>(layout[s]);
+        if (e < 0)
+        {
+            continue;
+        }
+        int const r = s / localSlots;
+        auto const& mine = perExpert[e];
+        auto it = std::find_if(mine.begin(), mine.end(), [&](int h) { return all[h].rank == r; });
+        int h = it == mine.end() ? -1 : *it;
+        if (h < 0)
+        {
+            h = static_cast<int>(all.size());
+            all.push_back({r, e, 0, 0.0});
+            perRank[r].push_back(h);
+            perExpert[e].push_back(h);
+        }
+        all[h].copies += 1;
+        all[h].rows += load[e] * shares[s];
+    }
+    return all;
+}
+
+//! Per GPU, its rows held alone as modeled time, with the read of each copy of a replicated expert with rows, over the
+//! time of one more row, minus those rows; less the smallest of them, as a common offset changes no split.
+std::vector<double> timeOffsets(std::vector<double> const& load, int64_t const* layout, int numSlots, int numRanks,
+    int localSlots, std::vector<std::vector<int>> const& slotsOf, TimeCosts const& c)
+{
+    std::vector<Holding> alone;
+    std::vector<std::vector<int>> mine(numRanks);
+    std::vector<int> copies(numRanks, 0);
+    std::vector<double> fixedRows(numRanks, 0.0);
+    for (int s = 0; s < numSlots; ++s)
+    {
+        int const e = static_cast<int>(layout[s]);
+        if (e < 0 || !(load[e] > 0.0))
+        {
+            continue;
+        }
+        int const r = s / localSlots;
+        auto const& sl = slotsOf[e];
+        if (sl.front() / localSlots != sl.back() / localSlots)
+        {
+            copies[r] += 1;
+        }
+        else if (sl.front() == s)
+        {
+            mine[r].push_back(static_cast<int>(alone.size()));
+            alone.push_back({r, e, static_cast<int>(sl.size()), load[e]});
+            fixedRows[r] += load[e];
+        }
+    }
+    double const slope = c.row + c.tile / c.tileRows;
+    std::vector<double> offset(numRanks);
+    for (int r = 0; r < numRanks; ++r)
+    {
+        offset[r] = gpuTime(alone, mine[r], c) / slope + c.read * copies[r] / slope - fixedRows[r];
+    }
+    double const low = *std::min_element(offset.begin(), offset.end());
+    for (double& x : offset)
+    {
+        x -= low;
+    }
+    return offset;
+}
+
+//! Moves rows of replicated experts off the busiest GPU while that lowers its modeled time (see the file comment).
+void shedBusiest(std::vector<double> const& load, int64_t const* layout, int numSlots, int numRanks, int localSlots,
+    TimeCosts const& c, std::vector<double>& shares)
+{
+    std::vector<std::vector<int>> perRank(numRanks);
+    std::vector<std::vector<int>> perExpert(load.size());
+    std::vector<Holding> all = holdingsOf(load, layout, numSlots, localSlots, shares, perRank, perExpert);
+    std::vector<double> times(numRanks);
+    for (int r = 0; r < numRanks; ++r)
+    {
+        times[r] = gpuTime(all, perRank[r], c);
+    }
+    auto movable = [&](int e) { return perExpert[e].size() > 1 && load[e] > 0.0; };
+    while (true)
+    {
+        int const a = static_cast<int>(std::max_element(times.begin(), times.end()) - times.begin());
+        double const ta = times[a];
+        double best = kInfinity;
+        int from = -1;
+        int to = -1;
+        double moved = 0.0;
+        double timeFrom = 0.0;
+        double timeTo = 0.0;
+        for (int const h : perRank[a])
+        {
+            double const y = all[h].rows;
+            if (!movable(all[h].expert) || !(y > 0.0))
+            {
+                continue;
+            }
+            double const k = all[h].copies;
+            double const q = std::ceil(y / k / c.tileRows);
+            double const amounts[2] = {y, (y / k - (q - 1.0) * c.tileRows) * k};
+            for (int i = 0; i < (q >= 2.0 ? 2 : 1); ++i)
+            {
+                double const ta2 = gpuTime(all, perRank[a], c, h, -amounts[i]);
+                if (!(ta2 < ta))
+                {
+                    continue;
+                }
+                for (int const g : perExpert[all[h].expert])
+                {
+                    if (all[g].rank == a)
+                    {
+                        continue;
+                    }
+                    double const tb2 = gpuTime(all, perRank[all[g].rank], c, g, amounts[i]);
+                    double const v = std::max(ta2, tb2);
+                    if (v < ta && v < best)
+                    {
+                        best = v;
+                        from = h;
+                        to = g;
+                        moved = amounts[i];
+                        timeFrom = ta2;
+                        timeTo = tb2;
+                    }
+                }
+            }
+        }
+        if (from < 0)
+        {
+            break;
+        }
+        all[from].rows = std::max(all[from].rows - moved, 0.0);
+        all[to].rows += moved;
+        times[a] = timeFrom;
+        times[all[to].rank] = timeTo;
+    }
+    for (int s = 0; s < numSlots; ++s)
+    {
+        int const e = static_cast<int>(layout[s]);
+        if (e >= 0 && movable(e))
+        {
+            auto const& mine = perExpert[e];
+            int const h = *std::find_if(mine.begin(), mine.end(), [&](int i) { return all[i].rank == s / localSlots; });
+            shares[s] = all[h].rows / all[h].copies / load[e];
+        }
+    }
+}
+
 } // namespace
 
 //! Shares of every slot's expert rows (see the file comment). loadRows: [num_experts] float64 rows per step of every
 //! expert, rows <= 0 counting as none; layout: [num_slots] int64 expert of every slot, -1 when free, rank-major with
 //! num_slots / ep_size slots per rank. Returns [num_slots] float64: the fraction of its expert's rows every slot
-//! receives, 0 on a free slot. Raises ValueError on a load that is not finite, an expert index outside
-//! [-1, num_experts) or an expert with rows but no slot.
-at::Tensor adaptiveEplbSolveShares(at::Tensor const& loadRows, at::Tensor const& layout, int64_t epSize)
+//! receives, 0 on a free slot. costs: the time model's (read, tile, row, hot tile in us, scale, tile rows) to minimize
+//! the busiest GPU's modeled time instead of its rows. Raises ValueError on a load that is not finite, an expert index
+//! outside [-1, num_experts), an expert with rows but no slot, or costs that are not six finite values, none negative
+//! and the scale and the tile rows positive.
+at::Tensor adaptiveEplbSolveShares(
+    at::Tensor const& loadRows, at::Tensor const& layout, int64_t epSize, c10::optional<at::ArrayRef<double>> costs)
 {
     TORCH_CHECK(loadRows.device().is_cpu() && layout.device().is_cpu(), "adaptive_eplb_solve_shares takes CPU tensors");
     TORCH_CHECK(loadRows.scalar_type() == at::kDouble && loadRows.dim() == 1, "load_rows must be a 1-D float64 tensor");
@@ -551,8 +759,26 @@ at::Tensor adaptiveEplbSolveShares(at::Tensor const& loadRows, at::Tensor const&
     {
         TORCH_CHECK_VALUE(!(load[e] > 0.0) || !slotsOf[e].empty(), "expert ", e, " has rows but no slot");
     }
-    std::vector<double> const shares = rowsBalancedShares(
-        load, slotsOf, static_cast<int>(epSize), static_cast<int>(numSlots / epSize), static_cast<int>(numSlots));
+    int const ranks = static_cast<int>(epSize);
+    int const local = static_cast<int>(numSlots / epSize);
+    int const n = static_cast<int>(numSlots);
+    std::vector<double> offset;
+    TimeCosts c{};
+    if (costs.has_value())
+    {
+        auto const& v = costs.value();
+        bool const valid
+            = v.size() == 6 && std::all_of(v.begin(), v.end(), [](double x) { return std::isfinite(x) && x >= 0.0; });
+        TORCH_CHECK_VALUE(valid && v[4] > 0.0 && v[5] > 0.0,
+            "costs must be six finite values, none negative, the scale and the tile rows positive");
+        c = TimeCosts{v[0], v[1], v[2], v[3], v[5]}; // the scale multiplies every GPU alike
+        offset = timeOffsets(load, layoutPtr, n, ranks, local, slotsOf, c);
+    }
+    std::vector<double> shares = rowsBalancedShares(load, slotsOf, ranks, local, n, offset);
+    if (costs.has_value())
+    {
+        shedBusiest(load, layoutPtr, n, ranks, local, c, shares);
+    }
     at::Tensor out = at::empty({numSlots}, at::TensorOptions().dtype(at::kDouble));
     std::copy(shares.begin(), shares.end(), out.data_ptr<double>());
     return out;
@@ -564,7 +790,7 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("adaptive_eplb_solve_shares(Tensor load_rows, Tensor layout, int ep_size) -> Tensor");
+    m.def("adaptive_eplb_solve_shares(Tensor load_rows, Tensor layout, int ep_size, float[]? costs=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

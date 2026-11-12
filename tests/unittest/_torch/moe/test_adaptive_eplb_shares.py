@@ -4,10 +4,11 @@
 
 import itertools
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
-from _torch.moe.test_adaptive_eplb_policy import GEOMETRY, even_shares
+from _torch.moe.test_adaptive_eplb_policy import GEOMETRY, MODEL, even_shares
 
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     ExpertGeometry,
@@ -91,32 +92,39 @@ def test_shares_balance_the_gpus_of_a_hot_expert_and_are_deterministic():
     assert np.array_equal(rows, rows_copy) and np.array_equal(layout, layout_copy)
 
 
+def test_time_shares_stop_a_replica_whose_read_outweighs_its_rows():
+    layout = GEOMETRY.home_layout()
+    layout[10] = 0  # a copy of expert 0 (home GPU 0) on GPU 1
+    rows = np.full(16, 40.0)
+    rows[0] = 100.0  # by rows GPU 1 takes some; by time its copy's read costs more than they do
+    by_rows = solve_shares(rows, layout, GEOMETRY, replace(MODEL, time_shares=False))
+    assert by_rows.tobytes() == solve_shares(rows, layout, GEOMETRY).tobytes() and by_rows[10] > 0
+    by_time = solve_shares(rows, layout, GEOMETRY, replace(MODEL, time_shares=True))
+    assert by_time[layout == 0].tolist() == [1.0, 0.0]
+
+
 def test_shares_refuse_invalid_inputs():
     rows, layout = _random_case(np.random.default_rng(3))
     rows[0] = 5.0
     solve_shares(rows, layout, GEOMETRY)
 
-    nan = rows.copy()
-    nan[3] = math.nan
-    inf = rows.copy()
-    inf[3] = math.inf
-    low = layout.copy()
-    low[5] = -2
-    high = layout.copy()
-    high[5] = GEOMETRY.num_experts
-    homeless = layout.copy()
-    homeless[layout == 0] = -1  # expert 0 has rows but no slot
+    def put(array, where, value):
+        changed = array.copy()
+        changed[where] = value
+        return changed
+
     invalid = [
         (rows[:-1], layout),
         (rows, layout.astype(np.float64)),
-        (nan, layout),
-        (inf, layout),
-        (rows, low),
-        (rows, high),
-        (rows, homeless),
+        (put(rows, 3, math.nan), layout),
     ]
+    invalid += [(put(rows, 3, math.inf), layout), (rows, put(layout, 5, -2))]
+    # The last: expert 0 has rows but no slot.
+    invalid += [(rows, put(layout, 5, GEOMETRY.num_experts)), (rows, put(layout, layout == 0, -1))]
     for bad_rows, bad_layout in invalid:
         with pytest.raises(ValueError):
             solve_shares(bad_rows, bad_layout, GEOMETRY)
     with pytest.raises(RuntimeError, match="divide evenly"):
         solve_shares(rows, layout[:-1], GEOMETRY)
+    with pytest.raises(ValueError, match="costs"):
+        solve_shares(rows, layout, GEOMETRY, replace(MODEL, per_row_us=-1.0, time_shares=True))

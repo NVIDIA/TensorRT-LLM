@@ -59,7 +59,8 @@ if TYPE_CHECKING:
 def time_layer_copy(
     transport: PeerSlotTransport, layer: int, geometry: ExpertGeometry, stream: torch.cuda.Stream
 ) -> float:
-    """Milliseconds of the copies of one layer's install, at the slowest rank; collective over EP.
+    """Milliseconds per replica of the copies of one layer's install, at the slowest rank;
+    collective over EP.
 
     Every rank copies into its free slots of ``layer`` as many experts as an install places on a
     GPU, each from the home slots of a rank half the EP group away. The ranks copy at the same
@@ -78,7 +79,7 @@ def time_layer_copy(
     for _ in range(2):
         transport.copy(experts, stream, start, end)
         end.synchronize()
-    return max(transport.allgather(start.elapsed_time(end)))
+    return max(transport.allgather(start.elapsed_time(end))) / max(1, replicas)
 
 
 CALIBRATION = ("tensorrt_llm.adaptive_eplb.decode_time_model", 1)
@@ -176,17 +177,18 @@ def load_time_model(
     rates = (doc["rates"]["hbm_bytes_per_s"], doc["rates"]["fp4_dense_flops_per_s"], 1.0)
     fields = backend.decode_time_model(expert_bytes, device, rates)
     own = dict(zip(TERMS, (fields["per_active_slot_us"], 0.0)))  # a bucket without them keeps these
-    by_rows = tuple(
+    by_rows = tuple(  # a bucket with its measured read cost solves the shares by time
         (t * identity["top_k"], float(b["scale"]), *(float(b.get(k, x)) for k, x in own.items()))
+        + (TERMS[0] in b,)
         for t, b in sorted(bucket_of.items())
     )
     if doc["measurement"].get("trtllm_version") != tensorrt_llm.__version__:
         logger.warning(
             f"{path} was measured with TensorRT LLM {doc['measurement'].get('trtllm_version')}"
         )
-    _, scale, read, route = by_rows[-1]
+    _, scale, read, route, timed = by_rows[-1]
     fields.update(scale=scale, per_active_slot_us=read)
-    return TimeModel(**fields, scales=by_rows, route_us=route), None
+    return TimeModel(**fields, scales=by_rows, route_us=route, time_shares=timed), None
 
 
 def ep_gather(group: dist.ProcessGroup) -> Callable:
@@ -497,7 +499,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         copy_ms = time_layer_copy(transport, first, geometry, self.copy_stream)
         logger.info(
             f"adaptive EPLB balances {len(self.layers)} MoE layers; one layer's install copy "
-            f"takes {copy_ms:.3f} ms at start-up"
+            f"takes {copy_ms:.3f} ms per replica at start-up"
         )
         self.start_runtime(time_model, self.mapping.gpus_per_node, copy_ms)
 
@@ -511,7 +513,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         self, model: TimeModel, ranks_per_node: int, copy_ms: float | None = None
     ) -> None:
         """Start the windows, the decision process and the installs, the decisions taking
-        ``copy_ms`` as one layer's copy time until an install is timed. Collective over EP."""
+        ``copy_ms`` per replica copied among the copies they time. Collective over EP."""
         if not dist.is_initialized():
             raise RuntimeError(
                 "adaptive EPLB needs torch.distributed: its statistics gathers run on a gloo group "

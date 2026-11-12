@@ -250,7 +250,9 @@ def test_a_calibration_file_prices_every_decode_bucket_at_its_own_scale(monkeypa
     _, _, seen, warnings = _prepare(monkeypatch, path, device="B200")
     model = seen["start"][0]
     assert seen["priced"][2] == (4e12, 1e16, 1.0) and not warnings
-    assert model.scales == ((16, 0.8, 0.0, 1.5), (32, 1.1, 1.0, 0.0)) and model.route_us == 0.0
+    # A bucket's read cost from the calibration's held-out checks also solves its shares by time.
+    assert model.scales == ((16, 0.8, 0.0, 1.5, True), (32, 1.1, 1.0, 0.0, False))
+    assert model.route_us == 0.0 and not model.time_shares
 
 
 @pytest.mark.parametrize(

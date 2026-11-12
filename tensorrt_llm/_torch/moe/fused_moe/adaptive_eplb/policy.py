@@ -17,7 +17,7 @@ import itertools
 import math
 import statistics
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -63,9 +63,10 @@ class TimeModel:
     needs beyond its first, ``per_row_us`` for every row, and ``hot_slot_extra_tile_us`` for every
     tile beyond the first of the GPU's busiest slot. A layer takes its busiest GPU's time, and
     ``route_us`` more while it holds a replica: the route op's path that spreads an expert's rows.
-    ``scales`` holds ``(rows, scale, per_active_slot_us, route_us)`` per calibrated CUDA graph
-    bucket, ascending by the rows a GPU's tokens route per forward in it (:meth:`at`); empty, the
-    fields hold at every size.
+    With ``time_shares``, :func:`solve_shares` minimizes the busiest GPU's time, not its rows.
+    ``scales`` holds ``(rows, scale, per_active_slot_us, route_us, time_shares)`` per calibrated
+    CUDA graph bucket, ascending by the rows a GPU's tokens route per forward in it (:meth:`at`);
+    empty, the fields hold at every size.
     """
 
     per_active_slot_us: float
@@ -74,8 +75,9 @@ class TimeModel:
     hot_slot_extra_tile_us: float
     scale: float
     tile_rows: int
-    scales: tuple[tuple[float, float, float, float], ...] = ()
+    scales: tuple[tuple[float, float, float, float, bool], ...] = ()
     route_us: float = 0.0
+    time_shares: bool = False
 
     def at(self, rows: float) -> TimeModel:
         """The model of the smallest bucket of at least ``rows`` rows per GPU per forward, the
@@ -83,8 +85,9 @@ class TimeModel:
         if not self.scales:
             return self
         i = bisect.bisect_left([size for size, *_ in self.scales], rows)
-        _, scale, read, route = self.scales[min(i, len(self.scales) - 1)]
-        return replace(self, scale=scale, per_active_slot_us=read, route_us=route, scales=())
+        _, scale, read, route, timed = self.scales[min(i, len(self.scales) - 1)]
+        bucket = dict(per_active_slot_us=read, route_us=route, time_shares=timed)
+        return replace(self, scale=scale, scales=(), **bucket)
 
     @property
     def slope_us(self) -> float:
@@ -404,19 +407,15 @@ def evaluate_gains(
 
 
 def choose_layers_to_install(
-    gains: dict[int, float], steps_left: float | None, copy_cost_ms_per_layer: float
+    gains: dict[int, float], steps_left: float | None, copy_ms: dict[int, float]
 ) -> list[int]:
-    """Layers to install, largest gain first, while a layer's gain (ms per step) over the steps
-    left repays one layer's copy. The drift of the rows sets the interval between evaluations
+    """Layers to install, largest gain first, whose gain (ms per step) over the steps left repays
+    their copy (``copy_ms`` per layer). The drift of the rows sets the interval between evaluations
     (:class:`EvaluationScheduler`), not the worth of an install."""
     if steps_left is None:
         return []
-    chosen = []
-    for layer, gain in sorted(gains.items(), key=lambda kv: (-kv[1], kv[0])):
-        if not gain * float(steps_left) > copy_cost_ms_per_layer:
-            break
-        chosen.append(layer)
-    return chosen
+    order = sorted(gains.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [layer for layer, gain in order if gain * float(steps_left) > copy_ms[layer]]
 
 
 def agreed_timings(
@@ -434,14 +433,6 @@ def agreed_timings(
     if bad:
         raise ValueError(f"ranks disagree on the layers of install groups {bad[:8]}")
     return [(g, by_rank[0][g][0], max(groups[g][1] for groups in by_rank)) for g in common]
-
-
-def copy_ms_per_layer(timings: Sequence[tuple[int, int, float]]) -> float | None:
-    """Copy-stream milliseconds per installed layer over the ``(group, layers, ms)`` timings, or
-    ``None`` without one."""
-    if not timings:
-        return None
-    return sum(ms for _, _, ms in timings) / sum(n for _, n, _ in timings)
 
 
 def fixed_install_ms(timings: Sequence[tuple[int, int, float]]) -> float | None:
@@ -581,17 +572,22 @@ class EvaluationScheduler:
 _UINT32_MAX = (1 << 32) - 1
 
 
-def solve_shares(load_rows: np.ndarray, layout: np.ndarray, geometry: ExpertGeometry) -> np.ndarray:
-    """``[num_slots]`` shares of ``layout`` that minimize the busiest GPU's ``load_rows``."""
+def solve_shares(
+    load: np.ndarray, layout: np.ndarray, geometry: ExpertGeometry, model: TimeModel | None = None
+) -> np.ndarray:
+    """``[num_slots]`` shares of ``layout`` that minimize the busiest GPU's rows of ``load``, or its
+    time by ``model`` where that model's ``time_shares`` is set."""
     import torch
 
-    load = np.ascontiguousarray(load_rows, dtype=np.float64)
+    load = np.ascontiguousarray(load, dtype=np.float64)
     slots = np.asarray(layout)
     if not np.issubdtype(slots.dtype, np.integer):
         raise ValueError("layout must hold integers")
     slots = torch.from_numpy(np.ascontiguousarray(slots, dtype=np.int64))
+    timed = model is not None and model.time_shares  # then its fields up to the tile rows
+    costs = [float(getattr(model, f.name)) for f in fields(model)[:6]] if timed else None
     solve = torch.ops.trtllm.adaptive_eplb_solve_shares
-    return solve(torch.from_numpy(load), slots, geometry.ep_size).numpy()
+    return solve(torch.from_numpy(load), slots, geometry.ep_size, costs).numpy()
 
 
 class RouteTables(NamedTuple):

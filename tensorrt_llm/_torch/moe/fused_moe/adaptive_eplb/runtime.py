@@ -41,7 +41,6 @@ from .policy import (
     agreed_timings,
     build_route_tables,
     choose_layers_to_install,
-    copy_ms_per_layer,
     evaluate_gains,
     plan_layout,
     solve_shares,
@@ -100,8 +99,8 @@ def window_stats_size(layers: int, experts: int) -> int:
 @dataclass(frozen=True)
 class DecisionConfig:
     """Inputs of the decision process; ``home_layouts`` is ``[L, num_slots]`` int64 and
-    ``copy_ms`` the copy time of one layer's install measured at start-up, which the decisions
-    take until an install is timed."""
+    ``copy_ms`` the copy time per replica measured at start-up, which stays among the install
+    timings the copies are priced by."""
 
     geometry: ExpertGeometry
     model: TimeModel
@@ -165,11 +164,12 @@ class _Decider:
         self.layout = np.array(config.home_layouts, dtype=np.int64)
         self.shares = (self.layout >= 0).astype(np.float64)
         self.committed = np.full(len(self.layout), -1)
-        self.copy_timings: dict[int, tuple[int, float]] = {}
         self.install_timings: dict[int, tuple[int, float]] = {}
         self.stats_copies: list[float] = []
         self.evaluations = EvaluationScheduler(config.model, config.geometry)
         self.active = active_slots(config.geometry)
+        # (apply call, ms per replica) of the timed copies; the start-up one, at call inf, always counts.
+        self.copy_samples = [] if config.copy_ms is None else [(math.inf, config.copy_ms)]
         self.forwards = 1
         self.next_forwards: int | None = None
         self.open_call = 0
@@ -188,8 +188,9 @@ class _Decider:
         col = {name: rows[:, i] for i, name in enumerate(ROW)}
         apply_call = int(col["copied_call"].max()) + 1
         per_rank = [[(window, int(n), float(ms))] for n, ms in zip(col["moved"], col["copy_ms"])]
-        self.copy_timings.update((g, (n, ms)) for g, n, ms in agreed_timings(per_rank) if n > 0)
-        close, growth, steps_left = self.awaiting_copy.pop(window)
+        # got: the replicas the update's busiest receiving GPU copied
+        close, growth, steps_left, got = self.awaiting_copy.pop(window)
+        self.copy_samples += [(apply_call, ms / got) for _, n, ms in agreed_timings(per_rank) if n]
         self.forwards = self.next_forwards or self.forwards
         plan = self.evaluations.plan(
             apply_call,
@@ -222,7 +223,7 @@ class _Decider:
         forwards = stats[:, layers * experts : layers * (experts + 1)].astype(np.float64)
         if forwards.min() < 1:
             # A rank counted no forward of some layer: this window gives no rows.
-            self.awaiting_copy[window] = (close, None, None)
+            self.awaiting_copy[window] = (close, None, None, 0)
             return update
         # Rows per forward of every expert: every rank's rows over its own forwards, summed.
         routed = stats[:, : layers * experts].astype(np.float64).reshape(len(stats), layers, -1)
@@ -233,7 +234,7 @@ class _Decider:
         if per_forward > 0.0:
             self.next_forwards = window_forwards(per_forward, experts)
         if sizing:
-            self.awaiting_copy[window] = (close, None, None)
+            self.awaiting_copy[window] = (close, None, None, 0)
             return update
         total = {name: float(values.astype(np.float64).sum()) for name, values in tail.items()}
         steps_left = None
@@ -253,48 +254,58 @@ class _Decider:
         requests = ahead or ((before + requests) / 2.0 if before > 0.0 else requests)
         applied_window = stats[:, layers * (experts + 1) : layers * (experts + 2)].min(0)
         planned = np.flatnonzero(self.committed <= applied_window)
-        new_layout = np.empty((len(planned), slots), dtype=np.int64)
-        new_shares = np.empty((len(planned), slots))
-        home = cfg.home_layouts[planned]
-        for i, layer in enumerate(planned.tolist()):
-            plan = plan_layout(rows[layer], geometry, home[i], self.layout[layer], self.active)
-            new_layout[i] = plan.layout
-            new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry)
-        current = (rows[planned], self.layout[planned], self.shares[planned])
         # The busiest rank's rows per forward size the CUDA graph bucket the steps pad to.
         model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
         self.evaluations.model = model
-        gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
-        timed = copy_ms_per_layer([(g, *t) for g, t in sorted(self.copy_timings.items())])
-        copy_ms = cfg.copy_ms if timed is None else timed
-        # The home layout is a candidate too: retiring the replicas copies nothing, so the plan stays
-        # only where it gains more than the home layout, net of a layer's copy over the steps left.
-        home_shares = (home >= 0).astype(np.float64)
-        home_gains = evaluate_gains(*current, home, home_shares, model, geometry)
-        left, copy = steps_left or 0.0, copy_ms or 0.0
-        to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - copy)
-        previous_load = None
+        new_layout = np.empty((len(planned), slots), dtype=np.int64)
+        new_shares, resolved = np.empty((2, len(planned), slots))
+        home, installed = cfg.home_layouts[planned], self.layout[planned]
+        previous_load = rows[
+            planned
+        ]  # replaced below by an earlier window's rows where one is kept
         for i, layer in enumerate(planned.tolist()):
+            plan = plan_layout(rows[layer], geometry, home[i], installed[i], self.active)
+            new_layout[i] = plan.layout
+            new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry, model)
+            resolved[i] = solve_shares(rows[layer], installed[i], geometry, model)
             # The latest kept window that neither the installed layout (planned on the window the
             # layer was committed in) nor the new one (planned on this window) was planned on, at
             # this window's batch; a layer without one keeps only this window's gains.
             seen = next((x for x in reversed(self.kept) if x[0] != self.committed[layer]), None)
             if seen is not None:
-                previous_load = current[0].copy() if previous_load is None else previous_load
                 previous_load[i] = seen[1][layer] * (ahead / seen[2] if ahead and seen[2] else 1.0)
-        if previous_load is not None:
-            # Both candidates must also gain on that window, and the plan beat the home layout there.
-            earlier = (previous_load, *current[1:])
-            plan_gains = evaluate_gains(*earlier, new_layout, new_shares, model, geometry)
-            back_gains = evaluate_gains(*earlier, home, home_shares, model, geometry)
-            to_home |= (home_gains > 0.0) & (back_gains * left >= plan_gains * left - copy)
-            gains, home_gains = np.minimum(gains, plan_gains), np.minimum(home_gains, back_gains)
+        # Shares solved again on the installed layouts replace the old ones where they gain on both
+        # windows: the layers that do not install get them without a copy, the candidates gain on them.
+        refresh = np.full(len(planned), True)
+        for load in (rows[planned], previous_load):
+            old = (load, installed, self.shares[planned])
+            refresh &= evaluate_gains(*old, installed, resolved, model, geometry) > 0.0
+        current = (rows[planned], installed, np.where(refresh[:, None], resolved, old[2]))
+        gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
+        # A layer's copy: its busiest receiving GPU's replicas at the lower median of the copy times per
+        # replica within the steps left (one slow copy prices nothing out; the start-up one counts).
+        fresh = (new_layout >= 0) & (new_layout != installed)
+        copied = fresh.reshape(-1, geometry.ep_size, geometry.local_slots).sum(2)
+        recent = [ms for call, ms in self.copy_samples if call >= close - (steps_left or 0.0)]
+        per_replica = sorted(recent)[(len(recent) - 1) // 2] if recent else None
+        # The home layout is a candidate too: retiring the replicas copies nothing, so the plan stays
+        # only where it gains more than the home layout, net of a layer's copy over the steps left.
+        home_shares = (home >= 0).astype(np.float64)
+        home_gains = evaluate_gains(*current, home, home_shares, model, geometry)
+        left, copy = steps_left or 0.0, (per_replica or 0.0) * copied.max(1, initial=0)
+        to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - copy)
+        # Both candidates must also gain on that window, and the plan beat the home layout there.
+        earlier = (previous_load, *current[1:])
+        plan_gains = evaluate_gains(*earlier, new_layout, new_shares, model, geometry)
+        back_gains = evaluate_gains(*earlier, home, home_shares, model, geometry)
+        to_home |= (home_gains > 0.0) & (back_gains * left >= plan_gains * left - copy)
+        gains, home_gains = np.minimum(gains, plan_gains), np.minimum(home_gains, back_gains)
         new_layout[to_home], new_shares[to_home] = home[to_home], home_shares[to_home]
         gains[to_home] = home_gains[to_home]
         gain = dict(zip(planned.tolist(), gains.tolist()))
         retire = [layer for layer in planned[to_home].tolist() if gain.pop(layer) * left > 0.0]
-        chosen = choose_layers_to_install(gain, steps_left, copy)
-        if copy_ms is None:
+        chosen = choose_layers_to_install(gain, steps_left, dict(zip(planned.tolist(), copy)))
+        if per_replica is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
         chosen += retire  # a retirement copies nothing: it pays as soon as it gains
@@ -302,16 +313,18 @@ class _Decider:
             range(layers), rows, self.layout, self.shares, self.open_call
         )
         self.kept.append((window, rows, requests))
-        self.awaiting_copy[window] = (close, growth, steps_left)
-        moved = []
+        moved, received = [], np.zeros(geometry.ep_size)
         for i, layer in enumerate(planned.tolist()):
             if layer not in chosen:
-                continue
+                if not refresh[i]:
+                    continue
+                new_layout[i], new_shares[i] = installed[i], current[2][i]
             tables = build_route_tables(new_layout[i], new_shares[i], experts, slots).packed()
             update.tables[layer] = np.array(tables, dtype=np.int32)
             fresh = (new_layout[i] >= 0) & (new_layout[i] != self.layout[layer])
             if fresh.any():
                 moved.append(layer)
+                received += copied[i]
                 update.copy_items[layer] = copy_items(
                     self.layout[layer], new_layout[i], geometry, cfg.ep_rank, cfg.ranks_per_node
                 )
@@ -319,6 +332,7 @@ class _Decider:
             self.shares[layer] = new_shares[i]
             self.committed[layer] = window
         update.moved = sorted(moved)
+        self.awaiting_copy[window] = (close, growth, steps_left, int(received.max()))
         update.digest = update.fingerprint()
         return update
 

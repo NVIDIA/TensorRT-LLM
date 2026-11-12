@@ -19,7 +19,6 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     active_slots,
     agreed_timings,
     choose_layers_to_install,
-    copy_ms_per_layer,
     evaluate_gains,
     fixed_install_ms,
     plan_layout,
@@ -284,11 +283,11 @@ def test_evaluate_gains_replica_of_hot_expert_pays():
 
 def test_choose_layers_to_install():
     gains = {1: 0.05, 2: 0.02, 3: 0.001, 4: 0.03}
-    assert choose_layers_to_install(gains, 100.0, 0.5) == [1, 4, 2]
-    assert choose_layers_to_install(gains, None, 0.5) == []
-    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 4.9) == [1, 2]
-    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 5.0) == []
-    assert choose_layers_to_install({1: 0.06, 2: 0.05}, 100.0, 5.5) == [1]
+    assert choose_layers_to_install(gains, 100.0, dict.fromkeys(gains, 0.5)) == [1, 4, 2]
+    assert choose_layers_to_install(gains, None, dict.fromkeys(gains, 0.5)) == []
+    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, {1: 4.9, 2: 4.9}) == [1, 2]
+    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, {1: 5.0, 2: 5.0}) == []
+    assert choose_layers_to_install({1: 0.06, 2: 0.05}, 100.0, {1: 6.5, 2: 4.0}) == [2]
 
 
 def test_group_readings_copy_and_apply():
@@ -296,8 +295,6 @@ def test_group_readings_copy_and_apply():
     rank1 = [(10, 2, 1.5), (20, 3, 1.0)]
     common = agreed_timings([rank0, rank1])
     assert common == [(10, 2, 1.5), (20, 3, 2.0)]
-    assert copy_ms_per_layer(common) == pytest.approx(3.5 / 5)
-    assert copy_ms_per_layer([]) is None
     assert fixed_install_ms([(10, 2, 1.0), (20, 2, 1.2)]) is None
     assert fixed_install_ms([(10, 2, 3.0), (20, 4, 5.0)]) == pytest.approx(1.0)
     assert fixed_install_ms([(10, 2, 0.2), (20, 4, 1.0)]) == 0.0
@@ -357,8 +354,8 @@ def test_rate_floor_follows_the_reading_interval():
 
 
 def test_a_step_takes_the_costs_of_the_bucket_it_pads_to():
-    buckets = ((40.0, 0.8, 5.0, 1.5), (160.0, 1.1, 0.0, 2.0))
+    buckets = ((40.0, 0.8, 5.0, 1.5, True), (160.0, 1.1, 0.0, 2.0, False))
     at = [TimeModel(1.0, 2.0, 3.0, 4.0, 1.0, 8, buckets).at(r) for r in (1, 40, 41, 160, 1e6)]
     want = [buckets[0][1:]] * 2 + [buckets[1][1:]] * 3
-    assert [(m.scale, m.per_active_slot_us, m.route_us) for m in at] == want
+    assert [(m.scale, m.per_active_slot_us, m.route_us, m.time_shares) for m in at] == want
     assert at[2].scales == () and at[2].at(1.0).scale == 1.1

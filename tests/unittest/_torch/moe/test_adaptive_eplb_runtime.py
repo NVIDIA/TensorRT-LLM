@@ -252,7 +252,7 @@ def set_statistics(runtime, rows: np.ndarray, forwards: int) -> None:
         layer.statistics.forwards.fill_(forwards)
 
 
-def even_split(rows, layout, geometry) -> np.ndarray:
+def even_split(rows, layout, geometry, model=None) -> np.ndarray:
     """Shares that split every expert's rows evenly over its copies."""
     copies = np.bincount(layout[layout >= 0], minlength=geometry.num_experts)
     return np.where(layout >= 0, 1.0 / copies[np.maximum(layout, 0)], 0.0)
@@ -270,7 +270,7 @@ def spy(monkeypatch, seen: dict) -> None:
         seen.setdefault("load", []).append(np.array(load))
         return REAL_PLAN(load, *args)
 
-    def solve(rows, layout, geometry):
+    def solve(rows, layout, geometry, model=None):
         seen.setdefault("rows", []).append(rows)
         return even_split(rows, layout, geometry)
 
@@ -347,7 +347,7 @@ def test_a_window_counts_every_ranks_rows_over_its_own_forwards(host_cuda, monke
     seen, rows, _, ranks = window_inputs(monkeypatch, (FORWARDS, FORWARDS + 1))
     expected = rows[0].astype(np.float64) / FORWARDS + rows[1].astype(np.float64) / (FORWARDS + 1)
     assert len(seen["load"]) == R * L  # every layer planned on both ranks: not skipped
-    for i, (load, solved) in enumerate(zip(seen["load"], seen["rows"])):
+    for i, (load, solved) in enumerate(zip(seen["load"], seen["rows"][::2])):  # plan, installed
         assert np.array_equal(load, expected[i % L]) and np.array_equal(solved, expected[i % L])
     last = [records(runtime)[-1] for runtime in (*ranks, base_ranks[0])]
     for key in ("window", "open_call", "solved_call"):
@@ -671,6 +671,38 @@ def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch):
     assert sorted(update.tables) == [0, 1] and update.moved == [] and (decider.layout == HOME).all()
 
 
+def test_shares_solved_again_on_the_installed_layouts_are_published_without_a_copy(monkeypatch):
+    decider = FakeDecision(0, copy_ms=0.5).decider  # the share op itself, by rows
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    window_stats(decider.stats)  # GPU 0's experts 0 and 1 are hot: both layers take replicas
+    assert decider.decide(0).moved == [0, 1]
+    decider.schedule(0, np.array([[10, 2, 1.0, 0]] * R))
+    old, installed = decider.shares.copy(), decider.layout.copy()
+    # Installs live, GPU 1's expert 4 warm, one step left: the plan (a replica of expert 4) repays
+    # no copy, but the installed replicas split otherwise.
+    candidate = np.where(np.arange(R * LOCAL) == 4, 4, HOME)
+    monkeypatch.setattr(rt, "plan_layout", lambda *args: SimpleNamespace(layout=candidate))
+    stats = window_stats(decider.stats)
+    stats[:, L * (E + 1) : L * (E + 2)], stats[:, 4 : L * E : E] = 0, 200
+    stats[:, L * (E + 2) + rt.FIELDS.index("remaining")] = 8
+    update = decider.decide(1)
+    assert sorted(update.tables) == [0, 1] and update.moved == [] and not update.copy_items
+    assert (decider.layout == installed).all() and not np.array_equal(decider.shares, old)
+
+
+def test_one_slow_copy_does_not_price_the_next_installs_out(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    decider = FakeDecision(0, copy_ms=0.5).decider  # one replica per GPU and layer at start-up
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    remaining = L * (E + 2) + rt.FIELDS.index("remaining")
+    window_stats(decider.stats)[:, remaining] = 800  # 100 steps left
+    assert decider.decide(0).moved == [0, 1]
+    decider.schedule(0, np.array([[10, 2, 100.0, 0]] * R))  # 50 ms per replica: 100x start-up's
+    window_stats(decider.stats, (4, 5))[:, L * (E + 1) : L * (E + 2)] = 0
+    decider.stats[:, remaining] = 800  # GPU 1's experts hot: the correction repays 0.5 ms, not 50
+    assert decider.decide(1).moved == [0, 1]
+
+
 def test_decision_process_answers_and_reports_its_failure():
     process = rt.DecisionProcess(rt.DecisionConfig(GEOMETRY, MODEL, np.tile(HOME, (L, 1)), 1, 1))
     try:
@@ -821,7 +853,7 @@ def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tm
 def test_a_window_prices_at_the_scale_of_the_bucket_its_busiest_rank_pads_to(monkeypatch):
     gains = []
     read = MODEL.per_active_slot_us  # the buckets differ in their scales alone
-    for scales in ((), ((100.0, 2.0, read, 0.0), (200.0, 3.0, read, 0.0))):
+    for scales in ((), ((100.0, 2.0, read, 0.0, False), (200.0, 3.0, read, 0.0, False))):
         seen = {}
         spy(monkeypatch, seen)
         decider = FakeDecision(0).decider
