@@ -17,9 +17,13 @@ import re
 import shlex
 import warnings
 from subprocess import CalledProcessError
-from typing import NoReturn, Optional
+from typing import TYPE_CHECKING, NoReturn, Optional
 
+import pytest
 from defs.conftest import tests_path
+
+if TYPE_CHECKING:
+    from defs.local_venv import PythonVenvRunnerImpl
 
 _MAX_CULPRITS = 20
 
@@ -521,3 +525,127 @@ def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):
         assert testcases, f"MPI rank {rank} collected no tests"
         assert all(case.find("skipped") is None for case in testcases), (
             f"MPI rank {rank} skipped a required TP case")
+
+
+def test_mpi_profiler(llm_root: str, llm_venv: "PythonVenvRunnerImpl",
+                      output_dir: str) -> None:
+    """Run the real MPI profiling contract on two ranks, rejecting skipped runs."""
+    import xml.etree.ElementTree as ET
+
+    from defs.common import venv_mpi_check_call
+
+    output_dir = os.path.abspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    for rank in range(2):
+        report_path = os.path.join(output_dir,
+                                   f"results-mpi-profiler-rank{rank}.xml")
+        if os.path.exists(report_path):
+            os.remove(report_path)
+    test_root = os.path.join(llm_root, "tests", "unittest")
+    case = os.path.join(test_root, "_torch", "distributed",
+                        "test_communicator_profiler.py"
+                        ) + "::test_two_rank_collective_p2p_profiler_smoke"
+    launcher = (
+        "import sys, pytest; from mpi4py import MPI; "
+        "rank = MPI.COMM_WORLD.Get_rank(); output = sys.argv[1]; "
+        "raise SystemExit(pytest.main(sys.argv[2:] + ['-v', '--tb=short', "
+        "f'--junitxml={output}/results-mpi-profiler-rank{rank}.xml']))")
+    venv_mpi_check_call(
+        llm_venv,
+        ["mpirun", "--allow-run-as-root", "-n", "2"],
+        ["-c", launcher, output_dir, case, "-m", "cpu_only"],
+        env={
+            "PYTHONPATH":
+            os.pathsep.join([test_root,
+                             os.environ.get("PYTHONPATH", "")]),
+            "TLLM_PROFILE_CUSTOM_REGIONS":
+            "mpi",
+        },
+        timeout=300,
+    )
+    for rank in range(2):
+        report = ET.parse(
+            os.path.join(output_dir, f"results-mpi-profiler-rank{rank}.xml"))
+        cases = report.findall(".//testcase")
+        assert len(
+            cases) == 1, f"MPI rank {rank} did not run exactly one smoke case"
+        case_result = cases[0]
+        assert case_result.find(
+            "skipped") is None, f"MPI rank {rank} skipped the smoke case"
+        assert case_result.find(
+            "failure") is None, f"MPI rank {rank} failed the smoke case"
+        assert case_result.find(
+            "error") is None, f"MPI rank {rank} errored in the smoke case"
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("enabled", [False, True], ids=["off", "on"])
+def test_nccl_profiler_build_contract(llm_root: str,
+                                      llm_venv: "PythonVenvRunnerImpl",
+                                      output_dir: str, enabled: bool) -> None:
+    """Require both native probe flags and run NCCL and binding contracts without skips."""
+    import xml.etree.ElementTree as ET
+
+    from defs.common import venv_check_call
+
+    mode = "on" if enabled else "off"
+    os.makedirs(output_dir, exist_ok=True)
+    report_path = os.path.abspath(
+        os.path.join(output_dir, f"results-nccl-profiler-{mode}.xml"))
+    if os.path.exists(report_path):
+        os.remove(report_path)
+    test_root = os.path.join(llm_root, "tests", "unittest")
+    contracts = [
+        os.path.join(test_root, "_torch", "distributed",
+                     "test_nccl_profiler.py"),
+        os.path.join(test_root, "bindings", "test_nanobind_profiler.py"),
+    ]
+    launcher = (
+        "import sys, pytest; from tensorrt_llm.bindings import BuildInfo; "
+        "from tensorrt_llm import _profiler; "
+        "assert all(getattr(BuildInfo, name) is (sys.argv[1] == 'on') "
+        "for name in ('ENABLE_NCCL_PROFILING', 'ENABLE_NANOBIND_PROFILING')), "
+        "'Native profiling flags do not match the required CI mode'; "
+        "assert _profiler.custom_region_enabled('nccl'), "
+        "'CI must select nccl before importing the product'; "
+        "raise SystemExit(pytest.main(sys.argv[2:]))")
+    venv_check_call(
+        llm_venv,
+        [
+            "-c", launcher, mode, *contracts, "-v", "--tb=short",
+            "--timeout=300", f"--junitxml={report_path}"
+        ],
+        env={
+            "PYTHONPATH":
+            os.pathsep.join([test_root,
+                             os.environ.get("PYTHONPATH", "")]),
+            "TLLM_PROFILE_CUSTOM_REGIONS":
+            "nccl",
+        },
+        timeout=900,
+    )
+    cases = ET.parse(report_path).findall(".//testcase")
+    assert cases, "Native profiler contracts collected no tests"
+    selector_cases = [
+        case.get("name", "") for case in cases
+        if case.get("name", "").startswith(
+            "test_nanobind_results_errors_and_selection[")
+    ]
+    assert len(selector_cases) == 4 and set(selector_cases) == {
+        f"test_nanobind_results_errors_and_selection[{selector}]"
+        for selector in ("None", "nanobind", "none", "mpi")
+    }, "Binding profiler must run all four batched selector cases"
+    p2p_cases = [
+        case for case in cases if case.get("name", "").startswith(
+            "test_nccl_owner_boundaries[point-to-point")
+    ]
+    assert len(
+        p2p_cases) == 2, "NCCL profiler must run eager and captured P2P cases"
+    assert any(
+        case.get("name", "").startswith(
+            "test_nccl_owner_boundaries[process-group") for case in
+        cases), "NCCL profiler must run the ProcessGroup ownership case"
+    for case_result in cases:
+        for status in ("skipped", "failure", "error"):
+            assert case_result.find(status) is None, (
+                f"Native profiler {case_result.get('name')} reported {status}")

@@ -14,6 +14,7 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - test_unittests.py::test_mpi_profiler
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
@@ -110,11 +111,14 @@ l0_cpu:
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
+  - unittest/_torch/executor/test_profile_window_filenames.py
+  - unittest/_torch/executor/test_workflow_profiler.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
+  - unittest/test_profiler.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory

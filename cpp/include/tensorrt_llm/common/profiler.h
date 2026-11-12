@@ -1,0 +1,154 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "tensorrt_llm/common/config.h"
+
+#include <ATen/record_function.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <exception>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
+{
+
+//! Categories shared by the Python and native process-start selectors.
+enum class ProfilerRegion : std::uint8_t
+{
+    kWorkflow,
+    kMpi,
+    kNccl,
+    kNanobind,
+    kKv,
+    kMoe,
+    kCount,
+};
+
+//! Validate and cache TLLM_PROFILE_CUSTOM_REGIONS once, at application startup.
+//! Return a diagnostic for malformed nonempty configuration and select the defaults.
+//! Empty configuration also selects the defaults. Repeated calls return the cached result.
+//! Call before installing instrumented consumers; never from a collective,
+//! profiler callback, or static loader initializer.
+//! Thread safe. Environment changes after initialization have no effect.
+[[nodiscard]] std::optional<std::string> initializeProfilerRegions();
+
+//! Return cached runtime selection, or false before successful explicit initialization.
+//! Runtime selection alone does not enable instrumentation omitted at build time.
+[[nodiscard]] bool customRegionEnabled(ProfilerRegion region) noexcept;
+
+//! Warn once per process about an omitted observational scope; never throws.
+//! diagnostic must point to a valid null-terminated message for the duration of the call.
+void reportProfilerFailure(char const* diagnostic) noexcept;
+
+//! A TRTLLM1 JSON object supporting UTF-8 strings, int64 values and int64 vectors.
+//! The builder owns its encoded bytes; take() transfers them to the caller.
+class ProfilerMetadata
+{
+public:
+    //! Start a payload with a UTF-8 byte-length-prefixed region name.
+    explicit ProfilerMetadata(std::string_view region);
+
+    //! Append a UTF-8 string field using JSON escaping.
+    void add(std::string_view name, std::string_view value);
+    //! Append a signed int64 field.
+    void add(std::string_view name, std::int64_t value);
+    //! Append an int64 list, including an empty list.
+    void add(std::string_view name, std::vector<std::int64_t> const& value);
+
+    //! Complete the dictionary and transfer its storage; consume each builder once.
+    [[nodiscard]] std::string take() &&;
+
+private:
+    std::string mPrefix;
+    nlohmann::ordered_json mFields = nlohmann::ordered_json::object();
+};
+
+//! An observational, same-thread PyTorch USER_SCOPE owning its name and string input.
+//! Probes remain inactive until initializeProfilerRegions() succeeds. Active callbacks determine
+//! whether metadata is needed. Factories, profiler start and cleanup never change the body.
+//! This owner cannot be copied or moved; its storage outlives the RecordFunction callbacks.
+class RecordFunctionWithMetadata
+{
+public:
+    //! Create an inactive or active probe without evaluating factories or parsing configuration.
+    explicit RecordFunctionWithMetadata(ProfilerRegion region) noexcept;
+    //! End the scope once on its creating thread, without replacing an operation exception.
+    ~RecordFunctionWithMetadata() noexcept;
+
+    RecordFunctionWithMetadata(RecordFunctionWithMetadata const&) = delete;
+    RecordFunctionWithMetadata& operator=(RecordFunctionWithMetadata const&) = delete;
+    RecordFunctionWithMetadata(RecordFunctionWithMetadata&&) = delete;
+    RecordFunctionWithMetadata& operator=(RecordFunctionWithMetadata&&) = delete;
+
+    //! Whether this probe has an active callback and can start (or has already started).
+    [[nodiscard]] bool isActive() const noexcept
+    {
+        return mRecord.has_value();
+    }
+
+    //! Evaluate nameFactory only for an active probe, and metadataFactory only for requested inputs.
+    template <typename NameFactory, typename MetadataFactory>
+    void startWithLazyName(NameFactory&& nameFactory, MetadataFactory&& metadataFactory) noexcept
+    {
+        if (!mRecord || mStarted)
+        {
+            return;
+        }
+        try
+        {
+            mName = std::forward<NameFactory>(nameFactory)();
+            if (mRecord->needsInputs())
+            {
+                ProfilerMetadata metadata{mRegion};
+                std::forward<MetadataFactory>(metadataFactory)(metadata);
+                mInputs.emplace_back(std::move(metadata).take());
+            }
+            mRecord->before(mName, &mInputs);
+            mStarted = true;
+        }
+        catch (std::exception const& error)
+        {
+            reportProfilerFailure(error.what());
+            mRecord.reset();
+        }
+        catch (...)
+        {
+            reportProfilerFailure("non-standard exception during scope setup");
+            mRecord.reset();
+        }
+    }
+
+private:
+    char const* mRegion{nullptr};
+    std::string mName;
+    std::vector<c10::IValue> mInputs;
+    std::optional<at::RecordFunction> mRecord;
+    bool mStarted{false};
+};
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END
