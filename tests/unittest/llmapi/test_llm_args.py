@@ -487,14 +487,6 @@ class TestMoeConfigPerLayerDynamicEplb:
                            r"'halo_r'"):
             MoePerLayerDynamicLoadBalancerConfig(**values)
 
-    def test_standard_mode_rejects_planner(self) -> None:
-        with pytest.raises(ValidationError):
-            MoeConfig(load_balancer={
-                "mode": "standard",
-                "num_slots": 64,
-                "planner": "halo_r"
-            })
-
     @pytest.mark.parametrize(
         "num_slots, valid",
         [

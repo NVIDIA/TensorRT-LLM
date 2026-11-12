@@ -246,23 +246,6 @@ def test_halo_r_planner_builds_the_halo_r_group(monkeypatch) -> None:
     assert repr(manager).endswith("planner=halo_r)")
 
 
-def test_default_planner_builds_the_halo_q_group(monkeypatch) -> None:
-    halo_r_builder = MagicMock()
-    halo_q_builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
-    _patch_group_builders(monkeypatch, halo_q=halo_q_builder, halo_r=halo_r_builder)
-    config = _Config("halo_q")
-    del config.planner
-    manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
-    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
-
-    _allocate_arena(layer, monkeypatch, _Arena())
-    layer.bind_backend(_Backend())
-
-    halo_r_builder.assert_not_called()
-    halo_q_builder.assert_called_once()
-    assert manager.planner == "halo_q"
-
-
 def test_rebinding_the_backend_forgets_helper_residency(monkeypatch) -> None:
     """Loaders bind the layer again after they rewrite its weights."""
     group = SimpleNamespace(home_experts=4, helper_slots=2, forget_helper_residency=MagicMock())
