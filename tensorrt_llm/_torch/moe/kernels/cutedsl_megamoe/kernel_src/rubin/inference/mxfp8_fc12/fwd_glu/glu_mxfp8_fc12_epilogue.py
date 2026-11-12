@@ -3,6 +3,10 @@
 """Autonomous epilogue for the fused fc1+fc2 swap-AB MegaMoE kernel.
 
 The B-reuse tile uses ``GluMxfp8BreuseEpilogue`` (glu_mxfp8_fc12_epilogue_breuse.py).
+
+TensorRT-LLM-local file, not part of the upstream cutedsl_megamoe export: adapted
+from the upstream training forward GLU kernel
+(``sources/kernel_src/rubin/training/mega/fwd_glu/``). A re-export must carry it forward.
 """
 
 import dataclasses
@@ -593,7 +597,7 @@ class GluMxfp8Epilogue:
             self._fc2_tma_stages = 1
         else:
             # TMA-only auto sizing: consume the FC1 scratch lifetime that is free
-            # during FC2, while preserving at least the old two-stage BF16 baseline.
+            # during FC2, with at least two BF16 store stages.
             bf16_baseline_bytes = (
                 min(2, max_store_stages)
                 * self._epi_tile_m
@@ -1766,7 +1770,7 @@ class GluMxfp8Epilogue:
                 self._write_sf_fc2_buffer(rmem_sf_fc2, subtile_idx, qpvscale)
             else:
                 # BF16 path: either stage a 128x32 tile for TMA/UBLK or use
-                # the original pair of 256-bit vector stores.
+                # a pair of 256-bit vector stores.
                 r_bf16 = cute.make_rmem_tensor(r_acc_layout.shape, cutlass.BFloat16)
                 r_bf16.store(r_acc.load().to(cutlass.BFloat16))
                 r_bf16_flat = cute.make_tensor(r_bf16.iterator, cute.make_layout(EpilogueTileN))

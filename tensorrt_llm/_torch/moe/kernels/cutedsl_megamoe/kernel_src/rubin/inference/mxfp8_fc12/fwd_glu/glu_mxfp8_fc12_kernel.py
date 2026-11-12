@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""
-Fused fc1+fc2 GLU MXFP8 MegaMoE kernel for SM107.
+"""Fused FC1 + GLU activation + FC2 MXFP8 kernel for SM107.
+
+TensorRT-LLM-local file, not part of the upstream cutedsl_megamoe export: adapted
+from the upstream training forward GLU kernel
+(``sources/kernel_src/rubin/training/mega/fwd_glu/``). A re-export must carry it forward.
 """
 
 import dataclasses
@@ -100,6 +103,20 @@ def _int64_pointer_array_tensor(pointer_array: cute.Pointer, element_count: int)
 
 
 class Sm107Mxfp8GluFc12Kernel:
+    """Persistent SM107 kernel computing ``FC2(act(FC1(x)))`` on MXFP8 operands.
+
+    FC1 tiles write the activated MXFP8 intermediate and its E8M0 scales to global
+    scratch and count their arrivals in ``fc1_done_counter``; FC2 tiles of the same
+    token band wait on that count, possibly in other CTAs. The grid therefore holds
+    one CTA per resident cluster, and every cluster must be co-resident: the kernel
+    hangs if another stream occupies SMs it was sized for.
+
+    TensorRT-LLM builds it in ``cute_dsl_mxfp8_shared_expert_custom_op`` for one
+    replicated SiTU expert with ``mma_tiler_mnk=(512, 256, 128)``, a ``(2, 1, 1)``
+    cluster, static scheduling, ``use_stg_fc1=True`` and ``use_pdl=False``. The
+    remaining options come from the upstream training kernel and keep their defaults.
+    """
+
     # SMEM budget for all "non-problem-tensor" buffers (mbarriers, sched
     # work-tile buffer, TMEM allocator state).  Reserved at host side in
     # ``_compute_stages``.  Bump if ``SharedStorage`` over-allocates SMEM.
@@ -163,6 +180,47 @@ class Sm107Mxfp8GluFc12Kernel:
         use_pdl: bool = False,
         weight_storage_mode: WeightStorageMode = "contiguous",
     ) -> None:
+        """Configure the kernel; shapes are bound at ``cute.compile`` from ``__call__``.
+
+        Args:
+            mma_tiler_mnk: MMA tile (M, N, K); (256, 256, k) or (512, 256, k).
+            cluster_shape_mnk: Cluster shape; M must cover the 2-CTA pair.
+            use_2cta_instrs: Use 2-CTA tcgen05 MMAs; required by the supported tiles.
+            group_hint: Scheduling group size, normally the resident cluster count.
+            token_padding_block: Row padding of the activation and intermediate tensors.
+            sf_padding_block: Row padding of the swizzled scale-factor tensors.
+            schedule_mode: Tile order, ``"grouped"`` or ``"phase_interleave"``.
+            load_balance_mode: Work distribution: ``"static"``, ``"atomic_counter"``
+                or ``"cluster_launch_control"``.
+            static_expert_shape: ``(experts, 2 * I, H)`` known at trace time, or None.
+            force_static_sched: Must be True.
+            clc_bundle_size: Tiles per cluster-launch-control ticket.
+            num_sched_stages: Scheduler pipeline depth; derived when None.
+            acc_dtype: Accumulator dtype.
+            sf_vec_size: Elements per scale factor; 32 for MXFP8.
+            ab_dtype: FP8 operand dtype, E4M3 or E5M2.
+            fallback_cluster_shape_mn: Smaller cluster shape for mixed-CGA launches.
+            preferred_cluster_count: Clusters of the preferred shape in mixed CGA.
+            fallback_cluster_count: Clusters of the fallback shape in mixed CGA.
+            fc2_in_kernel_topk_reduce: Reduce top-k contributions inside FC2.
+            token_back_by_dispatch: Return tokens through the dispatch warps.
+            epi_flag_batch: Epilogue flag batching (FC1, FC2).
+            gate_up_clamp: SwiGLU gate/up clamp; not valid with SiTU.
+            situ_beta: SiTU ``beta``; positive, with ``act_func="situ"``.
+            situ_linear_beta: SiTU ``linear_beta``; positive, with ``act_func="situ"``.
+            apply_topk_in_fc1: Scale FC1 outputs by ``topk_scores``.
+            generate_c: Also write the BF16 FC1 output to ``fc1_c``.
+            use_stg_fc1: Store the FC1 intermediate with STG instead of TMA.
+            act_func: ``"swiglu"`` or ``"situ"``.
+            combine_format: Quantized combine output format, or None for BF16.
+            fc2_use_bulk: Store FC2 outputs with bulk copies.
+            fc2_sf_blocked: Use the blocked FC2 scale-factor layout.
+            one_shot_sched: Derive every tile from the block index.
+            fc2_tma_stages: FC2 store stages; derived when None.
+            use_pdl: Programmatic dependent launch; the done counter then resets
+                itself (``FC1_DONE_FC2_PASS_UNIT``).
+            weight_storage_mode: ``"contiguous"`` weights or ``"discrete"`` per-expert pointers.
+        """
         if not force_static_sched:
             raise NotImplementedError(
                 "v1 only implements force_static_sched=True (8-warp layout: 4 epilogue + "
@@ -244,28 +302,20 @@ class Sm107Mxfp8GluFc12Kernel:
                 "'swiglu' and 'situ' are currently supported."
             )
 
-        # Supported (M,N) / 2-CTA geometries; the (128,64) tile relies on the SFB N round-up path.
+        # Supported (M,N) / 2-CTA geometries. Single-CTA (128,n) tiles are rejected: their
+        # epilogue scratch holds cta_tile_n // 64 stages while the four epilogue warps each
+        # write a stage, so those tiles would write past it.
         m, n, _k = mma_tiler_mnk
         _geom = ((m, n), bool(use_2cta_instrs))
         if _geom not in (
             ((256, 256), True),
             ((512, 256), True),
-            ((128, 128), False),
-            ((128, 64), False),
         ):
             raise ValueError(
                 "Sm107Mxfp8GluFc12Kernel supports mma_tiler (256,256)/(512,256) "
-                "with use_2cta_instrs=True or (128,128)/(128,64) with "
-                f"use_2cta_instrs=False; got {mma_tiler_mnk}, "
+                f"with use_2cta_instrs=True; got {mma_tiler_mnk}, "
                 f"use_2cta_instrs={use_2cta_instrs}."
             )
-        if m == 128:
-            if tuple(cluster_shape_mnk[:2]) != (1, 1):
-                raise ValueError(
-                    f"mma_tiler (128,n) requires cluster_shape (1,1); got {cluster_shape_mnk}."
-                )
-            if mma_tiler_mnk[2] != 128:
-                raise ValueError(f"mma_tiler (128,n) requires K tile 128; got {mma_tiler_mnk[2]}.")
 
         # Store ab_dtype so workspace-size helpers can use it without tensors.
         self.ab_dtype = ab_dtype
@@ -1103,7 +1153,7 @@ class Sm107Mxfp8GluFc12Kernel:
         if load_balance_counter_bytes:
             scratch_bytes = (scratch_bytes + 15) // 16 * 16 + load_balance_counter_bytes
 
-        # Keep the legacy scratch layout unchanged, then append aligned TensorMaps.
+        # Scratch regions first, then the aligned TensorMaps.
         alignment = discrete_weight_descriptor_workspace_alignment()
         scratch_bytes = ((scratch_bytes + alignment - 1) // alignment) * alignment
         if self.weight_storage_mode == "contiguous":
@@ -1414,7 +1464,34 @@ class Sm107Mxfp8GluFc12Kernel:
         # registered DeviceWorkspace region directly.
         weight_descriptor_workspace: Optional[cute.Pointer] = None,
     ) -> None:
-        """Launch the fused fc1+fc2 GLU MXFP8 kernel."""
+        """Launch the fused fc1+fc2 GLU MXFP8 kernel.
+
+        Args:
+            activation: MXFP8 input ``(rows_padded, H)``.
+            fc1_weight: FC1 weights ``(experts, H, 2 * I)`` view of ``[2I, H]`` rows with
+                gate and up interleaved in ``GateUpInterleave`` blocks, or a pointer array
+                under discrete weights.
+            activation_sf: E8M0 scales of ``activation`` in the swizzled layout.
+            fc1_weight_sf: E8M0 scales of ``fc1_weight``.
+            fc1_output: MXFP8 intermediate scratch ``(rows_padded, I)``.
+            fc1_output_sf: E8M0 scales of ``fc1_output``.
+            fc2_weight: FC2 weights ``(experts, I, H)`` view of ``[H, I]`` rows.
+            fc2_weight_sf: E8M0 scales of ``fc2_weight``.
+            fc2_output: BF16 output ``(rows_padded, H)``.
+            topk_scores: Float32 per-row scores, read when ``apply_topk_in_fc1``.
+            fc1_done_counter: Int32 per-band arrival counts, at least
+                ``fc1_done_counter_slots(rows, experts)`` slots; must be zero on entry
+                unless ``use_pdl``.
+            offs: Int32 cumulative end row of each expert (``offs[-1]`` is the token count).
+            max_active_clusters: Resident cluster count the grid is sized for.
+            stream: CUDA stream.
+            host_token_rows: Host-known row count for the CLC ticket grid and
+                ``one_shot_sched``.
+
+        The remaining arguments serve options TensorRT-LLM leaves at their defaults
+        (global scales, the atomic-counter workspace, token communication, quantized
+        combine and discrete weights) and stay None.
+        """
 
         if cutlass.const_expr(
             self.weight_storage_mode == "discrete" and weight_descriptor_workspace is None

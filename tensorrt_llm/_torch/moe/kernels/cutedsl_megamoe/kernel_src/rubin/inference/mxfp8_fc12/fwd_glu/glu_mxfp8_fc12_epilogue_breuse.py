@@ -3,6 +3,10 @@
 """B-reuse variant of the fused FC1 / FC2 epilogue: two warpgroups (one per 128-row half), a
 drain-first fc2 and deferred trailing fc1 subtiles shorten the time the single accumulator stage
 is held. The kernel instantiates it for the B-reuse tiler and ``GluMxfp8Epilogue`` otherwise.
+
+TensorRT-LLM-local file, not part of the upstream cutedsl_megamoe export: adapted
+from the upstream training forward GLU kernel
+(``sources/kernel_src/rubin/training/mega/fwd_glu/``). A re-export must carry it forward.
 """
 
 import cutlass

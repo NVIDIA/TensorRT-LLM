@@ -61,27 +61,46 @@ def _to_cute(tensor: torch.Tensor, assumed_align: int = 16) -> cute.Tensor:
     return cute_tensor.mark_layout_dynamic(leading_dim=cutlass_torch.get_leading_dim(tensor))
 
 
-def use_fused_fc12(num_tokens: int, intermediate_size: int) -> bool:
-    """Return whether this call runs the fused FC12 kernel instead of two MXFP8 GEMMs.
+def _fused_fc12_can_be_resident() -> bool:
+    """Return whether every CTA of the fused FC12 kernel can become resident.
 
     The fused kernel is persistent with one CTA per resident cluster, and its
     FC2 tiles wait for FC1 tiles of other CTAs. It stays out of multi-stream
-    execution and CUDA graph capture, where the shared expert can run beside
-    the routed MoE on another stream, and out of runs with expert or dense
-    DWDP, which prefetch the next layers' weights on a copy stream, possibly
-    with SM gather kernels. In all of these not every CTA is guaranteed to
-    become resident.
+    execution, CUDA graph capture and breakable CUDA graphs, where the shared
+    expert can run beside the routed MoE on another stream or warmup and capture
+    must take the same path, and out of runs with expert or dense DWDP, which
+    prefetch the next layers' weights on a copy stream, possibly with SM gather
+    kernels.
     """
     from ..modules.dwdp import fabric_gather
     from ..modules.dwdp.dense.manager import get_global_dense_dwdp_manager
+    from ..pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 
     return (
-        num_tokens * intermediate_size >= _FUSED_FC12_MIN_TOKENS_X_INTERMEDIATE
-        and not do_multi_stream()
+        not do_multi_stream()
         and not torch.cuda.is_current_stream_capturing()
+        and not is_in_breakable_cuda_graph()
         and not fabric_gather.is_enabled()
         and get_global_dense_dwdp_manager() is None
     )
+
+
+def use_fused_fc12(num_tokens: int, intermediate_size: int) -> bool:
+    """Return whether this call runs the fused FC12 kernel instead of two MXFP8 GEMMs."""
+    return (
+        num_tokens * intermediate_size >= _FUSED_FC12_MIN_TOKENS_X_INTERMEDIATE
+        and _fused_fc12_can_be_resident()
+    )
+
+
+def _validate_situ_betas(situ_beta: float, situ_linear_beta: float) -> None:
+    # beta * tanh(x / beta) is even in beta, so a negative "disabled" value would
+    # silently apply a cap; both betas must be set and positive.
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError(
+            f"SiTU betas must be positive, got situ_beta={situ_beta} and "
+            f"situ_linear_beta={situ_linear_beta}."
+        )
 
 
 def _get_aux_tensors(device: torch.device, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -213,8 +232,8 @@ def _get_plan(
     situ_beta: float,
     situ_linear_beta: float,
 ) -> _CompiledPlan:
-    # The persistent grid needs every cluster resident; a reserve set after the
-    # first call (DWDP) must size a new grid instead of reusing this one.
+    # The persistent grid needs every cluster resident; an SM reserve set after
+    # the first call must size a new grid instead of reusing this one.
     key = (
         device.index,
         hidden_size,
@@ -300,16 +319,22 @@ def cute_dsl_mxfp8_shared_expert_rubin(
         situ_linear_beta: SiTU ``linear_beta``.
 
     Returns:
-        BF16 ``[..., H]``; empty for zero tokens. Raises under CUDA graph
-        capture, where ``cute_dsl_mxfp8_gated_mlp_rubin`` runs two GEMMs instead.
+        BF16 ``[..., H]``; empty for zero tokens.
+
+    Raises:
+        RuntimeError: where not every CTA is guaranteed to be resident (see
+            ``_fused_fc12_can_be_resident``); ``cute_dsl_mxfp8_gated_mlp_rubin``
+            runs two GEMMs there.
     """
     num_tokens, hidden_size, intermediate_size = _validate_inputs(
         input, fc1_weight, fc1_weight_scale, fc2_weight, fc2_weight_scale
     )
-    if torch.cuda.is_current_stream_capturing():
+    _validate_situ_betas(situ_beta, situ_linear_beta)
+    if not _fused_fc12_can_be_resident():
         raise RuntimeError(
-            "SM107 MXFP8 fused FC12 cannot run in CUDA graph capture; "
-            "cute_dsl_mxfp8_gated_mlp_rubin runs the two-GEMM path there."
+            "SM107 MXFP8 fused FC12 needs every CTA resident, which multi-stream "
+            "execution, CUDA graph capture, breakable CUDA graphs and DWDP do not "
+            "guarantee; cute_dsl_mxfp8_gated_mlp_rubin runs the two-GEMM path there."
         )
     if num_tokens == 0:
         return input.new_empty(input.shape, dtype=torch.bfloat16)
@@ -407,14 +432,16 @@ def cute_dsl_mxfp8_gated_mlp_rubin(
     num_tokens, hidden_size, intermediate_size = _validate_inputs(
         input, fc1_weight, fc1_weight_scale, fc2_weight, fc2_weight_scale
     )
+    _validate_situ_betas(situ_beta, situ_linear_beta)
     if num_tokens == 0:
         return input.new_empty(input.shape)
     if allow_fused and use_fused_fc12(num_tokens, intermediate_size):
         if AutoTuner.get().is_tuning_mode:
-            # Smaller steps and CUDA graphs run the two GEMMs; tune them for
-            # every bucket up to this M as well.
+            # Smaller steps and CUDA graphs run the two GEMMs; tune them as well.
+            # Their tuning stops at _TWO_GEMM_TUNE_MAX_NUM_TOKENS rows, so a
+            # slice of that many rows fills the same tuning cache.
             _unfused_mxfp8_gated_mlp(
-                input,
+                input.reshape(num_tokens, hidden_size)[:_TWO_GEMM_TUNE_MAX_NUM_TOKENS],
                 fc1_weight,
                 fc1_weight_scale,
                 fc2_weight,
