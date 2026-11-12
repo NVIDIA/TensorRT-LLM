@@ -141,6 +141,10 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
             for layer in unified.pp_layers
         ]
         assert index_k_bytes == [0, 0, 0, 128] + [0] * NUM_DRAFT
+        # The cache-created event divides each tier quota by a total that includes index-K.
+        assert unified.get_cache_bytes_per_token() == sum(
+            spec.bytes_per_token() for spec in unified.layer_specs
+        ) + sum(index_k_bytes)
 
         # Draft layers: their own lifecycle, the base view in their dtype.
         groups = unified.layer_to_pool_mapping_dict
