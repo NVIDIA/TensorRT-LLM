@@ -474,25 +474,23 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
     def test_sliding_rope_params(self):
         """Sliding attention layers should use default RoPE with theta=10K."""
         model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
-        config = model_config.pretrained_config
 
         # Build a sliding attention to inspect its rope params
         attn = Gemma4Attention(model_config, layer_idx=0, is_sliding=True)
         rope = attn.pos_embd_params.rope
         self.assertEqual(rope.theta, 10_000.0)
         # Full rotation: dim should equal head_dim
-        self.assertEqual(rope.dim, config.head_dim)
+        self.assertEqual(rope.dim, GEMMA4_SMALL_CONFIG["head_dim"])
 
     def test_full_rope_params(self):
         """Full attention layers should use proportional RoPE with theta=1M."""
         model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
-        config = model_config.pretrained_config
 
         attn = Gemma4Attention(model_config, layer_idx=5, is_sliding=False)
         rope = attn.pos_embd_params.rope
         self.assertEqual(rope.theta, 1_000_000.0)
         # Partial rotation: dim = int(global_head_dim * 0.25)
-        expected_dim = int(config.global_head_dim * 0.25)
+        expected_dim = int(GEMMA4_SMALL_CONFIG["global_head_dim"] * 0.25)
         self.assertEqual(rope.dim, expected_dim)
 
     def test_rope_params_include_speculative_headroom(self):
@@ -518,7 +516,6 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
     def test_num_kv_heads_per_layer_type(self):
         """Sliding layers use num_key_value_heads, full use num_global_key_value_heads."""
         model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
-        config = model_config.pretrained_config
 
         for i, layer in enumerate(model_config.pretrained_config.layer_types):
             attn = Gemma4Attention(
@@ -527,9 +524,9 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
                 is_sliding=(layer == "sliding_attention"),
             )
             if layer == "sliding_attention":
-                expected_kv_heads = config.num_key_value_heads
+                expected_kv_heads = GEMMA4_SMALL_CONFIG["num_key_value_heads"]
             else:
-                expected_kv_heads = config.num_global_key_value_heads
+                expected_kv_heads = GEMMA4_SMALL_CONFIG["num_global_key_value_heads"]
             self.assertEqual(
                 attn.num_key_value_heads, expected_kv_heads, f"Layer {i} kv_heads mismatch"
             )
@@ -2977,22 +2974,25 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         queries = []
         keys = []
         values = []
+        layer_specs = _get_gemma4_kv_cache_layer_specs(config)
         for layer_idx in layer_indices:
-            is_sliding = config.layer_types[layer_idx] == "sliding_attention"
-            head_dim = config.head_dim if is_sliding else config.global_head_dim
+            layer_spec = layer_specs[layer_idx]
+            head_dim = layer_spec.head_dim
+            num_heads = layer_spec.num_q_heads
+            num_kv_heads = layer_spec.num_kv_heads
             layers.append(
                 FlashInferAttention(
                     layer_idx=layer_idx,
-                    num_heads=config.num_attention_heads,
+                    num_heads=num_heads,
                     head_dim=head_dim,
-                    num_kv_heads=config.num_key_value_heads,
+                    num_kv_heads=num_kv_heads,
                     flashinfer_backend="trtllm-gen",
                 )
             )
             queries.append(
                 torch.randn(
                     batch_size,
-                    config.num_attention_heads * head_dim,
+                    num_heads * head_dim,
                     dtype=config.torch_dtype,
                     device="cuda",
                 )
@@ -3000,7 +3000,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             keys.append(
                 torch.randn(
                     batch_size,
-                    config.num_key_value_heads * head_dim,
+                    num_kv_heads * head_dim,
                     dtype=config.torch_dtype,
                     device="cuda",
                 )
@@ -3008,7 +3008,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             values.append(
                 torch.randn(
                     batch_size,
-                    config.num_key_value_heads * head_dim,
+                    num_kv_heads * head_dim,
                     dtype=config.torch_dtype,
                     device="cuda",
                 )
@@ -3329,19 +3329,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         device = torch.device("cuda")
 
         layers_info = []
-        for layer_idx in range(num_layers):
-            is_sliding = layer_types[layer_idx] == "sliding_attention"
-            hd = (
-                config.head_dim
-                if is_sliding
-                else getattr(config, "global_head_dim", config.head_dim)
-            )
+        for layer_idx, layer_spec in enumerate(_get_gemma4_kv_cache_layer_specs(config)):
             layers_info.append(
                 {
                     "layer_idx": layer_idx,
-                    "head_dim": hd,
-                    "num_kv_heads": config.num_key_value_heads,
-                    "num_heads": config.num_attention_heads,
+                    "head_dim": layer_spec.head_dim,
+                    "num_kv_heads": layer_spec.num_kv_heads,
+                    "num_heads": layer_spec.num_q_heads,
                 }
             )
 
@@ -3501,19 +3495,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         device = torch.device("cuda")
 
         layers_info = []
-        for layer_idx in range(num_layers):
-            is_sliding = layer_types[layer_idx] == "sliding_attention"
-            hd = (
-                config.head_dim
-                if is_sliding
-                else getattr(config, "global_head_dim", config.head_dim)
-            )
+        for layer_idx, layer_spec in enumerate(_get_gemma4_kv_cache_layer_specs(config)):
             layers_info.append(
                 {
                     "layer_idx": layer_idx,
-                    "head_dim": hd,
-                    "num_kv_heads": config.num_key_value_heads,
-                    "num_heads": config.num_attention_heads,
+                    "head_dim": layer_spec.head_dim,
+                    "num_kv_heads": layer_spec.num_kv_heads,
+                    "num_heads": layer_spec.num_q_heads,
                 }
             )
 
@@ -3672,19 +3660,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         device = torch.device("cuda")
 
         layers_info = []
-        for layer_idx in range(num_layers):
-            is_sliding = layer_types[layer_idx] == "sliding_attention"
-            hd = (
-                config.head_dim
-                if is_sliding
-                else getattr(config, "global_head_dim", config.head_dim)
-            )
+        for layer_idx, layer_spec in enumerate(_get_gemma4_kv_cache_layer_specs(config)):
             layers_info.append(
                 {
                     "layer_idx": layer_idx,
-                    "head_dim": hd,
-                    "num_kv_heads": config.num_key_value_heads,
-                    "num_heads": config.num_attention_heads,
+                    "head_dim": layer_spec.head_dim,
+                    "num_kv_heads": layer_spec.num_kv_heads,
+                    "num_heads": layer_spec.num_q_heads,
                 }
             )
 
@@ -3847,33 +3829,15 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         num_layers = config.num_hidden_layers
         dtype = config.torch_dtype
         device = torch.device("cuda")
-        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
 
         layers_info = []
-        for layer_idx in range(num_layers):
-            is_sliding = layer_types[layer_idx] == "sliding_attention"
-            hd = (
-                config.head_dim
-                if is_sliding
-                else getattr(config, "global_head_dim", config.head_dim)
-            )
-            # Match Gemma4Attention K=V logic for kv_heads
-            use_k_eq_v = attention_k_eq_v and not is_sliding
-            if is_sliding:
-                kv_h = config.num_key_value_heads
-            elif use_k_eq_v:
-                kv_h = (
-                    getattr(config, "num_global_key_value_heads", None)
-                    or config.num_key_value_heads
-                )
-            else:
-                kv_h = config.num_key_value_heads
+        for layer_idx, layer_spec in enumerate(_get_gemma4_kv_cache_layer_specs(config)):
             layers_info.append(
                 {
                     "layer_idx": layer_idx,
-                    "head_dim": hd,
-                    "num_kv_heads": kv_h,
-                    "num_heads": config.num_attention_heads,
+                    "head_dim": layer_spec.head_dim,
+                    "num_kv_heads": layer_spec.num_kv_heads,
+                    "num_heads": layer_spec.num_q_heads,
                 }
             )
 
@@ -4059,36 +4023,18 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             if buf is not None:
                 torch.nn.init.normal_(buf)
 
-        layer_types = config.layer_types
         num_layers = config.num_hidden_layers
         dtype = config.torch_dtype
         device = torch.device("cuda")
-        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
 
         layers_info = []
-        for layer_idx in range(num_layers):
-            is_sliding = layer_types[layer_idx] == "sliding_attention"
-            hd = (
-                config.head_dim
-                if is_sliding
-                else getattr(config, "global_head_dim", config.head_dim)
-            )
-            use_k_eq_v = attention_k_eq_v and not is_sliding
-            if is_sliding:
-                kv_h = config.num_key_value_heads
-            elif use_k_eq_v:
-                kv_h = (
-                    getattr(config, "num_global_key_value_heads", None)
-                    or config.num_key_value_heads
-                )
-            else:
-                kv_h = config.num_key_value_heads
+        for layer_idx, layer_spec in enumerate(_get_gemma4_kv_cache_layer_specs(config)):
             layers_info.append(
                 {
                     "layer_idx": layer_idx,
-                    "head_dim": hd,
-                    "num_kv_heads": kv_h,
-                    "num_heads": config.num_attention_heads,
+                    "head_dim": layer_spec.head_dim,
+                    "num_kv_heads": layer_spec.num_kv_heads,
+                    "num_heads": layer_spec.num_q_heads,
                 }
             )
 
