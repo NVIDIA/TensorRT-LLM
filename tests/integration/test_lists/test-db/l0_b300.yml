@@ -160,6 +160,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/beam/_components/moe_router TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout_nvfp4.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_batching.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/attention TIMEOUT (30)
   - unittest/_torch/modeling_v2/gemm TIMEOUT (30)
   - unittest/_torch/modeling_v2/graph TIMEOUT (30)

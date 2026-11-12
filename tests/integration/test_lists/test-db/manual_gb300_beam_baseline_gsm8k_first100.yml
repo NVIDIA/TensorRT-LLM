@@ -1,0 +1,18 @@
+version: 0.0.1
+# Manual qualification until this extracted baseline is timed on the matching build.
+manual_gb300_beam_baseline_gsm8k_first100:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: manual
+      backend: pytorch
+  tests:
+  - accuracy/modeling_v2/beam/full_model_nvfp4__sm_103__tp4/test_accuracy.py::TestModelingV2BeamFullModelNvfp4Sm103Tp4::test_gsm8k_first100 TIMEOUT (45)

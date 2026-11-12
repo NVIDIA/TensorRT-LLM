@@ -61,7 +61,6 @@ __extra_import_path__ = [".", "../..", "../../../.."]
 import _beam_component_support as support  # noqa: E402
 import _router_cases as cases  # noqa: E402
 from _beam_component_support import tensor_sha256  # noqa: E402
-from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402
 
 from _components.moe_router.router import NORM_EPS, BeamMoeRouterBf16Sm103Tp1  # noqa: E501
@@ -145,7 +144,9 @@ def _environment() -> dict:
         "slurm_step_id": os.environ.get("SLURM_STEP_ID"),
         "execution": dict(EXECUTION),
         "ambient_math": {
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
             "cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
+            "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
         },
         "source_captures": os.environ.get("BEAM_MOE_ROUTER_SOURCE_CAPTURES"),
     }
@@ -290,9 +291,10 @@ class TorchCallTrace(TorchFunctionMode):
         kwargs = kwargs or {}
         name = resolve_name(func) or getattr(func, "__qualname__", None) or repr(func)
         entry = {"func": name}
-        if func is torch.ops.trtllm.cublas_mm:
+        if name == "torch.nn.functional.linear":
             entry["math"] = {
                 "cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
+                "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
                 "autocast_cuda": torch.is_autocast_enabled("cuda"),
             }
             entry["operand_dtypes"] = [str(t.dtype) for t in _tensors_of(args)]
@@ -324,10 +326,9 @@ def routed(router: BeamMoeRouterBf16Sm103Tp1, hidden: torch.Tensor) -> tuple:
 
 
 def reference_route(router: BeamMoeRouterBf16Sm103Tp1, hidden: torch.Tensor) -> dict:
-    with true_fp32_matmul():
-        return beam_grouped_topk_router.reference(
-            hidden, router.weight, router.e_score_correction_bias, **OP_KWARGS
-        )
+    return beam_grouped_topk_router.reference(
+        hidden, router.weight, router.e_score_correction_bias, **OP_KWARGS
+    )
 
 
 def check_output_contract(weights, ids, hidden) -> list:
@@ -558,34 +559,35 @@ def test_forward_rejects_invalid_input(case, error, match) -> None:
 def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
     """Projection, sigmoid, selection scores, group scores and normalization are fp32, the
     projection is IEEE fp32 even when the caller has TF32 or bf16 autocast on, and the
-    caller's global precision policy remains unchanged."""
+    caller's settings are restored afterwards."""
     weight, bias, hidden = cases.matrix_case(17, 17)
     router = loaded_router(weight, bias)
     hidden = hidden.cuda()
     plain_weights, plain_ids, plain = routed(router, hidden)
 
-    saved = torch.backends.cuda.matmul.fp32_precision
+    saved = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cuda.matmul.fp32_precision)
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.matmul.fp32_precision = "tf32"
     try:
-        ambient = torch.backends.cuda.matmul.fp32_precision
+        ambient = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cuda.matmul.fp32_precision)
         with torch.autocast("cuda", dtype=torch.bfloat16), TorchCallTrace() as trace:
             weights, ids, route = routed(router, hidden)
-        after = torch.backends.cuda.matmul.fp32_precision
+        after = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cuda.matmul.fp32_precision)
     finally:
-        torch.backends.cuda.matmul.fp32_precision = saved
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cuda.matmul.fp32_precision = saved
 
     # TF32 operands are ~1e-3 off; an IEEE fp32 product of these operands is ~1e-6 off fp64.
     fp64_logits = hidden.double() @ router.weight.double().t()
     fp64_error = float((route["logits"].double() - fp64_logits).abs().max())
-    projection = [c for c in trace.calls if c["func"] == "trtllm.cublas_mm"]
+    linear = [c for c in trace.calls if c["func"] == "torch.nn.functional.linear"]
     dtypes = {name: str(t.dtype) for name, t in route.items()}
     _write_evidence(
         "precision",
         {
             "test": "test_precision_path_is_fp32_without_tf32_or_autocast",
-            "ambient_during_call": {"fp32_precision": ambient, "autocast_bf16": True},
-            "ambient_after_call": after,
-            "projection_calls": projection,
+            "ambient_during_call": {"tf32": list(ambient), "autocast_bf16": True},
+            "ambient_after_call": list(after),
+            "projection_calls": linear,
             "route_dtypes": dtypes,
             "logits_vs_fp64_max_abs": fp64_error,
             "bitwise_equal_to_plain_call": {k: torch.equal(route[k], plain[k]) for k in route},
@@ -593,14 +595,15 @@ def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
             "environment": _environment(),
         },
     )
-    assert ambient == after == "tf32", (ambient, after)
-    assert len(projection) == 1, projection
-    assert projection[0]["math"] == {
-        "cuda_matmul_fp32_precision": "tf32",
+    assert ambient == (True, "tf32") and after == (True, "tf32"), (ambient, after)
+    assert len(linear) == 1, linear
+    assert linear[0]["math"] == {
+        "cuda_matmul_fp32_precision": "ieee",
+        "cuda_matmul_allow_tf32": False,
         "autocast_cuda": False,
-    }, projection[0]
-    assert projection[0]["operand_dtypes"] == ["torch.float32", "torch.float32"], projection[0]
-    assert projection[0]["outputs"][0][1] == "torch.float32"
+    }, linear[0]
+    assert linear[0]["operand_dtypes"] == ["torch.float32", "torch.float32"], linear[0]
+    assert linear[0]["outputs"][0][1] == "torch.float32"
     for name in ("logits", "scores", "selection_scores", "group_scores", "weights"):
         assert dtypes[name] == "torch.float32", (name, dtypes[name])
     assert dtypes["masked_selection_scores"] == "torch.float32"
@@ -653,7 +656,7 @@ def test_matrix(seed, tokens) -> None:
     ]
     called = {c["func"] for c in trace.calls}
     routing_calls = {
-        "trtllm.cublas_mm",
+        "torch.nn.functional.linear",
         "torch.Tensor.sigmoid",
         "torch.Tensor.topk",
         "torch.Tensor.scatter_",

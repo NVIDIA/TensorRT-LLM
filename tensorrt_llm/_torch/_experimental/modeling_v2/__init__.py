@@ -15,7 +15,7 @@ Entry is a single LLM API argument::
     LLM(model, modeling_v2="require")
 
 ``off`` is byte-for-byte the built-in behaviour: the resolver returns
-immediately and nothing in this package is imported. ``auto`` (the default)
+immediately and no routing module or target is imported. ``auto`` (the default)
 uses a target when one claims the configuration and falls back to the built-in
 implementation otherwise. A target decorated ``@disable_v2_by_default`` is used
 only when the caller sets ``modeling_v2`` itself. ``require`` raises instead of
@@ -25,6 +25,11 @@ This package sits *beside* ``_torch/models/`` rather than inside it. Targets
 are not registered in the model zoo at all: ``route`` returns the class and the
 loader builds it, so nothing here competes for an architecture slot and the
 zoo's static index never has to know these classes exist.
+
+A target served by plain ``trtllm-serve`` or ``LLM()`` names its checkpoint
+format, tokenizer and reasoning parser through the shared registries
+(``_torch/models/checkpoints``, ``tokenizer`` / ``custom_tokenizer`` import
+paths and ``llmapi/reasoning_parser.py``), like any other model.
 """
 
 from ._router_index import (
