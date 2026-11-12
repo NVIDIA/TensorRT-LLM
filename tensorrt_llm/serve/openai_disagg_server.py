@@ -218,6 +218,16 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
 
 
 class OpenAIDisaggServer:
+    """OpenAI- and Anthropic-compatible frontend of disaggregated serving.
+
+    Extension surface used outside this repository (NeMo-RL subclasses this
+    class): the constructor (config, req_timeout_secs=...,
+    coordinator_url=None) with self.app built and every route registered when
+    it returns; __call__(host, port, sockets=None); _wrap_entry_point;
+    _handle_exception; and _perf_metrics_collector.http_exceptions. Agree a
+    change to any of them with the NeMo-RL owners first; the contract test is
+    tests/unittest/disaggregated/test_disagg_server_contract.py.
+    """
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
