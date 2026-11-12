@@ -1795,7 +1795,7 @@ def test_host_init_failure_propagates_with_disk_tier(tmp_path) -> None:
 @pytest.mark.cpu_only
 def test_cold_codec_provider_receives_draft_role() -> None:
     impl = Mock()
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     codec_provider.create_cold_page_codec.return_value = object()
     _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20),
@@ -1819,7 +1819,7 @@ def test_cold_codec_provider_receives_draft_role() -> None:
 def test_cold_codec_provider_receives_layer_spec_dtype(
     manager_dtype: DataType, layer_dtype: DataType
 ) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     layer = KVCacheLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
@@ -1844,7 +1844,7 @@ def test_cold_codec_provider_receives_layer_spec_dtype(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("manager_dtype", [DataType.HALF, DataType.BF16])
 def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataType) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20),
         [Mock()],
@@ -1863,7 +1863,7 @@ def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataTy
 def test_cold_codec_provider_rejects_mixed_layer_spec_dtypes(
     layer_dtypes: tuple[DataType, DataType],
 ) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     layer_specs = [
         KVCacheLayerSpec(
             global_layer_id=layer_id,
