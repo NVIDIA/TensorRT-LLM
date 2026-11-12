@@ -3521,12 +3521,14 @@ def _score_and_select(
     hi: int,
     context_rows: bool,
     out,
+    order=None,
 ) -> None:
     """Score rows `[lo, hi)` against `index_cache` and select them into `out` (`_selection`),
     in equal chunks of at most `_score_chunk_rows` (whole query tiles): a row's scores and
     selection read only its query, position and request, so the chunks select what one call
     would; below the bound the rows are one call. Equal chunks keep the last one past the
-    index scores' decode-row limit, whose launch rounds the scores differently."""
+    index scores' decode-row limit, whose launch rounds the scores differently. `order`: the
+    step's `_RowOrder` over rows `[lo, hi)`, read when they are one call."""
     bound = _score_chunk_rows(core, block_table, tokens_per_block)
     pieces = max(1, -(-(hi - lo) // bound))
     chunk = -(-(hi - lo) // pieces)
@@ -3554,6 +3556,7 @@ def _score_and_select(
             row_starts[a:b],
             out[a - lo : b - lo],
             context=context_rows,
+            order=order if pieces == 1 else None,
         )
 
 
@@ -4106,6 +4109,8 @@ class _PrefillStep(NamedTuple):
     qsa_rows: tuple | None = None
     # `_selection_cuts`, or None for equal row counts.
     sel_cuts: tuple | None = None
+    # The generation rows' `_RowOrder`, shared by the step's sparse layers.
+    gen_order: _RowOrder | None = None
 
 
 class PrefillTarget:
@@ -4518,7 +4523,7 @@ class PrefillTarget:
                 device=proj.device,
             )
 
-            def score_and_select(lo, hi, context_rows, out):
+            def score_and_select(lo, hi, context_rows, out, order=None):
                 _score_and_select(
                     core,
                     core._bound.pools.index_cache[i],
@@ -4535,6 +4540,7 @@ class PrefillTarget:
                     hi,
                     context_rows,
                     out,
+                    order,
                 )
 
             for lo, hi, context_rows in parts:
@@ -4549,7 +4555,8 @@ class PrefillTarget:
                         step.sel_cuts if lo == 0 and hi == num_ctx else None,
                     )
                 else:
-                    score_and_select(lo, hi, context_rows, selected[lo:hi])
+                    order = None if context_rows else step.gen_order
+                    score_and_select(lo, hi, context_rows, selected[lo:hi], order)
             # The row-tile pass reads q in place; the other kernels need a compact copy.
             launches = []
             for lo, hi, context_rows in parts:
@@ -5221,6 +5228,7 @@ class PrefillTarget:
             split=self._split_of(mm, num_prefills, num_decodes, hi_p, num_tokens),
             qsa_rows=qsa_rows,
             sel_cuts=sel_cuts,
+            gen_order=_RowOrder(),
         )
 
     def _qsa_padded_rows(self, md, coords, num_tokens: int, physical_tokens: int) -> tuple:
