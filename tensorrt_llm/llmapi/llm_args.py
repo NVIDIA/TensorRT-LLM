@@ -1954,12 +1954,6 @@ class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         return assignments
 
 
-# HALO-R stores a receiver's helper slot index in two bits.
-_HALO_R_MAX_HELPER_SLOTS = 4
-# Each overloaded rank offers its 4 hottest experts to the HALO-R planner.
-_HALO_R_MIN_HOME_EXPERTS = 4
-# One HALO-R planner warp covers up to 32 EP ranks; the CUDA scheduler needs an even EP size.
-_HALO_R_MAX_EP = 32
 # The HALO-R scheduler plans on CTA 0 and maps routes on the others.
 _HALO_R_MIN_AUXILIARY_SMS = 2
 # HALO-R's relay copy runs on the auxiliary SMs, one CTA each, so they bound its copy bandwidth.
@@ -1968,48 +1962,6 @@ _HALO_R_MAX_AUXILIARY_SMS = 16
 _HALO_R_DEFAULT_AUXILIARY_SMS = _HALO_R_MAX_AUXILIARY_SMS
 # HALO-Q's in-switch TMA copy runs on at most 8 SMs.
 _HALO_Q_MAX_AUXILIARY_SMS = 8
-
-_PER_LAYER_DYNAMIC_EPLB = "tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb"
-
-
-@dataclass(frozen=True)
-class _PerLayerDynamicPlanner:
-    """What one per-layer dynamic EPLB replica planner supports.
-
-    ``_PER_LAYER_DYNAMIC_PLANNERS`` is the one place that maps a ``planner``
-    value to its scheduler group and capabilities; the load balancer, its
-    layers and the ``TorchLlmArgs`` validator read it.
-
-    Attributes:
-        group_builder: ``module:function`` that builds one layer's scheduler
-            group from its manager's resources.
-        helper_multicast: Whether its copy stores through NVLink multicast
-            objects bound to the helper sets.
-        breakable_prefill_cuda_graphs: Whether breakable prefill CUDA graphs
-            can capture its layer calls.
-    """
-
-    group_builder: str
-    helper_multicast: bool
-    breakable_prefill_cuda_graphs: bool
-
-
-_PER_LAYER_DYNAMIC_PLANNERS: Dict[str, _PerLayerDynamicPlanner] = {
-    "halo_q":
-    _PerLayerDynamicPlanner(
-        group_builder=
-        f"{_PER_LAYER_DYNAMIC_EPLB}.planner:build_rebalance_slot_scheduler_group",
-        helper_multicast=True,
-        breakable_prefill_cuda_graphs=False,
-    ),
-    "halo_r":
-    _PerLayerDynamicPlanner(
-        group_builder=
-        f"{_PER_LAYER_DYNAMIC_EPLB}.halo_r_planner:build_halo_r_slot_scheduler_group",
-        helper_multicast=False,
-        breakable_prefill_cuda_graphs=True,
-    ),
-}
 
 
 class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
@@ -2082,25 +2034,14 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
             raise ValueError(
                 f"`num_slots` ({self.num_slots}) must exceed `num_experts` "
                 f"({num_experts}) for per-layer dynamic EPLB.")
-        if self.planner != "halo_r":
-            return
-        helper_slots = (self.num_slots - num_experts) // self._ep_size
-        if helper_slots > _HALO_R_MAX_HELPER_SLOTS:
-            raise ValueError(
-                f"`planner: halo_r` supports at most {_HALO_R_MAX_HELPER_SLOTS} "
-                f"helper slots per rank; `num_slots` ({self.num_slots}) gives "
-                f"{helper_slots} for {num_experts} experts on {self._ep_size} "
-                "EP ranks.")
-        if self._ep_size % 2 or not 2 <= self._ep_size <= _HALO_R_MAX_EP:
-            raise ValueError(
-                f"`planner: halo_r` supports an even EP size from 2 to "
-                f"{_HALO_R_MAX_EP}; got {self._ep_size}.")
-        if num_experts // self._ep_size < _HALO_R_MIN_HOME_EXPERTS:
-            raise ValueError(
-                f"`planner: halo_r` needs at least {_HALO_R_MIN_HOME_EXPERTS} "
-                f"experts per EP rank; {num_experts} experts on "
-                f"{self._ep_size} EP ranks give "
-                f"{num_experts // self._ep_size}.")
+        from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.registry import \
+            PER_LAYER_DYNAMIC_PLANNERS
+        validate_config = PER_LAYER_DYNAMIC_PLANNERS[
+            self.planner].validate_config
+        if validate_config is not None:
+            validate_config(num_slots=self.num_slots,
+                            num_experts=num_experts,
+                            ep_size=self._ep_size)
 
 
 MoeLoadBalancerConfigType = Annotated[
@@ -8382,15 +8323,21 @@ class TorchLlmArgs(BaseLlmArgs):
         if getattr(load_balancer, "mode", None) != "per_layer_dynamic":
             return self
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
-            planner = _PER_LAYER_DYNAMIC_PLANNERS[getattr(
+            from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.registry import \
+                PER_LAYER_DYNAMIC_PLANNERS
+            planner = PER_LAYER_DYNAMIC_PLANNERS[getattr(
                 load_balancer, "planner", "halo_q")]
             capturable = (planner.breakable_prefill_cuda_graphs
                           and self.prefill_cuda_graph_backend
                           == PrefillCudaGraphBackend.BREAKABLE)
             if not capturable:
+                capturable_planners = " or ".join(
+                    f"planner='{name}'"
+                    for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()
+                    if spec.breakable_prefill_cuda_graphs)
                 raise ValueError(
                     "per-layer dynamic EPLB does not support prefill CUDA "
-                    "graphs except with planner='halo_r' and "
+                    f"graphs except with {capturable_planners} and "
                     "prefill_cuda_graph_backend='breakable'")
         if self.cuda_graph_config is not None:
             logger.warning("per-layer dynamic EPLB does not support decode "

@@ -935,7 +935,11 @@ set wrong has a test that catches it:
   layout and the `CudaPhysicalSlotScheduler` buffers. Its group subclasses
   `RebalanceSlotSchedulerGroup`, so generations, the route hold, the deferred
   route wait, the lent routes, the lease and `SchedulerSpinBound` are HALO-Q's;
-  `HaloRRelayEndpoint` replaces the TMA endpoint.
+  `HaloRRelayEndpoint` replaces the TMA endpoint. `registry.py` maps each
+  `planner` value to its group builder and capabilities
+  (`PER_LAYER_DYNAMIC_PLANNERS`); the manager reads it, and `llm_args`
+  keeps the `planner` `Literal` and the `auxiliary_sms` bounds and imports
+  the map lazily.
   HALO-R's helper sets get no multicast object (`helper_multicast=False` on
   `SharedSlotArenaProvider`): the relay writes peers' helper rows through
   `peer_helper_bases`, and the provider returns the layer's base

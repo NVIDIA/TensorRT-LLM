@@ -58,6 +58,7 @@ __all__ = [
     "HaloRRelayEndpoint",
     "HaloRSlotSchedulerGroup",
     "build_halo_r_slot_scheduler_group",
+    "validate_halo_r_config",
     "validate_halo_r_geometry",
 ]
 
@@ -115,6 +116,33 @@ def validate_halo_r_geometry(
         raise ValueError(
             f"HALO-R runs on auxiliary_sms CTAs, at least {HALO_R_MIN_AUXILIARY_SMS}; "
             f"got {auxiliary_sms}"
+        )
+
+
+def validate_halo_r_config(*, num_slots: int, num_experts: int, ep_size: int) -> None:
+    """Reject a ``planner: halo_r`` config whose slots, experts or EP size HALO-R cannot plan.
+
+    ``MoePerLayerDynamicLoadBalancerConfig.validate_expert_capacity`` calls it
+    once the shared checks have passed.
+    """
+    helper_slots = (num_slots - num_experts) // ep_size
+    if helper_slots > HALO_R_MAX_HELPER_SLOTS:
+        raise ValueError(
+            f"`planner: halo_r` supports at most {HALO_R_MAX_HELPER_SLOTS} "
+            f"helper slots per rank; `num_slots` ({num_slots}) gives "
+            f"{helper_slots} for {num_experts} experts on {ep_size} "
+            "EP ranks."
+        )
+    if ep_size % 2 or not 2 <= ep_size <= HALO_R_MAX_EP:
+        raise ValueError(
+            f"`planner: halo_r` supports an even EP size from 2 to {HALO_R_MAX_EP}; got {ep_size}."
+        )
+    if num_experts // ep_size < HALO_R_SEND_COUNT:
+        raise ValueError(
+            f"`planner: halo_r` needs at least {HALO_R_SEND_COUNT} "
+            f"experts per EP rank; {num_experts} experts on "
+            f"{ep_size} EP ranks give "
+            f"{num_experts // ep_size}."
         )
 
 

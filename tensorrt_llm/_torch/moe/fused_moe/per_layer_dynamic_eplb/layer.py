@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import importlib
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
@@ -246,8 +245,6 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             return
 
         backend_ref = weakref.ref(backend)
-        module_name, _, function_name = self.manager.planner_spec.group_builder.partition(":")
-        build_scheduler_group = getattr(importlib.import_module(module_name), function_name)
 
         if bool(getattr(backend, "tactic_autotune", False)):
             # Synthetic profiling may visit every helper row before a real
@@ -261,7 +258,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
 
         # ``layer_idx`` is the backend's model layer index: shared-slot pools
         # compare producers across ranks by it.
-        scheduler_group = build_scheduler_group(
+        scheduler_group = self.manager.planner_spec.build_group(
             arena=arena,
             manager=self.manager,
             mapping=backend.mapping,

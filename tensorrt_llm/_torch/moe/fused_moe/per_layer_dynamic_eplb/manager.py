@@ -48,13 +48,13 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             raise ValueError(f"unknown helper_slot_mode {helper_slot_mode!r}")
         # Resident helper experts need helper rows that only their layer writes.
         self.helper_residency = helper_slot_mode == "per_layer_resident"
-        from tensorrt_llm.llmapi.llm_args import _PER_LAYER_DYNAMIC_PLANNERS
+        from .registry import PER_LAYER_DYNAMIC_PLANNERS
 
         self.planner = str(getattr(config, "planner", "halo_q"))
-        if self.planner not in _PER_LAYER_DYNAMIC_PLANNERS:
+        if self.planner not in PER_LAYER_DYNAMIC_PLANNERS:
             raise ValueError(f"unknown per-layer dynamic EPLB planner {self.planner!r}")
         # The planner's scheduler group builder and capabilities.
-        self.planner_spec = _PER_LAYER_DYNAMIC_PLANNERS[self.planner]
+        self.planner_spec = PER_LAYER_DYNAMIC_PLANNERS[self.planner]
 
         # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None

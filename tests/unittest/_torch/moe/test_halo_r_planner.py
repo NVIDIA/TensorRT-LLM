@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contract tests of the HALO-R planner reference and its group selection."""
 
+import dataclasses
 import random
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -17,6 +18,9 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
     HALO_R_SEND_COUNT,
     validate_halo_r_geometry,
+)
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.registry import (
+    PER_LAYER_DYNAMIC_PLANNERS,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -197,6 +201,13 @@ def _allocate_arena(layer, monkeypatch, arena) -> _Arena:
     )
 
 
+def _patch_group_builders(monkeypatch, **builders) -> None:
+    """Replace planners' group builders in the registry that a new manager reads."""
+    for name, builder in builders.items():
+        spec = dataclasses.replace(PER_LAYER_DYNAMIC_PLANNERS[name], build_group=builder)
+        monkeypatch.setitem(PER_LAYER_DYNAMIC_PLANNERS, name, spec)
+
+
 class _Backend:
     def __init__(self) -> None:
         self.tactic_autotune = False
@@ -207,15 +218,12 @@ class _Backend:
 
 
 def test_halo_r_planner_builds_the_halo_r_group(monkeypatch) -> None:
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
-
-    manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_r"))
-    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     group = SimpleNamespace(home_experts=4, helper_slots=2)
     halo_r_builder = MagicMock(return_value=group)
     halo_q_builder = MagicMock()
-    monkeypatch.setattr(halo_r_planner, "build_halo_r_slot_scheduler_group", halo_r_builder)
-    monkeypatch.setattr(planner, "build_rebalance_slot_scheduler_group", halo_q_builder)
+    _patch_group_builders(monkeypatch, halo_q=halo_q_builder, halo_r=halo_r_builder)
+    manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_r"))
+    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     arena = _Arena()
     _allocate_arena(layer, monkeypatch, arena)
     backend = _Backend()
@@ -239,16 +247,13 @@ def test_halo_r_planner_builds_the_halo_r_group(monkeypatch) -> None:
 
 
 def test_default_planner_builds_the_halo_q_group(monkeypatch) -> None:
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
-
+    halo_r_builder = MagicMock()
+    halo_q_builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
+    _patch_group_builders(monkeypatch, halo_q=halo_q_builder, halo_r=halo_r_builder)
     config = _Config("halo_q")
     del config.planner
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
-    halo_r_builder = MagicMock()
-    halo_q_builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
-    monkeypatch.setattr(halo_r_planner, "build_halo_r_slot_scheduler_group", halo_r_builder)
-    monkeypatch.setattr(planner, "build_rebalance_slot_scheduler_group", halo_q_builder)
 
     _allocate_arena(layer, monkeypatch, _Arena())
     layer.bind_backend(_Backend())
@@ -260,12 +265,10 @@ def test_default_planner_builds_the_halo_q_group(monkeypatch) -> None:
 
 def test_rebinding_the_backend_forgets_helper_residency(monkeypatch) -> None:
     """Loaders bind the layer again after they rewrite its weights."""
+    group = SimpleNamespace(home_experts=4, helper_slots=2, forget_helper_residency=MagicMock())
+    _patch_group_builders(monkeypatch, halo_r=MagicMock(return_value=group))
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_r"))
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
-    group = SimpleNamespace(home_experts=4, helper_slots=2, forget_helper_residency=MagicMock())
-    monkeypatch.setattr(
-        halo_r_planner, "build_halo_r_slot_scheduler_group", MagicMock(return_value=group)
-    )
     _allocate_arena(layer, monkeypatch, _Arena())
     backend = _Backend()
 
@@ -330,37 +333,44 @@ def test_reference_plan_words_have_the_kernel_layout() -> None:
 
 
 def test_one_capability_map_covers_every_planner() -> None:
-    """The load balancer, its layers and the config validator read one planner map."""
-    import importlib
+    """The load balancer, its layers and the config validators read one planner map."""
     import typing
 
-    from tensorrt_llm.llmapi.llm_args import (
-        _PER_LAYER_DYNAMIC_PLANNERS,
-        MoePerLayerDynamicLoadBalancerConfig,
-    )
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
+    from tensorrt_llm.llmapi.llm_args import MoePerLayerDynamicLoadBalancerConfig
 
     field = MoePerLayerDynamicLoadBalancerConfig.model_fields["planner"]
-    assert set(typing.get_args(field.annotation)) == set(_PER_LAYER_DYNAMIC_PLANNERS)
-    for spec in _PER_LAYER_DYNAMIC_PLANNERS.values():
-        module_name, _, function_name = spec.group_builder.partition(":")
-        assert callable(getattr(importlib.import_module(module_name), function_name))
-    # HALO-Q's copy stores through multicast; only HALO-R can be captured.
-    multicast = {name: spec.helper_multicast for name, spec in _PER_LAYER_DYNAMIC_PLANNERS.items()}
+    assert set(typing.get_args(field.annotation)) == set(PER_LAYER_DYNAMIC_PLANNERS)
+    builders = {name: spec.build_group for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()}
+    assert builders == {
+        "halo_q": planner.build_rebalance_slot_scheduler_group,
+        "halo_r": halo_r_planner.build_halo_r_slot_scheduler_group,
+    }
+    # HALO-Q's copy stores through multicast; only HALO-R can be captured, and
+    # only HALO-R restricts the config's geometry beyond the shared checks.
+    multicast = {name: spec.helper_multicast for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()}
     assert multicast == {"halo_q": True, "halo_r": False}
     capturable = [
         name
-        for name, spec in _PER_LAYER_DYNAMIC_PLANNERS.items()
+        for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()
         if spec.breakable_prefill_cuda_graphs
     ]
     assert capturable == ["halo_r"]
+    config_checks = {
+        name: spec.validate_config for name, spec in PER_LAYER_DYNAMIC_PLANNERS.items()
+    }
+    assert config_checks == {"halo_q": None, "halo_r": halo_r_planner.validate_halo_r_config}
 
 
 def test_real_halo_r_config_builds_the_halo_r_group_through_the_factory(monkeypatch) -> None:
     """The real config, through the model factory, selects HALO-R end to end on the host."""
     from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import maybe_create_moe_load_balancer
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
     from tensorrt_llm.llmapi.llm_args import MoePerLayerDynamicLoadBalancerConfig
 
+    group = SimpleNamespace(home_experts=4, helper_slots=2)
+    halo_r_builder = MagicMock(return_value=group)
+    halo_q_builder = MagicMock()
+    _patch_group_builders(monkeypatch, halo_q=halo_q_builder, halo_r=halo_r_builder)
     config = MoePerLayerDynamicLoadBalancerConfig(
         num_slots=24, planner="halo_r", helper_slot_mode="shared_banks"
     )
@@ -376,11 +386,6 @@ def test_real_halo_r_config_builds_the_halo_r_group_through_the_factory(monkeypa
         assert (manager.planner, manager.auxiliary_sms) == ("halo_r", 16)
         assert not manager.planner_spec.helper_multicast
         layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
-        group = SimpleNamespace(home_experts=4, helper_slots=2)
-        halo_r_builder = MagicMock(return_value=group)
-        halo_q_builder = MagicMock()
-        monkeypatch.setattr(halo_r_planner, "build_halo_r_slot_scheduler_group", halo_r_builder)
-        monkeypatch.setattr(planner, "build_rebalance_slot_scheduler_group", halo_q_builder)
         _allocate_arena(layer, monkeypatch, _Arena())
         layer.bind_backend(_Backend())
         halo_q_builder.assert_not_called()
@@ -389,10 +394,7 @@ def test_real_halo_r_config_builds_the_halo_r_group_through_the_factory(monkeypa
 
 
 def test_config_limits_match_the_planner_module() -> None:
-    """llm_args validates HALO-R configs against the same limits the planner module enforces."""
+    """llm_args bounds HALO-R's ``auxiliary_sms`` by the planner module's minimum."""
     from tensorrt_llm.llmapi import llm_args
 
-    assert llm_args._HALO_R_MAX_HELPER_SLOTS == halo_r_planner.HALO_R_MAX_HELPER_SLOTS
-    assert llm_args._HALO_R_MIN_HOME_EXPERTS == HALO_R_SEND_COUNT
-    assert llm_args._HALO_R_MAX_EP == halo_r_planner.HALO_R_MAX_EP
     assert llm_args._HALO_R_MIN_AUXILIARY_SMS == halo_r_planner.HALO_R_MIN_AUXILIARY_SMS
