@@ -1559,8 +1559,8 @@ repos:
         language: python
         additional_dependencies: [PyYAML]
         pass_filenames: false
-        # Test-directory changes may create/remove paths covered by CODEOWNERS rules.
-        files: ^(\.github/CODEOWNERS|jenkins/L0_MergeRequest\.groovy|jenkins/scripts/cbts/cbts/rules/visual_gen\.py|scripts/check_serve_ci_coverage\.py|scripts/serve_ci_coverage\.yml|tensorrt_llm/serve/|tensorrt_llm/commands/|tests/unittest/serve/|tests/test_common/serve/)
+        # Deleted paths are absent from pre-commit's file selection.
+        always_run: true
     -   id: vendor-sources-check
         name: verify vendored sources are in sync
         entry: python scripts/vendor/manage.py check

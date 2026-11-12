@@ -22,6 +22,10 @@ tests/unittest/scripts/visual_gen/ so that CBTS keeps it for VisualGen-only PRs.
 from __future__ import annotations
 
 import importlib.util
+import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -399,6 +403,67 @@ def _cli_repo(tmp_path: Path, break_codeowners: bool = False) -> Path:
     }
     _write(tmp_path, "data.yml", yaml.safe_dump(data))
     return tmp_path
+
+
+def test_pre_commit_runs_guard_for_deletion_only_change(tmp_path: Path) -> None:
+    repo = _cli_repo(tmp_path / "repo")
+    deleted = "tensorrt_llm/serve/last.py"
+    _write(repo, deleted)
+    _write(repo, "OWNERS", f"/pkg/serve @org/team-a\n/{deleted} @org/team-a\n")
+    data = yaml.safe_load((repo / "data.yml").read_text())
+    data["codeowners"]["managed_prefixes"].append("/tensorrt_llm/serve")
+    _write(repo, "scripts/serve_ci_coverage.yml", yaml.safe_dump(data))
+    _write(repo, "scripts/check_serve_ci_coverage.py", SCRIPT.read_text())
+
+    config = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text())
+    hook = next(
+        hook
+        for source in config["repos"]
+        if source["repo"] == "local"
+        for hook in source["hooks"]
+        if hook["id"] == "serve-ci-coverage"
+    )
+    # Avoid provisioning an environment: keep the shipped selection/invocation
+    # settings, but run the checker with this test's interpreter and PyYAML.
+    hook["language"] = "system"
+    hook.pop("additional_dependencies")
+    hook["entry"] = shlex.join([sys.executable, *shlex.split(hook["entry"])[1:]])
+    config["repos"] = [{"repo": "local", "hooks": [hook]}]
+    _write(repo, ".pre-commit-config.yaml", yaml.safe_dump(config))
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(PRE_COMMIT_HOME=str(tmp_path / "cache"), TMPDIR=str(tmp_path))
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Coverage Hook Test",
+                "-c",
+                "user.email=coverage-hook@example.invalid",
+                *args,
+            ],
+            cwd=repo,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    git("init", "--template=")
+    git("add", ".")
+    git("commit", "-s", "-m", "Create synthetic coverage fixture")
+    git("rm", deleted)
+    assert git("diff", "--cached", "--name-status").strip() == f"D\t{deleted}"
+    result = subprocess.run(
+        [sys.executable, "-m", "pre_commit", "run", "serve-ci-coverage", "--verbose"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"rule `/{deleted}` matches no file" in result.stdout
 
 
 def test_cli_exit_codes_and_check_selection(mod, tmp_path, capfd):
