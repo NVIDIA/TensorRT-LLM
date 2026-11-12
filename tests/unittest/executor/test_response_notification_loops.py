@@ -5,6 +5,7 @@
 import asyncio
 import queue
 import threading
+from contextlib import ExitStack
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -27,12 +28,28 @@ def _select_when_idle(select, idle, timeout=None):
     return select(timeout)
 
 
+def _stop_loop(loop, thread):
+    async def cancel_pending():
+        pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    try:
+        asyncio.run_coroutine_threadsafe(cancel_pending(), loop).result(2)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(2)
+        assert not thread.is_alive()
+        loop.close()
+
+
 @pytest.fixture
 def consumers(request):
     """Real loops, with no timeout timer that could accidentally wake a stuck get."""
     owners = []
     errors = []
-    try:
+    with ExitStack() as cleanup:
         for _ in range(2):
             loop = asyncio.new_event_loop()
             loop.set_debug(request.param)
@@ -41,6 +58,7 @@ def consumers(request):
             loop._selector.select = partial(_select_when_idle, loop._selector.select, idle)
             thread = threading.Thread(target=loop.run_forever, daemon=True)
             thread.start()
+            cleanup.callback(_stop_loop, loop, thread)
 
             async def prepare():
                 result_queue = AsyncQueue()
@@ -72,18 +90,6 @@ def consumers(request):
             assert cleared.wait(2)
             assert owner.idle.wait(2)
         yield owners, errors
-    finally:
-        for owner in owners:
-            owner.result.cancel()
-
-            async def settle():
-                await asyncio.sleep(0)
-
-            asyncio.run_coroutine_threadsafe(settle(), owner.loop).result(2)
-            owner.loop.call_soon_threadsafe(owner.loop.stop)
-            owner.thread.join(2)
-            assert not owner.thread.is_alive()
-            owner.loop.close()
 
 
 def _dispatch(dispatcher, results, responses):
@@ -156,13 +162,9 @@ def test_stopped_request_loop_does_not_strand_other_requests(consumers, dispatch
     assert not results
 
 
-@pytest.mark.parametrize("consumers", [True], indirect=True)
-def test_engine_error_broadcast_wakes_each_request_loop(consumers):
-    owners, errors = consumers
+def _broadcast_crash(queues):
     delivered = threading.Event()
-    results = {
-        index: SimpleNamespace(queue=owner.queue.sync_q) for index, owner in enumerate(owners)
-    }
+    results = {index: SimpleNamespace(queue=q) for index, q in enumerate(queues)}
     helper = AwaitResponseHelper.__new__(AwaitResponseHelper)
     helper.handler_kind = AwaitResponseHelper.HandlerKind.single_process_worker
     helper.worker = SimpleNamespace(
@@ -172,13 +174,37 @@ def test_engine_error_broadcast_wakes_each_request_loop(consumers):
         engine=SimpleNamespace(_event_loop_error_delivered=delivered),
     )
     assert not helper._broadcast_event_loop_error(RuntimeError("engine failed"))
-    for index, owner in enumerate(owners):
+    assert not results
+    return delivered
+
+
+def _closed_sync_queue():
+    loop = asyncio.new_event_loop()
+    try:
+        return _SyncQueue(Mock(), loop)
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize("consumers", [True], indirect=True)
+@pytest.mark.parametrize("closed_first", [False, True])
+def test_engine_error_broadcast_wakes_each_request_loop(consumers, closed_first):
+    owners, errors = consumers
+    queues = [owner.queue.sync_q for owner in owners]
+    if closed_first:
+        queues.insert(0, _closed_sync_queue())
+    delivered = _broadcast_crash(queues)
+    for index, owner in enumerate(owners, start=int(closed_first)):
         response = owner.result.result(timeout=2)
         assert response.client_id == index
         assert "engine failed" in response.error_msg
     assert delivered.is_set()
     assert not errors
-    assert not results
+
+
+def test_engine_error_delivery_gate_stays_clear_without_a_live_loop():
+    delivered = _broadcast_crash([_closed_sync_queue()])
+    assert not delivered.is_set()
 
 
 @pytest.mark.parametrize("dispatcher", ["proxy", "rpc", "worker"])
@@ -193,3 +219,6 @@ def test_shared_loop_notifications_stay_batched(dispatcher):
     results = {index: SimpleNamespace(queue=q.sync_q) for index, q in enumerate(queues)}
     _dispatch(dispatcher, results, responses)
     loop.call_soon_threadsafe.assert_called_once()
+    callback, notified_queues = loop.call_soon_threadsafe.call_args.args
+    assert callback is _SyncQueue._notify_many
+    assert set(notified_queues) == {q.sync_q for q in queues}
