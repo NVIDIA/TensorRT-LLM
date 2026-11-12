@@ -143,6 +143,7 @@ class TestSendKvAsyncReleasesIndexSlot:
         kv_cache_manager.release_index_slot.assert_called_once_with(42)
 
 
+# Not cpu_only: the IndexMapper fixtures pin host buffers, which needs a CUDA device.
 class TestIndexMapperSlotReuse:
     """Test IndexMapper slot recycling after early release."""
 
@@ -306,6 +307,7 @@ class TestIndexMapperSlotReuse:
         assert manager._early_freed_index_requests == {1}
 
 
+# Not cpu_only: same pinned-host-buffer fixtures as above.
 class TestFreeResourcesDoubleReleaseSafety:
     """Test that free_resources handles already-released IndexMapper slots."""
 

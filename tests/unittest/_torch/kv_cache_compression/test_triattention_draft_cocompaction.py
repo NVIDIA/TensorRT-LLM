@@ -72,6 +72,7 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
     execution_stream.wait_event.assert_called_once_with(event)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "gate,match",
     [
@@ -79,7 +80,6 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
         ("union_only_per_head", "eviction_mode='union'"),
     ],
 )
-@pytest.mark.cpu_only
 def test_speculative_admission_gates_raise(gate, match):
     from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
     from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, MTPDecodingConfig
@@ -237,6 +237,7 @@ def test_request_admission_accepts_unaligned_sequence_limit_without_growth():
     manager._compaction_done_event.synchronize.assert_not_called()
 
 
+# Not cpu_only: reads the page-table snapshot back from a device tensor.
 def test_block_offset_snapshot_width_is_aligned_and_capped():
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         _allocate_block_offset_snapshot,

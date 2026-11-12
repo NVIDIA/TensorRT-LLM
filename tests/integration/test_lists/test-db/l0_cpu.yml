@@ -102,6 +102,8 @@ l0_cpu:
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py
   - unittest/_torch/distributed
+  # -m cpu_only selects only the marked tests here; the directory's GPU tests stay on l0_b200.
+  - unittest/_torch/kv_cache_compression
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_exchange.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
@@ -437,5 +439,3 @@ l0_cpu:
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
-  # TRTLLM-15161 CPU migration: files outside the directory entries above.
-  - unittest/_torch/kv_cache_compression/test_triattention_draft_cocompaction.py

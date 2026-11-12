@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for KVCacheManagerV2 rank-aware auto host tier sizing.
 
 The auto-provisioned host tier is computed per rank but drawn from a
