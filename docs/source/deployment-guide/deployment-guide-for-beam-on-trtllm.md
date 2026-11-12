@@ -36,9 +36,12 @@ The named `TestModelingV2BeamFullModelNvfp4Sm103Tp4` gate starts the baseline wi
 `trtllm-serve` and `modeling_v2: require`, then runs the public evaluator's pinned
 first 100 GSM8K questions. It requires at least 95 correct answers and no execution,
 parsing or truncation failures. It uses BF16 KV, no drafter, and one request at a time.
-This is a manual four-GB300 qualification with a 45-minute cap; it is not an L0
-or full-dataset CI test. LR/nightly scheduling requires timing and accuracy
-qualification on a build matching this extracted baseline.
+The four-GB300 gate is listed in QA's scheduled functional suite,
+`tests/integration/test_lists/qa/llm_function_core.txt`, with a 45-minute cap.
+The evaluator has a 40-minute budget, reserving five minutes for cleanup and
+result writing. QA infrastructure controls the daily/release schedule; this
+test is not part of automatic L0 pre-merge or the nightly-release image build.
+It never evaluates the full dataset in CI.
 
 Stage an authorized target below `LLM_MODELS_ROOT`, set
 `TRTLLM_TEST_TARGET_RELATIVE_PATH` to its relative directory, and stage the pinned
@@ -46,9 +49,23 @@ GSM8K files at `$LLM_MODELS_ROOT/datasets/openai/gsm8k` as described in the publ
 evaluator README. Missing inputs fail the selected run. With exactly four GB300s visible:
 
 ```bash
-pytest tests/integration/defs/accuracy/modeling_v2/test_beam.py \
+pytest tests/integration/defs/accuracy/modeling_v2/beam/full_model_nvfp4__sm_103__tp4/test_accuracy.py \
   -k test_gsm8k_first100 --timeout=2700
 ```
+
+To qualify the same gate on a PR build without waiting for the QA schedule, use
+the dedicated stage (subject to CI access and resource approval):
+
+```text
+/bot run --stage-list "GB300-4_GPUs-PyTorch-BeamAccuracy-OnDemand-1"
+```
+
+This stage selects only the named first-100 gate. Its test-db selector uses
+`stage: pre_merge`, but the `OnDemand` stage is excluded from automatic CI
+selection. The CI worker must have the staged inputs and environment variable
+above; selecting the stage does not provision them. Require an actual passing
+test result on the matching build, not a skipped stage or command acknowledgement.
+Selective stage runs do not update the overall GitHub CI check status.
 
 The test writes its server configuration, logs, per-question records and summary
 under pytest's temporary directory. The timeout and incomplete runs are failures,

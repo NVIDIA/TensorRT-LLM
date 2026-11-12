@@ -880,3 +880,4 @@ visual_gen/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_a
 
 # Tiny local Wan/FLUX checkpoints; one CUDA GPU, no pretrained model download.
 unittest/_torch/visual_gen/test_sleep_non_h3.py
+accuracy/modeling_v2/beam/full_model_nvfp4__sm_103__tp4/test_accuracy.py::TestModelingV2BeamFullModelNvfp4Sm103Tp4::test_gsm8k_first100 TIMEOUT (45)
