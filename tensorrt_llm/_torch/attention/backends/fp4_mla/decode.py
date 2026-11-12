@@ -45,7 +45,6 @@ from .metadata import (
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _get_linear_mtp_query_len_per_seq,
-    _infer_assume_full_pages,
     _materialize_fp4_mla_device_page_table_for_forward,
     _max_generation_pages,
 )
@@ -207,25 +206,8 @@ def _run_triton_attention_decode(
 
     assume_full_heads = num_heads % block_h == 0
     assume_full_v = kv_lora_rank % block_v == 0
-    # Match the cutile path: only mark pages "full" when we can prove every
-    # generation sequence has the same number of cached tokens AND
-    # query_len_per_seq == 1 (so the kv_len adjustment is a no-op).
-    assume_full_pages = query_len_per_seq == 1 and _infer_assume_full_pages(
-        metadata, max_pages, metadata.page_size
-    )
-    # Leave validity checks on. Matches cutile's default and is correctness-
-    # safe. The perfect-shape PV fast path (tl.ext.make_view + load_view_tko)
-    # remains gated off — when measured on the TileIR backend (ENABLE_TILE=1)
-    # it was net-slower on the bench, so the cost of enabling it isn't worth
-    # the win on the FP4 MLA shapes we care about.
-    assume_valid_pages = False
-    num_gen_seqs = num_queries // query_len_per_seq
-    if (
-        not assume_valid_pages
-        and assume_full_pages
-        and src_page_ids.numel() == num_gen_seqs * max_pages
-    ):
-        assume_valid_pages = True
+    # Keep KV-length and page-validity masks enabled: device lengths can change
+    # between metadata preparation and decode launch.
     # cutile checks only `make_tensor_descriptor`; on the nvt backend the
     # presence of TMA descriptors implies `tl.ext.make_view` is available too.
     use_tma_data_load = hasattr(triton.language, "make_tensor_descriptor")
@@ -263,7 +245,7 @@ def _run_triton_attention_decode(
     # measured markedly faster at num_warps=4 (e.g. bs256 q_len4: 131->95ms).
     page_stats_num_warps = _env_int("TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS")
     if page_stats_num_warps is None:
-        page_stats_num_warps = 8 if assume_full_pages else 4
+        page_stats_num_warps = 4
     page_stats_launch_meta = {"occupancy": 2, "num_warps": page_stats_num_warps}
     # PV benefits from num_warps=8 across shapes measured.
     pv_num_warps = _env_int("TRTLLM_FP4_MLA_PV_NUM_WARPS") or 8
@@ -353,8 +335,8 @@ def _run_triton_attention_decode(
         USE_TMA_DATA_LOAD=use_tma_data_load,
         PACK_PROBS=pack_prob_in_page_stats,
         ASSUME_FULL_HEADS=assume_full_heads,
-        ASSUME_FULL_PAGES=assume_full_pages,
-        ASSUME_VALID_PAGES=assume_valid_pages,
+        ASSUME_FULL_PAGES=False,
+        ASSUME_VALID_PAGES=False,
         **page_stats_launch_meta,
     )
     # Two-level softmax-stats reduction. The single-level reduce launched only
@@ -475,8 +457,8 @@ def _run_triton_attention_decode(
         MAX_PAGES=max_pages,
         BLOCK_H=block_h,
         ASSUME_FULL_HEADS=assume_full_heads,
-        ASSUME_FULL_PAGES=assume_full_pages,
-        ASSUME_VALID_PAGES=assume_valid_pages,
+        ASSUME_FULL_PAGES=False,
+        ASSUME_VALID_PAGES=False,
         **launch_meta,
     )
     num_dim_blocks = triton.cdiv(kv_lora_rank, block_v)
@@ -585,13 +567,13 @@ def _run_triton_attention_decode(
                 P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
                 BLOCK_H=block_h,
                 BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
+                USE_TMA_P_LOAD=False,
                 USE_TMA_OUT_STORE=use_tma_data_load and assume_full_heads and assume_full_v,
                 PV_LOOP_STAGES=pv_loop_stages,
                 ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
+                ASSUME_FULL_PAGES=False,
                 ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
+                ASSUME_VALID_PAGES=False,
                 PAGE_SPLIT=page_split,
                 PAGES_PER_SPLIT=pages_per_split,
                 PARTIAL_OUT=True,
@@ -637,14 +619,14 @@ def _run_triton_attention_decode(
                 P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
                 BLOCK_H=block_h,
                 BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
+                USE_TMA_P_LOAD=False,
                 USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
                 USE_PREPACKED_V=False,
                 PV_LOOP_STAGES=pv_loop_stages,
                 ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
+                ASSUME_FULL_PAGES=False,
                 ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
+                ASSUME_VALID_PAGES=False,
                 PAGE_SPLIT=page_split,
                 PAGES_PER_SPLIT=pages_per_split,
                 PARTIAL_OUT=True,
@@ -708,13 +690,13 @@ def _run_triton_attention_decode(
                 P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
                 BLOCK_H=block_h,
                 BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
+                USE_TMA_P_LOAD=False,
                 USE_TMA_OUT_STORE=use_tma_data_load and assume_full_heads and assume_full_v,
                 PV_LOOP_STAGES=pv_loop_stages,
                 ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
+                ASSUME_FULL_PAGES=False,
                 ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
+                ASSUME_VALID_PAGES=False,
                 **pv_launch_meta,
             )
         else:
@@ -752,14 +734,14 @@ def _run_triton_attention_decode(
                 P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
                 BLOCK_H=block_h,
                 BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
+                USE_TMA_P_LOAD=False,
                 USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
                 USE_PREPACKED_V=False,
                 PV_LOOP_STAGES=pv_loop_stages,
                 ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
+                ASSUME_FULL_PAGES=False,
                 ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
+                ASSUME_VALID_PAGES=False,
                 **pv_launch_meta,
             )
 

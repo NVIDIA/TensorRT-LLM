@@ -16,7 +16,6 @@ import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_ca
 import tensorrt_llm._torch.attention.backends.fp4_mla.decode as fp4_mla_decode
 import tensorrt_llm._torch.attention.backends.fp4_mla.layout as fp4_mla_layout
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
-import tensorrt_llm._torch.attention.backends.fp4_mla.state as fp4_mla_state
 import tensorrt_llm._torch.attention.backends.fp4_mla.v_cache as fp4_mla_v_cache
 import tensorrt_llm._torch.attention.backends.trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import Fp4MlaFmha
@@ -2984,49 +2983,6 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "kv_lens_advance_on_device", [False, True], ids=["host-lengths", "device-advance"]
-)
-@pytest.mark.parametrize("max_total_draft_tokens", [0, 1])
-def test_fp4_mla_full_pages_follow_host_kv_lengths_of_each_step(
-    monkeypatch: pytest.MonkeyPatch,
-    kv_lens_advance_on_device: bool,
-    max_total_draft_tokens: int,
-) -> None:
-    """Each prepare() decides the full-pages fast path from its own host KV lengths."""
-    # The device page table needs CUDA tensors; this test covers the host lengths only.
-    monkeypatch.setattr(
-        fp4_mla_state, "configure_fp4_mla_device_page_table", lambda metadata, kv_lens: True
-    )
-    state = Fp4MlaState()
-    metadata = SimpleNamespace(
-        fp4_mla_state=state,
-        kv_cache_manager=object(),
-        request_ids=[0],
-        is_cuda_graph=False,
-        num_contexts=0,
-        num_seqs=1,
-        num_tokens=1,
-        kv_lens_advance_on_device=lambda: kv_lens_advance_on_device,
-        max_total_draft_tokens=max_total_draft_tokens,
-        # A meta tensor holds no data: reading the device lengths would raise.
-        kv_lens_cuda_runtime=torch.empty(1, dtype=torch.int32, device="meta"),
-    )
-    kv_lens = torch.tensor([FP4_MLA_TOKENS_PER_BLOCK], dtype=torch.int32)
-    state.prepare(metadata, kv_lens)
-    assert fp4_mla_metadata._infer_assume_full_pages(metadata, 1, FP4_MLA_TOKENS_PER_BLOCK) == (
-        not kv_lens_advance_on_device and not max_total_draft_tokens
-    )
-    state.on_update_kv_lens(metadata)
-    assert not fp4_mla_metadata._infer_assume_full_pages(metadata, 1, FP4_MLA_TOKENS_PER_BLOCK)
-
-    # The next eager step keeps the batch layout with a shorter KV length.
-    kv_lens.fill_(51)
-    state.prepare(metadata, kv_lens)
-    assert not fp4_mla_metadata._infer_assume_full_pages(metadata, 1, FP4_MLA_TOKENS_PER_BLOCK)
-
-
-@pytest.mark.cpu_only
 def test_fp4_mla_triton_prepack_v_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.delenv(FP4_MLA_PREPACK_V_ENV, raising=False)
@@ -3677,8 +3633,9 @@ def test_fp4_mla_v_repack_generation_csr_crosses_page_boundary() -> None:
     ],
 )
 def test_context_mla_staging_floor_is_backend_owned(
-    sparse_algorithm: str | None, has_fp4: bool, expected: int
+    monkeypatch: pytest.MonkeyPatch, sparse_algorithm: str | None, has_fp4: bool, expected: int
 ) -> None:
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 103)
     config = SimpleNamespace(
         quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: has_fp4)),
         pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
@@ -3750,3 +3707,23 @@ def test_fp4_mla_graph_scratch_is_released_with_runner(monkeypatch: pytest.Monke
     runner.clear()
     assert reference() is None
     assert not runner.fp4_mla_decode_buffers.buffers
+
+
+@pytest.mark.cpu_only
+def test_context_mla_staging_floor_reuses_bounded_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = trtllm_backend.TrtllmAttention
+    monkeypatch.setattr(
+        backend,
+        "runtime_workspace_is_chunked_prefill_bounded",
+        classmethod(lambda cls, config: False),
+    )
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+    )
+    features = trtllm_backend.AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=16)
+    assert (
+        backend.runtime_workspace_min_tokens(
+            config, Mapping(), max_num_tokens=16, runtime_features=features
+        )
+        == 0
+    )

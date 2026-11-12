@@ -2248,12 +2248,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if (not is_mla(model_config.pretrained_config)
                 or not runtime_features.chunked_prefill):
             return 0
-        sparse_algorithm = getattr(model_config.sparse_attention_config,
-                                   "algorithm", None)
-        if sparse_algorithm == "csa2":
-            return 0
-        if (sparse_algorithm in ("dsa", "deepseek_v4")
-                and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
+        if not cls.runtime_workspace_is_chunked_prefill_bounded(model_config):
             return 0
         # Mirrors MLA::contextWorkspaceLayout's buffer_batch_size * query_tokens floor
         # and the cached-partition capacity prepared by this backend's metadata.

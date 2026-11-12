@@ -930,12 +930,6 @@ def _host_int_list(value: Any, start: int, end: int) -> Optional[list[int]]:
         return None
 
 
-def _infer_assume_full_pages(metadata: Any, max_pages: int, page_size: int) -> bool:
-    # prepare() provides only host lengths proven stable for this eager step.
-    kv_len = metadata.fp4_mla_state.uniform_generation_kv_len_host
-    return not metadata.is_cuda_graph and kv_len is not None and kv_len == max_pages * page_size
-
-
 def _get_linear_mtp_query_len_per_seq(
     metadata: Any,
     *,

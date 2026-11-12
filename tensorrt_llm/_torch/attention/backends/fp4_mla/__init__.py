@@ -104,7 +104,6 @@ from .metadata import _fp4_mla_uniform_generation_lengths as _fp4_mla_uniform_ge
 from .metadata import _get_linear_mtp_query_len_per_seq as _get_linear_mtp_query_len_per_seq
 from .metadata import _host_int_list as _host_int_list
 from .metadata import _host_int_list_during_forward as _host_int_list_during_forward
-from .metadata import _infer_assume_full_pages as _infer_assume_full_pages
 from .metadata import (
     _materialize_fp4_mla_device_page_table_for_forward as _materialize_fp4_mla_device_page_table_for_forward,
 )
