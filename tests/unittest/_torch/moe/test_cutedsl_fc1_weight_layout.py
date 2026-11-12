@@ -38,6 +38,7 @@ def _raw_fc1(num_experts: int = 1, seed: int = 0) -> torch.Tensor:
     )
 
 
+@pytest.mark.cpu_only
 def test_gate16_helper_matches_megamoe_inline_packing():
     raw = _raw_fc1(num_experts=3)
     ours = interleave_gate_and_linear(raw, group_size=16, dim=1)
@@ -56,6 +57,7 @@ def test_gate16_helper_matches_megamoe_inline_packing():
     assert torch.equal(ours, theirs)
 
 
+@pytest.mark.cpu_only
 def test_gate16_helper_matches_kernel_reference_permutation():
     # The kernel author's host packer starts from the older [up64, gate64]
     # interleave and reorders every 128-row block through the index map
@@ -75,6 +77,7 @@ def test_gate16_helper_matches_kernel_reference_permutation():
     assert torch.equal(interleave_gate_and_linear(raw, group_size=16, dim=0), expected)
 
 
+@pytest.mark.cpu_only
 def test_gate16_helper_is_one_row_permutation_for_weights_and_scales():
     perm = interleave_gate_and_linear(
         torch.arange(FC1_ROWS).view(FC1_ROWS, 1), group_size=16, dim=0
@@ -91,6 +94,7 @@ def test_gate16_helper_is_one_row_permutation_for_weights_and_scales():
     assert torch.equal(interleave_gate_and_linear(scales, group_size=16, dim=0), scales[perm])
 
 
+@pytest.mark.cpu_only
 def test_gate16_helper_dim_argument_is_per_expert():
     raw = _raw_fc1(num_experts=2)
     batched = interleave_gate_and_linear(raw, group_size=16, dim=1)
