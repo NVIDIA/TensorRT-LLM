@@ -1574,8 +1574,8 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         replay = _Replay(old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width)
         if ssm0.dtype == torch.bfloat16 and ssm0.is_cuda:
             # Every CuTe replay kernel a verify step launches, compiled here: a compile costs
-            # 5-10 s, the padded decode graphs skip the request counts an eager step carries,
-            # and the generic warmup skips this cache manager.
+            # about 0.5 s, the padded decode graphs skip the request counts an eager step
+            # carries, and the generic warmup skips this cache manager.
             gdn_replay_precompile(
                 width,
                 self.num_k_heads,

@@ -2270,9 +2270,9 @@ def precompile_keys(
 
 def precompile(t: int, h: int, hv: int, max_requests: int, **launches) -> int:
     """Compile every kernel of `precompile_keys(t, h, hv, max_requests, **launches)`. A compile
-    costs 5-10 s, so a target runs this at bind, before any step: the captured decode graphs do
-    not reach every mapping (padded graphs skip 9 to 15 requests, which an eager mixed step
-    carries). Returns the number of distinct kernels."""
+    costs about 0.5 s on GB300, so a target runs this at bind, before any step: the captured
+    decode graphs do not reach every mapping (padded graphs skip 9 to 15 requests, which an
+    eager mixed step carries). Returns the number of distinct kernels."""
     keys = precompile_keys(t, h, hv, max_requests, **launches)
     for key in keys:
         _compile(key, _Replay(**dict(key)))
@@ -2600,7 +2600,7 @@ class GdnCachedReplayCute(OpWrapper):
 
     note = """
     Source: this file's CuTe DSL kernel (`_Replay`), one compile per (geometry, T, launch
-    mapping, commit, PDL, folds) on first use (5-10 s): the warm-up before CUDA-graph capture
+    mapping, commit, PDL, folds) on first use (about 0.5 s): the warm-up before CUDA-graph capture
     must cover it. Called by `_gdn_verify` over the bf16 recurrent pool (slot stride 36 layers'
     states) when the rank's GDN heads are a `GEOMETRIES` pair, with work items +
     `use_all_layer_commit` exactly when the Triton entry gets them (N >= 16). PDL only at up to
