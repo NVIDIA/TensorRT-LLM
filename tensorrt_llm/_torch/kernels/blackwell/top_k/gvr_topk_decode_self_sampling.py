@@ -572,14 +572,62 @@ def _ld_g_nc_v4_f32(gaddr, *, loc=None, ip=None):
     )
 
 
-def ld_g_f32x4(copy_atom, base_addr, v_idx, frag):
+@dsl_user_op
+def _l2_evict_first_policy(*, loc=None, ip=None):
+    """64-bit L2 cache policy (createpolicy, sm_80+) that makes a load's lines first to evict.
+
+    The fraction is 1.0, so the policy is a constant that ptxas folds into the uniform memory
+    descriptor of the `.L2::cache_hint` loads: it costs no general register."""
+    return cutlass.Int64(
+        mlir_llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_g_nc_v4_f32_hint(gaddr, pol, *, loc=None, ip=None):
+    """`_ld_g_nc_v4_f32` under the L2 cache policy ``pol`` (`ld.global.nc.L2::cache_hint`)."""
+    from cutlass._mlir import ir as _ir
+
+    st = _ir.Type.parse("!llvm.struct<(f32, f32, f32, f32)>")
+    r = mlir_llvm.inline_asm(
+        st,
+        [gaddr.ir_value(loc=loc, ip=ip), pol.ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L2::cache_hint.v4.f32 {$0, $1, $2, $3}, [$4], $5;",
+        "=f,=f,=f,=f,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Float32(mlir_llvm.extractvalue(T.f32(), r, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+def ld_g_f32x4(copy_atom, base_addr, v_idx, frag, pol=None):
     """Load float4 #v_idx (16B units) from gmem byte base into frag[0..3].
 
     base_addr: Int64 byte address; frag: (4,) f32 fragment. Issue ALL batch
     members before consuming any. Pinned-asm form (see _ld_g_nc_v4_f32);
-    copy_atom kept for call-site compatibility.
+    copy_atom kept for call-site compatibility. pol: an L2 cache policy
+    (_l2_evict_first_policy) for the load, or None.
     """
-    v0, v1, v2, v3 = _ld_g_nc_v4_f32(base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16))
+    gaddr = base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16)
+    if pol is None:
+        v0, v1, v2, v3 = _ld_g_nc_v4_f32(gaddr)
+    else:
+        v0, v1, v2, v3 = _ld_g_nc_v4_f32_hint(gaddr, pol)
     frag[0] = v0
     frag[1] = v1
     frag[2] = v2
@@ -1944,6 +1992,23 @@ def _ld_g_nc_v4_b32(gaddr, *, loc=None, ip=None):
     return tuple(cutlass.Uint32(llvm.extractvalue(T.i32(), ret, [i])) for i in range(4))
 
 
+@dsl_user_op
+def _ld_g_nc_v4_b32_hint(gaddr, pol, *, loc=None, ip=None):
+    """`_ld_g_nc_v4_b32` under the L2 cache policy ``pol`` (`ld.global.nc.L2::cache_hint`)."""
+    ret = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [gaddr.ir_value(loc=loc, ip=ip), pol.ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L2::cache_hint.v4.b32 {$0, $1, $2, $3}, [$4], $5;",
+        "=r,=r,=r,=r,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(cutlass.Uint32(llvm.extractvalue(T.i32(), ret, [i])) for i in range(4))
+
+
 def ld_g_bf16x8(copy_atom, base_addr, v_idx, frag):
     """bf16 16-byte vector loader: bf16x8 vector #v_idx (16B units) widened
     into frag[0..7] (f32, exact). Halves the P3 load-instruction count vs the
@@ -1959,15 +2024,20 @@ def ld_g_bf16x8(copy_atom, base_addr, v_idx, frag):
     frag[7] = f32_of_u32(d & cutlass.Uint32(0xFFFF0000))
 
 
-def ld_g_b16x8_pk(copy_atom, base_addr, v_idx, pk):
+def ld_g_b16x8_pk(copy_atom, base_addr, v_idx, pk, pol=None):
     """Load 16-byte vector ``v_idx`` of 16-bit elements (either dtype) as raw packed pairs.
 
     ``base_addr`` is an Int64 global byte address, 16-byte aligned (the row base, or the col0 vector
     in prefill). One ld.global.nc.v4.b32 puts the eight elements in ``pk[0..3]`` as Uint32 pairs
     without widening, so a primed vector holds four registers instead of eight. ``copy_atom`` is
-    unused (call-site parity with ``ld_g_f32x4``).
+    unused (call-site parity with ``ld_g_f32x4``). ``pol`` is an L2 cache policy
+    (``_l2_evict_first_policy``) for the load, or None.
     """
-    a, b, c, d = _ld_g_nc_v4_b32(base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16))
+    gaddr = base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16)
+    if pol is None:
+        a, b, c, d = _ld_g_nc_v4_b32(gaddr)
+    else:
+        a, b, c, d = _ld_g_nc_v4_b32_hint(gaddr, pol)
     pk[0] = a
     pk[1] = b
     pk[2] = c
@@ -2901,10 +2971,13 @@ def _f16_env_samp(
 class GvrMainKernel:
     """gvr_main<BLK, U, MINB, NBS, KPT, SPLIT> — streaming self-sampling GVR.
 
-    The arguments below select the logits dtype and the 16-bit build options; an option is
-    dropped outside the builds it names.
+    The arguments below select the row stream's L2 policy, the logits dtype and the 16-bit
+    build options; an option is dropped outside the builds it names.
 
     Args:
+        l2ef: 16-byte-vector builds (not det or prefill): the P3 row-stream loads mark their
+            lines evict_first in L2, so the row streams of a batch evict their consumed lines
+            before the other rows' sampled lines.
         dtype: Float32, BFloat16 or Float16 logits. 16-bit builds must be hint-free; det
             builds are Float32 (get_compiled enforces it).
         vector_elems: elements per 16-byte load; 0 selects 4 (Float32) or 8 (16-bit).
@@ -2942,6 +3015,7 @@ class GvrMainKernel:
         fused_k: int = 0,
         warp_rank: bool = False,
         staged_k: int = 0,
+        l2ef: bool = False,
         dtype=cutlass.Float32,
         v16: bool = False,
         dense: bool = False,
@@ -3144,6 +3218,12 @@ class GvrMainKernel:
             and not self.det
         )
 
+        self.l2ef = (
+            bool(l2ef)
+            and not self.det
+            and not self.prefill
+            and (dtype is cutlass.Float32 or self.vector_elems == 8)
+        )
         self.env_first = (
             bool(env_first)
             and dtype is cutlass.Float16
@@ -4106,6 +4186,10 @@ class GvrMainKernel:
 
         # ============ P1: sample prefetch (hint gather LAZY) =================
         atom128 = C.g2r_atom_f32(128, invariant=True)
+        # l2ef: the P3 row-stream loads below take an evict_first L2 policy (None: plain loads)
+        l2pol = None
+        if cutlass.const_expr(self.l2ef):
+            l2pol = C._l2_evict_first_policy()
         # samp_rounds (FP16): the first samp_rounds * BLK sample vectors stay packed in spk
         # for the min/max and histogram passes; the rest are loaded once per pass.  env_first
         # builds issued spk before the per-row prologue and reload it only when the row's
@@ -4316,12 +4400,18 @@ class GvrMainKernel:
             if fullsl != Int32(0):
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
                     for uu in cutlass.range_constexpr(PFD):
-                        C.ld_g_f32x4(atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu])
+                        C.ld_g_f32x4(
+                            atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu], pol=l2pol
+                        )
                 else:
                     for uu in cutlass.range_constexpr(PFD):
                         if cutlass.const_expr(self.vector_elems == 8):
                             ld_g_b16x8_pk(
-                                atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu]
+                                atom128,
+                                x_addr,
+                                c0 + tidx + cutlass.Int32(uu * BLK),
+                                pf[uu],
+                                pol=l2pol,
                             )
                         else:
                             ld_g_16x4(
@@ -4338,7 +4428,7 @@ class GvrMainKernel:
                         ic = i_
                         if ic >= c1:
                             ic = lim4
-                        C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
+                        C.ld_g_f32x4(atom128, x_addr, ic, pf[uu], pol=l2pol)
                 else:
                     for uu in cutlass.range_constexpr(PFD):
                         i_ = c0 + tidx + cutlass.Int32(uu * BLK)
@@ -4346,7 +4436,7 @@ class GvrMainKernel:
                         if ic >= c1:
                             ic = lim4
                         if cutlass.const_expr(self.vector_elems == 8):
-                            ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu])
+                            ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu], pol=l2pol)
                         else:
                             ld_g_16x4(self.dtype, atom128, x_addr, ic, pf[uu])
             # asm prefetch site #1: gate (c1-c0)>=2*BLK*U && SMP>=160
@@ -4610,7 +4700,11 @@ class GvrMainKernel:
                             if cutlass.const_expr(self.dtype == cutlass.Float32):
                                 for uu in cutlass.range_constexpr(PFD):
                                     C.ld_g_f32x4(
-                                        atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu]
+                                        atom128,
+                                        x_addr,
+                                        c0 + tidx + cutlass.Int32(uu * BLK),
+                                        pf[uu],
+                                        pol=l2pol,
                                     )
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
@@ -4620,6 +4714,7 @@ class GvrMainKernel:
                                             x_addr,
                                             c0 + tidx + cutlass.Int32(uu * BLK),
                                             pf[uu],
+                                            pol=l2pol,
                                         )
                                     else:
                                         ld_g_16x4(
@@ -4636,7 +4731,7 @@ class GvrMainKernel:
                                     ic = i_
                                     if ic >= c1:
                                         ic = lim4
-                                    C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
+                                    C.ld_g_f32x4(atom128, x_addr, ic, pf[uu], pol=l2pol)
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
                                     i_ = c0 + tidx + cutlass.Int32(uu * BLK)
@@ -4644,7 +4739,7 @@ class GvrMainKernel:
                                     if ic >= c1:
                                         ic = lim4
                                     if cutlass.const_expr(self.vector_elems == 8):
-                                        ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu])
+                                        ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu], pol=l2pol)
                                     else:
                                         ld_g_16x4(self.dtype, atom128, x_addr, ic, pf[uu])
                     if cutlass.const_expr(NBD > BLK):
@@ -4770,7 +4865,11 @@ class GvrMainKernel:
                         if cutlass.const_expr(self.dtype == cutlass.Float32):
                             for uu in cutlass.range_constexpr(PFD, U):
                                 C.ld_g_f32x4(
-                                    atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                                    atom128,
+                                    x_addr,
+                                    i0 + cutlass.Int32(uu * BLK),
+                                    fr[uu - PFD],
+                                    pol=l2pol,
                                 )
                         else:
                             for uu in cutlass.range_constexpr(PFD, U):
@@ -4792,7 +4891,11 @@ class GvrMainKernel:
                         for uu in cutlass.range_constexpr(PFD, U):
                             if cutlass.const_expr(self.vector_elems == 8):
                                 ld_g_b16x8_pk(
-                                    atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                                    atom128,
+                                    x_addr,
+                                    i0 + cutlass.Int32(uu * BLK),
+                                    fr[uu - PFD],
+                                    pol=l2pol,
                                 )
                             else:
                                 ld_g_16x4(
@@ -4863,7 +4966,7 @@ class GvrMainKernel:
                                 ic = i_
                                 if ic >= c1:
                                     ic = lim4
-                                C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD])
+                                C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD], pol=l2pol)
                         else:
                             for uu in cutlass.range_constexpr(PFD, U):
                                 i_ = i0 + cutlass.Int32(uu * BLK)
@@ -4892,7 +4995,7 @@ class GvrMainKernel:
                             if ic >= c1:
                                 ic = lim4  # clamped address
                             if cutlass.const_expr(self.vector_elems == 8):
-                                ld_g_b16x8_pk(atom128, x_addr, ic, fr[uu - PFD])
+                                ld_g_b16x8_pk(atom128, x_addr, ic, fr[uu - PFD], pol=l2pol)
                             else:
                                 ld_g_16x4(self.dtype, atom128, x_addr, ic, fr[uu - PFD])
                         for uu in cutlass.range_constexpr(U):
@@ -4966,13 +5069,21 @@ class GvrMainKernel:
                             if cutlass.const_expr(self.dtype == cutlass.Float32):
                                 for uu in cutlass.range_constexpr(PFD):
                                     C.ld_g_f32x4(
-                                        atom128, x_addr, j0 + cutlass.Int32(uu * BLK), pf[uu]
+                                        atom128,
+                                        x_addr,
+                                        j0 + cutlass.Int32(uu * BLK),
+                                        pf[uu],
+                                        pol=l2pol,
                                     )
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
                                     if cutlass.const_expr(self.vector_elems == 8):
                                         ld_g_b16x8_pk(
-                                            atom128, x_addr, j0 + cutlass.Int32(uu * BLK), pf[uu]
+                                            atom128,
+                                            x_addr,
+                                            j0 + cutlass.Int32(uu * BLK),
+                                            pf[uu],
+                                            pol=l2pol,
                                         )
                                     else:
                                         ld_g_16x4(
@@ -4989,7 +5100,7 @@ class GvrMainKernel:
                                     jc = j_
                                     if jc >= c1:
                                         jc = lim4
-                                    C.ld_g_f32x4(atom128, x_addr, jc, pf[uu])
+                                    C.ld_g_f32x4(atom128, x_addr, jc, pf[uu], pol=l2pol)
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
                                     j_ = j0 + cutlass.Int32(uu * BLK)
@@ -4997,7 +5108,7 @@ class GvrMainKernel:
                                     if jc >= c1:
                                         jc = lim4
                                     if cutlass.const_expr(self.vector_elems == 8):
-                                        ld_g_b16x8_pk(atom128, x_addr, jc, pf[uu])
+                                        ld_g_b16x8_pk(atom128, x_addr, jc, pf[uu], pol=l2pol)
                                     else:
                                         ld_g_16x4(self.dtype, atom128, x_addr, jc, pf[uu])
                 # warp-aggregated reservation
@@ -8129,6 +8240,7 @@ def get_compiled(
     fused_k: int = 0,
     warp_rank: bool = False,
     staged_k: int = 0,
+    l2ef: bool = False,
     dtype: str = "f32",
     v16: bool = False,
     dense: bool = False,
@@ -8195,6 +8307,8 @@ def get_compiled(
             + (("regsel",) if regsel else ())
             + (("envf",) if envf else ())
         )
+        if l2ef:
+            key = key + (("l2ef", True),)
         if p2:
             key = key + (True,)
         if samp_rounds:
@@ -8246,6 +8360,7 @@ def get_compiled(
                 prefill=bool(prefill),
                 warp_rank=warp_rank,
                 staged_k=staged_k,
+                l2ef=bool(l2ef),
                 dtype=_dtype_of(dtype),
                 v16=bool(v16),
                 dense=bool(dense),
