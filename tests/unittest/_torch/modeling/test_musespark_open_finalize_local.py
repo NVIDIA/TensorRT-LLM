@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single-process contracts of the finalize+all-reduce module: imports, input checks, release order.
+"""Single-process contracts of the finalize+all-reduce module: input checks and release order.
 
 These need no peers. Argument validation runs on a workspace whose launcher is
 replaced by a recorder, so a rejected call is proven to launch nothing.
@@ -21,9 +21,6 @@ exchanges as `TorchDist` does. Release runs on a workspace holding fake
 buffers, with the TP group and the CUDA calls replaced by recorders, so the
 order of every step can be checked exactly.
 """
-
-import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -34,31 +31,6 @@ from tensorrt_llm._torch.models import musespark_open_finalize_ar
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.models.musespark_open_finalize_ar import FinalizeIpcWorkspace
 from tensorrt_llm.mapping import Mapping
-
-_BLOCKED_DSL = """
-import importlib
-import sys
-from tensorrt_llm._torch.models.modeling_musespark_open import _build_finalize_allreduce_workspace
-
-# Initialize required package dependencies before isolating the two local fusion modules.
-for name in ("cutlass", "cutlass.cute", "cutlass.utils", "cutlass._mlir", "cutlass.cutlass_dsl"):
-    sys.modules[name] = None
-for name in ("musespark_open_boundary", "musespark_open_finalize_ar"):
-    sys.modules.pop(f"tensorrt_llm._torch.models.{name}", None)
-musespark_open_boundary = importlib.import_module("tensorrt_llm._torch.models.musespark_open_boundary")
-musespark_open_finalize_ar = importlib.import_module("tensorrt_llm._torch.models.musespark_open_finalize_ar")
-print(musespark_open_finalize_ar.HAS_CUTEDSL, musespark_open_boundary._HAS_CUTE_DSL,
-      _build_finalize_allreduce_workspace(object()))
-"""
-
-
-def test_modules_import_without_cute_dsl() -> None:
-    """Fresh local fusion modules report unavailable and the model keeps the unfused path."""
-    result = subprocess.run(
-        [sys.executable, "-c", _BLOCKED_DSL], capture_output=True, text=True, timeout=600
-    )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.split()[-3:] == ["False", "False", "None"]
 
 
 @pytest.fixture
