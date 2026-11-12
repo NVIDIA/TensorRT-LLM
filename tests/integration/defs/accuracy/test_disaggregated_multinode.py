@@ -32,12 +32,14 @@ slower than context startup.
 import contextlib
 import os
 import re
+import socket
 import time
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Iterator, Optional
 
 import openai
+import psutil
 import pytest
 import requests
 
@@ -178,6 +180,36 @@ def _is_generation_node() -> bool:
 
 
 def _worker_env() -> dict[str, str]:
+    ucx_net_devices = os.environ.get("UCX_NET_DEVICES")
+    if ucx_net_devices is None:
+        peer_node = NODE_LIST[1 - NODE_RANK]
+        try:
+            # UDP connect selects a route without sending traffic to the peer.
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+                route_socket.connect((peer_node, CTX_SERVER_PORT))
+                local_address = route_socket.getsockname()[0]
+        except OSError as error:
+            raise RuntimeError(
+                f"Cannot determine the network route to {peer_node}; "
+                "set UCX_NET_DEVICES to an available TCP network interface."
+            ) from error
+        ucx_net_devices = next(
+            (
+                name
+                for name, addresses in psutil.net_if_addrs().items()
+                if any(
+                    address.family == socket.AF_INET and address.address == local_address
+                    for address in addresses
+                )
+            ),
+            None,
+        )
+        if ucx_net_devices is None:
+            raise RuntimeError(
+                f"No network interface found for local address {local_address} on the route "
+                f"to {peer_node}; set UCX_NET_DEVICES to an available TCP network interface."
+            )
+
     env = {
         key: value
         for key, value in os.environ.items()
@@ -198,9 +230,9 @@ def _worker_env() -> dict[str, str]:
             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
             # Avoid auto-selecting an NVL72 RDMA VF whose container-visible
-            # IPv6 address UCX cannot bind; override UCX_NET_DEVICES where
-            # eth0 is not the right interface.
-            "UCX_NET_DEVICES": os.environ.get("UCX_NET_DEVICES", "eth0"),
+            # IPv6 address UCX cannot bind. Use the TCP interface routed to the peer
+            # unless UCX_NET_DEVICES explicitly selects another device.
+            "UCX_NET_DEVICES": ucx_net_devices,
             "UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc",
         }
     )
