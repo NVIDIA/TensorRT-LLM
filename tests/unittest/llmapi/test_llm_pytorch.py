@@ -1059,6 +1059,7 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # Qwen1.5-MoE-A2.7B-Chat is absent from the Ray stage's model root
 @pytest.mark.part0
 def test_qwen_moe_shared_expert_lora():
     """Test MoE shared expert LoRA on Qwen1.5-MoE with PyTorch backend.
