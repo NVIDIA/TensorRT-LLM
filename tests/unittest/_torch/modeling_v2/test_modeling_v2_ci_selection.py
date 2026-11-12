@@ -350,6 +350,16 @@ _NO_CI_STAGE = {
 }
 
 
+# Targets whose accuracy tests no list runs yet, by test-db path, with what they wait for. A
+# target enters a list once its gates have passed on the hardware it names.
+_ACCURACY_NOT_LISTED_YET = {
+    "accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__dep32": (
+        "32 GB200 GPUs (eight trays); not GPU-certified yet, enters "
+        "qa/llm_function_multinode.txt beside dep16 once its GSM8K gates pass"
+    ),
+}
+
+
 def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     """Every modeling_v2 test is in a list some job runs.
 
@@ -358,7 +368,8 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     deployments, run from the QA lists. Paths are in test-db form: unit tests relative
     to ``tests/``, accuracy tests relative to ``tests/integration/defs/``. Only paths
     are compared: the ``-m cpu_only`` and ``-m "not cpu_only"`` split between stages is
-    not checked. Unit tests under ``_NO_CI_STAGE`` are exempt until a stage can run them.
+    not checked. Unit tests under ``_NO_CI_STAGE`` are exempt until a stage can run them,
+    and accuracy tests under ``_ACCURACY_NOT_LISTED_YET`` until their target is certified.
     """
     unit_root, accuracy_root = repo / "tests", repo / "tests/integration/defs"
     test_db = _test_db_entries(repo)
@@ -386,6 +397,15 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
                     str(p.relative_to(accuracy_root)) for p in sorted(accuracy.rglob("test_*.py"))
                 ]
                 tests[str(accuracy.relative_to(accuracy_root))] = (files, any_list)
+    # Likewise, an accuracy exemption outlives its reason once its directory goes or a list runs it.
+    stale = sorted(
+        where
+        for where in _ACCURACY_NOT_LISTED_YET
+        if where not in tests or any(_runs(e, f) for e in any_list for f in tests[where][0])
+    )
+    assert not stale, f"_ACCURACY_NOT_LISTED_YET entries with no target or now listed: {stale}"
+    for where in _ACCURACY_NOT_LISTED_YET:
+        del tests[where]
     unreached = [
         path
         for path, (files, entries) in tests.items()

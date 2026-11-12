@@ -8073,6 +8073,10 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
     "nemotron_h/nemotron3_ultra_bf16__sm_100__dep16": _ultra_cells(
         _ULTRA_BF16_DEP16_64_2_128, "BF16 dep16", mixed_packed=True, decode_256=False
     ),
+    # dep32 runs dep16's attention whole on every rank: the same specs, run once.
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__dep32": _ultra_cells(
+        _ULTRA_BF16_DEP16_64_2_128, "BF16 dep32", mixed_packed=True, decode_256=False
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

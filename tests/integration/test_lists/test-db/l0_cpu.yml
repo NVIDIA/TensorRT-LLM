@@ -113,6 +113,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/nemotron_h/nemotron3_ultra_bf16__sm_100__tep8
   - unittest/_torch/modeling_v2/models/nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2
   - unittest/_torch/modeling_v2/models/nemotron_h/nemotron3_ultra_bf16__sm_100__dep16
+  - unittest/_torch/modeling_v2/models/nemotron_h/nemotron3_ultra_bf16__sm_100__dep32
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
