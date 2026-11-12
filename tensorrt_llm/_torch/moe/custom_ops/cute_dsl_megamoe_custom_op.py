@@ -2203,8 +2203,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
-    ) -> Tuple[int, bool]:
-        """Probe workspace size and direct-input support of the default kernel."""
+    ) -> Tuple[int, bool, bool]:
+        """Probe the default kernel: its shared workspace bytes, whether it reads its inputs in
+        place (direct inputs), and whether its top-k reduce masks routes with an invalid expert
+        (``masks_invalid_combine_slots``), so that routes staged as -1 drop their rows."""
 
         sm_version = get_sm_version()
         use_default_tactic = tactic is None
@@ -2319,7 +2321,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
         _, shared_bytes = probe.get_workspace_sizes()
-        return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
+        return (
+            int(shared_bytes),
+            isinstance(probe, RubinInferenceGenphaseMegaMoE),
+            bool(getattr(probe, "masks_invalid_combine_slots", False)),
+        )
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
         """Shape-derivation rule: the activation token count (input[0] dim0)

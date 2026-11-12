@@ -31,9 +31,11 @@ constexpr int kThreads = 256;
 constexpr int64_t kMaxBlocks = 1024; // a larger bucket loops: one launch either way
 
 template <typename IdT, typename OutT>
-__global__ void megaMoeStageRoutesKernel(IdT const* __restrict__ ids, float const* __restrict__ weights,
-    int64_t liveElements, OutT* __restrict__ idsOut, float* __restrict__ weightsOut, int64_t elements)
+__global__ void megaMoeStageRoutesKernel(IdT const* __restrict__ ids, float const* __restrict__ weights, int64_t n,
+    int32_t const* __restrict__ liveRowWord, int topK, OutT* __restrict__ idsOut, float* __restrict__ weightsOut,
+    int64_t elements)
 {
+    int64_t const liveElements = (liveRowWord == nullptr ? n : megaMoeLiveRows(*liveRowWord, n)) * topK;
     for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < elements;
          i += static_cast<int64_t>(gridDim.x) * blockDim.x)
     {
@@ -46,8 +48,8 @@ __global__ void megaMoeStageRoutesKernel(IdT const* __restrict__ ids, float cons
 } // namespace
 
 template <typename IdT, typename OutT>
-void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t liveRows, OutT* idsOut, float* weightsOut,
-    int64_t rows, int topK, cudaStream_t stream)
+void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t n, int32_t const* liveRowWord, OutT* idsOut,
+    float* weightsOut, int64_t rows, int topK, cudaStream_t stream)
 {
     int64_t const elements = rows * topK;
     if (elements == 0)
@@ -56,12 +58,12 @@ void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t liveRows, 
     }
     auto const blocks = static_cast<int>(std::min((elements + kThreads - 1) / kThreads, kMaxBlocks));
     megaMoeStageRoutesKernel<IdT, OutT>
-        <<<blocks, kThreads, 0, stream>>>(ids, weights, liveRows * topK, idsOut, weightsOut, elements);
+        <<<blocks, kThreads, 0, stream>>>(ids, weights, n, liveRowWord, topK, idsOut, weightsOut, elements);
 }
 
 #define INSTANTIATE_MEGAMOE_STAGE_ROUTES(IdT, OutT)                                                                    \
     template void megaMoeStageRoutes<IdT, OutT>(                                                                       \
-        IdT const*, float const*, int64_t, OutT*, float*, int64_t, int, cudaStream_t)
+        IdT const*, float const*, int64_t, int32_t const*, OutT*, float*, int64_t, int, cudaStream_t)
 
 INSTANTIATE_MEGAMOE_STAGE_ROUTES(int32_t, int32_t);
 INSTANTIATE_MEGAMOE_STAGE_ROUTES(int32_t, int64_t);

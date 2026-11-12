@@ -82,6 +82,7 @@ import torch.distributed as dist
 # it is always importable. The provider / shared-workspace helpers used
 # in ``_alloc_symm_provider`` and ``_ensure_local_staging`` ARE inside
 # that gate and therefore stay lazy at the call site.
+from tensorrt_llm._torch.moe import live_rows
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
 )
@@ -663,6 +664,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Launch buffers per (bucket, top_k, hidden, device, dtype, inference mode).
         self._launch_buffers: Dict[Tuple, _MegaMoeBuffers] = {}
         self._genphase_direct_input_buckets: set[int] = set()
+        # Buckets whose kernel masks routes with an invalid expert in its top-k reduce: their
+        # staging drops the rows of the forward's padding requests (moe/live_rows.py).
+        self._padding_drop_buckets: set[int] = set()
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
@@ -1057,6 +1061,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             (
                 shared_workspace_bytes,
                 supports_direct_inputs,
+                masks_invalid_routes,
             ) = query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
@@ -1084,6 +1089,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
             if supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
+            if masks_invalid_routes:
+                self._padding_drop_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
                 world_size=self.ep_size,
@@ -1477,7 +1484,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 query_megamoe_kernel_properties,
             )
 
-            shared_bytes, supports_direct_inputs = query_megamoe_kernel_properties(
+            (
+                shared_bytes,
+                supports_direct_inputs,
+                masks_invalid_routes,
+            ) = query_megamoe_kernel_properties(
                 world_size=1,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -1504,6 +1515,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
             if supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
+            if masks_invalid_routes:
+                self._padding_drop_buckets.add(max_T)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
@@ -1612,6 +1625,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         top_k: int,
         stage_activation: bool,
         replica_plan=None,
+        live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
         pre-allocated buffers and reset the padded tail.
@@ -1630,6 +1644,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         both tails are rewritten on every launch. The op depends on
         ``num_tokens`` alone, so a CUDA graph replay resets rows that an
         eager launch into the same bucket wrote after the capture.
+
+        With ``live_row_word`` (the forward's word, ``moe/live_rows.py``),
+        the op reads it on the device and stages only the leading live
+        rows' routes; the rows of padding requests get ``-1`` and ``0.0``
+        like the tail, so the kernel neither routes nor computes them.
         """
         if topk_idx.shape[0] != num_tokens:
             raise ValueError(
@@ -1640,7 +1659,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
         self._wait_rebalance_routes(replica_plan)
         torch.ops.trtllm.megamoe_stage_routes(
-            topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights
+            topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights, live_row_word
         )
 
     def _launch_megamoe_kernel(
@@ -2039,6 +2058,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 top_k=top_k,
                 stage_activation=not use_direct_inputs and not activation_staged,
                 replica_plan=replica_plan,
+                live_row_word=(
+                    live_rows.current_word(device)
+                    if launch_max_T in self._padding_drop_buckets
+                    else None
+                ),
             )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,

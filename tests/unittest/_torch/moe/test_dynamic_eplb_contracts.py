@@ -1792,7 +1792,7 @@ def test_route_wait_occurs_after_independent_staging():
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
     trace = []
 
-    def stage_routes(ids, weights, ids_out, weights_out):
+    def stage_routes(ids, weights, ids_out, weights_out, live_row_word=None):
         trace.append(f"stage_routes:{ids_out.name},{weights_out.name}")
 
     impl = _extract_class(

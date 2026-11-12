@@ -83,6 +83,7 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
         ep_rank=0,
         tactic_autotune=False,
         _genphase_direct_input_buckets=set(),
+        _padding_drop_buckets=set(),
         _select_launch_max_tokens=lambda hint: 8,
         _acquire_buffers=lambda **kw: bufs,
         _stage_inputs=lambda **kw: stage_activation.append(kw["stage_activation"]),
@@ -123,3 +124,54 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
             run(*inputs)
         assert backend._quantized_into is None  # consumed by the launch it was meant for
     assert stage_activation == [False, True]
+
+
+@pytest.mark.parametrize("drops_padding_rows", [True, False])
+def test_run_moe_stages_with_the_forward_word_only_where_the_kernel_masks_dropped_routes(
+    monkeypatch: pytest.MonkeyPatch, drops_padding_rows: bool
+):
+    """A bucket whose kernel's top-k reduce masks routes with an invalid expert stages the routes
+    under the forward's live-row word, so the rows of padding requests are dropped; any other
+    bucket stages every row (its reduce would read the dropped rows' stale cells)."""
+    t = torch.zeros(8, 2)
+    bufs = mm._MegaMoeBuffers(
+        activation=torch.zeros(8, 4, dtype=torch.uint8),
+        activation_sf=torch.zeros(8, 1, dtype=torch.uint8),
+        topk_weights=t,
+        combine_output=t,
+        shared_workspace=t,
+        peer_offsets=(0,),
+        topk_idx_local=torch.full((8, 2), -1, dtype=torch.int64),
+    )
+    staged = []
+    backend = SimpleNamespace(
+        _active_launch_max_tokens=None,
+        _quantized_into=None,
+        ep_size=1,
+        ep_rank=0,
+        tactic_autotune=False,
+        _genphase_direct_input_buckets=set(),
+        _padding_drop_buckets={8} if drops_padding_rows else {16},
+        _select_launch_max_tokens=lambda hint: 8,
+        _acquire_buffers=lambda **kw: bufs,
+        _stage_inputs=lambda **kw: staged.append(kw["live_row_word"]),
+        _launch_megamoe_kernel=lambda **kw: "out",
+    )
+    backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
+    word = torch.zeros(1, dtype=torch.int32)
+    monkeypatch.setattr(mm.live_rows, "current_word", lambda device: word)
+    routes = torch.zeros(3, 2, dtype=torch.int64)
+    IMPL._run_moe(
+        backend,
+        x=torch.zeros(3, 4, dtype=torch.uint8),
+        x_sf=torch.zeros(3, 1, dtype=torch.uint8),
+        topk_idx=routes,
+        topk_weights=routes.float(),
+        weight_view=None,
+        num_tokens=3,
+        top_k=2,
+        hidden=8,
+        device=torch.device("cpu"),
+        output_dtype=torch.bfloat16,
+    )
+    assert len(staged) == 1 and staged[0] is (word if drops_padding_rows else None)

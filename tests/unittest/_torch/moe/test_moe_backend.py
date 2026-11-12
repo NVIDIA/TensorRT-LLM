@@ -4797,7 +4797,7 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
         )
         # The shared workspace layout grows with the slot count: the backend's is sized for
         # ``slots``, so the helper runner gets its own, sized as the backend sizes one.
-        helper_workspace_bytes, _ = megamoe_op.query_megamoe_kernel_properties(
+        helper_workspace_bytes, *_ = megamoe_op.query_megamoe_kernel_properties(
             world_size=1,
             num_topk=top_k,
             num_experts_per_rank=slots + len(sources),
@@ -4886,6 +4886,35 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize(
+    "sm_version,sm_count,masks", [(100, 148, True), (103, 160, True), (107, 184, False)]
+)
+def test_megamoe_kernel_properties_report_whether_the_reduce_masks_dropped_routes(
+    monkeypatch: pytest.MonkeyPatch, sm_version: int, sm_count: int, masks: bool
+) -> None:
+    """The backend stages the rows of padding requests as dropped routes only where the kernel's
+    top-k reduce masks routes with an invalid expert; the probe reads that off the kernel."""
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: sm_version)
+    # Construction only; the occupancy query would need a CUDA context.
+    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: sm_count // size)
+    *_, masks_invalid_routes = megamoe_op.query_megamoe_kernel_properties(
+        world_size=4,
+        num_topk=6,
+        num_experts_per_rank=96,
+        hidden_size=7168,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+        max_tokens_per_rank=128,
+        gate_up_clamp=10.0,
+    )
+    assert masks_invalid_routes is masks
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("hidden_size,uses_genphase", [(7168, True), (2880, False)])
 def test_megamoe_genphase_rejects_compact_rows_it_cannot_address(
     monkeypatch: pytest.MonkeyPatch, hidden_size: int, uses_genphase: bool
@@ -4899,7 +4928,7 @@ def test_megamoe_genphase_rejects_compact_rows_it_cannot_address(
     monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
     # hidden 2880 stages 180-byte SF rows; the gen kernel addresses 192-byte ones, so the
     # query must fall back to the generic kernel instead of trapping at launch.
-    _, is_genphase = megamoe_op.query_megamoe_kernel_properties(
+    _, is_genphase, _ = megamoe_op.query_megamoe_kernel_properties(
         world_size=4,
         num_topk=6,
         num_experts_per_rank=96,

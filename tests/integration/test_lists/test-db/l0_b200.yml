@@ -259,6 +259,8 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_megamoe_streaming_load.py
+  # The live-row word's writes are stream-ordered.
+  - unittest/_torch/moe/test_megamoe_live_rows_gpu.py -k "not drops_padding_rows"
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
@@ -266,6 +268,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run
   - unittest/_torch/moe/test_megamoe_stage_routes.py
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_kernel_properties_report_whether_the_reduce_masks_dropped_routes
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout

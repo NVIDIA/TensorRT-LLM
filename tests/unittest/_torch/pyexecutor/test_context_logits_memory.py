@@ -47,6 +47,7 @@ def make_request(
         py_prompt_logprobs=k,
         py_prompt_logprobs_simple_format=simple,
         is_last_context_chunk=True,
+        is_dummy=False,
         get_tokens=lambda beam: tokens,
         py_result=PyResult(
             prompt_len=length, max_new_tokens=2, return_context_logits=full or k is not None
@@ -284,6 +285,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_cohere2 import Cohere2ForCausalLM
     from tensorrt_llm._torch.modules.context_logits import context_logits_scope
+    from tensorrt_llm._torch.moe.live_rows import ALL_ROWS
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 
     model, mapping = make_model_and_mapping()
@@ -320,12 +322,14 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         context_requests=[request], num_context_requests=1, all_requests=lambda: [request]
     )
     if promoted_final_context:
-        graph_batch = SimpleNamespace(context_requests=[], generation_requests=[request])
+        graph_batch = SimpleNamespace(
+            context_requests=[], generation_requests=[request], all_requests=lambda: [request]
+        )
         promoted_ids = frozenset({17})
     else:
         graph_batch, promoted_ids = batch, frozenset()
     key = object()
-    metadata = SimpleNamespace()
+    metadata = SimpleNamespace(num_contexts=1, seq_lens=torch.ones(1, dtype=torch.int32))
     outputs = {"logits": object()}
     replay = Mock(return_value=outputs)
     forward = Mock(return_value=outputs)
@@ -354,6 +358,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         _dspark_device_budget=None,
     )
     bypass = Mock(side_effect=lambda **kwargs: nullcontext())
+    live_row_word = Mock()
     runner = SimpleNamespace(
         _model=model,
         _mapping=mapping,
@@ -373,6 +378,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         forward_pass_callable=None,
         _execute_logit_post_processors=Mock(),
         _restore_attention_dp_semantic_outputs=lambda batch, values: values,
+        _live_row_word=live_row_word,
     )
     forward_inputs = SimpleNamespace(
         batch=batch,
@@ -384,6 +390,8 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
     )
     manager = SimpleNamespace(get_resource_manager=lambda kind: object())
     result = DecoderRunner._forward_decoder(runner, forward_inputs, manager, is_dummy=False)
+    # No padding request in the batch: the forward keeps every row.
+    live_row_word.write.assert_called_once_with(ALL_ROWS)
     # A promoted final context yields one decode-sized row per request, so the
     # graph replays even when the head could project context logits eagerly.
     bounded = eligible and not promoted_final_context
