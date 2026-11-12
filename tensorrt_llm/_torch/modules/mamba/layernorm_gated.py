@@ -159,7 +159,9 @@ def _multirow_pdl(grid_size: int, device_index: int) -> bool:
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
-@triton.jit
+# M follows the batch: specializing it on == 1 and % 16 would compile variants
+# mid-serving (with identical code, since M only masks rows).
+@triton.jit(do_not_specialize=["M"])
 def _rms_norm_gated_fwd_multirow_kernel(
     X,  # pointer to the input
     Y,  # pointer to the output
@@ -235,6 +237,41 @@ def _rms_norm_gated_fwd_multirow_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+# Compiled variants of the multi-row kernel whose twin with the other PDL
+# setting has been compiled too.
+_multirow_variants_with_pdl_twin = set()
+
+
+def _launch_multirow_kernel(grid_size: int, device_index: int, *args,
+                            **kwargs) -> None:
+    """Launch the multi-row kernel, with PDL when its grid is below one wave.
+
+    PDL is compiled into the kernel (LAUNCH_WITH_PDL and Triton's launch_pdl),
+    so the first launch of a variant also compiles its twin with the other PDL
+    setting. Otherwise a server warmed up on large batches would compile the
+    PDL variant the first time it serves a small batch, while every request in
+    flight waits. (Under torch.compile the launch is traced, not run, so there
+    is no variant to pair.)
+    """
+    launch_with_pdl = _multirow_pdl(grid_size, device_index)
+    with torch.cuda.device(device_index):
+        variant = _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
+            *args,
+            LAUNCH_WITH_PDL=launch_with_pdl,
+            launch_pdl=launch_with_pdl,
+            **kwargs)
+        if (not torch.compiler.is_compiling()
+                and variant not in _multirow_variants_with_pdl_twin
+                and _pdl_device_policy(device_index)[0]):
+            _multirow_variants_with_pdl_twin.add(variant)
+            _rms_norm_gated_fwd_multirow_kernel.warmup(
+                *args,
+                grid=(grid_size, ),
+                LAUNCH_WITH_PDL=not launch_with_pdl,
+                launch_pdl=not launch_with_pdl,
+                **kwargs)
+
+
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
                                      is_rms_norm):
     return (is_rms_norm and norm_before_gate and z is not None and bias is None
@@ -290,34 +327,31 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
     device_index = x.device.index
-    launch_with_pdl = _multirow_pdl(grid_size, device_index)
-    with torch.cuda.device(device_index):
-        _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
-            x,
-            out,
-            weight,
-            z,
-            None,
-            fp8_scale,
-            x.stride(0),
-            out.stride(0),
-            z.stride(0),
-            M,
-            eps,
-            N=N,
-            ROWS=_MULTIROW_ROWS,
-            HEADS_PER_TOK=heads,
-            GATE_SIGMOID=gate_sigmoid,
-            WEIGHT_IS_DELTA=False,
-            LAUNCH_WITH_PDL=launch_with_pdl,
-            num_warps=_MULTIROW_NUM_WARPS,
-            # Dependents (out_proj) prefetch their weights; they read Y only
-            # after their own griddepcontrol.wait.
-            EARLY_TRIGGER=_pdl_device_policy(device_index)[0],
-            launch_pdl=launch_with_pdl,
-        )
+    _launch_multirow_kernel(
+        triton.cdiv(M, _MULTIROW_ROWS),
+        device_index,
+        x,
+        out,
+        weight,
+        z,
+        None,
+        fp8_scale,
+        x.stride(0),
+        out.stride(0),
+        z.stride(0),
+        M,
+        eps,
+        N=N,
+        ROWS=_MULTIROW_ROWS,
+        HEADS_PER_TOK=heads,
+        GATE_SIGMOID=gate_sigmoid,
+        WEIGHT_IS_DELTA=False,
+        num_warps=_MULTIROW_NUM_WARPS,
+        # Dependents (out_proj) prefetch their weights; they read Y only
+        # after their own griddepcontrol.wait.
+        EARLY_TRIGGER=_pdl_device_policy(device_index)[0],
+    )
     return out
 
 
@@ -384,31 +418,27 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid_size = triton.cdiv(M, _MULTIROW_ROWS)
-        device_index = x.device.index
-        launch_with_pdl = _multirow_pdl(grid_size, device_index)
-        with torch.cuda.device(device_index):
-            _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
-                x,
-                out,
-                weight,
-                z,
-                rstd,
-                fp8_scale,
-                x.stride(0),
-                out.stride(0),
-                z.stride(0),
-                M,
-                eps,
-                N=group_size,
-                ROWS=_MULTIROW_ROWS,
-                HEADS_PER_TOK=1,
-                GATE_SIGMOID=gate_sigmoid,
-                WEIGHT_IS_DELTA=weight_is_delta,
-                LAUNCH_WITH_PDL=launch_with_pdl,
-                num_warps=_MULTIROW_NUM_WARPS,
-                launch_pdl=launch_with_pdl,
-            )
+        _launch_multirow_kernel(
+            triton.cdiv(M, _MULTIROW_ROWS),
+            x.device.index,
+            x,
+            out,
+            weight,
+            z,
+            rstd,
+            fp8_scale,
+            x.stride(0),
+            out.stride(0),
+            z.stride(0),
+            M,
+            eps,
+            N=group_size,
+            ROWS=_MULTIROW_ROWS,
+            HEADS_PER_TOK=1,
+            GATE_SIGMOID=gate_sigmoid,
+            WEIGHT_IS_DELTA=weight_is_delta,
+            num_warps=_MULTIROW_NUM_WARPS,
+        )
         return out, mean, rstd
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()

@@ -15,6 +15,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 import triton
 from utils.util import getSMVersion
 
@@ -306,6 +307,53 @@ class TestRMSNormBasic:
             outputs[launch_with_pdl] = output
 
         assert torch.equal(outputs[True], outputs[False])
+
+    @pytest.mark.parametrize("heads", [1, 12])
+    def test_multirow_kernel_reuses_the_compiled_variant_across_batches(self, heads: int) -> None:
+        """No row count compiles a new variant of the multi-row kernel.
+
+        Warmup runs large batches and serving then sees every token count, so a
+        variant keyed on the rows (M on == 1 and % 16, or PDL chosen from the
+        grid) compiled mid-serving. heads=1 is the RMSNorm module path (SiLU
+        gate), heads=12 the Kimi K3 KDA output gate (token-major, sigmoid).
+        """
+        from _torch.helpers import triton_num_compiled
+
+        kernel = layernorm_gated._rms_norm_gated_fwd_multirow_kernel
+        while isinstance(kernel, triton.runtime.Heuristics):
+            kernel = kernel.fn  # the compiled variants live on the inner JITFunction
+        device = "cuda"
+        dtype = torch.bfloat16
+        N = 128
+        eps = 1e-6
+        torch.manual_seed(12)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        norm = RMSNorm(N, eps=eps).to(device=device, dtype=dtype)
+        norm.weight.data.copy_(weight)
+
+        def check(num_tokens: int) -> None:
+            x = torch.randn(num_tokens * heads, N, device=device, dtype=dtype)
+            wide = torch.randn(num_tokens, heads * N + 128, device=device, dtype=dtype)
+            z = wide[:, 128:].view(num_tokens, heads, N)
+            if heads == 1:
+                out = norm(x, z=z.reshape(num_tokens, N))
+                gate = F.silu(z.reshape(-1, N).float())
+            else:
+                out = layernorm_gated.rms_norm_gated_token_major(
+                    x, z, weight, eps, gate_activation="sigmoid"
+                )
+                gate = torch.sigmoid(z.reshape(-1, N).float())
+            xf = x.float()
+            ref = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float() * gate
+            torch.testing.assert_close(out, ref.to(dtype), rtol=1e-2, atol=1e-2)
+
+        # Warmup-sized first: the grid covers every SM. Then one row, multiples
+        # of 16 and neither, all below one wave of programs, and large again.
+        check(4096)
+        compiled = triton_num_compiled(kernel)
+        for num_tokens in (1, 2, 3, 16, 17, 64, 100, 1000, 333):
+            check(num_tokens)
+        assert triton_num_compiled(kernel) == compiled
 
 
 @skip_no_cuda
