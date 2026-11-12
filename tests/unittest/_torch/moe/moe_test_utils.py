@@ -286,7 +286,6 @@ def should_skip_trtllm(
     model_config: "MoeModelConfig",
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
-    comm_method: Optional[str] = None,
     seq_len: Optional[int] = None,
     moe_tp_size: int = 1,
     parallel_mode: Optional[str] = None,
@@ -304,13 +303,10 @@ def should_skip_trtllm(
         routing_method_cls: Optional routing method class for compatibility checks
             (used by test_moe_module.py)
         swiglu_gptoss_style: Whether using swiglu gptoss style
-        comm_method: Optional communication method (e.g. "DEEPEP", "DEEPEPLOWLATENCY")
-            for multi-GPU EP mode checks
         seq_len: Optional sequence length for seq_len-sensitive skip checks
         moe_tp_size: MoE TP parallelism size (default: 1, no TP sharding)
         parallel_mode: Optional multi-GPU parallel mode label (e.g. "DEP",
-            "DTP", "TTP", "TEP"); used by parallel-mode-specific kernel-bug
-            skips that ``moe_tp_size`` alone cannot disambiguate.
+            "DTP", "TTP", "TEP") for parallel-mode-specific constraints.
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -549,31 +545,6 @@ def should_skip_trtllm(
             "parallel modes, while the same kernel matches ref under default "
             "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
             "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path."
-        )
-
-    # W4A8_MXFP4_FP8 + DEP + NVLINK MoeAllReduce produces ~97% mismatch with
-    # default SwiGLU on the TRTLLM-Gen kernel. The same kernel + quant passes
-    # under TTP+NVLINK (no DEP combine), and DEP+DEEPEP / DEP+DEEPEPLOWLATENCY
-    # also pass on the same kernel - so the MoE kernel itself is correct and
-    # the bug is in how the NVLINK MoeAllReduce combine path consumes the
-    # FP8/per-tensor-scale output of the TRTLLM-Gen kernel under DEP. Tracked
-    # in https://nvbugspro.nvidia.com/bug/6178915. The gpt-oss SwiGLU subset
-    # of this intersection is already covered by the NVBUG-6178914 skip above,
-    # so we explicitly require ``not swiglu_gptoss_style`` to avoid double
-    # accounting of the same ID under two different bug numbers.
-    if (
-        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
-        and not swiglu_gptoss_style
-        and parallel_mode == "DEP"
-        and comm_method in ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED")
-    ):
-        return (
-            "[Kernel Bug NVBUG-6178915] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 in "
-            "DEP mode with NVLINK MoeAllReduce combine path produces ~97% "
-            "mismatch vs the bf16 reference (default SwiGLU). The same kernel "
-            "+ quant passes under TTP+NVLINK and under DEP+DEEPEP / "
-            "DEP+DEEPEPLOWLATENCY, so the bug is isolated to the DEP+NVLINK "
-            "MoeAllReduce combine path."
         )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.

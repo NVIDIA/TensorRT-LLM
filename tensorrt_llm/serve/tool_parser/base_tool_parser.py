@@ -471,6 +471,18 @@ class BaseToolParser(ABC):
         """Build a mandatory native tool-call format, or return None if unsupported."""
         return None
 
+    def forced_call_prefix(self, name: str) -> str:
+        """Text that comes before `structure_info()(name).begin` in a call.
+
+        A named `tool_choice` writes the opening of the call into the prompt
+        (see `_build_forced_tool_call_decoding`), so it writes this text there
+        too. A format whose calls open with more than the trigger, such as a
+        routing header, returns that part here. The triggered strict-tools
+        path does not use it: there the model writes that part itself, before
+        the trigger. Empty by default.
+        """
+        return ""
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

@@ -76,6 +76,7 @@ from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
 from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
+from ..watermark.config import WatermarkConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
@@ -4903,6 +4904,30 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         description=
         "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
         "K/V global scales. Omit it to use identity global scales.")
+    mixed_precision_first_n: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Number of leading tokens per sequence kept unquantized in the cold tiers, "
+        "in whole cache pages. Applies to full-attention layers; sliding-window "
+        "layers are stored as ordinary cold pages.")
+    mixed_precision_last_n: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Number of most recent tokens per sequence kept unquantized in the cold "
+        "tiers, in whole cache pages. Applies to full-attention layers; "
+        "sliding-window layers are stored as ordinary cold pages. Rejected when a "
+        "sliding-window layer keeps the same tokens (its window is this value plus "
+        "one, with the same sink pages): the high layers would share that layer's "
+        "page group, which the cold-page codec cannot split.")
+
+    @property
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` kept at the active precision, else None."""
+        if self.mixed_precision_first_n or self.mixed_precision_last_n:
+            return (self.mixed_precision_first_n, self.mixed_precision_last_n)
+        return None
 
     def supports_block_reuse(self) -> bool:
         """Block reuse is unchanged because token identity is preserved."""
@@ -7221,6 +7246,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    watermark_config: Optional[WatermarkConfig] = Field(
+        default=None,
+        description=
+        "Enables statistical text watermarking of generated tokens (Gumbel-max). "
+        "Requests may opt out with SamplingParams.watermarking=False unless "
+        "allow_request_opt_out is False. Greedy and beam-search requests cannot "
+        "carry a watermark and are generated normally. The key is a secret and "
+        "must match at detection time (see tensorrt_llm.watermark).",
+        status="prototype")
+
     lm_head_output_dtype: Literal["auto", "float32"] = Field(
         default="auto",
         description=
@@ -7252,7 +7287,8 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         ("Maximum number of top-level encoder inputs processed in one "
          "iteration. For encoder-decoder models, each encoder request counts "
-         "as one input. For multimodal models, each atomic image, video, or "
+         "as one input, and encoder requests beyond it wait for later "
+         "iterations. For multimodal models, each atomic image, video, or "
          "other encoder item counts as one input, even if it expands into "
          "multiple internal attention sequences. For encoder-decoder models, "
          "it also limits encoder CUDA graph batch sizes. Falls back to "
@@ -7261,14 +7297,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     encoder_max_num_tokens: Optional[int] = Field(
         default=None,
-        description=(
-            "Maximum number of encoder tokens. For encoder-decoder models, this "
-            "limits encoder CUDA graph total-token buckets. For multimodal "
-            "models, it limits encoder attention tokens scheduled in one "
-            "iteration and is shared across all encoded modalities. It falls "
-            "back to `max_num_tokens` when unset. Because an atomic multimodal "
-            "item cannot be split, the effective budget is raised to the "
-            "model's largest atomic item when necessary."),
+        description=
+        ("Maximum number of encoder tokens. For encoder-decoder models, this "
+         "limits the total encoder tokens of the requests encoded in one "
+         "iteration: encoder requests beyond it wait for later iterations, "
+         "and a request whose encoder tokens alone exceed it is rejected. It "
+         "also limits encoder CUDA graph total-token buckets. For multimodal "
+         "models, it limits encoder attention tokens scheduled in one "
+         "iteration and is shared across all encoded modalities. It falls "
+         "back to `max_num_tokens` when unset. Because an atomic multimodal "
+         "item cannot be split, the effective budget is raised to the "
+         "model's largest atomic item when necessary."),
         status="prototype")
 
     @model_validator(mode="before")
@@ -7309,6 +7348,18 @@ class TorchLlmArgs(BaseLlmArgs):
         # tensor derives both from the model, and only the engine knows which
         # kind of encoder the model has. It still raises for the token encoders
         # that require them.
+        return self
+
+    @model_validator(mode="after")
+    def validate_watermark_config(self) -> 'TorchLlmArgs':
+        spec = self.speculative_config
+        if (self.watermark_config is not None and spec is not None
+                and spec.spec_dec_mode.is_dspark()):
+            raise ValueError(
+                "watermark_config is not supported with DSpark speculative "
+                "decoding: its ragged verification windows cannot be "
+                "watermarked. Use another speculation mode or drop "
+                "watermark_config.")
         return self
 
     attn_backend: str = Field(
@@ -7838,42 +7889,58 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
-        """Reject runtime features the mixed-precision KV cache does not support."""
-        if self.kv_cache_config.mixed_precision_kv is None:
+        """Reject what the mixed-precision KV cache and the cold-page window do not support."""
+        hot = self.kv_cache_config.mixed_precision_kv is not None
+        cold = getattr(self.kv_cache_compression_config,
+                       "mixed_precision_high_window", None) is not None
+        if not hot and not cold:
             return self
+        feature = "Mixed-precision KV" if hot else "Mixed-precision cold pages"
+        if cold and self.kv_cache_config.dtype == "fp8_ds_mla":
+            # The sparse backends return that layout's indices before the redirect.
+            raise ValueError(
+                f"{feature} do not support kv_cache_config.dtype='fp8_ds_mla'.")
         if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
             raise ValueError(
-                "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
+                f"{feature} requires kv_cache_config.use_kv_cache_manager_v2=True."
             )
-        # get_attention_backend matches the name case-insensitively.
-        if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
+        # Case-insensitive like get_attention_backend; FlashInfer indexes whole pages.
+        backends = "TRTLLM" if cold else "TRTLLM and FLASHINFER"
+        if self.attn_backend.upper() not in backends.split(" and "):
             raise ValueError(
-                "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
-                f"backends; got attn_backend={self.attn_backend!r}.")
+                f"{feature} supports the {backends} attention backend"
+                f"{'' if cold else 's'}; got attn_backend={self.attn_backend!r}."
+            )
         # The connector layout maps every cache layer to one model layer; the
         # mixed-precision high layers break that mapping.
         if self.kv_connector_config is not None:
             raise ValueError(
-                "Mixed-precision KV is not supported together with a KV connector."
-            )
+                f"{feature} is not supported together with a KV connector.")
         if self.sleep_config is not None:
             raise ValueError(
-                "Mixed-precision KV requires KVCacheManagerV2, which does not support "
+                f"{feature} requires KVCacheManagerV2, which does not support "
                 "sleep_config.")
         sparse = self.sparse_attention_config
         if sparse is not None and sparse.algorithm not in ("dsa",
                                                            "deepseek_v4"):
             raise ValueError(
-                "Mixed-precision KV supports the dsa and deepseek_v4 sparse "
+                f"{feature} supports the dsa and deepseek_v4 sparse "
                 f"attention algorithms; got {sparse.algorithm!r}.")
-        if (self.kv_cache_compression_config is not None
-                or self.max_beam_width != 1):
+        if cold and sparse is not None and sparse.enable_kv_cache_offload:
+            # Sparse KV cache offload reads the selected rows from its own
+            # arena, which the redirect to the high layer does not cover.
             raise ValueError(
-                "Mixed-precision KV currently requires single-beam execution "
-                "without cold-page compression.")
+                f"{feature} is not supported together with sparse KV cache "
+                "offload (enable_kv_cache_offload).")
+        if hot and self.kv_cache_compression_config is not None:
+            raise ValueError(
+                "Mixed-precision KV (kv_cache_config.dtype=mixed_*) cannot be "
+                "combined with kv_cache_compression_config.")
+        if self.max_beam_width != 1:
+            raise ValueError(f"{feature} requires single-beam execution.")
         if getattr(self.speculative_config, "use_dynamic_tree", False):
             raise ValueError(
-                "Mixed-precision KV does not support dynamic-tree speculative "
+                f"{feature} does not support dynamic-tree speculative "
                 "decoding, which moves accepted KV rows inside the cache pools."
             )
         return self

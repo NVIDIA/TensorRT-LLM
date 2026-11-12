@@ -595,6 +595,22 @@
           "title": "Algorithm",
           "type": "string"
         },
+        "mixed_precision_first_n": {
+          "default": 0,
+          "description": "Number of leading tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision First N",
+          "type": "integer"
+        },
+        "mixed_precision_last_n": {
+          "default": 0,
+          "description": "Number of most recent tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages. Rejected when a sliding-window layer keeps the same tokens (its window is this value plus one, with the same sink pages): the high layers would share that layer's page group, which the cold-page codec cannot split.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision Last N",
+          "type": "integer"
+        },
         "nvfp4_residual_dim": {
           "default": 64,
           "description": "64 (default): use two independently scaled FP4 components for the 64 DeepSeek-V4 target cold-page RoPE values: a main component and its residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. Ignored for other models, draft caches, and when skip_rope_quantization preserves the original RoPE precision.",
@@ -6824,6 +6840,89 @@
       ],
       "title": "WaitingQueuePolicy",
       "type": "string"
+    },
+    "WatermarkConfig": {
+      "additionalProperties": false,
+      "description": "Configuration of the statistical text watermark applied while sampling.\n\nThe watermark is keyed: the same ``key`` and sampling settings are needed\nto detect it later. ``key`` is a secret and is excluded from ``repr``.",
+      "properties": {
+        "algorithm": {
+          "default": "gumbel",
+          "description": "Watermarking algorithm. 'gumbel' replaces the random draw of the final token selection with a keyed Gumbel-max draw, which leaves the output distribution unchanged on average over keys. 'gumbel_dual_key' is the same for ordinary decoding and additionally supports speculative decoding with rejection sampling: draft tokens are drawn under the key, and the tokens that replace rejected drafts (or follow the last accepted one) under a second key derived from it, which keeps the output distribution exact.",
+          "enum": [
+            "gumbel",
+            "gumbel_dual_key"
+          ],
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "allow_request_opt_out": {
+          "default": true,
+          "description": "Whether a request may disable watermarking with SamplingParams.watermarking=False. Set to False to enforce the watermark on every request that can carry one.",
+          "title": "Allow Request Opt Out",
+          "type": "boolean"
+        },
+        "allow_target_only_watermarking": {
+          "default": false,
+          "description": "Only relevant to rejection-sampling speculative decoding. Accepted draft tokens are then not watermarked, so the signal weakens in proportion to the acceptance rate.",
+          "title": "Allow Target Only Watermarking",
+          "type": "boolean"
+        },
+        "context_width": {
+          "default": 4,
+          "description": "Number of preceding tokens that seed each sampling decision. Larger values make the mark less robust to edits.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Context Width",
+          "type": "integer"
+        },
+        "deduplicate_contexts": {
+          "default": "single_turn",
+          "description": "How repeated contexts are treated. A repeated context would repeat its token and be counted as independent evidence, so it falls back to ordinary sampling. 'none' disables this; 'single_turn' deduplicates within the tokens this request generates; 'all' also searches the prompt (for instance earlier turns of a conversation) and leaves the first context_width generated tokens unwatermarked, so short answers do not share a random context across requests.",
+          "enum": [
+            "none",
+            "single_turn",
+            "all"
+          ],
+          "title": "Deduplicate Contexts",
+          "type": "string"
+        },
+        "deduplicate_contexts_max_history": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 8192,
+          "description": "How many generated positions back the repeated-context search reaches. None means the whole generation.",
+          "title": "Deduplicate Contexts Max History"
+        },
+        "key": {
+          "description": "Secret key, an integer in [0, 2**64). Detection needs the same value.",
+          "exclusiveMaximum": 18446744073709551616,
+          "minimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Key",
+          "type": "integer"
+        },
+        "prf": {
+          "const": "philox",
+          "default": "philox",
+          "description": "Pseudo-random function that turns (key, context) into per-token random numbers. Fast and parallel, but not a cryptographic PRF: it does not protect against key recovery or forgery.",
+          "title": "Prf",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "title": "WatermarkConfig",
+      "type": "object"
     }
   },
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-config.schema.json",
@@ -7446,7 +7545,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
+      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input, and encoder requests beyond it wait for later iterations. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
       "status": "prototype",
       "title": "Encoder Max Batch Size"
     },
@@ -7460,7 +7559,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
+      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits the total encoder tokens of the requests encoded in one iteration: encoder requests beyond it wait for later iterations, and a request whose encoder tokens alone exceed it is rejected. It also limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
       "status": "prototype",
       "title": "Encoder Max Num Tokens"
     },
@@ -8567,6 +8666,19 @@
       "status": "prototype",
       "title": "Use Fine Grained Sync",
       "type": "boolean"
+    },
+    "watermark_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WatermarkConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Enables statistical text watermarking of generated tokens (Gumbel-max). Requests may opt out with SamplingParams.watermarking=False unless allow_request_opt_out is False. Greedy and beam-search requests cannot carry a watermark and are generated normally. The key is a secret and must match at detection time (see tensorrt_llm.watermark).",
+      "status": "prototype"
     }
   },
   "required": [],
