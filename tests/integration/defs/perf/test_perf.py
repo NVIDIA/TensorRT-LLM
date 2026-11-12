@@ -1308,7 +1308,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                        dataset_source: str,
                                        num_requests: Optional[int] = None,
                                        skip_requests: int = 0):
-        """Write a real-text dataset of fixed-length prompts.
+        """Write a real-text dataset with target-length prompts.
 
         Args:
             num_requests: Samples to write; the case's request count if None.
@@ -1360,8 +1360,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if not prompt_ids:
                         continue
                     if len(prompt_ids) < input_len:
-                        # Keep strict fixed-length requests for perf coverage
-                        # by extending short real-dataset prompts.
+                        # Extend short articles to the target token-ID length.
                         repeats = (input_len + len(prompt_ids) -
                                    1) // len(prompt_ids)
                         prompt_ids = (prompt_ids * repeats)[:input_len]
@@ -1389,6 +1388,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         raise ValueError(
                             "Rendered V4.1 prompt and output cap exceed max_seq_len"
                         )
+                elif self._config.model_name in QWEN38_MTP_MODELS:
+                    prompt_ids = tokenizer.encode(prompt_text,
+                                                  add_special_tokens=False)
 
                 sample = {
                     "input": {
