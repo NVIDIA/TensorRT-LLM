@@ -33,7 +33,7 @@ def _function_body(source: str, name: str, next_name: str) -> str:
 class InfraDryRunPipelineTest(unittest.TestCase):
     def test_dry_run_allows_only_the_synthetic_pytest_target(self) -> None:
         expected = "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
-        targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList")
+        targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "isValidSlurmJobId")
 
         self.assertEqual(DRY_RUN_DB.count("::test_"), 1)
         self.assertIn(expected, DRY_RUN_DB)
@@ -51,7 +51,14 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("runInDockerOnNodeMultiStage", agent)
         self.assertIn("runInEnrootOnNode", agent)
         self.assertIn("testList = INFRA_DRY_RUN_TEST_CONTEXT", sbatch)
-        self.assertIn("pytestCommandParts += getInfraDryRunPytestTargets", sbatch)
+        self.assertIn(
+            "def infraDryRunTargets = getInfraDryRunPytestTargets(testListPathLocal)", sbatch
+        )
+        # eval launches append the targets to the pytest command; run_tests.py
+        # launches pass them through slurm_run.sh as --pytest-target.
+        self.assertIn("pytestCommandParts += infraDryRunTargets", sbatch)
+        self.assertIn('export pytestTargets="$pytestTargets"', sbatch)
+        self.assertIn('runTestsArgs+=(--pytest-target "$target")', SLURM_RUN)
         self.assertIn(
             'if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]',
             SLURM_RUN,
@@ -115,24 +122,39 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             classifier.index("retryContext.failureEvidence = evidence"),
         )
 
-    def test_no_rerun_failure_preserves_initial_infra_classification(self) -> None:
-        isolated = _function_body(L0_TEST, "runIsolatedTests", "getInfraDryRunPytestTargets")
+    def test_run_tests_failure_preserves_infra_classification(self) -> None:
         platform = _function_body(
             L0_TEST, "runLLMTestlistOnPlatformImpl", "runLLMTestlistOnPlatform"
         )
-        classify_initial_failure = "classifyFailure(pipeline, e, scope, retryContext)"
 
-        self.assertIn(classify_initial_failure, isolated)
-        self.assertIn("unrerunInfraFailure: unrerunInfraFailure", isolated)
-        self.assertIn(classify_initial_failure, platform)
+        # The run_tests.py step must throw so its pytest timeout records can be read.
+        self.assertNotIn("runTestsExitCode = sh(returnStatus", platform)
+        self.assertIn("runTestsExitCode = shStepExitCode(e)", platform)
+        self.assertIn("runTestsError = e", platform)
+        # Test failures are classified from failure_evidence.log, never from the
+        # step log, which also carries the failure-signature list.
         self.assertIn(
-            "unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure",
+            "pipeline, runTestsError, stageName, retryContext?.scope ?: InfraFailure.K8S",
             platform,
         )
+        self.assertNotIn("classifyFailure(", platform)
+        classifier = _function_body(L0_TEST, "classifyRunTestsFailure", "preservePrimaryFailure")
+        self.assertIn("failure_evidence.log", classifier)
+        self.assertNotIn("collectOriginatingStepEvidence", classifier)
+        throw_infra = platform.index("throw runTestsInfraFailure")
         self.assertLess(
-            platform.index("throw unrerunInfraFailure"),
-            platform.rindex('error "Some tests failed and were not eligible for rerun'),
+            throw_infra,
+            platform.index('error "Some tests still failed after rerun attempts'),
         )
+        self.assertLess(
+            platform.rindex("throw runTestsInfraFailure"),
+            platform.index('error "Some tests failed and were not eligible for rerun'),
+        )
+
+    def test_sh_step_exit_code_is_parsed_from_the_step_error(self) -> None:
+        helper = _function_body(L0_TEST, "shStepExitCode", "BUILD_CONFIGS")
+        self.assertIn("@NonCPS", L0_TEST[: L0_TEST.index("def shStepExitCode")][-40:])
+        self.assertIn("script returned exit code (\\d+)", helper)
 
     def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:
         result_handler = _function_body(
@@ -150,7 +172,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
 
     def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
-        upload_results = _function_body(L0_TEST, "uploadResults", "runIsolatedTests")
+        upload_results = _function_body(L0_TEST, "uploadResults", "getInfraDryRunPytestTargets")
 
         self.assertIn("if (!fileExists(stageName))", upload_results)
         self.assertLess(
