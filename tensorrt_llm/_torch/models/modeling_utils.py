@@ -437,6 +437,22 @@ def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
     return None
 
 
+def fused_checkpoint_names(module: nn.Module, name: str) -> list[str]:
+    """Checkpoint names of the projections fused into ``module``.
+
+    A fused ``Linear`` whose parts are not spelled ``gate_proj``/``up_proj`` or
+    ``q_proj``/``k_proj``/``v_proj`` declares their leaf names in a
+    ``fused_checkpoint_names`` attribute, e.g. ``("index_q_proj",
+    "index_k_proj")``. Both quantization passes match those names instead of
+    the fused module's own name. Returns an empty list when none are declared.
+    """
+    leaves = getattr(module, "fused_checkpoint_names", None)
+    if not leaves:
+        return []
+    prefix = name.rsplit('.', 1)[0]
+    return [f"{prefix}.{leaf}" for leaf in leaves]
+
+
 def apply_layerwise_quant_config(
         model_config: ModelConfig,
         named_modules: Iterator[tuple[str, nn.Module]]) -> None:
@@ -452,7 +468,20 @@ def apply_layerwise_quant_config(
             elif isinstance(module, Linear):
                 weight_mode = module.weights_loading_config.weight_mode
                 prefix_name = '.'.join(name.split('.')[:-1])
-                if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                fused_names = fused_checkpoint_names(module, name)
+                if fused_names:
+                    # The parts load into one weight, so they must agree.
+                    configs = [quant_config_dict.get(n) for n in fused_names]
+                    if any(q is not None for q in configs):
+                        if any(q is None
+                               for q in configs) or any(q != configs[0]
+                                                        for q in configs[1:]):
+                            raise ValueError(
+                                f"{', '.join(fused_names)} load into one fused "
+                                f"projection and need the same quantization, "
+                                f"got {configs}.")
+                        module.quant_config = configs[0]
+                elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
                     for n, q in quant_config_dict.items():
                         # gate_proj and up_proj share the same quant config
                         if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
@@ -521,9 +550,19 @@ def apply_quant_config_exclude_modules(
                             name.replace('qkv_proj', 'k_proj'),
                             name.replace('qkv_proj', 'v_proj')
                         ]
+                fused_names = fused_checkpoint_names(module, name)
+                fused_excluded = [
+                    quant_config.is_module_excluded_from_quantization(n)
+                    for n in fused_names
+                ]
+                if any(fused_excluded) and not all(fused_excluded):
+                    raise ValueError(
+                        f"{', '.join(fused_names)} load into one fused "
+                        f"projection, but exclude_modules excludes only some "
+                        f"of them.")
                 is_excluded = any(
                     quant_config.is_module_excluded_from_quantization(n)
-                    for n in candidates)
+                    for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
                     module.quant_config = new_config

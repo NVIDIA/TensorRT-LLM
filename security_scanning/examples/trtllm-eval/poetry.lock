@@ -5588,14 +5588,14 @@ test = ["packaging", "pytest (>=6.0.1)", "python-dateutil (>=2.8.0,<3.0.0)", "py
 
 [[package]]
 name = "typer"
-version = "0.29.0"
+version = "0.29.1"
 description = "Typer, build great CLIs. Easy to code. Based on Python type hints."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "typer-0.29.0-py3-none-any.whl", hash = "sha256:b3c3de6e06a848274dc7bd56a433499e9cf25fa1d40aa3ba4eccfec4e1624c7b"},
-    {file = "typer-0.29.0.tar.gz", hash = "sha256:6871960a1603fba66af2ff751be48a6735af6480a67660afaf2fab2f7e008ed4"},
+    {file = "typer-0.29.1-py3-none-any.whl", hash = "sha256:00dbc549c13428bec1be55fe1f4d0fb8c6637a310e4f178ef14abe9534ee7b58"},
+    {file = "typer-0.29.1.tar.gz", hash = "sha256:ab6eb3880bf67ce96147734717f9ec333c06f66e361f3ea947d0be43da39f242"},
 ]
 
 [package.dependencies]

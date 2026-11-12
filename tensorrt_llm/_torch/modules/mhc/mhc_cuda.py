@@ -1235,7 +1235,10 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+    if (
+        os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+        or os.getenv("FORCE_MHC_KERNEL_DETERMINISTIC", "0") == "1"
+    ):
         # This fixed FMA tactic has no cross-CTA floating-point atomics and
         # uses the same reduction order for context and generation shapes.
         # Bypass tuning so a cached tactic cannot change the reduction order.

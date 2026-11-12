@@ -381,9 +381,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Single-node experimental adaptation of the NVFP4 DSpark generation
-        # recipe in tests/scripts/perf/disaggregated/
-        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Single-node experimental NVFP4 DSpark generation recipe.
         # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
         # The blog does not provide a tuned single-node NVFP4 DSpark config.
         {

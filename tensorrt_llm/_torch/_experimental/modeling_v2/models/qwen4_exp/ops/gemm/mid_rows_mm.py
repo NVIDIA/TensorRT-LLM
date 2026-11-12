@@ -48,6 +48,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
@@ -272,20 +273,6 @@ def _mbar_expect_tx(addr, nbytes, *, loc=None, ip=None):
         T.i32(),
         [cutlass.Int32(addr), cutlass.Int32(nbytes)],
         "{ mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], $2; mov.u32 $0, 0; }",
-        "=r,r,r",
-        loc,
-        ip,
-        True,
-    )
-
-
-@dsl_user_op
-def _mbar_wait(addr, parity, *, loc=None, ip=None):
-    _asm(
-        T.i32(),
-        [cutlass.Int32(addr), cutlass.Int32(parity)],
-        "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2; "
-        "@!p bra WAIT; mov.u32 $0, 0; }",
         "=r,r,r",
         loc,
         ip,
@@ -729,6 +716,7 @@ class _MidMm:
         )
         sx_s = cutlass.Int32(sXt.iterator.toint())
         red_bar = cutlass.Int32(storage.red_mbar.ptr.toint())
+        red_mbar_ptr = storage.red_mbar.ptr
         mbox = cutlass.Int32(0)
         if const_expr(ks > 1):
             # The split-K mailbox: units of 32 weight rows x 4 activation rows (fp32, 512
@@ -1014,7 +1002,19 @@ class _MidMm:
             # the mailbox barrier) in rank order and stores them: an item is one unit's weight
             # row (lane) and its 4 activation rows; consecutive threads take consecutive rows.
             if warp_idx < self.mma_warp_id:
-                _mbar_wait(red_bar, 0)
+                # The peers' partials arrive by st.async, whose complete-tx releases at cluster
+                # scope: a relaxed cluster-scope wait followed by an acquire fence restricted to
+                # shared::cluster is the ISA's acquire pattern for it. Unlike .acquire.cluster on
+                # the wait itself it makes ptxas emit no L1 invalidate (the mailbox is shared
+                # memory, which never lives in L1).
+                while not prims.mbarrier_try_wait_parity(
+                    red_mbar_ptr,
+                    0,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
+                ):
+                    pass
+                prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
                 sw2 = cutlass.Float32(1.0)
                 if const_expr(self.w_mode == 1):
                     sw2 = _ldg_f32(sw_base)
