@@ -63,6 +63,7 @@ l0_gb300_musespark:
   - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/kernels/draft_head/test_modeling_v2_draft_head_sampled.py
   - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/test_modeling_v2_dflash_verify_fold_given.py
   - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/test_modeling_v2_context_kv_commit_paged.py
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/attention/test_modeling_v2_context_fmha_fmk_vs_library.py
   # trtllm::fp4_block_scale_moe_prerouted against the stock FP4 block-scale MoE op (the target's
   # prerouted expert calls at TEP4 and TEP8).
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_block_scale_moe_prerouted.py
