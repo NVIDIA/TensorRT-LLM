@@ -33,7 +33,6 @@ schema, lazy-import, or serving validation keeps the baseline fallback.
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
 from cbts.blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree
@@ -194,18 +193,6 @@ class VisualGenRule(Rule):
         affected = resolve_affected_stages(block_filters, self.yaml_index, self._stages_by_yaml)
         if outward:
             shared_filters = block_filters_for_stem(self.yaml_index, CPU_TEST_YAML_STEM)
-            validation_stages = {
-                stem: [
-                    (name, stage)
-                    for name, stage in stages
-                    if "-OnDemand-" not in name
-                    and (
-                        pr.post_merge
-                        or ("Post-Merge" not in name and not re.search(r"\d+_GPUs", name))
-                    )
-                ]
-                for stem, stages in self._stages_by_yaml.items()
-            }
             required = set(_PUBLIC_CPU_CHECKS) | set(_PUBLIC_SERVING_CHECKS)
             for check in sorted(required):
                 check_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
@@ -218,7 +205,9 @@ class VisualGenRule(Rule):
                             check_filters.setdefault(key, {}).setdefault(
                                 _entry_target(entry), set()
                             ).add(entry)
-                if not resolve_affected_stages(check_filters, self.yaml_index, validation_stages):
+                if not resolve_affected_stages(
+                    check_filters, self.yaml_index, self._stages_by_yaml
+                ):
                     return RuleResult(
                         handled_files=claimed,
                         affected_stages=set(),

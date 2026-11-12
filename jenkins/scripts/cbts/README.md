@@ -221,6 +221,11 @@ stages without filtering by trigger mode. Jenkins does not pass `post_merge` to
 the selector. Groovy alone applies the command-selected stage scope, including
 explicit `--stage-list` / `--extra-stage` requests and `--post-merge`.
 
+The selector input has no `post_merge` field. VisualGen public API changes still
+require runnable CPU and serving validation among the candidate stages. Dryrun
+also reports all candidates; it has no `--post-merge` selector mode and does not
+simulate downstream scheduling or shard intersections.
+
 ## How it's invoked (CI)
 
 `getCbtsResult` calls `cbts.command main` twice on the L0_MergeRequest agent
