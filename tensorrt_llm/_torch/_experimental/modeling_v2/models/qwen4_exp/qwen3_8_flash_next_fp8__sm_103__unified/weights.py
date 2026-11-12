@@ -85,9 +85,10 @@ def switch(env: str, on: frozenset = SWITCH_ON) -> bool:
 
 
 #: Opt-in (`rr`; default off) block-major copy of every MoE layer's routed experts for
-#: `ops/moe/moe_tpb_decode` (attention TP4 only): expert e's 128-row intermediate block b on rank
-#: (e + b) % 4, plus this rank's slice of the shared expert. The whole-expert window stays for
-#: prefill and the runner, so the copy costs one more window per layer (~31 GB / rank at tep4).
+#: `ops/moe/moe_tpb_decode` (tp4 and tep4 only, `moe_tpb_enabled`; `check_deployment` declines
+#: it at another layout): expert e's 128-row intermediate block b on rank (e + b) % 4, plus this
+#: rank's slice of the shared expert. The whole-expert window stays for prefill and the runner,
+#: so the copy costs one more window per layer (~31 GB / rank at tep4).
 MOE_TPB_ENV = "TRTLLM_MODELING_V2_DECODE_MOE_TPB"
 
 

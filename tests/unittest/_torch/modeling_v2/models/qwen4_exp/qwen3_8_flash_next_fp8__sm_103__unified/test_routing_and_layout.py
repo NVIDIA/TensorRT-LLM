@@ -27,6 +27,7 @@ from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import duplicate_kv_weight
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi import QSASparseAttentionConfig
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
@@ -407,20 +408,26 @@ def test_another_moe_backend_or_gpu_or_no_gdn_replay_declines(on_sm103, monkeypa
     with pytest.raises(ValueError, match="TRTLLM_USE_GDN_FLASHINFER_REPLAY"):
         modeling_v2_resolve(_routed_config("tep4", _MTP3), _llm_args("require"))
     monkeypatch.delenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY")
-    # An all-to-all MoE the deployment cannot run: no attention DP, or no MNNVL.
+    # Attention TP has no MoE round trip: the stock override is ignored there, as the stock
+    # factory ignores it.
+    for method in ("nvlink_one_sided", "NVLINK_TWO_SIDED"):
+        monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, method)
+        for member in ("tp2", "tep4"):
+            _admitted(_routed_config(member))
+    # An attention-DP all-to-all MoE the deployment cannot run: no MNNVL.
     monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "nvlink_one_sided")
-    with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED"):
-        modeling_v2_resolve(_routed_config("tep4"), _llm_args("require"))
     with mock.patch(
         "tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided.NVLinkOneSided"
         ".is_platform_supported",
         return_value=False,
     ):
-        with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED"):
-            modeling_v2_resolve(_routed_config("dep4"), _llm_args("require"))
+        config = _routed_config("dep4")
+        assert modeling_v2_resolve(config, _llm_args("auto")) is None
+        with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED at dep4"):
+            modeling_v2_resolve(config, _llm_args("require"))
     # A stock method the target does not run declines rather than routing as the default.
     monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "NVLINK_TWO_SIDED")
-    with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_TWO_SIDED"):
+    with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_TWO_SIDED at dep4"):
         modeling_v2_resolve(_routed_config("dep4"), _llm_args("require"))
     # `ALLGATHER`, in any case, is the default round trip.
     monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "allgather")
@@ -430,6 +437,54 @@ def test_another_moe_backend_or_gpu_or_no_gdn_replay_declines(on_sm103, monkeypa
     with pytest.raises(ValueError, match=f"{W.MOE_TPB_ENV}='1': expected rr"):
         modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
     monkeypatch.delenv(W.MOE_TPB_ENV)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("strategy", ["UB", "LOWPRECISION"])
+def test_a_strategy_only_the_stock_module_sets_up_declines(on_sm103, strategy):
+    """The target calls the all-reduce op directly: under attention TP a strategy whose buffers
+    the stock `AllReduce` module sets up declines; with no TP sum (one rank, attention DP) it is
+    admitted."""
+    for member in ("tp2", "tep2", "tp4", "tep4"):
+        config = replace(_routed_config(member), allreduce_strategy=AllReduceStrategy[strategy])
+        assert modeling_v2_resolve(config, _llm_args("auto")) is None
+        with pytest.raises(ValueError, match=f"allreduce_strategy={strategy} at {member}"):
+            modeling_v2_resolve(config, _llm_args("require"))
+    for member in ("tp1", "dep2", "dep4"):
+        _admitted(replace(_routed_config(member), allreduce_strategy=AllReduceStrategy[strategy]))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "strategy", ["NCCL", "NCCL_SYMMETRIC", "MIN_LATENCY", "ONESHOT", "TWOSHOT", "MNNVL"]
+)
+def test_a_strategy_the_target_runs_is_admitted(on_sm103, strategy):
+    """The raw all-reduce op runs these; MNNVL takes the target's MNNVL sum and the raw op at
+    AUTO."""
+    for member in ("tp2", "tep4"):
+        _admitted(replace(_routed_config(member), allreduce_strategy=AllReduceStrategy[strategy]))
+
+
+@pytest.mark.cpu_only
+def test_a_switch_that_would_do_nothing_declines(on_sm103, monkeypatch):
+    """`MOE_TPB_ENV=rr` outside tp4 / tep4 and `ROWTILE_SCRATCH_GROUPS_ENV` without an FP8 KV
+    cache decline, so a run that sets one never measures the target without it."""
+    monkeypatch.setenv(W.MOE_TPB_ENV, "rr")
+    for member in ("tp1", "tp2", "tep2", "dep2", "dep4"):
+        config = _routed_config(member)
+        assert modeling_v2_resolve(config, _llm_args("auto")) is None
+        with pytest.raises(ValueError, match=f"{W.MOE_TPB_ENV}=rr at {member}"):
+            modeling_v2_resolve(config, _llm_args("require"))
+    for member in ("tp4", "tep4"):
+        _admitted(_routed_config(member))
+    monkeypatch.delenv(W.MOE_TPB_ENV)
+    monkeypatch.setenv(M.ROWTILE_SCRATCH_GROUPS_ENV, "1")
+    for kv, stored in ((KvCacheConfig(), "bf16"), (KvCacheConfig(dtype="nvfp4"), "NVFP4")):
+        config = _routed_config("tep4")
+        assert modeling_v2_resolve(config, _llm_args("auto", kv_cache_config=kv)) is None
+        with pytest.raises(ValueError, match=f"{M.ROWTILE_SCRATCH_GROUPS_ENV} with a {stored} KV"):
+            modeling_v2_resolve(config, _llm_args("require", kv_cache_config=kv))
+    _admitted(_routed_config("tep4"), kv_cache_config=KvCacheConfig(dtype="fp8"))
 
 
 @pytest.mark.cpu_only
@@ -503,7 +558,7 @@ def _mtp(max_draft_len: int = 3) -> MTPDecodingConfig:
     return MTPDecodingConfig(max_draft_len=max_draft_len)
 
 
-def _core(member: str, rank: int, spec_config=None):
+def _core(member: str, rank: int, spec_config=None, **config):
     model_config = ModelConfig(
         pretrained_config=Qwen4ExpTextConfig(**_TEXT),
         mapping=_mapping(member, rank),
@@ -512,6 +567,7 @@ def _core(member: str, rank: int, spec_config=None):
         moe_backend_requested="TRTLLM",
         sparse_attention_config=QSASparseAttentionConfig(),
         spec_config=spec_config,
+        **config,
     )
     composite = SimpleNamespace(
         vision_config=Qwen4ExpVisionConfig(**_VISION), image_token_id=248056, video_token_id=248057
@@ -522,6 +578,122 @@ def _core(member: str, rank: int, spec_config=None):
         torch.device("meta"),
     ):
         return M.Qwen4ExpUnifiedModelingV2(model_config, composite)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("strategy", ["AUTO", "MNNVL", "NCCL"])
+def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, monkeypatch) -> None:
+    """At AUTO or MNNVL, sums up to `_TP_SUM_MNNVL_MAX_ROWS` rows take the MNNVL kernel (asked
+    for by name, so one node qualifies) and wider ones the raw op at AUTO, which has no MNNVL
+    branch. Another strategy reaches the raw op as it is; NCCL reads no IPC workspace."""
+    import tensorrt_llm._utils as utils
+    from tensorrt_llm._torch.distributed import ops as dist_ops
+
+    core = _core("tep4", 0, allreduce_strategy=AllReduceStrategy[strategy])
+    asked = []
+
+    def is_mnnvl(mapping, dtype, explicitly_requested=False):
+        asked.append(explicitly_requested)
+        return True
+
+    monkeypatch.setattr(M.MNNVLAllReduce, "is_mnnvl", staticmethod(is_mnnvl))
+    monkeypatch.setattr(dist_ops, "get_allreduce_workspace", lambda mapping: "ipc workspace")
+    monkeypatch.setattr(utils, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(M, "mnnvl_workspace_args", lambda *args: dict(buffers="mnnvl workspace"))
+    monkeypatch.setattr(M, "mnnvl_tp_sum", lambda x, buffers: ("mnnvl", buffers))
+    monkeypatch.setattr(
+        M, "allreduce", lambda x, *args, **kwargs: ("raw", kwargs["strategy"], kwargs["workspace"])
+    )
+    tp_sum = core._tp_sum_op()
+    narrow = torch.zeros(M._TP_SUM_MNNVL_MAX_ROWS, 8)
+    wide = torch.zeros(M._TP_SUM_MNNVL_MAX_ROWS + 1, 8)
+    if strategy == "NCCL":
+        assert asked == []
+        assert tp_sum(narrow) == tp_sum(wide) == ("raw", int(AllReduceStrategy.NCCL), None)
+        return
+    assert asked == [True]
+    assert tp_sum(narrow) == ("mnnvl", "mnnvl workspace")
+    assert tp_sum(wide) == ("raw", int(AllReduceStrategy.AUTO), "ipc workspace")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "strategy, own", [("AUTO", True), ("MNNVL", True), ("NCCL", False), ("ONESHOT", False)]
+)
+def test_the_target_opens_its_own_ipc_buffers_at_auto_or_mnnvl_only(
+    strategy, own, monkeypatch
+) -> None:
+    """`_own_ipc` gates the split index gather's Lamport buffers and the two-rank copy-engine
+    exchange; under another strategy neither is built and both gather over NCCL."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.comm.ce_exchange__sp_pair import (  # noqa: E501
+        CopyEngineExchange,
+    )
+
+    built = []
+    monkeypatch.setattr(M, "can_access_peer", lambda mapping: True)
+    monkeypatch.setattr(M, "get_env_enable_pdl", lambda: True)
+    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(
+        M, "_selection_lamport_build", lambda mapping, size: built.append("lamport") or "lamport"
+    )
+    monkeypatch.setattr(
+        CopyEngineExchange,
+        "create",
+        classmethod(lambda cls, mapping, capacity: built.append("ce") or "ce"),
+    )
+    core = SimpleNamespace(
+        attn_tp_size=2,
+        dp_size=1,
+        mapping=_mapping("tep2", 0),
+        allreduce_strategy=int(AllReduceStrategy[strategy]),
+        token_topk=2048,
+        compress_ratio=4,
+        max_num_tokens=8192,
+        hidden=HIDDEN,
+        model_config=SimpleNamespace(cuda_graph_batch_sizes=()),
+        _side_stream=SimpleNamespace(device="cpu"),
+        tp_sum=None,
+    )
+    assert M._own_ipc(core) is own
+    assert (M._index_split_lamport(core) is not None) is own
+    # The prefill target's construction, its views and graphs stubbed out.
+    monkeypatch.setattr(M, "_layer_views", lambda core: None)
+    monkeypatch.setattr(M, "_stack_views", lambda core: None)
+    monkeypatch.setattr(M, "_keyed_eager_on_graph", lambda *args, **kwargs: None)
+    monkeypatch.setattr(M._KvRangeProbe, "for_target", classmethod(lambda cls, core, on: None))
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(torch.cuda, "Event", lambda: None)
+    assert (M.PrefillTarget(core)._ce_exchange is not None) is own
+    assert built == (["lamport", "ce"] if own else [])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "strategy, fp32_acc, fused",
+    [
+        ("AUTO", None, True),
+        ("AUTO", "1", True),
+        ("AUTO", "0", False),
+        ("MNNVL", None, False),
+        ("NCCL", None, False),
+    ],
+)
+def test_the_fused_decode_sum_runs_at_auto_with_fp32_accumulation(
+    strategy, fp32_acc, fused, monkeypatch
+) -> None:
+    """`hc_allreduce_inject_norm` sums in fp32 only: under the stock all-reduce's opt-out
+    (`AR_FP32_ACC_ENV=0`) and at a strategy other than AUTO the decode sites sum through
+    `tp_sum`."""
+    monkeypatch.setattr(M, "can_access_peer", lambda mapping: True)
+    monkeypatch.setattr(M, "allreduce_group_args", lambda mapping, s: dict(workspace="ipc"))
+    if fp32_acc is None:
+        monkeypatch.delenv(M.AR_FP32_ACC_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.AR_FP32_ACC_ENV, fp32_acc)
+    state = _core("tep4", 0, allreduce_strategy=AllReduceStrategy[strategy])._hc_ar_inject()
+    assert (state is not None) is fused
+    if fused:
+        assert (state.workspace, state.rank, state.nranks) == ("ipc", 0, 4)
 
 
 #: Every rank; MTP with 7 drafts at a member's last rank, 1 elsewhere, and none at dep2.
