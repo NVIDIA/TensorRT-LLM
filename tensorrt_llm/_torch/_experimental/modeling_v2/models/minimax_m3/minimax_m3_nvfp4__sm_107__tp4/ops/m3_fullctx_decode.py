@@ -3,7 +3,7 @@
 """MiniMax-M3 full-context FP8 decode attention on Rubin: ``fullctx_decode``.
 
 The dense layers (0-2) attend every token of their FP8 E4M3 (unscaled) paged KV cache. On SM 10.7 the stock call
-(flashinfer trtllm-gen, ``minimax_m3_trtllm_gen_dense_decode``) caps its split at 16 cluster CTAs per (request, KV
+(trtllm-gen, ``minimax_m3_trtllm_gen_dense_decode``) caps its split at 16 cluster CTAs per (request, KV
 head): at TP4 (16 query heads and 1 KV head per rank) one request runs on 16 CTAs of 212 and takes 33.4-33.8 us
 per call at 165k tokens.
 
