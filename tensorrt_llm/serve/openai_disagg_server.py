@@ -139,6 +139,9 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_disagg_request_id(self, disagg_request_id: int):
         self.disagg_request_id = disagg_request_id
         self.request_id = str(disagg_request_id)
+        # A route that names its reply after the request (Anthropic Messages)
+        # reads it here, the id the perf metrics record.
+        self.raw_req.state.disagg_request_id = disagg_request_id
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
@@ -483,10 +486,15 @@ class OpenAIDisaggServer:
             return anthropic_error_response(str(e.detail), error_type,
                                             e.status_code)
 
+        # The reply is named after the disaggregated request rather than the
+        # worker's own id for it (see anthropic_message_id).
+        disagg_request_id = getattr(raw_request.state, "disagg_request_id",
+                                    None)
         if isinstance(openai_response, StreamingResponse):
             return StreamingResponse(
                 content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model),
+                                              model=request.model,
+                                              request_id=disagg_request_id),
                 media_type="text/event-stream",
             )
 
@@ -505,7 +513,8 @@ class OpenAIDisaggServer:
         try:
             chat_response = ChatCompletionResponse(
                 **json.loads(openai_response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response, request_id=disagg_request_id)
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"

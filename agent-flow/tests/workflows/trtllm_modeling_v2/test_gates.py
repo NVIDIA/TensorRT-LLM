@@ -402,6 +402,50 @@ def test_an_op_imported_from_another_target_is_refused_and_copying_it_is_the_fix
     assert "copy it into this target's ops/norm/" in check.detail
 
 
+def test_the_accuracy_test_path_follows_the_tree_layout(tmp_path):
+    """Each accuracy layout the trees have used maps to its own path, and test-db is read by path."""
+    package = tmp_path / delivery.ACCURACY_TESTS_DIR / "modeling_v2"
+    oldest = delivery.accuracy_test_path(tmp_path, "gpt_oss", "t")
+    assert oldest == "test_modeling_v2_gpt_oss.py"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    assert (
+        delivery.accuracy_test_path(tmp_path, "gpt_oss", "t")
+        == "modeling_v2/gpt_oss/t/test_accuracy.py"
+    )
+    (package / "test_gpt_oss.py").write_text("", encoding="utf-8")
+    assert delivery.accuracy_test_path(tmp_path, "gpt_oss", "t") == "modeling_v2/test_gpt_oss.py"
+
+    # Per target, every file is test_accuracy.py: registration must match the path, not the stem.
+    (package / "test_gpt_oss.py").unlink()
+    accuracy_test = "modeling_v2/gpt_oss/t/test_accuracy.py"
+    (package / "gpt_oss" / "t").mkdir(parents=True)
+    (package / accuracy_test.split("/", 1)[1]).write_text("", encoding="utf-8")
+    db = tmp_path / delivery.TEST_DB_DIR
+    db.mkdir(parents=True)
+    (db / "l0_x.yml").write_text(
+        "  - accuracy/modeling_v2/gpt_oss/other/test_accuracy.py::TestOther::test_gsm8k\n",
+        encoding="utf-8",
+    )
+    checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
+    assert checks == {"tests:accuracy-file": True, "tests:test-db": False}
+    (db / "l0_x.yml").write_text(
+        f"  - accuracy/{accuracy_test}::TestT::test_gsm8k\n", encoding="utf-8"
+    )
+    checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
+    assert checks == {"tests:accuracy-file": True, "tests:test-db": True}
+    # An entry may name the target's directory instead of the file; an entry that only shares
+    # a string prefix with the path does not count.
+    (db / "l0_x.yml").write_text(
+        "  - accuracy/modeling_v2/gpt_oss/t TIMEOUT (30)\n", encoding="utf-8"
+    )
+    checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
+    assert checks == {"tests:accuracy-file": True, "tests:test-db": True}
+    (db / "l0_x.yml").write_text("  - accuracy/modeling_v2/gpt\n", encoding="utf-8")
+    checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
+    assert checks == {"tests:accuracy-file": True, "tests:test-db": False}
+
+
 @pytest.mark.skipif(
     not (_REPO_ROOT / catalog_paths.MODELING_V2_PACKAGE).is_dir(),
     reason="not running inside a TensorRT-LLM checkout with modeling_v2 present",
@@ -413,13 +457,13 @@ def test_an_op_imported_from_another_target_is_refused_and_copying_it_is_the_fix
             f"{catalog_paths.MODELING_V2_PACKAGE}/models/gpt_oss/gpt_oss_120b__sm_10x__default",
             "gpt_oss",
             "openai/gpt-oss-120b",
-            "modeling_v2/test_gpt_oss.py",
+            "modeling_v2/gpt_oss/gpt_oss_120b__sm_10x__default/test_accuracy.py",
         ),
         (
             f"{catalog_paths.MODELING_V2_PACKAGE}/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default",
             "deepseek_v3",
             "deepseek-ai/DeepSeek-R1-0528",
-            "modeling_v2/test_deepseek_v3.py",
+            "modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py",
         ),
     ],
     ids=["gpt_oss", "deepseek_v3"],
