@@ -237,6 +237,9 @@ class VideoData(BaseModalityData):
             - duration: Duration of the video in seconds
             - frames_indices: List of indices of the sampled frames
         audio: Structured audio payload from the video, when extracted.
+        is_sampled: Whether the loader intentionally selected fewer source
+            frames. False means full decoding was requested, even if some
+            frames failed to decode; None means the provenance is unknown.
         raw_bytes_hash: BLAKE3 hex digest of the source video bytes when
             available. Populated by media loaders that hold the source
             (e.g. `VideoMediaIO`); `None` when the `VideoData` is
@@ -250,6 +253,7 @@ class VideoData(BaseModalityData):
     metadata: dict[str, Any]
     audio: AudioData | None = None
     raw_bytes_hash: str | None = None
+    is_sampled: bool | None = None
 
     def __post_init__(self) -> None:
         if len(self.frames) == 0:
@@ -264,6 +268,8 @@ class VideoData(BaseModalityData):
         # media IO `num_frames`/`fps` kwargs, so per-request kwarg
         # overrides land here implicitly.
         meta = {k: self.metadata[k] for k in _VIDEO_HASH_METADATA_FIELDS if k in self.metadata}
+        if self.is_sampled is not None:
+            meta["is_sampled"] = self.is_sampled
         _hash_serialized_item(hasher, meta)
         if self.raw_bytes_hash is not None:
             # Source anchor: metadata + source digest is equivalent to

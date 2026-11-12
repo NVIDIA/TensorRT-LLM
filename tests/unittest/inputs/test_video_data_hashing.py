@@ -79,6 +79,17 @@ def test_metadata_change_alters_hash():
     assert _hex(v1) != _hex(v3)
 
 
+@pytest.mark.parametrize("raw_bytes_hash", [None, "a" * 64])
+def test_sampling_provenance_participates_in_cache_identity(raw_bytes_hash):
+    """A full-decode failure and an intentional sample can encode differently."""
+    video = _make_video(raw_bytes_hash=raw_bytes_hash)
+    hashes = []
+    for provenance in (None, False, True):
+        video.is_sampled = provenance
+        hashes.append(_hex(video))
+    assert len(set(hashes)) == 3
+
+
 def test_audio_contributes_to_hash():
     """Adding an audio track changes the digest."""
     audio = AudioData(samples=torch.zeros(1024), sample_rate=16000)

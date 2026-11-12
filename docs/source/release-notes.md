@@ -43,6 +43,12 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Fixed Issues
 
+- Qwen3-VL preserves pre-sampled video frames and source timestamps by default.
+  Standard VideoIO and VideoMME inputs normally retain their 10 and 8 sampled
+  frames, respectively, where the previous path could reduce them to 4.
+  This can increase visual token counts, encoder work and prompt lengths, and
+  change model outputs; review encoder and context token budgets.
+
 ### Known Issues
 
 ## TensorRT-LLM Release 1.3

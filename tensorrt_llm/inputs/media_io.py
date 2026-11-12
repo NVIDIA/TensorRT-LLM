@@ -1030,6 +1030,7 @@ def _load_video_by_cv2(
         frames=loaded_frames,
         metadata=metadata,
         raw_bytes_hash=raw_bytes_hash,
+        is_sampled=num_frames_to_sample < frame_count,
     )
     try:
         frame_bytes = (
