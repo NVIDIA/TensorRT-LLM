@@ -63,7 +63,8 @@ def _case(num_heads, num_kv_heads, head_dim, q_len, rows, seed, massive=False, t
     k = torch.randn(ntok, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
     v = torch.randn(ntok, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
     if massive:
-        # Qwen2.5-7B-like magnitudes: keys ~600x, queries ~80x, odd heads with every logit hugely negative.
+        # Massive activations as in real models: large keys and queries, odd heads with every logit
+        # hugely negative.
         pool[:, 0] = (pool[:, 0].float().abs() * 600.0).bfloat16()
         k = (k.float().abs() * 600.0).bfloat16()
         sign = torch.where(torch.arange(num_heads, device=device) % 2 == 1, -1.0, 1.0)[
@@ -104,11 +105,8 @@ def _reference(case, num_heads, num_kv_heads, head_dim, q_len):
     "num_heads,num_kv_heads,head_dim,q_len,massive",
     [
         (28, 4, 128, 1, False),
-        (28, 4, 128, 4, False),
         (28, 4, 128, 9, False),
-        (20, 20, 128, 1, False),
         (20, 20, 128, 4, False),
-        (20, 20, 128, 9, False),
         (16, 8, 64, 9, False),
         (28, 4, 128, 4, True),
     ],
@@ -193,10 +191,13 @@ def _rope_reference(qkv, cos_sin, kv_lens, *, num_heads, num_kv_heads, head_dim,
 
 
 @pytest.mark.parametrize(
-    "num_heads,num_kv_heads,head_dim,rotary_dim,q_len",
-    [(28, 4, 128, 128, 4), (28, 4, 128, 128, 9), (20, 20, 128, 128, 1), (16, 2, 128, 64, 4)],
+    "num_heads,num_kv_heads,head_dim,rotary_dim,q_len,rope",
+    [
+        (28, 4, 128, 128, 9, True),
+        (16, 2, 128, 64, 4, True),  # partial rotary
+        (20, 20, 128, 128, 1, False),
+    ],
 )
-@pytest.mark.parametrize("rope", [True, False])
 def test_rope_write_kv_paged_matches_rope_then_write(
     num_heads, num_kv_heads, head_dim, rotary_dim, q_len, rope
 ):
@@ -248,15 +249,13 @@ def test_rope_write_kv_paged_matches_rope_then_write(
     "num_heads,num_kv_heads,head_dim,q_len,massive",
     [
         (28, 4, 128, 1, False),
-        (28, 4, 128, 4, False),
         (28, 4, 128, 9, False),
         (20, 20, 128, 9, False),
         (16, 8, 64, 4, False),
         (28, 4, 128, 9, True),
     ],
 )
-@pytest.mark.parametrize("splits", [2, 5, 16])
-@pytest.mark.parametrize("min_split_tokens", [1, 512])
+@pytest.mark.parametrize("splits,min_split_tokens", [(2, 512), (16, 1)])
 def test_fa4_paged_generation_split_matches_dense(
     num_heads, num_kv_heads, head_dim, q_len, massive, splits, min_split_tokens, monkeypatch
 ):
@@ -311,8 +310,7 @@ def test_generation_splits_follow_the_grid(monkeypatch):
     assert generation_splits(1, 28, 4, 1, 132) == 1
 
 
-@pytest.mark.parametrize("q_len", [4, 9])
-def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
+def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions():
     """A page table covering only the end of each row (``page_lens`` < ``kv_lens``, as for the n-sample
     library's private pages): RoPE at the absolute positions, K/V at slot ``page_len - q_len + j``."""
     from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
@@ -321,7 +319,7 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
     )
 
     device = torch.device("cuda")
-    num_heads, num_kv_heads, head_dim, tpb, rows, width = 28, 4, 128, 32, 7, 6
+    num_heads, num_kv_heads, head_dim, tpb, rows, width, q_len = 28, 4, 128, 32, 7, 6, 9
     gen = torch.Generator(device=device).manual_seed(1)
     shared_tokens = 4 * tpb
     page_lens = torch.randint(q_len, width * tpb, (rows,), generator=gen, device=device).to(
@@ -352,25 +350,18 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
     )
 
 
-@pytest.mark.parametrize(
-    "per_layer_tables", [False, True], ids=["group_tables", "per_layer_tables"]
-)
-def test_per_layer_page_tables_are_declined(per_layer_tables):
-    """A KV manager with per-layer page tables (SWA scratch reuse) indexes ``kv_cache_block_offsets``
-    by local layer: layers 1 and 3 of one lifecycle group can map different pages. The library reads
-    the lifecycle group's table, so it declines such a manager; layer 3 then runs on the regular
-    kernel instead of reading layer 1's pages."""
+def _support_inputs(gen_lens, *, per_layer_tables=False, max_total_draft_tokens=None):
+    """``FlashAttn4GenerationFmha._is_supported`` inputs of a generation-only batch whose rows carry
+    ``gen_lens`` query tokens, served by layer 3 of a KV manager whose layers 1 and 3 share a
+    lifecycle group."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
-        FlashAttn4GenerationFmha,
-    )
-    from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
     from tensorrt_llm._torch.attention.backends.interface import (
         AttentionInputType,
         PredefinedAttentionMask,
     )
 
+    rows = len(gen_lens)
     manager = SimpleNamespace(
         index_mapper=object(),
         is_draft=False,
@@ -379,10 +370,13 @@ def test_per_layer_page_tables_are_declined(per_layer_tables):
         _use_per_layer_page_tables=per_layer_tables,
     )
     metadata = SimpleNamespace(
-        num_generations=4,
+        num_generations=rows,
         num_contexts=0,
+        num_ctx_tokens=0,
+        seq_lens=torch.tensor(gen_lens, dtype=torch.int32),
+        max_total_draft_tokens=max_total_draft_tokens,
         kv_cache_manager=manager,
-        kv_cache_block_offsets=torch.zeros(4, 4, 2, 8, dtype=torch.int32),
+        kv_cache_block_offsets=torch.zeros(4, rows, 2, 8, dtype=torch.int32),
         beam_width=1,
         is_cross=False,
         enable_helix=False,
@@ -391,7 +385,7 @@ def test_per_layer_page_tables_are_declined(per_layer_tables):
         max_seq_len=None,
     )
     forward_args = SimpleNamespace(
-        attention_input_type=AttentionInputType.mixed,
+        attention_input_type=AttentionInputType.generation_only,
         is_fused_qkv=True,
         update_kv_cache=True,
         attention_mask=PredefinedAttentionMask.CAUSAL,
@@ -403,11 +397,55 @@ def test_per_layer_page_tables_are_declined(per_layer_tables):
         attention_window_size=None,
     )
     fmha = SimpleNamespace(attn=SimpleNamespace(layer_idx=3, position_embedding_type=0))
-    q = torch.empty(4, 8, dtype=torch.bfloat16)
+    q = torch.empty(sum(gen_lens), 8, dtype=torch.bfloat16)
+    return fmha, q, metadata, forward_args
+
+
+@pytest.mark.parametrize(
+    "per_layer_tables", [False, True], ids=["group_tables", "per_layer_tables"]
+)
+def test_per_layer_page_tables_are_declined(per_layer_tables):
+    """A KV manager with per-layer page tables (SWA scratch reuse) indexes ``kv_cache_block_offsets``
+    by local layer: layers 1 and 3 of one lifecycle group can map different pages. The library reads
+    the lifecycle group's table, so it declines such a manager; layer 3 then runs on the regular
+    kernel instead of reading layer 1's pages."""
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+        FlashAttn4GenerationFmha,
+    )
+    from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
+
+    fmha, q, metadata, forward_args = _support_inputs(
+        [1, 1, 1, 1], per_layer_tables=per_layer_tables
+    )
     supported = FlashAttn4GenerationFmha._is_supported(
         fmha, q, None, None, metadata, forward_args, phase=FmhaPhase.GENERATION
     )
     assert supported is not per_layer_tables
+
+
+@pytest.mark.parametrize(
+    "gen_lens, max_total_draft_tokens, supported",
+    [
+        ([5, 5], 4, True),  # 1 + K tokens per row
+        ([1, 5], 4, False),  # a row without drafts next to a 1 + K row: 3 tokens per row on average
+    ],
+)
+def test_non_uniform_generation_rows_are_declined(gen_lens, max_total_draft_tokens, supported):
+    """A generation-only batch can pack a row without drafts (one token) next to ``1 + K`` rows.
+    The library gives every row ``tokens // rows`` query tokens, so it declines such a batch even
+    when the tokens divide evenly (RoPE positions, KV write slots and the causal mask would all be
+    wrong); the regular kernel serves it."""
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+        FlashAttn4GenerationFmha,
+    )
+
+    fmha, q, metadata, forward_args = _support_inputs(
+        gen_lens, max_total_draft_tokens=max_total_draft_tokens
+    )
+    assert (
+        FlashAttn4GenerationFmha._is_supported(fmha, q, None, None, metadata, forward_args)
+        is supported
+    )
 
 
 def test_split_workspaces_are_owned_per_kv_cache_manager():

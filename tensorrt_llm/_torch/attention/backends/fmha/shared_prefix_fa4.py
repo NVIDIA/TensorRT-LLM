@@ -476,9 +476,8 @@ def fa4_prefix_splits(
 
     The prefix call launches about one CTA per (request, KV head, 128-row tile of the
     request's packed GQA queries) and walks the group's whole prompt in it; a batch of a few
-    rows (a single group) then runs a handful of CTAs: on H100 (Qwen2.5-7B, K=8, 4 rows,
-    4k-token prompt) 8 CTAs. When the rows' query tiles fill less than half the SMs, the
-    group's pages are cut into up to one wave's worth of runs (at most
+    rows (a single group) then runs a handful of CTAs. When the rows' query tiles fill less
+    than half the SMs, the group's pages are cut into up to one wave's worth of runs (at most
     ``FA4_PREFIX_MAX_SPLITS``), each attended by a copy of the queries.
     """
     gqa = max(num_heads // max(num_kv_heads, 1), 1)

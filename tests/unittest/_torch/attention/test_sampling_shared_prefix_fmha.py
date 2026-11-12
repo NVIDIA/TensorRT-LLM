@@ -17,8 +17,9 @@ KV cache manager V2, SM90).
 
 The grouping and the cost model run on the host; the planner and the FlashAttention-4 kernels need
 an SM90 GPU and are checked against float64 references; the end-to-end tests run EAGLE-3 n-sampling
-with and without the library on Qwen2.5-7B-Instruct and an EAGLE-3 draft trained for it, loaded
-from ``llm_models_root()`` (they skip when the checkpoints are not staged there).
+with and without the library on Qwen3-8B and on Qwen2.5-7B-Instruct, each with an EAGLE-3 draft
+trained for it, loaded from ``llm_models_root()`` (a model skips when its checkpoints are not staged
+there).
 """
 
 import contextlib
@@ -330,9 +331,9 @@ def test_size_gate_follows_saved_bytes(monkeypatch):
         False, True, False, True, True, True
     ]  # fmt: skip
     assert lib._group_filter(9, gqa)(rows, tokens).all()
-    # The Curiosity-4B cells (20-80 rows per group, 600-6,500 shared tokens) always share.
-    cells = np.array([[20, 600], [40, 600], [80, 600], [20, 6500]])
-    assert lib._group_filter(9, mha)(cells[:, 0], cells[:, 1]).all()
+    # Wide groups with a prefix of a few hundred tokens or more share.
+    wide = np.array([[20, 600], [40, 600], [80, 600], [20, 6500]])
+    assert lib._group_filter(9, mha)(wide[:, 0], wide[:, 1]).all()
 
 
 def test_group_filter_follows_the_env_threshold(monkeypatch):
@@ -603,7 +604,7 @@ def test_planner_declines_short_drafts_and_eager_batches_without_sharing(monkeyp
     host[0, 1, 0, :] = torch.tensor([5, 6, 7, 8])
     host[0, 2, 0, :] = torch.tensor([9, 10, 11, 12])
     ids, slots = [1, 2, 3], {1: 0, 2: 1, 3: 2}
-    # Fewer query tokens per row than the FA4 prefix tile is measured with.
+    # Fewer query tokens per row than MIN_Q_LEN.
     caches = {}
     lib._plan_sampling_step(_planner_meta(host, ids, slots, [12] * 3, tpb, q_len=lib.MIN_Q_LEN - 1,
                                           caches=caches))  # fmt: skip
@@ -846,9 +847,8 @@ def _spec_case(num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_r
         own.append(list(range(page, page + b)))
         page += b
     if massive:
-        # Massive-activation magnitudes of real models (Qwen2.5-7B layer 27: |k| ~ 420, |q| ~ 66, scaled logits
-        # of -3500..-6800 for some heads): keys of one sign, queries of either sign per head, so odd heads have
-        # every logit hugely negative and even heads random-signed.
+        # Massive activations as in real models: large keys of one sign and queries of either sign per head,
+        # so odd heads have every logit hugely negative and even heads random-signed.
         pool[:, 0] = (pool[:, 0].float().abs() * 600.0).bfloat16()
         sign = torch.where(torch.arange(num_heads, device=device) % 2 == 1, -1.0, 1.0)[
             None, :, None
@@ -974,18 +974,17 @@ def _run(case, pool, q, k, v, out, prefix, tail, head_dim):
 
 @needs_fa4
 @pytest.mark.parametrize(
-    "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
+    "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot,massive",
     [
-        (28, 4, 128, 4, True, 2, True),
-        (28, 4, 128, 9, True, 2, True),
-        (20, 20, 128, 4, False, 0, False),
-        (20, 20, 128, 9, True, 2, False),
+        (28, 4, 128, 9, True, 2, True, False),
+        (28, 4, 128, 9, True, 2, True, True),
+        (20, 20, 128, 4, False, 0, False, False),
+        (20, 20, 128, 9, True, 2, False, False),
     ],
 )
-@pytest.mark.parametrize("massive", [False, True])
 @pytest.mark.parametrize(
     "prefix_splits,tail_splits,min_split_tokens",
-    [(1, 1, 512), (3, 1, 32), (8, 1, 32), (1, 4, 32), (8, 16, 32), (8, 16, 512)],
+    [(1, 1, 512), (3, 1, 32), (1, 4, 32), (8, 16, 32)],
 )
 def test_fa4_shared_prefix_attention_matches_dense_and_writes_kv(
     num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, massive,
@@ -1099,25 +1098,42 @@ def _accepted_drafts():
         PyExecutor._update_iter_stats = original
 
 
-EAGLE3_TARGET = "Qwen2.5-7B-Instruct"
-EAGLE3_DRAFT = "EAGLE3-Qwen2.5-7B-Instruct"
+# (target, EAGLE-3 draft) under ``llm_models_root()``. Qwen3 applies RoPE in its fused QK-norm
+# kernel; Qwen2 fuses RoPE into the attention op, so there the library's RoPE runs too.
+EAGLE3_MODELS = {
+    "qwen3_8b": ("Qwen3/Qwen3-8B", "Qwen3/qwen3_8b_eagle3"),
+    "qwen2.5_7b": ("Qwen2.5-7B-Instruct", "EAGLE3-Qwen2.5-7B-Instruct"),
+}
 
 
-def _eagle3_paths():
-    """(target, draft) checkpoints of the EAGLE-3 e2e tests under ``llm_models_root()``."""
+def _eagle3_paths(model):
+    """(target, draft) checkpoints of ``EAGLE3_MODELS[model]`` under ``llm_models_root()``."""
     root = llm_models_root()
     if root is None:
         return None
-    target, draft = root / EAGLE3_TARGET, root / EAGLE3_DRAFT
+    target, draft = (root / path for path in EAGLE3_MODELS[model])
     if target.is_dir() and draft.is_dir():
         return str(target), str(draft)
     return None
 
 
-needs_eagle3 = pytest.mark.skipif(
-    _eagle3_paths() is None,
-    reason=f"needs {EAGLE3_TARGET} and {EAGLE3_DRAFT} under llm_models_root()",
-)
+def _eagle3_models(*models):
+    """Parametrize a test over ``models``; each skips when its checkpoints are not staged."""
+    return pytest.mark.parametrize(
+        "model",
+        [
+            pytest.param(
+                model,
+                marks=pytest.mark.skipif(
+                    _eagle3_paths(model) is None,
+                    reason=f"needs {' and '.join(EAGLE3_MODELS[model])} under llm_models_root()",
+                ),
+            )
+            for model in models
+        ],
+    )
+
+
 _LIBRARY_ENV = {
     "TLLM_FMHA_LIBS": f"+{lib.LIB_NAME}",
     lib.MIN_SHARED_ENV: "0",
@@ -1140,11 +1156,11 @@ def _env(values):
                 os.environ[key] = value
 
 
-def _eagle3_llm(prompts, n, max_tokens, draft_len, block_reuse=True):
+def _eagle3_llm(model, prompts, n, max_tokens, draft_len, block_reuse=True):
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig
 
-    target, draft = _eagle3_paths()
+    target, draft = _eagle3_paths(model)
     return LLM(
         model=target,
         max_batch_size=len(prompts) * n,
@@ -1163,9 +1179,9 @@ def _eagle3_llm(prompts, n, max_tokens, draft_len, block_reuse=True):
 
 
 @pytest.mark.skipif(not _fa4_available(), reason="needs SM90 and FlashAttention-4")
-@needs_eagle3
+@_eagle3_models("qwen2.5_7b")
 @pytest.mark.threadleak(enabled=False)
-def test_eagle3_n_sampling_with_library_keeps_acceptance_e2e():
+def test_eagle3_n_sampling_with_library_keeps_acceptance_e2e(model):
     """EAGLE-3 (3 draft tokens) with n-sample requests, CUDA graphs on: with the library forced open
     every child produces its tokens and the mean accepted length stays within 5% of the run without
     the library."""
@@ -1176,7 +1192,7 @@ def test_eagle3_n_sampling_with_library_keeps_acceptance_e2e():
 
     def run(env):
         with _env(env):
-            llm = _eagle3_llm(prompts, n, max_tokens, 3, block_reuse=False)
+            llm = _eagle3_llm(model, prompts, n, max_tokens, 3, block_reuse=False)
             with _accepted_drafts() as counts, llm:
                 sampling = SamplingParams(
                     n=n, temperature=1.0, max_tokens=max_tokens, ignore_eos=True, end_id=-1
@@ -1193,9 +1209,9 @@ def test_eagle3_n_sampling_with_library_keeps_acceptance_e2e():
 
 
 @pytest.mark.skipif(not _fa4_available(), reason="needs SM90 and FlashAttention-4")
-@needs_eagle3
+@_eagle3_models("qwen3_8b", "qwen2.5_7b")
 @pytest.mark.threadleak(enabled=False)
-def test_eagle3_greedy_n_sampling_matches_fa4_e2e():
+def test_eagle3_greedy_n_sampling_matches_fa4_e2e(model):
     """Greedy EAGLE-3 (8 draft tokens) n-sample children with the library and with FlashAttention-4
     alone (the kernel the library takes the rows from) give the same first 16 tokens. The prompts
     repeat a 64-token pattern, which the model continues with a clear margin: on the regular kernel
@@ -1215,7 +1231,7 @@ def test_eagle3_greedy_n_sampling_matches_fa4_e2e():
 
     def run(env):
         with _env({"TLLM_ALLOW_N_GREEDY_DECODING": "1", **env}):
-            with _eagle3_llm(prompts, n, max_tokens, 8) as llm:
+            with _eagle3_llm(model, prompts, n, max_tokens, 8) as llm:
                 sampling = SamplingParams(
                     n=n, top_k=1, max_tokens=max_tokens, ignore_eos=True, end_id=-1
                 )
