@@ -22,6 +22,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._errors import ResourceError, UnsupportedError
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
@@ -60,10 +61,10 @@ from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
-                           get_layer_attention_window, is_hybrid_linear,
-                           is_kimi_linear, is_mla, is_nemotron_hybrid,
-                           is_qwen3_hybrid, is_qwen4_exp, resolve_vocab_size,
-                           uses_vswa_kv_cache_layout)
+                           get_layer_attention_window, is_decode_only,
+                           is_hybrid_linear, is_kimi_linear, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+                           resolve_vocab_size, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
@@ -699,7 +700,7 @@ def get_indexer_mqa_logits_workspace_reserve(kv_cache_memory: int,
     if kv_cache_memory <= 0 or workspace_memory <= 0:
         return 0
     if workspace_memory >= kv_cache_memory:
-        raise ValueError(
+        raise ResourceError(
             f"The DeepSeek-V4 Indexer MQA-logits workspace ({workspace_memory} bytes) "
             f"needs the whole KV cache budget ({kv_cache_memory} bytes). Lower "
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET or max_num_tokens, or raise "
@@ -2087,10 +2088,12 @@ class KvCacheCreator:
         # A completed chunk-aware profiling run already prices the cached-KV
         # staging buffers in the measured peak. Do not subtract an additional
         # workspace reserve or install an attended-KV admission cap for it.
+        # A decode-only worker never runs the context-MLA gather at all.
         profiled_mla_chunks = (py_executor is not None and not self._skip_est
                                and self._mla_chunked_profile_length is not None)
-        w_bytes_per_token = (0 if profiled_mla_chunks else
-                             get_attention_workspace_bytes_per_token(
+        w_bytes_per_token = (0 if profiled_mla_chunks
+                             or is_decode_only(self._sparse_attention_config)
+                             else get_attention_workspace_bytes_per_token(
                                  self._model_engine.model.model_config,
                                  self._mapping))
         workspace_is_chunked_prefill_bounded = True
@@ -3099,7 +3102,7 @@ class KvCacheCreator:
         When the split is *infeasible* (the combined fixed cost exhausts the
         budget while either manager has a per-token cost, or exceeds it)
         the shortfall is fatal: both managers need their fixed state resident in
-        GPU memory, so the run would OOM. It raises ``ValueError`` rather than
+        GPU memory, so the run would OOM. It raises ``ResourceError`` rather than
         silently producing an unusable config. A defensive degrade-to-zero path
         for non-GPU budgets remains so the draft never silently inherits the full
         budget and double-allocates it.
@@ -3142,7 +3145,7 @@ class KvCacheCreator:
                 # fatal: both managers need their fixed state resident in GPU
                 # memory, so the run would OOM. Fail fast with actionable
                 # guidance rather than producing an unusable zero-budget draft.
-                raise ValueError(
+                raise ResourceError(
                     f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
                     f"insufficient after the combined fixed cost "
                     f"({intercept_total / GB:.2f} GiB, e.g. SWA or mamba state) "
@@ -4281,11 +4284,11 @@ def validate_kv_cache_compression_compatibility(
     """Reject unsupported KV-cache compression feature combinations."""
     if config.algorithm == "quantization_for_cold_page":
         if config.quant == "nvfp4" and not is_sm_100f():
-            raise RuntimeError(
+            raise UnsupportedError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
                 "(SM100, SM103 or SM107).")
     elif config.algorithm == "triattention" and not is_sm_100f():
-        raise RuntimeError(
+        raise UnsupportedError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")
 
     if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
@@ -5053,6 +5056,7 @@ def create_torch_sampler_args(
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
     max_num_sequences: int,
+    watermark_config=None,
 ):
     # The sampler's per-slot state is indexed by sequence slots, so it must
     # be sized identically to the executor's slot pool.
@@ -5070,6 +5074,7 @@ def create_torch_sampler_args(
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
+        watermark_config=watermark_config,
     )
 
 
@@ -5103,6 +5108,7 @@ def instantiate_sampler(
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
         max_num_sequences=max_num_sequences,
+        watermark_config=getattr(llm_args, "watermark_config", None),
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):

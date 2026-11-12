@@ -23,6 +23,7 @@ import struct
 import threading
 import time
 import weakref
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
@@ -47,6 +48,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     RegMemoryDescs,
     TransferOp,
     TransferRequest,
+    TransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     ReceiverBase,
@@ -94,7 +96,10 @@ from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_unique_pool_memory_descs,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
@@ -202,6 +207,49 @@ class WriteMetaType(Enum):
     AUX = "AUX"
 
 
+@dataclass(frozen=True)
+class _TransferGroup:
+    src_memory_type: str
+    dst_memory_type: str
+    start: int
+    stop: int
+
+
+@dataclass(frozen=True)
+class _TransferRequestGroup:
+    requests: tuple[TransferRequest, ...]
+
+
+class _TransferGroupStatus:
+    """Retain every submitted write until the whole group has completed.
+
+    An incomplete submission has no proof of quiescence, even if the handles
+    returned before a submission error have completed.
+    """
+
+    def __init__(self) -> None:
+        self.statuses: list[TransferStatus] = []
+        self.submission_complete = False
+
+    def is_completed(self) -> bool:
+        return self.submission_complete and all(
+            status.is_completed() is True for status in self.statuses
+        )
+
+    def wait(self) -> bool:
+        completed = self.submission_complete
+        for status in self.statuses:
+            # Wait for every handle, including after another handle fails.
+            completed = status.wait() and completed
+        return completed
+
+    def last_status_str(self) -> str:
+        return "; ".join(
+            getattr(status, "last_status_str", lambda: "<unavailable>")()
+            for status in self.statuses
+        )
+
+
 @dataclass
 class WriteMeta:
     task: Union[SendTaskBase, "KVRecvTask"]
@@ -219,6 +267,7 @@ class WriteMeta:
     receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    transfer_groups: tuple[_TransferGroup, ...] = ()
     kv_result_report_token: bytes = b""
     # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
     transfer_bytes: Optional[int] = None
@@ -935,16 +984,18 @@ class Sender(SenderBase):
         self,
         task: SendTaskBase,
         peer_rank: int,
-        request: TransferRequest,
+        request: TransferRequest | _TransferRequestGroup,
         on_submitted: Optional[Callable[[], None]] = None,
     ) -> tuple[bool, Optional[str]]:
+        requests = request.requests if isinstance(request, _TransferRequestGroup) else (request,)
         owned = self._owns_task(task)
         try:
             # This query cannot submit a transfer. Reject before acquiring backend ownership.
-            if request.op == TransferOp.WRITE and not self._agent.check_remote_descs(
-                request.remote_name, request.dst_descs
-            ):
-                raise RuntimeError("NIXL WRITE remote descriptors unavailable")
+            for member in requests:
+                if member.op == TransferOp.WRITE and not self._agent.check_remote_descs(
+                    member.remote_name, member.dst_descs
+                ):
+                    raise RuntimeError("NIXL WRITE remote descriptors unavailable")
         except Exception as error:
             if owned:
                 task.retire_unsubmitted_physical_operation(peer_rank)
@@ -952,13 +1003,29 @@ class Sender(SenderBase):
                 "NIXL sender rejected transfer before backend submission"
             ) from error
         if not owned:
-            status = self._agent.submit_transfer_requests(request)
-            if on_submitted is not None:
-                with disagg_diagnostics.suppress_diagnostic_errors():
-                    on_submitted()
-            completed = status.wait()
-            detail = None if completed else getattr(status, "last_status_str", lambda: None)()
-            return completed, detail
+            # Finish each group before submitting the next so a later submission
+            # failure cannot abandon an earlier group's in-flight handle.
+            for index, member in enumerate(requests):
+                status = self._agent.submit_transfer_requests(member)
+                if index == 0 and on_submitted is not None:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        on_submitted()
+                if not status.wait():
+                    return False, getattr(status, "last_status_str", lambda: None)()
+            return True, None
+
+        group_status = (
+            _TransferGroupStatus() if isinstance(request, _TransferRequestGroup) else None
+        )
+
+        def submit() -> TransferStatus | _TransferGroupStatus:
+            if group_status is None:
+                return self._agent.submit_transfer_requests(request)
+            for member in request.requests:
+                group_status.statuses.append(self._agent.submit_transfer_requests(member))
+            group_status.submission_complete = True
+            return group_status
+
         with self._ownership_poison_lock:
             if self._ownership_poisoned is not None:
                 error = self._ownership_poisoned
@@ -970,8 +1037,13 @@ class Sender(SenderBase):
         try:
             # SUBMITTING already retains the request. Neither backend admission
             # nor completion may hold the lock needed by deadline containment.
-            status = self._agent.submit_transfer_requests(request)
-            task.record_backend_submission(peer_rank, status)
+            if group_status is not None:
+                # Keep earlier handles if a later submission raises. Until all
+                # submissions finish, the group cannot attest quiescence.
+                task.record_backend_submission(peer_rank, group_status)
+            status = submit()
+            if group_status is None:
+                task.record_backend_submission(peer_rank, status)
         except Exception as error:
             with self._ownership_poison_lock:
                 self._ownership_poisoned = error
@@ -1133,7 +1205,9 @@ class Sender(SenderBase):
 
     @staticmethod
     @nvtx_range("_make_agent_request")
-    def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
+    def _make_agent_request(
+        write_meta: WriteMeta, device_id: int
+    ) -> TransferRequest | _TransferRequestGroup:
         if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
             raise ValueError(
                 f"Pointer/size mismatch for unique_rid={write_meta.unique_rid}: "
@@ -1141,34 +1215,43 @@ class Sender(SenderBase):
                 f"{write_meta.dst_ptrs.size=}, "
                 f"{write_meta.sizes.size=}"
             )
-        n = write_meta.src_ptrs.size
         if write_meta.meta_type == WriteMetaType.AUX:
-            src_dev, dst_dev, mem_type = 0, 0, MemoryType.DRAM
+            groups = (_TransferGroup("DRAM", "DRAM", 0, write_meta.src_ptrs.size),)
         else:
             if write_meta.dst_device_id is None:
                 raise RuntimeError(
                     f"_make_agent_request: dst_device_id is None for KV transfer "
                     f"unique_rid={write_meta.unique_rid}"
                 )
-            src_dev, dst_dev, mem_type = device_id, write_meta.dst_device_id, MemoryType.VRAM
+            groups = write_meta.transfer_groups or (
+                _TransferGroup("VRAM", "VRAM", 0, write_meta.src_ptrs.size),
+            )
 
-        if n == 0:
-            src_memory_descs = MemoryDescs(mem_type, [])
-            dst_memory_descs = MemoryDescs(mem_type, [])
-        else:
+        memory_types = {"VRAM": MemoryType.VRAM, "DRAM": MemoryType.DRAM}
+        requests = []
+        for group in groups:
+            span = slice(group.start, group.stop)
+            src_dev = device_id if group.src_memory_type == "VRAM" else 0
+            dst_dev = write_meta.dst_device_id if group.dst_memory_type == "VRAM" else 0
             src_memory_descs = MemoryDescs.from_arrays_uniform_device(
-                mem_type, write_meta.src_ptrs, write_meta.sizes, src_dev
+                memory_types[group.src_memory_type],
+                write_meta.src_ptrs[span],
+                write_meta.sizes[span],
+                src_dev,
             )
             dst_memory_descs = MemoryDescs.from_arrays_uniform_device(
-                mem_type, write_meta.dst_ptrs, write_meta.sizes, dst_dev
+                memory_types[group.dst_memory_type],
+                write_meta.dst_ptrs[span],
+                write_meta.sizes[span],
+                dst_dev,
             )
-
-        # NOTE: TransferRequest moves (not copies) src/dst MemoryDescs internally.
-        # After this call, src_memory_descs and dst_memory_descs are in a moved-from
-        # state and must NOT be accessed again.
-        return TransferRequest(
-            TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
-        )
+            # TransferRequest moves the descriptors; do not access them afterwards.
+            requests.append(
+                TransferRequest(
+                    TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
+                )
+            )
+        return requests[0] if len(requests) == 1 else _TransferRequestGroup(tuple(requests))
 
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
@@ -1569,13 +1652,13 @@ class Sender(SenderBase):
         # Aggregate fragment pointers from all matching pool pairs.
         # Each pool pair produces one or more region pairs (rp), each containing
         # a numpy array of src/dst pointers and a uniform bytes_per_region.
-        src_frag_parts: list[np.ndarray] = []
-        dst_frag_parts: list[np.ndarray] = []
+        src_frag_parts: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
+        dst_frag_parts: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
         # Instead of calling np.full() per region pair to build a size array and
         # then np.concatenate() all of them, we record (count, bytes_per_region)
         # tuples and construct the final sizes array with a single np.repeat().
         # For 48k+ items this avoids many small allocations in the hot loop.
-        size_specs: list[tuple[int, int]] = []
+        size_specs: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
@@ -1654,20 +1737,38 @@ class Sender(SenderBase):
             else:
                 region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            src_view = lg_info.pool_views[self_pi]
+            dst_view = peer_extractor.page_table.layer_groups[peer_lg].pool_views[peer_pi]
+            memory_types = (
+                get_physical_pool(extractor.page_table, self_lg, src_view.pool_idx).memory_type,
+                get_physical_pool(
+                    peer_extractor.page_table, peer_lg, dst_view.pool_idx
+                ).memory_type,
+            )
             for rp in region_pairs:
-                src_frag_parts.append(rp.src.memory.ptrs)
-                dst_frag_parts.append(rp.dst.memory.ptrs)
-                size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+                if rp.src.memory.ptrs.size == 0:
+                    continue
+                src_frag_parts[memory_types].append(rp.src.memory.ptrs)
+                dst_frag_parts[memory_types].append(rp.dst.memory.ptrs)
+                size_specs[memory_types].append(
+                    (rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region)
+                )
 
+        transfer_groups = []
         if src_frag_parts:
-            src_frags = np.concatenate(src_frag_parts)
-            dst_frags = np.concatenate(dst_frag_parts)
+            src_frags = np.concatenate([p for parts in src_frag_parts.values() for p in parts])
+            dst_frags = np.concatenate([p for parts in dst_frag_parts.values() for p in parts])
             # Build the kv_sizes array in one shot: np.repeat expands each
             # bytes_per_region value by its count, e.g.:
             #   values=[4096, 8192], counts=[100, 200]
             #   → [4096]*100 ++ [8192]*200
-            counts, values = zip(*size_specs)
+            counts, values = zip(*(spec for specs in size_specs.values() for spec in specs))
             kv_sizes = np.repeat(np.array(values, dtype=np.int64), counts)
+            start = 0
+            for (src_type, dst_type), specs in size_specs.items():
+                stop = start + sum(count for count, _ in specs)
+                transfer_groups.append(_TransferGroup(src_type, dst_type, start, stop))
+                start = stop
         else:
             src_frags = np.array([], dtype=np.int64)
             dst_frags = np.array([], dtype=np.int64)
@@ -1693,6 +1794,7 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
+            transfer_groups=tuple(transfer_groups),
             kv_result_report_token=req_info.kv_result_report_token,
             transfer_bytes=transfer_bytes,
         )
@@ -4611,6 +4713,26 @@ class TransferWorker:
             retirement_watchdog=getattr(self, "_retirement_watchdog", None),
         )
 
+    def create_receive_retirement(self, request_id: int) -> RetirementDeadline:
+        """Track an unpublished destination's local access during cancellation.
+
+        Args:
+            request_id: Executor-local identity of the retained destination.
+
+        Returns:
+            A fresh owner using the configured receive grace and containment
+            watchdog. Its caller starts grace with retain_unproven at cancellation;
+            this does not reuse or extend an existing session's deadline.
+
+        Raises:
+            RuntimeError: Physical retirement enforcement is not configured.
+        """
+        if self._retirement_watchdog is None:
+            raise RuntimeError("receive retirement requires an ownership watchdog")
+        return self._retirement_watchdog.create_owner(
+            request_id, "receive", self._config.rx_timeout_s
+        )
+
     def create_rx_session(self, request: LlmRequest) -> RxSession:
         params = request.py_disaggregated_params
         assert params is not None
@@ -4690,14 +4812,15 @@ class TransferWorker:
 
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
-        memory_descs = get_unique_pool_memory_descs(
-            self._rank_info.page_table, self._rank_info.device_id
-        )
-        if memory_descs:
-            reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
-            self._agent.register_memory(reg_memory_desc)
-            logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
-            self._registered_mem.append(reg_memory_desc)
+        for memory_type in ("VRAM", "DRAM"):
+            memory_descs = get_unique_pool_memory_descs(
+                self._rank_info.page_table, self._rank_info.device_id, memory_type
+            )
+            if memory_descs:
+                reg_memory_desc = RegMemoryDescs(memory_type, memory_descs)
+                self._agent.register_memory(reg_memory_desc)
+                logger.debug(f"Registered {memory_type} KV cache memory: {memory_descs}")
+                self._registered_mem.append(reg_memory_desc)
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None
