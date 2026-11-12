@@ -206,6 +206,15 @@ change performance independently of instrumentation. The implementation has
 not yet been validated by this comparison; no zero-overhead or negligible-tail-
 latency claim is established.
 
+## Grafana setup
+
+Use the [Grafana example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/grafana)
+for physical tier occupancy, turnover, final drop, sampled restore-latency and
+skipped-sample panels in Prefill/Decode views. The [setup walkthrough](prometheus-metrics.md#create-a-grafana-dashboard)
+covers offline rendering, datasource/workload selection and explicit publication.
+Missing native observations hide these optional panels; the dashboard does not
+change collection flags or migration timing's default-off setting.
+
 ## Dashboard queries
 
 ### Per-tier resident occupancy
