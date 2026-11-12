@@ -72,6 +72,12 @@ from .utils import log_attention_failure_context
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
 
+def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
+    """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
+    FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
+    return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
+
+
 def _resolve_skip_correction_threshold(threshold: float,
                                        sm_version: int,
                                        *,
@@ -2227,6 +2233,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return (self.is_mla_enable and self.has_fp4_kv_cache
                 and self.sparse_params is None)
 
+    @property
+    def has_fp8_context_mla(self) -> bool:
+        """Whether MLA context attention with an FP8 KV cache runs the op's FP8
+        context MLA FMHA, which reads FP8 Q, K and V."""
+        return (self.is_mla_enable and self.has_fp8_kv_cache
+                and _has_fp8_context_mla_fmha(get_sm_version()))
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = self.quant_config.layer_quant_mode
@@ -2334,12 +2347,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fp8_fallback_layers and fp8_fallback_layers.intersection(
                     mapping.pp_layers(config.num_hidden_layers)):
                 nvfp4_uses_fp8_context = True
-        sm_version = get_sm_version()
         fp8_context_mla = (quant_mode is not None
                            and (quant_mode.has_fp8_kv_cache()
                                 or nvfp4_uses_fp8_context)
-                           and (sm_version == 90 or is_sm_100f(sm_version)
-                                or is_sm_120f(sm_version)))
+                           and _has_fp8_context_mla_fmha(get_sm_version()))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror

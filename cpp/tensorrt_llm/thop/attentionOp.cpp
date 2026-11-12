@@ -2890,6 +2890,34 @@ void MLA::prepareInputs(FmhaParams& p, bool isGen)
                 "Separate-K context FMHA requires contiguous K features within each token");
             TORCH_CHECK(p.value_input->strides()[1] == 1,
                 "Separate-V context FMHA requires contiguous V features within each token");
+            auto const& k = p.key_input.value();
+            auto const& v = p.value_input.value();
+            TORCH_CHECK(k.scalar_type() == v.scalar_type(), "MLA context k and v must have the same dtype.");
+            // FP8 k / v (and an FP8 Q in quant_q_buffer, if given with quant_scale_qkv): the caller already
+            // quantized them for the FP8 context FMHA, which reads them instead of quantizing BF16 inputs.
+            if (k.scalar_type() == torch::kFloat8_e4m3fn)
+            {
+                TORCH_CHECK(mFP8ContextMLA, "FP8 MLA context k / v require the FP8 context MLA FMHA.");
+                TORCH_CHECK(!p.fwd.latent_cache.has_value(),
+                    "FP8 MLA context k / v are for cached-KV context attention, without latent_cache.");
+                TORCH_CHECK(k.is_contiguous() && v.is_contiguous(), "FP8 MLA context k and v must be contiguous.");
+                TORCH_CHECK(k.size(1) == num_heads * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)
+                        && v.size(1) == num_heads * mMLAParams.v_head_dim,
+                    "FP8 MLA context k / v must be [kv_tokens, num_heads * qk_head_dim] / [kv_tokens, num_heads * "
+                    "v_head_dim].");
+                if (p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value())
+                {
+                    auto const& quantQ = p.fwd.quant_q_buffer.value();
+                    TORCH_CHECK(quantQ.scalar_type() == torch::kFloat8_e4m3fn && quantQ.is_contiguous()
+                            && quantQ.numel() >= p.getQueryInput().numel(),
+                        "The FP8 MLA context quant_q_buffer must be a contiguous FP8 copy of q.");
+                }
+            }
+            else
+            {
+                TORCH_CHECK(k.scalar_type() == p.getQueryInput().scalar_type(),
+                    "MLA context k / v must be FP8 E4M3 or have the dtype of q.");
+            }
         }
     }
     else
@@ -3300,6 +3328,8 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
     {
         mla.k_buf = p.getK<T>();
         mla.v_buf = p.getV<T>();
+        mla.fp8_kv_input = p.key_input.has_value() && p.key_input->scalar_type() == torch::kFloat8_e4m3fn;
+        mla.fp8_q_input = mla.fp8_kv_input && p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value();
         mla.helix_position_offsets = p.getHelixPositionOffsets();
         mla.helix_is_inactive_rank = p.getHelixIsInactiveRank();
     }
@@ -3462,8 +3492,21 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
             "FP8 v buffer is required for fp8 context MLA in non-sparse mode");
 
         fmhaParams.qPtr = reinterpret_cast<void const*>(fp8QBuf);
-        fmhaParams.kPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
-        fmhaParams.vPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+        if (useSparseMLA())
+        {
+            fmhaParams.kPtr = nullptr;
+            fmhaParams.vPtr = nullptr;
+        }
+        else if (mla.fp8_kv_input)
+        {
+            fmhaParams.kPtr = reinterpret_cast<void const*>(mla.k_buf);
+            fmhaParams.vPtr = reinterpret_cast<void const*>(mla.v_buf);
+        }
+        else
+        {
+            fmhaParams.kPtr = reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
+            fmhaParams.vPtr = reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+        }
     }
     else
     {

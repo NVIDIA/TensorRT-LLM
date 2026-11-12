@@ -2914,6 +2914,15 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
+def _drafter_reads_helix_sharded_context(
+        decoding_type: Optional[str], attention_backend: Optional[str]) -> bool:
+    """Whether a speculative_config's drafter reads a helix-sharded context.
+
+    Only the standalone MLA DSpark drafter's CUTEDSL block decode does.
+    """
+    return decoding_type == "DSpark" and attention_backend == "CUTEDSL"
+
+
 def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     """What keeps the context and generation servers from sharing draft KV, or None."""
     with_spec = {
@@ -2923,34 +2932,55 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     if with_spec != {"ctx", "gen"}:
         return ("speculative_config in both context_servers and "
                 "generation_servers")
-    if len({(cfg.other_args.get("tensor_parallel_size", 1),
-             bool(cfg.other_args.get("enable_attention_dp", False)))
-            for cfg in server_configs}) != 1:
-        return ("the same tensor_parallel_size and enable_attention_dp in "
-                "context_servers and generation_servers")
+    # Ranks hold the same KV heads when their attention TP matches: attention
+    # DP keeps every head on each rank.
+    if len({
+            1 if cfg.other_args.get("enable_attention_dp", False) else
+            cfg.other_args.get("tensor_parallel_size", 1)
+            for cfg in server_configs
+    }) != 1:
+        return ("the same attention tensor parallelism (tensor_parallel_size, "
+                "or 1 with enable_attention_dp) in context_servers and "
+                "generation_servers")
+    if any(
+            cfg.other_args.get("context_parallel_size", 1) != 1
+            for cfg in server_configs
+    ) and not all(
+            _drafter_reads_helix_sharded_context(
+                cfg.other_args["speculative_config"].get("decoding_type"),
+                cfg.other_args["speculative_config"].get("attention_backend"))
+            for cfg in server_configs):
+        return ("context_parallel_size 1, or DSpark with attention_backend "
+                "CUTEDSL, in both sections")
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
         backend = spec.get("attention_backend")
         if not ((spec.get("decoding_type") == "DFlash" and backend == "TRTLLM")
                 or (spec.get("decoding_type") == "DSpark"
-                    and backend in (None, "AUTO", "TRTLLM"))):
+                    and backend in (None, "AUTO", "TRTLLM", "CUTEDSL"))):
             return ("speculative_config to be DFlash with attention_backend "
-                    "TRTLLM, or DSpark with attention_backend AUTO or TRTLLM, "
-                    "in both sections")
+                    "TRTLLM, or DSpark with attention_backend AUTO, TRTLLM "
+                    "or CUTEDSL, in both sections")
         if (spec.get("draft_len_schedule") is not None
                 or spec.get("max_concurrency") is not None):
             return "draft_len_schedule and max_concurrency to be unset in both sections"
         if cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM":
             return "attn_backend TRTLLM in both sections"
-        if (cfg.other_args.get("pipeline_parallel_size", 1) != 1
-                or cfg.other_args.get("context_parallel_size", 1) != 1):
-            return "pipeline_parallel_size and context_parallel_size to be 1 in both sections"
+        if cfg.other_args.get("pipeline_parallel_size", 1) != 1:
+            return "pipeline_parallel_size 1 in both sections"
         if cfg.other_args.get("kv_cache_compression_config") is not None:
             return "kv_cache_compression_config to be unset in both sections"
         kv_cache = cfg.other_args.get("kv_cache_config") or {}
         if str(kv_cache.get("dtype", "auto")).lower().startswith("mixed_"):
             return "a uniform KV cache dtype in both sections"
-        if kv_cache.get("tokens_per_block", 32) not in (16, 32, 64):
+        tokens_per_block = kv_cache.get("tokens_per_block", 32)
+        if spec.get("decoding_type") == "DSpark" and backend == "CUTEDSL":
+            # The CuTe DSL MLA block decode pages by any divisor of 128 above 1.
+            if tokens_per_block <= 1 or 128 % tokens_per_block:
+                return (
+                    "kv_cache_config.tokens_per_block to divide 128 for "
+                    "DSpark with attention_backend CUTEDSL in both sections")
+        elif tokens_per_block not in (16, 32, 64):
             return "kv_cache_config.tokens_per_block to be 16, 32, or 64 in both sections"
     return None
 

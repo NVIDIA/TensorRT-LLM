@@ -607,6 +607,20 @@ class DFlashForCausalLM(nn.Module):
     # tests), so the config cap stands.
     _runtime_position_ceiling = None
 
+    def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
+        """Whether the block decode reads the context KV from a KV cache
+        manager's pages of ``tokens_per_block`` tokens.
+
+        The worker validates the TRTLLM kernels' page sizes when it binds them.
+        """
+        return self.dflash_attention_backend == "TRTLLM"
+
+    @property
+    def reads_helix_sharded_ctx_pages(self) -> bool:
+        """Whether the block decode reads a context whose pages are sharded over
+        helix CP, merging the ranks' partial attention."""
+        return False
+
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
         """Turn ``AUTO`` into a concrete backend for this drafter family."""
@@ -712,6 +726,9 @@ class DFlashForCausalLM(nn.Module):
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
+        # The block's draft tokens sit in slots 0..K-1 (the DSpark shift_label
+        # convention, set by DSpark heads) instead of 1..K.
+        self.shift_label = False
         self.logit_multiplier, self.logit_softcap = resolve_draft_logit_transform(dflash_config)
         if dflash_attention_backend == "AUTO":
             dflash_attention_backend = self._resolve_auto_attention_backend()

@@ -1313,9 +1313,7 @@ class DSparkWorker(DFlashWorker):
         checkpoint at max_draft_len=7, which is how both published DSpark
         drafters are meant to run.
         """
-        return self.block_width_for(
-            self.spec_config, shift_label=getattr(draft_model, "_dspark_shift_label", False)
-        )
+        return self.block_width_for(self.spec_config, shift_label=draft_model.shift_label)
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
@@ -1326,9 +1324,8 @@ class DSparkWorker(DFlashWorker):
         draft model rather than assumed: a DSpark drafter trained with the
         legacy DFlash slot layout keeps the base class' slots 1..K.
         """
-        shift_label = getattr(draft_model, "_dspark_shift_label", False)
         return dflash_draft_slot_ids(
-            num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
+            num_gens, block_size, num_draft_tokens, draft_model.shift_label, device="cuda"
         )
 
     def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:

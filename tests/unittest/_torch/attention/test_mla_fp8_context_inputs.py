@@ -1,0 +1,216 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""MLA cached-KV context attention with caller-quantized FP8 Q / K / V.
+
+With an FP8 KV cache, the attention op's FP8 context MLA FMHA reads FP8 Q, K and V. Given BF16
+K / V it quantizes them itself (unit scale, round to nearest, saturating). A caller may hand it
+those FP8 tensors directly (``key`` / ``value`` in E4M3, and ``quant_q_buffer`` with
+``quant_scale_qkv``); the output must be bit-identical to handing it the BF16 inputs.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    MLAParams,
+    PositionalEmbeddingParams,
+    RopeParams,
+)
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+NUM_HEADS = 32
+Q_LORA_RANK = 1536
+KV_LORA_RANK = 512
+QK_NOPE_HEAD_DIM = 128
+QK_ROPE_HEAD_DIM = 64
+V_HEAD_DIM = 128
+QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
+MAX_POSITIONS = 4096
+FP8_MAX = 448.0
+
+
+def _make_layer():
+    rope_config = SimpleNamespace(
+        hidden_size=7168,
+        num_attention_heads=NUM_HEADS,
+        rope_scaling={
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 40.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn",
+        },
+        max_position_embeddings=MAX_POSITIONS,
+        rope_theta=10000.0,
+        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+        model_type="deepseek_v3",
+    )
+    return get_attention_backend("TRTLLM")(
+        layer_idx=0,
+        num_heads=NUM_HEADS,
+        head_dim=QK_HEAD_DIM,
+        num_kv_heads=NUM_HEADS,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8.value),
+        q_scaling=1.0,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams.from_config(rope_config),
+            is_neox=False,
+        ),
+        mla_params=MLAParams(
+            q_lora_rank=Q_LORA_RANK,
+            kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+            v_head_dim=V_HEAD_DIM,
+            predicted_tokens_per_seq=1,
+        ),
+    )
+
+
+def _to_e4m3(x: torch.Tensor) -> torch.Tensor:
+    """What the op's unit-scale copy writes: round to nearest, saturating."""
+    return x.float().clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+
+
+@pytest.mark.parametrize(
+    "cached,new", [([256], [128]), ([256, 200], [128, 184])], ids=["one_request", "two_requests"]
+)
+def test_mla_cached_kv_context_fp8_inputs_match_bf16_inputs(cached, new) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    layer = _make_layer()
+    if not layer.has_fp8_context_mla:
+        pytest.skip("this SM has no FP8 context MLA FMHA")
+    scale = layer.kv_scale_orig_quant
+    assert isinstance(scale, torch.Tensor) and bool(torch.all(scale == 1.0))
+
+    torch.manual_seed(7)
+    batch = len(cached)
+    total = [c + n for c, n in zip(cached, new)]
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    tokens_per_block = 32
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=sum(-(-t // tokens_per_block) * tokens_per_block for t in total),
+            enable_block_reuse=False,
+        ),
+        CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max(total),
+        max_batch_size=batch,
+        mapping=mapping,
+        dtype=str_dtype_to_binding(torch_dtype_to_str(torch.float8_e4m3fn)),
+    )
+    metadata_cls = get_attention_backend("TRTLLM").Metadata
+
+    def context_metadata(seq_lens, cached_lens):
+        metadata = metadata_cls(
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+            request_ids=list(range(batch)),
+            max_num_requests=batch,
+            num_contexts=batch,
+            prompt_lens=list(seq_lens),
+            max_num_tokens=sum(seq_lens),
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lens),
+            mapping=mapping,
+            enable_context_mla_with_cached_kv=True,
+        )
+        metadata.prepare()
+        return metadata
+
+    def random_inputs(num_tokens):
+        q = torch.randn(num_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        latent = torch.randn(
+            num_tokens, KV_LORA_RANK + QK_ROPE_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        return q, latent
+
+    try:
+        stream = torch.cuda.current_stream().cuda_stream
+        caches = []
+        for req_id, length in enumerate(cached):
+            kv_cache = manager._create_kv_cache(req_id, None, None)
+            assert kv_cache.resume(stream)
+            kv_cache.capacity = length
+            caches.append(kv_cache)
+        # First chunk: write the cached tokens' latent KV into the FP8 cache.
+        q, latent = random_inputs(sum(cached))
+        layer.mla_rope_append_paged_kv_assign_q(q, latent, context_metadata(cached, [0] * batch))
+
+        for kv_cache, length in zip(caches, total):
+            kv_cache.capacity = length
+        metadata = context_metadata(new, cached)
+        q, latent = random_inputs(sum(new))
+        layer.mla_rope_append_paged_kv_assign_q(q, latent, metadata)
+        compressed_kv, k_pe = layer.load_paged_kv_cache_for_mla(metadata, torch.bfloat16)
+        assert compressed_kv.shape[0] == sum(total)
+
+        kv_b = (
+            torch.randn(
+                KV_LORA_RANK,
+                NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * KV_LORA_RANK**-0.5
+        )
+        k_nope, v = (compressed_kv @ kv_b).split(
+            [NUM_HEADS * QK_NOPE_HEAD_DIM, NUM_HEADS * V_HEAD_DIM], -1
+        )
+        k = torch.cat(
+            (
+                k_nope.reshape(-1, NUM_HEADS, QK_NOPE_HEAD_DIM),
+                k_pe.view(-1, 1, QK_ROPE_HEAD_DIM).expand(-1, NUM_HEADS, -1),
+            ),
+            dim=-1,
+        ).reshape(-1, NUM_HEADS * QK_HEAD_DIM)
+        v = v.contiguous()
+
+        def run(key, value, **fp8_q_args):
+            return layer.forward(
+                q.clone(),
+                key,
+                value,
+                metadata,
+                forward_args=AttentionForwardArgs(
+                    attention_input_type=AttentionInputType.context_only,
+                    latent_cache=None,
+                    **fp8_q_args,
+                ),
+            )
+
+        bf16_out = run(k, v)
+        q_fp8 = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(q, scale)[0]
+        fp8_out = run(_to_e4m3(k), _to_e4m3(v), quant_q_buffer=q_fp8, quant_scale_qkv=scale)
+        fp8_kv_only_out = run(_to_e4m3(k), _to_e4m3(v))
+        torch.cuda.synchronize()
+
+        assert bf16_out.abs().sum() > 0
+        assert torch.equal(fp8_out.view(torch.int16), bf16_out.view(torch.int16))
+        # Without quant_q_buffer the op quantizes Q itself; K / V still come from the caller.
+        assert torch.equal(fp8_kv_only_out.view(torch.int16), bf16_out.view(torch.int16))
+
+        with pytest.raises(RuntimeError, match="same dtype"):
+            run(_to_e4m3(k), v)
+    finally:
+        manager.shutdown()
