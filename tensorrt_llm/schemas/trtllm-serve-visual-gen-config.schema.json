@@ -1289,7 +1289,8 @@
               "quant_attention_config": {
                 "properties": {
                   "ignore": {
-                    "maxItems": 0
+                    "maxItems": 0,
+                    "type": "array"
                   }
                 }
               }
@@ -1301,10 +1302,18 @@
           "quant_config": {
             "properties": {
               "exclude_modules": {
-                "maxItems": 0
+                "maxItems": 0,
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "ignore": {
-                "maxItems": 0
+                "maxItems": 0,
+                "type": [
+                  "array",
+                  "null"
+                ]
               }
             }
           }
@@ -1334,11 +1343,32 @@
       "then": {
         "properties": {
           "quant_config": {
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "config_groups": {
+                      "maxProperties": 0
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "dynamic": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            ],
             "properties": {
               "quant_algo": {
-                "not": {
-                  "type": "null"
-                }
+                "enum": [
+                  "FP8",
+                  "FP8_BLOCK_SCALES",
+                  "FP8_PER_CHANNEL_PER_TOKEN",
+                  "NVFP4"
+                ]
               }
             },
             "required": [
