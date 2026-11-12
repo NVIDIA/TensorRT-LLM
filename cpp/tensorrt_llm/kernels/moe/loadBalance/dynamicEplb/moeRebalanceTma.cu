@@ -1174,7 +1174,7 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint
         if (error == cudaSuccess)
             error = cudaMemset(d.resident, 0xFF, bytes); // -1: no expert is known to be resident.
         if (error == cudaSuccess)
-            error = cudaStreamSynchronize(nullptr); // Cold initialization only.
+            error = cudaStreamSynchronize(nullptr);      // Cold initialization only.
         if (error != cudaSuccess)
             return error;
     }
