@@ -1219,9 +1219,9 @@ def _nccl_ep_replay_slots(
 
 
 def _worker_nccl_ep_cuda_graph_replay(
-    config: CommTestConfig, routing_dtype: torch.dtype, force_window_fallback: bool = False
+    config: CommTestConfig, routing_dtype: torch.dtype, force_window_fallback: bool | None = None
 ) -> dict:
-    """Verify captured LL routing updates with window-backed and fallback outputs."""
+    """Verify routing replay; a non-None fallback flag also requires the selected window path."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
@@ -1275,7 +1275,9 @@ def _worker_nccl_ep_cuda_graph_replay(
         availability = MPI.COMM_WORLD.allgather((comm._ctx.zerocopy_enabled, warmup_uses_window))
         zerocopy_enabled = availability[0][0]
         assert all(enabled == zerocopy_enabled for enabled, _ in availability), availability
-        if zerocopy_enabled:
+        if force_window_fallback is not None:
+            assert zerocopy_enabled, "Window-specific replay requires NCCL-EP zero-copy support"
+        if force_window_fallback is False:
             assert all(available for _, available in availability), availability
 
         allocate = torch.ops.trtllm.allocate_output_with_nccl_window
@@ -1317,7 +1319,7 @@ def _worker_nccl_ep_cuda_graph_replay(
                 )
             )
             # Validate on every rank before any rank enters collective replay.
-            if zerocopy_enabled:
+            if force_window_fallback is not None:
                 assert all(
                     window == (not force_window_fallback) and calls == int(force_window_fallback)
                     for window, calls, _ in capture_states
@@ -2509,7 +2511,7 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
 
 
 def _run_nccl_ep_cuda_graph_replay_test(
-    mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool
+    mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool | None
 ) -> None:
     """Verify graph replay observes routing changed between replays."""
     ep_size = mpi_pool_executor.num_workers
@@ -2534,12 +2536,13 @@ def _run_nccl_ep_cuda_graph_replay_test(
     results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
     for result in results:
         rank = result["rank"]
-        if result["zerocopy_enabled"]:
+        if force_window_fallback is not None:
+            assert result["zerocopy_enabled"], result
             assert result["uses_window"] == (not force_window_fallback), result
         for replay_name in ("local", "peer"):
             replay = result[replay_name]
             assert replay["pointer_stable"], result
-            if force_window_fallback and result["zerocopy_enabled"]:
+            if force_window_fallback:
                 assert replay["uses_persistent_output"], result
             valid_count = replay["valid_count"]
             assert valid_count == 16, (
@@ -3088,9 +3091,11 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
     @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float16, torch.float32])
-    @pytest.mark.parametrize("force_window_fallback", [False, True], ids=["window", "fallback"])
+    @pytest.mark.parametrize(
+        "force_window_fallback", [None, False, True], ids=["routing", "window", "fallback"]
+    )
     def test_nccl_ep_cuda_graph_replay_uses_updated_routing(
-        self, mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool
+        self, mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool | None
     ) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""
         _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype, force_window_fallback)
