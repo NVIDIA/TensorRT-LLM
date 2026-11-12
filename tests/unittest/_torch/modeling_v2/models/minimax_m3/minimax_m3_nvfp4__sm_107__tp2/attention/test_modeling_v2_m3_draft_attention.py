@@ -4,7 +4,7 @@
 
 Every cell runs on the runtime's own objects (``_m3_attn_runtime_tp2``): the target's hybrid NVFP4
 ``MiniMaxM3KVCacheManagerV2`` with its one-model Eagle3 draft layer, the requests allocated in it, drafter
-``TrtllmAttentionMetadata`` over the manager's FP8 draft view (the manager the runtime's draft swap installs) filled
+``TrtllmAttentionMetadata`` over the manager's FP8 draft view (the manager a draft metadata runs on) filled
 by its ``prepare()``, and the drafter's ``TrtllmAttention`` built as ``M3Eagle3Draft`` builds it (fused NeoX RoPE at
 the drafter checkpoint's theta, FP8 KV). Earlier rows go into the draft layer's cache through the in-tree scatter at
 the slots the manager assigned; the call rotates and appends the step's own.

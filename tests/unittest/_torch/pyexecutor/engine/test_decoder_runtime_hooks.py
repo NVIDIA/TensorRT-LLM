@@ -95,6 +95,7 @@ def test_a_default_msa_policy_arms_nothing():
     metadata = _metadata(DEFAULT_RUNTIME_HOOKS, object.__new__(TrtllmAttentionMetadata))
 
     metadata._arm_msa_policy(None)
+    assert metadata._model_metadata_config() == {}
 
 
 def test_an_msa_policy_requires_the_msa_backend_and_cache():
@@ -120,6 +121,7 @@ def test_an_msa_policy_reaches_the_metadata_and_the_cache():
 
     metadata._arm_msa_policy(manager)
 
-    assert metadata.attn_metadata.msa_policy is policy
+    # The policy reaches the metadata as creation configuration (msa_policy).
+    assert metadata._model_metadata_config() == {"msa_policy": policy}
     assert manager.skip_unchanged_block_offsets is True
     assert manager.reuse_pool_views is False

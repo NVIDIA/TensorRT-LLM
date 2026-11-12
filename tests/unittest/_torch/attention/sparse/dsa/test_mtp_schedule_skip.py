@@ -1,15 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""update_for_spec_dec() skips the indexer schedule rebuild only inside an index-sharing draft loop."""
+"""A draft step's before_forward() skips the indexer schedule rebuild only inside an index-sharing draft loop."""
 
 import pytest
 import torch
 from utils.util import skip_pre_hopper
 
-from tensorrt_llm._torch.attention.backends.sparse.dsa import (
-    DSACacheManager,
-    DSAtrtllmAttentionMetadata,
-)
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingConfig
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager, DSAMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -79,7 +78,10 @@ def decode_metadata():
             request_ids=request_ids, token_nums=KV_LENS, is_gen=False
         )
         cached = [kv_len - 1 for kv_len in KV_LENS]
-        metadata = DSAtrtllmAttentionMetadata(
+        # The draft depth sizes the next_n-dependent buffers. Spec-dec attention
+        # stays off, as in draft steps >= 1.
+        metadata = TrtllmAttentionMetadata(
+            extension_types=(DSAMetadata,),
             seq_lens=torch.ones(batch_size, dtype=torch.int),
             request_ids=request_ids,
             max_num_requests=batch_size,
@@ -90,16 +92,9 @@ def decode_metadata():
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
             mapping=mapping,
             sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
-        )
-        # The draft depth is set the way the engine sets it; this also sizes the
-        # next_n-dependent buffers. Spec-dec attention stays off, as in draft steps >= 1.
-        metadata.update_spec_dec_param(
-            batch_size=batch_size,
-            is_spec_decoding_enabled=False,
-            is_spec_dec_tree=False,
-            is_spec_dec_dynamic_tree=False,
-            max_draft_len=MAX_DRAFT_TOKENS,
-            max_total_draft_tokens=MAX_DRAFT_TOKENS,
+            spec_decoding=SpecDecodingConfig(
+                max_draft_len=MAX_DRAFT_TOKENS, max_total_draft_tokens=MAX_DRAFT_TOKENS
+            ),
         )
         metadata.prepare()
         torch.cuda.synchronize()
@@ -110,7 +105,7 @@ def decode_metadata():
 
 
 def _schedule_buffers(metadata):
-    """What on_update_kv_lens(skip_indexer_schedule=True) leaves untouched."""
+    """What a skipped indexer schedule rebuild leaves untouched."""
     return [
         metadata.scheduler_metadata_buffer,
         metadata.scheduler_metadata_buffer_full_next_n,
@@ -129,7 +124,7 @@ def _is_poisoned(metadata):
 
 
 def _kv_lens_buffers(metadata):
-    """What on_update_kv_lens() refreshes from the KV lengths even when it skips the schedule."""
+    """What before_forward() refreshes from the KV lengths even when it skips the schedule."""
     num_tokens = metadata.num_tokens
     num_generations = metadata.num_generations
     return [
@@ -147,10 +142,11 @@ def _snapshot(buffers):
 
 def test_schedule_is_skipped_only_inside_the_draft_loop(decode_metadata):
     metadata = decode_metadata
+    dsa = metadata.ext(DSAMetadata)
 
     # Outside the draft loop: full rebuild.
     _poison(metadata)
-    metadata.update_for_spec_dec()
+    dsa.refresh_from_draft_lengths()
     assert not metadata.indexer_schedule_stale
     assert _is_poisoned(metadata) == [False, False, False]
     before_advance = _snapshot(_kv_lens_buffers(metadata))
@@ -158,21 +154,30 @@ def test_schedule_is_skipped_only_inside_the_draft_loop(decode_metadata):
     # Inside the index-sharing draft loop, after a draft step appends a token: the schedule
     # is left as is and marked stale, but the KV-lens-dependent buffers are still rewritten.
     metadata.set_in_mtp_draft_loop(True)
-    metadata.kv_lens_cuda[: metadata.num_generations] += 1
+    metadata.adjust_kv_lens(slice(0, metadata.num_generations), 1)
     _poison(metadata)
     for buf in _kv_lens_buffers(metadata):
         buf.fill_(-1)
-    metadata.update_for_spec_dec()
+    dsa.refresh_from_draft_lengths()
     assert metadata.indexer_schedule_stale
     assert _is_poisoned(metadata) == [True, True, True]
     in_draft_loop = _snapshot(_kv_lens_buffers(metadata))
 
-    # The next full rebuild (target forward) restores the schedule, clears the marker and
-    # writes the same slot mappings and gen indptrs, which follow the advanced lengths.
-    metadata.on_update_kv_lens()
+    # A full rebuild restores the schedule, clears the marker and writes the same slot
+    # mappings and gen indptrs, which follow the advanced lengths.
+    metadata.set_in_mtp_draft_loop(False)
+    dsa.refresh_from_draft_lengths()
     assert not metadata.indexer_schedule_stale
     assert _is_poisoned(metadata) == [False, False, False]
     full_rebuild = _snapshot(_kv_lens_buffers(metadata))
     for skipped, rebuilt, stale in zip(in_draft_loop, full_rebuild, before_advance):
         assert torch.equal(skipped, rebuilt)
         assert not torch.equal(skipped, stale)
+
+    # The next step's prepare rebuilds the schedule as well.
+    metadata.set_in_mtp_draft_loop(True)
+    dsa.refresh_from_draft_lengths()
+    assert metadata.indexer_schedule_stale
+    metadata.set_in_mtp_draft_loop(False)
+    metadata.prepare()
+    assert not metadata.indexer_schedule_stale

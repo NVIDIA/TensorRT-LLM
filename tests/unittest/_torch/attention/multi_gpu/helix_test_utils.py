@@ -20,6 +20,7 @@ import torch
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features import HelixMetadata
 from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -82,6 +83,7 @@ def split_inputs_for_rank(input_ctx, position_ids_ctx, scenario, rank, world_siz
 
 def activate_all_ranks_for_context(attn_metadata, position_ids):
     """Override helix metadata so all ranks participate in the context step."""
+    attn_metadata.add_ext(HelixMetadata)
     attn_metadata.helix_position_offsets = position_ids
     if (
         hasattr(attn_metadata, "helix_is_inactive_rank")
@@ -126,7 +128,7 @@ def create_helix_gen_metadata(
         ),
         **kwargs,
     )
-    attn_metadata.enable_helix = True
+    attn_metadata.add_ext(HelixMetadata)
     attn_metadata.helix_is_inactive_rank = torch.tensor(
         helix_is_inactive_rank, dtype=torch.bool, device="cuda"
     )

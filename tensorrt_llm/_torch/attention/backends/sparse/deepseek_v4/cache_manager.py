@@ -1680,6 +1680,12 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
             self._device_scratch_slots_staging,
         )
 
+    def prepare_batch_tables(self, request_ids: List[int], num_contexts: int) -> None:
+        # Publish an offloaded batch first; copy_batch_block_offsets then copies
+        # the SWA tables computed here.
+        super().prepare_batch_tables(request_ids, num_contexts)
+        self.compute_sliding_block_tables(request_ids, num_contexts)
+
     @nvtx_range_debug("dsv4_compute_sliding_block_tables")
     def compute_sliding_block_tables(
         self,

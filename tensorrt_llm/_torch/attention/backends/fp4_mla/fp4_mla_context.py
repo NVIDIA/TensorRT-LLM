@@ -25,6 +25,7 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
+from .state import Fp4MlaState
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -340,25 +341,22 @@ def _build_fp8_mla_context_metadata(
         kv_lens_cuda = meta.prompt_lens_cuda_runtime[: meta.num_contexts]
     if kv_lens_cpu is None:
         kv_lens_cpu = meta.prompt_lens_cpu_runtime[: meta.num_contexts]
-    fp8_meta = copy.copy(meta)
-    fp8_meta.fp4_mla_state = None
-    fp8_meta.kv_cache_manager = scratch.cache_manager_view
-    fp8_meta.kv_cache_block_offsets = scratch.block_offsets
-    fp8_meta.block_ids_per_seq = scratch.block_ids_per_seq
-    fp8_meta.prompt_lens_cuda_runtime = meta.prompt_lens_cuda_runtime[: meta.num_contexts]
-    fp8_meta.prompt_lens_cpu_runtime = meta.prompt_lens_cpu_runtime[: meta.num_contexts]
-    fp8_meta.host_request_types_runtime = meta.host_request_types_runtime[: meta.num_contexts]
     # The disposable cache represents only this context invocation. Expose
     # exact context-only lengths so cached prefixes, trailing generation
-    # metadata, and stale totals cannot extend FP8 K/V quantization.
-    fp8_meta.kv_lens_cuda_runtime = kv_lens_cuda
-    fp8_meta.kv_lens_runtime = kv_lens_cpu
-    fp8_meta.host_total_kv_lens = scratch.host_total_kv_lens
-    # Scratch lengths intentionally start from zero. Preserve the actual
-    # absolute positions for Q/K RoPE through the native kernel's explicit
-    # per-token position-offset input.
-    fp8_meta.helix_position_offsets = meta.fp4_mla_state.positions[: meta.num_ctx_tokens]
-    return fp8_meta
+    # metadata, and stale totals cannot extend FP8 K/V quantization. Scratch
+    # lengths intentionally start from zero; the actual absolute positions
+    # reach Q/K RoPE through the native kernel's explicit per-token
+    # position-offset input.
+    return meta.context_scratch_view(
+        kv_cache_manager=scratch.cache_manager_view,
+        kv_cache_block_offsets=scratch.block_offsets,
+        block_ids_per_seq=scratch.block_ids_per_seq,
+        host_total_kv_lens=scratch.host_total_kv_lens,
+        kv_lens_cuda=kv_lens_cuda,
+        kv_lens=kv_lens_cpu,
+        position_offsets=meta.fp4_mla_state.positions[: meta.num_ctx_tokens],
+        without=(Fp4MlaState,),
+    )
 
 
 def _get_fp8_mla_context_metadata(
@@ -366,11 +364,11 @@ def _get_fp8_mla_context_metadata(
     scratch: _Fp8MlaContextScratch,
 ) -> "TrtllmAttentionMetadata":
     """Prepare and reuse one direct metadata view for all layers in a step."""
-    state = meta.fp4_mla_state.fp8_context_state
+    state = meta.fp4_mla_state._fp8_context_view
     if state is not None and state[0] is scratch:
         return state[1]
 
     scratch.prepare(meta)
     fp8_meta = _build_fp8_mla_context_metadata(meta, scratch)
-    meta.fp4_mla_state.fp8_context_state = (scratch, fp8_meta)
+    meta.fp4_mla_state._fp8_context_view = (scratch, fp8_meta)
     return fp8_meta

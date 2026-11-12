@@ -515,7 +515,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             buffers=preparer._buffers,
             attention_runtime_features=AttentionRuntimeFeatures(),
         ).setup_attention(kv_cache_manager)
-        self.assertIs(type(attn_metadata), TrtllmAttentionMetadata)
+        self.assertIsInstance(attn_metadata, TrtllmAttentionMetadata)
         graph_metadata = attn_metadata.create_cuda_graph_metadata(
             len(requests), False, max_draft_len
         )

@@ -15,6 +15,7 @@
 
 import copy
 import os
+import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -29,11 +30,11 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
-from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
-                                         TrtllmAttentionMetadata)
+from ..attention.backends.trtllm import AttentionBackend, TrtllmAttention
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor import step_inputs
 from ..pyexecutor.resource_manager import ResourceManagerType
+from ..utils import get_model_extra_attrs
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -234,70 +235,6 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         return 0
     # DraftTargetOneModel likely shifts by 1 but is unvalidated upstream.
     return None
-
-
-def prepare_attn_metadata_for_draft_replay(attn_metadata,
-                                           draft_kv_cache_manager):
-    """
-    Prepare attention metadata for a draft forward or CUDA graph replay when using a
-    separate draft KV cache. Swaps cache-layout-dependent buffers, refreshes FlashMLA
-    block IDs outside capture, and (for DSA) re-prepares indexer slot mappings
-    for the current batch.
-    Call restore_attn_metadata_after_draft_replay in a finally block.
-    Returns saved state or None if no-op.
-    """
-    if (draft_kv_cache_manager is None
-            or draft_kv_cache_manager is attn_metadata.kv_cache_manager):
-        return None
-    if not isinstance(attn_metadata, TrtllmAttentionMetadata):
-        return None
-    draft_block_offsets = getattr(attn_metadata, 'draft_kv_cache_block_offsets',
-                                  None)
-    if draft_block_offsets is None:
-        return None
-
-    # Marks that a swap happened and carries the backend's state for its
-    # restore hook; swap_for_draft records the originals on attn_metadata.
-    saved = {}
-    if attn_metadata.enable_flash_mla:
-        if (attn_metadata.draft_block_ids_per_seq is None
-                or attn_metadata.draft_kv_block_ids_per_seq is None):
-            raise RuntimeError(
-                "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
-            )
-        attn_metadata.swap_for_draft('block_ids_per_seq',
-                                     attn_metadata.draft_block_ids_per_seq)
-        attn_metadata.swap_for_draft('kv_block_ids_per_seq',
-                                     attn_metadata.draft_kv_block_ids_per_seq)
-    attn_metadata.swap_for_draft('kv_cache_manager', draft_kv_cache_manager)
-    attn_metadata.swap_for_draft('kv_cache_block_offsets',
-                                 attn_metadata.draft_kv_cache_block_offsets)
-    attn_metadata.swap_for_draft(
-        'host_kv_cache_block_offsets',
-        draft_kv_cache_manager.host_kv_cache_block_offsets)
-    if attn_metadata.enable_flash_mla:
-        attn_metadata.prepare_flash_mla()
-
-    # Backends select any additional draft-forward state, such as native DSA
-    # indexer buffers or DeepSeek-V4 sparse tables and pool pointers.
-    backend_saved = attn_metadata.prepare_for_draft_forward()
-    if backend_saved is not None:
-        saved['saved_backend_state'] = backend_saved
-    return saved
-
-
-def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
-    """Restore attention metadata after draft replay. No-op if saved_state is None."""
-    if saved_state is None:
-        return
-    attn_metadata.restore_draft_swaps()
-    if attn_metadata.enable_flash_mla:
-        # Target and draft block-ID buffers are independent. Restoring only
-        # needs to invalidate the scheduler metadata; refreshing the unchanged
-        # target buffers would repeat request-specific H2D work.
-        attn_metadata._flash_mla_metadata_valid = False
-    attn_metadata.restore_after_draft_forward(
-        saved_state.get('saved_backend_state'))
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -1884,6 +1821,9 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
+    # The target metadata of the running draft_loop(), or None.
+    _draft_loop_target = None
+
     def __init__(self,
                  use_separate_draft_kv_cache: bool = False,
                  key_exchange=None):
@@ -1965,9 +1905,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Tolerated forward failures (e.g. an OOM during the max-shape general
         warmup, or an error-budget-tolerated serving exception) must not leak
-        the attn-metadata state saved by prepare_for_spec_dec: a stale save
-        fails every subsequent forward at the pairing assert.
-        https://nvbugs/6442074
+        a worker's transient state into later forwards.
         """
         attn_metadata = kwargs.get("attn_metadata")
         spec_metadata = kwargs.get("spec_metadata")
@@ -2006,17 +1944,12 @@ class SpecWorkerBase(nn.Module, ABC):
                                         True)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
-        """Restore attn-metadata spec-dec state if a failure skipped it.
+        """Undo a worker's transient state if a failed forward skipped it.
 
-        No-op on the success path: workers restore at their preferred point
-        and this sees no saved state. Subclasses with extra transient state
-        (e.g. the deferred kv_lens rewind in PARD/DFlash) extend this.
+        The draft loop changes only ``md.draft``, so the target metadata has
+        nothing to restore; subclasses with transient state of their own
+        (e.g. DFlash's context lengths) extend this.
         """
-        if attn_metadata is not None and attn_metadata.has_spec_dec_saved_state:
-            logger.warning(
-                "Spec-dec worker forward failed between prepare_for_spec_dec "
-                "and restore_from_spec_dec; restoring attn metadata state.")
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
     @property
     @abstractmethod
@@ -2151,20 +2084,6 @@ class SpecWorkerBase(nn.Module, ABC):
         :meth:`target_logits` returns, as :class:`VocabShardedLogits`, in
         place of the gathered target logits. None to receive gathered logits."""
         return None
-
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        """
-        Prepare attention metadata before speculative decoding draft token generation.
-        Saves current state for later restoration.
-        """
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
-        """
-        Restore attention metadata after speculative decoding draft token generation.
-        """
-        attn_metadata.restore_from_spec_dec()
-        attn_metadata.on_update()
 
     def _ensure_force_accept_rng_state(self, device: torch.device) -> None:
         """
@@ -3632,41 +3551,69 @@ class SpecWorkerBase(nn.Module, ABC):
         return None
 
     @contextmanager
-    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+    def draft_loop(self, attn_metadata):
+        """Run one draft loop on the draft metadata of ``attn_metadata``.
+
+        ``with md.draft_loop() as draft`` of the target's ``DraftMetadata``:
+        the draft starts from the target's state (an adopting draft takes its
+        prepared state, any other draft its lengths, counts and spec-dec
+        state), and the loop changes only the draft. While the loop runs, the
+        draft is the model's ``attention_metadata`` extra attribute, which
+        attention custom ops (MLA) read instead of taking the metadata as an
+        argument, and ``refresh_draft()`` refreshes it. A stub metadata (no
+        ``AttentionMetadata``, in unit tests) is yielded as it is.
         """
-        Select draft attention metadata for one-engine speculative decoding.
+        if not isinstance(attn_metadata, AttentionMetadata):
+            yield attn_metadata
+            return
+        if attn_metadata.find("draft_or_none", None) is None:
+            raise RuntimeError(
+                "One-model drafting runs on md.draft: create the attention "
+                "metadata with one_model_draft=True")
+        previous = self._draft_loop_target
+        with attn_metadata.draft_loop() as draft, \
+                self._as_attention_metadata(draft):
+            self._draft_loop_target = attn_metadata
+            try:
+                yield draft
+            finally:
+                self._draft_loop_target = previous
 
-        TRTLLM metadata temporarily swaps its manager and cache-layout-dependent
-        buffers, including DSA indexer offsets and slot mappings.
-        FlashInfer uses an independently planned metadata view because its page
-        tables and kernel wrappers are manager-specific.
+    def refresh_draft(self) -> None:
+        """Refresh the running draft loop's draft before its next forward.
+
+        ``md.refresh_draft()`` of the loop's target: re-derives the draft's
+        length-dependent state when the loop changed its lengths. A no-op
+        outside a loop on a stub metadata.
         """
+        if self._draft_loop_target is not None:
+            self._draft_loop_target.refresh_draft()
 
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if (draft_kv_cache_manager is None
-                or draft_kv_cache_manager is attn_metadata.kv_cache_manager):
+    @contextmanager
+    def _as_attention_metadata(self, attn_metadata):
+        """Make ``attn_metadata`` the model's ``attention_metadata`` extra
+        attribute while the context is open."""
+        attrs = get_model_extra_attrs()
+        current = None if attrs is None else attrs.get("attention_metadata")
+        if current is None or current() is attn_metadata:
             yield attn_metadata
             return
-
-        from ..attention.backends.flashinfer import FlashInferAttentionMetadata
-        if isinstance(attn_metadata, FlashInferAttentionMetadata):
-            yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
-            return
-
-        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
-            yield attn_metadata
-            return
-
-        saved_state = prepare_attn_metadata_for_draft_replay(
-            attn_metadata, draft_kv_cache_manager)
-        if saved_state is None:
-            yield attn_metadata
-            return
-
+        attrs["attention_metadata"] = weakref.ref(attn_metadata)
         try:
             yield attn_metadata
         finally:
-            restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
+            attrs["attention_metadata"] = current
+
+    @contextmanager
+    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+        """The metadata a draft forward runs on: the draft metadata itself.
+
+        ``md.draft`` is built over the draft KV cache (or the target's when
+        shared), so nothing is selected or swapped; while the context is open
+        the draft is the model's ``attention_metadata`` extra attribute.
+        """
+        with self._as_attention_metadata(attn_metadata) as selected:
+            yield selected
 
     def _sample_sharded_temperature(self, logits: torch.Tensor,
                                     temperatures: torch.Tensor) -> torch.Tensor:

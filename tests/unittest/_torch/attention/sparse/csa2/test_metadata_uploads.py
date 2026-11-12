@@ -8,8 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _torch.helpers import bare_extension
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -28,15 +31,25 @@ _DEVICES = [
 ]
 
 
+def _bare_csa2_metadata() -> TrtllmAttentionMetadata:
+    """Metadata built without ``__init__``, carrying a bare CSA2 extension."""
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(bare_extension(CSA2Metadata, metadata))
+    metadata.replace_ext(bare_extension(SpecDecodingMetadata, metadata))
+    return metadata
+
+
 def _metadata(device):
-    metadata = object.__new__(CSA2TrtllmMetadata)
+    metadata = _bare_csa2_metadata()
     metadata.is_cuda_graph = False
     metadata.num_sparse_topk = 256
-    for name in ("query_lens_host", "kv_lens", "prompt_lens_cpu", "host_request_types"):
-        setattr(metadata, name, torch.empty(4, dtype=torch.int32, device="cpu"))
-    for name in ("query_lens_device", "kv_lens_cuda", "prompt_lens_cuda"):
-        setattr(metadata, name, torch.empty(4, dtype=torch.int32, device=device))
+    for name in ("kv_lens", "prompt_lens_cpu", "host_request_types"):
+        setattr(metadata.core(), name, torch.empty(4, dtype=torch.int32, device="cpu"))
+    for name in ("kv_lens_cuda", "prompt_lens_cuda"):
+        setattr(metadata.core(), name, torch.empty(4, dtype=torch.int32, device=device))
     metadata.host_total_kv_lens = torch.zeros(2, dtype=torch.int32, device="cpu")
+    metadata.query_lens_host = torch.empty(4, dtype=torch.int32, device="cpu")
+    metadata.query_lens_device = torch.empty(4, dtype=torch.int32, device=device)
     metadata.prepared_cu_q = torch.empty(5, dtype=torch.int32, device=device)
     metadata.prepared_cu_kv = torch.empty(5, dtype=torch.int32, device=device)
     return metadata

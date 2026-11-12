@@ -6,11 +6,11 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
     CSA2CacheRole,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -58,7 +58,7 @@ def test_context_metadata_omits_decoder_swa_and_preserves_boundary_global(length
         assert manager.prepare_context(request)
         assert manager.resize_context(request, length)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.Metadata(
             max_num_requests=1, max_num_tokens=8192, kv_cache_manager=manager
         )
         metadata.request_ids = [71]
@@ -73,7 +73,7 @@ def test_context_metadata_omits_decoder_swa_and_preserves_boundary_global(length
         for direct in (False, True):
             if direct:
                 metadata.prepare_csa2()
-            metadata.on_update_kv_lens()
+            metadata._refresh_live_endpoints()
             metadata._ensure_swa_slots()
             assert set(metadata.csa2_swa_indices) == set(range(40))
             assert set(metadata._csa2_swa_page_tables) == set(range(20))

@@ -38,7 +38,7 @@ from ..attention.backends.sparse.csa2.decoder_replay import (
     plan_decoder_replay,
     scatter_replayed_rows,
 )
-from ..attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from ..attention.backends.sparse.csa2.metadata import CSA2Metadata, CSA2TrtllmMetadata
 from ..attention.backends.sparse.csa2.module import DeepseekV41Attention as CSA2Attention
 from ..attention.backends.sparse.csa2.params import CSA2Mode
 from ..configs.deepseek_v41 import (
@@ -778,7 +778,9 @@ class DeepseekV41Model(DeepseekV4Model):
     def forward(self, attn_metadata, *args, **kwargs):
         from ..pyexecutor.ced_replay import uses_private_decoder_cache
 
-        attn_metadata.begin_model_forward()
+        csa2 = attn_metadata.find_ext(CSA2Metadata)
+        if csa2 is not None:
+            csa2.reset_forward_state()
         spec_metadata = kwargs.get("spec_metadata")
         if isinstance(spec_metadata, DSparkSpecMetadata):
             spec_metadata.context_capture_lens = None
@@ -1137,24 +1139,22 @@ class DeepseekV41Model(DeepseekV4Model):
         position_ids: torch.Tensor | None,
         input_ids: torch.Tensor | None,
         hc_state: HCState,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, HCState]:
-        """Resolve deferred mHC state, then compact token rows and rebuild metadata."""
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, HCState, CSA2TrtllmMetadata]:
+        """Resolve deferred mHC state, then compact token rows onto the replay metadata."""
         from ..pyexecutor.ced_replay import uses_private_decoder_cache
 
         if not plan.updates_local_metadata:
-            enter_decoder_replay(attn_metadata, plan)
-            return position_ids, input_ids, hc_state
+            return position_ids, input_ids, hc_state, enter_decoder_replay(attn_metadata, plan)
         hc_state = self._resolve_hc_state(hc_state)
         if self.ced_kv_precompute:
             prepare_ced_global_kv(self.layers[self.decoder_replay_split], hc_state, attn_metadata)
-        enter_decoder_replay(
+        replay_metadata = enter_decoder_replay(
             attn_metadata,
             plan,
             self.decoder_replay_split
             if uses_private_decoder_cache(self, attn_metadata.kv_cache_manager)
             else None,
         )
-        attn_metadata.csa2_replay_query_rows = plan.rows
         return (
             gather_replayed_rows(position_ids, plan),
             gather_replayed_rows(input_ids, plan),
@@ -1162,10 +1162,11 @@ class DeepseekV41Model(DeepseekV4Model):
                 gather_replayed_rows(hc_state.residual, plan),
                 pre_mix=gather_replayed_rows(hc_state.pre_mix, plan),
             ),
+            replay_metadata,
         )
 
     def _exit_bounded_replay(self, plan, attn_metadata, hidden_states):
-        """Restore the output layout and metadata after successful Decoder execution."""
+        """Restore the output layout after successful Decoder execution."""
         hidden_states = scatter_replayed_rows(hidden_states, plan)
         exit_decoder_replay(attn_metadata, plan)
         attn_metadata.csa2_decoder_capture_lens = tuple(

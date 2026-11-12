@@ -1348,7 +1348,7 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
         metadata.seq_lens = torch.ones(key.num_contexts, dtype=torch.int32)
         bind_seq_lens = getattr(metadata, "bind_encoder_cuda_graph_seq_lens", None)
         if callable(bind_seq_lens):
-            bind_seq_lens(metadata.seq_lens, key.num_contexts)
+            bind_seq_lens(metadata.seq_lens, key.num_contexts, max_q_len=None)
         return metadata
 
     def refresh_in_place(

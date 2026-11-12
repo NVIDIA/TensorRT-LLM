@@ -33,7 +33,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import (
+    TrtllmAttentionMetadata,
+    TrtllmCoreMetadata,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -57,7 +60,7 @@ def _make_metadata(head_dim, features, kv_dtype=_ABSENT, tokens_per_block=32):
         manager.dtype = kv_dtype
     if tokens_per_block is not _ABSENT:
         manager.tokens_per_block = tokens_per_block
-    with mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers"):
+    with mock.patch.object(TrtllmCoreMetadata, "_allocate_buffers"):
         return TrtllmAttentionMetadata(
             max_num_requests=4,
             max_num_tokens=1024,
@@ -463,7 +466,7 @@ def test_native_lookup_reports_absent_for_an_unbuilt_head_size():
 def test_unknown_head_dim_is_not_guessed():
     """A manager that exposes no head_dim (or no manager at all) cannot be
     judged; the gate must not block it on a guess."""
-    with mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers"):
+    with mock.patch.object(TrtllmCoreMetadata, "_allocate_buffers"):
         metadata = TrtllmAttentionMetadata(
             max_num_requests=4,
             max_num_tokens=1024,

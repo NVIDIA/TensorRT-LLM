@@ -58,7 +58,7 @@ def transform_local_topk_and_prepare_pool_view(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Convert local topk indices to global pool indices and prepare KV pool.
 
-    Uses cached values from attn_metadata._ensure_pool_view_cached()
+    Uses the pool-view values the DSA metadata caches (DSAMetadata._ensure_pool_view_cached)
     to avoid redundant Python/CUDA overhead across layers.
     """
     assert topk_indices.dtype == torch.int32
@@ -987,9 +987,10 @@ class Glm52Indexer(nn.Module):
             ctx_rows = topk_indices_buffer[ctx_last]
             rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
         if rows is not None:
-            shared_topk_indices = metadata.shared_topk_indices
+            index_share = metadata.index_share
+            shared_topk_indices = index_share.shared_topk_indices
             if shared_topk_indices is None:
-                metadata.shared_topk_indices = rows.contiguous()
+                index_share.bind_buffers(shared_topk_indices=rows.contiguous())
             else:
                 row_start = num_contexts if is_generation else 0
                 shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(

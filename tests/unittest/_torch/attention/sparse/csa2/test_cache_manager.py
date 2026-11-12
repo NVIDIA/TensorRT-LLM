@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
     CSA2CacheRole,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     read_index_rows,
@@ -401,7 +401,7 @@ def _request(request_id, tokens):
 
 
 def _metadata(manager, request, metadata=None):
-    metadata = metadata or CSA2TrtllmMetadata(
+    metadata = metadata or CSA2TrtllmAttention.Metadata(
         max_num_requests=1, max_num_tokens=512, kv_cache_manager=manager
     )
     metadata.request_ids = [request.py_request_id]
@@ -416,7 +416,7 @@ def _metadata(manager, request, metadata=None):
 
 
 @pytest.mark.cpu_only
-def test_swa_publication_is_scoped_transaction_with_exact_request_and_destination():
+def test_swa_publication_matches_exact_request_and_destination():
     manager = CSA2CacheManager.__new__(CSA2CacheManager)
     manager._swa_publication_token = manager._swa_publication = None
     manager.pp_layers = [0, 1]
@@ -442,31 +442,32 @@ def test_swa_publication_is_scoped_transaction_with_exact_request_and_destinatio
     manager.compute_batch_page_tables = compute
     destination = torch.full((2, 4, 2, 4), 99, dtype=torch.int32)
     ids = [3, 3, 1]  # Repeated padding IDs retain packed row order.
-    with manager._swa_publication_scope() as token:
+    # Each step: the core prepares the batch tables, copies the block offsets
+    # (which publishes the SWA tables) and CSA2's prepare consumes them.
+    manager.prepare_batch_tables(ids, 2)
+    manager.copy_batch_block_offsets(destination, ids, 1, 2, 3)
+    token = manager.consume_swa_publication()
+    assert token is not None
+    device = manager._get_swa_publication(token, destination, ids, 2, 3)
+    torch.testing.assert_close(manager._batch_page_tables[:, :, :3], device, atol=0, rtol=0)
+    assert device.stride(-2) == 8 and torch.all(destination[:, 3] == -1)
+    assert manager._get_swa_publication(token, destination, ids, 2, 5) is None
+    assert manager._get_swa_publication(token, destination, [1, 3, 3], 2, 3) is None
+    assert manager._get_swa_publication(token, destination, ids, 1, 3) is None
+    assert manager._get_swa_publication(token, destination.clone(), ids, 2, 3) is None
+    state["fail"] = True
+    with pytest.raises(ValueError, match="conversion failed"):
         manager.copy_batch_block_offsets(destination, ids, 1, 2, 3)
-        device = manager._get_swa_publication(token, destination, ids, 2, 3)
-        torch.testing.assert_close(manager._batch_page_tables[:, :, :3], device, atol=0, rtol=0)
-        assert device.stride(-2) == 8 and torch.all(destination[:, 3] == -1)
-        assert manager._get_swa_publication(token, destination, ids, 2, 5) is None
-        assert manager._get_swa_publication(token, destination, [1, 3, 3], 2, 3) is None
-        assert manager._get_swa_publication(token, destination, ids, 1, 3) is None
-        assert manager._get_swa_publication(token, destination.clone(), ids, 2, 3) is None
-        state["fail"] = True
-        with pytest.raises(ValueError, match="conversion failed"):
-            manager.copy_batch_block_offsets(destination, ids, 1, 2, 3)
-        assert manager._get_swa_publication(token, destination, ids, 2, 3) is None
-    assert manager._swa_publication_token is manager._swa_publication is None
+    assert manager._get_swa_publication(token, destination, ids, 2, 3) is None
+    assert manager.consume_swa_publication() is None
     state.update(fail=False, offset=100)
-    with manager._swa_publication_scope() as fresh:
-        manager.copy_batch_block_offsets(destination, ids, 1, 2, 3)
-        assert manager._get_swa_publication(token, destination, ids, 2, 3) is None
-        assert manager._get_swa_publication(fresh, destination, ids, 2, 3)[0, 0, 0] == 103
-        destination.set_(torch.empty_like(destination))
-        assert manager._get_swa_publication(fresh, destination, ids, 2, 3) is None
-    with pytest.raises(RuntimeError, match="later preparation failed"):
-        with manager._swa_publication_scope():
-            manager.copy_batch_block_offsets(destination, ids, 1, 2, 3)
-            raise RuntimeError("later preparation failed")
+    manager.prepare_batch_tables(ids, 2)
+    manager.copy_batch_block_offsets(destination, ids, 1, 2, 3)
+    fresh = manager.consume_swa_publication()
+    assert manager._get_swa_publication(token, destination, ids, 2, 3) is None
+    assert manager._get_swa_publication(fresh, destination, ids, 2, 3)[0, 0, 0] == 103
+    manager.close_swa_publication(fresh)
+    assert manager._get_swa_publication(fresh, destination, ids, 2, 3) is None
     assert manager._swa_publication_token is manager._swa_publication is None
 
 
@@ -494,7 +495,7 @@ def _spec_manager(block):
 
 
 def _spec_metadata(manager):
-    return CSA2TrtllmMetadata(
+    return CSA2TrtllmAttention.Metadata(
         max_num_requests=manager.max_batch_size,
         max_num_tokens=manager.max_num_tokens,
         kv_cache_manager=manager,

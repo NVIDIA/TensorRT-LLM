@@ -2869,6 +2869,8 @@ class DeepseekV4Model(DecoderModel):
         remote_tail_at = self._remote_tail_boundary(attn_metadata)
 
         engram_kv_cache: dict[int, torch.Tensor] = {}
+        # The metadata the layers run on; a replayed suffix runs on its own.
+        layer_metadata = attn_metadata
         for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
             if idx == remote_tail_at:
                 boundary_output, hc_state = self._enter_remote_tail_boundary(
@@ -2877,7 +2879,7 @@ class DeepseekV4Model(DecoderModel):
                 if boundary_output is not None:
                     return boundary_output
             if idx == replay_at:
-                position_ids, input_ids, hc_state = self._enter_bounded_replay(
+                position_ids, input_ids, hc_state, layer_metadata = self._enter_bounded_replay(
                     replay_plan, attn_metadata, position_ids, input_ids, hc_state
                 )
                 if image_mask is not None and replay_plan.replays_local_tokens:
@@ -2905,7 +2907,7 @@ class DeepseekV4Model(DecoderModel):
             hc_state = decoder_layer(
                 position_ids=position_ids,
                 hc_state=hc_state,
-                attn_metadata=attn_metadata,
+                attn_metadata=layer_metadata,
                 spec_metadata=spec_metadata,
                 input_ids=input_ids,
                 engram_embeddings=engram_embeddings,
@@ -2991,7 +2993,8 @@ class DeepseekV4Model(DecoderModel):
         """Re-index the per-token state the replayed layers will read.
 
         Never called on V4, because :meth:`_plan_bounded_replay` never returns a
-        split. Returns the three per-token carriers narrowed to the replayed rows.
+        split. Returns the three per-token carriers narrowed to the replayed rows
+        and the attention metadata the replayed layers run on.
         """
         raise NotImplementedError
 
@@ -2999,7 +3002,7 @@ class DeepseekV4Model(DecoderModel):
         """Restore encoder-pass shape and metadata after a successful replayed suffix.
 
         Never called on V4. Returns ``hidden_states`` back at the encoder pass's
-        row count and restores the matching metadata for downstream consumers.
+        row count; ``attn_metadata`` is the encoder pass's metadata.
         """
         raise NotImplementedError
 

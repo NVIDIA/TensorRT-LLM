@@ -289,16 +289,17 @@ def test_state_workspace_warmup_and_reuse(
 
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttentionMetadata,
+        TrtllmCoreMetadata,
+    )
 
     monkeypatch.setattr(mixer, "_use_flashinfer_gdn_prefill", lambda: True)
     monkeypatch.setattr(mixer, "is_sm_100f", lambda: native_state)
     config = SimpleNamespace(extra_attrs={})
     layer = SimpleNamespace(model_config=config)
     # Keep the real metadata contract; bypass only TRTLLM's unrelated CUDA buffers.
-    monkeypatch.setattr(
-        TrtllmAttentionMetadata, "_post_init_with_buffers", lambda self, buffers: None
-    )
+    monkeypatch.setattr(TrtllmCoreMetadata, "_allocate_buffers", lambda self, buffers: None)
     metadata_cls = AttentionMetadata if metadata_backend == "base" else TrtllmAttentionMetadata
     metadata = metadata_cls(
         max_num_sequences=max_sequences,

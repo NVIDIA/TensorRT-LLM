@@ -15,7 +15,7 @@
 """The spec-decode step kernels reproduce the eager chains they replace."""
 
 import copy
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from _torch.helpers import triton_num_compiled
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.core import AttentionCoreMetadata
 from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.spec_tail_kernels import (
@@ -264,13 +265,15 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
     )
 
     def attn_metadata():
-        return SimpleNamespace(
+        md = SimpleNamespace(
             num_contexts=num_ctx_reqs,
             num_seqs=batch,
             num_ctx_tokens=num_ctx_tokens,
             _seq_lens_cuda=torch.full((batch,), 99, dtype=torch.int32, device="cuda"),
             _seq_lens=torch.full((batch,), 99, dtype=torch.int32),
         )
+        md.set_seq_lens = MethodType(AttentionCoreMetadata.set_seq_lens, md)
+        return md
 
     def prepare(fused):
         w = copy.copy(worker)

@@ -19,12 +19,13 @@ draft model. The full generated-FMHA path is covered by the Qwen3.6 NVFP4
 DFlash accuracy test in ``integration/defs/accuracy/test_llm_api_pytorch.py``.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.attention.backends.core import AttentionCoreMetadata
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.llmapi import DFlashDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -71,7 +72,7 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
     draft_model = _FakeDraftModel()
     worker.set_draft_model(draft_model)
     spec_metadata = SimpleNamespace(max_num_requests=2)
-    attn_metadata = SimpleNamespace(max_seq_len=64)
+    attn_metadata = SimpleNamespace(max_seq_len=64, find=lambda name, default=None: default)
 
     worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
 
@@ -145,6 +146,7 @@ def test_generation_step_keeps_the_dummy_slot_context_empty():
         _seq_lens_cuda=torch.zeros(num_gens, dtype=torch.int32, device="cuda"),
         _seq_lens=torch.zeros(num_gens, dtype=torch.int32),
     )
+    attn_metadata.set_seq_lens = MethodType(AttentionCoreMetadata.set_seq_lens, attn_metadata)
     accepted_tokens = torch.arange(num_gens * tokens_per_req, dtype=torch.long, device="cuda").view(
         num_gens, tokens_per_req
     )

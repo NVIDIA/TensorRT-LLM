@@ -9,10 +9,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.features import RecurrentConfig
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingConfig
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     KVCacheManager,
@@ -29,7 +30,7 @@ from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sa
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...metadata import build_attention_metadata
+from ...metadata import build_attention_metadata, metadata_extensions_of
 from .config import DecoderRunnerConfig
 
 if TYPE_CHECKING:
@@ -88,6 +89,7 @@ class DecoderMetadata:
         self,
         kv_cache_manager: KVCacheManager | KVCacheManagerV2,
         draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
+        spec_decoding: SpecDecodingConfig | None = None,
     ) -> AttentionMetadata:
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -110,15 +112,29 @@ class DecoderMetadata:
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
             enable_ragged_verification=self._ragged_verification_enabled,
+            recurrent_config=RecurrentConfig(
+                chunk_size=getattr(config, "chunk_size", RecurrentConfig.chunk_size),
+                mamba_metadata_cls=resolve_mamba_metadata_cls(self.model),
+            ),
+            spec_decoding=spec_decoding,
+            one_model_draft=(
+                self._config.spec_config is not None
+                and self._config.spec_config.spec_dec_mode.use_one_engine()
+            ),
+            model_extension_types=metadata_extensions_of(self.model),
+            model_extension_config=self._model_metadata_config(),
         )
-        if isinstance(kv_cache_manager, BaseMambaCacheManager):
-            self.attn_metadata.mamba_chunk_size = getattr(
-                config, "chunk_size", self.attn_metadata.mamba_chunk_size
-            )
-        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
         self._arm_msa_policy(kv_cache_manager)
 
         return self.attn_metadata
+
+    def _model_metadata_config(self) -> dict:
+        """The creation arguments the model gives its metadata's extensions."""
+        config = dict(self.runtime_hooks.metadata_config)
+        if self.runtime_hooks.msa != MsaRuntimePolicy():
+            # The MiniMax-M3 MSA metadata takes the model's preparation choices.
+            config["msa_policy"] = self.runtime_hooks.msa
+        return config
 
     def _arm_msa_policy(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None) -> None:
         """Hand the model's MiniMax-M3 MSA preparation choices to the metadata and the KV cache."""
@@ -140,7 +156,8 @@ class DecoderMetadata:
                 "RuntimeHooks.msa requires the MiniMax-M3 MSA sparse attention backend and KV cache, "
                 f"got {type(self.attn_metadata).__name__} and {type(kv_cache_manager).__name__}"
             )
-        self.attn_metadata.msa_policy = msa
+        # The policy reached the MSA metadata as creation configuration
+        # (msa_policy); the KV cache takes the decode shortcuts it allows.
         kv_cache_manager.configure_decode_shortcuts(
             skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
@@ -192,7 +209,13 @@ class DecoderMetadata:
         if not self._ragged_verification_enabled:
             return
 
-        metadata = getattr(self, "attn_metadata", None)
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+            DeepseekV4Metadata,
+        )
+
+        attn_metadata = getattr(self, "attn_metadata", None)
+        # The DeepSeek-V4 extension owns the compressor buffers and helpers.
+        metadata = None if attn_metadata is None else attn_metadata.find_ext(DeepseekV4Metadata)
         required_attributes = (
             "_compute_compressed_mask",
             "_compute_gen_compressed_position_ids",
@@ -356,18 +379,6 @@ def update_spec_metadata(
         runtime_draft_len
     )
 
-    is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
-        config.attention_backend
-    )
-    # Parallel-draft modes advertise their full generation width rather than a
-    # conventional draft length, so attention needs the total-token capacity.
-    if spec_metadata.spec_dec_mode.is_parallel_draft():
-        max_draft_len = config.original_max_total_draft_tokens
-        max_total_draft_tokens = config.original_max_total_draft_tokens
-    else:
-        max_draft_len = config.original_max_draft_len
-        max_total_draft_tokens = config.spec_dec_max_total_draft_tokens
-
     if spec_tree_manager is not None:
         spec_tree_manager.slot_storage.fill_all_slot_ids(
             scheduled_requests.context_requests,
@@ -376,14 +387,39 @@ def update_spec_metadata(
 
     attn_metadata.update_spec_dec_param(
         batch_size=scheduled_requests.batch_size,
-        is_spec_decoding_enabled=is_spec_dec_mode,
+        spec_metadata=spec_metadata,
+        spec_tree_manager=spec_tree_manager,
+        num_contexts=scheduled_requests.num_context_requests,
+    )
+
+
+def spec_decoding_config(
+    config: DecoderRunnerConfig,
+    spec_metadata: SpecMetadata | None,
+    spec_tree_manager: SpecTreeManager | None,
+) -> SpecDecodingConfig | None:
+    """The speculative-decoding settings the attention metadata is created with."""
+    if spec_metadata is None:
+        return None
+    # Parallel-draft modes advertise their full generation width rather than a
+    # conventional draft length, so attention needs the total-token capacity.
+    if spec_metadata.spec_dec_mode.is_parallel_draft():
+        max_draft_len = config.original_max_total_draft_tokens
+        max_total_draft_tokens = config.original_max_total_draft_tokens
+    else:
+        max_draft_len = config.original_max_draft_len
+        max_total_draft_tokens = config.spec_dec_max_total_draft_tokens
+    return SpecDecodingConfig(
+        attention_needs_spec_dec_mode=spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
+            config.attention_backend
+        ),
         is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
         is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
-        spec_metadata=spec_metadata,
-        spec_tree_manager=spec_tree_manager,
-        num_contexts=scheduled_requests.num_context_requests,
+        tree_buffer_dim=(
+            spec_tree_manager._internal_buf_dim if spec_tree_manager is not None else 0
+        ),
     )
 
 

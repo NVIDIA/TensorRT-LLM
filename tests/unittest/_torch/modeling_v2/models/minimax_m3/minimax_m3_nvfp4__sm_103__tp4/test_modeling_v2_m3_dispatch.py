@@ -311,7 +311,7 @@ _DECODE_FIELDS = (
     "msa_decode_span",
     "msa_block_table",
     "msa_seq_lens_cuda",
-    "_msa_short_ok",
+    "msa_short_table_staged",
     "msa_short_table",
     "msa_proxy_max_score_view",
     "msa_worst_case_max_k_tiles",
@@ -323,6 +323,7 @@ def _decode_metadata(num_tokens: int) -> SimpleNamespace:
     """The decode projection's fields and nothing else (no ``num_contexts`` / ``num_ctx_tokens``)."""
     md = SimpleNamespace(**{name: object() for name in _DECODE_FIELDS})
     md.num_tokens = num_tokens
+    md.msa_write_slots = lambda n=None: md.msa_out_cache_loc
     return md
 
 
@@ -330,7 +331,7 @@ def test_the_decode_projection_states_the_phase_and_reads_no_count_back() -> Non
     md = _decode_metadata(4)
     step = dispatch.DecodeTarget(SimpleNamespace()).step_args(md)
     assert step["num_contexts"] == 0 and step["num_ctx_tokens"] == 0
-    assert step["metadata"] is md and step["msa_short_ok"] is md._msa_short_ok
+    assert step["metadata"] is md and step["msa_short_ok"] is md.msa_short_table_staged
 
 
 @pytest.mark.parametrize(

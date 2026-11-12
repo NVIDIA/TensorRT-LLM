@@ -276,7 +276,7 @@ def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayer
         or metadata.max_draft_tokens
         or manager.max_draft_len
         or manager.max_total_draft_tokens
-        or metadata.draft_kv_cache_manager is not None
+        or metadata.find("draft_kv_cache_manager", None) is not None
     ):
         raise NotImplementedError("Sparse offload requires single-beam, non-speculative execution")
     manager._validate_sparse_history_policy()
@@ -441,6 +441,16 @@ class SparseOffloadCacheMixin:
         asked of it.
         """
         return self._ensure_sparse_batch().get_sparse_cache_base_address(layer_id, role)
+
+    def prepare_batch_tables(self, request_ids: list[int], num_contexts: int) -> None:
+        """Publish the batch before attention metadata copies its block offsets.
+
+        The runtime's host tables, which the copy reads, take their snapshot of
+        the published batch.
+        """
+        if self._has_sparse_offload_layers():
+            self.prepare_sparse_batch(request_ids)
+        super().prepare_batch_tables(request_ids, num_contexts)
 
     def prepare_sparse_batch(self, request_ids: list[int]) -> None:
         """Publish scheduler or warmup requests, or join an already published batch.

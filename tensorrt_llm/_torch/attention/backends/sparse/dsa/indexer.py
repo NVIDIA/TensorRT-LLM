@@ -96,6 +96,7 @@ if TYPE_CHECKING:
 
     from .metadata import DSAtrtllmAttentionMetadata
 
+
 # Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -1476,12 +1477,9 @@ class Indexer(nn.Module):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
-        # A full rebuild clears the stale marker.
-        metadata.indexer_schedule_stale = False
-        gen_seq_lens = metadata.get_indexer_kv_lens(
+        gen_seq_lens = metadata.bind_gen_indexer_kv_lens(
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
-        metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
         if not metadata.use_expanded_buffers_for_mtp:
             scheduler_context_lens = metadata.update_indexer_kv_lens_2d(gen_seq_lens)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(

@@ -9,10 +9,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch import utils as torch_utils
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-    DeepseekV4TrtllmAttentionMetadata,
-)
-from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import DeepseekV4Metadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, DSparkCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine import metadata as metadata_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
@@ -172,6 +170,11 @@ def _warmup_metadata(position_helper, mask_helper):
     )
 
 
+def _container(extension):
+    """An attention metadata whose DeepSeek-V4 extension is ``extension`` (None: not attached)."""
+    return SimpleNamespace(find_ext=lambda extension_type: extension)
+
+
 def test_ragged_compressor_warmup_primes_and_cleans_intermediate_shape(monkeypatch):
     position_calls = []
     mask_calls = []
@@ -185,7 +188,7 @@ def test_ragged_compressor_warmup_primes_and_cleans_intermediate_shape(monkeypat
     metadata = _warmup_metadata(record_positions, record_mask)
     engine = SimpleNamespace(
         _ragged_verification_enabled=True,
-        attn_metadata=metadata,
+        attn_metadata=_container(metadata),
         _config=SimpleNamespace(max_batch_size=8, cuda_graph_batch_sizes=[1, 4, 8]),
     )
     sync_calls = []
@@ -214,7 +217,7 @@ def test_ragged_compressor_warmup_cleans_after_helper_failure(monkeypatch):
     metadata = _warmup_metadata(fail_positions, lambda *_args: None)
     engine = SimpleNamespace(
         _ragged_verification_enabled=True,
-        attn_metadata=metadata,
+        attn_metadata=_container(metadata),
         _config=SimpleNamespace(max_batch_size=4, cuda_graph_batch_sizes=[1, 4]),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
@@ -234,7 +237,7 @@ def test_ragged_compressor_warmup_cleans_after_helper_failure(monkeypatch):
 @pytest.mark.parametrize("fail_after_mask", [False, True])
 def test_ragged_compressor_warmup_calls_current_metadata_helpers(monkeypatch, fail_after_mask):
     """Run the real five-argument mask and position helper bodies on CPU tensors."""
-    actual_mask = DeepseekV4TrtllmAttentionMetadata._compute_compressed_mask
+    actual_mask = DeepseekV4Metadata._compute_compressed_mask
 
     def mask(new_comp, cu_new_comp, compressed_mask, batch_size, compress_ratios):
         actual_mask(new_comp, cu_new_comp, compressed_mask, batch_size, compress_ratios)
@@ -247,14 +250,12 @@ def test_ragged_compressor_warmup_calls_current_metadata_helpers(monkeypatch, fa
         if fail_after_mask:
             raise RuntimeError("mask cleanup probe")
 
-    metadata = _warmup_metadata(
-        DeepseekV4TrtllmAttentionMetadata._compute_gen_compressed_position_ids, mask
-    )
+    metadata = _warmup_metadata(DeepseekV4Metadata._compute_gen_compressed_position_ids, mask)
     original_storage = metadata.batch_size_cuda.data_ptr()
     original_gen_storage = metadata.gen_position_params_cuda.data_ptr()
     engine = SimpleNamespace(
         _ragged_verification_enabled=True,
-        attn_metadata=metadata,
+        attn_metadata=_container(metadata),
         _config=SimpleNamespace(max_batch_size=8, cuda_graph_batch_sizes=[1, 4, 8]),
     )
     monkeypatch.setattr(torch_utils, "is_piecewise_running", lambda: True)
@@ -287,7 +288,7 @@ def test_ragged_compressor_warmup_requires_trimmed_tokens():
 def test_ragged_compressor_warmup_rejects_missing_metadata_contract():
     engine = SimpleNamespace(
         _ragged_verification_enabled=True,
-        attn_metadata=SimpleNamespace(),
+        attn_metadata=_container(None),
     )
 
     with pytest.raises(RuntimeError, match="missing .*max_draft_tokens"):
@@ -434,36 +435,30 @@ def _metadata_inputs(metadata_type):
     return model, kwargs
 
 
+class _RecordingMetadata(TrtllmAttentionMetadata):
+    """TRTLLM-family metadata that records its creation arguments instead of building."""
+
+    def __init__(self, **kwargs):
+        self.__dict__["creation_kwargs"] = kwargs
+
+
 @pytest.mark.parametrize("explicit_false", [False, True])
 def test_metadata_helper_keeps_native_constructor_kwargs(explicit_false):
-    seen = []
-
-    class NativeMetadata:
-        def __init__(self, **kwargs):
-            seen.append(kwargs)
-
-    model, kwargs = _metadata_inputs(NativeMetadata)
+    model, kwargs = _metadata_inputs(_RecordingMetadata)
     if explicit_false:
         kwargs["enable_ragged_verification"] = False
-    metadata_module.build_attention_metadata(model, **kwargs)
+    metadata = metadata_module.build_attention_metadata(model, **kwargs)
 
-    assert "enable_ragged_verification" not in seen[0]
-    assert seen[0]["max_num_heads_per_kv"] == 4
+    assert "enable_ragged_verification" not in metadata.creation_kwargs
+    assert metadata.creation_kwargs["max_num_heads_per_kv"] == 4
 
 
 def test_metadata_helper_enables_only_supported_ragged_metadata():
-    class RaggedMetadata(DSAtrtllmAttentionMetadata):
-        def __init__(self, **kwargs):
-            self.constructor_flag = kwargs.pop("enable_ragged_verification", False)
-            self.enable_ragged_verification = self.constructor_flag
-            self.ragged_verify_lens = [1, 2]
-
-    model, kwargs = _metadata_inputs(RaggedMetadata)
+    model, kwargs = _metadata_inputs(_RecordingMetadata)
     result = metadata_module.build_attention_metadata(
         model, enable_ragged_verification=True, **kwargs
     )
-    assert result.constructor_flag is True
-    result._validate_ragged_verification()
+    assert result.creation_kwargs["enable_ragged_verification"] is True
 
     kwargs["attention_backend"] = SimpleNamespace(Metadata=object)
     with pytest.raises(ValueError, match="DSA target metadata"):
@@ -474,19 +469,25 @@ def test_metadata_helper_enables_only_supported_ragged_metadata():
 def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enabled):
     seen = []
 
-    class MetadataProbe(DSAtrtllmAttentionMetadata):
+    class MetadataProbe(_RecordingMetadata):
         def __init__(self, **kwargs):
-            self.enable_ragged_verification = kwargs.pop("enable_ragged_verification", False)
-            self.kv_cache_manager = kwargs["kv_cache_manager"]
-            self.ragged_verify_lens = None
-            seen.append(self.enable_ragged_verification)
+            super().__init__(**kwargs)
+            seen.append(kwargs.get("enable_ragged_verification", False))
+
+        @property
+        def kv_cache_manager(self):
+            return self.creation_kwargs["kv_cache_manager"]
 
     model, kwargs = _metadata_inputs(MetadataProbe)
     decoder = object.__new__(DecoderMetadata)
     decoder.attn_metadata = None
     decoder.model = SimpleNamespace(model_config=model)
     decoder._config = SimpleNamespace(
-        **kwargs, spec_config=SimpleNamespace(enable_confidence_scheduling=enabled)
+        **kwargs,
+        spec_config=SimpleNamespace(
+            enable_confidence_scheduling=enabled,
+            spec_dec_mode=SimpleNamespace(use_one_engine=lambda: False),
+        ),
     )
     decoder.mapping = kwargs["mapping"]
     decoder._attention_runtime_features = kwargs["attention_runtime_features"]
@@ -495,9 +496,6 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
     kv = object()
 
     result = decoder.setup_attention(kv)
-    if enabled:
-        result.ragged_verify_lens = [1, 2]
-    result._validate_ragged_verification()
 
     assert seen == [enabled]
     assert decoder.setup_attention(kv) is result
@@ -738,7 +736,12 @@ def test_overlap_offsets_follow_the_packed_prefix(
     state.new_tokens = torch.arange(12, dtype=torch.int32).reshape(4, 3)
     state.new_tokens_lens = torch.tensor([2, 3, 4], dtype=torch.int32)
     state.next_draft_tokens = torch.arange(9, dtype=torch.int32).reshape(3, 3)
-    metadata = SimpleNamespace(is_cuda_graph=False, prepare=lambda: None)
+    batches = []
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        prepare=lambda batch, **_kwargs: batches.append(batch),
+        find_ext=lambda _extension_type: None,
+    )
 
     prepared = decoder.prepare_inputs(
         scheduled,
@@ -762,8 +765,9 @@ def test_overlap_offsets_follow_the_packed_prefix(
         4 - previous_lengths[1],
     ]
     assert inputs["input_ids"].numel() == sum(lengths)
-    assert metadata.seq_lens.tolist() == lengths
-    assert metadata.kv_cache_params.num_extra_kv_tokens == 2
+    (batch,) = batches
+    assert batch.seq_lens.tolist() == lengths
+    assert batch.kv_cache_params.num_extra_kv_tokens == 2
     assert decoder._gather_ids_buffer.tensor[: sum(lengths)].tolist() == list(range(sum(lengths)))
     assert draft_len == 3
     assert gather_calls == (

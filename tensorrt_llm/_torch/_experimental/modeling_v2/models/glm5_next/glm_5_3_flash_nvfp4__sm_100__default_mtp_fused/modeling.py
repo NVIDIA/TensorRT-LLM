@@ -39,6 +39,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import set_use_spec_decoding
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -2127,8 +2128,8 @@ class Glm5NextMtpStep:
     3. Draft ``K = runtime_draft_len`` tokens: the MTP layer on (accepted token, target hidden state) rows, its
        shared head on the vocabulary shard, and the global argmax across the TP group; step 0 runs on the verify
        layout, steps 1.. on one row per request.
-    4. Restore the attention metadata the chain rewrote (CUDA-graph warmup replays this forward on the same
-       metadata) and return what the speculative sampler reads.
+    4. Return what the speculative sampler reads. The chain runs on the draft metadata (``draft_loop``), which
+       starts from the target's state on every replay, so the target's metadata is left as it was.
 
     Every shape is fixed by host integers of the step (batch size, number of contexts, K), so the step captures in
     one CUDA graph with the target.
@@ -2137,7 +2138,6 @@ class Glm5NextMtpStep:
     def __init__(self, mapping: Mapping, vocab_size: int) -> None:
         self.mapping = mapping
         self.vocab_size = vocab_size
-        self._saved: dict[str, Any] = {}
 
     def __call__(
         self,
@@ -2183,9 +2183,7 @@ class Glm5NextMtpStep:
                 state_indices=attn_metadata.mamba_metadata.state_indices,
             )
 
-        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        self._save_metadata(attn_metadata, batch_size)
-        try:
+        with attn_metadata.draft_loop() as draft_metadata:
             next_draft_tokens = self._draft(
                 input_ids,
                 position_ids,
@@ -2193,19 +2191,16 @@ class Glm5NextMtpStep:
                 accepted_tokens,
                 num_accepted_tokens,
                 attn_metadata,
+                draft_metadata,
                 spec_metadata,
                 draft_model,
             )
-        finally:
-            self._restore_metadata(attn_metadata)
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         last_accepted = accepted_tokens[
             spec_metadata.batch_indices_cuda[:batch_size], num_accepted_tokens - 1
         ]
         next_new_tokens = torch.cat([last_accepted.unsqueeze(1), next_draft_tokens], dim=1)
-        attn_metadata.use_spec_decoding = True
+        set_use_spec_decoding(attn_metadata, True)
         return {
             "logits": logits,
             "new_tokens": accepted_tokens,
@@ -2260,11 +2255,13 @@ class Glm5NextMtpStep:
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
+        target_metadata: AttentionMetadata,
         attn_metadata: AttentionMetadata,
         spec_metadata: Any,
         draft_model: Glm5NextDraftModel,
     ) -> torch.Tensor:
-        """``next_draft_tokens [B, K]``. Rewrites the attention metadata's lengths as it goes; the caller restores."""
+        """``next_draft_tokens [B, K]``. ``attn_metadata`` is ``target_metadata``'s draft metadata in its draft loop;
+        the chain advances its lengths as it goes."""
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -2319,7 +2316,13 @@ class Glm5NextMtpStep:
                     step_positions[rows] if step_positions.dim() == 1 else step_positions[..., rows]
                 ) + 1
             self._advance_lengths(
-                attn_metadata, step, num_contexts, batch_size, draft_len, num_accepted_tokens
+                target_metadata,
+                attn_metadata,
+                step,
+                num_contexts,
+                batch_size,
+                draft_len,
+                num_accepted_tokens,
             )
         return torch.stack(drafts, dim=1)
 
@@ -2366,6 +2369,7 @@ class Glm5NextMtpStep:
 
     @staticmethod
     def _advance_lengths(
+        target_metadata: AttentionMetadata,
         attn_metadata: AttentionMetadata,
         step: int,
         num_contexts: int,
@@ -2376,18 +2380,14 @@ class Glm5NextMtpStep:
         """Lengths for the next draft step. After step 0 every request feeds one row: a generation request's KV
         length drops its rejected drafts and a context request's grows by its first draft, then each step adds one."""
         if step == 0:
-            attn_metadata._seq_lens[:batch_size].fill_(1)
-            attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-            attn_metadata.on_update()
+            attn_metadata.set_seq_lens(slice(0, batch_size), host=1, device=1, update_counts=True)
             has_kv_cache = attn_metadata.kv_cache_manager is not None
-            if has_kv_cache and hasattr(attn_metadata, "host_request_types"):
-                attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
             if has_kv_cache:
-                attn_metadata.num_contexts = 0
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                draft_len - num_accepted_tokens[num_contexts:]
+                attn_metadata.as_generation_rows()
+            attn_metadata.adjust_kv_lens(
+                slice(num_contexts, batch_size), num_accepted_tokens[num_contexts:] - draft_len
             )
-            attn_metadata.kv_lens_cuda[:num_contexts] += 1
+            attn_metadata.adjust_kv_lens(slice(0, num_contexts), 1)
             if (
                 has_kv_cache
                 and num_contexts > 0
@@ -2396,42 +2396,11 @@ class Glm5NextMtpStep:
                 attn_metadata.block_ids_per_seq[:batch_size].copy_(
                     attn_metadata.kv_block_ids_per_seq[:batch_size], non_blocking=True
                 )
-            attn_metadata.update_for_spec_dec()
-            attn_metadata.use_spec_decoding = False
+            target_metadata.refresh_draft()
+            set_use_spec_decoding(attn_metadata, False)
         else:
-            attn_metadata.kv_lens_cuda[:batch_size] += 1
-            attn_metadata.update_for_spec_dec()
-
-    # -- attention metadata save / restore ----------------------------------
-
-    def _save_metadata(self, attn_metadata: AttentionMetadata, batch_size: int) -> None:
-        """Save what the draft chain overwrites: the sequence lengths (``prepare_for_spec_dec``) and the target's
-        speculative masks, position offsets and generation lengths."""
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        saved = {}
-        if attn_metadata.spec_decoding_packed_mask is not None:
-            saved["packed_mask"] = attn_metadata.spec_decoding_packed_mask[:batch_size].clone()
-        if attn_metadata.spec_decoding_position_offsets is not None:
-            saved["position_offsets"] = attn_metadata.spec_decoding_position_offsets.clone()
-        if attn_metadata.spec_decoding_generation_lengths is not None:
-            saved["generation_lengths"] = attn_metadata.spec_decoding_generation_lengths[
-                :batch_size
-            ].clone()
-        self._saved = saved
-
-    def _restore_metadata(self, attn_metadata: AttentionMetadata) -> None:
-        if attn_metadata.has_spec_dec_saved_state:
-            attn_metadata.restore_from_spec_dec()
-            attn_metadata.on_update()
-        saved, self._saved = self._saved, {}
-        if "packed_mask" in saved:
-            mask = saved["packed_mask"]
-            attn_metadata.spec_decoding_packed_mask[: mask.shape[0]].copy_(mask)
-        if "position_offsets" in saved:
-            attn_metadata.spec_decoding_position_offsets.copy_(saved["position_offsets"])
-        if "generation_lengths" in saved:
-            lengths = saved["generation_lengths"]
-            attn_metadata.spec_decoding_generation_lengths[: lengths.shape[0]].copy_(lengths)
+            attn_metadata.adjust_kv_lens(slice(0, batch_size), 1)
+            target_metadata.refresh_draft()
 
 
 # ---------------------------------------------------------------------------

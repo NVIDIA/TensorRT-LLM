@@ -3,15 +3,18 @@
 """Host-side contract tests for the CuTe DSL MLA FMHA library (FP8 scales, split-KV sizing)."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
+from _torch.helpers import bare_extension
 
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmCoreMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm.bindings import DataType
 
@@ -490,7 +493,10 @@ def test_generation_kv_lengths_keep_the_runner_alignment(num_contexts: int) -> N
 @pytest.mark.parametrize("num_contexts", [0, 1, 3, 4])
 def test_decode_kv_lengths_keep_one_pointer_per_step(num_contexts: int) -> None:
     """Every layer of a step passes the same pointer, so the split plan runs once."""
-    meta = SimpleNamespace(max_num_requests=16)
+    core = bare_extension(
+        TrtllmCoreMetadata, Mock(), max_num_requests=16, _aligned_kv_lens_staging=None
+    )
+    meta = SimpleNamespace(aligned_kv_lens_staging=core.aligned_kv_lens_staging)
     sequence_lengths = torch.arange(1, 17, dtype=torch.int32)
     generation_lengths = sequence_lengths[num_contexts:]
 
@@ -502,7 +508,7 @@ def test_decode_kv_lengths_keep_one_pointer_per_step(num_contexts: int) -> None:
     torch.testing.assert_close(second_layer, generation_lengths)
     if generation_lengths.data_ptr() % 16 == 0:
         assert first_layer is generation_lengths
-        assert not hasattr(meta, "_cute_dsl_mla_kv_lens_staging")
+        assert core._aligned_kv_lens_staging is None
 
 
 @pytest.mark.parametrize(

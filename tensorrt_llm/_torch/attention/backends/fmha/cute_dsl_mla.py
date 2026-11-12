@@ -810,13 +810,10 @@ class CuteDslMlaFmha(PhasedFmha):
         if lengths.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
             return lengths
         num_lengths = lengths.numel()
-        staging = getattr(meta, "_cute_dsl_mla_kv_lens_staging", None)
-        if staging is None or staging.numel() < num_lengths or staging.device != lengths.device:
-            if lengths.is_cuda and torch.cuda.is_current_stream_capturing():
-                return cls._aligned_kernel_input(lengths)
-            capacity = max(int(getattr(meta, "max_num_requests", 0) or 0), num_lengths)
-            staging = torch.empty(capacity, dtype=torch.int32, device=lengths.device)
-            meta._cute_dsl_mla_kv_lens_staging = staging
+        staging_of = getattr(meta, "aligned_kv_lens_staging", None)
+        staging = staging_of(num_lengths, lengths.device) if staging_of is not None else None
+        if staging is None:
+            return cls._aligned_kernel_input(lengths)
         staged = staging[:num_lengths].view(lengths.shape)
         staged.copy_(lengths)
         return staged
@@ -861,18 +858,11 @@ class CuteDslMlaFmha(PhasedFmha):
 
         if not 0 < batch_size <= _SPLIT_PLAN_MAX_REQUESTS:
             return None
-        plan = getattr(meta, "_cute_dsl_mla_split_plan", None)
-        capacity = max(int(getattr(meta, "max_num_requests", 0) or 0), batch_size)
-        if plan is None or plan.numel() < batch_size or plan.device != cache_seqs.device:
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            plan = torch.empty(capacity, dtype=torch.int32, device=cache_seqs.device)
-            meta._cute_dsl_mla_split_plan = plan
         runner = CuteDSLNVMlaDecodeBlackwellRunner
         rows_per_request = runner.get_num_q_tiles(num_heads, seq_len_q)
         wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
-        key = (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr(), plan.data_ptr())
-        if getattr(meta, "_cute_dsl_mla_split_plan_key", None) != key:
+
+        def launch(plan: torch.Tensor) -> None:
             launch_mla_split_kv_plan(
                 cache_seqs,
                 plan,
@@ -880,8 +870,13 @@ class CuteDslMlaFmha(PhasedFmha):
                 rows_per_request=rows_per_request,
                 wave_clusters=wave_clusters,
             )
-            meta._cute_dsl_mla_split_plan_key = key
-        return plan[:batch_size]
+
+        return meta.cute_dsl_mla_split_plan(
+            batch_size,
+            cache_seqs.device,
+            (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr()),
+            launch,
+        )
 
     def run_mla_generation(
         self,

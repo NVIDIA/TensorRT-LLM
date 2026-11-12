@@ -460,20 +460,42 @@ class MTPWorker(SpecWorkerBase):
             spec_metadata=spec_metadata,
             attn_metadata=attn_metadata)
 
-        # update attn metadata
-        if attn_metadata is not None:
-            self.change_attn_metadata(num_accepted_tokens, attn_metadata,
-                                      spec_metadata)
+        # The MTP layers run on the draft metadata, which leaves the target's
+        # untouched; without one, the target's state is saved and restored
+        # around them.
+        with self.draft_loop(attn_metadata) as draft_attn_metadata:
+            return self._mtp_draft_loop_body(
+                draft_attn_metadata, input_ids, hidden_states, logits,
+                attn_metadata, spec_metadata, draft_model, resource_manager,
+                runtime_draft_len, batch_size, raw_logits, accepted_tokens,
+                num_accepted_tokens, draft_inputs)
+
+    def _mtp_draft_loop_body(self, draft_attn_metadata, input_ids,
+                             hidden_states, logits, attn_metadata,
+                             spec_metadata, draft_model, resource_manager,
+                             runtime_draft_len, batch_size, raw_logits,
+                             accepted_tokens, num_accepted_tokens,
+                             draft_inputs):
+        """The rest of ``_forward_impl``, inside its draft loop."""
+        self.change_attn_metadata(num_accepted_tokens,
+                                  draft_attn_metadata,
+                                  spec_metadata,
+                                  target=attn_metadata)
 
         # Run MTP layers to predict draft tokens
         next_draft_tokens = []
         last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            draft_attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+        with self.draft_kv_cache_context(
+                draft_attn_metadata,
+                draft_kv_cache_manager) as draft_attn_metadata:
+            # Forward on the metadata the context selects, such as a
+            # FlashInfer view over a separate draft KV cache.
+            draft_inputs["attn_metadata"] = draft_attn_metadata
             for i, mtp_layer in enumerate(
                     draft_model.mtp_layers[:runtime_draft_len]):
                 if self.guided_decoder is not None:
@@ -487,7 +509,7 @@ class MTPWorker(SpecWorkerBase):
 
                 logits = mtp_layer.shared_head(hidden_states,
                                                draft_model.lm_head,
-                                               attn_metadata).float()
+                                               draft_attn_metadata).float()
                 if self.guided_decoder is not None:
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
@@ -521,10 +543,6 @@ class MTPWorker(SpecWorkerBase):
             gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
                 gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
-
-        # restore attn metadata
-        if attn_metadata is not None:
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = self._prepare_next_new_tokens(
@@ -923,43 +941,53 @@ class MTPWorker(SpecWorkerBase):
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
                              attn_metadata: AttentionMetadata,
-                             spec_metadata: MTPSpecMetadata):
-        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+                             spec_metadata: MTPSpecMetadata, *,
+                             target: AttentionMetadata):
+        """Set the MTP layers' lengths on ``attn_metadata``.
+
+        Each generation request feeds ``runtime_draft_len`` tokens and keeps
+        only its accepted tokens' KV. ``attn_metadata`` is the draft metadata
+        (or the target's while its state is saved); the host cached-token
+        counts are derived from ``target``'s, which stay unchanged.
+        """
         batch_size = attn_metadata.num_seqs
         runtime_draft_len = spec_metadata.runtime_draft_len
 
         num_contexts = attn_metadata.num_contexts
-        attn_metadata._seq_lens[num_contexts:batch_size] -= 1
-        attn_metadata._seq_lens_cuda[num_contexts:batch_size] -= 1
-        attn_metadata.on_update()
+        attn_metadata.adjust_seq_lens(slice(num_contexts, batch_size), -1)
 
         if hasattr(attn_metadata, 'kv_lens_cuda'):
             # Note that it's important to not free the seq_lens_cuda
             # buffer once the graph has been captured also - this will invalidate
             # the graph and force an expensive recapture.
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                runtime_draft_len + 1 -
-                num_accepted_tokens[num_contexts:batch_size])
             # A generation request's KV length can never be smaller than the
-            # number of query tokens (mtp_num_modules) the draft layer processes
-            # this step. This only underflows for the tiny dummy sequences used
-            # during generation-step warmup; real sequences are long enough that
-            # subtracting the rejected draft tokens stays well above the draft
-            # length. Clamping in-place (CUDA-graph safe) keeps an invalid
-            # kv_len < q_len from reaching the attention kernel, which otherwise
-            # computes a negative effective KV range and triggers an illegal
-            # memory access (e.g. Step3p7 MTP with dense sliding-window attention).
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size].clamp_(
-                min=runtime_draft_len)
-            attn_metadata.on_update_kv_lens()
-            if getattr(attn_metadata, "fp4_mla_state", None) is not None:
-                attn_metadata.update_for_spec_dec()
+            # number of query tokens (mtp_num_modules) the draft layer
+            # processes this step. This only underflows for the tiny dummy
+            # sequences used during generation-step warmup; real sequences
+            # are long enough that subtracting the rejected draft tokens
+            # stays well above the draft length. Clamping in-place (CUDA-graph
+            # safe) keeps an invalid kv_len < q_len from reaching the
+            # attention kernel, which otherwise computes a negative effective
+            # KV range and triggers an illegal memory access (e.g. Step3p7
+            # MTP with dense sliding-window attention).
+            attn_metadata.adjust_kv_lens(
+                slice(num_contexts, batch_size),
+                num_accepted_tokens[num_contexts:batch_size] -
+                (runtime_draft_len + 1),
+                min_value=runtime_draft_len)
 
-        if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
-            for i in range(num_contexts, batch_size):
-                # used for vanilla MLA, list on cpu
-                attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
-                    i] -= runtime_draft_len + 1 - num_accepted_tokens[i].item()
+        target_params = target.kv_cache_params
+        if target_params is not None and not attn_metadata.is_cuda_graph:
+            # Host-side readers (vanilla MLA, host KV appends) see the
+            # accepted tokens only.
+            num_cached = list(target_params.num_cached_tokens_per_seq)
+            rejected = (runtime_draft_len + 1 -
+                        num_accepted_tokens[num_contexts:batch_size]).tolist()
+            for i, num_rejected in enumerate(rejected, start=num_contexts):
+                num_cached[i] -= num_rejected
+            attn_metadata.set_cached_token_counts(num_cached)
+        # One refresh after every length change of the step.
+        self.refresh_draft()
 
     def prepare_drafter_inputs(
         self,

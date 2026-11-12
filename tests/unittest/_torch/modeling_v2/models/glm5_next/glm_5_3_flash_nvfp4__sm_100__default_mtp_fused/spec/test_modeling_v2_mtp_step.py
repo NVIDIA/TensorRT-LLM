@@ -9,6 +9,7 @@ the KDA state, and leave the metadata as the worker leaves it.
 """
 
 import copy
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flas
     Glm5NextMtpStep,
     _check_speculation,
 )
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, MTPDecodingConfig
@@ -47,7 +49,10 @@ _AcceptanceRecorder.__abstractmethods__ = frozenset()
 
 
 class _Metadata:
-    """The attention-metadata surface the draft chain reads and rewrites."""
+    """The attention-metadata surface the draft chain reads and rewrites.
+
+    It is its own draft metadata: a draft loop on it runs on it, and refreshing the draft does nothing.
+    """
 
     def __init__(self, ctx_lens, num_gens, draft_len, kv_lens, device):
         seq_lens = list(ctx_lens) + [draft_len + 1] * num_gens
@@ -70,7 +75,6 @@ class _Metadata:
         self.spec_decoding_generation_lengths = None
         self.use_spec_decoding = True
         self.enable_flash_mla = False
-        self._saved_tensors = {}
         self.on_update()
 
     @property
@@ -84,26 +88,38 @@ class _Metadata:
     def on_update(self):
         self._num_ctx_tokens = int(self._seq_lens[: self.num_contexts].sum())
 
-    def on_update_kv_lens(self):
+    def set_seq_lens(self, rows, *, host=None, device=None, update_counts=False):
+        if host is not None:
+            self._seq_lens[rows] = host
+        if device is not None:
+            self._seq_lens_cuda[rows] = device
+        if update_counts:
+            self.on_update()
+
+    def as_generation_rows(self):
+        self.host_request_types[: self.num_contexts].fill_(1)
+        self.num_contexts = 0
+        self.on_update()
+
+    def adjust_kv_lens(self, rows, delta):
+        self.kv_lens_cuda[rows] += delta
+
+    def lengths_for_kernel_update(self):
+        return {"seq_lens_cuda": self._seq_lens_cuda, "kv_lens_cuda": self.kv_lens_cuda}
+
+    @contextmanager
+    def draft_loop(self):
+        yield self
+
+    def refresh_draft(self):
         pass
 
-    def update_for_spec_dec(self):
-        pass
+    def find_ext(self, cls):
+        # Serves the speculative-decoding flags itself; has no other extension.
+        return self if cls is SpecDecodingMetadata else None
 
-    def prepare_for_spec_dec(self, *fields):
-        assert not self._saved_tensors
-        for f in fields:
-            self._saved_tensors[f] = getattr(self, f)
-            setattr(self, f, getattr(self, f).clone())
-
-    def restore_from_spec_dec(self):
-        for f, v in self._saved_tensors.items():
-            setattr(self, f, v)
-        self._saved_tensors.clear()
-
-    @property
-    def has_spec_dec_saved_state(self):
-        return bool(self._saved_tensors)
+    def find(self, name, default=None):
+        return default
 
     def snapshot(self):
         return dict(
@@ -265,7 +281,6 @@ def test_step_matches_stock_worker(ctx_lens, accept_depths, draft_len, greedy):
         stock_in["draft_model"].mtp_layers[0].calls == fused_in["draft_model"].mtp_layers[0].calls
     )
     assert stock_in["attn_metadata"].snapshot() == fused_in["attn_metadata"].snapshot()
-    assert not fused_in["attn_metadata"].has_spec_dec_saved_state
     # The same accepted counts committed to the KDA state.
     s_commits = stock_in["attn_metadata"].kv_cache_manager.commits
     f_commits = fused_in["attn_metadata"].kv_cache_manager.commits

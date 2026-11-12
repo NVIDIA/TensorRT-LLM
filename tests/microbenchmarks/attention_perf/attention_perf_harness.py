@@ -52,6 +52,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     AttentionRuntimeFeatures,
@@ -548,7 +549,7 @@ def _build_mla_gen_metadata(case: AttnCase, kv_mgr: KVCacheManagerV2):
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         # FlashMLA decode kernel is sm90-only — that is where the DeepSeek-R1
         # gen regressions live; on other archs this routes to the generic kernel.
-        enable_flash_mla=(torch.cuda.get_device_capability() == (9, 0)),
+        extension_types=(FlashMlaMetadata,) if torch.cuda.get_device_capability() == (9, 0) else (),
     )
     metadata = TrtllmAttention.Metadata(**kwargs)
     metadata.prepare()
@@ -734,7 +735,7 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
             use_cache=True, num_cached_tokens_per_seq=[0] * case.batch_size
         ),
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        sparse_attention_config=sparse_config,
+        sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
     )
     metadata.prepare()
 

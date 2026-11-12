@@ -16,17 +16,20 @@
 
 After each draft step the native one-model loop (``Eagle3OneModelWorker.
 _forward_linear_draft_loop``) advances the next step's position ids and the
-KV lengths, then calls ``DSAtrtllmAttentionMetadata.update_for_spec_dec``,
-which rebuilds the DSA decode metadata: the 2-D KV-length view, three DeepGEMM
+KV lengths, then refreshes the draft (``md.refresh_draft()``), whose DSA
+extension rebuilds the DSA decode metadata: the 2-D KV-length view, three DeepGEMM
 paged-MQA-logits schedules (each computed into a fresh tensor and copied into
 its persistent buffer), the expanded KV lengths for the CuTe DSL logits path,
 and the fused decode metadata (request index, indexer K-cache slot mappings and
 generation indptrs). That is about twelve small launches per step.
 
-``draft_step_update`` performs the same update with one Triton launch plus the
-native host-side bookkeeping. Every device tensor it writes holds exactly the
-value the native chain writes. The schedule is the DeepGEMM SM100 metadata
-partition (``deep_gemm/scheduler/sm100_paged_mqa_logits.cuh``): request work
+``draft_step_update`` performs the same update with
+``GlmTp8DSAMetadata.run_draft_step``: one Triton launch writes the draft's query
+and KV lengths (the core's ``lengths_for_kernel_update`` buffers), the DSA
+decode state and the next step's position ids, and the draft refresh after it
+does the rest of the native refresh on the host. Every device tensor it writes
+holds exactly the value the native chain writes. The schedule is the DeepGEMM SM100 metadata partition
+(``deep_gemm/scheduler/sm100_paged_mqa_logits.cuh``): request work
 ``ceil(ctx / SPLIT_KV) * next_n``, SM ``i`` starts at work unit
 ``i * q + min(i, rem)`` and records ``(request_q_token_start,
 work_in_request // next_n)``, with a ``(num_q_tokens, 0)`` sentinel past the
@@ -35,11 +38,13 @@ last request. ``SPLIT_KV`` is confirmed against the native op once per process
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
 
 _SCHEDULE_BLOCK_KV = 64
 _SPLIT_KV_CANDIDATES = (64, 128, 256, 512)
@@ -86,7 +91,7 @@ def _draft_step_kernel(
     num_accepted_ptr,  # int32 [B] (STEP0)
     pos_in_ptr,  # int32/int64 position ids of this step (HAS_POS)
     pos_out_ptr,  # same dtype [B] (out, HAS_POS)
-    gather_ptr,  # int64 [B] rows of pos_in to advance (STEP0 and HAS_POS)
+    gather_ptr,  # int64 [B] rows of pos_in to advance (HAS_GATHER: STEP0 and HAS_POS)
     kv2d_ptr,  # int32 [max_seqs, cap] (out)
     kv2d_stride,
     sched_ptr,  # int32 [(NUM_SMS + 1) * 2] (out)
@@ -105,6 +110,8 @@ def _draft_step_kernel(
     DRAFT_LEN: tl.constexpr,
     STEP0: tl.constexpr,
     HAS_POS: tl.constexpr,
+    HAS_GATHER: tl.constexpr,
+    SKIP_SCHED: tl.constexpr,
     WIDTH: tl.constexpr,
     HAS_FULL: tl.constexpr,
     EXPAND: tl.constexpr,
@@ -127,14 +134,17 @@ def _draft_step_kernel(
     mask_b = offs_b < B
 
     # ----- KV lengths and query lengths (the loop's in-place updates) -------
-    kv_old = tl.load(kv_lens_ptr + offs_b, mask=mask_b, other=0)
+    kv = tl.load(kv_lens_ptr + offs_b, mask=mask_b, other=0)
+    # The lengths are updated in place, and each warp holds its own copy of them: without
+    # this barrier a warp that loads after another warp stored applies the update twice.
+    tl.debug_barrier()
     if STEP0:
         accepted = tl.load(num_accepted_ptr + offs_b, mask=mask_b, other=0)
-        kv = kv_old - (DRAFT_LEN - accepted)
+        kv = kv - (DRAFT_LEN - accepted)
         seq = tl.full((BLOCK_B,), 1, tl.int32)
         tl.store(seq_lens_ptr + offs_b, seq, mask=mask_b)
     else:
-        kv = kv_old + 1
+        kv = kv + 1
         seq = tl.load(seq_lens_ptr + offs_b, mask=mask_b, other=0)
     tl.store(kv_lens_ptr + offs_b, kv, mask=mask_b)
     kv = tl.where(mask_b, kv, 0)
@@ -142,7 +152,7 @@ def _draft_step_kernel(
 
     # ----- next step's position ids ------------------------------------------
     if HAS_POS:
-        if STEP0:
+        if HAS_GATHER:
             rows = tl.load(gather_ptr + offs_b, mask=mask_b, other=0)
         else:
             rows = offs_b.to(tl.int64)
@@ -150,25 +160,24 @@ def _draft_step_kernel(
         tl.store(pos_out_ptr + offs_b, pos + 1, mask=mask_b)
 
     # ----- 2-D KV lengths and the paged-MQA-logits schedules -----------------
-    offs_w = tl.arange(0, BLOCK_W)
-    kv2d_mask = mask_b[:, None] & (offs_w[None, :] < WIDTH)
-    tl.store(
-        kv2d_ptr + offs_b[:, None] * kv2d_stride + offs_w[None, :],
-        kv[:, None] + tl.zeros((BLOCK_B, BLOCK_W), tl.int32),
-        mask=kv2d_mask,
-    )
-    _write_schedule(kv, mask_b, B, sched_ptr, 1, NUM_SMS, SPLIT_KV, BLOCK_SM)
-    if HAS_FULL:
-        _write_schedule(kv, mask_b, B, sched_full_ptr, WIDTH, NUM_SMS, SPLIT_KV, BLOCK_SM)
-    if EXPAND > 1:
-        offs_e = tl.arange(0, BLOCK_E)
-        mask_e = offs_e < B * EXPAND
-        # repeat_interleave from registers (the updated lengths are not
-        # re-read from memory within this launch).
-        owner = (offs_e[:, None] // EXPAND) == offs_b[None, :]
-        kv_e = tl.sum(tl.where(owner, kv[None, :], 0), 1)
-        tl.store(kv_exp_ptr + offs_e, kv_e, mask=mask_e)
-        _write_schedule(kv_e, mask_e, B * EXPAND, sched_exp_ptr, 1, NUM_SMS, SPLIT_KV, BLOCK_SM)
+    if not SKIP_SCHED:
+        offs_w = tl.arange(0, BLOCK_W)
+        kv2d_mask = mask_b[:, None] & (offs_w[None, :] < WIDTH)
+        tl.store(
+            kv2d_ptr + offs_b[:, None] * kv2d_stride + offs_w[None, :],
+            kv[:, None] + tl.zeros((BLOCK_B, BLOCK_W), tl.int32),
+            mask=kv2d_mask,
+        )
+        _write_schedule(kv, mask_b, B, sched_ptr, 1, NUM_SMS, SPLIT_KV, BLOCK_SM)
+        if HAS_FULL:
+            _write_schedule(kv, mask_b, B, sched_full_ptr, WIDTH, NUM_SMS, SPLIT_KV, BLOCK_SM)
+        if EXPAND > 1:
+            offs_e = tl.arange(0, BLOCK_E)
+            mask_e = offs_e < B * EXPAND
+            owner = (offs_e[:, None] // EXPAND) == offs_b[None, :]
+            kv_e = tl.sum(tl.where(owner, kv[None, :], 0), 1)
+            tl.store(kv_exp_ptr + offs_e, kv_e, mask=mask_e)
+            _write_schedule(kv_e, mask_e, B * EXPAND, sched_exp_ptr, 1, NUM_SMS, SPLIT_KV, BLOCK_SM)
 
     # ----- fused DSA decode metadata (same arithmetic as the native kernel) --
     kv64 = kv.to(tl.int64)
@@ -303,6 +312,145 @@ class DraftStepResult:
     position_ids: Optional[torch.Tensor]
 
 
+class GlmTp8DSAMetadata(DSAMetadata):
+    """DSA metadata extension for ``glm_5_2_nvfp4__sm_103__tp8`` draft loop.
+
+    ``run_draft_step`` is this target's metadata update after a draft step: one
+    Triton launch writes the draft's query and KV lengths (through the core's
+    ``lengths_for_kernel_update``), the DSA decode state that follows them and
+    the next step's position ids. The draft refresh after it
+    (``refresh_from_draft_lengths``) then only does the host side of the native
+    DSA refresh. Any other refresh is ``DSAMetadata``'s.
+    """
+
+    fields = frozenset({"_draft_step_written"})
+
+    adopts_target_state = True
+    draft_private = frozenset({"_draft_step_written"})
+
+    _draft_step_written: bool = False
+
+    def __init__(self, metadata, *, source=None, **config) -> None:
+        super().__init__(metadata, source=source, **config)
+        self._draft_step_written = False
+
+    def _skips_indexer_schedule(self) -> bool:
+        # Every draft step after the first of an index-sharing draft loop reuses
+        # the TopK selection the first step captured (see DSAMetadata).
+        return bool(
+            self.index_share.in_mtp_draft_loop and self.sparse_metadata_params.mtp_index_share
+        )
+
+    def run_draft_step(
+        self,
+        step: int,
+        draft_len: int,
+        num_accepted: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        gather_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """The update after draft step ``step`` of a pure-decode loop, before the refresh.
+
+        Step 0 switches every row to one query token and takes the KV lengths
+        back to the accepted tokens (``kv += num_accepted - draft_len``); a later
+        step advances them by one. Returns ``position_ids[gather_ids] + 1``
+        (step 0) or ``position_ids[:B] + 1``, or None without ``position_ids``.
+        """
+        md = self.metadata
+        batch_size = md.num_seqs
+        if step == 0:
+            # The host side of the switch; the device lengths are the kernel's.
+            md.set_seq_lens(slice(0, batch_size), host=1, update_counts=True)
+            md.as_generation_rows()
+        lengths = md.lengths_for_kernel_update()
+        skip_indexer_schedule = self._skips_indexer_schedule()
+        kv_mgr = md.kv_cache_manager
+        index_head_dim = kv_mgr.index_head_dim
+        use_fp4 = getattr(kv_mgr, "use_fp4", False)
+        data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
+        scale_size = index_head_dim // kv_mgr.quant_block_size * 4
+        tokens_per_block = self._tokens_per_block
+        block_stride = tokens_per_block * (data_bytes_per_token + scale_size)
+        width = min(self.gen_token_stride, self.kv_lens_cuda_2d.shape[1])
+        expand = self.dsl_expand_factor if self.expand_for_dsl else 1
+        num_sms = self.num_sms
+        block_offsets = self.indexer_k_cache_block_offsets
+        step0 = step == 0
+        has_pos = position_ids is not None
+        has_gather = has_pos and step0
+        pos_out = torch.empty_like(position_ids[:batch_size]) if has_pos else None
+        dummy = md.kv_lens_cuda
+
+        _draft_step_kernel[(1,)](
+            lengths["kv_lens_cuda"],
+            lengths["seq_lens_cuda"],
+            num_accepted if step0 else dummy,
+            position_ids if has_pos else dummy,
+            pos_out if has_pos else dummy,
+            gather_ids if has_gather else dummy,
+            self.kv_lens_cuda_2d,
+            self.kv_lens_cuda_2d.stride(0),
+            self.scheduler_metadata_buffer,
+            self.scheduler_metadata_buffer_full_next_n,
+            self.kv_lens_expanded_cuda if expand > 1 else dummy,
+            self.scheduler_metadata_buffer_expanded if expand > 1 else dummy,
+            block_offsets,
+            block_offsets.stride(0),
+            self.index_share.req_idx_per_token,
+            self.slot_mapping_fp8,
+            self.slot_mapping_scale,
+            self.gen_kv_indptr,
+            self.gen_cached_token_indptr,
+            md.num_tokens,
+            B=batch_size,
+            DRAFT_LEN=draft_len,
+            STEP0=step0,
+            HAS_POS=has_pos,
+            HAS_GATHER=has_gather,
+            SKIP_SCHED=skip_indexer_schedule,
+            WIDTH=width,
+            HAS_FULL=True,
+            EXPAND=expand,
+            NUM_SMS=num_sms,
+            SPLIT_KV=_SPLIT_KV_BY_SMS[num_sms],
+            max_blocks=block_offsets.shape[1],
+            block_offsets_stride_1=block_offsets.stride(1),
+            tokens_per_block=tokens_per_block,
+            data_bytes_per_token=data_bytes_per_token,
+            scale_size=scale_size,
+            block_stride=block_stride,
+            scale_base_offset=tokens_per_block * data_bytes_per_token,
+            BLOCK_B=max(2, triton.next_power_of_2(batch_size)),
+            BLOCK_W=max(2, triton.next_power_of_2(width)),
+            BLOCK_E=max(2, triton.next_power_of_2(batch_size * expand)),
+            BLOCK_T=max(2, triton.next_power_of_2(1 + self.max_draft_tokens)),
+            BLOCK_SM=triton.next_power_of_2(num_sms + 1),
+            num_warps=_NUM_WARPS,
+        )
+        self._draft_step_written = True
+        return pos_out
+
+    def refresh_from_draft_lengths(self) -> None:
+        if not self._draft_step_written:
+            super().refresh_from_draft_lengths()
+            return
+        self._draft_step_written = False
+        # The native refresh's host side; run_draft_step wrote every device
+        # buffer its on_update_kv_lens writes.
+        md = self.metadata
+        self._invalidate_length_prefixes()
+        if md.num_generations > 0:
+            self.max_gen_seq_len = md.seq_lens[md.num_contexts : md.num_seqs].max().item()
+        else:
+            self.max_gen_seq_len = 0
+        skip_indexer_schedule = self._skips_indexer_schedule()
+        self.indexer_schedule_stale = skip_indexer_schedule
+        self._invalidate_pool_view_cache()
+        if not skip_indexer_schedule:
+            self.gen_indexer_kv_lens_cuda_runtime = md.kv_lens_cuda[: md.num_seqs]
+            self.kv_lens_row_reorder = None
+
+
 def step_ineligibility(md, batch_size: int, num_contexts: int) -> Optional[str]:
     """Return why the fused step update cannot replace the native chain, or None.
 
@@ -312,21 +460,18 @@ def step_ineligibility(md, batch_size: int, num_contexts: int) -> Optional[str]:
     lengths, no expanded MTP buffers, no ragged verification, no FP4/FP8-DS MLA
     state and no dense top-k fallback.
     """
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
-        _fused_dsa_meta_enabled,
-    )
-
-    if not isinstance(md, DSAtrtllmAttentionMetadata):
-        return "metadata is not DSAtrtllmAttentionMetadata"
-    cls = type(md)
-    for name in ("update_for_spec_dec", "on_update_kv_lens", "on_update"):
-        if getattr(cls, name) is not getattr(DSAtrtllmAttentionMetadata, name):
-            return f"metadata overrides {name}"
+    from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
+    from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
     from tensorrt_llm._torch.attention.backends.sparse.dsa import is_dsa_cache_manager
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import _fused_dsa_meta_enabled
 
-    # With a separate draft KV cache the loop has rebound the manager and the
-    # indexer buffers to the draft ones; the update reads them at call time.
+    dsa = md.find_ext(GlmTp8DSAMetadata)
+    if type(dsa) is not GlmTp8DSAMetadata:
+        return "metadata does not carry GlmTp8DSAMetadata"
+    if md.find_ext(FlashMlaMetadata) is not None:
+        return "FlashMLA metadata state"
+    if md.find_ext(Fp4MlaState) is not None:
+        return "FP8-DS/FP4 MLA metadata state"
     if md.kv_cache_manager is None or not is_dsa_cache_manager(md.kv_cache_manager):
         return "KV cache manager is not a DSA cache manager"
     if num_contexts != 0 or md.num_contexts != 0:
@@ -335,7 +480,7 @@ def step_ineligibility(md, batch_size: int, num_contexts: int) -> Optional[str]:
         return f"batch size {batch_size} outside the fused domain"
     if not _fused_dsa_meta_enabled():
         return "native fused DSA metadata disabled"
-    if md.use_fp8_ds_mla or getattr(md, "fp4_mla_state", None) is not None:
+    if md.use_fp8_ds_mla:
         return "FP8-DS/FP4 MLA metadata state"
     if md.enable_ragged_verification or md.is_ragged_verify:
         return "ragged verification"
@@ -369,6 +514,7 @@ def draft_step_update(
     num_accepted_tokens: Optional[torch.Tensor],
     position_ids: Optional[torch.Tensor],
     gather_ids: Optional[torch.Tensor],
+    refresh: Callable[[], None],
 ) -> Optional[DraftStepResult]:
     """Fused replacement of one draft step's metadata update, or None (native).
 
@@ -376,7 +522,7 @@ def draft_step_update(
     position ids (``position_ids[gather_ids] + 1`` at step 0,
     ``position_ids[:batch_size] + 1`` later; skipped when ``position_ids`` is
     None), the step-0 switch to one query token per request, the KV-length
-    update and ``update_for_spec_dec``.
+    update and the draft refresh.
 
     Args:
         md: the draft loop's attention metadata.
@@ -388,12 +534,13 @@ def draft_step_update(
         position_ids: 1-D position ids of this step, or None on the last step.
         gather_ids: int64 ``[batch_size]`` rows of ``position_ids`` (step 0).
 
+    The caller checked the draft metadata once for the loop
+    (``step_ineligibility``).
+
     Returns:
         ``DraftStepResult`` when the fused update ran, None when the caller
         must run the native update (no state has been modified then).
     """
-    if step_ineligibility(md, batch_size, num_contexts) is not None:
-        return None
     if step == 0:
         if (
             num_accepted_tokens is None
@@ -408,90 +555,10 @@ def draft_step_update(
     if position_ids is not None and (position_ids.dim() != 1 or not position_ids.is_contiguous()):
         return None
 
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-
-    if step == 0:
-        # Host side of the native step-0 switch to one query token per request.
-        md._seq_lens[:batch_size].fill_(1)
-        md.on_update()
-        if hasattr(md, "host_request_types"):
-            md.host_request_types[: md.num_contexts].fill_(1)
-        md.num_contexts = 0
-
-    kv_mgr = md.kv_cache_manager
-    index_head_dim = kv_mgr.index_head_dim
-    use_fp4 = getattr(kv_mgr, "use_fp4", False)
-    data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
-    scale_size = index_head_dim // kv_mgr.quant_block_size * 4
-    tokens_per_block = md._tokens_per_block
-    block_stride = tokens_per_block * (data_bytes_per_token + scale_size)
-    width = min(md.gen_token_stride, md.kv_lens_cuda_2d.shape[1])
-    expand = md.dsl_expand_factor if md.expand_for_dsl else 1
-    num_sms = md.num_sms
-    block_offsets = md.indexer_k_cache_block_offsets
-    has_pos = position_ids is not None
-    pos_out = torch.empty_like(position_ids[:batch_size]) if has_pos else None
-    dummy = md.kv_lens_cuda
-
-    _draft_step_kernel[(1,)](
-        md.kv_lens_cuda,
-        md.seq_lens_cuda,
-        num_accepted_tokens if step == 0 else dummy,
-        position_ids if has_pos else dummy,
-        pos_out if has_pos else dummy,
-        gather_ids if (step == 0 and has_pos) else dummy,
-        md.kv_lens_cuda_2d,
-        md.kv_lens_cuda_2d.stride(0),
-        md.scheduler_metadata_buffer,
-        md.scheduler_metadata_buffer_full_next_n,
-        md.kv_lens_expanded_cuda if expand > 1 else dummy,
-        md.scheduler_metadata_buffer_expanded if expand > 1 else dummy,
-        block_offsets,
-        block_offsets.stride(0),
-        md.req_idx_per_token,
-        md.slot_mapping_fp8,
-        md.slot_mapping_scale,
-        md.gen_kv_indptr,
-        md.gen_cached_token_indptr,
-        md.num_tokens,
-        B=batch_size,
-        DRAFT_LEN=runtime_draft_len,
-        STEP0=step == 0,
-        HAS_POS=has_pos,
-        WIDTH=width,
-        HAS_FULL=True,
-        EXPAND=expand,
-        NUM_SMS=num_sms,
-        SPLIT_KV=_SPLIT_KV_BY_SMS[num_sms],
-        max_blocks=block_offsets.shape[1],
-        block_offsets_stride_1=block_offsets.stride(1),
-        tokens_per_block=tokens_per_block,
-        data_bytes_per_token=data_bytes_per_token,
-        scale_size=scale_size,
-        block_stride=block_stride,
-        scale_base_offset=tokens_per_block * data_bytes_per_token,
-        BLOCK_B=max(2, triton.next_power_of_2(batch_size)),
-        BLOCK_W=max(2, triton.next_power_of_2(width)),
-        BLOCK_E=max(2, triton.next_power_of_2(batch_size * expand)),
-        BLOCK_T=max(2, triton.next_power_of_2(1 + md.max_draft_tokens)),
-        BLOCK_SM=triton.next_power_of_2(num_sms + 1),
-        num_warps=_NUM_WARPS,
+    pos_out = md.ext(GlmTp8DSAMetadata).run_draft_step(
+        step, runtime_draft_len, num_accepted_tokens, position_ids, gather_ids
     )
-
-    # Host side of update_for_spec_dec -> on_update_kv_lens (no device work in
-    # the eligible domain, checked above).
-    TrtllmAttentionMetadata.update_for_spec_dec(md)
-    md.max_ctx_kv_len = 0
-    md.num_ctx_cached_tokens = 0
-    md.max_gen_seq_len = 1
-    TrtllmAttentionMetadata.on_update_kv_lens(md)
-    md._invalidate_pool_view_cache()
-    md._fused_dsa_meta_armed = True
-    md.gen_indexer_kv_lens_cuda_runtime = md.get_indexer_kv_lens(
-        md.kv_lens_cuda[md.num_contexts : md.num_seqs]
-    )
-    md._compute_kv_lens_row_reorder()
-    md.prepare_dense_topk_indices(md.kv_lens_cuda, device=True)
+    refresh()
     if step == 0:
         md.use_spec_decoding = False
     return DraftStepResult(position_ids=pos_out)

@@ -4,8 +4,6 @@ from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
 from .eagle3 import MTPEagleWorker
 from .interface import (SpecMetadata, SpecWorkerBase, draft_prompt_lookahead,
-                        prepare_attn_metadata_for_draft_replay,
-                        restore_attn_metadata_after_draft_replay,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
@@ -59,8 +57,6 @@ __all__ = [
     "get_spec_metadata",
     "get_spec_resource_manager",
     "get_spec_worker",
-    "prepare_attn_metadata_for_draft_replay",
-    "restore_attn_metadata_after_draft_replay",
     "should_use_separate_draft_kv_cache",
     "update_spec_config_from_draft_model_config",
     "update_spec_config_from_loaded_model",

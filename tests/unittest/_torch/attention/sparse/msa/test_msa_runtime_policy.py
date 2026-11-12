@@ -12,6 +12,7 @@ from unittest.mock import create_autospec
 import numpy as np
 import pytest
 import torch
+from _torch.helpers import bare_extension
 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
@@ -27,9 +28,10 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen
     write_subpage_block_table,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
-    MiniMaxM3MsaSparseAttentionMetadata,
+    MiniMaxM3MsaMetadata,
     _fill_unused_slots,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import h2d_cache
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -81,19 +83,28 @@ def manager(monkeypatch) -> MiniMaxM3KVCacheManagerV2:
 # ---------------------------------------------------------------------------
 
 
+def _bare_msa() -> MiniMaxM3MsaMetadata:
+    """The MSA extension of an uninitialized TRTLLM metadata, with no buffers."""
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    msa = bare_extension(MiniMaxM3MsaMetadata, metadata)
+    metadata.replace_ext(msa)
+    return msa
+
+
 def _short_table_metadata(
     policy: MsaRuntimePolicy, manager: MiniMaxM3KVCacheManagerV2, num_contexts: int = 0
-) -> MiniMaxM3MsaSparseAttentionMetadata:
-    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
-    metadata.msa_policy = policy
-    metadata._num_contexts = num_contexts
-    metadata.kv_cache_manager = manager
-    metadata.max_num_sequences = 4
-    metadata.max_num_tokens = 16
-    metadata.cuda_graph_buffers = None
-    metadata.is_cuda_graph = False
-    metadata.mapping = Mapping()
-    return metadata
+) -> MiniMaxM3MsaMetadata:
+    msa = _bare_msa()
+    msa.msa_policy = policy
+    core = msa.metadata.core()
+    core._num_contexts = num_contexts
+    core.kv_cache_manager = manager
+    core.max_num_sequences = 4
+    core.max_num_tokens = 16
+    core.cuda_graph_buffers = None
+    core.is_cuda_graph = False
+    core.mapping = Mapping()
+    return msa
 
 
 def _identity(n_valid: list[int]) -> torch.Tensor:
@@ -103,7 +114,7 @@ def _identity(n_valid: list[int]) -> torch.Tensor:
     return table.unsqueeze(0).expand(NUM_KV_HEADS, len(n_valid), MSA_REQUIRED_TOPK)
 
 
-def _staged(metadata: MiniMaxM3MsaSparseAttentionMetadata, total_q: int) -> torch.Tensor:
+def _staged(metadata: MiniMaxM3MsaMetadata, total_q: int) -> torch.Tensor:
     torch.cuda.synchronize()
     size = NUM_KV_HEADS * total_q * MSA_REQUIRED_TOPK
     return metadata.msa_short_table[:size].view(NUM_KV_HEADS, total_q, MSA_REQUIRED_TOPK).cpu()
@@ -143,7 +154,7 @@ def test_ineligible_steps_do_not_use_the_identity_table(manager, n_valid, num_co
     metadata._stage_msa_short_table(torch.tensor([3], dtype=torch.int32), PARAMS)
     assert metadata._msa_short_ok
 
-    metadata._num_contexts = num_contexts
+    metadata.metadata._num_contexts = num_contexts
     metadata._stage_msa_short_table(torch.tensor(n_valid, dtype=torch.int32), PARAMS)
 
     assert not metadata._msa_short_ok
@@ -470,10 +481,8 @@ def test_block_ids_per_seq_matches_the_cache_index_rows(seed):
 # ---------------------------------------------------------------------------
 
 
-def _subpage_metadata(
-    rows: int, max_blocks: int, factor: int
-) -> MiniMaxM3MsaSparseAttentionMetadata:
-    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+def _subpage_metadata(rows: int, max_blocks: int, factor: int) -> MiniMaxM3MsaMetadata:
+    metadata = _bare_msa()
     metadata._msa_subpage_rows = rows  # as prepare() stages them
     metadata.msa_block_table = torch.randint(
         0, 1 << 20, (rows + 2, max_blocks), dtype=torch.int32, device="cuda"
@@ -518,7 +527,7 @@ def test_each_forward_expands_the_current_block_table(monkeypatch):
     metadata = _subpage_metadata(rows=2, max_blocks=16, factor=4)
     metadata.msa_subpage_rows(0, 2)
     metadata.msa_block_table[:2, :5] += 11
-    # The next forward (on_update_kv_lens opens it).
+    # The next forward: its prepare (or a draft's before_forward) resets the flag.
     metadata._msa_subpage_expanded = False
 
     table, _ = metadata.msa_subpage_rows(0, 2)
@@ -552,7 +561,7 @@ def test_a_captured_forward_expands_the_table_at_every_replay(monkeypatch):
 
 
 def test_nothing_is_expanded_without_a_prepared_step():
-    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata = _bare_msa()
     metadata.msa_subpage_block_table = torch.arange(12, dtype=torch.int32).reshape(2, 2, 3)
     metadata._msa_subpages_per_slot = 2
 
@@ -566,25 +575,26 @@ def test_nothing_is_expanded_without_a_prepared_step():
 # ---------------------------------------------------------------------------
 
 
-def _tail_metadata(cap: int, start) -> MiniMaxM3MsaSparseAttentionMetadata:
-    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+def _tail_metadata(cap: int, start) -> MiniMaxM3MsaMetadata:
+    metadata = _bare_msa()
     metadata.msa_out_cache_loc = torch.arange(100, 100 + cap, dtype=torch.int32, device="cuda")
     metadata._msa_tail_start = start
+    metadata._msa_tail_filled = False
     return metadata
 
 
 @requires_cuda
 def test_the_forward_fills_only_past_the_live_slots():
     metadata = _tail_metadata(10, 4)
-    metadata._fill_tail_in_forward()
+    metadata.msa_write_slots()
     assert metadata.msa_out_cache_loc.tolist() == [100, 101, 102, 103] + [-1] * 6
 
     untouched = _tail_metadata(6, None)
-    untouched._fill_tail_in_forward()
+    untouched.msa_write_slots()
     assert untouched.msa_out_cache_loc.tolist() == list(range(100, 106))
 
     full = _tail_metadata(6, 6)
-    full._fill_tail_in_forward()
+    full.msa_write_slots()
     assert full.msa_out_cache_loc.tolist() == list(range(100, 106))
 
 
@@ -598,7 +608,9 @@ def test_a_captured_forward_refills_its_tail_at_every_replay():
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
-        metadata._fill_tail_in_forward()
+        metadata._msa_tail_filled = False
+        metadata.msa_write_slots()
+        metadata.msa_write_slots(5)
     torch.cuda.current_stream().wait_stream(stream)
 
     for step in range(3):

@@ -11,6 +11,7 @@ import types
 from importlib import import_module
 
 import torch
+from _torch.helpers import give_stub_a_draft
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 
@@ -242,10 +243,10 @@ def check_spec_accept_uses_current_slot_buffer(monkeypatch, spec_worker, request
         num_seqs=3,
         num_contexts=0,
         kv_cache_manager=manager,
-        draft_kv_cache_block_offsets=torch.zeros(3, 1),
         mamba_metadata=types.SimpleNamespace(state_indices=torch.arange(3)),
         kv_lens_cuda=torch.ones(3, dtype=torch.int32),
     )
+    give_stub_a_draft(metadata, torch.zeros(3, 1))
     spec = types.SimpleNamespace(
         runtime_draft_len=7, is_cuda_graph=False, draft_tokens=torch.zeros(3, 7)
     )
@@ -254,7 +255,7 @@ def check_spec_accept_uses_current_slot_buffer(monkeypatch, spec_worker, request
             model=types.SimpleNamespace(embed_tokens=torch.nn.Embedding(8, 4))
         )
     )
-    worker._k3_accept(torch.zeros(3, 8), metadata, spec, draft)
+    worker._k3_accept(torch.zeros(3, 8), metadata, spec, draft, metadata.kv_lens_cuda)
     assert received[0] is worker._batch_to_slot_buffer.tensor
     torch.testing.assert_close(received[0], torch.tensor(expected), rtol=0, atol=0)
 
@@ -270,9 +271,17 @@ def check_drafter_inputs_use_current_slot_buffer(monkeypatch, spec_worker, num_c
     metadata = types.SimpleNamespace(
         num_contexts=num_contexts,
         num_seqs=3,
-        _seq_lens_cuda=torch.ones(3, dtype=torch.int32),
-        _seq_lens=torch.ones(3, dtype=torch.int32),
+        seq_lens_cuda=torch.ones(3, dtype=torch.int32),
+        seq_lens=torch.ones(3, dtype=torch.int32),
     )
+
+    def set_seq_lens(rows, *, host=None, device=None, update_counts=False):
+        if host is not None:
+            metadata.seq_lens[rows] = host
+        if device is not None:
+            metadata.seq_lens_cuda[rows] = device
+
+    metadata.set_seq_lens = set_seq_lens
     spec = types.SimpleNamespace(
         hidden_size=4, runtime_draft_len=7, get_hidden_states=lambda count: None
     )

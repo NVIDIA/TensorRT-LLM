@@ -3,35 +3,45 @@
 """CPU coverage of ragged preparation, update and backend dispatch contracts."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from _torch.helpers import bare_extension, refresh_from_lengths
 
+from tensorrt_llm._torch.attention.backends.features import DraftMetadata, FlashMlaMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     forward_generation_sparse_attn,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
-from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAMetadata
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 pytestmark = pytest.mark.cpu_only
 
 
-def _metadata(seq_lens: list[int], num_contexts: int = 0) -> DSAtrtllmAttentionMetadata:
-    metadata = DSAtrtllmAttentionMetadata.__new__(DSAtrtllmAttentionMetadata)
+def _metadata(seq_lens: list[int], num_contexts: int = 0) -> TrtllmAttentionMetadata:
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
     metadata._seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-    metadata._seq_lens_cuda = metadata._seq_lens.clone()
+    metadata._seq_lens_cuda = metadata.seq_lens.clone()
     metadata._num_contexts = num_contexts
     metadata._num_generations = len(seq_lens) - num_contexts
     metadata._num_ctx_tokens = sum(seq_lens[:num_contexts])
     metadata._num_tokens = sum(seq_lens)
-    metadata.max_draft_tokens = 5
-    metadata.runtime_tokens_per_gen_step = 0
-    metadata._indexer_compress_ratio = 1
     metadata.kv_cache_manager = None
-    metadata.num_sms = 1
+    with patch(
+        "tensorrt_llm.deep_gemm.get_num_sms",
+        return_value=1,
+    ):
+        dsa = bare_extension(DSAMetadata, metadata)
+    dsa.max_draft_tokens = 5
+    dsa._indexer_compress_ratio = 1
+    metadata.replace_ext(bare_extension(MTPIndexShareExtension, metadata))
+    metadata.replace_ext(dsa)
+    metadata.replace_ext(bare_extension(SpecDecodingMetadata, metadata))
     return metadata
 
 
@@ -48,7 +58,6 @@ def test_schedule_update_keeps_runtime_query_width(monkeypatch, runtime_width: i
     metadata.gen_kv_indptr = torch.zeros(3, dtype=torch.int64)
     metadata.gen_cached_token_indptr = torch.zeros(3, dtype=torch.int64)
     metadata.enable_ragged_verification = False
-    metadata.enable_flash_mla = False
     metadata.use_fp8_ds_mla = False
     metadata.use_expanded_buffers_for_mtp = False
     metadata.expand_for_dsl = False
@@ -72,7 +81,7 @@ def test_schedule_update_keeps_runtime_query_width(monkeypatch, runtime_width: i
     )
     Indexer.prepare_scheduler_metadata(metadata)
     metadata.kv_lens_cuda.add_(1)
-    metadata.on_update_kv_lens()
+    refresh_from_lengths(metadata)
 
     assert [tuple(value.shape) for value in scheduler_inputs] == [
         (2, 1),
@@ -92,8 +101,8 @@ def test_prepare_initializes_row_extents_and_refresh_reuses_storage(
 ) -> None:
     metadata = _metadata(([3] if num_contexts else []) + [2, 4], num_contexts)
     metadata.ragged_verify_lens = [2, 4]
+    dsa = metadata.ext(DSAMetadata)
     metadata.enable_ragged_verification = True
-    metadata.is_spec_decoding_enabled = False
     metadata.sparse_metadata_params = SimpleNamespace(use_cute_dsl_paged_mqa_logits=False)
     metadata.gen_token_repeats_cuda = torch.empty(2, dtype=torch.int64)
     metadata.host_gen_token_repeats = torch.empty(2, dtype=torch.int64)
@@ -102,11 +111,11 @@ def test_prepare_initializes_row_extents_and_refresh_reuses_storage(
     for name in ("row_kv_lens", "row_kv_correction", "row_req_idx"):
         dtype = torch.long if name == "row_req_idx" else torch.int32
         for suffix in ("host", "cuda"):
-            setattr(metadata, f"{name}_{suffix}", torch.full((6,), -777, dtype=dtype))
+            setattr(dsa, f"{name}_{suffix}", torch.full((6,), -777, dtype=dtype))
     for name in ("attn_row_kv_lens", "attn_row_kv_correction", "attn_row_req_idx"):
         dtype = torch.long if name == "attn_row_req_idx" else torch.int32
         for suffix in ("host", "cuda"):
-            setattr(metadata, f"{name}_{suffix}", torch.full((7,), -777, dtype=dtype))
+            setattr(dsa, f"{name}_{suffix}", torch.full((7,), -777, dtype=dtype))
     metadata.prompt_lens_cpu = torch.tensor(([3] if num_contexts else []) + [100, 200])
     metadata.attn_row_prompt_lens_cpu = torch.empty(7, dtype=torch.int32)
     metadata.attn_row_prompt_lens_cuda = torch.empty(7, dtype=torch.int32)
@@ -152,7 +161,7 @@ def _prefix_metadata(monkeypatch, num_contexts=0, ragged=True):
     metadata.ragged_verify_lens = [1, 2, 4] if ragged else None
     metadata.max_num_sequences = len(seq_lens)
     metadata.cuda_graph_buffers = {}
-    metadata.draft_kv_cache_manager = None
+    metadata.replace_ext(bare_extension(DraftMetadata, metadata))
     metadata.kv_cache_manager = SimpleNamespace(
         num_pools=1, num_attention_op_pools=1, max_blocks_per_seq=1
     )
@@ -176,11 +185,10 @@ def _prefix_metadata(monkeypatch, num_contexts=0, ragged=True):
     metadata.mla_cu_q_rows = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
     metadata.mla_cu_kv_seqlens = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
     metadata.mla_ctx_cu_q_seqlens = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
-    metadata._mla_ctx_cu_seqlens_valid = False
-    metadata._mla_scheduler_buffers_valid = False
+    metadata.core()._mla_ctx_cu_seqlens_valid = False
+    metadata.core()._mla_scheduler_buffers_valid = False
     metadata.prompt_lens_cpu = metadata.seq_lens.clone()
     metadata.kv_cache_block_offsets = None
-    metadata.is_spec_decoding_enabled = False
     metadata.sparse_metadata_params = SimpleNamespace(use_cute_dsl_paged_mqa_logits=False)
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.get_sm_version",
@@ -209,8 +217,8 @@ def test_feature_off_keeps_request_major_prefixes_and_allocations(monkeypatch):
 def test_uniform_step_with_opt_in_keeps_request_major_prefixes(monkeypatch):
     metadata, _ = _prefix_metadata(monkeypatch)
     metadata.ragged_verify_lens = None
-    metadata._seq_lens.fill_(2)
-    metadata._seq_lens_cuda.copy_(metadata._seq_lens)
+    metadata.seq_lens.fill_(2)
+    metadata.seq_lens_cuda.copy_(metadata.seq_lens)
     q_prefix, kv_prefix = metadata.mla_prepare_scheduler_buffers(2)
     assert q_prefix.data_ptr() == metadata.mla_cu_q_rows.data_ptr()
     torch.testing.assert_close(q_prefix, torch.tensor([0, 4, 8, 12], dtype=torch.int32))
@@ -275,10 +283,10 @@ def test_module_precomputes_causal_token_major_prefixes_and_refreshes(monkeypatc
     launch()
     assert observed[-1][2:] == observed[-2][2:]
 
-    # Exercise the actual overlap hook: refresh device rows and invalidate the
-    # cached prefix before the next module-level dispatch, without host refresh.
+    # Exercise the device refresh after a draft step: refresh device rows and
+    # invalidate the cached prefix before the next module-level dispatch,
+    # without host refresh.
     metadata.kv_cache_manager = None
-    metadata.enable_flash_mla = False
     metadata.use_fp8_ds_mla = False
     metadata.expand_for_dsl = False
     metadata.kv_lens_cuda_2d = torch.empty(metadata.num_generations, 6, dtype=torch.int32)
@@ -295,8 +303,8 @@ def test_module_precomputes_causal_token_major_prefixes_and_refreshes(monkeypatc
         lambda *unused: torch.zeros(1, dtype=torch.int32),
     )
     metadata.kv_lens_cuda[num_contexts:] -= torch.tensor([2, 3, 6])
-    metadata.on_update_kv_lens()
-    assert metadata._mla_scheduler_buffers_valid is False
+    refresh_from_lengths(metadata)
+    assert metadata._ragged_mla_buffers_valid is False
     launch()
     expected_kv -= torch.tensor([2, 3, 3, 6, 6, 6, 6])
     torch.testing.assert_close(observed[-1][0], expected_q)
@@ -308,9 +316,10 @@ def test_module_precomputes_causal_token_major_prefixes_and_refreshes(monkeypatc
 @pytest.mark.parametrize("metadata_valid", [False, True])
 def test_flash_mla_rejects_token_major_generation_before_dispatch(metadata_valid: bool) -> None:
     metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
-    metadata.enable_flash_mla = True
-    metadata._flash_mla_metadata_valid = metadata_valid
-    metadata.token_major_gen_view = Mock(return_value=object())
+    flash_mla = bare_extension(FlashMlaMetadata, metadata)
+    flash_mla.metadata_valid = metadata_valid
+    metadata.replace_ext(flash_mla)
+    metadata.core().token_major_view = Mock(return_value=object())
     attention = SimpleNamespace(
         sparse_params=None,
         is_mla_enable=False,
@@ -336,8 +345,9 @@ def test_uniform_flash_mla_and_ragged_native_pass_the_guard(
     flash_mla: bool, token_major: bool
 ) -> None:
     metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
-    metadata.enable_flash_mla = flash_mla
-    metadata.token_major_gen_view = Mock(return_value=object() if token_major else None)
+    if flash_mla:
+        metadata.replace_ext(bare_extension(FlashMlaMetadata, metadata))
+    metadata.core().token_major_view = Mock(return_value=object() if token_major else None)
     metadata.use_paged_context_fmha = False
     attention = SimpleNamespace(
         sparse_params=None,

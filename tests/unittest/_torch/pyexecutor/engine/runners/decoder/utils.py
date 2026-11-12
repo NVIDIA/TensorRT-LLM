@@ -208,7 +208,8 @@ def decoder_warmup(
         warmup_timer=_WarmupTimer(rank=0),
         metrics={},
         agreement=agreement if agreement is not None else WarmupAgreement(None, mapping),
-        metadata=Mock(),
+        # Attention metadata with no extensions attached.
+        metadata=Mock(attn_metadata=Mock(find_ext=Mock(return_value=None))),
         dummy_requests=dummy_requests,
         graphs=graphs,
         inputs=SimpleNamespace(guided_decoder=None),

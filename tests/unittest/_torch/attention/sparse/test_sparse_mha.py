@@ -33,17 +33,16 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import (
+    generate_spec_decoding_packed_mask,
+    generate_spec_decoding_position_offsets,
+)
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseParams
-from tensorrt_llm._torch.attention.backends.trtllm import (
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
-    generate_spec_decoding_packed_mask,
-    generate_spec_decoding_position_offsets,
-)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
@@ -275,12 +274,12 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
             runtime_features=AttentionRuntimeFeatures(
                 has_speculative_draft_tokens=scenario.has_draft_tokens
             ),
-            is_spec_decoding_enabled=scenario.has_draft_tokens,
-            use_spec_decoding=scenario.has_draft_tokens,
-            is_spec_dec_tree=False,
-            max_total_draft_tokens=(
-                scenario.max_query_len - 1 if scenario.has_draft_tokens else None
-            ),
+        )
+        metadata.is_spec_decoding_enabled = scenario.has_draft_tokens
+        metadata.use_spec_decoding = scenario.has_draft_tokens
+        metadata.is_spec_dec_tree = False
+        metadata.max_total_draft_tokens = (
+            scenario.max_query_len - 1 if scenario.has_draft_tokens else None
         )
         if scenario.has_draft_tokens:
             draft_len = scenario.max_query_len - 1

@@ -9,13 +9,15 @@ from unittest import mock
 
 import pytest
 import torch
+from _torch.helpers import refresh_from_lengths
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention import mla as mla_module
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention.backends.trtllm import \
-    TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import (
+    TrtllmAttentionMetadata, TrtllmCoreMetadata)
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
@@ -1196,9 +1198,9 @@ def _run_test_for_backend(backend_name,
                     ),
                     mapping=mapping,
                 )
-                if backend_name == "TRTLLM":
-                    gen_metadata_kwargs["enable_flash_mla"] = (
-                        cuda_capability == (9, 0))
+                if backend_name == "TRTLLM" and cuda_capability == (9, 0):
+                    gen_metadata_kwargs["extension_types"] = (
+                        FlashMlaMetadata, )
                 attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
                 attn_metadata.prepare()
             for layer_idx in range(num_layers):
@@ -1440,21 +1442,24 @@ def _run_test_for_backend(backend_name,
 NUM_HEADS = 128
 
 
-class _Prefixes:
-    """The state `mla_prepare_*` touches, with the real methods bound to it.
+class _PrefixesCore(TrtllmCoreMetadata):
+    """The core state `mla_prepare_*` reads, with the length properties as plain attributes."""
+
+    num_contexts = 0
+    num_seqs = 0
+    seq_lens_cuda = None
+
+
+class _Prefixes(TrtllmAttentionMetadata):
+    """The state `mla_prepare_*` touches, running the real metadata methods.
 
     Deliberately not a full `TrtllmAttentionMetadata`: that needs a KV cache
-    manager and a resource pool, none of which these methods read. Binding the
-    production functions keeps this a test of the shipped code rather than of a
-    reimplementation.
+    manager and a resource pool, none of which these methods read. Inheriting
+    the production methods keeps this a test of the shipped code rather than of
+    a reimplementation.
     """
 
-    # Bind the unbound functions so any edit to them is exercised here.
-    mla_prepare_scheduler_buffers = TrtllmAttentionMetadata.mla_prepare_scheduler_buffers
-    mla_prepare_ctx_cu_seqlens = TrtllmAttentionMetadata.mla_prepare_ctx_cu_seqlens
-    _invalidate_mla_scheduler_buffers = TrtllmAttentionMetadata._invalidate_mla_scheduler_buffers
-    on_update_kv_lens = TrtllmAttentionMetadata.on_update_kv_lens
-    update_for_spec_dec = TrtllmAttentionMetadata.update_for_spec_dec
+    core_metadata_type = _PrefixesCore
 
     def __init__(self, q_lens, kv_lens, num_contexts=0):
         device = torch.device("cuda")
@@ -1467,17 +1472,16 @@ class _Prefixes:
                                          dtype=torch.int32,
                                          device=device)
         size = self.num_seqs + 1
-        self.mla_cu_q_rows = torch.zeros(size, dtype=torch.int32, device=device)
-        self.mla_cu_kv_seqlens = torch.zeros(size,
-                                             dtype=torch.int32,
-                                             device=device)
-        self.mla_ctx_cu_q_seqlens = torch.zeros(size,
+        self.core().mla_cu_q_rows = torch.zeros(size,
                                                 dtype=torch.int32,
                                                 device=device)
-        # The hooks also read `enable_flash_mla` and `mixed_precision_staging`.
-        self.enable_flash_mla = False
-        self.mixed_precision_staging = None
-        self._invalidate_mla_scheduler_buffers()
+        self.core().mla_cu_kv_seqlens = torch.zeros(size,
+                                                    dtype=torch.int32,
+                                                    device=device)
+        self.core().mla_ctx_cu_q_seqlens = torch.zeros(size,
+                                                       dtype=torch.int32,
+                                                       device=device)
+        self.core()._invalidate_mla_scheduler_buffers()
 
     def rebuild(self):
         cu_q, cu_kv = self.mla_prepare_scheduler_buffers(NUM_HEADS)
@@ -1495,18 +1499,18 @@ def test_q_rows_follow_a_spec_dec_query_length_change():
     cu_q, _ = state.rebuild()
     assert cu_q == [0, 4 * NUM_HEADS, 8 * NUM_HEADS]
 
-    # What MTPWorker.change_attn_metadata does to the generation rows.
+    # What MTPWorker.change_attn_metadata does to the generation rows of its draft.
     state.seq_lens_cuda -= 1
     assert state.rebuild(
     )[0] == cu_q, "no rebuild is expected until a hook fires"
 
-    state.update_for_spec_dec()
+    refresh_from_lengths(state)
     assert state.rebuild()[0] == [0, 3 * NUM_HEADS, 6 * NUM_HEADS]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_kv_prefix_follows_an_in_place_device_kv_len_change():
-    """The overlap scheduler bumps `kv_lens_cuda` on device, never the host copy.
+    """A draft step advances `kv_lens_cuda` on device, never the host copy.
 
     A host-derived prefix cannot see this, which is why the rebuild reads
     `kv_lens_cuda` directly.
@@ -1514,8 +1518,10 @@ def test_kv_prefix_follows_an_in_place_device_kv_len_change():
     state = _Prefixes(q_lens=[1, 1], kv_lens=[100, 200])
     assert state.rebuild()[1] == [0, 100, 300]
 
-    state.kv_lens_cuda += torch.tensor([3, 5], dtype=torch.int32, device="cuda")
-    state.on_update_kv_lens()
+    state.core().kv_lens_cuda += torch.tensor([3, 5],
+                                              dtype=torch.int32,
+                                              device="cuda")
+    refresh_from_lengths(state)
     assert state.rebuild()[1] == [0, 103, 308]
 
 
@@ -1527,7 +1533,7 @@ def test_partial_acceptance_differs_per_request():
 
     state.seq_lens_cuda.copy_(
         torch.tensor([1, 3, 4], dtype=torch.int32, device="cuda"))
-    state.update_for_spec_dec()
+    refresh_from_lengths(state)
     cu_q, _ = state.rebuild()
     assert cu_q == [0, 1 * NUM_HEADS, 4 * NUM_HEADS, 8 * NUM_HEADS]
 
@@ -1540,7 +1546,7 @@ def test_context_prefix_counts_tokens_not_rows():
 
     state.seq_lens_cuda.copy_(
         torch.tensor([2, 3, 7], dtype=torch.int32, device="cuda"))
-    state.on_update_kv_lens()
+    refresh_from_lengths(state)
     assert state.mla_prepare_ctx_cu_seqlens().tolist() == [0, 2, 5, 12]
 
 

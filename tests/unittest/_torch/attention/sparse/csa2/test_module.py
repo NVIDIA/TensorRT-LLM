@@ -12,6 +12,7 @@ from pydantic import TypeAdapter
 from torch import nn
 from utils.util import skip_blackwell_geforce
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2Layout,
@@ -107,17 +108,21 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         select_global_source=lambda layer, local, global_hidden: local,
         enter_layer=lambda layer: entered.append(layer.layer_idx),
     )
+    # The stubs serve as both the core metadata and its CSA2 extension.
+    source.ext = source.find_ext = lambda cls: source
 
     def phase_metadata(query, extra_width, query_start, *, staging_dtype, layer_idx=None):
         stop = query_start + query.shape[0]
         assert stop <= (contexts if query_start < contexts else count)
         torch.testing.assert_close(query.flatten(1), hidden[query_start:stop], atol=0, rtol=0)
-        return SimpleNamespace(
+        tile = SimpleNamespace(
             num_contexts=int(query_start < contexts),
             num_tokens=query.shape[0],
             num_query_heads=1,
             swa_pool=torch.empty(0, dtype=staging_dtype),
         )
+        tile.ext = lambda cls: tile
+        return tile
 
     def map_indices(layer, start, end, logical, *, visible_lengths):
         torch.testing.assert_close(logical[:, 0], row_ids[start:end], atol=0, rtol=0)
@@ -271,20 +276,21 @@ def test_ced_owner_is_written_once_before_narrowed_query(monkeypatch, module_cac
         PositionalEmbeddingParams,
         RopeParams,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm.functional import PositionEmbeddingType
 
     manager, request = module_cache
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.Metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
     metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
     metadata.prepare()
-    metadata.begin_model_forward()
+    metadata.reset_forward_state()
     torch.manual_seed(4126)
     with torch.device("cuda"):
         model = DeepseekV41Attention(
@@ -345,7 +351,6 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
         PositionalEmbeddingParams,
         RopeParams,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
         pack_rows,
@@ -361,7 +366,9 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
     torch.manual_seed(818)
     manager, request = module_cache
     layout = manager.layout
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.Metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
@@ -783,7 +790,6 @@ def test_fused_native_index_q_and_graph(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     torch.manual_seed(946)
@@ -795,7 +801,9 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
         "tensorrt_llm._torch.attention.backends.sparse.csa2.module.do_multi_stream",
         lambda: enabled[0],
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.Metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
@@ -841,7 +849,6 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
 @pytest.mark.parametrize("overlap", [False, True])
 @torch.inference_mode()
 def test_native_module_fixed_context_graph(monkeypatch, module_cache, overlap):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     torch.manual_seed(947)
@@ -852,7 +859,9 @@ def test_native_module_fixed_context_graph(monkeypatch, module_cache, overlap):
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.sparse.csa2.module.do_multi_stream", lambda: overlap
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.Metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
@@ -960,7 +969,6 @@ def test_packed_output_inverse_rope_module_and_graph(
 
     from dataclasses import replace
 
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     torch.manual_seed(950)
@@ -972,7 +980,9 @@ def test_packed_output_inverse_rope_module_and_graph(
         grouped_block=block,
         sparse_options={"use_packed_sparse_attention": True, "fuse_packed_output_rope": True},
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.Metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
@@ -1034,7 +1044,6 @@ def test_packed_output_inverse_rope_module_and_graph(
 @torch.inference_mode()
 def test_two_rank_module_projection_parity(monkeypatch, quantization):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
@@ -1111,7 +1120,7 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
         assert manager.prepare_context(request)
         assert manager.resize_context(request, request.context_chunk_size)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.Metadata(
             max_num_requests=1, max_num_tokens=3, kv_cache_manager=manager
         )
         metadata.request_ids = [request.py_request_id]
@@ -1150,7 +1159,6 @@ def replay_module_factory():
         RopeParams,
     )
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -1194,7 +1202,7 @@ def replay_module_factory():
         assert manager.prepare_context(request)
         assert manager.resize_context(request, request.context_chunk_size)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.Metadata(
             max_num_requests=1, max_num_tokens=16, kv_cache_manager=manager
         )
         metadata.request_ids = [request.py_request_id]
@@ -1440,13 +1448,14 @@ def test_pure_replay_skips_global_projection_and_restores_odd_state(
 @torch.inference_mode()
 def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_factory):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     torch.manual_seed(957)
     model, manager, seed_metadata, hidden = replay_module_factory(2, input_length=12)
 
     def new_metadata(graph=False):
-        result = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=16, kv_cache_manager=manager)
+        result = CSA2TrtllmAttention.Metadata(
+            max_num_requests=1, max_num_tokens=16, kv_cache_manager=manager
+        )
         result.request_ids = list(seed_metadata.request_ids)
         result.num_contexts = 1
         result.prompt_lens = [12]

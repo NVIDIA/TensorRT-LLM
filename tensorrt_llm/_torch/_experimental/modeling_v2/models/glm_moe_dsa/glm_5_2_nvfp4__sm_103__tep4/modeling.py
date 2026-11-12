@@ -201,7 +201,7 @@ from .ops.quantization import cute_dsl_moe_quantize_nvfp4 as _moe_quant_op
 from .ops.quantization.cute_dsl_act_quant_mxf8_rows import cute_dsl_act_quant_mxf8_rows
 from .ops.quantization.cute_dsl_moe_quantize_nvfp4 import cute_dsl_moe_quantize_nvfp4
 from .ops.sampling import cute_dsl_argmax as _argmax_op
-from .spec_worker import Glm52MTPEagleWorker
+from .spec_worker import Glm52MTPEagleWorker, Glm52Tep4DSAMetadata
 
 
 def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
@@ -5779,6 +5779,10 @@ class DraftModel:
 class ModelingV2Glm52Nvfp4Sm103Tep4(
     DecoderModelForCausalLM[GlmMoeDsaTep4ModelingV2, PretrainedConfig]
 ):
+    # The DSA metadata of this target, with the draft loop's one-launch `run_draft_step`
+    # (`spec_worker.py`).
+    metadata_extensions = (Glm52Tep4DSAMetadata,)
+
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         super().__init__(

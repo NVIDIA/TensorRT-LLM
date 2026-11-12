@@ -2002,15 +2002,17 @@ class TestGemma4HFComparison(unittest.TestCase):
         )
 
         # VSWA detection must populate layer-to-pool mapping
-        self.assertIsNotNone(metadata._vswa_layer_to_pool, "VSWA layer_to_pool mapping not created")
+        self.assertIsNotNone(
+            metadata.core()._vswa_layer_to_pool, "VSWA layer_to_pool mapping not created"
+        )
         # Sliding and full layers must map to different pools
         sliding_pools = {
-            metadata._vswa_layer_to_pool[i]
+            metadata.core()._vswa_layer_to_pool[i]
             for i in range(config.num_hidden_layers)
             if config.layer_types[i] == "sliding_attention"
         }
         full_pools = {
-            metadata._vswa_layer_to_pool[i]
+            metadata.core()._vswa_layer_to_pool[i]
             for i in range(config.num_hidden_layers)
             if config.layer_types[i] == "full_attention"
         }
@@ -2023,11 +2025,13 @@ class TestGemma4HFComparison(unittest.TestCase):
             metadata.prepare()
 
         self.assertIsNotNone(
-            metadata._vswa_pool_indices_cache,
+            metadata.core()._vswa_pool_indices_cache,
             "Per-pool indices cache not populated after prepare()",
         )
         self.assertEqual(
-            len(metadata._vswa_pool_indices_cache), 2, "Expected 2 pool entries (sliding + full)"
+            len(metadata.core()._vswa_pool_indices_cache),
+            2,
+            "Expected 2 pool entries (sliding + full)",
         )
 
         # Each pool's indices are fetched via different layer_id → pool_id
@@ -2160,7 +2164,7 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         # Swap to sliding → check buffer matches sliding pool
         metadata.swap_paged_kv_indices_for_layer(sliding_layer)
-        actual = metadata._paged_kv_indices[:total_blocks].cpu()
+        actual = metadata.core()._paged_kv_indices[:total_blocks].cpu()
         self.assertTrue(
             torch.equal(actual, sliding_expected),
             "After swap to sliding layer, buffer should match sliding pool",
@@ -2168,7 +2172,7 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         # Swap to full → check buffer matches full pool
         metadata.swap_paged_kv_indices_for_layer(full_layer)
-        actual = metadata._paged_kv_indices[:total_blocks].cpu()
+        actual = metadata.core()._paged_kv_indices[:total_blocks].cpu()
         self.assertTrue(
             torch.equal(actual, full_expected),
             "After swap to full layer, buffer should match full pool",
@@ -2176,7 +2180,7 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         # Swap back to sliding → check buffer is restored
         metadata.swap_paged_kv_indices_for_layer(sliding_layer)
-        actual = metadata._paged_kv_indices[:total_blocks].cpu()
+        actual = metadata.core()._paged_kv_indices[:total_blocks].cpu()
         self.assertTrue(
             torch.equal(actual, sliding_expected),
             "After swap back to sliding, buffer should be restored",
@@ -2347,17 +2351,17 @@ class TestGemma4HFComparison(unittest.TestCase):
         with torch.inference_mode():
             metadata.prepare()
 
-        if metadata._vswa_layer_to_pool is None:
+        if metadata.core()._vswa_layer_to_pool is None:
             kv_cache_manager.shutdown()
             self.skipTest("No VSWA detected")
 
-        primary_pool_id = metadata._vswa_layer_to_pool.get(0, 0)
+        primary_pool_id = metadata.core()._vswa_layer_to_pool.get(0, 0)
 
         # The primary pool cache buffer must NOT be the same object as
         # _paged_kv_indices — that's the aliasing bug.
         self.assertIsNot(
-            metadata._vswa_pool_indices_cache[primary_pool_id],
-            metadata._paged_kv_indices,
+            metadata.core()._vswa_pool_indices_cache[primary_pool_id],
+            metadata.core()._paged_kv_indices,
             "Primary pool cache is aliased to _paged_kv_indices! "
             "Pool swaps will corrupt the primary pool's cached indices.",
         )
@@ -2365,7 +2369,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         # Record the original primary pool indices
         total_blocks = metadata.num_generation_blocks + metadata.num_context_blocks
         pool0_original = (
-            metadata._vswa_pool_indices_cache[primary_pool_id][:total_blocks].cpu().clone()
+            metadata.core()._vswa_pool_indices_cache[primary_pool_id][:total_blocks].cpu().clone()
         )
 
         # Find a full-attention (secondary pool) layer
@@ -2385,7 +2389,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         metadata.swap_paged_kv_indices_for_layer(sliding_layer)
 
         # After round-trip swap, primary pool cache must still have original values
-        pool0_after = metadata._vswa_pool_indices_cache[primary_pool_id][:total_blocks].cpu()
+        pool0_after = metadata.core()._vswa_pool_indices_cache[primary_pool_id][:total_blocks].cpu()
         self.assertTrue(
             torch.equal(pool0_original, pool0_after),
             f"Primary pool indices corrupted after pool swap round-trip: "
@@ -3520,7 +3524,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         width: int,
     ) -> torch.Tensor:
         """Build the expected compact table from one VSWA pool's host indices."""
-        pool_indices = metadata._host_pool_indices[pool_id].numpy()
+        pool_indices = metadata.core()._host_pool_indices[pool_id].numpy()
         expected = torch.zeros((rows, width), dtype=torch.int32)
         source_offset = metadata.num_context_blocks
         for row, page_count in enumerate(page_counts):
@@ -3550,14 +3554,14 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             accepted_tokens,
             num_contexts=0,
         )
-        expected_kv_lens = metadata._cached_token_lens[:2] + accepted_tokens
+        expected_kv_lens = metadata.core()._cached_token_lens[:2] + accepted_tokens
 
         for layer, query in zip(layers, queries, strict=True):
             layer.forward(query, None, None, draft_metadata)
 
         self.assertIs(draft_metadata.kv_cache_manager, metadata.kv_cache_manager)
         torch.testing.assert_close(
-            draft_metadata._draft_kv_runtime_lens[:2],
+            draft_metadata.core()._draft_kv_runtime_lens[:2],
             expected_kv_lens,
             atol=0,
             rtol=0,
@@ -3586,7 +3590,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
+        for plan_params, wrappers in metadata.core()._plan_params_to_wrappers.items():
             with self.subTest(head_dim=plan_params.head_dim):
                 block_tables = wrappers.decode_wrapper._block_tables
                 expected = self._expected_decode_block_table(
@@ -3617,7 +3621,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         )
 
         initial_state = {}
-        for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
+        for plan_params, wrappers in metadata.core()._plan_params_to_wrappers.items():
             self.assertIsNotNone(plan_params.kv_pool_id)
             block_tables = wrappers.decode_wrapper._block_tables
             self.assertGreaterEqual(block_tables.size(1), 65)
@@ -3632,7 +3636,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         self._prepare_decode_page_counts(metadata, [0, 1], new_page_counts)
         torch.cuda.synchronize()
 
-        for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
+        for plan_params, wrappers in metadata.core()._plan_params_to_wrappers.items():
             with self.subTest(head_dim=plan_params.head_dim):
                 block_tables = wrappers.decode_wrapper._block_tables
                 old_device_ptr, old_host_ptr = initial_state[plan_params.kv_pool_id]
@@ -4378,7 +4382,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         if expect_split_kv:
             split_kv_head_dims = set()
-            for plan_params, wrappers in cg_metadata._plan_params_to_wrappers.items():
+            for plan_params, wrappers in cg_metadata.core()._plan_params_to_wrappers.items():
                 decode_wrapper = wrappers.decode_wrapper
                 if decode_wrapper is None or decode_wrapper._backend != "fa2":
                     continue

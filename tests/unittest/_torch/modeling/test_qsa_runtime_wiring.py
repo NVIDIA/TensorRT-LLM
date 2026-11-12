@@ -5,16 +5,18 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _torch.helpers import bare_extension, construct_extension, stub_extension
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.hooks import get_sparse_attention_hooks
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
 from tensorrt_llm._torch.attention.backends.sparse.qsa import (
     QSAAttentionMetadata,
     QSASparseMetadataParams,
     QSASparseParams,
 )
+from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAMetadata
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import QSASparseHooks
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
@@ -224,18 +226,19 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
     assert output is None
 
 
-def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers(monkeypatch) -> None:
-    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
+def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers() -> None:
     manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = None
     metadata = object.__new__(QSAAttentionMetadata)
     metadata.kv_cache_manager = manager
-    metadata.sparse_metadata_params = QSASparseMetadataParams(
+    metadata.replace_ext(bare_extension(MTPIndexShareExtension, metadata))
+    qsa = stub_extension(QSAMetadata, metadata)
+    qsa.sparse_metadata_params = QSASparseMetadataParams(
         token_topk=2048,
         compress_ratio=4,
     )
-
-    metadata.__post_init__()
+    metadata.replace_ext(qsa)
+    construct_extension(qsa)
 
     assert not metadata.qsa_has_local_layers
 

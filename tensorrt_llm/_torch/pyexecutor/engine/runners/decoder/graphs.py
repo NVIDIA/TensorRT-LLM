@@ -40,11 +40,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
-from tensorrt_llm._torch.speculative import (
-    SpecMetadata,
-    prepare_attn_metadata_for_draft_replay,
-    restore_attn_metadata_after_draft_replay,
-)
+from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import get_per_request_prefill_cuda_graph_flag
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
@@ -505,9 +501,7 @@ class DecoderCudaGraphs:
         postprocess_inputs: Callable[[dict[str, Any]], None],
         *,
         attn_metadata: AttentionMetadata,
-        draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
         moe_load_balancer: MoeLoadBalancer | None,
-        enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
         static_inputs_staged: int = 0,
@@ -528,9 +522,7 @@ class DecoderCudaGraphs:
                 run_model,
                 postprocess_inputs,
                 attn_metadata=attn_metadata,
-                draft_kv_cache_manager=draft_kv_cache_manager,
                 moe_load_balancer=moe_load_balancer,
-                enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
                 position_id_offsets=position_id_offsets,
                 static_inputs_staged=static_inputs_staged,
@@ -544,9 +536,7 @@ class DecoderCudaGraphs:
         postprocess_inputs: Callable[[dict[str, Any]], None],
         *,
         attn_metadata: AttentionMetadata,
-        draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
         moe_load_balancer: MoeLoadBalancer | None,
-        enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
         static_inputs_staged: int = 0,
@@ -577,41 +567,27 @@ class DecoderCudaGraphs:
                     key,
                     capture_model,
                     inputs,
-                    enable_spec_decode=enable_spec_decode,
                     postprocess_fn=postprocess_inputs,
+                    prepare_each_forward=True,
                 )
 
             if self.cuda_graph_runner.is_warmup_only:
                 outputs = capture_outputs
             elif needs_capture:
-                # Refresh attention metadata for the current batch's
-                # draft cache before replaying the captured graph.
-                saved_draft = prepare_attn_metadata_for_draft_replay(
-                    attn_metadata, draft_kv_cache_manager
+                outputs = self.cuda_graph_runner.replay(
+                    key,
+                    inputs,
+                    position_id_offsets=position_id_offsets,
+                    static_inputs_staged=static_inputs_staged,
                 )
-                try:
+            else:
+                with MoeLoadBalancerIterContext(moe_load_balancer):
                     outputs = self.cuda_graph_runner.replay(
                         key,
                         inputs,
                         position_id_offsets=position_id_offsets,
                         static_inputs_staged=static_inputs_staged,
                     )
-                finally:
-                    restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
-            else:
-                saved_draft = prepare_attn_metadata_for_draft_replay(
-                    attn_metadata, draft_kv_cache_manager
-                )
-                try:
-                    with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = self.cuda_graph_runner.replay(
-                            key,
-                            inputs,
-                            position_id_offsets=position_id_offsets,
-                            static_inputs_staged=static_inputs_staged,
-                        )
-                finally:
-                    restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
         return outputs
 
     def _get_graphs_to_capture(

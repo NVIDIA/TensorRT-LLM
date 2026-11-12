@@ -627,7 +627,9 @@ class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider[AttentionMeta
         metadata.seq_lens = torch.zeros(
             key.num_contexts, dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        metadata.bind_encoder_cuda_graph_seq_lens(metadata.seq_lens, key.num_contexts)
+        metadata.bind_encoder_cuda_graph_seq_lens(
+            metadata.seq_lens, key.num_contexts, max_q_len=None
+        )
         return metadata
 
     def refresh_in_place(

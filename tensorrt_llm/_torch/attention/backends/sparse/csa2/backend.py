@@ -24,7 +24,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .indexer import CSA2Indexer
-from .metadata import CSA2TrtllmMetadata
+from .metadata import CSA2Metadata, CSA2TrtllmMetadata
 from .params import CSA2BackendForwardArgs, CSA2Layout, CSA2Mode, CSA2Params, select_csa2_backend
 
 if TYPE_CHECKING:
@@ -81,7 +81,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config, mapping) -> int:
-        return CSA2TrtllmMetadata.cache_gather_bytes_per_token(model_config)
+        return CSA2Metadata.cache_gather_bytes_per_token(model_config)
 
     @classmethod
     def runtime_workspace_is_chunked_prefill_bounded(cls, model_config) -> bool:
@@ -115,7 +115,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         ).multi_processor_count
 
         def arena_bytes(queries: int, page_capacity: int) -> int:
-            return CSA2TrtllmMetadata.workspace_reservation_bytes(
+            return CSA2Metadata.workspace_reservation_bytes(
                 max_batch_size,
                 queries,
                 page_capacity * 64,
@@ -288,7 +288,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if (
             q.shape != (count, self.num_heads * _HEAD_DIM)
             or q.dtype != torch.bfloat16
-            or metadata.num_query_heads != self.num_heads
+            or metadata.ext(CSA2Metadata).num_query_heads != self.num_heads
         ):
             raise ValueError("CSA2 Q geometry/dtype must match its BF16 metadata")
         if forward_args.attention_input_type not in (

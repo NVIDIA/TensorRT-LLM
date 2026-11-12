@@ -349,6 +349,119 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
                        logits.float().argmax(-1)).to(torch.int32)
 
 
+def bare_extension(extension_type, metadata, **values):
+    """An extension of ``metadata``, constructed but not attached.
+
+    For kernel and op tests that give a stub metadata the few fields an op
+    reads: ``values`` that are creation arguments are passed to the
+    constructor, the others are set afterwards; attach it with
+    ``metadata.replace_ext``. Over a metadata made without ``__init__`` the
+    core has no capacities, so the buffers it sizes are empty. Over a stub
+    that is no ``AttentionMetadata`` (or None) nothing is constructed: the
+    extension holds its creation defaults, its dataclass field defaults and
+    ``values`` only.
+    """
+    import copy
+    import dataclasses
+
+    from tensorrt_llm._torch.attention.backends.interface import \
+        AttentionMetadata
+
+    init_names = set(extension_type.declared_init_fields())
+    if not isinstance(metadata, AttentionMetadata):
+        extension = extension_type.__new__(extension_type)
+        extension.metadata = metadata
+        for name, default in extension_type.init_field_defaults().items():
+            setattr(extension, name, copy.copy(default))
+        if dataclasses.is_dataclass(extension_type):
+            for field in dataclasses.fields(extension_type):
+                if field.name == "metadata":
+                    continue
+                if field.default_factory is not dataclasses.MISSING:
+                    setattr(extension, field.name, field.default_factory())
+                elif field.default is not dataclasses.MISSING:
+                    setattr(extension, field.name, field.default)
+        for name, value in values.items():
+            setattr(extension, name, value)
+        return extension
+    config = {
+        name: value
+        for name, value in values.items() if name in init_names
+    }
+    extension = extension_type(metadata, **config)
+    for name, value in values.items():
+        if name not in init_names:
+            setattr(extension, name, value)
+    return extension
+
+
+def stub_extension(extension_type, metadata, **values):
+    """An extension of ``metadata`` that is not constructed, for ``replace_ext``.
+
+    For tests of an extension whose constructor needs a real KV cache manager
+    or its sibling extensions: it holds its creation defaults, its dataclass
+    field defaults and ``values`` only. ``construct_extension`` constructs it
+    later, once it is attached and the metadata has what the constructor reads.
+    """
+    extension = bare_extension(extension_type, None, **values)
+    extension.metadata = metadata
+    return extension
+
+
+def construct_extension(extension, **config):
+    """Run ``extension``'s constructor in place, as its metadata would.
+
+    For tests that set up an extension (``bare_extension``, or an attached
+    one) before it allocates: its creation values are kept unless ``config``
+    replaces them, and instance attributes the constructor does not set (such
+    as mocked methods) stay.
+    """
+    values = {
+        name: extension.creation_value(name)
+        for name in type(extension).declared_init_fields()
+        if name in vars(extension) or hasattr(type(extension), name)
+    }
+    values.update(config)
+    type(extension).__init__(extension, extension.metadata, **values)
+    return extension
+
+
+def refresh_from_lengths(metadata):
+    """Refresh ``metadata``'s length-derived state as a draft refresh does.
+
+    For a draft metadata (or one standing in for it) whose lengths a test
+    changed through the core's primitives: the core re-derives its eager
+    state and every other extension refreshes, whether or not the lengths
+    changed.
+    """
+    core = metadata.core()
+    core.resync_length_derived_state()
+    for extension in metadata.extensions:
+        if extension is not core:
+            extension.refresh_from_draft_lengths()
+    core.clear_lengths_changed()
+
+
+def give_stub_a_draft(stub, block_offsets):
+    """Give a stub target metadata a draft metadata with ``block_offsets``.
+
+    The draft is a stub too: ``stub.draft`` / ``stub.find("draft_or_none")``
+    return it, and its ``lengths_for_kernel_update()`` hands out the stub's
+    own length buffers (a draft loop on a stub runs on the stub itself).
+    """
+    from types import SimpleNamespace
+
+    draft = SimpleNamespace(kv_cache_block_offsets=block_offsets)
+    stub.draft = draft
+    stub.find = lambda name, default=None: draft if name == "draft_or_none" else default
+    stub.lengths_for_kernel_update = lambda: {
+        name: getattr(stub, name)
+        for name in ("seq_lens_cuda", "kv_lens_cuda")
+        if getattr(stub, name, None) is not None
+    }
+    return stub
+
+
 def triton_num_compiled(kernel) -> int:
     """Specializations of a ``triton.jit`` kernel compiled in this process.
 

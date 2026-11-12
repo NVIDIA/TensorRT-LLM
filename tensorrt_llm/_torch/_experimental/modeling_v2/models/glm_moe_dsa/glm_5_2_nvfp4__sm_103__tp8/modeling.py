@@ -262,6 +262,16 @@ class ModelingV2Glm52Nvfp4Sm103Tp8(GlmMoeDsaForCausalLM):
         dispatch.check_rank_uniform_adopted(adopted_state(self), world_size)
 
     @property
+    def metadata_extensions(self) -> tuple:
+        """The attention-metadata extensions this target requires: with the plan's draft loop,
+        the DSA metadata with its one-launch draft-step update (``GlmTp8DSAMetadata``)."""
+        if not self.plan.enabled("draft_loop"):
+            return ()
+        from .kernels.draft_loop.draft_step import GlmTp8DSAMetadata
+
+        return (GlmTp8DSAMetadata,)
+
+    @property
     def runtime_hooks(self) -> RuntimeHooks:
         """The step-loop hooks this target declares, built on the engine's first read.
 

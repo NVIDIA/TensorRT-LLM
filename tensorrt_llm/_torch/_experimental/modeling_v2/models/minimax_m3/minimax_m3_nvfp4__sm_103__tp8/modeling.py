@@ -1936,7 +1936,9 @@ class PrefillTarget:
             num_tokens=md.num_tokens,
             kv_cache_manager=md.kv_cache_manager,
             msa_idx_k_cache=md.msa_idx_k_cache,
-            msa_out_cache_loc=md.msa_out_cache_loc,
+            msa_out_cache_loc=(
+                md.msa_write_slots() if hasattr(md, "msa_write_slots") else md.msa_out_cache_loc
+            ),
             metadata=md,
         )
 
@@ -2227,11 +2229,13 @@ class DecodeTarget:
             num_seqs=md.num_seqs,
             kv_cache_manager=md.kv_cache_manager,
             msa_idx_k_cache=md.msa_idx_k_cache,
-            msa_out_cache_loc=md.msa_out_cache_loc,
+            msa_out_cache_loc=(
+                md.msa_write_slots() if hasattr(md, "msa_write_slots") else md.msa_out_cache_loc
+            ),
             msa_decode_span=md.msa_decode_span,
             msa_block_table=md.msa_block_table,
             msa_seq_lens_cuda=md.msa_seq_lens_cuda,
-            msa_short_ok=md._msa_short_ok,
+            msa_short_ok=md.msa_short_table_staged,
             msa_short_table=md.msa_short_table,
             msa_proxy_max_score_view=md.msa_proxy_max_score_view,
             msa_worst_case_max_k_tiles=md.msa_worst_case_max_k_tiles,
@@ -3441,46 +3445,41 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size=batch_size,
             )
         else:
-            # Save the old attn_metadata and spec_metadata
-            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+            # The draft forwards run on the draft metadata, which leaves the target's untouched; without one,
+            # the target's state is saved and restored around the draft loop.
+            with self.draft_loop(attn_metadata) as draft_attn_metadata:
+                # Prepare inputs for the 1st draft model forward
+                position_ids = position_ids.squeeze(0)
+                inputs = self.prepare_1st_drafter_inputs(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    accepted_tokens=accepted_tokens,
+                    attn_metadata=draft_attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_model=draft_model,
+                )
 
-            # Prepare inputs for the 1st draft model forward
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                accepted_tokens=accepted_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=draft_model,
-            )
+                # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here so the post-loop restore (below)
+                # can put attn_metadata back into a state the target model expects.
+                original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here so the post-loop restore (below)
-            # can put attn_metadata back into a state the target model expects.
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+                # Get the draft KV cache manager if using separate layouts
+                draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
-
-            next_draft_tokens = self._forward_draft_loop(
-                inputs,
-                attn_metadata,
-                spec_metadata,
-                draft_model,
-                draft_kv_cache_manager,
-                num_contexts,
-                num_gens,
-                batch_size,
-                num_accepted_tokens,
-                original_all_rank_num_tokens,
-                resource_manager,
-            )
-            # restore attn_metadata to support cuda graph
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
-            # restore all_rank_num_tokens for attention DP
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                next_draft_tokens = self._forward_draft_loop(
+                    inputs,
+                    draft_attn_metadata,
+                    spec_metadata,
+                    draft_model,
+                    draft_kv_cache_manager,
+                    num_contexts,
+                    num_gens,
+                    batch_size,
+                    num_accepted_tokens,
+                    original_all_rank_num_tokens,
+                    resource_manager,
+                )
 
         # prepare next new tokens to support overlap scheduler
         if self._m3_next_new_tokens is not None:
@@ -4075,18 +4074,15 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 ids, pos, hidden = ids_next, pos_next, to_save
                 if i == 0:
                     # The draft step set the device sequence lengths to 1 and rolled the KV lengths back.
-                    md._seq_lens[:batch_size].fill_(1)
-                    md.on_update()
-                    has_kv_cache = md.kv_cache_manager is not None
-                    if has_kv_cache and hasattr(md, "host_request_types"):
-                        md.host_request_types[: md.num_contexts].fill_(1)
-                    if has_kv_cache:
-                        md.num_contexts = 0
+                    md.set_seq_lens(slice(0, batch_size), host=1, update_counts=True)
+                    if md.kv_cache_manager is not None:
+                        # The context requests continue as one-token generation rows.
+                        md.as_generation_rows()
                         self._prepare_flash_mla_generation_layout(md, 0, batch_size)
-                    md.update_for_spec_dec()
+                    self.refresh_draft()
                     md.use_spec_decoding = False
                 else:
-                    md.update_for_spec_dec()
+                    self.refresh_draft()
         self._m3_next_new_tokens = next_new
         return draft_tokens
 

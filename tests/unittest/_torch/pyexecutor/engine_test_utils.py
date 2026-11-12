@@ -14,6 +14,8 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
+from tensorrt_llm._torch.attention.backends.interface import AttentionBackend
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import WarmupAgreement
@@ -278,15 +280,18 @@ def _agreement(
     return WarmupAgreement(dist, mapping)
 
 
-class _AttentionMetadata:
+class _AttentionMetadata(TrtllmAttentionMetadata):
+    """Records its creation arguments; like the TRTLLM core, it has block-ID
+    tables only with a KV cache manager."""
+
     def __init__(self, **kwargs: object) -> None:
         self.__dict__.update(kwargs)
-        self.block_ids_per_seq = object()
-        self.kv_block_ids_per_seq = object()
-        self.on_update_kv_lens = Mock()
+        has_cache = kwargs.get("kv_cache_manager") is not None
+        self.__dict__["block_ids_per_seq"] = object() if has_cache else None
+        self.__dict__["kv_block_ids_per_seq"] = object() if has_cache else None
 
 
-class _AttentionBackend:
+class _AttentionBackend(AttentionBackend):
     Metadata = _AttentionMetadata
 
 

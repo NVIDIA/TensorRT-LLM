@@ -1529,6 +1529,7 @@ def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
     model.ple_layer_index = 0
     model.layers = [SimpleNamespace(ple=SimpleNamespace())]
     model.eos_token_id = 2
+    model._resolved_ple_pools = {}
 
     captured = {}
 
@@ -1585,6 +1586,8 @@ def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
     assert captured["state_indices"].dtype == torch.long
     assert captured["kwargs"]["host_seq_lens"] == [2, 3]
     assert captured["input_ids"].shape == (5,)
+    # The model keeps the pools it resolved; the metadata takes no writes.
+    assert model._resolved_ple_pools == {0: (conv_state, ngram_context)}
     torch.testing.assert_close(conv_state.flatten(), torch.tensor([1.0, 0.0], device=device))
     torch.testing.assert_close(
         ngram_context.flatten(), torch.tensor([11, 2], dtype=torch.long, device=device)

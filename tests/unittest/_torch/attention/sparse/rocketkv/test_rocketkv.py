@@ -557,7 +557,8 @@ def test_sparse_attn_predict(batch_size, num_contexts):
 
         for req_idx in range(num_contexts, batch_size):
             # Get the number of KT tokens for this request
-            past_token = past_seen_tokens[req_idx]
+            # The cached length the kernels see, capped at the prompt budget.
+            past_token = trtllm_metadata.kv_cache_params.num_cached_tokens_per_seq[req_idx]
             num_kt_tokens = (
                 past_token + 1 + sparse_attn_config_trtllm.page_size - 1
             ) // sparse_attn_config_trtllm.page_size
@@ -614,7 +615,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         q = q.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
         k = k.view(1, seq_len, num_kv_heads, head_dim)
 
-        past_seen_token = past_seen_tokens[i]
+        past_seen_token = vanilla_metadata.kv_cache_params.num_cached_tokens_per_seq[i]
         vanilla_indices = vanilla_attn._rocketkv_selection(
             q, k, vanilla_metadata, past_seen_token, i
         )

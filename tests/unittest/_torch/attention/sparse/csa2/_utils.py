@@ -2,13 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent CSA2 test fixtures and mathematical references."""
 
+import dataclasses
 from copy import copy
 from types import SimpleNamespace
 
 import torch
+from _torch.helpers import bare_extension
 
+from tensorrt_llm._torch.attention.backends.core import AttentionCoreMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2ForwardState,
     CSA2Layout,
@@ -24,6 +28,15 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     store_index_rows,
     store_rows,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+
+def _bare_csa2_metadata() -> TrtllmAttentionMetadata:
+    """Metadata built without ``__init__``, carrying a bare CSA2 extension."""
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(bare_extension(CSA2Metadata, metadata))
+    metadata.replace_ext(bare_extension(SpecDecodingMetadata, metadata))
+    return metadata
 
 
 def _index_pages(rows: int, device="cpu") -> torch.Tensor:
@@ -80,7 +93,7 @@ def _attention_reference(q, kv, valid, sink):
 def _page_metadata(table, requests, page_size, max_positions):
     # Exercise device-independent metadata transforms without allocating native
     # compute buffers. Constructor/lifecycle coverage uses real V2 managers.
-    meta = object.__new__(CSA2TrtllmMetadata)
+    meta = _bare_csa2_metadata()
     meta.csa2_global_page_tables = {0: table}
     meta.csa2_token_requests = requests
     meta.csa2_global_page_sizes = {0: page_size}
@@ -130,7 +143,10 @@ def _run_indexer(layout, layer_idx, state):
     layer = layout.layer(layer_idx)
     meta.enter_layer(layer)
     manager.write_swa(
-        layer_idx, meta.csa2_swa_write_slots[layer_idx], state.swa_kv, state.swa_transform
+        layer_idx,
+        meta.csa2_swa_write_slots[layer_idx],
+        state.swa_kv,
+        state.swa_transform,
     )
     if layer.mode == CSA2Mode.FULL:
         manager.write_global(
@@ -265,6 +281,9 @@ def _run_modes(device, graph_replay=False):
 
     def run():
         meta = copy(base)
+        routing = copy(base.ext(CSA2Metadata))
+        routing.metadata = meta
+        meta.replace_ext(routing)
         meta.reset_routing()
         outputs = []
         for i in range(3):
@@ -324,24 +343,56 @@ class _FakeMapping:
         self.enable_attention_dp = enable_attention_dp
 
 
+@dataclasses.dataclass
 class _FakeKvParams:
-    def __init__(self, num_cached):
-        self.num_cached_tokens_per_seq = list(num_cached)
+    num_cached_tokens_per_seq: list
 
 
 class _FakeMetadata:
     """The attributes ``plan_decoder_replay`` reads, plus the SWA floors and slot resolution.
 
-    A real ``CSA2TrtllmMetadata`` needs a KV cache manager, pools
+    A real CSA2 metadata needs a KV cache manager, pools
     and a device; the planner is pure host arithmetic over these fields, so
     standing them up here keeps this a CPU test and keeps the refusals -- which
     are the part worth pinning -- independent of cache-manager plumbing.
 
     ``prepare()`` is modelled too, because the boundary's correctness depends on
-    what it clears; see the method.
+    what it clears; see the method. Its decoder replay metadata is a copy of
+    it with tensors and publications of its own.
     """
 
-    reset_routing = CSA2TrtllmMetadata.reset_routing
+    reset_routing = CSA2Metadata.reset_routing
+    prepare_decoder_replay = CSA2Metadata.prepare_decoder_replay
+    set_all_rank_num_tokens = AttentionCoreMetadata.set_all_rank_num_tokens
+    decoder_context_ends = CSA2Metadata.decoder_context_ends
+    csa2_remote_tail_mode = CSA2Metadata.csa2_remote_tail_mode
+    csa2_remote_tail_starts = CSA2Metadata.csa2_remote_tail_starts
+
+    @property
+    def metadata(self) -> "_FakeMetadata":
+        # The fake serves as both the core metadata and its CSA2 extension.
+        return self
+
+    def ext(self, cls: type) -> "_FakeMetadata":
+        return self
+
+    find_ext = ext
+
+    def core(self) -> "_FakeMetadata":
+        return self
+
+    @property
+    def decoder_replay_metadata(self) -> "_FakeMetadata":
+        if self._fake_replay is None:
+            replay = copy(self)
+            for name, value in vars(self).items():
+                if isinstance(value, torch.Tensor):
+                    setattr(replay, name, value.clone())
+                elif isinstance(value, (dict, set)):
+                    setattr(replay, name, type(value)())
+            replay.prepare_calls = 0
+            self._fake_replay = replay
+        return self._fake_replay
 
     def __init__(
         self,
@@ -361,7 +412,15 @@ class _FakeMetadata:
         self.is_cuda_graph = captured
         self.mapping = _FakeMapping(attention_dp)
         self.kv_cache_manager = _FakeManager(swa_reuse)
-        self.kv_cache_params = _FakeKvParams(num_cached or [0] * len(seq_lens))
+        self.kv_cache_params = _FakeKvParams(list(num_cached or [0] * len(seq_lens)))
+        self.kv_lens_offsets = None
+        self.num_chunked_ctx_requests = 0
+        self.beam_width = 1
+        self.request_ids = None
+        self.all_rank_num_tokens = None
+        self.csa2_precomputed_kv_layers = set()
+        self._fake_replay = None
+        self.csa2_replay_query_rows = None
         self.csa2_candidates = {}
         self.csa2_candidate_blocks = {}
         self.csa2_candidate_counts = {}
@@ -378,7 +437,26 @@ class _FakeMetadata:
         self.csa2_replay_start_positions = torch.zeros(self.num_seqs, dtype=torch.int64)
         self._csa2_swa_resolved = False
 
-    def prepare(self):
+    def apply_batch_inputs(self, inputs) -> None:
+        self.seq_lens = inputs.seq_lens
+        self.seq_lens_cuda = self.seq_lens
+        self.num_contexts = inputs.num_contexts
+        self.num_seqs = len(inputs.seq_lens)
+        self.num_tokens = int(inputs.seq_lens.sum())
+        self.request_ids = inputs.request_ids
+        self.prompt_lens = inputs.prompt_lens
+        self.kv_cache_params = inputs.kv_cache_params
+        self.num_chunked_ctx_requests = inputs.num_chunked_ctx_requests
+        self.kv_lens_offsets = inputs.kv_lens_offsets
+
+    def live_cached_lengths(self) -> torch.Tensor:
+        """The cached lengths with the KV-length correction a prepare applies."""
+        cached = torch.tensor(self.kv_cache_params.num_cached_tokens_per_seq[: self.num_seqs])
+        if self.kv_lens_offsets is not None:
+            cached = cached + self.kv_lens_offsets[: self.num_seqs].cpu()
+        return cached
+
+    def prepare(self, inputs=None):
         """Only the part of ``prepare()`` the boundary has to survive.
 
         The real one rebuilds every device index buffer; what matters to
@@ -387,6 +465,8 @@ class _FakeMetadata:
         boundary testable on CPU and keeps the test honest about *why* the
         reinstatement exists.
         """
+        if inputs is not None:
+            self.apply_batch_inputs(inputs)
         self.prepare_calls += 1
         self.csa2_indices.clear()
         self.csa2_candidates.clear()
@@ -399,7 +479,7 @@ class _FakeMetadata:
             [
                 torch.arange(start, start + length)
                 for start, length in zip(
-                    self.kv_cache_params.num_cached_tokens_per_seq, self.seq_lens.tolist()
+                    self.live_cached_lengths().tolist(), self.seq_lens.tolist()
                 )
             ]
         )
@@ -420,11 +500,3 @@ class _FakeMetadata:
         self.csa2_swa_indices = {0: slots.masked_fill(logical < read_floor[:, None], -1)}
         self.csa2_swa_write_slots = {0: slots[:, -1]}
         self.csa2_visible_lengths = {0: self.csa2_positions + 1}
-
-    def on_update_kv_lens(self):
-        self._csa2_swa_resolved = False
-        lengths = self.seq_lens.tolist()
-        starts = self.kv_lens_cuda[: self.num_seqs] - self.seq_lens
-        self.csa2_positions = torch.cat(
-            [torch.arange(s, s + n) for s, n in zip(starts.tolist(), lengths)]
-        )

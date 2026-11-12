@@ -10,11 +10,16 @@ from types import SimpleNamespace
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import bare_extension
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+    MiniMaxM3MsaMetadata,
+)
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
 from tensorrt_llm._torch.distributed import Distributed
@@ -66,6 +71,8 @@ def _run_empty_adp_rank(world_size: int) -> int:
     # allocator is stubbed; slot construction/clearing and GPU writes are real.
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
+    metadata.replace_ext(bare_extension(MiniMaxM3MsaMetadata, metadata))
+    metadata.replace_ext(bare_extension(SpecDecodingMetadata, metadata))
     metadata._msa_buffers_ready = True
     metadata.kv_cache_manager = SimpleNamespace(
         tokens_per_block=128,
@@ -150,6 +157,7 @@ def _run_empty_adp_rank(world_size: int) -> int:
                 # read the live (unpadded) count off it.
                 metadata._num_tokens = live_tokens
                 metadata._build_msa_fields()
+                metadata.msa_write_slots()
                 assert metadata.msa_out_cache_loc.tolist() == list(
                     range(128, 128 + live_tokens)
                 ) + [-1] * (bucket - live_tokens)

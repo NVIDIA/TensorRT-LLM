@@ -31,6 +31,7 @@ from ...inputs import (
     register_input_processor,
 )
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.extensions import MetadataExtension
 from ..attention.backends.sparse.qsa.indexer import QSAIndexer
 from ..attention.backends.sparse.qsa.params import QSASparseParams
 from ..distributed import AllReduce, AllReduceParams, allgather
@@ -74,6 +75,25 @@ _PendingCombine = tuple[_PendingBlockOutput, HCResidual]
 def _qwen4_exp_tp_output_reduction_enabled(mapping) -> bool:
     """Return whether decoder outputs require a tensor-parallel reduction."""
     return mapping.tp_size > 1 and not mapping.enable_attention_dp
+
+
+class Qwen4ExpPleState(MetadataExtension):
+    """PLE pools given to the model's forwards without a cache manager.
+
+    ``qwen4_exp_ple_state`` maps a PLE layer index to its (short-conv state,
+    n-gram context) pools; a test harness that owns its state tensors gives
+    them at creation (``extension_types=(Qwen4ExpPleState,)``,
+    ``qwen4_exp_ple_state=...``). Without them the model resolves pools of its
+    own.
+    """
+
+    fields = frozenset(
+        {
+            "qwen4_exp_ple_state",
+        }
+    )
+    methods = frozenset()
+    init_fields = {"qwen4_exp_ple_state": None}
 
 
 def _validate_qwen4_exp_runtime_config(
@@ -497,6 +517,9 @@ class Qwen4ExpModel(DecoderModel):
         # Shapes match the model-owned ``extract_qwen4_exp_ple_cache_params``.
         # (conv_state_shape / ngram_context_len).
         self._ple_conv_state: Optional[torch.Tensor] = None
+        # The pools each PLE layer's last forward resolved, by layer index:
+        # later forwards and graph capture read the same tensors.
+        self._resolved_ple_pools: Dict[int, tuple] = {}
         self._ple_ngram_context: Optional[torch.Tensor] = None
 
         # The final Hyper-Connection mixer IS the last norm (use_combine=False);
@@ -702,11 +725,10 @@ class Qwen4ExpModel(DecoderModel):
                 conv_state.index_fill_(0, ctx_slots, 0)
                 ngram_context.index_fill_(0, ctx_slots, self.eos_token_id)
 
-        # Surface the resolved pools on metadata so graph capture and the
-        # decoder layer observe the same tensors.
-        # The cache-manager branch below is checked first each forward, so this
-        # write never shadows the authoritative KVCacheManagerV2-owned pools.
-        attn_metadata.qwen4_exp_ple_state = {ple_layer_idx: (conv_state, ngram_context)}
+        # Later forwards and graph capture resolve the same pools. The
+        # cache-manager branch is checked first each forward, so these never
+        # shadow the authoritative KVCacheManagerV2-owned pools.
+        self._resolved_ple_pools[ple_layer_idx] = (conv_state, ngram_context)
         return ple_meta, conv_state, ngram_context
 
     def _resolve_ple_pools(
@@ -744,6 +766,9 @@ class Qwen4ExpModel(DecoderModel):
             conv_state, ngram_context = provided[ple_layer_idx]
             self._assert_ple_pool_shape(conv_state, ngram_context, ple_module)
             return conv_state, ngram_context
+        resolved = self._resolved_ple_pools.get(ple_layer_idx)
+        if resolved is not None:
+            return resolved
 
         max_slots = int(attn_metadata.max_num_requests or 0)
         needed = max(max_slots, num_seq, 1)

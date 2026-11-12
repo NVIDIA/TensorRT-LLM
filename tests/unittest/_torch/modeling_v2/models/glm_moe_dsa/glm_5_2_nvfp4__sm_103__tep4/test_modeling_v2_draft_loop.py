@@ -9,9 +9,9 @@ Every fused op is compared, exactly, with the engine's own code on the same inpu
   patterns, batches 1-8, 33 and 64, MTP1 / MTP3 / MTP5;
 * finalize: `torch.stack` plus the engine's `_prepare_next_new_tokens`;
 * the DeepGEMM schedule: `get_paged_mqa_logits_metadata`, 1-D and 2-D lengths;
-* the per-step metadata update (refresh, step 0, advance): `DSAtrtllmAttentionMetadata`'s own
-  `on_update_kv_lens` / `update_for_spec_dec` chain (`native_step`) on a metadata object with
-  the GEN server's decode buffers, every device field and the host fields the next step reads,
+* the per-step metadata update (step 0, advance): `DSAMetadata`'s own draft refresh
+  (`run_step` without `fused`) on a DSA extension with the GEN server's decode buffers, every
+  device field and the host fields the next step reads,
   with CUDA-graph padding rows (short KV lengths), the DSL expansion on and off, the dense
   top-k fallback and the GVR row reorder, and 200 back-to-back in-place updates;
 * the domain check: each declining condition declines.
@@ -31,8 +31,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.spec import (  # noqa: E402, E501
     draft_loop as K,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (  # noqa: E402
-    DSAtrtllmAttentionMetadata,
+from tensorrt_llm._torch.attention.backends.sparse.params import (  # noqa: E402
+    MTPIndexShareExtension,
 )
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase  # noqa: E402
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata  # noqa: E402
@@ -216,35 +216,121 @@ _INDEX_HEAD_DIM = 128
 _TOPK = 256  # the dense top-k fallback's width (2048 on GLM-5.2; any width checks the same code)
 
 
+class _Metadata:
+    """The composed metadata around one `Glm52Tep4DSAMetadata`: the core's lengths, counts and
+    length primitives, the MTP index-share tables, and every other name forwarded to the DSA
+    extension, as the composed metadata forwards it."""
+
+    def __init__(self, core: dict, index_share, dsa) -> None:
+        self.__dict__.update(core, _index_share=index_share, _dsa=dsa)
+
+    @property
+    def num_seqs(self) -> int:
+        return self.seq_lens.shape[0]
+
+    @property
+    def num_generations(self) -> int:
+        return self.num_seqs - self.num_contexts
+
+    @property
+    def num_tokens(self) -> int:
+        return int(self.seq_lens.sum())
+
+    @property
+    def num_ctx_tokens(self) -> int:
+        return int(self.seq_lens[: self.num_contexts].sum())
+
+    def __getattr__(self, name):
+        owner = self.__dict__["_dsa"]
+        if name in type(self.__dict__["_index_share"]).declared_fields():
+            owner = self.__dict__["_index_share"]
+        return getattr(owner, name)
+
+    def __setattr__(self, name, value) -> None:
+        if name in self.__dict__:
+            self.__dict__[name] = value
+        else:
+            setattr(self.__dict__["_dsa"], name, value)
+
+    def find_ext(self, extension_type):
+        for extension in (self._dsa, self._index_share):
+            if isinstance(extension, extension_type):
+                return extension
+        return None
+
+    def ext(self, extension_type):
+        extension = self.find_ext(extension_type)
+        assert extension is not None, extension_type
+        return extension
+
+    def _attached_extensions(self):
+        return (self._dsa, self._index_share)
+
+    def set_seq_lens(self, rows, *, host=None, device=None, update_counts=False) -> None:
+        if host is not None:
+            self.seq_lens[rows] = host
+        if device is not None:
+            self.seq_lens_cuda[rows] = device
+
+    def as_generation_rows(self) -> None:
+        self.num_contexts = 0
+
+    def adjust_kv_lens(self, rows, delta) -> None:
+        self.kv_lens_cuda[rows] += delta
+
+    def lengths_for_kernel_update(self) -> dict:
+        return {"seq_lens_cuda": self.seq_lens_cuda, "kv_lens_cuda": self.kv_lens_cuda}
+
+
+class _RefreshWorker:
+    """The draft loop's `refresh_draft()`: the DSA extension's refresh of the draft (the core
+    keeps no device state this metadata reads)."""
+
+    def __init__(self, md: _Metadata) -> None:
+        self._md = md
+
+    def refresh_draft(self) -> None:
+        self._md._dsa.refresh_from_draft_lengths()
+
+
 def _metadata(batch, draft_len, expand, seed, seq_len, skip=False, gvr=False):
-    """A `DSAtrtllmAttentionMetadata` holding the GEN server's pure-decode buffers, built
-    without a KV-cache manager (only the fields the decode update reads)."""
+    """A composed metadata holding the GEN server's pure-decode buffers, built without a
+    KV-cache manager (only the fields the decode refresh reads)."""
     g = torch.Generator().manual_seed(seed)
     cap = batch + 3  # the persistent buffers are sized for more requests than run
     num_sms = _num_sms()
-    md = object.__new__(DSAtrtllmAttentionMetadata)
     # The dense top-k fallback runs at short KV only; its rows read KV lengths up to the width.
     hi = _TOPK - draft_len if skip else 200_000
     kv = torch.randint(draft_len + 2, hi, (cap,), generator=g, dtype=torch.int32)
     if batch > 2:  # CUDA-graph padding rows: tiny KV lengths
         kv[batch - 1] = draft_len + 1
         kv[batch - 2] = draft_len + 2
-    fields = dict(
-        _seq_lens=torch.full((batch,), seq_len, dtype=torch.int32),
-        _seq_lens_kv=None,
-        _seq_lens_cuda=torch.full((cap,), seq_len, dtype=torch.int32, device=DEV),
-        _num_contexts=0,
-        cross=None,
-        enable_flash_mla=False,
+    core = dict(
+        seq_lens=torch.full((batch,), seq_len, dtype=torch.int32),
+        seq_lens_cuda=torch.full((cap,), seq_len, dtype=torch.int32, device=DEV),
+        kv_lens_cuda=kv.to(DEV),
+        num_contexts=0,
+        kv_cache_manager=SimpleNamespace(index_head_dim=_INDEX_HEAD_DIM, use_fp4=False),
+        num_sparse_topk=_TOPK,
         fp4_mla_state=None,
+        use_spec_decoding=True,
+    )
+    index_share = object.__new__(MTPIndexShareExtension)
+    index_share.__dict__.update(
+        in_mtp_draft_loop=False,
+        req_idx_per_token=torch.full((cap * (1 + draft_len),), -7, dtype=torch.int32,
+                                     device=DEV),
+    )  # fmt: skip
+    dsa = object.__new__(op.Glm52Tep4DSAMetadata)
+    dsa.__dict__.update(
+        _draft_step_written=False,
         _pool_cache_valid=True,
         _group_remap_batched={},
+        _ragged_mla_buffers_valid=True,
         nvfp4_mla_context_fp8_scratch=None,
-        kv_cache_manager=SimpleNamespace(index_head_dim=_INDEX_HEAD_DIM, use_fp4=False),
         use_fp8_ds_mla=False,
         enable_ragged_verification=False,
         ragged_verify_lens=None,
-        kv_lens_cuda=kv.to(DEV),
         _indexer_compress_ratio=1,
         runtime_tokens_per_gen_step=0,
         max_draft_tokens=draft_len,
@@ -259,11 +345,11 @@ def _metadata(batch, draft_len, expand, seed, seq_len, skip=False, gvr=False):
         use_expanded_buffers_for_mtp=False,
         expand_for_dsl=expand > 1,
         dsl_expand_factor=expand,
+        dsl_kernel_atoms=1,
+        dsl_kernel_next_n=0,
         kv_lens_expanded_cuda=torch.zeros((cap * 8,), dtype=torch.int32, device=DEV),
         indexer_k_cache_block_offsets=torch.randint(
             0, 1 << 20, (cap, _MAX_BLOCKS), generator=g, dtype=torch.int32).to(DEV),
-        req_idx_per_token=torch.full((cap * (1 + draft_len),), -7, dtype=torch.int32,
-                                     device=DEV),
         slot_mapping_fp8=torch.full((cap * (1 + draft_len),), -7, dtype=torch.int64, device=DEV),
         slot_mapping_scale=torch.full((cap * (1 + draft_len),), -7, dtype=torch.int64,
                                       device=DEV),
@@ -276,28 +362,35 @@ def _metadata(batch, draft_len, expand, seed, seq_len, skip=False, gvr=False):
         kv_lens_row_reorder_buffer=torch.full((cap,), -7, dtype=torch.int32, device=DEV),
         skip_indexer_for_ctx_reqs=False,
         skip_indexer_for_gen_reqs=skip,
-        num_sparse_topk=_TOPK,
         topk_indices_buffer=torch.full((cap * (1 + draft_len), _TOPK), -7, dtype=torch.int32,
                                        device=DEV),
         _fused_dsa_meta_armed=True,
-        use_spec_decoding=True,
-        max_ctx_kv_len=123,
-        num_ctx_cached_tokens=45,
+        indexer_schedule_stale=False,
         max_gen_seq_len=draft_len + 1,
         gen_indexer_kv_lens_cuda_runtime=None,
     )  # fmt: skip
-    md.__dict__.update(fields)
-    md.on_update()
+    md = _Metadata(core, index_share, dsa)
+    dsa.metadata = md
+    index_share.metadata = md
     return md
 
 
-_HOST_FIELDS = ("num_contexts", "num_tokens", "num_generations", "use_spec_decoding",
-                "max_ctx_kv_len", "num_ctx_cached_tokens", "max_gen_seq_len",
-                "kv_lens_row_reorder", "_pool_cache_valid")  # fmt: skip
+_HOST_FIELDS = ("num_contexts", "num_tokens", "num_generations", "max_gen_seq_len",
+                "indexer_schedule_stale", "kv_lens_row_reorder",
+                "_pool_cache_valid")  # fmt: skip
 
 
 def _device_fields(md) -> list[str]:
-    return sorted(n for n, v in vars(md).items() if isinstance(v, torch.Tensor) and v.is_cuda)
+    owners = (md.__dict__, vars(md._dsa), vars(md._index_share))
+    return sorted(
+        n for owner in owners for n, v in owner.items() if isinstance(v, torch.Tensor) and v.is_cuda
+    )
+
+
+def _step(md, step, batch, draft_len, num_accepted, pos, gather, fused):
+    return op.run_step(
+        _RefreshWorker(md), md, step, batch, draft_len, num_accepted, pos, gather, fused=fused
+    )
 
 
 _VARIANTS = {
@@ -312,8 +405,8 @@ _VARIANTS = {
 @pytest.mark.parametrize("draft_len", DRAFT_LENS)
 @pytest.mark.parametrize("batch", BATCHES)
 def test_step_updates_match_engine(batch, draft_len, expand, variant) -> None:
-    """A whole loop: the refresh, step 0 and the advances, on two identical metadata objects,
-    one through the engine's chain and one fused."""
+    """A whole loop: step 0 and the advances, on two identical metadata objects, one through
+    the engine's refresh and one fused."""
     seed = batch * 31 + draft_len * 7 + expand
     kw = _VARIANTS[variant]
     native, fused = (
@@ -327,27 +420,25 @@ def test_step_updates_match_engine(batch, draft_len, expand, variant) -> None:
     gather_ids = torch.arange(batch, device=DEV) * (draft_len + 1) + num_accepted.long() - 1
     positions = torch.randint(0, 200_000, (batch * (draft_len + 1),), generator=g,
                               dtype=torch.int32).to(DEV)  # fmt: skip
-    steps = [(op.MODE_REFRESH, False)]
-    steps += [(op.MODE_STEP0 if i == 0 else op.MODE_ADVANCE, i + 1 < draft_len)
-              for i in range(draft_len)]  # fmt: skip
-    for mode, has_pos in steps:
-        gather = gather_ids if mode == op.MODE_STEP0 else None
+    for step in range(draft_len):
+        has_pos = step + 1 < draft_len
+        gather = gather_ids if step == 0 else None
         pos = positions if has_pos else None
-        want_pos = op.native_step(native, mode, batch, draft_len, num_accepted, pos, gather)
-        got_pos = op.fused_step(fused, mode, batch, draft_len, num_accepted, pos, gather)
+        want_pos = _step(native, step, batch, draft_len, num_accepted, pos, gather, False)
+        got_pos = _step(fused, step, batch, draft_len, num_accepted, pos, gather, True)
         for name in _device_fields(native):
-            assert torch.equal(getattr(native, name), getattr(fused, name)), (mode, name)
+            assert torch.equal(getattr(native, name), getattr(fused, name)), (step, name)
         for name in _HOST_FIELDS:
             want, got = getattr(native, name), getattr(fused, name)
             if isinstance(want, torch.Tensor):  # the GVR row order: a view of its buffer
-                assert torch.equal(want, got), (mode, name)
+                assert torch.equal(want, got), (step, name)
             else:
-                assert want == got, (mode, name)
+                assert want == got, (step, name)
         assert torch.equal(
             native.gen_indexer_kv_lens_cuda_runtime, fused.gen_indexer_kv_lens_cuda_runtime
         )
         if has_pos:
-            assert torch.equal(want_pos, got_pos), mode
+            assert torch.equal(want_pos, got_pos), step
             positions = want_pos  # the next step's input positions
         else:
             assert want_pos is None and got_pos is None
@@ -359,12 +450,12 @@ def test_step_in_place_update_repeats(batch, draft_len) -> None:
     """The update writes the KV lengths in place while every warp holds a copy of them (the
     in-pipeline oracle once caught a warp loading after another one stored: the 2-D lengths
     and slot mappings of a block of rows one ahead). Many back-to-back updates, each compared
-    with the engine's chain."""
+    with the engine's refresh."""
     native, fused = (_metadata(batch, draft_len, 1, batch, 1) for _ in range(2))
     num_accepted = torch.ones((batch,), dtype=torch.int32, device=DEV)
     for _ in range(200):
-        op.native_step(native, op.MODE_ADVANCE, batch, draft_len, num_accepted, None, None)
-        op.fused_step(fused, op.MODE_ADVANCE, batch, draft_len, num_accepted, None, None)
+        _step(native, 1, batch, draft_len, num_accepted, None, None, False)
+        _step(fused, 1, batch, draft_len, num_accepted, None, None, True)
     for name in _device_fields(native):
         assert torch.equal(getattr(native, name), getattr(fused, name)), name
 
@@ -374,8 +465,8 @@ def test_domain(monkeypatch) -> None:
 
     monkeypatch.setattr(dsa, "is_dsa_cache_manager", lambda m: m is not None)
     md = _metadata(4, 5, 1, 1, 6)
-    assert op.step_ineligibility(md, 4) is None
-    assert op.step_ineligibility(md, 3) is not None  # not the batch the metadata holds
+    assert op.draft_ineligibility(md, 4) is None
+    assert op.draft_ineligibility(md, 3) is not None  # not the batch the metadata holds
     for name, value in (
         ("use_expanded_buffers_for_mtp", True),
         ("use_fp8_ds_mla", True), ("enable_ragged_verification", True),
@@ -383,29 +474,29 @@ def test_domain(monkeypatch) -> None:
     ):  # fmt: skip
         md = _metadata(4, 5, 1, 1, 6)
         setattr(md, name, value)
-        assert op.step_ineligibility(md, 4) is not None, name
+        assert op.draft_ineligibility(md, 4) is not None, name
     # The dense top-k fallback and the GVR row reorder stay in the domain.
-    assert op.step_ineligibility(_metadata(4, 5, 1, 1, 6, skip=True), 4) is None
-    assert op.step_ineligibility(_metadata(64, 5, 1, 1, 6, gvr=True), 64) is None
+    assert op.draft_ineligibility(_metadata(4, 5, 1, 1, 6, skip=True), 4) is None
+    assert op.draft_ineligibility(_metadata(64, 5, 1, 1, 6, gvr=True), 64) is None
     md = _metadata(4, 5, 1, 1, 6)
     md.num_contexts = 1
-    assert op.step_ineligibility(md, 4) is not None
+    assert op.draft_ineligibility(md, 4) is not None
 
 
-def test_step_declines_and_stays_declined(monkeypatch) -> None:
-    """Once a step declines, the loop's later steps keep the built-in update."""
-    target, draft, batch_indices = _accept_case(4, 5, 3, torch.int32)
-    spec = SimpleNamespace(
-        draft_tokens=draft, batch_indices_cuda=batch_indices, is_cuda_graph=False,
-        is_ragged_verify=False, runtime_draft_len=5,
-    )  # fmt: skip
-    worker = _Worker(target, 0.0)
-    loop = op.DraftLoop(worker, SimpleNamespace(num_seqs=4), spec)
-    reasons = iter(["declined", None])
-    monkeypatch.setattr(op, "step_ineligibility", lambda md, b: next(reasons))
-    assert loop.step(None, op.MODE_REFRESH, None, None) == (False, None)
-    assert loop.step(None, op.MODE_STEP0, None, None) == (False, None)
-    assert worker.counts == {("draft_step", False): 1}
+def test_declined_draft_metadata_runs_the_built_in_loop(monkeypatch) -> None:
+    """A forward whose draft metadata is outside the domain runs the built-in loop whole."""
+    worker = object.__new__(op.Glm52MTPEagleWorker)
+    counts = {}
+    worker._glm_count = lambda route, hit: counts.update({(route, hit): 1})
+    worker._glm_draft_loop = SimpleNamespace(step=None)  # a fused acceptance ran
+    monkeypatch.setattr(op, "draft_ineligibility", lambda md, b: "declined")
+    built_in = object()
+    monkeypatch.setattr(
+        op.MTPEagleWorker, "_forward_linear_draft_loop", lambda self, *args: built_in
+    )
+    args = ({}, None, None, None, None, 0, 4, None, None)
+    assert op.Glm52MTPEagleWorker._forward_linear_draft_loop(worker, *args) is built_in
+    assert counts == {("draft_step", False): 1}
 
 
 def test_worker_overrides_are_model_local() -> None:

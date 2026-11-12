@@ -33,6 +33,7 @@ from _torch.pyexecutor.engine_test_utils import (
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs as graphs_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingConfig
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.models.modeling_utils import remove_weights
@@ -307,7 +308,10 @@ class DecoderDsaWarmupTestCase(unittest.TestCase):
         """The DSA top-K pre-compile hooks read attn_metadata; when every
         warmup forward was skipped it is built on demand so the engines still
         compile before serving."""
-        from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import (
+            DSAMetadata,
+            DSAtrtllmAttentionMetadata,
+        )
 
         engine = object.__new__(DecoderWarmup)
         engine._config = SimpleNamespace(
@@ -323,10 +327,14 @@ class DecoderDsaWarmupTestCase(unittest.TestCase):
             buffers=None,
             attention_runtime_features=None,
         )
-        metadata = Mock(spec=DSAtrtllmAttentionMetadata)
+        dsa = Mock(spec=DSAMetadata)
+        metadata = Mock()
+        metadata.find_ext.side_effect = lambda cls: dsa if cls is DSAMetadata else None
 
         def build(
-            kv_cache_manager: KVCacheManagerV2, draft_kv_cache_manager: KVCacheManagerV2 | None
+            kv_cache_manager: KVCacheManagerV2,
+            draft_kv_cache_manager: KVCacheManagerV2 | None,
+            spec_decoding: SpecDecodingConfig | None,
         ) -> Mock:
             engine._metadata.attn_metadata = metadata
             return metadata
@@ -339,9 +347,9 @@ class DecoderDsaWarmupTestCase(unittest.TestCase):
         engine._ensure_dsa_attn_metadata_for_warmup(resource_manager)
         engine._warmup_cute_dsl_radix_topk()
 
-        engine._metadata.setup_attention.assert_called_once_with(kv_cache_manager, None)
-        metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
-        metadata.warmup_selfsampling_topk.assert_called_once_with(3, batch_sizes=[8])
+        engine._metadata.setup_attention.assert_called_once_with(kv_cache_manager, None, None)
+        dsa.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
+        dsa.warmup_selfsampling_topk.assert_called_once_with(3, batch_sizes=[8])
 
     def test_warmup_does_not_build_metadata_for_non_dsa_backend(self) -> None:
         engine = object.__new__(DecoderWarmup)

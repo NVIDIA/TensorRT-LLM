@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -9,10 +8,17 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends import core as core_module
 from tensorrt_llm._torch.attention.backends import interface as interface_module
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_module
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
+from tensorrt_llm._torch.attention.backends.features import helix as helix_module
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionBackend,
+    AttentionRuntimeFeatures,
+    BatchInputs,
+)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec, ModelConfig
 from tensorrt_llm._torch.pyexecutor.engine.metadata import (
@@ -24,13 +30,26 @@ from tensorrt_llm.mapping import CpType, Mapping
 pytestmark = pytest.mark.cpu_only
 
 
-class _AttentionMetadata:
+class _AttentionMetadata(TrtllmAttentionMetadata):
     def __init__(self, **kwargs: Any) -> None:
         self.__dict__.update(kwargs)
 
 
-class _AttentionBackend:
+class _AttentionBackend(AttentionBackend):
     Metadata = _AttentionMetadata
+
+
+def _backend_creating_with(constructor: Mock) -> type[AttentionBackend]:
+    """A backend whose Metadata(...) calls ``constructor`` with the creation arguments."""
+
+    class _ConstructorMetadata(_AttentionMetadata):
+        def __new__(cls, **kwargs: Any) -> Any:
+            return constructor(**kwargs)
+
+    class _ConstructorBackend(_AttentionBackend):
+        Metadata = _ConstructorMetadata
+
+    return _ConstructorBackend
 
 
 def test_build_attention_metadata_resolves_model_derived_values() -> None:
@@ -63,7 +82,7 @@ def test_build_attention_metadata_resolves_model_derived_values() -> None:
     )
 
     assert metadata.max_num_heads_per_kv == 4
-    assert metadata.enable_flash_mla
+    assert metadata.extension_types == (FlashMlaMetadata,)
     assert metadata.enable_context_mla_with_cached_kv
     assert metadata.sparse_metadata_params is sparse_metadata_params
     sparse_attention_config.to_sparse_metadata_params.assert_called_once_with(
@@ -215,7 +234,7 @@ def test_build_attention_metadata_explicit_disable(
         max_batch_size=4,
         max_num_tokens=16,
         max_beam_width=1,
-        attention_backend=SimpleNamespace(Metadata=constructor),
+        attention_backend=_backend_creating_with(constructor),
         attention_runtime_features=AttentionRuntimeFeatures(
             cache_reuse=cache_reuse, chunked_prefill=chunked_prefill
         ),
@@ -252,9 +271,10 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
         ),
     )
     monkeypatch.setattr(torch.Tensor, "cuda", lambda self, **kwargs: self.clone())
-    monkeypatch.setattr(interface_module, "maybe_pin_memory", lambda tensor: tensor)
+    monkeypatch.setattr(core_module, "maybe_pin_memory", lambda tensor: tensor)
     monkeypatch.setattr(trtllm_module, "maybe_pin_memory", lambda tensor: tensor)
     monkeypatch.setattr(trtllm_module, "prefer_pinned", lambda: False)
+    monkeypatch.setattr(helix_module, "prefer_pinned", lambda: False)
     monkeypatch.setattr(trtllm_module, "get_model_extra_attrs", lambda: object())
     mapping = Mapping(world_size=2, rank=rank, cp_size=2, cp_config={"cp_type": CpType.HELIX})
     manager = SimpleNamespace(
@@ -264,6 +284,7 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
         max_blocks_per_seq=8,
         max_seq_len=128,
         host_kv_cache_block_offsets=torch.zeros((1, 3, 2, 8), dtype=torch.int32),
+        prepare_batch_tables=Mock(),
         copy_batch_block_offsets=Mock(),
     )
     model_config = SimpleNamespace(
@@ -282,13 +303,7 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
         max_batch_size=3,
         max_num_tokens=32,
         max_beam_width=1,
-        attention_backend=SimpleNamespace(
-            Metadata=partial(
-                TrtllmAttentionMetadata,
-                workspace=torch.empty(0),
-                cuda_graph_workspace=torch.empty(0),
-            )
-        ),
+        attention_backend=TrtllmAttention,
         attention_runtime_features=AttentionRuntimeFeatures(),
         mapping=mapping,
         cache_indirection=None,
@@ -301,13 +316,16 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
         ([1], 0, [10]),
         ([3, 19, 1], 2, [0, 0, 11]),
     ]:
-        metadata.num_contexts = num_contexts
-        metadata.seq_lens = torch.tensor(lengths, dtype=torch.int32)
-        metadata.prompt_lens = lengths
-        metadata.request_ids = list(range(len(lengths)))
-        metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached)
         metadata.update_helix_param([cached[-1]], [False])
-        metadata.prepare()
+        metadata.prepare(
+            BatchInputs(
+                seq_lens=torch.tensor(lengths, dtype=torch.int32),
+                num_contexts=num_contexts,
+                request_ids=list(range(len(lengths))),
+                prompt_lens=lengths,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
+            )
+        )
 
         assert metadata.num_ctx_cached_tokens == 0
         assert metadata.max_ctx_cached_token_len == 0
@@ -345,7 +363,7 @@ def test_build_attention_metadata_dense_sparse_config_rejects_explicit_disable()
             max_batch_size=4,
             max_num_tokens=16,
             max_beam_width=1,
-            attention_backend=SimpleNamespace(Metadata=constructor),
+            attention_backend=_backend_creating_with(constructor),
             attention_runtime_features=AttentionRuntimeFeatures(),
             mapping=Mapping(world_size=2, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
             cache_indirection=None,

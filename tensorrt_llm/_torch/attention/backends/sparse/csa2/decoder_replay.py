@@ -41,12 +41,9 @@ __all__ = [
 
 @dataclass
 class DecoderReplayPlan:
-    """One forward's replay bookkeeping: what to run, and how to undo it.
+    """One forward's replay bookkeeping: what to run, and how to map back.
 
-    One record rather than loose locals because the "undo" half is not derivable
-    from the metadata once :func:`enter_decoder_replay` has overwritten it -- the
-    original ``seq_lens`` is the only place the encoder-pass row count survives,
-    and ``rows`` is the only map back to it.
+    ``rows`` is the only map from the replayed rows back to the encoder pass's.
     """
 
     #: Global query rows, in the *encoder* pass's token space, that the decoder
@@ -59,13 +56,7 @@ class DecoderReplayPlan:
     #: Per-request cached-token count for the replay pass, raised by exactly the
     #: number of query rows the pass drops.
     replay_num_cached: List[int]
-    #: ``seq_lens`` as the encoder pass saw it. Restoring this restores
-    #: ``num_tokens``, ``num_ctx_tokens`` and ``seq_lens_cuda`` with it, because
-    #: they are all derived through the ``seq_lens`` setter.
-    saved_seq_lens: torch.Tensor
-    saved_num_cached: List[int]
     replay_prompt_lens: List[int]
-    saved_prompt_lens: List[int]
     #: Row count of the encoder pass, i.e. the length every per-token activation
     #: crossing the boundary has on the way in and must have again on the way out.
     num_encoder_tokens: int
@@ -190,13 +181,10 @@ def plan_decoder_replay(
         ),
         replay_seq_lens=torch.tensor(replay_lens, dtype=seq_lens.dtype),
         replay_num_cached=replay_num_cached,
-        saved_seq_lens=seq_lens,
-        saved_num_cached=num_cached,
         replay_prompt_lens=[
             replay_lens[r] if r < num_contexts else int(metadata.prompt_lens[r])
             for r in range(num_requests)
         ],
-        saved_prompt_lens=metadata.prompt_lens,
         num_encoder_tokens=metadata.num_tokens,
         swa_floors=floors,
         updates_local_metadata=updates_local_metadata,
@@ -225,49 +213,24 @@ def enter_decoder_replay(
     metadata: "CSA2TrtllmMetadata",
     plan: DecoderReplayPlan,
     first_layer: Optional[int] = None,
-) -> None:
-    """Rebuild query views and carry encoder publications across the boundary."""
-    if plan.replay_all_rank_num_tokens is not None:
-        metadata.all_rank_num_tokens = plan.replay_all_rank_num_tokens
+) -> "CSA2TrtllmMetadata":
+    """Return the metadata the decoder layers run on, with the encoder publications.
+
+    A plan that compacts the local rows prepares the decoder replay metadata
+    of ``metadata``'s CSA2 (``prepare_decoder_replay``); ``metadata`` itself
+    is not changed. An attention-DP identity plan keeps ``metadata`` and only
+    presents the exchanged decoder token counts.
+    """
     if not plan.updates_local_metadata:
-        return
-    saved_indices = dict(metadata.csa2_indices)
-    saved_candidates = {
-        name: dict(getattr(metadata, name))
-        for name in ("csa2_candidates", "csa2_candidate_blocks", "csa2_candidate_counts")
-    }
-    saved_last_layer = metadata._csa2_last_layer
-    precomputed = set(getattr(metadata, "csa2_precomputed_kv_layers", ()))
-    live_kv_lens = metadata.kv_lens_cuda[: metadata.num_seqs].clone()
-    metadata.kv_cache_params.num_cached_tokens_per_seq[: len(plan.replay_num_cached)] = (
-        plan.replay_num_cached
-    )
-    metadata.prompt_lens = plan.replay_prompt_lens
-    metadata.seq_lens = plan.replay_seq_lens
+        if plan.replay_all_rank_num_tokens is not None:
+            metadata.all_rank_num_tokens = plan.replay_all_rank_num_tokens
+        return metadata
+    replay = metadata.prepare_decoder_replay(plan, first_layer)
     if plan.num_replay_tokens == 0:
-        # No local attention runs. Keep GLOBAL publication and live KV lengths,
-        # but do not ask attention backends to prepare an empty query batch.
-        metadata.reset_routing()
-        metadata.csa2_precomputed_kv_layers = precomputed
-        metadata.csa2_replay_query_rows = plan.rows
-        return
-    if first_layer is not None:
-        metadata.set_decoder_query_boundary(first_layer)
-    metadata.prepare()
-    metadata.kv_lens_cuda[: metadata.num_seqs].copy_(live_kv_lens)
-    metadata.on_update_kv_lens()
-    metadata.csa2_precomputed_kv_layers = precomputed
-    metadata.csa2_replay_query_rows = plan.rows
-    for layer, indices in saved_indices.items():
-        metadata.csa2_indices[layer] = indices.index_select(0, plan.rows)
-    for name, published in saved_candidates.items():
-        target = getattr(metadata, name)
-        for layer, value in published.items():
-            target[layer] = value.index_select(0, plan.rows)
-    metadata._csa2_last_layer = saved_last_layer
+        return replay
     # Only context SWA is truncated. Generation rows and global visibility
     # retain their original logical positions and cache history.
-    starts = metadata._copy_csa2_tensor(
+    starts = replay._copy_csa2_tensor(
         "decoder_starts",
         torch.tensor(
             plan.swa_floors,
@@ -275,7 +238,8 @@ def enter_decoder_replay(
             device="cpu",
         ),
     )
-    _apply_decoder_swa_floor(metadata, starts)
+    _apply_decoder_swa_floor(replay, starts)
+    return replay
 
 
 def enter_remote_tail_decoder(metadata: "CSA2TrtllmMetadata", context_starts: List[int]) -> None:
@@ -320,26 +284,17 @@ def exit_decoder_replay(
     metadata: "CSA2TrtllmMetadata",
     plan: DecoderReplayPlan,
 ) -> None:
-    """Restore the encoder pass's shape.
+    """Return ``metadata`` to the encoder pass's state after the decoder layers.
 
-    Only the *inputs* are restored -- ``seq_lens`` (and with it ``num_tokens``,
-    ``num_ctx_tokens`` and ``seq_lens_cuda``), the cached-token counts, and the
-    floor switch. The device index buffers are deliberately left holding replay
-    values: every forward rebuilds them from these inputs in ``prepare()``, and
-    copying them back would cost a second rebuild to no observable end.
+    An attention-DP identity plan restores its token counts. Otherwise the
+    decoder layers ran on the replay metadata and ``metadata`` kept its
+    lengths; its encoder publications, indexed in the encoder pass's rows,
+    are reset.
     """
-    if plan.saved_all_rank_num_tokens is not None:
+    if plan.saved_all_rank_num_tokens is not None and not plan.updates_local_metadata:
         metadata.all_rank_num_tokens = plan.saved_all_rank_num_tokens
     if not plan.updates_local_metadata:
         return
-    metadata.kv_cache_params.num_cached_tokens_per_seq[: len(plan.saved_num_cached)] = (
-        plan.saved_num_cached
-    )
-    metadata.prompt_lens = plan.saved_prompt_lens
-    metadata.seq_lens = plan.saved_seq_lens
-    metadata.csa2_replay_query_rows = None
-    # Publications are indexed in the compact query space and cannot survive
-    # shape restoration.
     metadata.reset_routing()
 
 

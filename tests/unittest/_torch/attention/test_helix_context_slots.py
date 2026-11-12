@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmCoreMetadata
 from tensorrt_llm.mapping import CpType, Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -45,7 +45,7 @@ def test_helix_context_slots(cp_size: int, page: int) -> None:
         metadata = _metadata(cp_size, rank, page)
         positions = metadata.helix_position_offsets.clone()
         inactive = metadata.helix_is_inactive_rank.clone()
-        TrtllmAttentionMetadata._prepare_helix_context_slots(
+        TrtllmCoreMetadata._prepare_helix_context_slots(
             metadata, torch.tensor(prefixes + [5, 7], dtype=torch.int32)
         )
         expected = []
@@ -86,7 +86,7 @@ def test_helix_context_slots_reset(phase: str) -> None:
         metadata.enable_context_mla_with_cached_kv = False
     else:
         metadata.kv_cache_manager.mapping = Mapping()
-    TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
+    TrtllmCoreMetadata._prepare_helix_context_slots(metadata, cached)
     assert metadata.helix_context_local_slots is None
 
 
@@ -100,7 +100,7 @@ def test_helix_context_slots_metadata_reuse(phase: str) -> None:
     inactive = metadata.helix_is_inactive_rank.clone()
 
     def check_slots(cached: torch.Tensor) -> None:
-        TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
+        TrtllmCoreMetadata._prepare_helix_context_slots(metadata, cached)
         expected = []
         for prefix, length in zip(
             cached[: metadata.num_contexts].tolist(),
@@ -127,7 +127,7 @@ def test_helix_context_slots_metadata_reuse(phase: str) -> None:
         metadata.kv_cache_manager.mapping = Mapping()
     else:
         metadata.enable_context_mla_with_cached_kv = False
-    TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
+    TrtllmCoreMetadata._prepare_helix_context_slots(metadata, cached)
     assert metadata.helix_context_local_slots is None
     torch.testing.assert_close(metadata.helix_position_offsets, positions)
     torch.testing.assert_close(metadata.helix_is_inactive_rank, inactive)
@@ -160,7 +160,7 @@ def test_helix_mla_chunk_plans(cp_size: int) -> None:
         chunked_loop_num=2,
         seq_lens_cuda=torch.empty(0),
     )
-    TrtllmAttentionMetadata._prepare_helix_mla_chunks(metadata)
+    TrtllmCoreMetadata._prepare_helix_mla_chunks(metadata)
     assert len(metadata.helix_mla_chunk_plans) == 2
     for loop, plan in enumerate(metadata.helix_mla_chunk_plans):
         expected_cu, expected_starts = [], []
@@ -185,5 +185,5 @@ def test_helix_mla_chunk_plans(cp_size: int) -> None:
         assert plan.rank_sizes == sizes.tolist()
         assert plan.max_local_seq_len == (cu[-1, 1:] - cu[-1, :-1]).max().item()
     metadata.helix_context_local_slots = None
-    TrtllmAttentionMetadata._prepare_helix_mla_chunks(metadata)
+    TrtllmCoreMetadata._prepare_helix_mla_chunks(metadata)
     assert metadata.helix_mla_chunk_plans is None

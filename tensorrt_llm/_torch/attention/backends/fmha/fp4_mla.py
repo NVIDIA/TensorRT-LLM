@@ -342,6 +342,7 @@ class Fp4MlaFmha(PhasedFmha):
     def run_mla_generation(self, params: FmhaParams) -> None:
         attn = params.attn
         metadata = params.meta
+        fp4_mla_state = metadata.fp4_mla_state
         forward_args = params.fwd
         q = params.query_input
         output = params.output
@@ -359,18 +360,18 @@ class Fp4MlaFmha(PhasedFmha):
         qk_rope_head_dim = attn.qk_rope_head_dim or 0
         fused_head_dim = kv_lora_rank + qk_rope_head_dim
 
-        if not bool(getattr(metadata.fp4_mla_state, "generation_cache_scattered", False)):
+        if not bool(getattr(fp4_mla_state, "generation_cache_scattered", False)):
             raise RuntimeError(
                 "FP4 MLA generation requires fused RoPE/Q quantization and "
                 "cache/HP-pool update before attention."
             )
-        metadata.fp4_mla_state.generation_cache_scattered = False
+        fp4_mla_state.generation_cache_scattered = False
         query = q.view(q.shape[0], attn.num_heads, fused_head_dim)
         output_view = output.view(q.shape[0], attn.num_heads, kv_lora_rank)
         sm_scale = 1.0 / (attn.q_scaling * ((attn.qk_nope_head_dim or 0) + qk_rope_head_dim) ** 0.5)
-        prequantized_q = getattr(metadata.fp4_mla_state, "prequantized_q", None)
-        prequantized_q_sf = getattr(metadata.fp4_mla_state, "prequantized_q_sf", None)
-        q_batch_capacity = getattr(metadata.fp4_mla_state, "q_batch_capacity", None)
+        prequantized_q = getattr(fp4_mla_state, "prequantized_q", None)
+        prequantized_q_sf = getattr(fp4_mla_state, "prequantized_q_sf", None)
+        q_batch_capacity = getattr(fp4_mla_state, "q_batch_capacity", None)
         try:
             run_fp4_mla_attention_decode(
                 metadata,
@@ -387,10 +388,10 @@ class Fp4MlaFmha(PhasedFmha):
                 softmax_stats_tensor=params.fwd.softmax_stats_tensor,
             )
         finally:
-            metadata.fp4_mla_state.prequantized_q = None
-            metadata.fp4_mla_state.prequantized_q_sf = None
-            metadata.fp4_mla_state.q_batch_capacity = None
-            metadata.fp4_mla_state.prequantized_q_rows_per_seq = None
+            fp4_mla_state.prequantized_q = None
+            fp4_mla_state.prequantized_q_sf = None
+            fp4_mla_state.q_batch_capacity = None
+            fp4_mla_state.prequantized_q_rows_per_seq = None
 
 
 __all__ = ["Fp4MlaFmha"]

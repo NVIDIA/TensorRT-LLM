@@ -111,9 +111,11 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
     )
     original = source.clone()
     other_source = torch.full_like(source, 123)
+    # The draft metadata over the draft KV cache stages its own block offsets.
+    draft = SimpleNamespace(kv_cache_block_offsets=other_source if unified else source)
     metadata = SimpleNamespace(
         kv_cache_block_offsets=source if unified else other_source,
-        draft_kv_cache_block_offsets=other_source if unified else source,
+        find=lambda name, default=None: draft if name == "draft_or_none" else default,
     )
 
     def decode_reference(

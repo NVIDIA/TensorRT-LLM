@@ -8,14 +8,16 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from _torch.helpers import bare_extension, refresh_from_lengths
 
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttention
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
+    BatchInputs,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -550,47 +552,37 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
 
 
 @pytest.mark.cpu_only
-def test_dsa_draft_forward_uses_draft_mixed_precision_high_table():
-    """A mixed DSA draft manager's MTP layers read its own mixed-precision high page table."""
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
+def test_staging_follows_this_metadatas_device_kv_lengths():
+    """A draft's length changes reach its staging copy; another manager's staging is hidden."""
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmCoreMetadata
+
+    core = bare_extension(TrtllmCoreMetadata, Mock())
+    manager = Mock(name="draft_kv_cache_manager")
+    core.kv_cache_manager = manager
+    core._seq_lens_cuda = torch.tensor([1, 2], dtype=torch.int32)
+    core.kv_lens_cuda = torch.tensor([10, 20, 0], dtype=torch.int32)
+    view = SimpleNamespace(
+        manager=manager, lengths=torch.zeros((2, 2), dtype=torch.int32), pools={0: None}
     )
+    core.mixed_precision_staging = view
+    assert core._mixed_precision_staging_name() == "mixed"
+    # A draft metadata is created with a staging name of its own.
+    core.mixed_precision_staging_name = "draft_mixed"
+    assert core._mixed_precision_staging_name() == "draft_mixed"
 
-    metadata = Mock()
-    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
-    metadata.draft_replay_swapped_attrs = {}
-    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
-    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
-    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
-    target, draft = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
-    metadata.mixed_precision_high_block_table = target
-    metadata.draft_mixed_precision_high_block_table = draft
+    # A draft step advanced the device KV lengths, then the draft loop calls before_forward().
+    core.kv_lens_cuda[:2] += 1
+    core.resync_length_derived_state()
+    assert view.lengths.tolist() == [[10, 19], [11, 21]]
+    assert core.get_mixed_precision_kv_view(0) is view
+    assert core.get_mixed_precision_kv_view(1) is None
 
-    DSAtrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
-    assert metadata.mixed_precision_high_block_table is draft
-    metadata.restore_draft_swaps()
-    assert metadata.mixed_precision_high_block_table is target
-
-
-@pytest.mark.cpu_only
-def test_draft_forward_swaps_in_draft_staging():
-    """A mixed MTP draft manager's layers run on its own staging copy during the draft forward."""
-    metadata = Mock()
-    metadata.draft_replay_swapped_attrs = {}
-    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
-    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
-    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
-    metadata.sync_draft_mixed_precision_staging = partial(
-        TrtllmAttentionMetadata.sync_draft_mixed_precision_staging, metadata
-    )
-    target, draft = Mock(name="target_staging"), Mock(name="draft_staging")
-    metadata.mixed_precision_staging = target
-    metadata.draft_mixed_precision_staging = draft
-
-    TrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
-    assert metadata.mixed_precision_staging is draft
-    metadata.restore_draft_swaps()
-    assert metadata.mixed_precision_staging is target
+    # A staging copy of another manager is neither used nor updated.
+    view.manager = Mock(name="target_kv_cache_manager")
+    core.kv_lens_cuda[:2] += 1
+    core.resync_length_derived_state()
+    assert view.lengths.tolist() == [[10, 19], [11, 21]]
+    assert core.get_mixed_precision_kv_view(0) is None
 
 
 @pytest.mark.cpu_only
@@ -739,7 +731,7 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
     "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
 )
 def test_staging_lengths_follow_corrected_kv_lens(backend):
-    """The overlap scheduler corrects KV lengths on the device after prepare(); staging follows."""
+    """The overlap scheduler corrects KV lengths on the device; staging follows."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     block, cached = 128, 32
@@ -754,49 +746,43 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
         view = metadata.mixed_precision_staging
         assert view.lengths.tolist() == [[cached], [cached + block]]
         offsets = torch.full((1,), -2, dtype=torch.int32, device="cuda")
+        corrected = [[cached - 2], [cached + block - 2]]
+        if backend is TrtllmAttention:
+            # prepare applies the step's device corrections to the target and its draft.
+            metadata.prepare(_small_inputs(manager, block, cached, kv_lens_offsets=offsets))
+            view = metadata.mixed_precision_staging
+            assert view.lengths.tolist() == corrected
+            # The draft runs on its own staging copy of the draft manager.
+            draft_view = metadata.draft.mixed_precision_staging
+            assert draft_view is not view
+            assert draft_view.manager is draft
+            assert draft_view.name == "draft_mixed"
+            assert draft_view.lengths.tolist() == corrected
+            assert metadata.get_mixed_precision_kv_view(0) is view
+            assert metadata.draft.get_mixed_precision_kv_view(0) is draft_view
+            return
 
         def correct():
-            if backend is TrtllmAttention:
-                metadata.kv_lens_cuda[:1] += offsets
-                metadata.on_update_kv_lens()
-            else:
-                metadata._uses_full_generation_page_table = True
-                metadata.apply_spec_decode_kv_lens_offsets(
-                    offsets, num_generations=0, tokens_per_generation=1, num_chunked_contexts=1
-                )
+            metadata.core()._uses_full_generation_page_table = True
+            metadata.apply_spec_decode_kv_lens_offsets(
+                offsets, num_generations=0, tokens_per_generation=1, num_chunked_contexts=1
+            )
 
         correct()
-        corrected = [[cached - 2], [cached + block - 2]]
         assert view.lengths.tolist() == corrected
-        # The draft forward runs on the draft staging copy with the corrected lengths.
-        if backend is TrtllmAttention:
-            metadata.prepare_for_draft_forward()
-            assert metadata.mixed_precision_staging is metadata.draft_mixed_precision_staging
-            assert metadata.mixed_precision_staging.lengths.tolist() == corrected
-            metadata.restore_draft_swaps()
-            assert metadata.mixed_precision_staging is view
-        else:
-            # The first draft view sync follows the correction; later syncs precede it.
-            draft_view = metadata.get_draft_metadata(draft)
-            assert draft_view.mixed_precision_staging is metadata.draft_mixed_precision_staging
-            assert draft_view.mixed_precision_staging.lengths.tolist() == corrected
-            metadata.prepare()
-            correct()
-            assert view.lengths.tolist() == corrected
-            # Every draft forward starts here; the view reuses the same staging copy and
-            # builds none of its own.
-            assert metadata.get_draft_metadata(draft) is draft_view
-            assert draft_view.mixed_precision_staging is metadata.draft_mixed_precision_staging
-            assert draft_view.draft_mixed_precision_staging is None
-            assert draft_view.mixed_precision_staging.lengths.tolist() == corrected
-        # Draft layers run on another manager through this metadata: the view is
-        # hidden and the staging lengths are left alone.
-        metadata.kv_cache_manager = object()
-        assert metadata.get_mixed_precision_kv_view(0) is None
+        # The separate draft view runs on its own staging copy of the draft
+        # manager, which takes the corrected lengths each time the view is fetched.
+        draft_view = metadata.get_draft_metadata(draft)
+        draft_staging = draft_view.mixed_precision_staging
+        assert draft_staging is not view and draft_staging.manager is draft
+        assert draft_staging.name == "draft_mixed"
+        assert draft_staging.lengths.tolist() == corrected
+        metadata.prepare()
         correct()
-        assert view.lengths.tolist() == [[cached - 2], [cached + block - 2]]
-        metadata.kv_cache_manager = manager
-        assert metadata.get_mixed_precision_kv_view(0) is view
+        assert view.lengths.tolist() == corrected
+        assert metadata.get_draft_metadata(draft) is draft_view
+        assert draft_view.mixed_precision_staging is draft_staging
+        assert draft_staging.lengths.tolist() == corrected
     finally:
         manager.shutdown()
         draft.shutdown()
@@ -823,7 +809,37 @@ def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloa
     )
 
 
+def _small_inputs(manager, block: int, cached: int, *, seq_lens=None, kv_lens_offsets=None):
+    """The step _small_metadata describes, as BatchInputs (one context request)."""
+    return BatchInputs(
+        seq_lens=torch.tensor([block], dtype=torch.int32) if seq_lens is None else seq_lens,
+        num_contexts=1 if seq_lens is None else 0,
+        request_ids=[0],
+        prompt_lens=[cached + block],
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+        kv_lens_offsets=kv_lens_offsets,
+    )
+
+
 def _small_metadata(backend, manager, mapping: Mapping, block: int, cached: int, draft=None):
+    if draft is not None and backend is TrtllmAttention:
+        # One-model speculative decoding: the draft forwards get md.draft.
+        return backend.Metadata(
+            seq_lens=torch.tensor([block], dtype=torch.int32),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+            max_num_requests=2,
+            max_num_tokens=block,
+            max_num_sequences=2,
+            kv_cache_manager=manager,
+            draft_kv_cache_manager=draft,
+            one_model_draft=True,
+            request_ids=[0],
+            prompt_lens=[cached + block],
+            kv_layout="NHD",
+            mapping=mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+        )
     return backend.Metadata(
         seq_lens=torch.tensor([block], dtype=torch.int32),
         num_contexts=1,
@@ -874,38 +890,6 @@ def test_mixed_precision_llm_args_accept_supported_features(overrides):
         kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
         **overrides,
     )
-
-
-@pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
-@pytest.mark.cpu_only
-def test_draft_forward_hides_mixed_precision_high_rows(backend):
-    """A draft manager without a mixed-precision high pool skips its writes and reads."""
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-        DeepseekV4TrtllmAttentionMetadata,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
-    )
-
-    cls = {"dsa": DSAtrtllmAttentionMetadata, "deepseek_v4": DeepseekV4TrtllmAttentionMetadata}[
-        backend
-    ]
-    metadata = Mock()
-    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
-    metadata.draft_sliding_block_tables = None
-    metadata.draft_mixed_precision_high_block_table = None
-    metadata.draft_replay_swapped_attrs = {}
-    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
-    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
-    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
-    table = torch.full((2, 4), -1, dtype=torch.int32)
-    metadata.mixed_precision_high_block_table = table
-
-    assert cls.prepare_for_draft_forward(metadata) is None
-    assert cls.has_mixed_precision_high_rows.fget(metadata) is False
-    metadata.restore_draft_swaps()
-    assert metadata.mixed_precision_high_block_table is table
-    assert cls.has_mixed_precision_high_rows.fget(metadata) is True
 
 
 @pytest.mark.cpu_only
@@ -975,7 +959,7 @@ def test_staging_page_tables_follow_each_layer_page_scale():
 
 
 def test_draft_staging_follows_corrected_kv_lens_in_cuda_graph():
-    """Inside a CUDA graph, each draft forward's staging copy follows the corrected KV lengths."""
+    """Each prepare corrects both staging copies; a captured draft step keeps the draft's in step."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     block, cached = 128, 32
@@ -987,23 +971,29 @@ def test_draft_staging_follows_corrected_kv_lens_in_cuda_graph():
         # A separate MTP draft manager holds the same tokens; graph metadata is a one-token decode.
         metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached, draft=draft)
         metadata = metadata.create_cuda_graph_metadata(1, buffers=Buffers())
-        metadata.prepare()
         offsets = torch.zeros(1, dtype=torch.int32, device="cuda")
+        decode = torch.ones(1, dtype=torch.int32)
+        metadata.prepare(
+            _small_inputs(manager, block, cached, seq_lens=decode, kv_lens_offsets=offsets)
+        )
+        draft_core = metadata.draft.core()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            # The overlap scheduler corrects KV lengths on the device, then a draft forward runs.
-            metadata.kv_lens_cuda[:1] += offsets
-            metadata.on_update_kv_lens()
-            metadata.prepare_for_draft_forward()
-            metadata.restore_draft_swaps()
+            # A draft step advances the draft's KV lengths, then readies its next forward.
+            draft_core.adjust_kv_lens(slice(0, 1), 1)
+            refresh_from_lengths(metadata.draft)
         for offset in (-1, -3):
-            # Each step, prepare() writes uncorrected lengths; the replay must correct both copies.
-            metadata.prepare()
             offsets.fill_(offset)
-            graph.replay()
+            metadata.prepare(
+                _small_inputs(manager, block, cached, seq_lens=decode, kv_lens_offsets=offsets)
+            )
             corrected = [[cached + offset], [cached + 1 + offset]]
             assert metadata.mixed_precision_staging.lengths.tolist() == corrected
-            assert metadata.draft_mixed_precision_staging.lengths.tolist() == corrected
+            assert metadata.draft.mixed_precision_staging.lengths.tolist() == corrected
+            graph.replay()
+            advanced = [[cached + 1 + offset], [cached + 2 + offset]]
+            assert metadata.draft.mixed_precision_staging.lengths.tolist() == advanced
+            assert metadata.mixed_precision_staging.lengths.tolist() == corrected
     finally:
         manager.shutdown()
         draft.shutdown()
@@ -1053,3 +1043,79 @@ def test_steady_decode_step_skips_mixed_precision(dtype):
         assert metadata.supports_steady_decode_step == (dtype == "auto")
     finally:
         manager.shutdown()
+
+
+def _high_table_manager(high_layers):
+    """A KV cache manager stub with mixed-precision high layers that records page-table fills."""
+    manager = SimpleNamespace(
+        mixed_precision_high_layers=high_layers, max_blocks_per_seq=4, filled=[]
+    )
+    manager._fill_page_table = lambda layer, request_ids, table: manager.filled.append(
+        (layer, list(request_ids))
+    )
+    return manager
+
+
+def _dsa_over(manager):
+    """The DSA mixed-precision high-table state of a metadata over ``manager``."""
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        max_num_sequences=2,
+        cuda_graph_buffers=None,
+        num_seqs=2,
+        request_ids=[3, 4],
+        get_empty=lambda buffers, shape, cache_name, dtype, capture_graph: torch.full(
+            shape, -1, dtype=dtype
+        ),
+    )
+    return SimpleNamespace(metadata=metadata, mixed_precision_high_block_table=None)
+
+
+@pytest.mark.cpu_only
+def test_dsa_draft_over_a_mixed_draft_manager_fills_its_own_high_table():
+    """A draft metadata over a separate mixed-precision draft manager fills its own
+    mixed-precision high page table from that manager; the target's stays the target's."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAMetadata
+
+    target_manager, draft_manager = _high_table_manager({0: 7}), _high_table_manager({0: 9})
+    target, draft = _dsa_over(target_manager), _dsa_over(draft_manager)
+    for dsa in (target, draft):
+        DSAMetadata._allocate_mixed_precision_high_block_table(dsa, capture_graph=False)
+        dsa._fill_mixed_precision_high_block_table = partial(
+            DSAMetadata._fill_mixed_precision_high_block_table, dsa
+        )
+        DSAMetadata._fill_mixed_precision_high_block_tables(dsa)
+    assert target.mixed_precision_high_block_table is not draft.mixed_precision_high_block_table
+    assert target_manager.filled == [(7, [3, 4])]
+    assert draft_manager.filled == [(9, [3, 4])]
+    assert DSAMetadata.has_mixed_precision_high_rows.fget(draft) is True
+
+
+@pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
+@pytest.mark.cpu_only
+def test_draft_without_a_high_pool_has_no_mixed_precision_high_rows(backend):
+    """A draft metadata whose manager has no mixed-precision high pool (DSA), or whose
+    MTP layers have none (DeepSeek-V4, created with builds_mixed_precision_high_tables
+    off), skips the high-pool writes and reads."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4Metadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAMetadata
+
+    if backend == "dsa":
+        draft = _dsa_over(_high_table_manager({}))
+        DSAMetadata._allocate_mixed_precision_high_block_table(draft, capture_graph=False)
+        assert draft.mixed_precision_high_block_table is None
+        assert DSAMetadata.has_mixed_precision_high_rows.fget(draft) is False
+        DSAMetadata._fill_mixed_precision_high_block_tables(draft)
+        assert draft.metadata.kv_cache_manager.filled == []
+    else:
+        table = {4: torch.full((2, 4), -1, dtype=torch.int32)}
+        draft = SimpleNamespace(
+            mixed_precision_high_block_table=table, builds_mixed_precision_high_tables=False
+        )
+        assert DeepseekV4Metadata.has_mixed_precision_high_rows.fget(draft) is False
+        target = SimpleNamespace(
+            mixed_precision_high_block_table=table, builds_mixed_precision_high_tables=True
+        )
+        assert DeepseekV4Metadata.has_mixed_precision_high_rows.fget(target) is True

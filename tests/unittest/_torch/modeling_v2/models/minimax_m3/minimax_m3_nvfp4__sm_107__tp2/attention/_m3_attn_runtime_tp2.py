@@ -4,7 +4,7 @@
 
 One hybrid NVFP4 KV cache manager (``MiniMaxM3KVCacheManagerV2``) laid out as the target's: a dense layer in the FP8
 half, a sparse MSA layer in the NVFP4 half with its FP8 index-K cache, and (``draft=True``) the one-model Eagle3
-drafter's shared layer, read through the manager's FP8 draft view as the runtime's draft swap reads it. Metadata is
+drafter's shared layer, read through the manager's FP8 draft view as a draft metadata reads it. Metadata is
 the runtime's own type, filled by its own ``prepare()``; the backends are built the way the target builds them.
 
 The geometry is one rank's: 32 query heads over two KV heads and two index heads of dim 128 (one index-K head).
@@ -173,7 +173,7 @@ def make_msa_metadata(manager) -> MiniMaxM3MsaSparseAttentionMetadata:
 
 
 def make_draft_metadata(manager) -> TrtllmAttentionMetadata:
-    """Drafter metadata over the shared manager's FP8 draft view, the manager the runtime's draft swap installs."""
+    """Drafter metadata over the shared manager's FP8 draft view, the manager a draft metadata runs on."""
     view = manager.get_draft_kv_cache_view()
     assert view is not None and view.dtype == DataType.FP8
     return TrtllmAttentionMetadata(

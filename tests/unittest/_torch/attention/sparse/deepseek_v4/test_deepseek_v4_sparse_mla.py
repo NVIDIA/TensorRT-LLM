@@ -23,8 +23,10 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
+from _torch.helpers import construct_extension, refresh_from_lengths
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
@@ -34,10 +36,11 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4AttentionType,
     DeepseekV4CacheManager,
+    DeepseekV4Metadata,
     DeepseekV4TrtllmAttention,
-    DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseBackendForwardArgs
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -172,6 +175,17 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         batch, num_key_value_heads, n_rep, slen, head_dim
     )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _create_metadata(
+    *, sparse_attention_config, enable_flash_mla: bool = False, **kwargs
+) -> TrtllmAttentionMetadata:
+    """DeepSeek-V4 attention metadata, built the way the backend builds it."""
+    return DeepseekV4TrtllmAttention.Metadata(
+        sparse_metadata_params=sparse_attention_config.to_sparse_metadata_params(),
+        extension_types=(FlashMlaMetadata,) if enable_flash_mla else (),
+        **kwargs,
+    )
 
 
 def _create_cache_manager(scenario: Scenario, context_lengths: List[int], max_seq_len: int):
@@ -723,7 +737,7 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
     attn_sink = torch.randn(local_num_heads, dtype=torch.float32, device=device).mul_(0.5)
     layer.attn_sink = torch.nn.Parameter(attn_sink, requires_grad=False)
 
-    attn_metadata = DeepseekV4TrtllmAttentionMetadata(
+    attn_metadata = _create_metadata(
         seq_lens=torch.tensor(context_lengths, dtype=torch.int),
         request_ids=[0],
         max_num_requests=1,
@@ -1054,7 +1068,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
 
     # 7. Context phase
     ctx_seq_lens = torch.tensor(context_lengths, dtype=torch.int)
-    attn_metadata = DeepseekV4TrtllmAttentionMetadata(
+    attn_metadata = _create_metadata(
         seq_lens=ctx_seq_lens,
         request_ids=request_ids,
         max_num_requests=batch_size,
@@ -1188,8 +1202,8 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
         gen_seq_lens = torch.tensor(generation_lens, dtype=torch.int)
         total_gen_tokens = sum(generation_lens)
 
-        def create_gen_metadata(ragged: bool) -> DeepseekV4TrtllmAttentionMetadata:
-            metadata = DeepseekV4TrtllmAttentionMetadata(
+        def create_gen_metadata(ragged: bool) -> TrtllmAttentionMetadata:
+            metadata = _create_metadata(
                 seq_lens=gen_seq_lens,
                 request_ids=request_ids,
                 max_num_requests=batch_size,
@@ -1204,8 +1218,11 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 mapping=mapping,
                 enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
                 sparse_attention_config=sparse_config,
-                enable_ragged_verification=ragged,
             )
+            dsa = metadata.ext(DeepseekV4Metadata)
+            # Ragged-verification buffers are sized when the extension allocates.
+            metadata.enable_ragged_verification = ragged
+            construct_extension(dsa)
             # Keep the persistent allocation ceiling independent of this
             # step's query lengths, as in update_spec_dec_param.
             metadata.max_draft_tokens = MAX_GENERATION_SEQ_LEN_Q - 1
@@ -1231,14 +1248,16 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 device=device,
             )
             torch.testing.assert_close(
-                gen_metadata.ragged_row_kv_lens(total_gen_tokens), expected_rows
+                gen_metadata.ragged_row_kv_lens(total_gen_tokens),
+                expected_rows,
             )
             torch.testing.assert_close(
                 gen_metadata.token_major_gen_view().sequence_length, expected_rows
             )
-            gen_metadata.on_update_kv_lens()
+            refresh_from_lengths(gen_metadata)
             torch.testing.assert_close(
-                gen_metadata.ragged_row_kv_lens(total_gen_tokens), expected_rows
+                gen_metadata.ragged_row_kv_lens(total_gen_tokens),
+                expected_rows,
             )
             torch.testing.assert_close(
                 gen_metadata.token_major_gen_view().sequence_length, expected_rows
@@ -1514,7 +1533,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
     ).uniform_(-1, 1)
     prefill_latent = torch.cat([prefill_compressed_kv, prefill_k_pe], dim=-1)
 
-    prefill_metadata = DeepseekV4TrtllmAttentionMetadata(
+    prefill_metadata = _create_metadata(
         seq_lens=torch.tensor(gen_ctx_lengths, dtype=torch.int),
         request_ids=gen_request_ids,
         max_num_requests=num_gen,
@@ -1592,7 +1611,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
     # 4. Mixed metadata: request 0 = context, requests 1..N = generation.
     mixed_seq_lens = [context_lengths[0]] + [generation_seq_len_q] * num_gen
     mixed_cached_lens = [0, *gen_cached_lens]
-    mixed_metadata = DeepseekV4TrtllmAttentionMetadata(
+    mixed_metadata = _create_metadata(
         seq_lens=torch.tensor(mixed_seq_lens, dtype=torch.int),
         request_ids=request_ids,
         max_num_requests=batch_size,

@@ -571,9 +571,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 dim=0,
             )
 
-            attn_metadata._seq_lens[num_contexts:batch_size].fill_(max_path_len)
-            attn_metadata._seq_lens_cuda[num_contexts:batch_size].fill_(max_path_len)
-            attn_metadata.on_update()
+            attn_metadata.set_seq_lens(
+                slice(num_contexts, batch_size),
+                host=max_path_len,
+                device=max_path_len,
+                update_counts=True,
+            )
         else:
             # Context-only (warmup). No gen tokens.
             input_ids = input_ids_ctx
@@ -643,15 +646,21 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # KV correction: target processed tokens_per_gen_step per request,
         # but step 0 should only attend to max_draft_len + 1 accepted-path tokens.
         if num_gens > 0 and hasattr(attn_metadata, "kv_lens_cuda"):
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
+            attn_metadata.adjust_kv_lens(slice(num_contexts, batch_size), -self._kv_correction)
+        self.refresh_draft()
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+        with self.draft_kv_cache_context(
+            attn_metadata, draft_kv_cache_manager
+        ) as draft_attn_metadata:
+            # Forward on the metadata the context selects, such as a
+            # FlashInfer view over a separate draft KV cache.
+            inputs["attn_metadata"] = draft_attn_metadata
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
             step0_hs = hidden_states_to_save[gather_ids]
 
             logits = draft_model.logits_processor(
-                hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
+                hidden_states[gather_ids], draft_model.lm_head, draft_attn_metadata, True
             )
 
             new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
@@ -662,7 +671,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 new_draft_scores=new_draft_scores,
                 previous_draft_scores=None,
                 batch_size=batch_size,
-                attn_metadata=attn_metadata,
+                attn_metadata=draft_attn_metadata,
             )
 
             self.update_hidden_states(
@@ -673,7 +682,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             self.prepare_for_generation(
                 0,
-                attn_metadata,
+                draft_attn_metadata,
                 batch_size,
                 inputs=inputs,
                 gather_ids=gather_ids,
@@ -687,7 +696,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
                 if original_all_rank_num_tokens is not None:
                     if spec_metadata.all_rank_num_seqs is not None:
-                        attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+                        draft_attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
                 # Growing context: process ALL accumulated tokens
                 num_infer_tokens = batch_size * num_tokens_per_req
@@ -701,7 +710,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     "input_ids": inp_ids,
                     "position_ids": inp_pos,
                     "hidden_states": inp_hs,
-                    "attn_metadata": attn_metadata,
+                    "attn_metadata": draft_attn_metadata,
                     "spec_metadata": spec_metadata,
                 }
 
@@ -711,7 +720,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
                 selected_hs = hs_reshaped[:, -self.K :, :].reshape(batch_size * self.K, -1)
                 logits = draft_model.logits_processor(
-                    selected_hs, draft_model.lm_head, attn_metadata, True
+                    selected_hs, draft_model.lm_head, draft_attn_metadata, True
                 )
 
                 new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
@@ -726,7 +735,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     new_draft_scores=new_draft_scores,
                     previous_draft_scores=previous_draft_scores,
                     batch_size=batch_size,
-                    attn_metadata=attn_metadata,
+                    attn_metadata=draft_attn_metadata,
                 )
 
                 self.update_hidden_states(
@@ -736,7 +745,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     selected_parents=self._last_selected_parents,
                 )
 
-                self.prepare_for_generation(layer_idx, attn_metadata, batch_size)
+                self.prepare_for_generation(layer_idx, draft_attn_metadata, batch_size)
 
         # Resample final tokens and build tree
         real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
@@ -1197,21 +1206,25 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 -1, self.K
             )
 
-            attn_metadata._seq_lens[:batch_size].fill_(self.K)
-            attn_metadata._seq_lens_cuda[:batch_size].fill_(self.K)
-            attn_metadata.on_update()
+            attn_metadata.set_seq_lens(
+                slice(0, batch_size),
+                host=self.K,
+                device=self.K,
+                update_counts=True,
+            )
 
             if inputs["attn_metadata"].kv_cache_manager is not None:
-                attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
-                attn_metadata.num_contexts = 0
+                # The context requests continue as generation rows.
+                attn_metadata.as_generation_rows()
 
             if hasattr(attn_metadata, "kv_lens_cuda"):
                 # KV rewind: remove unaccepted draft-path tokens
                 if num_gens > 0:
-                    attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                        self._max_path_len
-                    ) - num_accepted_tokens[num_contexts:batch_size]
-                attn_metadata.kv_lens_cuda[:batch_size] += self.K
+                    attn_metadata.adjust_kv_lens(
+                        slice(num_contexts, batch_size),
+                        num_accepted_tokens[num_contexts:batch_size] - self._max_path_len,
+                    )
+                attn_metadata.adjust_kv_lens(slice(0, batch_size), self.K)
 
             attn_metadata.use_spec_decoding = True
 
@@ -1222,10 +1235,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 :batch_size, num_tokens_previous_layer:num_tokens_current_layer
             ] = prev_pos[:, -self.K :] + 1
 
-            attn_metadata._seq_lens[:batch_size].fill_(num_tokens_current_layer)
-            attn_metadata._seq_lens_cuda[:batch_size].fill_(num_tokens_current_layer)
-            attn_metadata.on_update()
-            attn_metadata.kv_lens_cuda[:batch_size] += self.K
+            attn_metadata.set_seq_lens(
+                slice(0, batch_size),
+                host=num_tokens_current_layer,
+                device=num_tokens_current_layer,
+                update_counts=True,
+            )
+            attn_metadata.adjust_kv_lens(slice(0, batch_size), self.K)
+        self.refresh_draft()
 
     def update_hidden_states(
         self,

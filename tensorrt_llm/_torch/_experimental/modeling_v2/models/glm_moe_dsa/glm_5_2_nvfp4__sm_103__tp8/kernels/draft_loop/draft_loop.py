@@ -338,9 +338,23 @@ class DraftLoopOps:
         return self.gather_ids, rows
 
     def step_update(
-        self, attn_metadata, step: int, num_accepted_tokens, position_ids, gather_ids
+        self, attn_metadata, step: int, num_accepted_tokens, position_ids, gather_ids, refresh
     ) -> Optional["_draft_step.DraftStepResult"]:
-        """Fused per-step metadata update, or None for the native update."""
+        """Fused per-step metadata update, or None for the native update.
+
+        Whether the loop's metadata updates are fused is decided once, at draft
+        step 0, from the draft metadata (``step_ineligibility``); the rest of
+        the loop follows. ``refresh`` refreshes the draft after its lengths
+        changed (``md.refresh_draft()`` of the running draft loop).
+        """
+        from ... import dispatch
+
+        if step == 0:
+            reason = _draft_step.step_ineligibility(attn_metadata, self.batch_size, 0)
+            dispatch.log_capability(
+                "draft_loop", f"draft_step:{reason or 'engaged'}", reason is None, reason or ""
+            )
+            self.step_engaged = reason is None
         if not self.step_engaged:
             return None
 
@@ -354,17 +368,13 @@ class DraftLoopOps:
                 num_accepted_tokens,
                 position_ids,
                 gather_ids,
+                refresh,
             )
 
-        from ... import dispatch
-
-        reason = _draft_step.step_ineligibility(attn_metadata, self.batch_size, 0)
-        dispatch.log_capability(
-            "draft_loop", f"draft_step:{reason or 'engaged'}", reason is None, reason or ""
-        )
-        if _verify.verify_enabled() and reason is None:
+        if _verify.verify_enabled():
             result = _verify.verified_step_update(
                 run_draft_loop,
+                refresh,
                 attn_metadata,
                 step,
                 self.batch_size,

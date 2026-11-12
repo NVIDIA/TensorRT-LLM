@@ -65,6 +65,13 @@ MIRRORED_CLASSES = {
     "RopeParams": "AttentionRopeParams",
 }
 
+# Mirrored runtime classes whose members another class declares: the attention
+# metadata keeps its state on its core and extensions, so a declaration-only
+# class lists the members the native op reads, with their types.
+MIRROR_DECLARATIONS = {
+    "TrtllmAttentionMetadata": "TrtllmAttentionMetadataNativeFields",
+}
+
 # Root fields whose C++ usage decides which mirrored members are emitted.
 USAGE_PREFIXES = ("attn", "meta")
 
@@ -367,9 +374,10 @@ def _read_mirror(
     struct_name = _struct_name(class_name)
     if struct_name in mirrors:
         return mirrors[struct_name]
-    if class_name not in classes:
-        raise ValueError(f"mirrored class {class_name} not found in the schema sources")
-    members = _collect_members(classes[class_name], classes)
+    declaring_class = MIRROR_DECLARATIONS.get(class_name, class_name)
+    if declaring_class not in classes:
+        raise ValueError(f"mirrored class {declaring_class} not found in the schema sources")
+    members = _collect_members(classes[declaring_class], classes)
     if used is not None:
         unknown = sorted({path[0] for path in used} - members.keys())
         if unknown:

@@ -14,7 +14,10 @@ from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, input
 from _torch.pyexecutor.engine_test_utils import DummyModel
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
@@ -267,6 +270,8 @@ def test_replay_skips_only_staged_static_copies(use_mrope):
 
 # Plain values and tensors of a metadata object (other objects are shared or derived).
 _PLAIN = (int, float, bool, str, bytes, list, tuple, type(None), torch.Tensor)
+# Records which prepare ran the step (set by the steady step only), not what the step hands the model.
+_PATH_MARKERS = ("steady_decode_kv_lens",)
 
 
 def _snapshot(value):
@@ -305,13 +310,12 @@ def _step_state(preparer, inputs, attn_metadata, spec_metadata, b, t):
         "previous_kv_lens_offsets": buffers.previous_kv_lens_offsets_cuda[:b],
         "gather_ids": buffers.gather_ids_cuda[:n],
     }
-    for prefix, obj in (
-        ("attn", attn_metadata),
-        ("kv_cache_params", attn_metadata.kv_cache_params),
-    ):
-        for name, value in vars(obj).items():
-            if isinstance(value, _PLAIN):
-                state[f"{prefix}.{name}"] = value
+    for name, value in _metadata_fields(attn_metadata, _PLAIN).items():
+        if name.rsplit(".", 1)[-1] not in _PATH_MARKERS:
+            state[f"attn.{name}"] = value
+    for name, value in vars(attn_metadata.kv_cache_params).items():
+        if isinstance(value, _PLAIN):
+            state[f"kv_cache_params.{name}"] = value
     for name in (
         "num_tokens",
         "num_generations",
@@ -339,6 +343,23 @@ def _repage_last_block(manager, request, other):
         if after != before:
             break
     assert after[0][0] == before[0][0] and after != before
+
+
+def _metadata_fields(metadata, kinds=(torch.Tensor,), prefix="", seen=None):
+    """Fields of every extension of ``metadata`` that are instances of ``kinds``, nested metadata
+    (the draft) included, keyed by path."""
+    seen = set() if seen is None else seen
+    seen.add(id(metadata))
+    fields = {}
+    for extension in metadata.extensions:
+        for name, value in vars(extension).items():
+            path = f"{prefix}{type(extension).__name__}.{name}"
+            if isinstance(value, AttentionMetadata):
+                if id(value) not in seen:
+                    fields.update(_metadata_fields(value, kinds, f"{path}.", seen))
+            elif isinstance(value, kinds):
+                fields[path] = value
+    return fields
 
 
 def _previous_step_tensors(gen, t, num_slots=8):
@@ -410,7 +431,7 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
                 .setup_attention(manager)
                 .create_cuda_graph_metadata(len(requests), False, draft_len)
             )
-            assert type(attn_metadata) is TrtllmAttentionMetadata
+            assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             spec_metadata = Mock(
                 _force_non_greedy_for_capture=False,
                 context_prompt_lookahead_tokens=None,
@@ -418,13 +439,12 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
             )
             arms[arm] = (preparer, attn_metadata, spec_metadata)
         # Both arms start from the same metadata buffer contents.
-        steady_fields, full_fields = (vars(arms[arm][1]) for arm in ("steady", "full"))
+        steady_fields, full_fields = (_metadata_fields(arms[arm][1]) for arm in ("steady", "full"))
         for name, value in steady_fields.items():
             twin = full_fields.get(name)
-            if isinstance(value, torch.Tensor) and isinstance(twin, torch.Tensor):
-                if value.data_ptr() != twin.data_ptr():
-                    value.zero_()
-                    twin.zero_()
+            if twin is not None and value.data_ptr() != twin.data_ptr():
+                value.zero_()
+                twin.zero_()
 
         # Accepted tokens per request and step. None: request 1 re-pages its last block (which holds
         # draft slots only) and no request advances, so that is the batch's only block-table change.

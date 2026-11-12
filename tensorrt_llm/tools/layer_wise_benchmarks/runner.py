@@ -16,6 +16,8 @@ import torch
 import tensorrt_llm._torch.model_config
 import tensorrt_llm._torch.pyexecutor.config_utils
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingConfig
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -706,6 +708,21 @@ class Runner:
             if sparse_attention_config is not None
             else None
         )
+        # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens.
+        # The DSA indexer sizes its buffers from the draft length; without it
+        # its context_lens buffer stays one column wide and DeepGEMM aborts on
+        # the next_n mismatch. Shapes only -- spec-dec masking stays off. Only
+        # DSA needs it: max_total_draft_tokens otherwise reaches the attention
+        # op cache key and FMHA kernel selection.
+        spec_settings = {}
+        if (
+            run_type == "GEN"
+            and seq_len_q > 1
+            and any(issubclass(cls, DSAMetadata) for cls in metadata_cls.backend_extension_types)
+        ):
+            spec_settings["spec_decoding"] = SpecDecodingConfig(
+                max_draft_len=seq_len_q - 1, max_total_draft_tokens=seq_len_q - 1
+            )
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
@@ -730,32 +747,13 @@ class Runner:
             workspace=attn_workspace,
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
+            **spec_settings,
         )
         # One entry per attention-DP rank, not per world rank: the non-DP MoE path
         # asserts len(all_rank_num_tokens) == 1.
         attn_metadata.all_rank_num_tokens = [
             batch_size * seq_len_q
         ] * self.model_config.mapping.dp_size
-        # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
-        # serving the executor announces that via update_spec_dec_param(), the only
-        # place max_draft_tokens is set. Without it the DSA indexer's context_lens
-        # buffer stays one column wide and DeepGEMM aborts on the next_n mismatch.
-        # Shapes only -- spec-dec masking stays off.
-        #
-        # Gate on kv_lens_cuda_2d, not on the method: update_spec_dec_param() is on
-        # the base metadata class, so hasattr() would let every backend in, and the
-        # base sets max_total_draft_tokens unconditionally -- which reaches the
-        # attention op cache key and FMHA kernel selection. kv_lens_cuda_2d exists
-        # only on DSA metadata, which is the backend that needs this.
-        if run_type == "GEN" and seq_len_q > 1 and hasattr(attn_metadata, "kv_lens_cuda_2d"):
-            attn_metadata.update_spec_dec_param(
-                batch_size=batch_size,
-                is_spec_decoding_enabled=False,
-                is_spec_dec_tree=False,
-                is_spec_dec_dynamic_tree=False,
-                max_draft_len=seq_len_q - 1,
-                max_total_draft_tokens=seq_len_q - 1,
-            )
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size
         position_ids = torch.tensor(

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
+    BatchInputs,
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
@@ -26,14 +27,19 @@ def test_pixtral_head104_attention(dtype: torch.dtype, monkeypatch: pytest.Monke
     lengths = [2048, 32]
     num_heads, head_dim = 4, 104
     metadata = TrtllmAttentionMetadata(
-        max_num_requests=4096, max_num_tokens=16384, kv_cache_manager=None
+        max_num_requests=4096,
+        max_num_tokens=16384,
+        kv_cache_manager=None,
+        max_seq_len=max(lengths),
     )
-    metadata.num_contexts = len(lengths)
-    metadata.request_ids = list(range(len(lengths)))
-    metadata.prompt_lens = lengths
-    metadata.seq_lens = torch.tensor(lengths, dtype=torch.int)
-    metadata.max_seq_len = max(lengths)
-    metadata.prepare()
+    metadata.prepare(
+        BatchInputs(
+            seq_lens=torch.tensor(lengths, dtype=torch.int),
+            num_contexts=len(lengths),
+            request_ids=list(range(len(lengths))),
+            prompt_lens=lengths,
+        )
+    )
     attention = TrtllmAttention(
         layer_idx=0, num_heads=num_heads, num_kv_heads=num_heads, head_dim=head_dim
     )

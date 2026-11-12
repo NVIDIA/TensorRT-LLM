@@ -35,7 +35,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata, BatchInputs
 from tensorrt_llm._torch.speculative.interface import (
     FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR,
     SpecWorkerBase,
@@ -370,25 +370,33 @@ if __name__ == "__main__":
 
 
 class _FailingSpecWorker(_StubSpecWorker):
-    """Stub whose forward saves spec-dec metadata state and then fails."""
+    """Stub whose forward changes the draft's lengths in a draft loop and then fails."""
 
     def _forward_impl(self, *args: object, **kwargs: object) -> None:
         attn_metadata = kwargs["attn_metadata"]
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        raise RuntimeError("simulated draft failure")
+        with self.draft_loop(attn_metadata) as draft:
+            draft.set_seq_lens(slice(0, 2), host=3, device=3, update_counts=True)
+            raise RuntimeError("simulated draft failure")
 
 
-def test_forward_restores_spec_dec_state_on_failure() -> None:
-    """A failure between prepare_for_spec_dec and restore must not leak saved
-    attn-metadata state; SpecWorkerBase.forward restores it in its cleanup
-    (https://nvbugs/6442074)."""
+def test_a_failed_draft_forward_leaves_the_target_as_prepared() -> None:
+    """A failure inside a draft loop must not leak into later forwards: the
+    loop closes, and the target's lengths, which the loop never changes, stay
+    as prepared (https://nvbugs/6442074)."""
     _require_cuda()
-    attn_metadata = AttentionMetadata(max_num_requests=2, max_num_tokens=16)
-    attn_metadata.seq_lens = torch.ones(2, dtype=torch.int32)
+    attn_metadata = AttentionMetadata(max_num_requests=2, max_num_tokens=16, one_model_draft=True)
+    attn_metadata.prepare(
+        BatchInputs(
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            num_contexts=0,
+            request_ids=[0, 1],
+            prompt_lens=[1, 1],
+        )
+    )
     worker = _FailingSpecWorker()
     for _ in range(2):
-        # The second iteration would trip the pairing assert inside
-        # prepare_for_spec_dec if the first failure had leaked saved state.
         with pytest.raises(RuntimeError, match="simulated draft failure"):
             worker(attn_metadata=attn_metadata, spec_metadata=None)
-        assert not attn_metadata.has_spec_dec_saved_state
+        assert not attn_metadata.in_draft_loop
+        assert attn_metadata.seq_lens.tolist() == [1, 1]
+        assert not attn_metadata.lengths_changed

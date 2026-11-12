@@ -137,6 +137,13 @@ def _expand_qk_residual_terms(
     )
 
 
+def _fp4_mla_metadata(**fields) -> SimpleNamespace:
+    """A metadata stub whose ``fp4_mla_state`` is also its FP4 MLA extension."""
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = lambda cls: metadata.fp4_mla_state if cls is Fp4MlaState else None
+    return metadata
+
+
 def _build_multi_seq_metadata(
     kv_cache_manager: Fp4MlaKVCacheManagerV2, *, seq_lens: list[int], page_size: int, layer_idx: int
 ) -> SimpleNamespace:
@@ -194,7 +201,7 @@ def _build_multi_seq_metadata(
     kv_global_scale = torch.tensor([_BENCH_KV_GLOBAL_SCALE], dtype=torch.float32, device=device)
     q_global_scale = torch.tensor([FP4_MLA_Q_GLOBAL_SCALE], dtype=torch.float32, device=device)
 
-    return SimpleNamespace(
+    return _fp4_mla_metadata(
         kv_cache_manager=kv_cache_manager,
         page_size=page_size,
         num_contexts=num_seqs,

@@ -20,7 +20,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from _torch.helpers import bare_extension
 
+from tensorrt_llm._torch.attention.backends.features import DraftMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import backend as deepseek_v4_backend
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
@@ -29,9 +31,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
     deepseek_v4_local_to_global_indices,
 )
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-    DeepseekV4TrtllmAttentionMetadata,
-)
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import DeepseekV4Metadata
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepseekV4AttentionType
 from tensorrt_llm._torch.attention.backends.sparse.offload import (
     NVFP4_SCRATCH_TAIL_ROWS,
@@ -39,6 +39,8 @@ from tensorrt_llm._torch.attention.backends.sparse.offload import (
     _SparseBatchMember,
     allocate_sparse_offload_state,
 )
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm.bindings import DataType
@@ -52,18 +54,23 @@ _requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA 
 def _metadata(manager, *, enabled=True, graph=False, buffers=None, initialize=True):
     # Exercise the production offload initialization without constructing the
     # unrelated indexer/compressor/native attention workspaces.
-    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
-    metadata.kv_cache_manager = manager
-    metadata.sparse_metadata_params = DeepSeekV4SparseAttentionConfig(
+    core = object.__new__(TrtllmAttentionMetadata)
+    metadata = object.__new__(DeepseekV4Metadata)
+    metadata.metadata = core
+    core.replace_ext(bare_extension(MTPIndexShareExtension, core))
+    core.replace_ext(metadata)
+    core.core().kv_cache_manager = manager
+    core.sparse_metadata_params = DeepSeekV4SparseAttentionConfig(
         enable_kv_cache_offload=enabled, index_topk=8
     ).to_sparse_metadata_params()
-    metadata.max_num_sequences = 4
+    core.core().max_num_sequences = 4
     metadata.sparse_mla_topk = 8
-    metadata.beam_width = 1
+    metadata.mixed_precision_high_block_table = None
+    core.core().beam_width = 1
     metadata.max_draft_tokens = 0
-    metadata.draft_kv_cache_manager = None
-    metadata.is_cuda_graph = graph
-    metadata.cuda_graph_buffers = buffers
+    core.replace_ext(bare_extension(DraftMetadata, core))
+    core.core().is_cuda_graph = graph
+    core.core().cuda_graph_buffers = buffers
     if initialize:
         metadata._init_sparse_offload_state()
     return metadata
@@ -83,7 +90,7 @@ def test_sparse_offload_rejects_configuration_before_allocation(
         manager.pp_layers = [3]
     metadata = _metadata(manager, initialize=False)
     if unsupported == "beam":
-        metadata.beam_width = 2
+        metadata.metadata.beam_width = 2
     elif unsupported == "configured_beam":
         manager.max_beam_width = 2
     elif unsupported == "draft":
@@ -93,8 +100,8 @@ def test_sparse_offload_rejects_configuration_before_allocation(
     elif unsupported == "draft_tree":
         manager.max_total_draft_tokens = 1
     else:
-        metadata.draft_kv_cache_manager = object()
-    with patch.object(metadata, "get_empty") as allocate:
+        metadata.metadata.draft_kv_cache_manager = object()
+    with patch.object(metadata.metadata, "get_empty") as allocate:
         with pytest.raises(NotImplementedError, match="single-beam, non-speculative"):
             metadata._init_sparse_offload_state()
         allocate.assert_not_called()
@@ -122,9 +129,9 @@ def test_sparse_offload_stage_without_local_csa_allocates_nothing():
 def test_sparse_metadata_uses_native_capacity_and_configured_width():
     manager = _manager()
     metadata = _metadata(manager, initialize=False)
-    metadata.max_num_sequences = 2
+    metadata.metadata.core().max_num_sequences = 2
     with patch.object(
-        metadata,
+        metadata.metadata,
         "get_empty",
         side_effect=lambda buffers, shape, **kwargs: torch.empty(shape, dtype=torch.int32),
     ):
@@ -172,7 +179,7 @@ def test_nvfp4_scratch_keeps_a_zeroed_tail_past_its_rows():
 def test_sparse_metadata_rejects_different_selection_width():
     metadata = _metadata(_manager(), initialize=False)
     metadata.sparse_mla_topk = 4
-    with patch.object(metadata, "get_empty") as allocate:
+    with patch.object(metadata.metadata, "get_empty") as allocate:
         with pytest.raises(ValueError, match="configured positive top-k"):
             metadata._init_sparse_offload_state()
         allocate.assert_not_called()
@@ -203,7 +210,7 @@ def test_sparse_offload_buffers_are_persistent_and_separate(graph):
     assert len({t.data_ptr() for t in tensors}) == len(tensors)
     if graph:
         smaller = _metadata(manager, graph=True, buffers=buffers, initialize=False)
-        smaller.max_num_sequences = 2
+        smaller.metadata.core().max_num_sequences = 2
         smaller._init_sparse_offload_state()
         reused = smaller.sparse_offload_state
         assert reused.selected_history_units.data_ptr() == state.selected_history_units.data_ptr()
@@ -339,9 +346,9 @@ def test_metadata_routes_only_sparse_main_table(enabled):
     manager._enable_kv_cache_offload = enabled
     manager._stream = torch.cuda.current_stream()
     metadata = _metadata(manager, enabled=enabled)
-    metadata.request_ids = [20, 10]
-    metadata._seq_lens = torch.ones(2, dtype=torch.int32)
-    metadata._num_contexts = 0
+    metadata.metadata.request_ids = [20, 10]
+    metadata.metadata._seq_lens = torch.ones(2, dtype=torch.int32)
+    metadata.metadata._num_contexts = 0
     metadata.sliding_block_tables = torch.empty((1, 1, 4, 6), dtype=torch.int32, device="cuda")
     metadata.compress_block_tables = {
         ratio: torch.empty((4, 6), dtype=torch.int32, device="cuda") for ratio in (4, 128)
@@ -351,7 +358,7 @@ def test_metadata_routes_only_sparse_main_table(enabled):
         side_effect=lambda out, *args, **kwargs: out.fill_(29)
     )
     if enabled:
-        _publish(manager, metadata.request_ids)
+        _publish(manager, metadata.metadata.request_ids)
     metadata.prepare_for_block_tables()
     assert (metadata.sliding_block_tables == 71).all()
     assert (metadata.compress_block_tables[128] == 29).all()
@@ -770,12 +777,19 @@ def _host_batch(*, prefill=False):
         prompt_lens=[8, 12],
         kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[0, 0]),
     )
+    # The stub serves as both the core metadata and its extension.
+    metadata.metadata = metadata
+    metadata.index_share = metadata
+    # Not a draft: it takes no target's state.
+    metadata.target_source = lambda: None
     metadata._validate_ragged_verification = MethodType(
-        DeepseekV4TrtllmAttentionMetadata._validate_ragged_verification, metadata
+        DeepseekV4Metadata._validate_ragged_verification, metadata
     )
     metadata._validate_dsa_sparse_offload_batch = MethodType(
-        DeepseekV4TrtllmAttentionMetadata._validate_dsa_sparse_offload_batch, metadata
+        DeepseekV4Metadata._validate_dsa_sparse_offload_batch, metadata
     )
+    # The stub has no lazily built length prefixes to invalidate.
+    metadata._invalidate_length_prefixes = lambda: None
     return metadata
 
 
@@ -787,9 +801,9 @@ def test_offload_admits_only_decode(prefill):
     metadata = _host_batch(prefill=prefill)
     if prefill:
         with pytest.raises(NotImplementedError, match="decode batches only"):
-            DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+            DeepseekV4Metadata.validate_sparse_offload_batch(metadata)
     else:
-        DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+        DeepseekV4Metadata.validate_sparse_offload_batch(metadata)
     assert not metadata.sparse_offload_state.prepared
 
 
@@ -820,9 +834,9 @@ def test_offload_rejects_batch_before_table_preparation(unsupported):
     else:
         metadata.seq_lens_kv[0] += 1
     metadata.validate_sparse_offload_batch = lambda: (
-        DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+        DeepseekV4Metadata.validate_sparse_offload_batch(metadata)
     )
     with pytest.raises(NotImplementedError):
-        DeepseekV4TrtllmAttentionMetadata.prepare(metadata)
+        DeepseekV4Metadata.prepare(metadata)
     metadata.kv_cache_manager.compute_sliding_block_tables.assert_not_called()
     assert not metadata.sparse_offload_state.prepared

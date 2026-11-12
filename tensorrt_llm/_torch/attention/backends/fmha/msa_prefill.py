@@ -246,9 +246,9 @@ def run_msa_nvfp4_sparse_gqa(
 
     # A short pure-prefill step hands every layer the same identity selection (staged once per step by the
     # backend), so its k2q CSR worklist is layer-invariant: build it for the first layer and reuse it.
-    identity = metadata._msa_prefill_identity
+    identity = metadata.msa_prefill_identity
     csr_key = (batch, int(kv_block_indexes.shape[0]))
-    cached = metadata._msa_identity_csr
+    cached = metadata.msa_identity_csr
     if (
         identity is not None
         and cached is not None
@@ -271,7 +271,7 @@ def run_msa_nvfp4_sparse_gqa(
             return_schedule=True,
         )
         if identity is not None:
-            metadata._msa_identity_csr = (identity, csr_key, (k2q_row_ptr, k2q_q_indices, schedule))
+            metadata.cache_identity_csr((identity, csr_key, (k2q_row_ptr, k2q_q_indices, schedule)))
     result = sparse.sparse_atten_nvfp4_kv_func(
         q,
         k_paged.view(torch.uint8),

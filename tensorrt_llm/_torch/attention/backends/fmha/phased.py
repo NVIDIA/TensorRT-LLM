@@ -27,7 +27,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_sm_version
 
 from .interface import Fmha
 
@@ -105,22 +104,7 @@ def get_spec_decoding_position_offsets(
     """Return the active int32 offsets as a zero-copy [requests, query width] view."""
     if not (metadata.is_spec_decoding_enabled and metadata.use_spec_decoding):
         return None
-    offsets = metadata.spec_decoding_position_offsets
-    if offsets is not None and offsets.dim() == 1:
-        if not metadata.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-            # Hopper offsets use the current compact query width, which can be
-            # smaller than the persistent buffer's capacity.
-            query_len = metadata.spec_decoding_query_len
-            if query_len <= 0:
-                raise ValueError(
-                    "1-D speculative position offsets require a positive query length."
-                )
-            offsets = offsets[: metadata.max_num_requests * query_len].view(
-                metadata.max_num_requests, query_len
-            )
-        else:
-            offsets = offsets.view(metadata.max_num_requests, -1)
-    return offsets
+    return metadata.position_offsets_for_cpp
 
 
 def _leading_rows(t: torch.Tensor, n: int) -> torch.Tensor:
