@@ -1381,7 +1381,6 @@ def _make_send_kv_coordinator(canceled_req_ids, active_requests=()):
             canceled_request_ids=lambda: list(canceled_req_ids),
         ),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     return coordinator, transceiver, transfer_manager
 
