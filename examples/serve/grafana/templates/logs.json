@@ -1,0 +1,1770 @@
+{
+  "annotations": [],
+  "cursorSync": "Off",
+  "description": "Role-aware inference monitoring. Workers are discovered at refresh. Gauges show snapshots; rates use consecutive-scrape deltas. Additive counts use stacked lines; ratios and latency stay separate.",
+  "editable": true,
+  "elements": {
+    "panel-124": {
+      "kind": "Panel",
+      "spec": {
+        "id": 124,
+        "title": "Prefill - TRTLLM context logs (prefill)",
+        "description": "Scoped to prefill; the Role selector filters this section.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",@@LOG_ROLE_LABEL@@=\"@@PREFILL_LOG_ROLE@@\",container=\"@@ENGINE_CONTAINER@@\"} |~ \"$search\"",
+                      "legendFormat": "{{pod}}"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "logs",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "showLabels": true,
+              "showTime": true,
+              "sortOrder": "Descending",
+              "wrapLogMessage": true
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-125": {
+      "kind": "Panel",
+      "spec": {
+        "id": 125,
+        "title": "Prefill - TRTLLM raw iteration logs",
+        "description": "Scoped to prefill; the Role selector filters this section.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" |~ \"$search\" | regexp \"global_rank = (?P<rank>[0-9]+),\" | rank=~\"${mpi_rank:raw}\"",
+                      "legendFormat": "{{pod}}"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "logs",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "showLabels": true,
+              "showTime": true,
+              "sortOrder": "Descending",
+              "wrapLogMessage": true
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-15": {
+      "kind": "Panel",
+      "spec": {
+        "id": 15,
+        "title": "Instance logs by role and container",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"(${worker:regex})|(@@FRONTEND_PODS@@)\",container=~\"${container:regex}\"} |~ \"$search\"",
+                      "legendFormat": ""
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "logs",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "showLabels": true,
+              "showTime": true,
+              "sortOrder": "Descending",
+              "wrapLogMessage": true
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-152": {
+      "kind": "Panel",
+      "spec": {
+        "id": 152,
+        "title": "Decode - TRTLLM generation logs (decode)",
+        "description": "Scoped to decode; the Role selector filters this section.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",@@LOG_ROLE_LABEL@@=\"@@DECODE_LOG_ROLE@@\",container=\"@@ENGINE_CONTAINER@@\"} |~ \"$search\"",
+                      "legendFormat": "{{pod}}"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "logs",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "showLabels": true,
+              "showTime": true,
+              "sortOrder": "Descending",
+              "wrapLogMessage": true
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-153": {
+      "kind": "Panel",
+      "spec": {
+        "id": 153,
+        "title": "Decode - TRTLLM raw iteration logs",
+        "description": "Scoped to decode; the Role selector filters this section.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" |~ \"$search\" | regexp \"global_rank = (?P<rank>[0-9]+),\" | rank=~\"${mpi_rank:raw}\"",
+                      "legendFormat": "{{pod}}"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "logs",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "showLabels": true,
+              "showTime": true,
+              "sortOrder": "Descending",
+              "wrapLogMessage": true
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-16": {
+      "kind": "Panel",
+      "spec": {
+        "id": 16,
+        "title": "Per-request Dynamo traces",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "{namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"@@FRONTEND_PODS@@\",container=\"@@FRONTEND_CONTAINER@@\"} |= \"dynamo.request.trace.v1\"",
+                      "legendFormat": ""
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "logs",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "showLabels": true,
+              "showTime": true,
+              "sortOrder": "Descending",
+              "wrapLogMessage": true
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-119": {
+      "kind": "Panel",
+      "spec": {
+        "id": 119,
+        "title": "Prefill - Iteration ADP dummy tokens per iteration (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_ctx_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} context"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_gen_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} generation"
+                    }
+                  },
+                  "refId": "B",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-120": {
+      "kind": "Panel",
+      "spec": {
+        "id": 120,
+        "title": "Prefill - Iteration requests fetched per iteration (latest logged) per rank [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_fetched = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-121": {
+      "kind": "Panel",
+      "spec": {
+        "id": 121,
+        "title": "Prefill - Active requests per rank (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_active = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
+                      "queryType": "range"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "noValue": "—",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-122": {
+      "kind": "Panel",
+      "spec": {
+        "id": 122,
+        "title": "Prefill - Unscheduled requests per rank (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_unscheduled = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
+                      "queryType": "range"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "noValue": "—",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-123": {
+      "kind": "Panel",
+      "spec": {
+        "id": 123,
+        "title": "Prefill - ADP dummy requests per rank (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_dummy = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
+                      "queryType": "range"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "noValue": "—",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-147": {
+      "kind": "Panel",
+      "spec": {
+        "id": 147,
+        "title": "Decode - Iteration ADP dummy tokens per iteration (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_ctx_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} context"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*adp_dummy_gen_tokens = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}} generation"
+                    }
+                  },
+                  "refId": "B",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-148": {
+      "kind": "Panel",
+      "spec": {
+        "id": 148,
+        "title": "Decode - Iteration requests fetched per iteration (latest logged) per rank [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_fetched = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-149": {
+      "kind": "Panel",
+      "spec": {
+        "id": 149,
+        "title": "Decode - Active requests per rank (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_active = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
+                      "queryType": "range"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "noValue": "—",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-150": {
+      "kind": "Panel",
+      "spec": {
+        "id": 150,
+        "title": "Decode - Unscheduled requests per rank (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_unscheduled = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
+                      "queryType": "range"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "noValue": "—",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-151": {
+      "kind": "Panel",
+      "spec": {
+        "id": 151,
+        "title": "Decode - ADP dummy requests per rank (latest logged) [log-only]",
+        "description": "Actual latest numeric iteration sample for each reporting MPI rank in the plotted $__interval time bin. No window sum, maximum, averaged rate or log-window quantile. Missing/NA and idle bins remain no data. Per-iteration token/request counts are counts in that iteration, not tokens/s or lifetime totals. No exact native exporter equivalent is currently available; retained as a log-only diagnostic.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "loki",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "@@LOKI_UID@@"
+                    },
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "last_over_time({namespace=\"$namespace\",job=\"@@LOG_JOB@@\",pod=~\"${role:raw}\",pod=~\"${decode_worker:regex}\",pod=~\"@@DECODE_PODS@@\",container=\"@@ENGINE_CONTAINER@@\"} |= \"iter = \" | regexp \"global_rank = (?P<rank>[0-9]+),.*num_dummy = (?P<value>[0-9]+([.][0-9]+)?)\" | rank=~\"${mpi_rank:raw}\" | unwrap value | __error__=\"\" [$__interval]) by(@@LOG_ROLE_LABEL@@,pod,rank)",
+                      "legendFormat": "{{pod}} / {{@@LOG_ROLE_LABEL@@}} / rank {{rank}}",
+                      "queryType": "range"
+                    }
+                  },
+                  "refId": "A",
+                  "hidden": false
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "last"
+                ],
+                "displayMode": "table",
+                "placement": "bottom"
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "noValue": "—",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "linear",
+                  "lineWidth": 2,
+                  "showPoints": "never",
+                  "spanNulls": true
+                }
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    }
+  },
+  "layout": {
+    "kind": "RowsLayout",
+    "spec": {
+      "rows": [
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "title": "Prefill - engine logs — ${prefill_worker:text}",
+            "collapse": false,
+            "hideHeader": false,
+            "conditionalRendering": {
+              "kind": "ConditionalRenderingGroup",
+              "spec": {
+                "visibility": "show",
+                "condition": "or",
+                "items": [
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@PREFILL_PODS@@"
+                    }
+                  },
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@ENGINE_PODS@@"
+                    }
+                  }
+                ]
+              }
+            },
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 0,
+                      "width": 24,
+                      "height": 10,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-124"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 10,
+                      "width": 24,
+                      "height": 10,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-125"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "repeat": {
+              "mode": "variable",
+              "value": "prefill_worker"
+            }
+          }
+        },
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "title": "Decode - engine logs — ${decode_worker:text}",
+            "collapse": false,
+            "hideHeader": false,
+            "conditionalRendering": {
+              "kind": "ConditionalRenderingGroup",
+              "spec": {
+                "visibility": "show",
+                "condition": "or",
+                "items": [
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@DECODE_PODS@@"
+                    }
+                  },
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@ENGINE_PODS@@"
+                    }
+                  }
+                ]
+              }
+            },
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 0,
+                      "width": 24,
+                      "height": 10,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-152"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 10,
+                      "width": 24,
+                      "height": 10,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-153"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "repeat": {
+              "mode": "variable",
+              "value": "decode_worker"
+            }
+          }
+        },
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "title": "E2E - Selected role logs and frontend request traces",
+            "collapse": false,
+            "hideHeader": false,
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 0,
+                      "width": 24,
+                      "height": 10,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-15"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 10,
+                      "width": 24,
+                      "height": 10,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-16"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "conditionalRendering": {
+              "kind": "ConditionalRenderingGroup",
+              "spec": {
+                "visibility": "show",
+                "condition": "or",
+                "items": [
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "e2e"
+                    }
+                  },
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@ENGINE_PODS@@"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "title": "Prefill - log-only diagnostics by MPI rank — ${prefill_worker:text}",
+            "collapse": false,
+            "hideHeader": false,
+            "conditionalRendering": {
+              "kind": "ConditionalRenderingGroup",
+              "spec": {
+                "visibility": "show",
+                "condition": "or",
+                "items": [
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@PREFILL_PODS@@"
+                    }
+                  },
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@ENGINE_PODS@@"
+                    }
+                  }
+                ]
+              }
+            },
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 0,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-119"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 0,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-120"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 8,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-121"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 8,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-122"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 16,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-123"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "repeat": {
+              "mode": "variable",
+              "value": "prefill_worker"
+            }
+          }
+        },
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "title": "Decode - log-only diagnostics by MPI rank — ${decode_worker:text}",
+            "collapse": false,
+            "hideHeader": false,
+            "conditionalRendering": {
+              "kind": "ConditionalRenderingGroup",
+              "spec": {
+                "visibility": "show",
+                "condition": "or",
+                "items": [
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@DECODE_PODS@@"
+                    }
+                  },
+                  {
+                    "kind": "ConditionalRenderingVariable",
+                    "spec": {
+                      "variable": "role",
+                      "operator": "equals",
+                      "value": "@@ENGINE_PODS@@"
+                    }
+                  }
+                ]
+              }
+            },
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 0,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-147"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 0,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-148"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 8,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-149"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 8,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-150"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 16,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-151"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "repeat": {
+              "mode": "variable",
+              "value": "decode_worker"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "links": [
+    {
+      "title": "Performance and metrics",
+      "type": "link",
+      "icon": "external link",
+      "tooltip": "",
+      "url": "/d/@@METRICS_UID@@",
+      "tags": [],
+      "asDropdown": false,
+      "targetBlank": false,
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
+  "preload": false,
+  "tags": [
+    "inference",
+    "dynamo",
+    "trtllm",
+    "logs"
+  ],
+  "timeSettings": {
+    "timezone": "browser",
+    "from": "now-30m",
+    "to": "now",
+    "autoRefresh": "1m",
+    "autoRefreshIntervals": [
+      "15s",
+      "30s",
+      "1m",
+      "5m",
+      "15m"
+    ],
+    "hideTimepicker": false,
+    "fiscalYearStartMonth": 0
+  },
+  "title": "@@TITLE@@ - Logs",
+  "variables": [
+    {
+      "kind": "ConstantVariable",
+      "spec": {
+        "name": "namespace",
+        "query": "@@NAMESPACE@@",
+        "current": {
+          "text": "@@NAMESPACE@@",
+          "value": "@@NAMESPACE@@"
+        },
+        "hide": "hideVariable",
+        "skipUrlSync": false
+      }
+    },
+    {
+      "kind": "CustomVariable",
+      "spec": {
+        "name": "role",
+        "query": "E2E : e2e,Prefill : @@PREFILL_PODS@@,Decode : @@DECODE_PODS@@,All : @@ENGINE_PODS@@",
+        "current": {
+          "text": "All",
+          "value": "@@ENGINE_PODS@@"
+        },
+        "options": [
+          {
+            "text": "E2E",
+            "value": "e2e",
+            "selected": false
+          },
+          {
+            "text": "Prefill",
+            "value": "@@PREFILL_PODS@@",
+            "selected": false
+          },
+          {
+            "text": "Decode",
+            "value": "@@DECODE_PODS@@",
+            "selected": false
+          },
+          {
+            "text": "All",
+            "value": "@@ENGINE_PODS@@",
+            "selected": true
+          }
+        ],
+        "multi": false,
+        "includeAll": false,
+        "label": "Role",
+        "hide": "dontHide",
+        "skipUrlSync": false,
+        "allowCustomValue": false
+      }
+    },
+    {
+      "kind": "QueryVariable",
+      "spec": {
+        "name": "worker",
+        "label": "Engine worker",
+        "hide": "dontHide",
+        "skipUrlSync": false,
+        "refresh": "onTimeRangeChanged",
+        "sort": "alphabeticalAsc",
+        "regex": "/pod=\"([^\"]+)\"/",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [],
+        "multi": true,
+        "includeAll": true,
+        "allowCustomValue": false,
+        "query": {
+          "kind": "DataQuery",
+          "group": "prometheus",
+          "version": "v0",
+          "datasource": {
+            "name": "@@PROMETHEUS_UID@@"
+          },
+          "spec": {
+            "query": "query_result(up{namespace=\"$namespace\",job=~\"@@METRIC_JOBS@@\",endpoint=\"@@ENGINE_ENDPOINT@@\",pod=~\"${role:raw}\"})",
+            "refId": "PrometheusVariableQueryEditor-VariableQuery"
+          }
+        },
+        "description": "Discovered native-engine scrape targets. Updated on load/time-range refresh; no fixed worker count or pod suffix.",
+        "allValue": ".*"
+      }
+    },
+    {
+      "kind": "QueryVariable",
+      "spec": {
+        "name": "prefill_worker",
+        "label": "Prefill worker",
+        "hide": "hideVariable",
+        "skipUrlSync": true,
+        "refresh": "onTimeRangeChanged",
+        "sort": "alphabeticalAsc",
+        "regex": "/pod=\"([^\"]+)\"/",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [],
+        "multi": true,
+        "includeAll": true,
+        "allowCustomValue": false,
+        "query": {
+          "kind": "DataQuery",
+          "group": "prometheus",
+          "version": "v0",
+          "datasource": {
+            "name": "@@PROMETHEUS_UID@@"
+          },
+          "spec": {
+            "query": "query_result(up{namespace=\"$namespace\",job=~\"@@METRIC_JOBS@@\",endpoint=\"@@ENGINE_ENDPOINT@@\",pod=~\"${role:raw}\",pod=~\"@@PREFILL_PODS@@\",pod=~\"${worker:regex}\"})",
+            "refId": "PrometheusVariableQueryEditor-VariableQuery"
+          }
+        },
+        "description": "Discovered native-engine scrape targets. Updated on load/time-range refresh; no fixed worker count or pod suffix."
+      }
+    },
+    {
+      "kind": "QueryVariable",
+      "spec": {
+        "name": "decode_worker",
+        "label": "Decode worker",
+        "hide": "hideVariable",
+        "skipUrlSync": true,
+        "refresh": "onTimeRangeChanged",
+        "sort": "alphabeticalAsc",
+        "regex": "/pod=\"([^\"]+)\"/",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [],
+        "multi": true,
+        "includeAll": true,
+        "allowCustomValue": false,
+        "query": {
+          "kind": "DataQuery",
+          "group": "prometheus",
+          "version": "v0",
+          "datasource": {
+            "name": "@@PROMETHEUS_UID@@"
+          },
+          "spec": {
+            "query": "query_result(up{namespace=\"$namespace\",job=~\"@@METRIC_JOBS@@\",endpoint=\"@@ENGINE_ENDPOINT@@\",pod=~\"${role:raw}\",pod=~\"@@DECODE_PODS@@\",pod=~\"${worker:regex}\"})",
+            "refId": "PrometheusVariableQueryEditor-VariableQuery"
+          }
+        },
+        "description": "Discovered native-engine scrape targets. Updated on load/time-range refresh; no fixed worker count or pod suffix."
+      }
+    },
+    {
+      "kind": "TextVariable",
+      "spec": {
+        "name": "mpi_rank",
+        "label": "Iteration MPI rank (regex)",
+        "query": ".*",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        },
+        "hide": "dontHide",
+        "skipUrlSync": false,
+        "description": "Local MPI rank within each selected worker, e.g. 0 or 0|1. .* shows every reported rank. No fixed rank count; separate workers can each have rank 0."
+      }
+    },
+    {
+      "kind": "CustomVariable",
+      "spec": {
+        "name": "container",
+        "query": "@@CONTAINERS@@",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [],
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "Log container",
+        "hide": "dontHide",
+        "skipUrlSync": false,
+        "allowCustomValue": false
+      }
+    },
+    {
+      "kind": "TextVariable",
+      "spec": {
+        "name": "search",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "query": "",
+        "label": "Log search",
+        "hide": "dontHide",
+        "skipUrlSync": false
+      }
+    }
+  ]
+}

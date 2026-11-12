@@ -117,6 +117,7 @@ from ..kv_cache_stats import (
     KVCacheV2PoolGroupIterationStats,
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
+    KVCacheV2StorageIterationStats,
 )
 from ..llm_request import (
     LlmRequest,
@@ -7746,6 +7747,10 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_stats:
             return None
 
+        get_timings = getattr(self.impl, "take_migration_timings", None)
+        if get_timings is None:
+            get_timings = getattr(self.impl, "get_and_reset_migration_timings", None)
+        migration_timings, skipped_migration_timings = get_timings() if get_timings else ([], None)
         disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
         cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
         connector_cached_tokens = self.impl.get_and_reset_iteration_connector_cached_tokens()
@@ -7852,6 +7857,24 @@ class KVCacheManagerV2(BaseResourceManager):
             disk_prefetch_blocks=disk_prefetch_blocks,
             cached_tokens_by_level=list(cached_tokens_by_level),
             cache_level_tiers=self._stats_cache_level_tier_names(),
+            migration_timings=migration_timings,
+            skipped_migration_timings=skipped_migration_timings,
+            storage_stats=[
+                KVCacheV2StorageIterationStats(
+                    cache_level=level,
+                    pool_group_id=pool_group_id,
+                    slot_size=self._stats_slot_sizes(stats),
+                    total_blocks=int(stats.total),
+                    free_blocks=int(stats.free),
+                    evictable_blocks=int(stats.evictable),
+                    restored_blocks=getattr(stats, "restored_blocks", None),
+                    evicted_blocks=getattr(stats, "evicted_blocks", None),
+                    capacity_dropped_blocks=getattr(stats, "capacity_dropped_blocks", None),
+                    priority_dropped_blocks=getattr(stats, "priority_dropped_blocks", None),
+                )
+                for level, level_stats in enumerate([primary_stats, *secondary_stats_by_level])
+                for pool_group_id, stats in enumerate(level_stats)
+            ],
             connector_cached_tokens=(
                 connector_cached_tokens if self._connector_reports_cached_tokens() else None
             ),

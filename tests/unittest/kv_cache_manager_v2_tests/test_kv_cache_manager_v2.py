@@ -6334,6 +6334,23 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    @parameterized.expand([(False, 0), (False, 1), (True, 0), (True, 1)])
+    def test_prefetch_reuse_without_a_cache_owner(self, release_cache: bool, target: int) -> None:
+        """Prefetch must own the manager while constructing its temporary cache."""
+        self.prepare(2 << 20, 2 << 20, 0, 1, None, 0, tokens_per_block=4)
+        if release_cache:
+            cache = self.manager.create_kv_cache()
+            cache.close()
+            del cache
+            gc.collect()
+
+        # Each call releases its temporary cache, so the next call must also
+        # work without a persistent cache keeping the manager's owner alive.
+        for _ in range(2):
+            self.assertTrue(
+                self.manager.prefetch_reuse(ReuseScope(), [1, 2, 3, 4], CacheLevel(target))
+            )
+
     def test_side_stream_waits_for_a_busy_recycled_slot(self) -> None:
         """A full pool hands out a slot its previous owner's stream still writes.
 

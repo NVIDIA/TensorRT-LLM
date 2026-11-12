@@ -116,6 +116,20 @@ class KVCacheV2SsmLifeCycleIterationStats:
 
 
 @dataclass(slots=True)
+class KVCacheV2StorageIterationStats:
+    cache_level: int
+    pool_group_id: int
+    slot_size: tuple[int, ...]
+    total_blocks: int
+    free_blocks: int
+    evictable_blocks: int
+    restored_blocks: int | None = None
+    evicted_blocks: int | None = None
+    capacity_dropped_blocks: int | None = None
+    priority_dropped_blocks: int | None = None
+
+
+@dataclass(slots=True)
 class KVCacheV2IterationStatsReport:
     by_window_size: dict[int, Any]
     by_pool_group: dict[int, KVCacheV2PoolGroupIterationStats]
@@ -142,6 +156,9 @@ class KVCacheV2IterationStatsReport:
     # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
     # None when no connector can serve tokens.
     connector_cached_tokens: int | None = None
+    storage_stats: list[KVCacheV2StorageIterationStats] = field(default_factory=list)
+    migration_timings: list[tuple[int, int, int, float]] = field(default_factory=list)
+    skipped_migration_timings: int | None = None
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -237,6 +254,31 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     stats_dict["iterCachedTokensByLevel"] = list(kv_iter_stats.cached_tokens_by_level)
     if kv_iter_stats.cache_level_tiers:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
+    if kv_iter_stats.skipped_migration_timings is not None:
+        stats_dict["kvCacheMigrationTimings"] = list(kv_iter_stats.migration_timings)
+        stats_dict["kvCacheMigrationTimingsSkipped"] = kv_iter_stats.skipped_migration_timings
+    if kv_iter_stats.storage_stats:
+        stats_dict["kvCacheStorageStats"] = [
+            {
+                "cacheLevel": snapshot.cache_level,
+                "poolGroupId": snapshot.pool_group_id,
+                "slotSize": list(snapshot.slot_size),
+                "totalNumBlocks": snapshot.total_blocks,
+                "freeNumBlocks": snapshot.free_blocks,
+                "evictableNumBlocks": snapshot.evictable_blocks,
+                **{
+                    key: value
+                    for key, value in (
+                        ("restoredBlocks", snapshot.restored_blocks),
+                        ("evictedBlocks", snapshot.evicted_blocks),
+                        ("capacityDroppedBlocks", snapshot.capacity_dropped_blocks),
+                        ("priorityDroppedBlocks", snapshot.priority_dropped_blocks),
+                    )
+                    if value is not None
+                },
+            }
+            for snapshot in kv_iter_stats.storage_stats
+        ]
     if kv_iter_stats.connector_cached_tokens is not None:
         stats_dict["iterConnectorCachedTokens"] = kv_iter_stats.connector_cached_tokens
 

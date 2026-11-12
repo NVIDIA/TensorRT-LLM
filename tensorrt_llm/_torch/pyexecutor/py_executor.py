@@ -102,11 +102,11 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
+from .iteration_stats import IterationStatsRecord
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
 from .kv_cache_load import KvLoadTracker, aggregate_load
-from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
@@ -1209,6 +1209,8 @@ class PyExecutor:
         # above: _append_iter_stats is reached from per-rank-divergent gates,
         # so its tp_allgather collective is lifted to _flush_iter_stats_synced.
         self._pending_iter_stats_dict: Optional[Dict] = None
+        self._last_published_transfer_outcomes: Optional[tuple[int, int,
+                                                               int]] = None
         # Legacy ADP dummy role for overlap and PP fallback paths. The generic
         # non-overlap path derives its role from fresh per-iteration intent.
         self._adp_dummy_is_gen: bool = True
@@ -3528,7 +3530,9 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           kv_transfer_outcomes: Optional[tuple[int, int,
+                                                                int]] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -3554,11 +3558,15 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
+            kv_transfer_outcomes: Rank-local cumulative request success/error/timeout counts.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
         # KV stats explicitly.
         if not self.enable_attention_dp:
+            coordinator = self.__dict__.get("_disagg_coordinator")
+            kv_transfer_outcomes = (coordinator.transfer_outcomes
+                                    if coordinator is not None else None)
             kv_iter_stats = self._latest_kv_iter_stats
             # Same reasoning for the per-loop timings: non-ADP captures them
             # at append time. ADP passes the values that were saved with the
@@ -3580,49 +3588,41 @@ class PyExecutor:
                            or self.dist.pp_size > 1)
         scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
 
+        loop_metrics = None
+        runtime_metrics = getattr(self, "_perf_metrics", None)
+        if (attention_dp_rank is None or attention_dp_rank
+                == self.dist.rank) and runtime_metrics is not None:
+            loop = runtime_metrics.latest_loop
+            if loop is not None:
+                loop_metrics = {"kind": "loop", "per_iter": dict(loop.per_iter)}
+
+        entry = IterationStatsRecord(
+            iteration_stats=stats,
+            request_stats=req_stats,
+            kv_iteration_stats=kv_iter_stats,
+            attention_dp_rank=attention_dp_rank,
+            host_step_time_ms=host_step_time_ms,
+            prev_device_step_time_ms=prev_device_step_time_ms,
+            scheduler_mode=scheduler_mode,
+            gpu_forward_time_ms=gpu_forward_time_ms,
+            kv_transfer_outcomes=kv_transfer_outcomes,
+            executor_loop=loop_metrics)
+
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
                 and self.enable_attention_dp and attention_dp_rank is None):
-            import json as _json
-            local_dict = _json.loads(stats.to_json_str())
-            if req_stats:
-                local_dict["requestStats"] = [
-                    _json.loads(r.to_json_str()) for r in req_stats
-                ]
-            append_kv_cache_iteration_stats(local_dict, kv_iter_stats)
-            if host_step_time_ms is not None:
-                local_dict["hostStepTimeMS"] = host_step_time_ms
-            if prev_device_step_time_ms is not None:
-                local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
-            if gpu_forward_time_ms is not None:
-                local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
-            local_dict["schedulerMode"] = scheduler_mode
-            local_dict["rank"] = self.dist.tp_rank
+            local_dict = entry.to_dict(tp_rank=self.dist.tp_rank)
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
             # desync (reached from per-rank-divergent gates).
             self._pending_iter_stats_dict = local_dict
             return
 
-        # Legacy path: rank-0-only (single-rank or iter stats disabled).
-        # Tuple layout (length is sniffed by _stats_serializer with
-        # len() > N guards so older 4-tuples remain readable):
-        #   [0] stats: IterationStats
-        #   [1] req_stats: Optional[List[RequestStats]]
-        #   [2] kv_iter_stats: Optional[Dict[int, KvCacheIterationStats]]
-        #   [3] attention_dp_rank: Optional[int]
-        #   [4] host_step_time_ms: Optional[float]
-        #   [5] prev_device_step_time_ms: Optional[float]
-        #   [6] scheduler_mode: "overlap" | "non_overlap"
-        #   [7] gpu_forward_time_ms: Optional[float]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
-            self.stats.append(
-                (stats, req_stats, kv_iter_stats, attention_dp_rank,
-                 host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+            self.stats.append(entry)
 
     def _process_iter_stats(
         self,
@@ -3694,10 +3694,13 @@ class PyExecutor:
                                         micro_batch_id,
                                         batch_state.scheduled_batch_stats)
         if self.enable_attention_dp:
+            coordinator = self.__dict__.get("_disagg_coordinator")
             self._adp_iter_stats.queue(
                 stats,
                 req_stats,
                 kv_iter_stats=self._latest_kv_iter_stats,
+                kv_transfer_outcomes=(coordinator.transfer_outcomes
+                                      if coordinator is not None else None),
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
@@ -8026,9 +8029,34 @@ class PyExecutor:
             if validate_mm is not None:
                 validate_mm(mm_data)
 
+    def _publish_transfer_outcomes(self) -> None:
+        """Publish changed terminal counts before an idle request wait."""
+        if not self.enable_iter_perf_stats or self.enable_attention_dp:
+            return
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        if coordinator is None:
+            return
+        outcomes = getattr(coordinator, "transfer_outcomes", None)
+        if outcomes is None or outcomes == getattr(
+                self, "_last_published_transfer_outcomes", None):
+            return
+        snapshot = {
+            "attentionDpRank":
+            0,
+            "kvTransferOutcomes":
+            dict(zip(("success", "error", "timeout"), outcomes))
+        }
+        with self.stats_lock:
+            if (not _stats_buffer_is_unbounded(self.max_stats_len)
+                    and len(self.stats) > self.max_stats_len):
+                self.stats.pop(0)
+            self.stats.append(("per_rank_dict", snapshot))
+            self._last_published_transfer_outcomes = outcomes
+
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
+        self._publish_transfer_outcomes()
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # ADP polls owner-local completions before routing. All owners must
@@ -8351,7 +8379,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        kv_transfer_outcomes=record.kv_transfer_outcomes)
             total_num_active_requests = sum(s.num_active_requests
                                             for s in all_rank_states)
             total_num_live_requests = total_num_active_requests + sum(

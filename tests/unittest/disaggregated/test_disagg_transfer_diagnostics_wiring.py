@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1734,3 +1736,152 @@ def test_native_profile_diagnostics_do_not_affect_worker_setup(
             rank_info=rank_info,
             profile="native_v1",
         )
+
+
+def test_request_transfer_outcomes_ignore_polls_and_deduplicate_timeout_cleanup():
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
+
+    requests = [_disagg_request(i, i) for i in range(1, 5)]
+    for request in requests:
+        request.is_child = False
+    coordinator = _coordinator(active_requests=requests)
+    coordinator._registry.canceled_request_ids = lambda: {4}
+    coordinator._check_transfer_errors = Mock()
+    coordinator.inflight_cancel_active = lambda: False
+    coordinator._describe_transfer_timeout = lambda request: "test deadline"
+    coordinator._transceiver.check_gen_transfer_status = Mock(
+        return_value=GenTransferStatus([], [], [])
+    )
+    for _ in range(5):
+        coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (0, 0, 0)
+
+    timed_out = requests[2]
+    timed_out.py_kv_transfer_start_time = 0.0
+    timed_out.py_kv_transfer_timed_out = False
+    coordinator._flag_transfer_timeout(timed_out, "generation", 1000, current_time=2.0)
+    # A late completion cannot turn the same timed-out request into a success.
+    # Cancellation alone does not count as an error.
+    coordinator._transceiver.check_gen_transfer_status.return_value = GenTransferStatus(
+        [1, 3], [2], [requests[3]]
+    )
+    for _ in range(5):
+        coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (1, 1, 1)
+    coordinator._record_transfer_outcome(timed_out, "error")
+    assert coordinator.transfer_outcomes == (1, 1, 1)
+
+
+@pytest.mark.parametrize("physical_ownership", [False, True])
+def test_expired_blocking_receive_marks_timeout_and_preserves_retirement(
+    monkeypatch: pytest.MonkeyPatch, receive_chunk_bytes: Mock, physical_ownership: bool
+) -> None:
+    session = object.__new__(RxSession)
+    session._logical_outcomes = transfer_module._LogicalOutcomes()
+    session._retirement = None
+    session._enforce_physical_ownership = physical_ownership
+    session._terminal_status = None
+    session._exception = None
+    session._need_aux = False
+    session._timeout_s = 0.0
+    session._kv_tasks = [
+        SimpleNamespace(status=TaskStatus.TRANSFERRING, wait=Mock(return_value=False))
+    ]
+    session.resources_drained = Mock(return_value=not physical_ownership)
+    session.receive = Mock()
+    session.close = Mock(return_value=not physical_ownership)
+    request = _disagg_request(41, 4041)
+    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    request.set_kv_cache_size = Mock()
+    transceiver = _diagnostic_transceiver()
+    transceiver._validate_bridge_req = Mock(return_value=True)
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
+    transceiver._create_cache_extent = Mock(return_value=_extent(4041))
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
+    transceiver.request_and_receive_sync(request)
+    assert session.timed_out is True
+    assert request.py_kv_transfer_timed_out is True
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    session._kv_tasks[0].wait.assert_called_once_with(timeout=0.0)
+    assert bool(transceiver._recv_sessions) == physical_ownership
+    session.close.assert_called_once_with()
+
+
+def test_transfer_failure_is_exported_before_idle_wait_without_another_batch() -> None:
+    from prometheus_client import CollectorRegistry
+
+    from tensorrt_llm.executor.base_worker import BaseWorker
+    from tensorrt_llm.metrics.collector import MetricsCollector
+
+    request = _disagg_request(1, 1)
+    request.is_child = False
+    coordinator = _coordinator(active_requests=[request])
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
+
+    coordinator._check_transfer_errors = Mock()
+    coordinator.inflight_cancel_active = lambda: False
+    coordinator._transceiver.check_gen_transfer_status = Mock(
+        return_value=GenTransferStatus([], [1], [])
+    )
+    coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (0, 1, 0)
+    executor = object.__new__(PyExecutor)
+    executor.enable_iter_perf_stats = True
+    executor.enable_attention_dp = False
+    executor._disagg_coordinator = coordinator
+    executor.stats_lock = threading.Lock()
+    executor.stats = []
+    executor.max_stats_len = 10
+    executor.kv_connector_manager = None
+    executor.control_requests = []
+    executor.is_shutdown = False
+    executor._has_pending_connector_transfers = Mock(return_value=False)
+    executor._disable_mpi = False
+    executor.dist = SimpleNamespace(rank=0)
+    executor.request_accumulated = []
+    executor.hang_detector = SimpleNamespace(pause=nullcontext)
+    collector = MetricsCollector({"model_name": "test"}, registry=CollectorRegistry())
+
+    class IdleWaitReached(Exception):
+        pass
+
+    def idle_wait(timeout: object, *, wait_for_batch: bool) -> None:
+        assert timeout is None
+        assert wait_for_batch is True
+        assert len(executor.stats) == 1
+        collector.log_iteration_stats(json.loads(BaseWorker._stats_serializer(executor.stats[0])))
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_kv_cache_transfer_requests_total",
+                {**collector.labels, "dp_rank": "0", "outcome": "error"},
+            )
+            == 1
+        )
+        raise IdleWaitReached
+
+    executor.executor_request_queue = SimpleNamespace(get_from_request_queue=idle_wait)
+    with pytest.raises(IdleWaitReached):
+        executor._fetch_and_enqueue_requests([], 0)
+    executor._publish_transfer_outcomes()
+    assert len(executor.stats) == 1
+    executor.enable_iter_perf_stats = False
+    coordinator._record_transfer_outcome(_disagg_request(2, 2), "error")
+    executor._publish_transfer_outcomes()
+    assert len(executor.stats) == 1
+
+
+def test_outcome_transport_extends_refactor_tuple_without_shifting_loop() -> None:
+    from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
+
+    native = Mock()
+    native.to_json_str.return_value = '{"iter": 1}'
+    loop = {"kind": "loop", "per_iter": {"iter": 2}}
+    prefix = (native, None, None, None, None, None, None, None, loop)
+    plain = IterationStatsRecord.from_tuple(prefix).to_dict()
+    assert plain["executorLoop"] == loop
+    assert "kvTransferOutcomes" not in plain
+    extended = IterationStatsRecord.from_tuple((*prefix, (3, 2, 1))).to_dict()
+    assert extended["executorLoop"] == loop
+    assert extended["kvTransferOutcomes"] == {"success": 3, "error": 2, "timeout": 1}

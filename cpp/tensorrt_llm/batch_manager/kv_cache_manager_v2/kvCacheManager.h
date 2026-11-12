@@ -340,6 +340,11 @@ public:
     void commitStats(KVCacheStatsDelta const& stats, IterationStatsByLifeCycle const& iterationStatsByLifeCycle = {});
     KVCacheStatsDelta getCommittedStats() const;
     IterationStatsByLifeCycle getAndResetIterationStats();
+    //! Drain completed timing samples and return the lifetime cumulative skipped-sample count.
+    //! Incomplete samples remain pending; the skipped-sample count is never reset.
+    std::pair<MigrationTimingSamples, int64_t> takeMigrationTimings();
+    // Compatibility alias; only completed samples are drained, not the skipped counter.
+    std::pair<MigrationTimingSamples, int64_t> getAndResetMigrationTimings();
     PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
     // Drain every level at once. The peaks are already tracked as one per-level record, so a
     // caller that wants all of them should not take that record apart one level at a time.

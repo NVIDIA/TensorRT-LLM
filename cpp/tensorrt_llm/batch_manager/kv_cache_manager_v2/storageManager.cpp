@@ -26,6 +26,7 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -231,8 +232,18 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume, Priority coldTierOffloadMinPriority)
-    : mLifeCycles(lifeCycles)
+    float maxUtilForResume, Priority coldTierOffloadMinPriority, bool enableStats)
+    : mTimingEvents(
+        []() -> CUevent
+        {
+            CUevent event;
+            cuCheck(cuEventCreate(&event, CU_EVENT_DEFAULT));
+            return event;
+        },
+        [](CUevent event) { cuEventDestroy(event); }, 0, 128)
+    , mTimingSampleInterval(tensorrt_llm::common::getIntEnv("TRTLLM_KV_CACHE_TIMING_SAMPLE_INTERVAL").value_or(0))
+    , mEnableStats(enableStats)
+    , mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mColdTierOffloadMinPriority(coldTierOffloadMinPriority)
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
@@ -539,6 +550,8 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
+    mPendingMigrationTimings.clear();
+    mTimingEvents.clear();
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -652,8 +665,61 @@ Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, Slot
     return mLevels.at(level).storage->slotAddress(pgIdx, slotId).at(poolIdx);
 }
 
+std::pair<MigrationTimingSamples, int64_t> StorageManager::takeMigrationTimings()
+{
+    MigrationTimingSamples samples;
+    for (auto it = mPendingMigrationTimings.begin(); it != mPendingMigrationTimings.end();)
+    {
+        CUresult const status = cuEventQuery(it->stop.get());
+        if (status == CUDA_ERROR_NOT_READY)
+        {
+            ++it;
+            continue;
+        }
+        cuCheck(status);
+        float elapsedMs;
+        cuCheck(cuEventElapsedTime(&elapsedMs, it->start.get(), it->stop.get()));
+        samples.emplace_back(it->sourceLevel, it->destinationLevel, it->poolGroup, elapsedMs);
+        it = mPendingMigrationTimings.erase(it);
+    }
+    return {std::move(samples), mSkippedMigrationTimings};
+}
+
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
     PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    std::optional<PendingMigrationTiming> timing;
+    if (mEnableStats && mTimingSampleInterval > 0 && srcLevel != dstLevel && numPages > 0)
+    {
+        bool const restoring = dstLevel < srcLevel;
+        CacheLevel const level = restoring ? dstLevel : srcLevel;
+        PoolGroupIndex const pgIdx = getPoolGroupIndex(level, batchingLayerGroupId);
+        auto& batches = mMigrationBatches[{srcLevel, dstLevel, pgIdx}];
+        constexpr size_t kMaxPending = 64;
+        if (batches++ % mTimingSampleInterval == 0)
+        {
+            if (mPendingMigrationTimings.size() < kMaxPending)
+            {
+                timing.emplace(PendingMigrationTiming{
+                    srcLevel.value(), dstLevel.value(), pgIdx.value(), mTimingEvents.get(), mTimingEvents.get()});
+                cuCheck(cuEventRecord(timing->start.get(), stream));
+            }
+            else
+            {
+                ++mSkippedMigrationTimings;
+            }
+        }
+    }
+    submitMigrationBatchImpl(dstLevel, srcLevel, batchingLayerGroupId, pageIndices, numPages, stream);
+    if (timing)
+    {
+        cuCheck(cuEventRecord(timing->stop.get(), stream));
+        mPendingMigrationTimings.push_back(std::move(*timing));
+    }
+}
+
+void StorageManager::submitMigrationBatchImpl(CacheLevel dstLevel, CacheLevel srcLevel,
+    LayerGroupId batchingLayerGroupId, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
@@ -690,6 +756,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             mCopyEngine->transfer(poolMedium(dstLevel, dstPgIdx, poolIdx), poolMedium(srcLevel, srcPgIdx, poolIdx),
                 srcSizes.at(poolIdx), tasks, stream);
         }
+        recordMigration(dstLevel, srcLevel, batchingLayerGroupId, numPages);
         return;
     }
 
@@ -730,6 +797,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             ? encodeBatch(reinterpret_cast<void*>(coldBase), pageIndices, numPages, stream)
             : decodeBatch(reinterpret_cast<void const*>(coldBase), pageIndices, numPages, stream);
         TLLM_CHECK_WITH_INFO(submitted, "Cold-page codec rejected a migration batch");
+        recordMigration(dstLevel, srcLevel, batchingLayerGroupId, numPages);
         return;
     }
 
@@ -796,6 +864,48 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     {
         std::vector<PageIndexPair>().swap(stagingPageIndices);
     }
+    recordMigration(dstLevel, srcLevel, batchingLayerGroupId, numPages);
+}
+
+void StorageManager::recordMigration(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId lifeCycle, size_t numPages)
+{
+    if (!mEnableStats || srcLevel == dstLevel)
+    {
+        return;
+    }
+    // Restore is attributed to the receiving hotter level; eviction to the departing level.
+    CacheLevel const level = dstLevel < srcLevel ? dstLevel : srcLevel;
+    auto& stats = mMovementStats[{level, getPoolGroupIndex(level, lifeCycle)}];
+    auto& count = dstLevel < srcLevel ? stats.restoredBlocks : stats.evictedBlocks;
+    count += static_cast<int64_t>(numPages);
+}
+
+void StorageManager::recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, bool belowPriorityThreshold)
+{
+    if (!mEnableStats || pages.empty())
+    {
+        return;
+    }
+    // These batches are already grouped by physical pool (or a single lifecycle).
+    auto const level = pages.front()->cacheLevel;
+    auto const poolGroup = getPoolGroupIndex(level, pages.front()->lifeCycle);
+    TLLM_CHECK_DEBUG(std::all_of(pages.begin(), pages.end(),
+        [&](auto const& page)
+        { return page->cacheLevel == level && getPoolGroupIndex(level, page->lifeCycle) == poolGroup; }));
+    auto& stats = mMovementStats[{level, poolGroup}];
+    auto& count = belowPriorityThreshold ? stats.priorityDroppedBlocks : stats.capacityDroppedBlocks;
+    count += static_cast<int64_t>(pages.size());
+}
+
+void StorageManager::recordDroppedPage(Page const& page, bool belowPriorityThreshold)
+{
+    if (!mEnableStats)
+    {
+        return;
+    }
+    auto& stats = mMovementStats[{page.cacheLevel, getPoolGroupIndex(page.cacheLevel, page.lifeCycle)}];
+    auto& count = belowPriorityThreshold ? stats.priorityDroppedBlocks : stats.capacityDroppedBlocks;
+    ++count;
 }
 
 void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
@@ -1013,6 +1123,10 @@ void StorageManager::forceEvict(
                 }
             }
         }
+        for (auto const& pages : evicted)
+        {
+            recordDroppedPages(pages);
+        }
         rescheduleEvictedPagesOnFailure.cancel();
         return;
     }
@@ -1215,6 +1329,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 dropRecorder(ev, lvlId);
             }
+            recordDroppedPages(ev);
             ev.clear();
 
             freeAfterEviction = storage.numFreeSlots(pgIdx);
@@ -1243,6 +1358,10 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 accepted.insert(
                     accepted.end(), std::make_move_iterator(held.begin()), std::make_move_iterator(held.end()));
                 held.clear();
+                for (auto const& page : fallenPages.at(lifeCycle))
+                {
+                    recordDroppedPage(*page);
+                }
                 fallenPages.at(lifeCycle).clear();
             }
         }
@@ -1303,6 +1422,10 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         for (auto const& pages : belowOffloadThreshold)
             if (!pages.empty())
                 dropRecorder(pages, kHotLevel);
+    for (auto const& pages : belowOffloadThreshold)
+    {
+        recordDroppedPages(pages, true);
+    }
     restoreBelowThreshold.cancel();
 }
 
@@ -1656,7 +1779,9 @@ StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex
     SlotCount totalSlots = lvl.storage->numSlots(pgIdx);
     SlotCount evictable = lvl.controller.numEvictablePages(pgIdx);
     auto sizes = lvl.storage->slotSize(pgIdx);
-    return StorageStatistics{sizes, totalSlots, freeSlots, evictable};
+    auto const it = mMovementStats.find({level, pgIdx});
+    return StorageStatistics{
+        sizes, totalSlots, freeSlots, evictable, it == mMovementStats.end() ? StorageMovementStatistics{} : it->second};
 }
 
 TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level) const

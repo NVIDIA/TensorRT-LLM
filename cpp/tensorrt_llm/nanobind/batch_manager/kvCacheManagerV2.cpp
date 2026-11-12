@@ -1504,6 +1504,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("total", &kv::StorageStatistics::total)
         .def_ro("free", &kv::StorageStatistics::free)
         .def_ro("evictable", &kv::StorageStatistics::evictable)
+        .def_prop_ro("restored_blocks", [](kv::StorageStatistics const& self) { return self.movement.restoredBlocks; })
+        .def_prop_ro("evicted_blocks", [](kv::StorageStatistics const& self) { return self.movement.evictedBlocks; })
+        .def_prop_ro("capacity_dropped_blocks",
+            [](kv::StorageStatistics const& self) { return self.movement.capacityDroppedBlocks; })
+        .def_prop_ro("priority_dropped_blocks",
+            [](kv::StorageStatistics const& self) { return self.movement.priorityDroppedBlocks; })
         .def_prop_ro("available", &kv::StorageStatistics::available)
         .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
 
@@ -3371,14 +3377,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("refresh_retention", &kv::KvCacheManager::refreshRetention, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch_reuse",
-            [](kv::KvCacheManager& self, nb::object reuseScopeObj, nb::object inputTokens, int target)
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens, int target)
             {
                 auto reuseScope = castReuseScope(std::move(reuseScopeObj));
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
                     {
                         nb::gil_scoped_release release;
-                        return self.prefetchReuse(std::move(reuseScope), view, kv::CacheLevel{target}, knownNoDigest);
+                        return self->prefetchReuse(std::move(reuseScope), view, kv::CacheLevel{target}, knownNoDigest);
                     });
             },
             nb::arg("reuse_scope"), nb::arg("input_tokens"), nb::arg("target"))
@@ -3505,6 +3511,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_quota",
             [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },
             nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>())
+        .def("take_migration_timings", &kv::KvCacheManager::takeMigrationTimings,
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Drain completed timing samples and return the lifetime cumulative skipped count. "
+            "Incomplete samples remain pending; the skipped count is not reset.")
+        .def("get_and_reset_migration_timings", &kv::KvCacheManager::getAndResetMigrationTimings,
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Compatibility alias for take_migration_timings; the skipped count is not reset.")
         .def("get_committed_stats", &kv::KvCacheManager::getCommittedStats, nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_stats",
             [](kv::KvCacheManager& self)
