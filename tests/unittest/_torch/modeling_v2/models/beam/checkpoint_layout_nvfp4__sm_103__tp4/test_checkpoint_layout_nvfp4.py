@@ -130,6 +130,7 @@ def unswizzle(flat: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
 # ------------------------------------------------------------------ layout and recipe
 
 
+@pytest.mark.cpu_only
 def test_layout_counts_dtypes_and_rank_intervals() -> None:
     specs = layout.tensor_specs(model_config())
     quant = [s for s in specs.values() if isinstance(s, layout.QuantSpec)]
@@ -176,6 +177,7 @@ def test_layout_counts_dtypes_and_rank_intervals() -> None:
     assert layout.swizzled_numel(17, 40) == 128 * 40
 
 
+@pytest.mark.cpu_only
 def test_rank_slices_must_fall_on_whole_blocks() -> None:
     # 2600 columns split four ways is 650, which is not a whole number of 16-element blocks.
     spec = layout.QuantSpec("x.down_proj", (5120, 2600), 3, 0, "down_proj", 1)
@@ -183,6 +185,7 @@ def test_rank_slices_must_fall_on_whole_blocks() -> None:
         spec.interval(0)
 
 
+@pytest.mark.cpu_only
 def test_ledger_rows_record_packed_and_scale_ownership() -> None:
     specs = layout.tensor_specs(model_config(), layers=(5,))
     rows = {row["name"]: row for row in layout.ownership_ledger(specs)}
@@ -194,6 +197,7 @@ def test_ledger_rows_record_packed_and_scale_ownership() -> None:
     assert rows["model.layers.5.self_attn.q_proj.weight"]["stored_dtype"] == "BF16"
 
 
+@pytest.mark.cpu_only
 def test_recipe_is_reconciled_against_module_names() -> None:
     specs = layout.tensor_specs(model_config())
     summary = layout.check_recipe(recipe(), specs)
@@ -202,6 +206,7 @@ def test_recipe_is_reconciled_against_module_names() -> None:
     assert summary["excluded_linear_modules"] == 52 * 5 + 9 + 49 + 1
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "mutate, match",
     [
@@ -292,6 +297,7 @@ def quartets(tmp_path) -> tuple:
     return path, expected, tensors, scalars
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tile_bytes", [2560 * 3 + 17, 1 << 16, loader.TILE_BYTES])
 def test_packed_slices_preserve_bytes_on_every_rank(quartets, tile_bytes) -> None:
     path, expected, t, _ = quartets
@@ -331,6 +337,7 @@ def test_packed_slices_preserve_bytes_on_every_rank(quartets, tile_bytes) -> Non
         reader.close()
 
 
+@pytest.mark.cpu_only
 def test_scalars_read_exactly(quartets) -> None:
     path, _, _, scalars = quartets
     catalog = loader.SafetensorsCatalog(path)
@@ -344,6 +351,7 @@ def test_scalars_read_exactly(quartets) -> None:
     }
 
 
+@pytest.mark.cpu_only
 def test_block_scale_validation() -> None:
     ok = torch.tensor([[0x00, 0x80, 0x01, 0x7E, 0x38]], dtype=torch.uint8)
     loader.check_block_scales("ok", ok)
@@ -352,6 +360,7 @@ def test_block_scale_validation() -> None:
             loader.check_block_scales("bad", torch.tensor([[0x38, bad]], dtype=torch.uint8))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("how", ["missing", "extra", "dtype", "shape", "scalar_shape"])
 def test_validate_rejects_malformed_metadata(quartets, tmp_path, how) -> None:
     path, expected, _, _ = quartets
@@ -372,6 +381,7 @@ def test_validate_rejects_malformed_metadata(quartets, tmp_path, how) -> None:
         loader.validate(catalog, want)
 
 
+@pytest.mark.cpu_only
 def test_wrong_destination_raises(quartets) -> None:
     path, _, _, _ = quartets
     catalog = loader.SafetensorsCatalog(path)

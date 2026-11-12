@@ -179,6 +179,7 @@ def _bits16(t: torch.Tensor) -> list:
 # ------------------------------------------------------------------ layout
 
 
+@pytest.mark.cpu_only
 def test_layout_counts_intervals_and_banks() -> None:
     specs = layout.tensor_specs(model_config())
     assert len(specs) == 3 + 3 * 15 + 49 * 782
@@ -221,6 +222,7 @@ def test_layout_counts_intervals_and_banks() -> None:
     )
 
 
+@pytest.mark.cpu_only
 def test_gqa_pairing_and_ledger_rows() -> None:
     specs = layout.tensor_specs(model_config(), layers=(5,))
     q, k = (
@@ -249,6 +251,7 @@ def test_gqa_pairing_and_ledger_rows() -> None:
     assert all(r["replicated"] for r in rows["model.layers.5.mlp.gate.weight"]["ranks"])
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "change",
     [
@@ -273,6 +276,7 @@ def test_inconsistent_configuration_is_rejected(change) -> None:
         layout.tensor_specs(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("rank, world", [(4, 4), (-1, 4), (0, 2), (0, 8), (True, 4), (1.0, 4)])
 def test_invalid_rank_or_world_is_rejected(rank, world) -> None:
     with pytest.raises(ValueError):
@@ -284,6 +288,7 @@ def test_invalid_rank_or_world_is_rejected(rank, world) -> None:
         spec.interval(rank, world)
 
 
+@pytest.mark.cpu_only
 def test_unknown_layers_are_rejected() -> None:
     for layers in ((52,), (-1,), (3, 3), ("3",)):
         with pytest.raises(ValueError):
@@ -293,6 +298,7 @@ def test_unknown_layers_are_rejected() -> None:
 # ------------------------------------------------------------------ catalog validation
 
 
+@pytest.mark.cpu_only
 def test_catalog_accepts_the_exact_checkpoint(checkpoint) -> None:
     catalog = loader.SafetensorsCatalog(checkpoint)
     catalog.validate(SPECS, complete=True)
@@ -326,6 +332,7 @@ def _mutated(entries_by_file: dict, how: str) -> dict:
     return shards
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "how",
     [
@@ -344,6 +351,7 @@ def test_catalog_rejects_malformed_metadata(tmp_path, how) -> None:
         loader.SafetensorsCatalog(path).validate(SPECS, complete=True)
 
 
+@pytest.mark.cpu_only
 def test_catalog_rejects_index_header_disagreement_and_truncation(checkpoint) -> None:
     index_path = os.path.join(checkpoint, loader.INDEX_FILE)
     index = json.load(open(index_path))

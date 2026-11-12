@@ -63,7 +63,8 @@ l0_cpu:
   # tests that run on the source text, stubbed weights and meta tensors: its multimodal
   # splice and admission check on a stub tower, the KV pool contract, its KV storage
   # derivation and attention-call arguments, its routed-expert scalars and its weight table.
-  # The rest of unittest/_torch/modeling_v2 needs a GPU.
+  # Beam diagnostic and checkpoint-layout checks also run on CPU; mixed modules
+  # select only cpu_only-marked cases here.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving.py
@@ -71,6 +72,8 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/beam/test_routing.py
   - unittest/_torch/modeling_v2/models/beam/test_loading_contracts.py
   - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
+  - unittest/_torch/modeling_v2/models/beam/checkpoint_layout_bf16__sm_103__tp4/test_checkpoint_layout.py
+  - unittest/_torch/modeling_v2/models/beam/checkpoint_layout_nvfp4__sm_103__tp4/test_checkpoint_layout_nvfp4.py
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
