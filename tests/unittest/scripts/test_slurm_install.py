@@ -594,7 +594,7 @@ def _fetch_script(command: str, status_path: Path) -> str:
     return script.replace('\\"', '"').replace("\\$", "$")
 
 
-@pytest.mark.parametrize("status", (0, 2, 3, 4, 64))
+@pytest.mark.parametrize("status", (0, 2, 3, 4, 5, 64))
 def test_l0_fetch_repeats_only_a_failed_transfer(tmp_path: Path, status: int) -> None:
     status_path = tmp_path / "fetch-status"
     script = _fetch_script(f"sh -c 'exit {status}'", status_path)
@@ -855,6 +855,52 @@ def test_l0_takes_checkpoints_from_a_watcher_beside_the_tests() -> None:
     # copy brings nothing back.
     for name in ("SNAPSHOT_REQUIRES", "FINAL_REQUIRES"):
         assert f'"{name}=${{WORKSPACE}}/${{stageName}}/results.xml",' in batch
+
+
+def test_l0_checkpoint_netrc_entries_stand_on_their_own() -> None:
+    """A location whose netrc entry cannot be written does not stop the other's checkpoints."""
+    prepare = _groovy_function_body(_l0_test_code_lines(), "prepareCheckpointWatcher")
+
+    # Each entry is written in a try block of its own, and a location becomes one of the
+    # watcher's targets only after its entry is written.
+    loop = prepare.index("for (location in locations) {")
+    entry = prepare.index("addArtifactoryNetrcEntry(pipeline, netrcPath, location)", loop)
+    assert prepare[loop:entry].split() == ["for", "(location", "in", "locations)", "{", "try", "{"]
+    interrupted = prepare.index("catch (InterruptedException e) {", entry)
+    left_out = prepare.index("continue", interrupted)
+    target = prepare.index('targets << "${location}=', left_out)
+
+    # The watcher gets the netrc only together with a target.
+    with_targets = prepare.index("if (targets) {", target)
+    netrc = prepare.index('watcherEnv << "CHECKPOINT_NETRC_FILE=${netrcPath}"', with_targets)
+    assert prepare.count("CHECKPOINT_NETRC_FILE") == 1
+    without_targets = prepare.index("} else {", netrc)
+    prepare.index("removeCheckpointNetrc(pipeline, netrcDir)", without_targets)
+
+
+def test_l0_wheel_sanity_tests_get_no_checkpoint_netrc() -> None:
+    """The "Run LLMAPI Test" step's sanity tests run code from the wheel without a credential."""
+    lines = _l0_test_code_lines()
+    code = "\n".join(lines)
+
+    # The step names its attempt before it starts the sanity tests, and no other step does.
+    withheld = "CHECKPOINT_NETRC_WITHHELD << (toStageName(values[1], key) + sanityPostTag)"
+    assert code.count("CHECKPOINT_NETRC_WITHHELD <<") == 1
+    code.index(
+        'runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check"', code.index(withheld)
+    )
+
+    # For such an attempt, the watcher gets no netrc and no target, so it uploads no checkpoint.
+    prepare = _groovy_function_body(lines, "prepareCheckpointWatcher")
+    check = prepare.index("if ((stageName + postTag) in CHECKPOINT_NETRC_WITHHELD) {")
+    returned = prepare.index('return [netrcDir: "", env: watcherEnv]', check)
+    for later in (
+        "mktemp",
+        "addArtifactoryNetrcEntry(",
+        "CHECKPOINT_TARGETS",
+        "CHECKPOINT_NETRC_FILE",
+    ):
+        assert prepare.index(later) > returned, later
 
 
 # A netrc entry that a pipeline writes with printf, which keeps the secret off the command line.

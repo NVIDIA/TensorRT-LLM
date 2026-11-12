@@ -76,15 +76,13 @@ GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 # Authoritative source of the main-branch revisions represented by coverage DBs.
 COVERAGE_GIT_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
 
-_URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 
-# `build_info.txt` and the coverage archives are read with the read helper,
+# `build_info.txt`, the coverage archives, and the pins are read with the read helper,
 # jenkins/scripts/fetch_build_artifact.sh, which looks for each file in the primary artifact
 # location (LLM_ARTIFACTS_PRIMARY) first and in the other one only when it is absent there,
-# authenticating to artifactory.nvidia.com with the ARTIFACTORY_NETRC file. Pins are read from
-# `_URM` only.
+# authenticating to artifactory.nvidia.com with the ARTIFACTORY_NETRC file.
 _FETCH_BUILD_ARTIFACT = Path(__file__).resolve().parents[5] / "fetch_build_artifact.sh"
 # Exit codes of the read helper that this module acts on, by the names the helper gives them;
 # tests/unittest/scripts/test_fetch_build_artifact.py checks that they match.
@@ -195,16 +193,18 @@ def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str
     build's read would be rejected too. The helper reports a rejection by the secondary location as
     a transfer failure, so that build is skipped.
 
-    While artifactory.nvidia.com is down or unreachable, each read that has to go there, of this
-    file or of a coverage archive, fails in transfer after the helper's three attempts: about 6 s
-    when it refuses connections or answers 5xx at once, about 96 s when connections time out, and
-    about 15 min when no data arrives (curl ends an attempt after 300 s below 1 byte/s). While it
-    is the primary location (the default), every read goes there, so the probe pays that once for
-    each of the last `_MAX_PROBE` builds, whose first coverage archive cannot be read, before the
-    coverage tier declines. After a rollback to urm, only files that urm does not hold are read
-    there, and the probe stops at the newest complete build that urm holds. A pre-merge
-    L0_MergeRequest run calls this command in its Setup Environment stage, before it starts any
-    build, so its builds wait for these reads.
+    While artifactory.nvidia.com is down or unreachable, each read that has to go there, of the
+    pin, of this file, or of a coverage archive, fails in transfer after the helper's three
+    attempts: about 6 s when it refuses connections or answers 5xx at once, about 96 s when
+    connections time out, and about 15 min when no data arrives (curl ends an attempt after 300 s
+    below 1 byte/s). While it is the primary location (the default), every read goes there. A
+    pre-merge L0_MergeRequest run calls this command with `--resolve-pin` in its Setup Environment
+    stage, before it starts any build. `resolve_pin` reads the pin first, so the run waits for
+    that one read, and the coverage tier declines without probing a build. The probe pays for a
+    failed read once for each of the last `_MAX_PROBE` builds, whose first coverage archive
+    cannot be read, only when no pin's read comes before it or the outage starts after that read.
+    After a rollback to urm, only files that urm does not hold are read there, and the probe
+    stops at the newest complete build that urm holds.
 
     Raises:
         ArtifactError: As `_fetch_build_artifact` raises it, except `ArtifactTransferError`;
@@ -351,12 +351,26 @@ def resolve_pin(
     pr_head: str,
     pr_base_commit: str,
 ) -> dict:
-    """Reuse a PR-head coverage pin or create the local file Jenkins must upload."""
+    """Reuse a PR-head coverage pin or create the local file Jenkins must upload.
+
+    The pin is read with the read helper, and one is created only when neither location has it.
+    A read that fails in transfer leaves that unknown and declines; so does a pin that does not
+    match this PR head or the schema.
+
+    Raises:
+        ArtifactError: As `_fetch_build_artifact` or `select_tarball` raises it, except
+            `ArtifactTransferError`; `main` reports it and exits 1.
+    """
     if _PR_NUMBER_RE.fullmatch(pr_number) is None or _COMMIT_RE.fullmatch(pr_head) is None:
         return _pin_decline("invalid PR identity for coverage DB pin")
     target = f"{PIN_BASE}/{pr_number}/{pr_head}/"
-    status, data = _get(f"{_URM}/{target}{PIN_NAME}")
-    if status == 200:
+    try:
+        data = _fetch_build_artifact(f"{target}{PIN_NAME}")
+    except ArtifactTransferError as e:
+        # The helper's message above says why.
+        print(f"[artifact] {e}", file=sys.stderr)
+        return _pin_decline("coverage DB pin query failed")
+    if data is not None:
         try:
             pin = json.loads(data) if data else None
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -370,8 +384,6 @@ def resolve_pin(
             "commit": pin["coverage_db_commit"],
             "pin_upload_required": False,
         }
-    if status != 404:
-        return _pin_decline("coverage DB pin query failed")
 
     selected = select_tarball(pr_base_commit)
     if selected is None:

@@ -95,7 +95,9 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch, bolt_profile_ref=None):
                 str(wheel),
                 str(bolted)
             ]
-            # 3 = that branch has nothing promoted; anything else is decisive.
+            # 3 = that branch has nothing promoted, so the next one is tried.
+            # 4 = the profile store could not be read, which no other branch
+            # would change: it raises below, as any other status does.
             rc = subprocess.run(cmd, env=env).returncode
             if rc == 0:
                 os.replace(bolted, wheel)

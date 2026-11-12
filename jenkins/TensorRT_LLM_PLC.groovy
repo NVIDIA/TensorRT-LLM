@@ -197,6 +197,8 @@ def savePipelineScripts() {
     sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
     sh "cp scripts/generate_lock_file.py /tmp/generate_lock_file.py"
     sh "cp jenkins/scripts/get_image_key_to_tag.py /tmp/get_image_key_to_tag.py"
+    // get_image_key_to_tag.py reads through the fetch_build_artifact.sh beside it.
+    sh "cp jenkins/scripts/fetch_build_artifact.sh /tmp/fetch_build_artifact.sh"
 }
 
 def checkoutSource ()
@@ -436,16 +438,86 @@ def getImageScriptArgs() {
     return "'${branch}'"
 }
 
+// Credential with which jenkins/scripts/fetch_build_artifact.sh reads from artifactory.nvidia.com.
+LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
+
+// Writes a netrc for artifactory.nvidia.com with LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its
+// owner. The shell's printf builtin moves the secret from the bound variables into the file, so it
+// never appears on a command line or in the trace. Callers remove the file in a finally block.
+def writeArtifactoryNetrc(String netrcPath) {
+    withCredentials([usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
+            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+        withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
+            sh(label: "Write Artifactory netrc", script: '''
+                set +x
+                umask 077
+                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+            ''')
+        }
+    }
+}
+
+// Returns the image-tag map that /tmp/get_image_key_to_tag.py prints for imageScriptArgs. The
+// script reads the map with /tmp/fetch_build_artifact.sh, which looks in the primary artifact
+// location first, by default artifactory.nvidia.com, and authenticates there with a netrc. The
+// netrc is removed when the lookup ends. It is in the cpu container's /tmp, which the pod's other
+// containers do not mount, so call this inside container("cpu"), and only while nothing from
+// params.ref runs in that container: see lookUpImageKeyToTag.
+def readImageKeyToTag(String imageScriptArgs) {
+    def netrcPath = "/tmp/artifactory-netrc-${UUID.randomUUID().toString()}"
+    try {
+        writeArtifactoryNetrc(netrcPath)
+        def output = withEnv([
+            "ARTIFACTORY_NETRC=${netrcPath}",
+            "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+        ]) {
+            sh(
+                script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
+                returnStdout: true
+            ).trim()
+        }
+        return output
+    } finally {
+        sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
+    }
+}
+
+// The outcome of the image-tag lookup that "Prepare Environment" makes for the container scanning
+// stages: [output: the map as JSON text], or [failure: why it could not be read].
+imageKeyToTagLookup = null
+
+// Reads the image-tag map when a container scanning stage will need it. It runs before the
+// parallel stages start, because one of them runs code from params.ref in the cpu container,
+// where the lookup's netrc would be readable. A failed lookup is kept for the container scanning
+// stages to report, so that the other stages still run. Call this inside container("cpu").
+def lookUpImageKeyToTag() {
+    if (!params.runContainerOssScanning && !params.runContainerMalwareScanning) {
+        return
+    }
+    try {
+        imageKeyToTagLookup = [output: readImageKeyToTag(getImageScriptArgs())]
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        imageKeyToTagLookup = [failure: e.toString()]
+        echo "The image-tag lookup failed, and the container scanning stages will report it: ${e}"
+    }
+}
+
+// Returns the image-tag map that lookUpImageKeyToTag read, or fails with that lookup's failure.
+def imageKeyToTagOutput() {
+    if (imageKeyToTagLookup?.output == null) {
+        error("The image-tag map could not be read in Prepare Environment: ${imageKeyToTagLookup?.failure}")
+    }
+    return imageKeyToTagLookup.output
+}
+
 def pulseLicenseScanContainer(llmRepo, ref) {
     // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
     def imageTags = [:]
     def token
     container("cpu") {
-        def imageScriptArgs = getImageScriptArgs()
-        def output = sh(
-            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
-            returnStdout: true
-        ).trim()
+        def output = imageKeyToTagOutput()
         println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
         def containerTagMap = new JsonSlurper().parseText(output)
         imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
@@ -514,11 +586,7 @@ def pulseMalwareScanContainer(llmRepo, ref) {
     def imageTags = [:]
     def token
     container("cpu") {
-        def imageScriptArgs = getImageScriptArgs()
-        def output = sh(
-            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
-            returnStdout: true
-        ).trim()
+        def output = imageKeyToTagOutput()
         println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
         def containerTagMap = new JsonSlurper().parseText(output)
         imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
@@ -782,6 +850,7 @@ pipeline {
                         savePipelineScripts()
                         checkoutSource()
                         validateRef()
+                        lookUpImageKeyToTag()
                     }
                 }
             }

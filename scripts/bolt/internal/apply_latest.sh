@@ -29,19 +29,32 @@
 # proceeding un-BOLTed would let premerge "pass" while actually testing the wrong
 # binary, so every failure here is fatal (distinct non-zero codes for triage):
 #   1  usage / input artifact missing
-#   2  apply_bolt failed (bundle present but did not apply cleanly)
+#   2  llvm-bolt could not be staged, or apply_bolt failed (bundle present but
+#      did not apply cleanly)
 #   3  no bundle promoted for the branch (cold start / new branch): nothing to
 #      consume -- await/trigger a postmerge BoltProfileGen (PROMOTE=true), or turn
 #      BOLT_CONSUME off for this build.
+#   4  the profile store could not be read: a location refused the request or the
+#      read failed, so whether a bundle is promoted is unknown. Trying another
+#      branch would fail the same way.
 #
 # Usage: apply_latest.sh <branch> <triple> <in_artifact> <out_bolted_artifact>
 #        <in_artifact> is a release tarball or a .whl.
-# Requires: llvm-bolt on PATH; urm-artifactory-creds for artifactory.sh pull-latest.
+# Requires: llvm-bolt on PATH (staged here when it is missing); and, for
+#           artifactory.sh pull-latest, the environment that
+#           jenkins/scripts/fetch_build_artifact.sh reads: LLM_ARTIFACTS_PRIMARY,
+#           ARTIFACTORY_NETRC (a netrc file with the credential for the aws
+#           location), and ARTIFACTORY_CREDENTIAL_ID.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../scripts/bolt/internal
 TOOLKIT="$(dirname "$HERE")"                            # .../scripts/bolt
+
+# Exit statuses that this script shares with artifactory.sh pull-latest: no
+# bundle is promoted, and the profile store could not be read.
+BOLT_NO_BUNDLE=3
+BOLT_STORE_UNREADABLE=4
 
 BRANCH="${1:?apply_latest: <branch> <triple> <in_artifact> <out_bolted_artifact>}"
 TRIPLE="${2:?triple required}"
@@ -65,12 +78,21 @@ if ! . "$HERE/stage_llvm_bolt.sh"; then
     exit 2
 fi
 
-# 1) Pull the branch `latest` bundle. A missing bundle is fatal here (see header):
-#    consumption was requested but there is nothing promoted to consume.
-if ! bash "$HERE/artifactory.sh" pull-latest "$BRANCH" "$TRIPLE" "$DEST"; then
+# 1) Pull the branch `latest` bundle, or the one BOLT_PROFILE_REF pins. A missing
+#    bundle is fatal here (see header): consumption was requested but there is
+#    nothing promoted to consume. A store that could not be read keeps its own
+#    status, so that a caller can tell it from a branch without a bundle; any
+#    other failure of the pull counts as no bundle.
+PULL_STATUS=0
+bash "$HERE/artifactory.sh" pull-latest "$BRANCH" "$TRIPLE" "$DEST" || PULL_STATUS=$?
+if [ "$PULL_STATUS" -eq "$BOLT_STORE_UNREADABLE" ]; then
+    echo "[apply_latest] FATAL: the BOLT profile store could not be read for ${BRANCH}/${TRIPLE}." >&2
+    echo "[apply_latest]   a location refused the request or the read failed; the messages above say why." >&2
+    exit "$BOLT_STORE_UNREADABLE"
+elif [ "$PULL_STATUS" -ne 0 ]; then
     echo "[apply_latest] FATAL: no promoted bundle for ${BRANCH}/${TRIPLE}." >&2
     echo "[apply_latest]   run/await a postmerge BoltProfileGen (PROMOTE=true) or unset BOLT_CONSUME." >&2
-    exit 3
+    exit "$BOLT_NO_BUNDLE"
 fi
 
 # 2) Apply the pulled profiles. Fatal on failure -- do NOT fall back to the
