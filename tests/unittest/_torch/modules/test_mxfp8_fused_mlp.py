@@ -165,9 +165,9 @@ def test_mxfp8_shared_expert_matches_bf16(beta: float, linear_beta: float) -> No
     assert empty.shape == (0, hidden_size)
 
     weights = (expert.fc1_weight, expert.fc1_scale, expert.fc2_weight, expert.fc2_scale)
-    # 32 and 1024 run the two-GEMM path; 2048 and 2100 (padded to 2176 rows)
-    # run the fused FC12 kernel in eager mode.
-    for num_tokens in (32, 1024, 2048, 2100):
+    # 32 and 1024 run the two-GEMM path; 2048 and up run the fused FC12 kernel in
+    # eager mode, and 2100, 2248 and 2498 leave the last 128-row band partly filled.
+    for num_tokens in (32, 1024, 2048, 2100, 2248, 2498):
         x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
         reference = _reference(x, reference_gate_up, reference_down, beta, linear_beta)
         output = expert(x)
@@ -187,7 +187,9 @@ def test_mxfp8_shared_expert_matches_bf16(beta: float, linear_beta: float) -> No
         if not use_fused_fc12(num_tokens, intermediate_size):
             torch.testing.assert_close(output, unfused, rtol=0, atol=0)
         else:
-            # Fused (1x32 activation scales) and two-GEMM (1x128) differ only by quantization.
+            # Fused (1x32 activation scales) and two-GEMM (1x128) differ only by
+            # quantization, so an identical output means fused never ran.
+            assert not torch.equal(output, unfused), num_tokens
             assert _max_tile_relative_l2(output, unfused) < 0.1, num_tokens
 
 
@@ -227,12 +229,18 @@ def test_ops_reject_unsafe_calls() -> None:
     weights = (expert.fc1_weight, expert.fc1_scale, expert.fc2_weight, expert.fc2_scale)
     x = torch.randn((2048, 2048), dtype=torch.bfloat16, device="cuda")
     # A negative beta would silently cap SiTU, since beta * tanh(x / beta) is even in beta.
-    with pytest.raises(ValueError, match="positive"):
-        op.cute_dsl_mxfp8_gated_mlp_rubin(x, *weights, -1.0, _LINEAR_BETA)
-    # Called directly, the fused op refuses where its CTAs may not all be resident.
-    with with_multi_stream(True), pytest.raises(RuntimeError, match="resident"):
-        op.cute_dsl_mxfp8_shared_expert_rubin(x, *weights, _BETA, _LINEAR_BETA)
-    with enable_breakable_cuda_graph(), pytest.raises(RuntimeError, match="resident"):
+    for beta in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            op.cute_dsl_mxfp8_gated_mlp_rubin(x, *weights, beta, _LINEAR_BETA)
+    # Called directly, the fused op names the condition it cannot run under.
+    with with_multi_stream(True):
+        with pytest.raises(RuntimeError, match="multi-stream"):
+            op.cute_dsl_mxfp8_shared_expert_rubin(x, *weights, _BETA, _LINEAR_BETA)
+        # An empty input returns before that check.
+        assert op.cute_dsl_mxfp8_shared_expert_rubin(
+            x[:0], *weights, _BETA, _LINEAR_BETA
+        ).shape == (0, 2048)
+    with enable_breakable_cuda_graph(), pytest.raises(RuntimeError, match="breakable"):
         op.cute_dsl_mxfp8_shared_expert_rubin(x, *weights, _BETA, _LINEAR_BETA)
 
 

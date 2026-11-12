@@ -3,6 +3,7 @@
 
 """SM107 MXFP8 replacement for a loaded SiTU GatedMLP."""
 
+import math
 from typing import Optional
 
 import torch
@@ -15,7 +16,8 @@ from ..distributed import AllReduceParams
 from .gated_mlp import GatedMLP
 from .situ import SituAndMul
 
-# Fused FC12 only pays off from this local intermediate size up.
+# Smallest local intermediate size that converts to MXFP8 at all (both the fused
+# and the two-GEMM paths); smaller MLPs keep their BF16 GatedMLP.
 _MIN_INTERMEDIATE_SIZE = 3072
 
 
@@ -37,20 +39,20 @@ class Mxfp8SharedExpertMLP(nn.Module):
             return "gate and up are separate projections"
         gate_up, down, activation = mlp.gate_up_proj, mlp.down_proj, mlp.activation
         if down.tp_size > 1:
-            # Kimi K3 shards its shared expert only without attention DP: TEP8 and
-            # TEP16 leave a local intermediate size of 768 and 384, where SM107
-            # MXFP8 measured up to ~34% slower than BF16 in decode and no faster
-            # in prefill. Other TP widths are not Kimi K3 deployments.
+            # forward() ignores final_all_reduce_params, so a TP shard would return
+            # its unreduced partial sum. Only replicated MLPs can convert.
             return "tensor-parallel MLP"
         if not (IS_CUTLASS_DSL_RUBIN_AVAILABLE and get_sm_version() == 107):
             return "needs SM107 with the CuTe DSL Rubin package"
         if not (
             isinstance(activation, SituAndMul)
-            and activation.beta > 0
             and activation.linear_beta is not None
-            and activation.linear_beta > 0
+            and all(
+                math.isfinite(beta) and beta > 0
+                for beta in (activation.beta, activation.linear_beta)
+            )
         ):
-            return "needs SiTU with positive beta and linear_beta"
+            return "needs SiTU with finite, positive beta and linear_beta"
         if gate_up.bias is not None or down.bias is not None:
             return "projections have a bias"
         weights = (gate_up.weight, down.weight)
