@@ -278,6 +278,22 @@ def test_refused_load_leaves_the_weights_unchanged(
     _assert_nothing_written(method, module)
 
 
+def test_shared_expert_with_narrow_block_scale_is_refused_before_any_write() -> None:
+    # With online EPLB the rank also loads the load balancer's shared copies, of
+    # experts it does not hold locally; those are checked with the local ones.
+    method = _RecordingMethod()
+    module = _module()
+    module.num_experts = 2
+    module.layer_load_balancer = SimpleNamespace(
+        need_load_shared_weights=lambda: True, get_load_expert_ids=lambda: [1]
+    )
+    with pytest.raises(ValueError, match=r"1\.w1\.weight_scale has shape \(32, 2\)"):
+        _load(method, module, _two_experts_the_second_narrow())
+    _assert_nothing_written(method, module)
+    assert not hasattr(module, "local_shared_w3_w1_tensors")
+    assert not hasattr(module, "local_shared_w3_w1_scale_tensors")
+
+
 def test_partial_reload_bucket_without_weights_loads_its_scales() -> None:
     method = _RecordingMethod()
     weights = {k: v for k, v in _expert().items() if not k.endswith(".weight")}
