@@ -12,14 +12,14 @@ lazy until the rebalance path is enabled.
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["SharedSlotArenaProvider", "allocate_rebalance_arena"]
+__all__ = ["SharedSlotArenaProvider", "allocate_rebalance_arena", "run_collective_phase"]
 
 BUFFER_ALIGNMENT = 2 * 1024 * 1024
 
@@ -184,6 +184,34 @@ class _EpComm:
         with _disable_current_modes():
             torch.distributed.all_gather_object(values, value, group=self.process_group)
         return values
+
+
+def run_collective_phase(
+    comm: _EpComm, world: int, label: str, operation: Callable[[], object]
+) -> None:
+    """Run ``operation`` on this rank, then raise on every EP rank if it failed on any.
+
+    An EP collective: every rank of ``comm`` must call it with the same
+    ``label`` at the same point. The ranks exchange their outcomes, so that a
+    failure on one rank (VMM resources, for example) raises the root cause on
+    every rank instead of leaving the others waiting at their next collective.
+    The error names each failed rank and chains this rank's own exception.
+    """
+    error: Exception | None = None
+    try:
+        operation()
+    except Exception as exc:  # noqa: BLE001 - shared with the peers, then raised
+        error = exc
+    outcomes = list(comm.allgather(None if error is None else f"{type(error).__name__}: {error}"))
+    if len(outcomes) != world:
+        raise RuntimeError(
+            f"{label}: the outcome exchange returned {len(outcomes)} EP ranks; expected {world}"
+        ) from error
+    failures = [f"rank {rank}: {outcome}" for rank, outcome in enumerate(outcomes) if outcome]
+    if failures:
+        raise RuntimeError(
+            f"{label} failed on {len(failures)} of {world} EP ranks: " + "; ".join(failures)
+        ) from error
 
 
 class _RawPointer:
@@ -651,20 +679,8 @@ class _SharedSlotPool:
             ),
         )
 
-    def _collective_phase(self, label: str, operation: Any) -> None:
-        error = None
-        try:
-            operation()
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        errors = self.comm.allgather(error)
-        if len(errors) != self.world:
-            raise RuntimeError(
-                f"shared-slot cleanup {label} returned {len(errors)} ranks; expected {self.world}"
-            )
-        failures = [f"rank {rank}: {item}" for rank, item in enumerate(errors) if item]
-        if failures:
-            raise RuntimeError(f"shared-slot cleanup {label} failed: {'; '.join(failures)}")
+    def _collective_phase(self, label: str, operation: Callable[[], object]) -> None:
+        run_collective_phase(self.comm, self.world, f"shared-slot cleanup {label}", operation)
 
     def _close_producers(self) -> None:
         for producer in self._producers.values():
@@ -693,8 +709,8 @@ class _SharedSlotPool:
         )
         if len(preflight) != self.world:
             raise RuntimeError(
-                f"shared-slot cleanup preflight returned {len(preflight)} ranks; "
-                f"expected {self.world}"
+                f"shared-slot cleanup preflight: the outcome exchange returned "
+                f"{len(preflight)} EP ranks; expected {self.world}"
             )
         if not all(item["local_safe"] for item in preflight):
             return False

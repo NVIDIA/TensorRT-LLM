@@ -400,3 +400,24 @@ def test_config_limits_match_the_planner_module() -> None:
     from tensorrt_llm.llmapi import llm_args
 
     assert llm_args._HALO_R_MIN_AUXILIARY_SMS == halo_r_planner.HALO_R_MIN_AUXILIARY_SMS
+
+
+def test_a_collective_phase_words_every_failure_the_same_way() -> None:
+    """Shared-slot cleanup and HALO-R's producer setup report failed and missing ranks alike."""
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import run_collective_phase
+
+    def fail() -> None:
+        raise OSError("map")
+
+    peers = SimpleNamespace(allgather=lambda outcome: [None, outcome, "RuntimeError: unmap", None])
+    with pytest.raises(RuntimeError) as raised:
+        run_collective_phase(peers, 4, "setup", fail)
+    assert str(raised.value) == (
+        "setup failed on 2 of 4 EP ranks: rank 1: OSError: map; rank 2: RuntimeError: unmap"
+    )
+    assert isinstance(raised.value.__cause__, OSError)
+
+    short = SimpleNamespace(allgather=lambda outcome: [outcome] * 3)
+    with pytest.raises(RuntimeError, match=r"^setup: the outcome exchange returned 3 EP ranks; "):
+        run_collective_phase(short, 4, "setup", lambda: None)
+    run_collective_phase(SimpleNamespace(allgather=lambda outcome: [outcome] * 4), 4, "setup", list)

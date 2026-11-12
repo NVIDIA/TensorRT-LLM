@@ -48,6 +48,7 @@ import torch
 from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.lease import LiveBankLease
 from tensorrt_llm.logger import logger
 
+from .arena import run_collective_phase
 from .planner import (
     RebalanceSlotSchedulerGroup,
     SchedulerSpinBound,
@@ -563,8 +564,8 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         no meeting point, so every rank raises the root cause instead of
         waiting for a failed peer.
         """
-        error: Exception | None = None
-        try:
+
+        def bind() -> None:
             self.broadcaster = HaloRRelayEndpoint(
                 scheduler=self.scheduler,
                 route_counter=self._route_epoch,
@@ -583,17 +584,10 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             with torch.cuda.device(self.device):
                 arena.terminal_flags_tensor().view(torch.int64).fill_(_READY_GENERATION)
                 torch.cuda.synchronize(self.device)
-        except Exception as exc:  # noqa: BLE001 - shared with the peers, then raised
-            error = exc
-        outcomes = list(
-            self._ep_comm.allgather(None if error is None else f"{type(error).__name__}: {error}")
+
+        run_collective_phase(
+            self._ep_comm, self.ep_size, f"HALO-R producer setup of layer {self.layer_idx}", bind
         )
-        failures = [f"rank {rank}: {outcome}" for rank, outcome in enumerate(outcomes) if outcome]
-        if failures or len(outcomes) != self.ep_size:
-            raise RuntimeError(
-                f"HALO-R producer setup of layer {self.layer_idx} failed on {len(failures)} of "
-                f"{self.ep_size} EP ranks: " + "; ".join(failures)
-            ) from error
         logger.debug(
             "[MegaMoECuteDsl] layer=%s planner=halo_r endpoint bound: ep=%d helpers=%d ctas=%d",
             self.layer_idx,
