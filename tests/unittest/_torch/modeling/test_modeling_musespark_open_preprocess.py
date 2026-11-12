@@ -24,9 +24,10 @@ answer.
 
 `TestOracleExpansion` is the gate: it replays a captured reference prompt set
 and asserts the expanded prompt ids match token for token. That refset is a
-large out-of-tree artifact, so the class is skipped unless
-`MUSESPARK_OPEN_VISION_ORACLE` points at a directory holding
-`vision-manifest.json`, `media-manifest.json` and `media/`.
+large out-of-tree artifact, read from `Muse-Spark-Open-test-data/vision-oracle`
+under `LLM_MODELS_ROOT` (or the directory `MUSESPARK_OPEN_VISION_ORACLE` names):
+`vision-manifest.json`, `media-manifest.json` and `media/`. The class is
+skipped without it.
 """
 
 import json
@@ -38,6 +39,7 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.musespark_open_vision_processing import (
     VISION_TOKEN_IDS,
@@ -678,13 +680,22 @@ class TestExpandPromptPlaceholders:
 
 ORACLE_ENV = "MUSESPARK_OPEN_VISION_ORACLE"
 TOKENIZER_ENV = "MUSESPARK_OPEN_TOKENIZER"
+# Under LLM_MODELS_ROOT; the environment variables above override them.
+ORACLE_SUBDIR = os.path.join("Muse-Spark-Open-test-data", "vision-oracle")
+CHECKPOINT = "Muse-Spark-Open-816B-A42B-NVFP4"
+
+
+def _under_models_root(*parts):
+    root = llm_models_root()
+    return os.path.join(root, *parts) if root is not None else None
+
 
 _IMAGE_MARKER = (-1,)
 _VIDEO_MARKER = (-2,)
 
 
 def _oracle_dir():
-    root = os.environ.get(ORACLE_ENV)
+    root = os.environ.get(ORACLE_ENV) or _under_models_root(ORACLE_SUBDIR)
     if not root:
         return None
     path = Path(root)
@@ -778,7 +789,8 @@ def _mp4_video_track(path):
 
 
 @pytest.mark.skipif(
-    _oracle_dir() is None, reason=f"set {ORACLE_ENV} to the captured refset directory"
+    _oracle_dir() is None,
+    reason=f"no captured refset under LLM_MODELS_ROOT/{ORACLE_SUBDIR} (or {ORACLE_ENV})",
 )
 class TestOracleExpansion:
     """Replay the captured prompt set: expansion must match token for token."""
@@ -803,7 +815,7 @@ class TestOracleExpansion:
 
     @pytest.fixture(scope="class")
     def tokenizer(self, oracle):
-        path = os.environ.get(TOKENIZER_ENV) or oracle[1].get("checkpoint_dir")
+        path = os.environ.get(TOKENIZER_ENV) or _under_models_root(CHECKPOINT)
         if not path or not Path(path, "tokenizer.json").is_file():
             return None
         from transformers import AutoTokenizer
@@ -841,7 +853,7 @@ class TestOracleExpansion:
     def test_video_prompt_expansion(self, oracle, tokenizer):
         root, manifest = oracle
         if tokenizer is None:
-            pytest.skip(f"set {TOKENIZER_ENV} to the checkpoint tokenizer dir")
+            pytest.skip(f"{CHECKPOINT} is not under LLM_MODELS_ROOT (or set {TOKENIZER_ENV})")
         record = self._record(manifest, "vmme_short_1")
         expected = record["prompt_token_ids"]
         skeleton, segments = _split_expansions(expected)

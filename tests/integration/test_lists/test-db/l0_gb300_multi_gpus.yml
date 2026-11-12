@@ -93,6 +93,13 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling/test_musespark_open_finalize_allreduce.py
   - unittest/_torch/modeling/test_musespark_open_finalize_lifecycle.py
   - unittest/_torch/modeling/test_musespark_open_finalize_stress.py
+  # Muse Spark Open's MoE TP finalize under real NCCL. These two tests spawn their four ranks with
+  # MPIPoolExecutor; the file's single-process tests run in l0_b200.
+  - unittest/_torch/modeling/test_musespark_open_moe_tp.py -k "distributed or complete_experts"
+  # Muse Spark Open GSM8K on the documented serving recipe (TP4/EP4, FP8 KV cache), with and without SA
+  # speculative decoding. Measured about 5 minutes per case on 4x GB300, model load included.
+  - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus[cuda_graph] TIMEOUT (30)
+  - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus_sa_spec[sa2] TIMEOUT (30)
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py

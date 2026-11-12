@@ -4,21 +4,23 @@
 
 Covers the pieces that are checkable without a GPU or an engine: the token
 accounting formula, the placeholder expansion, the tower's shape/dtype
-contract, the checkpoint-name mirror, and -- when a checkpoint and golden
-files are provided via environment variables -- numeric parity of the tower
-against reference-produced embeddings.
+contract, the checkpoint-name mirror, and -- when the checkpoint and the
+golden files are available -- numeric parity of the tower against
+reference-produced embeddings.
 
 The module under test is loaded by file path so the tests run with any plain
 Python that has torch + numpy, without importing (or building) tensorrt_llm.
 
-Environment for the golden test:
-    MUSESPARK_CKPT_DIR      HF checkpoint dir (model.safetensors.index.json +
+Data for the golden test, under LLM_MODELS_ROOT (environment variables override):
+    Muse-Spark-Open-816B-A42B-NVFP4 (MUSESPARK_CKPT_DIR)
+                            HF checkpoint dir (model.safetensors.index.json +
                             shards) to pull the 72 audio tensors from.
-    MUSESPARK_AUDIO_GOLDENS Directory containing speech_<k>.pt golden files,
+    Muse-Spark-Open-test-data/audio-goldens (MUSESPARK_AUDIO_GOLDENS)
+                            Directory containing speech_<k>.pt golden files,
                             each a torch.save dict with keys `wav_24k`
                             (float32 [N]), `n_tokens` (int), `embeddings`
                             (bfloat16 [n_tokens, 8192]).
-Both unset -> the golden test skips cleanly.
+Either one absent -> the golden test skips.
 """
 
 import glob
@@ -31,6 +33,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
 
 pytestmark = pytest.mark.cpu_only
 
@@ -336,13 +339,23 @@ def test_tower_causality():
 GOLDEN_ATOL = 1e-2
 GOLDEN_RTOL = 1e-2
 
-_CKPT_DIR = os.environ.get("MUSESPARK_CKPT_DIR", "")
-_GOLDENS_DIR = os.environ.get("MUSESPARK_AUDIO_GOLDENS", "")
+
+def _under_models_root(*parts) -> str:
+    root = llm_models_root()
+    return os.path.join(root, *parts) if root is not None else ""
+
+
+_CKPT_DIR = os.environ.get("MUSESPARK_CKPT_DIR") or _under_models_root(
+    "Muse-Spark-Open-816B-A42B-NVFP4"
+)
+_GOLDENS_DIR = os.environ.get("MUSESPARK_AUDIO_GOLDENS") or _under_models_root(
+    "Muse-Spark-Open-test-data", "audio-goldens"
+)
 _AUDIO_CKPT_PREFIX = "modalities.soft_audio_perception.interaction_encoder."
 
 
 def _golden_files():
-    if not _GOLDENS_DIR:
+    if not os.path.isdir(_GOLDENS_DIR):
         return []
     return sorted(
         glob.glob(os.path.join(_GOLDENS_DIR, "speech_*.pt"))
@@ -406,9 +419,13 @@ def _load_real_tower():
 @pytest.mark.parametrize("golden_path", _golden_files() or [pytest.param(None, id="no-goldens")])
 def test_golden_embeddings_parity(golden_path):
     if golden_path is None:
-        pytest.skip("MUSESPARK_AUDIO_GOLDENS unset or empty: no golden files to compare")
-    if not _CKPT_DIR:
-        pytest.skip("MUSESPARK_CKPT_DIR unset: no real weights to load")
+        pytest.skip(
+            "no audio goldens under LLM_MODELS_ROOT/Muse-Spark-Open-test-data/audio-goldens"
+        )
+    if not os.path.isfile(os.path.join(_CKPT_DIR, "model.safetensors.index.json")):
+        pytest.skip(
+            "Muse-Spark-Open-816B-A42B-NVFP4 is not under LLM_MODELS_ROOT: no real weights to load"
+        )
 
     golden = torch.load(golden_path, map_location="cpu", weights_only=True)
     wav = golden["wav_24k"].to(torch.float32)

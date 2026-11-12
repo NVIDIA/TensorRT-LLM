@@ -379,6 +379,17 @@ moonshotai/Kimi-K3:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: NVFP4
     accuracy: 95.4
+# TestMuseSparkOpen on the documented serving recipe (TP4/EP4, TRTLLM attention, FP8 KV cache),
+# all 1,319 samples on 4x GB300: 94.84 in each of three runs.
+meta-models/Muse-Spark-Open-816B-A42B-NVFP4:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 94.84
+  # SA speculation reproduces the target model's tokens: 94.81 in each of two runs at draft length 2.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: SA
+    accuracy: 94.81
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8

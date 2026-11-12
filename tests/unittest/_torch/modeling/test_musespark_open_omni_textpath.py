@@ -875,13 +875,18 @@ def test_a_missing_tokenizer_is_built_from_the_checkpoint():
     that copy still tokenizes."""
     import os  # noqa: PLC0415
 
+    from utils.llm_data import llm_models_root  # noqa: PLC0415
+
     from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
         MuseSparkInputProcessor,
     )
 
-    checkpoint = os.environ.get("MUSESPARK_OPEN_TOKENIZER")
-    if not checkpoint:
-        pytest.skip("MUSESPARK_OPEN_TOKENIZER unset: no checkpoint to build a tokenizer from")
+    root = llm_models_root()
+    checkpoint = os.environ.get("MUSESPARK_OPEN_TOKENIZER") or (
+        os.path.join(root, "Muse-Spark-Open-816B-A42B-NVFP4") if root is not None else ""
+    )
+    if not os.path.isfile(os.path.join(checkpoint, "tokenizer.json")):
+        pytest.skip("Muse-Spark-Open-816B-A42B-NVFP4 is not under LLM_MODELS_ROOT")
 
     processor = MuseSparkInputProcessor(
         model_path=checkpoint, config=_tiny_vision_config(), tokenizer=None
