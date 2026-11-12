@@ -132,7 +132,17 @@ inline bool requiresPrefixCoverage(LifeCycle const& lc)
 
 inline bool allowsCheckpoint(LifeCycle const& lc)
 {
-    return reusePolicy(lc) == ReusePolicy::OPTIONAL;
+    return reusePolicy(lc) == ReusePolicy::OPTIONAL || reusePolicy(lc) == ReusePolicy::SINK_REQUIRED_ONLY;
+}
+
+//! Reuse policy that decides which pools a lifecycle shares. SINK_REQUIRED_ONLY shares the REQUIRED pools, so its
+//! pages can be reached through the block offsets of a REQUIRED layer of the same page shape. This is safe: evicting
+//! a page has the same effect on reuse whichever pool holds it. OPTIONAL keeps its own pools, so the extra slot per
+//! request that pool sizing gives it (ratioFromBatch) is not used up by other lifecycles.
+inline ReusePolicy effectivePoolReusePolicy(LifeCycle const& lc)
+{
+    auto const policy = reusePolicy(lc);
+    return policy == ReusePolicy::SINK_REQUIRED_ONLY ? ReusePolicy::REQUIRED : policy;
 }
 
 // Free function: compute stale range via std::visit.

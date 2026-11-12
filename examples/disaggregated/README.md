@@ -76,7 +76,7 @@ Set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` to select the NIXL LIBFABRIC backend
 - The source build requires the `pkg-config` command to discover hwloc. Ubuntu container base setup installs the `pkg-config` package; standalone builds must provide it as well.
 - NIXL's LIBFABRIC build requires development files for hwloc 2.3 or later.
 - NGC PyTorch 26.09 builds reuse HPC-X hwloc 2.7.1 under `/usr/local/mpi`, with `/usr/local/mpi/lib/pkgconfig` prepended to `PKG_CONFIG_PATH`. Non-NGC SBSA Ubuntu 24.04 builds reuse system hwloc 2.10.0. Neither configuration rebuilds hwloc when these development files are present.
-- If `pkg-config` cannot find a suitable version, the installer builds and retains hwloc 2.12.2 under `/usr/local`. This applies to Rocky 8's older hwloc 2.2.0. The system RPM and files remain installed, but the loader cache prefers the new library; this also affects other hwloc consumers, including Open MPI.
+- If `pkg-config` cannot find a suitable version, the installer builds and retains hwloc 2.12.2 under `/opt/nvidia/nixl-deps/hwloc`, exposing it to the NIXL build through `PKG_CONFIG_PATH`. This applies to Rocky 8's older hwloc 2.2.0. The fallback does not change the system hwloc installation or global runtime library search configuration. Running the NIXL LIBFABRIC backend requires a compatible hwloc runtime supplied separately.
 - Custom installations must provide compatible development and runtime libraries and expose `hwloc.pc` through `PKG_CONFIG_PATH`.
 
 **GDRCopy (for the source-build installer)**
@@ -598,10 +598,29 @@ trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
 
 The metadata_config file looks like
 ```yaml
+server_type: etcd
 hostname: "localhost"
 port: 2379
 health_check_timeout: 5.0
-refersh_interval: 10.0
+refresh_interval: 10.0
+```
+
+To use an ETCD server with TLS, add ```ca_cert``` (with optional ```cert_key``` and ```cert_cert``` for client certificates) to the metadata_config file. To use ETCD authentication, add ```user``` and ```password``` together with ```ca_cert```: the etcd client sends its authentication token only over a TLS connection, and the config is rejected if ```user``` and ```password``` are set without ```ca_cert```. The ETCD user needs read and write permission on the ```trtllm/``` key prefix only. The etcd client logs in once, when the server starts, and does not renew its token: after ETCD stops accepting the token, for example following an ETCD restart, restart the context, generation and disaggregated servers so that they log in again. Set ```record_auth_key``` to the same non-empty secret in the metadata_config file of every context, generation and disaggregated server: servers then sign the records they register, and the disaggregated server ignores records without a valid signature.
+
+Without these fields the connection to the ETCD server is anonymous and unencrypted, and the disaggregated server uses every ```trtllm/*``` record found in the store. When the ETCD server is reachable from hosts other than the context, generation and disaggregated servers, enable ETCD authentication with TLS together with ```record_auth_key```. The signature is checked only by readers, so access control of the store itself still comes from the ETCD server. A metadata_config file with all optional fields looks like
+
+```yaml
+server_type: etcd
+hostname: "etcd.internal"
+port: 2379
+health_check_timeout: 5.0
+refresh_interval: 10.0
+user: "trtllm"
+password: "<etcd user credential>"
+ca_cert: "/etc/trtllm/etcd-ca.pem"
+cert_key: "/etc/trtllm/etcd-client-key.pem"
+cert_cert: "/etc/trtllm/etcd-client.pem"
+record_auth_key: "<shared secret, identical on every server>"
 ```
 
 The ```hostname``` and ```port``` must match those used when starting the ETCD server. The ```health_check_timeout``` parameter specifies how long a server will be considered dead if no healthy response is received. By default, trtllm will perform two checks before marking a server as dead. The ```refresh_interval``` parameter determines how often the latest server list is fetched from the ETCD server.

@@ -175,22 +175,22 @@ class KimiK3ServingExtension(ServingExtension):
         """Message-level (dynamic) tools are a Kimi API extension."""
         return dynamic_tool_dicts(messages)
 
-    def prompt_tokens_excluded_from_usage(self, request: ChatCompletionRequest) -> int:
+    def prompt_tokens_excluded_from_usage(
+        self,
+        *,
+        add_generation_prompt: bool,
+        pre_tokenized: bool,
+        request_chat_template: Optional[str],
+    ) -> int:
         """Exclude the generation channel opener from prompt usage.
 
         Kimi's prompt-token accounting excludes the trailing generation channel
-        opener; the model still sees the full rendered prompt. Pre-tokenized
-        requests (``prompt_token_ids`` or its base64 relay) render nothing here,
-        so there is no opener to exclude. An explicit request-level template
-        may end differently, so report unadjusted usage for it. The caller also
-        skips the adjustment when the server was started with ``--chat_template``.
+        opener; the model still sees the full rendered prompt. A pre-tokenized
+        prompt is not rendered here, so there is no opener to exclude. A
+        request-level template may end differently, so report unadjusted usage
+        for it.
         """
-        if (
-            request.add_generation_prompt
-            and request.prompt_token_ids is None
-            and request.prompt_token_ids_b64 is None
-            and request.chat_template is None
-        ):
+        if add_generation_prompt and not pre_tokenized and request_chat_template is None:
             return self._GENERATION_CHANNEL_OPENER_TOKENS
         return 0
 

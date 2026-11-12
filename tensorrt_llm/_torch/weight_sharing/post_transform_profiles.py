@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
 
+from tensorrt_llm.logger import logger
+
 if TYPE_CHECKING:
     from torch import nn
 
@@ -48,6 +50,21 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for the Qwen3 dense layout above when `lm_head.weight` is an
+# alias of `model.embed_tokens.weight`. The shared table is one transferred
+# tensor, named `model.embed_tokens.weight`; no `lm_head.weight` tensor is
+# transferred, and the receiver's constructor rebuilds the alias.
+QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-tied-target-layout-v1"
+# Stable contract for Qwen3 dense rows with FP8 block-scale (128x128) weights:
+# every Linear the realized quant config quantizes holds E4M3 weights [N, K],
+# FP32 [ceil(N/128), ceil(K/128)] block scales, and 0-dim FP32 `input_scale`
+# and `inv_input_scale` as loaded (1.0 unless a non-fused projection's
+# checkpoint stores an input scale). All other tensors, the Q/K norm state, and
+# the target-only receiver finalization follow the Qwen3 dense contract, and no
+# one-shot transform changes them.
+QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-qwen3-dense-fp8-block128-fp32scale-target-layout-v1"
+)
 # Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
 # tensors plus target-only receiver finalization. Mistral shares the dense
 # decoder base class with Llama but is a distinct root with its own contract.
@@ -63,6 +80,13 @@ PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
 # Q/K norm state, fused gate-up MLP tensors, and complete-model receiver
 # finalization.
 QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complete-layout-v1"
+# Stable contract for unquantized Qwen3 MoE fused-QKV tensors, Q/K norm state,
+# the replicated router weight, CUTLASS routed-expert tensors (`w3_w1_weight`
+# with the up projection before the gate projection, and `w2_weight`)
+# partitioned by MoE TP or EP, and target-only receiver finalization. Routed
+# expert layouts differ per MoE implementation, so another implementation
+# needs its own ID.
+QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-target-layout-v1"
 _MISSING = object()
 
 
@@ -125,11 +149,101 @@ def _realized_sliding_window(model: nn.Module) -> str | None:
     return "uniform" if len(realized_values) == 1 else "mixed"
 
 
+def _same_weight_memory(first: object, second: object) -> bool | None:
+    """Whether two weights are one tensor or identical views of the same memory.
+
+    Meta tensors have no memory to compare, so distinct meta tensors count as
+    unshared. Returns `None` when either weight is not a tensor.
+    """
+    if first is second:
+        return True
+    try:
+        if first.is_meta or second.is_meta:
+            return False
+        first_view = (
+            first.device,
+            first.dtype,
+            first.data_ptr(),
+            tuple(first.shape),
+            first.stride(),
+        )
+        second_view = (
+            second.device,
+            second.dtype,
+            second.data_ptr(),
+            tuple(second.shape),
+            second.stride(),
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    # Distinct empty tensors can both report a null data pointer.
+    return first_view == second_view and first_view[2] != 0
+
+
+def _realized_tied_word_embeddings(model: nn.Module) -> bool | None:
+    """Report whether a constructed model's LM head reads its token-embedding table.
+
+    The head is the one submodule named `lm_head` and the table is the one
+    submodule named `embed_tokens`, at any depth. The result is `True` when
+    their weights are the same tensor or identical views of the same memory,
+    and `False` when they are distinct tensors. It is `None` when the model
+    does not have exactly one of each, or when either has no tensor weight.
+
+    Matching by trailing name is deliberate: a root that holds a second head
+    or table, such as an in-tree MTP or draft model, always gets `None`, so no
+    profile that constrains the tie qualifies it. Such a root needs its own
+    rule for which head and table to compare before a profile can qualify it.
+    """
+    weights: dict[str, list[object]] = {"lm_head": [], "embed_tokens": []}
+    for name, module in model.named_modules():
+        module_weights = weights.get(name.rpartition(".")[2])
+        if module_weights is not None:
+            module_weights.append(getattr(module, "weight", None))
+    head_weights, table_weights = weights["lm_head"], weights["embed_tokens"]
+    if len(head_weights) != 1 or len(table_weights) != 1:
+        return None
+    if head_weights[0] is None or table_weights[0] is None:
+        return None
+    return _same_weight_memory(head_weights[0], table_weights[0])
+
+
+def _tie_mismatch_reason(declared: bool | None, realized: bool | None) -> str:
+    """Explain, for logs, how a declared embedding tie and the realized one disagree."""
+    if realized is None:
+        found = "the model has no single lm_head and embed_tokens weight pair to compare"
+    else:
+        sharing = "shared" if realized else "distinct"
+        found = f"the model's lm_head and embed_tokens weights are {sharing}"
+    if declared is None:
+        return f"the config declares no boolean tie_word_embeddings, and {found}"
+    return f"the config declares tie_word_embeddings={declared}, but {found}"
+
+
 def _canonical_optional_string(container: object, attribute: str) -> str | None:
     value = getattr(container, attribute, _MISSING)
     if value is _MISSING:
         return None
     return "none" if value is None else _canonical_string(value)
+
+
+def _declared_weight_block_size(pretrained_config: object) -> tuple[int, ...] | None:
+    """Return the weight block size a checkpoint's quantization config declares.
+
+    Hugging Face FP8 checkpoints declare `weight_block_size` in
+    `quantization_config`, either as a dict entry or as an attribute of a parsed
+    config. The result is `None` when no block size is declared or the value is
+    not a non-empty sequence of `int`, so a row that constrains
+    `weight_block_sizes` rejects it.
+    """
+    quantization_config = getattr(pretrained_config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        block_size = quantization_config.get("weight_block_size")
+    else:
+        block_size = getattr(quantization_config, "weight_block_size", None)
+    if not isinstance(block_size, (list, tuple)) or not block_size:
+        return None
+    canonical_block_size = tuple(_canonical_int(value) for value in block_size)
+    return None if None in canonical_block_size else canonical_block_size
 
 
 @dataclass(frozen=True)
@@ -175,22 +289,50 @@ class PostTransformRuntimeConfig:
     cp_size: int | None
     moe_tp_size: int | None
     moe_ep_size: int | None
+    # MoE cluster (smart-router) parallel size from the final mapping.
+    moe_cluster_size: int | None
     attention_tp_size: int | None
     attention_cp_size: int | None
     attention_dp: bool | None
     multi_node: bool | None
+    # The declared `tie_word_embeddings` flag, or `None` when a constructed
+    # model does not realize the declared value.
     tied_word_embeddings: bool | None
     rope_type: str | None
     rope_fusion: bool | None
     # Realized sliding-window attention: `none`, `uniform`, `mixed`, or `None`
     # when the constructed model does not determine it.
     sliding_window: str | None
+    # SM version (`major * 10 + minor`) of the GPU that runs the load, or `None`
+    # when the caller did not supply it. Quantized transforms can realize a
+    # different tensor layout per architecture. A row that constrains
+    # `sm_versions` rejects an unknown SM, so the default fails closed.
+    sm_version: int | None = None
+    # Weight block size declared by the checkpoint's Hugging Face quantization
+    # config, or `None` when it declares none. A row that constrains
+    # `weight_block_sizes` rejects an undeclared block size.
+    weight_block_size: tuple[int, ...] | None = None
 
     @classmethod
     def from_model_config(
-        cls, model_config: object, *, model: nn.Module | None = None
+        cls,
+        model_config: object,
+        *,
+        model: nn.Module | None = None,
+        sm_version: int | None = None,
     ) -> "PostTransformRuntimeConfig":
-        """Capture the support-matrix dimensions from a final model config."""
+        """Capture the support-matrix dimensions from a final model config.
+
+        Args:
+            model_config: Final model config of the concrete load.
+            model: Constructed root model, used for dimensions that only the
+                built modules realize.
+            sm_version: SM version of the device that runs the load. The caller
+                supplies it so this module does not depend on CUDA.
+
+        Returns:
+            The canonical runtime dimensions of the load.
+        """
 
         pretrained_config = getattr(model_config, "pretrained_config", None)
         quant_config = getattr(model_config, "quant_config", None)
@@ -219,6 +361,21 @@ class PostTransformRuntimeConfig:
 
         rope_fusion = _realized_rope_fusion(model) if model is not None else None
         sliding_window = _realized_sliding_window(model) if model is not None else None
+        # A constructed model must realize the declared tie, so the config flag
+        # can neither claim nor hide an `lm_head`/`embed_tokens` alias.
+        tied_word_embeddings = _canonical_bool(
+            getattr(pretrained_config, "tie_word_embeddings", None)
+        )
+        if model is not None:
+            realized_tie = _realized_tied_word_embeddings(model)
+            if realized_tie != tied_word_embeddings:
+                # Qualification reports only the dimension; log the cause at
+                # debug level, since loads that never use MX also get here.
+                logger.debug(
+                    "Post-transform qualification treats tied_word_embeddings as unknown: "
+                    + _tie_mismatch_reason(tied_word_embeddings, realized_tie)
+                )
+                tied_word_embeddings = None
 
         return cls(
             dtype=_canonical_string(getattr(model_config, "torch_dtype", None)),
@@ -241,16 +398,17 @@ class PostTransformRuntimeConfig:
             cp_size=_canonical_int(getattr(mapping, "cp_size", None)),
             moe_tp_size=_canonical_int(getattr(mapping, "moe_tp_size", None)),
             moe_ep_size=_canonical_int(getattr(mapping, "moe_ep_size", None)),
+            moe_cluster_size=_canonical_int(getattr(mapping, "moe_cluster_size", None)),
             attention_tp_size=_canonical_int(getattr(mapping, "attn_tp_size", None)),
             attention_cp_size=_canonical_int(getattr(mapping, "attn_cp_size", None)),
             attention_dp=_canonical_bool(getattr(mapping, "enable_attention_dp", None)),
             multi_node=multi_node,
-            tied_word_embeddings=_canonical_bool(
-                getattr(pretrained_config, "tie_word_embeddings", None)
-            ),
+            tied_word_embeddings=tied_word_embeddings,
             rope_type=rope_type,
             rope_fusion=rope_fusion,
             sliding_window=sliding_window,
+            sm_version=_canonical_int(sm_version),
+            weight_block_size=_declared_weight_block_size(pretrained_config),
         )
 
 
@@ -273,6 +431,7 @@ class PostTransformRuntimeConstraints:
         ("cp_sizes", "cp_size"),
         ("moe_tp_sizes", "moe_tp_size"),
         ("moe_ep_sizes", "moe_ep_size"),
+        ("moe_cluster_sizes", "moe_cluster_size"),
         ("attention_tp_sizes", "attention_tp_size"),
         ("attention_cp_sizes", "attention_cp_size"),
         ("attention_dp", "attention_dp"),
@@ -281,6 +440,8 @@ class PostTransformRuntimeConstraints:
         ("rope_types", "rope_type"),
         ("rope_fusion", "rope_fusion"),
         ("sliding_windows", "sliding_window"),
+        ("sm_versions", "sm_version"),
+        ("weight_block_sizes", "weight_block_size"),
     )
 
     dtypes: frozenset[str | None] | None = None
@@ -297,6 +458,7 @@ class PostTransformRuntimeConstraints:
     cp_sizes: frozenset[int | None] | None = None
     moe_tp_sizes: frozenset[int | None] | None = None
     moe_ep_sizes: frozenset[int | None] | None = None
+    moe_cluster_sizes: frozenset[int | None] | None = None
     attention_tp_sizes: frozenset[int | None] | None = None
     attention_cp_sizes: frozenset[int | None] | None = None
     attention_dp: frozenset[bool | None] | None = None
@@ -305,6 +467,8 @@ class PostTransformRuntimeConstraints:
     rope_types: frozenset[str | None] | None = None
     rope_fusion: frozenset[bool | None] | None = None
     sliding_windows: frozenset[str | None] | None = None
+    sm_versions: frozenset[int | None] | None = None
+    weight_block_sizes: frozenset[tuple[int, ...] | None] | None = None
 
     def __post_init__(self) -> None:
         for constraint_name, _runtime_name in self._DIMENSIONS:
@@ -372,6 +536,12 @@ class PostTransformFeature(str, Enum):
 
     SEPARATE_DRAFT_MODEL = "separate_draft_model"
     LOCALITY_DOMAIN_LOCALIZED_WEIGHTS = "localized_weights"
+    # A realized MoE expert-parallel load balancer (EPLB) places experts in
+    # slots that can differ per rank and migrate at runtime.
+    MOE_LOAD_BALANCER = "moe_load_balancer"
+    # DWDP installs its own expert storage range on every MoE layer while the
+    # mapping reports MoE TP and EP sizes of 1.
+    DWDP = "dwdp"
 
 
 class PostTransformQualificationReason(str, Enum):
@@ -539,6 +709,24 @@ class PostTransformQualificationDecision:
         return (
             self.profile.transform_abi_id if self.qualified and self.profile is not None else None
         )
+
+    def describe(self) -> str:
+        """Render the reason and the details this decision reports, for logs and errors.
+
+        For example `reason=feature_not_supported; unsupported_features=dwdp`.
+        Empty details are omitted: `qualify()` stops at a runtime mismatch
+        before it checks features, so an empty feature set there does not mean
+        that no unsupported feature is active.
+        """
+
+        parts = [f"reason={self.reason.value}"]
+        if self.unsupported_runtime_dimensions:
+            dimensions = ",".join(sorted(self.unsupported_runtime_dimensions))
+            parts.append(f"unsupported_runtime_dimensions={dimensions}")
+        if self.unsupported_features:
+            features = ",".join(sorted(feature.value for feature in self.unsupported_features))
+            parts.append(f"unsupported_features={features}")
+        return "; ".join(parts)
 
 
 @dataclass(frozen=True)

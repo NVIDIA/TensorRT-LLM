@@ -336,6 +336,10 @@ class TestSplitGpuBudgetForDraft:
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
         # one-engine arm; this test's config is a drafter outside the engine.
         mode.use_one_engine.return_value = False
+        # A truthy DFlash or DSpark check would route costing through the shared
+        # target and drafter cache path.
+        mode.is_dflash.return_value = False
+        mode.is_dspark.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
         class RecordingKVCacheManager(KVCacheManagerV2):
@@ -654,7 +658,7 @@ class TestSplitGpuBudgetForDraft:
             total_kv_intercept=200,
         )
 
-        with pytest.raises(ValueError, match="GPU budget"):
+        with pytest.raises(RuntimeError, match="GPU budget"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
 
@@ -1004,7 +1008,7 @@ class TestGpuSplitChargesFixedCost:
             total_kv_intercept=2 * GB,
         )
 
-        with pytest.raises(ValueError, match="GPU budget"):
+        with pytest.raises(RuntimeError, match="GPU budget"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
     def test_gpu_raise_does_not_block_subsequent_host_split(self):
@@ -1812,7 +1816,7 @@ class TestPerRequestWeightedSplit:
         # The slope budget is 1000 - 400 = 600, below the 700-byte one-mirror
         # quota. Flooring anyway would hand the draft 700 and the target 300,
         # below its 400-byte intercept.
-        with pytest.raises(ValueError, match="insufficient"):
+        with pytest.raises(RuntimeError, match="insufficient"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
     def test_draft_gpu_budget_cap_moves_the_excess_to_the_target(self, monkeypatch):

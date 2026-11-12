@@ -28,11 +28,9 @@ TestKimiK25E2ESmoke — E2E smoke test (requires GPU + checkpoint):
   - Text, image, and video generation through the full multimodal pipeline
   - Uses the NVFP4 checkpoint with 4x GPU
 
-NOTE: TestKimiK25Structure does not include forward-pass tests because
-DeepSeek-V3's MLA attention uses fused CUDA kernels with hard-coded tile
-sizes that require production-scale dimensions (hidden_size=7168, 64 heads).
-A model this large cannot be instantiated with random weights in a
-unit-test context without risking C++ kernel aborts.
+The focused forward test retains production MLA dimensions but reduces the
+vocabulary and layer count. It compares text and attached-embedding context
+forwards without loading a checkpoint.
 """
 
 import os
@@ -50,7 +48,10 @@ from transformers import AutoTokenizer, PretrainedConfig
 from utils.llm_data import llm_models_root
 from utils.util import skip_pre_blackwell_unittest
 
+import tensorrt_llm
 from tensorrt_llm._torch.attention.attention import Attention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_kimi_k25 import (
@@ -59,11 +60,15 @@ from tensorrt_llm._torch.models.modeling_kimi_k25 import (
     KimiK25VisionModel,
     _frames_to_chunks,
 )
-from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode, get_registered_model_class
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.inputs import create_input_processor
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # ---------------------------------------------------------------------------
 # Model path — needed for tokenizer / processor loading
@@ -211,6 +216,125 @@ def _build_hf_config():
     config.text_config = text_config
     config.vision_config = vision_dict
     return config
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_kimi_k25_forward_with_attached_embeddings():
+    config = _build_hf_config()
+    vocab_size = 32
+    num_tokens = 4
+    config.media_placeholder_token_id = vocab_size - 1
+    for token_config in (config, config.text_config):
+        token_config.vocab_size = vocab_size
+        token_config.pad_token_id = None
+        token_config.bos_token_id = 1
+        token_config.eos_token_id = 2
+    config.text_config.num_hidden_layers = 1
+    config.text_config.max_position_embeddings = 32
+    config.vision_config["vt_num_hidden_layers"] = 1
+    config.vision_config["init_pos_emb_height"] = 2
+    config.vision_config["init_pos_emb_width"] = 2
+    model_config = ModelConfig(
+        pretrained_config=config,
+        attn_backend="TRTLLM",
+        max_num_tokens=num_tokens,
+        max_seq_len=32,
+    )
+    model_cls = get_registered_model_class("KimiK25ForConditionalGeneration")
+    assert model_cls is KimiK25ForConditionalGeneration
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        model = KimiK25ForConditionalGeneration(model_config)
+        model = model.to(device="cuda", dtype=torch.bfloat16).eval()
+        for name, parameter in model.named_parameters():
+            if parameter.ndim > 1:
+                parameter.normal_(mean=0.0, std=0.02)
+            elif name.endswith("weight"):
+                parameter.fill_(1.0)
+            else:
+                parameter.zero_()
+        model.llm.setup_aliases()
+        for layer in model.llm.model.layers:
+            # Use MLA's direct path without an executor custom-op registry.
+            layer.self_attn.register_to_config = False
+
+        # Native MLA context attention requires a backed latent KV pool.
+        cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=64, enable_block_reuse=False),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=config.text_config.kv_lora_rank + config.text_config.qk_rope_head_dim,
+            tokens_per_block=64,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=model_config.mapping,
+            dtype=torch_dtype_to_binding(torch.bfloat16),
+        )
+        requests = None
+        try:
+            requests = cache_manager.add_dummy_requests([0], [num_tokens])
+            assert requests is not None and len(requests) == 1
+            metadata = TrtllmAttentionMetadata(
+                max_num_requests=1,
+                max_num_tokens=num_tokens,
+                num_contexts=1,
+                seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+                request_ids=[0],
+                prompt_lens=[num_tokens],
+                kv_cache_manager=cache_manager,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+                kv_layout="HND",
+            )
+            input_ids = torch.tensor([1, 4, 7, 9], device="cuda", dtype=torch.int32)
+            position_ids = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+            metadata.prepare()
+            text_logits = model(
+                attn_metadata=metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                return_context_logits=True,
+            )
+            embeddings = model.llm.model.embed_tokens(input_ids)
+            placeholder_ids = torch.full_like(input_ids, config.media_placeholder_token_id)
+            mm_indices = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+            text_indices = torch.empty(0, device="cuda", dtype=torch.int64)
+
+            def forward_attached(attached_embeddings):
+                metadata.prepare()
+                return model(
+                    attn_metadata=metadata,
+                    input_ids=placeholder_ids,
+                    position_ids=position_ids,
+                    return_context_logits=True,
+                    multimodal_params=[
+                        MultimodalParams(
+                            multimodal_data={"multimodal_embedding": attached_embeddings}
+                        )
+                    ],
+                    mm_token_indices=mm_indices,
+                    text_token_indices=text_indices,
+                )
+
+            multimodal_logits = forward_attached(embeddings)
+            changed_logits = forward_attached(model.llm.model.embed_tokens(input_ids + 1))
+            for logits in (text_logits, multimodal_logits, changed_logits):
+                assert logits.shape == (num_tokens, vocab_size)
+                assert logits.dtype == torch.float32
+                assert torch.isfinite(logits).all()
+            torch.testing.assert_close(multimodal_logits, text_logits, atol=1e-2, rtol=1e-2)
+            assert not torch.allclose(changed_logits, multimodal_logits, atol=1e-2, rtol=1e-2)
+
+            decoder_bypassed_logits = model.llm.lm_head(model.llm.model.norm(embeddings)).float()
+            assert not torch.allclose(text_logits, decoder_bypassed_logits, atol=1e-2, rtol=1e-2)
+        finally:
+            try:
+                for request in requests or []:
+                    cache_manager.free_resources(request)
+            finally:
+                cache_manager.shutdown()
 
 
 class TestKimiK25Structure(unittest.TestCase):

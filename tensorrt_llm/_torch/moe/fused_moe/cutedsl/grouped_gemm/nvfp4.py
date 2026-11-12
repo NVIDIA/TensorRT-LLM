@@ -32,6 +32,7 @@ from ...impl_contract import (
     MoEInputRequirement,
     MoEProblem,
     MoERunContext,
+    MoESortTables,
     MoEStaticCapability,
     nvfp4_fc1_row_alignment_rejection,
     require_comm_plan,
@@ -40,10 +41,18 @@ from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind
 from ...quantization import NVFP4CuteDslFusedMoEMethod
 from ..identity import grouped_gemm_identity
-from ..kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from ..kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    prequantized_nvfp4_input_scale,
+    quantize_input_nvfp4,
+)
 from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
+
+# Import-time opt-in for the grouped-GEMM leaf's tiled BF16 input quantizer.
+TRITON_INPUT_QUANT = os.environ.get("TRTLLM_MOE_TRITON_FP4_QUANT", "0") == "1"
 
 # Kill switch for TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async.
 ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
@@ -126,7 +135,35 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             and getattr(self, "_locality_domain_runtime", None) is None
         )
 
-    quantize_input = quantize_input_nvfp4
+    # Shared NVFP4 input handling: the passthrough rule and its prequant
+    # exception live once in kernel_inputs.py.
+    prequantized_nvfp4_input_scale = prequantized_nvfp4_input_scale
+
+    def consumes_sort_tables(self) -> bool:
+        """Runs on the routing kernel's tables when they match the tuned tile
+        (``run_moe_nvfp4``); not with locality domains or a slot remap."""
+        return self._locality_domain_runtime is None and self.num_slots == self.num_experts
+
+    def quantize_input(
+        self,
+        x: torch.Tensor | Fp4QuantizedTensor,
+        post_quant_comm: bool = True,
+        *,
+        enable_triton: bool = TRITON_INPUT_QUANT,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize eligible inputs with the tiled Triton kernel when enabled.
+
+        ``TRTLLM_MOE_TRITON_FP4_QUANT`` sets this grouped-GEMM leaf's default
+        at import time; it does not enable the dense-GEMM or fused-FC12 leaves.
+        Callers can override it with ``enable_triton``; input eligibility and
+        the NVFP4 backend's architecture requirements still apply.
+        """
+        return quantize_input_nvfp4(
+            self,
+            x,
+            post_quant_comm,
+            enable_triton=enable_triton,
+        )
 
     def quantize_input_async(
         self,
@@ -211,6 +248,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             deep_ep_expert_capacity=plan.deep_ep_expert_capacity,
             use_deep_ep_direct_metadata=plan.use_deep_ep_direct_metadata,
             x_ready_event=ctx.x_ready_event,
+            sort_tables=ctx.sort_tables,
         )
 
     def run_moe_nvfp4(
@@ -227,6 +265,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         deep_ep_expert_capacity: int | None = None,
         use_deep_ep_direct_metadata: bool = False,
         x_ready_event: torch.cuda.Event | None = None,
+        sort_tables: MoESortTables | None = None,
     ) -> torch.Tensor:
         """NVFP4 MoE computation through ``run_moe_nvfp4_impl``.
 
@@ -238,6 +277,9 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 ``quantize_input_async``; joined inside ``run_moe_nvfp4_impl``
                 right before the FC1 gather GEMM (the locality-domain path and
                 empty micro-batches join here).
+            sort_tables: ``moe_sort`` outputs the routing produced
+                (``try_route_with_sort``); used instead of ``moe_sort`` when
+                their tile is the tuned one.
         """
         output_dtype = torch.bfloat16
         use_locality_domain = self._locality_domain_runtime is not None
@@ -329,6 +371,16 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             runner.get_tuning_config(),
             inputs,
         )
+        if sort_tables is not None and runner.tile_size_of(best_tactic) == sort_tables.tile_size:
+            # Only routed without a communication strategy or locality domain
+            # (``consumes_sort_tables``, ``sort_routing_applies``).
+            assert not use_locality_domain and not use_direct_expert_metadata
+            return self.run_moe_nvfp4_impl(
+                *inputs,
+                enable_alltoall=enable_alltoall,
+                tile_size=sort_tables.tile_size,
+                sort_tables=sort_tables,
+            )
         return runner(inputs, tactic=best_tactic)
 
     def run_moe_nvfp4_impl(
@@ -344,8 +396,12 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         recv_expert_count: torch.Tensor | None = None,
         deep_ep_expert_capacity: int | None = None,
         use_count_native_expert_metadata: bool = False,
+        sort_tables: MoESortTables | None = None,
     ) -> torch.Tensor:
-        """NVFP4 MoE through the single-tensor CuteDSL ops."""
+        """NVFP4 MoE through the single-tensor CuteDSL ops.
+
+        ``sort_tables`` (at ``tile_size``) replace this rank's ``moe_sort``.
+        """
         output_dtype = torch.bfloat16
         sm_version = get_sm_version()
         use_rubin = sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -386,6 +442,19 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         else:
             if use_count_native_expert_metadata:
                 raise RuntimeError("Count-native metadata requires DeepEP receive counts")
+            if sort_tables is not None:
+                assert sort_tables.tile_size == tile_size
+                sort_outputs = sort_tables.outputs
+            else:
+                sort_outputs = torch.ops.trtllm.moe_sort(
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    num_experts=self.num_slots,
+                    top_k=effective_top_k,
+                    local_expert_offset=slot_start,
+                    local_num_experts=esp,
+                    tile_tokens_dim=tile_size,
+                )
             (
                 tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit,
@@ -393,15 +462,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 permuted_idx_to_expanded_idx,
                 _total_num_padded_tokens,
                 num_non_exiting_tiles,
-            ) = torch.ops.trtllm.moe_sort(
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                num_experts=self.num_slots,
-                top_k=effective_top_k,
-                local_expert_offset=slot_start,
-                local_num_experts=esp,
-                tile_tokens_dim=tile_size,
-            )
+            ) = sort_outputs
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()
         if self.use_fused_finalize and has_aux_streams:

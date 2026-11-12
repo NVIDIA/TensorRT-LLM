@@ -242,6 +242,22 @@ class Fp4QuantizedTensor:
 
 
 @dataclass
+class Fp8PerTokenQuantizedTensor:
+    """FP8 E4M3 activation with an FP32 scale per token.
+
+    ``unquantized_hidden_states`` optionally keeps the BF16/FP16 source for
+    non-FP8 consumers of the same input.
+    """
+    fp8_tensor: torch.Tensor
+    per_token_scale: torch.Tensor  # [num_tokens, 1], fp32
+    unquantized_hidden_states: Optional[torch.Tensor] = None
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+
+@dataclass
 class MxFp8QuantizedTensor:
     """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
 
@@ -445,8 +461,8 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
 
     DeepGemm picks its tile layout from a heuristic over M and compiles one
     kernel per selected layout. A layout no bucket selects gets compiled
-    mid-inference instead, and DeepGemm forks nvcc while holding the GIL, so
-    that compile stalls every rank of the attention-DP group.
+    mid-inference instead, inside that rank's forward, so that compile stalls
+    every rank of the attention-DP group.
 
     Step 16 is exactly the right spacing, and it is needed over the whole
     range. In ``deepgemm/csrc/jit_kernels/heuristics/sm100.hpp`` the selection
@@ -472,11 +488,13 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
     return tuple(low) + tuple(dense) + (max_m, )
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+def fp4_scale_infer_shape(input_shapes: List[List[int]],
+                          sf_vec_size: int = 16) -> int:
     """Calculate the swizzled scale size for a packed FP4 input tensor."""
     unpacked_shape = list(input_shapes[0])
     unpacked_shape[-1] *= 2
-    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape, sf_vec_size=16)
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape,
+                                             sf_vec_size=sf_vec_size)
     return scale_shape
 
 

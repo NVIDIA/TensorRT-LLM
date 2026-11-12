@@ -204,7 +204,7 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     fi && \
     set -- ${BUILD_WHEEL_ARGS} && \
     if [ "${BUILD_WHEEL_SCRIPT}" = "scripts/build_wheel.py" ] && [ -n "${TRT_LLM_VER}" ]; then \
-      set -- "$@" --version-override "${TRT_LLM_VER}"; \
+      python3 scripts/bump_version.py "${TRT_LLM_VER}"; \
     fi && \
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
@@ -266,10 +266,8 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
 
 # Check installed metadata without importing CUDA-linked modules.
 RUN --mount=type=bind,source=docker/common/validate_wheel_metadata.py,target=/tmp/validate_wheel_metadata.py \
-    --mount=type=bind,source=tensorrt_llm/version.py,target=/tmp/trtllm_source_version.py \
     python3 /tmp/validate_wheel_metadata.py \
-        --expected-version "${TRT_LLM_VER}" --expected-commit "${GIT_COMMIT}" \
-        --source-version-file /tmp/trtllm_source_version.py
+        --expected-version "${TRT_LLM_VER}" --expected-commit "${GIT_COMMIT}"
 
 # Generate OSS attribution file for release image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \

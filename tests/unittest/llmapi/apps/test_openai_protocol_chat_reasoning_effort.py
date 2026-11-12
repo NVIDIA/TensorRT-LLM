@@ -108,7 +108,7 @@ def test_chat_route_rejects_only_an_unknown_effort(tmp_path, effort, status):
 
     def generate_async(*, inputs, **kwargs):
         submitted.append(inputs)
-        return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+        return SimpleNamespace(prompt_token_ids=[1, 2, 3], request_id=1, finished=True)
 
     server = make_stub_openai_server(
         tmp_path, "m", _StubModelConfig(), generate_async, tokenizer=_StubTokenizer()
