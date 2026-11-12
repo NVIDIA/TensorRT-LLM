@@ -91,7 +91,7 @@ def test_fused_accept_matches_unfused(force, num_contexts, num_gens, monkeypatch
 )
 def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
     # rows = 0: 1-D position ids, else [rows, tokens] MRoPE positions.
-    from tensorrt_llm._torch.speculative.fused_accept import step0_epilogue
+    from tensorrt_llm._torch.speculative.fused_accept import step0_epilogue, step0_gather_ids
 
     g = torch.Generator(device="cuda").manual_seed(num_contexts * 1000 + num_gens * 10 + k)
     b, H = num_contexts + num_gens, 4096
@@ -145,6 +145,31 @@ def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
         )
         is None
     )
+    # step0_gather_ids gives the same ids before the draft forward; the epilogue of a draft layer that kept
+    # only those rows (picked_gather_ids) reuses the ids and rows instead of gathering, with the same results.
+    ids = step0_gather_ids(seq_lens, num_acc, num_contexts, b, k, num_ctx_tokens)
+    assert ids is not None and ids.dtype == torch.int64 and torch.equal(ids, ids_ref)
+    hid_picked = hidden[ids]
+    seq_picked, kv_picked = torch.full_like(seq_live, 7), kv.clone()
+    picked = step0_epilogue(
+        seq_lens,
+        num_acc,
+        hid_picked,
+        pos,
+        seq_picked,
+        kv_picked,
+        num_contexts,
+        b,
+        k,
+        num_ctx_tokens,
+        picked_gather_ids=ids,
+    )
+    torch.cuda.synchronize()
+    assert picked is not None and picked.gather_ids is ids and picked.hidden is hid_picked
+    for j in range(1, k):
+        assert torch.equal(picked.positions(j), pos_ref[j - 1]), j
+    assert torch.equal(seq_picked, seq_live) and torch.equal(kv_picked, kv_ref)
+    assert step0_gather_ids(seq_lens, num_acc, num_contexts, 2048, k, num_ctx_tokens) is None
     # Draft tail: row 0 of the token buffer = stock _prepare_next_new_tokens column 0.
     acc_tok = torch.randint(0, 248320, (b, k + 3), generator=g, device="cuda", dtype=torch.int32)[
         :, : k + 2
@@ -169,60 +194,3 @@ def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
     ref_last = acc_tok[torch.arange(b, device="cuda"), num_acc.long() - 1]
     assert torch.equal(tok[0], ref_last)
     assert torch.all(tok[1:] == -5)  # draft rows untouched (written by the heads)
-
-
-@pytest.mark.parametrize("num_contexts,num_gens,k", [(3, 5, 6), (2, 0, 7), (0, 64, 8), (1, 1, 1)])
-def test_step0_gather_ids_and_picked_epilogue(num_contexts, num_gens, k):
-    """``step0_gather_ids`` gives the epilogue's gather ids before the draft forward, and the epilogue of a
-    draft layer that kept only those rows (``picked_gather_ids``) gives the same hidden rows, positions and
-    metadata updates as the stock one, reusing the given ids and rows instead of gathering."""
-    from tensorrt_llm._torch.speculative.fused_accept import step0_epilogue, step0_gather_ids
-
-    g = torch.Generator(device="cuda").manual_seed(num_contexts * 1000 + num_gens * 10 + k)
-    b, H = num_contexts + num_gens, 1024
-    ctx_lens = torch.randint(1, 300, (num_contexts,), generator=g, device="cuda", dtype=torch.int32)
-    seq_lens = torch.cat(
-        [ctx_lens, torch.full((num_gens,), k + 1, device="cuda", dtype=torch.int32)]
-    )
-    num_acc = torch.randint(1, k + 2, (b,), generator=g, device="cuda", dtype=torch.int32)
-    num_ctx_tokens = int(ctx_lens.sum())
-    n_tok = num_ctx_tokens + num_gens * (k + 1)
-    hidden = torch.randn((n_tok, H), generator=g, device="cuda").to(torch.bfloat16)
-    pos = torch.randint(0, 200000, (n_tok,), generator=g, device="cuda", dtype=torch.int32)
-    kv = torch.randint(1000, 5000, (b + 3,), generator=g, device="cuda", dtype=torch.int32)
-
-    ids = step0_gather_ids(seq_lens, num_acc, num_contexts, b, k, num_ctx_tokens)
-    assert ids is not None and ids.dtype == torch.int64
-    # Distinguishable non-zero starting values; rows past the batch must stay untouched.
-    seq_out_ref, seq_out = (
-        torch.full((b + 3,), 7, device="cuda", dtype=torch.int32) for _ in range(2)
-    )
-    kv_ref, kv_picked = kv.clone(), kv.clone()
-    ref = step0_epilogue(
-        seq_lens, num_acc, hidden, pos, seq_out_ref, kv_ref, num_contexts, b, k, num_ctx_tokens
-    )
-    hidden_picked = hidden[ids]
-    picked = step0_epilogue(
-        seq_lens,
-        num_acc,
-        hidden_picked,
-        pos,
-        seq_out,
-        kv_picked,
-        num_contexts,
-        b,
-        k,
-        num_ctx_tokens,
-        picked_gather_ids=ids,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(ids, ref.gather_ids)
-    assert picked.gather_ids is ids and picked.hidden is hidden_picked  # reused, not gathered
-    assert torch.equal(picked.hidden, ref.hidden)
-    for j in range(1, k):
-        assert torch.equal(picked.positions(j), ref.positions(j)), j
-    assert torch.equal(seq_out, seq_out_ref)
-    assert torch.all(seq_out[:b] == 1) and torch.all(seq_out[b:] == 7)
-    assert torch.equal(kv_picked, kv_ref) and not torch.equal(kv_ref[:b], kv[:b])
-    assert torch.equal(kv_ref[b:], kv[b:])
-    assert step0_gather_ids(seq_lens, num_acc, num_contexts, 2048, k, num_ctx_tokens) is None

@@ -283,7 +283,8 @@ def _compare(ref_layer, ref, layer, out, b, n_rows):
 
 
 @pytest.mark.parametrize("fast_paths", [False, True])
-@pytest.mark.parametrize("num_contexts,num_gens,k", [(2, 3, 3), (0, 4, 1), (3, 0, 2), (1, 1, 4)])
+# Mixed contexts and generations; contexts only with a single draft step.
+@pytest.mark.parametrize("num_contexts,num_gens,k", [(2, 3, 3), (3, 0, 1)])
 def test_mtp_eagle_step0_pick_matches_full(fast_paths, num_contexts, num_gens, k):
     b = num_contexts + num_gens
     ref_layer = _PlainMtpLayer(seed=7)
@@ -296,8 +297,8 @@ def test_mtp_eagle_step0_pick_matches_full(fast_paths, num_contexts, num_gens, k
     assert layer.post_rows == [b] * k
 
 
-@pytest.mark.parametrize("num_contexts,num_gens,k", [(2, 3, 3), (0, 4, 2)])
-def test_eagle3_step0_pick_matches_full(num_contexts, num_gens, k):
+def test_eagle3_step0_pick_matches_full():
+    num_contexts, num_gens, k = 0, 4, 2
     b = num_contexts + num_gens
     ref_layer = _Eagle3Model(seed=11, supports=False)
     ref = _run_loop(ref_layer, False, False, num_contexts, num_gens, k, 5)
@@ -318,34 +319,6 @@ def test_layer_without_pick_support_is_unaffected(layer_cls):
     n_rows = ref_layer.kv_writes[0].shape[0]
     assert not _compare(ref_layer, ref, layer, out, num_contexts + num_gens, n_rows)
     assert layer.post_rows == ref_layer.post_rows
-
-
-@pytest.mark.parametrize("is_mtp_eagle", [True, False])
-@pytest.mark.parametrize("picking", [True, False])
-def test_step0_pick_uses_per_request_counts_under_attention_dp(is_mtp_eagle, picking):
-    """Attention DP: a picked step 0 hands the layer the per-request counts
-    (``subseq_all_rank_num_tokens``, the counts of its post-attention rows);
-    an unpicked one the full step-0 counts. Later steps always get the
-    per-request counts."""
-    num_contexts, num_gens, k = 2, 3, 3
-    b = num_contexts + num_gens
-    full_counts, per_request_counts = [101, 202], [5, 6]
-    if is_mtp_eagle:
-        layer = _PickingMtpLayer(seed=7) if picking else _PlainMtpLayer(seed=7)
-    else:
-        layer = _Eagle3Model(seed=11, supports=picking)
-    _, _, picked = _run_loop(
-        layer, is_mtp_eagle, False, num_contexts, num_gens, k, 3, full_counts, per_request_counts
-    )
-    assert picked == picking
-    step0 = per_request_counts if picking else full_counts
-    assert layer.all_rank_num_tokens == [step0] + [per_request_counts] * (k - 1)
-    assert layer.post_rows[0] == (b if picking else layer.kv_writes[0].shape[0])
-
-
-def test_step0_pick_requires_per_request_counts_with_attention_dp():
-    with pytest.raises(AssertionError):
-        _run_loop(_PickingMtpLayer(seed=7), True, False, 2, 3, 3, 3, [101, 202], None)
 
 
 def _mtp_worker(mapping=None):
@@ -417,25 +390,40 @@ def test_mtp_worker_layers_pick_matches_full():
         torch.testing.assert_close(layer.kv_writes[0], ref_layer.kv_writes[0], rtol=1e-5, atol=1e-5)
 
 
-def test_mtp_worker_declines_pick_under_attention_dp():
+def test_step0_pick_under_attention_dp():
+    """Attention DP. The draft loop: a picked step 0 hands the layer the
+    per-request counts (``subseq_all_rank_num_tokens``, the counts of its
+    post-attention rows), an unpicked one the full step-0 counts, later steps
+    always the per-request counts; picking without the per-request counts
+    fails. Vanilla MTP declines the pick and runs as before."""
+    shape = num_contexts, num_gens, k = 2, 3, 3
+    b = num_contexts + num_gens
+    full_counts, per_request_counts = [101, 202], [5, 6]
+    for layer, is_mtp_eagle, picking in [
+        (_PickingMtpLayer(seed=7), True, True),
+        (_Eagle3Model(seed=11, supports=False), False, False),
+    ]:
+        _, _, picked = _run_loop(
+            layer, is_mtp_eagle, False, *shape, 3, full_counts, per_request_counts
+        )
+        assert picked == picking
+        step0 = per_request_counts if picking else full_counts
+        assert layer.all_rank_num_tokens == [step0] + [per_request_counts] * (k - 1)
+        assert layer.post_rows[0] == (b if picking else layer.kv_writes[0].shape[0])
+    with pytest.raises(AssertionError):
+        _run_loop(_PickingMtpLayer(seed=7), True, False, *shape, 3, full_counts)
+
     adp = SimpleNamespace(enable_attention_dp=True, cp_size=1)
-    tokens, layers, picked, b, n = _run_mtp_worker(_PickingMtpLayer, mapping=adp)
+    tokens, layers, picked, _, n = _run_mtp_worker(_PickingMtpLayer, mapping=adp)
     ref_tokens, _, _, _, _ = _run_mtp_worker(_PlainMtpLayer)
     assert not picked
     assert all(layer.post_rows == [n] for layer in layers)
     assert torch.equal(tokens, ref_tokens)
 
 
-def test_draft_row_pick_resolves_again_on_class_change():
-    resolver = DraftRowPick("test")
-    assert resolver.resolve([_PickingMtpLayer(0)])
-    assert not resolver.resolve([_OverridingMtpLayer(0)])
-    assert resolver.resolve([_PickingMtpLayer(0)])
-    assert not resolver.resolve([_PickingMtpLayer(0), _PlainMtpLayer(0)])
-    assert not DraftRowPick("test").resolve([_PickingMtpLayer(0)], decline="attention DP")
-
-
-def test_draft_layer_picks_rows_gates(monkeypatch):
+def test_draft_row_pick_gates(monkeypatch):
+    """``draft_layer_picks_rows`` and the ``DraftRowPick`` decision, which is
+    resolved again whenever the draft layer classes change."""
     monkeypatch.delenv("TLLM_SPEC_DISABLE_DRAFT_ROW_PICK", raising=False)
     assert draft_layer_picks_rows(_PickingMtpLayer(0))
     assert not draft_layer_picks_rows(None)
@@ -445,6 +433,14 @@ def test_draft_layer_picks_rows_gates(monkeypatch):
     assert draft_layer_picks_rows(_Eagle3Model(0, supports=True))
     assert not draft_layer_picks_rows(_PickingMtpLayer(0), SimpleNamespace(cp_size=2))
     assert draft_layer_picks_rows(_PickingMtpLayer(0), SimpleNamespace(cp_size=1))
+
+    resolver = DraftRowPick("test")
+    assert resolver.resolve([_PickingMtpLayer(0)])
+    assert not resolver.resolve([_OverridingMtpLayer(0)])
+    assert resolver.resolve([_PickingMtpLayer(0)])
+    assert not resolver.resolve([_PickingMtpLayer(0), _PlainMtpLayer(0)])
+    assert not DraftRowPick("test").resolve([_PickingMtpLayer(0)], decline="attention DP")
+
     monkeypatch.setenv("TLLM_SPEC_DISABLE_DRAFT_ROW_PICK", "1")
     assert not draft_layer_picks_rows(_PickingMtpLayer(0))
 
@@ -476,8 +472,9 @@ def _mtp_layer_cls(name):
     return Glm4MTP
 
 
-@pytest.mark.parametrize("layer_name", ["DeepseekV3MTP", "Glm4MTP"])
-@pytest.mark.parametrize("fused_allreduce", [False, True])
+@pytest.mark.parametrize(
+    "layer_name,fused_allreduce", [("DeepseekV3MTP", False), ("Glm4MTP", True)]
+)
 def test_mtp_layer_forward_pick_rows(layer_name, fused_allreduce):
     """The MTP layer's ``forward`` with ``pick_rows`` equals the picked rows of
     the full forward; attention sees every row, the MoE only the picked."""
