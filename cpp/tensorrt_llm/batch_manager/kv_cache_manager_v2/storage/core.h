@@ -872,12 +872,16 @@ public:
     //!
     //! With `secondBudget` unset, `quota` is the only bound and every pool is charged to it.
     //!
-    //! @throws std::runtime_error when the floors alone exceed either budget.
+    //! A pool group with a fixed slot count in `fixedSlots` gets exactly that many slots, taken
+    //! from both budgets first; the rest is divided among the other groups as above, and the
+    //! fixed groups' ratios and floors are ignored. An empty `fixedSlots` makes every group elastic.
+    //!
+    //! @throws std::runtime_error when the fixed groups and the floors alone exceed either budget.
     static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
         TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
+        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt, FixedSlotCounts const& fixedSlots = {});
 
     //! The pools `quota` pays for: every pool the second budget does not name.
     //!

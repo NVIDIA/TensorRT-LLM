@@ -47,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     SPARSE_ARENA_ALIGNMENT,
     HostHistoryReservations,
@@ -91,6 +92,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     Batch,
     BatchDesc,
     BufferConfig,
+    BufferId,
     CacheLevel,
     CacheTier,
     CudaStream,
@@ -452,7 +454,7 @@ def _make_manager_for_cache_tier_test(
         None,
     )
     if fake_impl is not None:
-        fake_impl.layer_grouping = [[0]]
+        fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
         fake_impl.pool_group_descs = []
         fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -686,6 +688,107 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
             assert torch.all(buffer[0] == global_layer_id)
     finally:
         manager.shutdown()
+
+
+def _layer_api_snapshot(manager: KVCacheManagerV2) -> dict:
+    """A manager's built cache config and layer-based API, with pool addresses as (pool, offset)."""
+    impl = manager.impl
+    config = manager.kv_cache_manager_py_config
+    pools = {
+        int(pool.base_address): (int(group.pool_group_index), int(pool.pool_index))
+        for group in impl.pool_group_descs
+        for pool in group.pools
+    }
+
+    def pool_offset(address: int):
+        if address == 0:
+            return None
+        base = max(base for base in pools if base <= address)
+        return pools[base], address - base
+
+    return {
+        "layers": [
+            (
+                type(layer).__name__,
+                int(layer.layer_id),
+                [
+                    (str(buffer.role), buffer.size, buffer.coalescing_group, buffer.reuse_policy)
+                    for buffer in layer.buffers
+                ],
+                getattr(layer, "sliding_window_size", None),
+                layer.reuse_policy,
+            )
+            for layer in config.layers
+        ],
+        "commit_min_snapshot": config.commit_min_snapshot,
+        "regions": [region.name for region in config.regions],
+        "initial_pool_ratio": config.initial_pool_ratio,
+        "pool_groups": [
+            (int(group.num_slots), list(group.slot_desc.slot_size_list), len(group.pools))
+            for group in impl.pool_group_descs
+        ],
+        "layer_grouping": [[int(layer_id) for layer_id in group] for group in impl.layer_grouping],
+        "layer_group_ids": [
+            int(impl.get_layer_group_id(LayerId(layer_id)))
+            for layer_id in range(manager.num_local_layers)
+        ],
+        "layer_to_pool_mapping_dict": dict(manager.layer_to_pool_mapping_dict),
+        "pool_pointers": [
+            pool_offset(int(address))
+            for address in manager.kv_cache_pool_pointers.flatten().tolist()
+        ],
+        "pool_mapping": manager.kv_cache_pool_mapping.tolist(),
+        "index_scales": manager.index_scales.tolist(),
+        "block_offsets_shape": tuple(manager.host_kv_cache_block_offsets.shape),
+    }
+
+
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_manager_without_regions_builds_as_before(monkeypatch, enable_block_reuse: bool) -> None:
+    """Without regions, the region hooks change neither the built cache nor the layer-based API."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+
+    def build() -> KVCacheManagerV2:
+        return KVCacheManagerV2(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+                enable_block_reuse=enable_block_reuse,
+                max_attention_window=[MAX_SEQ_LEN, 8],
+                pool_ratio=[0.5, 0.5],
+            ),
+            CacheType.SELF,
+            num_layers=4,
+            num_kv_heads=2,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )
+
+    manager = build()
+    try:
+        assert manager.region_layout == RegionLayout()
+        assert manager.get_region_group_ids("recurrent_state") == ()
+        with_hooks = _layer_api_snapshot(manager)
+    finally:
+        manager.shutdown()
+    with monkeypatch.context() as patch:
+        patch.setattr(KVCacheManagerV2, "_declare_regions", lambda self: None)
+        patch.setattr(KVCacheManagerV2, "_lay_out_regions", lambda self, config: config)
+        manager = build()
+        try:
+            without_hooks = _layer_api_snapshot(manager)
+        finally:
+            manager.shutdown()
+
+    assert with_hooks == without_hooks
+    assert len(with_hooks["layer_grouping"]) == 2
 
 
 @pytest.mark.parametrize("kv_first", [False, True], ids=["key-first", "kv-first"])
@@ -1172,6 +1275,67 @@ def test_zero_size_filter_preserves_layer_and_buffer_reuse_policies() -> None:
     assert private_layer.reuse_policy == ReusePolicy.PRIVATE
 
 
+def test_layer_group_helpers_describe_split_ssm_layers() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=4096)],
+                sliding_window_size=8,
+            ),
+            *[
+                SsmLayerConfig(
+                    layer_id=LayerId(layer_id),
+                    buffers=[
+                        BufferConfig(role=DataRole("ssm_state"), size=4096),
+                        BufferConfig(
+                            role=DataRole("old_x"), size=2048, reuse_policy=ReusePolicy.PRIVATE
+                        ),
+                    ],
+                )
+                for layer_id in (1, 2)
+            ],
+        ],
+        commit_min_snapshot=True,
+    )
+    impl = KVCacheManager(config)
+    try:
+        manager = object.__new__(KVCacheManagerV2)
+        manager.max_seq_len = MAX_SEQ_LEN
+        manager.tokens_per_block = TOKENS_PER_BLOCK
+        manager.kv_cache_manager_py_config = config
+        manager.impl = impl
+        manager._layer_group_life_cycles = None
+
+        attention = impl.get_layer_group_id(LayerId(0))
+        required = impl.get_buffer_group_id(LayerId(1), DataRole("ssm_state"))
+        private = impl.get_buffer_group_id(LayerId(1), DataRole("old_x"))
+        assert len({attention, required, private}) == 3
+        assert sorted({buffer.layer_id for buffer in impl.buffer_grouping[private]}) == [1, 2]
+
+        assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {attention: 8}
+        assert manager._get_event_window_sizes_by_layer_group() == {
+            attention: 8,
+            required: MAX_SEQ_LEN,
+            private: MAX_SEQ_LEN,
+        }
+        life_cycles = manager._life_cycle_by_layer_group()
+        assert life_cycles[attention].window_size == 8
+        assert life_cycles[required].window_size is None
+        assert life_cycles[private].window_size is None
+        metadata = manager._stats_life_cycle_metadata()
+        assert metadata[attention][1:] == (8, "attention")
+        assert metadata[required][1:] == (None, "ssm")
+        assert metadata[private][1:] == (None, "ssm")
+        assert len({metadata[group][0] for group in (attention, required, private)}) == 3
+    finally:
+        impl.shutdown()
+
+
 @pytest.mark.parametrize("sliding_window_size", [None, 8])
 @pytest.mark.parametrize("attention_first", [False, True])
 def test_event_window_sizes_filter_attention_without_backend_internals(
@@ -1194,7 +1358,11 @@ def test_event_window_sizes_filter_attention_without_backend_internals(
     )
     # Match the C++ binding surface: layer_grouping is public, while the
     # Python implementation's private _life_cycles registry is absent.
-    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]] if attention_first else [[1], [0]])
+    manager.impl = SimpleNamespace(
+        buffer_grouping=[
+            [BufferId(LayerId(i), Role.KEY)] for i in ([0, 1] if attention_first else [1, 0])
+        ]
+    )
 
     attention_group_id = 0 if attention_first else 1
     window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
@@ -4685,7 +4853,7 @@ def _index_mapper_capacity_for(
     """
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -5088,7 +5256,7 @@ def _native_config_with_sparse_arena(
         ]
     )
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -6202,7 +6370,7 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
 
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -7246,3 +7414,41 @@ def test_try_commit_generation_blocks_honors_guards(
     manager.try_commit_generation_blocks(request)
 
     assert kv_cache.committed_tokens is None
+
+
+@pytest.mark.parametrize("role", [Role.VALUE, Role.KEY_BLOCK_SCALE])
+def test_default_attention_rejects_split_coupled_buffers(monkeypatch, role):
+    original = KVCacheManagerV2._build_cache_config
+
+    def build_config(self, config):
+        config = original(self, config)
+        layers = list(config.layers)
+        layer = layers[0]
+        buffers = [
+            BufferConfig(
+                role=buffer.role,
+                size=buffer.size,
+                reuse_policy=ReusePolicy.PRIVATE if buffer.role == role else None,
+            )
+            for buffer in layer.buffers
+        ]
+        if role == Role.KEY_BLOCK_SCALE:
+            buffers.append(BufferConfig(role=role, size=128, reuse_policy=ReusePolicy.PRIVATE))
+        layers[0] = AttentionLayerConfig(layer_id=layer.layer_id, buffers=buffers)
+        return replace(config, layers=layers)
+
+    monkeypatch.setattr(KVCacheManagerV2, "_build_cache_config", build_config)
+    with pytest.raises(ValueError, match="requires one shared page-index table"):
+        KVCacheManagerV2(
+            KvCacheConfig(max_gpu_total_bytes=4 << 20, host_cache_size=0),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )
