@@ -597,7 +597,8 @@ def split_radix_topk_decode(
     buffers hold at least ``rows * partitions * 2048`` elements; their initial contents are
     ignored. Unit-stride logits may have padded rows and nonzero storage offsets. This
     selector uses the native op when its shape would select fewer than ten partitions,
-    preserving that shape's sentinel and nonfinite behavior.
+    preserving that shape's sentinel and nonfinite behavior, and when its rows are not
+    32-byte aligned with a width that is a multiple of 8, which its vector reads require.
     """
     if logits.ndim != 2 or logits.dtype != torch.float32 or not logits.is_cuda:
         raise ValueError("logits must be a two-dimensional CUDA float32 tensor")
@@ -624,8 +625,9 @@ def split_radix_topk_decode(
         raise ValueError("compiled selector and logits must be on the same CUDA device")
     if aux_indices.numel() < needed or aux_logits.numel() < needed:
         raise ValueError(f"scratch must hold at least {needed} elements")
+    vector_rows = logits.data_ptr() % 32 == 0 and logits.stride(0) % 8 == 0 and width % 8 == 0
     if rows:
-        if native_partitions != compiled.partitions:
+        if native_partitions != compiled.partitions or not vector_rows:
             return indexer_topk_decode(
                 logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
             )

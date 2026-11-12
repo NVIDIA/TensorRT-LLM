@@ -121,6 +121,47 @@ def test_split_radix_graph_dynamic_lengths():
         _check(logits, lengths, output)
 
 
+@pytest.mark.parametrize("seed,kind", [(0, "ordinary"), (42, "boundaries")])
+def test_split_radix_partition_heads_within_vector(seed, kind):
+    compiled = build_split(torch.cuda.current_device())
+    logits, output, aux_i, aux_l = _buffers(1, 65536)
+    for residue in range(8):
+        # Every row's partitions span 4096 + residue columns, so their starts fall at
+        # every offset inside a 256-bit vector and the aligned reads cover a neighbor's
+        # columns on both sides.
+        lengths = [10 * (4096 + residue) + 3]
+        lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        _fill(logits, lengths, 4, seed + residue, kind)
+        output.fill_(-7)
+        split_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+        _check(logits, lengths, output)
+
+
+@pytest.mark.parametrize("layout", ["unaligned_rows", "unaligned_width"])
+def test_split_radix_unaligned_layout_uses_native(layout):
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.indexer_topk_decode import (
+        indexer_topk_decode as native_topk,
+    )
+
+    compiled = build_split(torch.cuda.current_device())
+    width = 65536 if layout == "unaligned_rows" else 65535
+    _, output, aux_i, aux_l = _buffers(1, 65536)
+    storage = torch.empty(4 * 65536 + 9, dtype=torch.float32, device="cuda")
+    offset = 1 if layout == "unaligned_rows" else 8
+    logits = storage[offset:].as_strided((4, width), (65536, 1))
+    lengths = [width]
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    _fill(logits, lengths, 4, 42, "boundaries")
+    target = (
+        "tensorrt_llm._torch._experimental.modeling_v2.catalog.attention."
+        "cute_dsl_radix_topk_decode.indexer_topk_decode"
+    )
+    with patch(target, wraps=native_topk) as fallback:
+        split_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+        fallback.assert_called_once()
+    _check(logits, lengths, output)
+
+
 def test_split_radix_rejects_invalid_inputs():
     compiled = build_split(torch.cuda.current_device())
     for partitions in (4, 8):

@@ -718,7 +718,12 @@ class RadixTopkDecodeKernel:
 
 
 class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
-    """Partition selection and exact radix merge, with caller-owned candidate storage."""
+    """Partition selection and exact radix merge, with caller-owned candidate storage.
+
+    A partition's first pass reads its scores as 256-bit vectors from the 8-column boundary
+    at or below its start, so the logits rows start 32-byte aligned and every row is readable
+    through its width rounded up to a multiple of VEC. The merge reads its candidates one
+    score per thread."""
 
     def __init__(self, next_n: int, partitions: int, use_pdl: bool):
         super().__init__(next_n)
@@ -726,11 +731,41 @@ class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
         self.use_pdl = use_pdl
 
     @cute.jit
-    def _select_partition(self, score, end, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid):
-        """Select a native stage's candidates, including its negative-NaN ordering."""
+    def _begin_select(self, s_hist, s_scal, tid):
         if tid < cutlass.Int32(_NUM_SCALARS):
             s_scal[tid] = cutlass.Int32(0)
         self._clear(s_hist, D1_BINS, tid)
+
+    @cute.jit
+    def _count_aligned(self, src, start, length, s_hist, s_scal, tid):
+        """Digit 31..20 of `src[start:start + length]` into `s_hist` and its negative NaNs
+        into `s_scal`, read as 256-bit vectors from column `start` rounded down to VEC."""
+        lo = start - start % cutlass.Int32(VEC)
+        head = start - lo
+        stop = head + length
+        size = (stop + cutlass.Int32(VEC - 1)) // cutlass.Int32(VEC) * cutlass.Int32(VEC)
+        window = cute.make_tensor(src.iterator + lo, cute.make_layout((size,)))
+        neg = cutlass.Int32(0)
+        atom, t_src, t_crd, tiles = self._row_tiles(window, size, tid)
+        t_val = cute.make_fragment_like(t_src[None, None, None, 0])
+        for tile in range(tiles):
+            pred = self._predicate(t_crd[None, None, None, tile], size)
+            cute.copy(atom, t_src[None, None, None, tile], t_val, pred=pred[None, None, None])
+            crd = t_crd[(0, None), None, None, tile]
+            for v in cutlass.range(cute.size(t_val), unroll_full=True):
+                c = crd[v // VEC][1] + v % VEC
+                if pred[0, v // VEC, 0] & (c >= head) & (c < stop):
+                    key = _key(t_val[v])
+                    self._count(s_hist, _digit(key, D1_SHIFT, D1_MASK), cutlass.Int32(1))
+                    if key > cutlass.Uint32(NEG_INF_KEY):
+                        neg = neg + cutlass.Int32(1)
+        if neg > cutlass.Int32(0):
+            self._count(s_scal, cutlass.Int32(_N_NEG_NAN), neg)
+
+    @cute.jit
+    def _select_partition(self, score, end, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid):
+        """Select a native stage's candidates, including its negative-NaN ordering."""
+        self._begin_select(s_hist, s_scal, tid)
         neg = cutlass.Int32(0)
         col = tid
         while col < end:
@@ -741,6 +776,11 @@ class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
             col = col + cutlass.Int32(self.T)
         if neg > cutlass.Int32(0):
             self._count(s_scal, cutlass.Int32(_N_NEG_NAN), neg)
+        self._select_counted(score, end, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid)
+
+    @cute.jit
+    def _select_counted(self, score, end, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid):
+        """Finish a stage whose digit 31..20 and negative NaNs have been counted."""
         cute.arch.barrier()
         if s_scal[_N_NEG_NAN] == cutlass.Int32(0):
             self._select(
@@ -807,9 +847,9 @@ class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
         score = cute.make_tensor(src.iterator + start, cute.make_layout((length,)))
         dst = (row * cutlass.Int32(self.partitions) + part) * cutlass.Int32(TOP_K)
         if length > cutlass.Int32(TOP_K):
-            self._select_partition(
-                score, length, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid
-            )
+            self._begin_select(s_hist, s_scal, tid)
+            self._count_aligned(src, start, length, s_hist, s_scal, tid)
+            self._select_counted(score, length, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid)
         k = tid
         while k < cutlass.Int32(TOP_K):
             col = cutlass.Int32(-1)
