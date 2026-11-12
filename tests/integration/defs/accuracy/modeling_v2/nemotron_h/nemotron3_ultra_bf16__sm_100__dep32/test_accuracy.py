@@ -12,13 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gate for nemotron3_ultra_bf16__sm_100__dep32: GSM8K on eight GB200 trays.
-
-Not in any test list yet: the target is not GPU-certified until these gates pass on 32 GB200
-GPUs. Once they do, list them in tests/integration/test_lists/qa/llm_function_multinode.txt
-beside dep16's and drop this directory from ``_ACCURACY_NOT_LISTED_YET`` in
-tests/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py.
-"""
+"""Whole-model gate for nemotron3_ultra_bf16__sm_100__dep32: GSM8K on eight GB200 trays."""
 
 import pytest
 
