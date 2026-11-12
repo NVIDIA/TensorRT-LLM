@@ -63,14 +63,10 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.encoder import EncoderRunner, resolve_scheduled_encoder_args
-from .engine.runners.encoder_decoder import (
-    EncoderDecoderRunner,
-    EncoderDecoderRunnerConfig,
-    EncoderStageConfig,
-)
+from .engine.runners.encoder import EncoderConfig, EncoderRunner, resolve_scheduled_encoder_args
+from .engine.runners.encoder_decoder import EncoderDecoderRunner, EncoderDecoderRunnerConfig
 from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
-from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
+from .engine.runners.mm_encoder import MultimodalEncoderRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
 from .model_loader import ModelLoader
@@ -149,8 +145,9 @@ class ModelEngine:
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
-        if not (self.model.model_config.is_generation or self.llm_args.mm_encoder_only):
+        if not self.model.model_config.is_generation:
             self.llm_args = resolve_scheduled_encoder_args(self.llm_args)
+        self._validate_breakable_cuda_graph_compatibility()
         self._init_from_model()
         self._size_cuda_graphs()
         self._compile_model(configured_encoder_max_num_tokens)
@@ -284,7 +281,6 @@ class ModelEngine:
         else:
             self.model = model
         self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
-        self._validate_breakable_cuda_graph_compatibility()
 
     def _init_from_model(self) -> None:
         """Copy the loaded model's facts onto the engine, rewriting the requested
@@ -453,7 +449,7 @@ class ModelEngine:
         self.attn_backend = resolve_attention_backend(self.model, self.llm_args)
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
-        if self.is_spec_decode and issubclass(runner_cls, (NoKVCacheRunner, EncoderRunner)):
+        if self.is_spec_decode and issubclass(runner_cls, (MultimodalEncoderRunner, EncoderRunner)):
             raise ValueError(
                 f"{runner_cls.__name__} does not support speculative decoding; "
                 "pooling and multimodal encoder models must not set "
@@ -506,8 +502,8 @@ class ModelEngine:
             )
         if issubclass(runner_cls, EncoderDecoderRunner):
             return self._initialize_encoder_decoder_runner(runner_cls)
-        if issubclass(runner_cls, NoKVCacheRunner):
-            return self._initialize_no_kv_cache_runner(runner_cls)
+        if issubclass(runner_cls, MultimodalEncoderRunner):
+            return runner_cls.create(self.model, moe_load_balancer=self.moe_load_balancer)
         if issubclass(runner_cls, DecoderRunner):
             return self._initialize_decoder_runner(runner_cls)
         raise TypeError(
@@ -518,7 +514,7 @@ class ModelEngine:
     def _initialize_encoder_decoder_runner(
         self, runner_cls: type[EncoderDecoderRunner]
     ) -> EncoderDecoderRunner:
-        encoder_config = EncoderStageConfig.create(
+        encoder_config = EncoderConfig.create(
             model=self.model,
             mapping=self.mapping,
             graph_config=self.llm_args.encoder_cuda_graph_config,
@@ -542,28 +538,6 @@ class ModelEngine:
             runner_config,
             encoder_config=encoder_config,
             input_processor=self.input_processor,
-        )
-
-    def _initialize_no_kv_cache_runner(self, runner_cls: type[NoKVCacheRunner]) -> NoKVCacheRunner:
-        runner_config = NoKVCacheRunnerConfig(
-            max_batch_size=self.batch_size,
-            max_num_tokens=self.max_num_tokens,
-            max_seq_len=self.max_seq_len,
-            max_beam_width=self.max_beam_width,
-            without_logits=self.without_logits,
-            enable_attention_dp=self.enable_attention_dp,
-            prefill_cuda_graph_backend=self.llm_args.prefill_cuda_graph_backend,
-            prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
-            attention_backend=self.attn_backend,
-            mm_encoder_cache_enabled=mm_encoder_cache_enabled(self.model),
-        )
-        return runner_cls(
-            self.model,
-            runner_config,
-            mapping=self.mapping,
-            dist=self.dist,
-            moe_load_balancer=self.moe_load_balancer,
-            attention_runtime_features=self.attn_runtime_features,
         )
 
     def _decoder_runner_config(
@@ -613,6 +587,7 @@ class ModelEngine:
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
+            watermark_config=self.llm_args.watermark_config,
             **extra_fields,
         )
 
@@ -896,11 +871,20 @@ class ModelEngine:
         with self.warmup_scope():
             self._warmup_impl(resource_manager)
 
+    def _configure_allreduce_tuning(self) -> None:
+        """Configure profiling buckets from the resolved budget before runner warmup."""
+        from ..custom_ops.torch_custom_ops import AllReduceRunner
+
+        if not self.llm_args.enable_autotuner:
+            return
+        AllReduceRunner.configure_tuning_buckets(self.max_num_tokens)
+
     def _warmup_impl(self, resource_manager: ResourceManager | None = None) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        self._configure_allreduce_tuning()
         assert resource_manager is not None, "scheduled warmup requires a resource manager"
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)

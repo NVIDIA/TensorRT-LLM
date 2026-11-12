@@ -43,6 +43,12 @@ SCHEDULE_BY_M = {
     32: tgv_instance(TgvSchedule(16, 64, 8, split_k=8)),
     48: tcgen05_instance(16, 8, 6),
     64: tcgen05_instance(16, 8, 6),
+    # MTP3 / MTP5 decode batches (32 sequences x 4 / 6 rows; the tcgen05 backend stops at
+    # 64): TGV over 64-row tiles, split-K 8, 64 / 96 CTAs. B300, cold weights: 4.9 / 5.2 us,
+    # against 22.4 us on the prefill GEMM those rows took (and 9.0 / 12.4 us for one
+    # 128 / 192-row TGV tile).
+    128: tgv_instance(TgvSchedule(64, 128, 6, split_k=8)),
+    192: tgv_instance(TgvSchedule(64, 128, 6, split_k=8)),
 } | context_instances(
     tgv_instance(TgvSchedule(64, 64, 12, split_k=2)),
     tgv_instance(TgvSchedule(96, 128, 5)),
@@ -50,5 +56,7 @@ SCHEDULE_BY_M = {
     persistent_instance(GemmSchedule(True, (256, 128), (2, 1), raster_along="n")),
 )
 SUPPORTED_M_VALUES = tuple(SCHEDULE_BY_M)
+# The decode row counts above 64, built only for an engine drafting more than one token.
+MTP_DECODE_M_VALUES = (128, 192)
 
 build = make_build(ABI, SCHEDULE_BY_M)
