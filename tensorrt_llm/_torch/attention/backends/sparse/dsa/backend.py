@@ -28,7 +28,6 @@ from ..mixed_precision_high_rows import (
     overlay_mixed_precision_high_rows,
 )
 from ..offload_kernels import gather_sparse_batch_rows, merge_sparse_arena_indices
-from .cache_manager import NVFP4_MLA_RECORD_LAYOUT, get_nvfp4_mla_kv_cache_layout
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -128,15 +127,13 @@ class DSATrtllmAttention(TrtllmAttention):
         # quantization path in TRTLLMGen. Keep those at their default value and
         # use separate scales for the E2M1 x E4M3 KV representation: its global
         # scale contains an extra factor of six that would otherwise saturate Q.
+        # The cache ops apply it to the residual layout only: the records of the
+        # fp8rope layout keep real-valued block scales and E4M3 RoPE.
         self._nvfp4_mla_kv_scale_quant_orig = self.kv_scale_quant_orig
         self._nvfp4_mla_kv_scale_orig_quant = self.kv_scale_orig_quant
         if quant_config is not None and quant_config.layer_quant_mode.has_fp4_kv_cache():
-            if get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
-                # Records keep real-valued block scales and E4M3 RoPE without a global scale.
-                dequant_scale = 1.0
-            else:
-                kv_cache_amax = _get_nvfp4_mla_kv_cache_amax()
-                dequant_scale = kv_cache_amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE)
+            kv_cache_amax = _get_nvfp4_mla_kv_cache_amax()
+            dequant_scale = kv_cache_amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE)
             self._nvfp4_mla_kv_scale_quant_orig = torch.full_like(
                 self.kv_cache_scaling_factor, dequant_scale
             )

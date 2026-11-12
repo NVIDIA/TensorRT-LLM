@@ -16,8 +16,9 @@
 """TRT-LLM FMHA adapter for DSA generation on the PrimTS D576 sparse MLA kernel over NVFP4 KV.
 
 Serves the generation phase of DSA layers (512 + 64 latent, e.g. GLM-5) whose latent cache uses the
-``fp8rope`` NVFP4 layout (``TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT=fp8rope``). Each cache row is the
-352-byte record that ``BatchSparseMLADecodePagedTSWrapper`` reads as
+``fp8rope`` NVFP4 layout, which ``TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT`` selects by default for the
+caches that can hold it. Each cache row is the 352-byte record that
+``BatchSparseMLADecodePagedTSWrapper`` reads as
 ``kv_cache_format="nvfp4.fp8rope"``: the kernel loads the selected records, expands their E2M1 NoPE
 values with the E4M3 block scales in its loader, and runs FP8 QK/PV MMAs. Generation therefore needs
 neither the NVFP4-to-FP8 gather nor its scratch rows.
@@ -81,13 +82,20 @@ class _SparsePlan:
     lengths: torch.Tensor
 
 
-def uses_nvfp4_mla_record_cache(attn: "TrtllmAttention") -> bool:
-    """Whether a DSA layer writes its latent cache as PrimTS ``nvfp4.fp8rope`` records."""
+def may_use_nvfp4_mla_record_cache(attn: "TrtllmAttention") -> bool:
+    """Whether the latent cache of a DSA layer may hold PrimTS ``nvfp4.fp8rope`` records.
+
+    The cache manager settles the layout of its cache after the layers are built, so a layer can
+    only rule records out: it has no NVFP4 KV cache, or the ``residual`` layout is requested.
+    """
     if not getattr(attn, "has_fp4_kv_cache", False):
         return False
-    from ..sparse.dsa.cache_manager import NVFP4_MLA_RECORD_LAYOUT, get_nvfp4_mla_kv_cache_layout
+    from ..sparse.dsa.cache_manager import (
+        NVFP4_MLA_RESIDUAL_LAYOUT,
+        get_requested_nvfp4_mla_kv_cache_layout,
+    )
 
-    return get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT
+    return get_requested_nvfp4_mla_kv_cache_layout() != NVFP4_MLA_RESIDUAL_LAYOUT
 
 
 def _metadata_unsupported_reason(metadata) -> Optional[str]:
@@ -172,7 +180,7 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
             return False
         if getattr(getattr(attn, "sparse_params", None), "algorithm", None) != "dsa":
             return False
-        if not uses_nvfp4_mla_record_cache(attn):
+        if not may_use_nvfp4_mla_record_cache(attn):
             return False
         reason = cls._unavailable_reason(attn)
         if reason is not None:
@@ -491,6 +499,6 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
 
 __all__ = [
     "PrimsTSDsaSparseMlaFmha",
+    "may_use_nvfp4_mla_record_cache",
     "prims_ts_reads_nvfp4_mla_records",
-    "uses_nvfp4_mla_record_cache",
 ]

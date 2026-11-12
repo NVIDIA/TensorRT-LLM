@@ -352,7 +352,8 @@ def test_nvfp4_mla_record_kv_cache_gather():
     global_indices = torch.tensor([[5, 0, -1], [3, 1, 6]], dtype=torch.int32, device="cuda")
     output = torch.zeros((*global_indices.shape, 576), dtype=torch.float8_e4m3fn, device="cuda")
     compact_indices = torch.empty_like(global_indices)
-    unit_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    # Records carry no global scale: the gather does not apply the one of the residual layout.
+    residual_layout_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
 
     torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
         host_pool_pointers,
@@ -360,7 +361,7 @@ def test_nvfp4_mla_record_kv_cache_gather():
         global_indices,
         output,
         compact_indices,
-        unit_scale,
+        residual_layout_scale,
         0,
         128,
         num_pool_tokens,
@@ -388,7 +389,8 @@ def test_nvfp4_mla_record_context_kv_cache_gather():
     lengths = torch.tensor([0, 4], dtype=torch.int64, device="cuda")
     output = torch.zeros((4, 1, 576), dtype=torch.float8_e4m3fn, device="cuda")
     compact = torch.empty_like(topk)
-    unit_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    # Records carry no global scale: the gather does not apply the one of the residual layout.
+    residual_layout_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
     # Two tokens per block and two layers per physical page. Layer one maps
     # logical tokens [0, 1, 2, 3] to physical rows [6, 7, 2, 3].
     torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather(
@@ -400,7 +402,7 @@ def test_nvfp4_mla_record_context_kv_cache_gather():
         lengths,
         output,
         compact,
-        unit_scale,
+        residual_layout_scale,
         0,
         4,
         2,

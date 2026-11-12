@@ -10,6 +10,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.fmha import prims_ts_dsa_sparse_mla, registry
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_dsa_sparse_mla import (
     PrimsTSDsaSparseMlaFmha,
+    may_use_nvfp4_mla_record_cache,
     prims_ts_reads_nvfp4_mla_records,
 )
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
@@ -38,6 +39,9 @@ _NOPE_HEAD_DIM = 128
 _RECORD_STORAGE_EXTRA_DIM = 2 * _ROPE_DIM
 _TOKENS_PER_BLOCK = 64
 _SEQ_LENS = (300, 200)
+# The global scale a DSA layer keeps for the residual layout (amax 100 over 448 * 6). The layer
+# passes it to the cache ops whatever the layout; records do not take it.
+_RESIDUAL_LAYOUT_SCALE = 100.0 / (448 * 6)
 
 requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
@@ -126,10 +130,22 @@ def test_library_rejects_the_requests_the_gather_skip_rejects():
         assert expected in library._unsupported_reason(q, None, None, metadata, fwd)
 
 
+@pytest.mark.cpu_only
+def test_layer_may_hold_records_unless_the_residual_layout_is_requested(monkeypatch):
+    layer = SimpleNamespace(has_fp4_kv_cache=True)
+    monkeypatch.delenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, raising=False)
+    assert may_use_nvfp4_mla_record_cache(layer)
+    assert not may_use_nvfp4_mla_record_cache(SimpleNamespace(has_fp4_kv_cache=False))
+    monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_RECORD_LAYOUT)
+    assert may_use_nvfp4_mla_record_cache(layer)
+    monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_RESIDUAL_LAYOUT)
+    assert not may_use_nvfp4_mla_record_cache(layer)
+
+
 @pytest.fixture
 def written_records(monkeypatch):
-    """A record-layout cache whose rows the native MLA writer filled from known latents."""
-    monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_RECORD_LAYOUT)
+    """A default-layout cache (records) that the native MLA writer filled from known latents."""
+    monkeypatch.delenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, raising=False)
     manager = DSACacheManagerV2(
         KvCacheConfig(max_tokens=4096, enable_block_reuse=False),
         CacheType.SELFKONLY,
@@ -147,6 +163,7 @@ def written_records(monkeypatch):
         ),
     )
     try:
+        assert manager.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT
         assert manager.mla_kv_cache_residual_dim == _RECORD_STORAGE_EXTRA_DIM
         request_ids = list(range(len(_SEQ_LENS)))
         seq_lens = list(_SEQ_LENS)
@@ -207,7 +224,7 @@ def written_records(monkeypatch):
             metadata.kv_cache_block_offsets,
             manager.kv_cache_pool_pointers,
             manager.kv_cache_pool_mapping,
-            torch.ones(1, dtype=torch.float32, device="cuda"),
+            torch.tensor([1.0 / _RESIDUAL_LAYOUT_SCALE], dtype=torch.float32, device="cuda"),
             manager.mla_kv_cache_residual_dim,
             0,
             manager.tokens_per_block,
@@ -248,7 +265,7 @@ def _gather(records, indices: torch.Tensor) -> torch.Tensor:
         indices,
         output,
         compact_indices,
-        torch.ones(1, dtype=torch.float32, device="cuda"),
+        torch.tensor([_RESIDUAL_LAYOUT_SCALE], dtype=torch.float32, device="cuda"),
         0,
         records.manager.mla_kv_cache_residual_dim,
         records.num_pool_tokens,
