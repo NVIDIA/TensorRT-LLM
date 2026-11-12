@@ -4022,12 +4022,8 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens = torch.where(active, keyed, sampled_tokens)
         elif spec_metadata.sharded_target_logits:
             # The logits are this rank's vocabulary shard; global greedy
-            # tokens from one launch (local first maximum + LL key exchange;
-            # same tokens as torch.argmax).
-            sampled_tokens = self.key_exchange.argmax_logits(
-                logits,
-                vocab_offset=self.mapping.tp_rank * logits.shape[-1],
-                channel=1)
+            # tokens, the same as torch.argmax over the gathered logits.
+            sampled_tokens = self._sharded_argmax(logits)
         else:
             sampled_tokens = greedy_argmax(
                 logits, small_rows=spec_metadata.is_cuda_graph)
