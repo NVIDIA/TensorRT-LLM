@@ -503,9 +503,10 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
 # Static default for the SM107 Kimi K3 NVFP4 generation-phase shape at EP4. The full runner
 # key matches only a runner whose max_tokens_per_rank is exactly 512 (the 512 rung of the
 # default ladder); a per-rank cap of 385-511 keeps the generic table because it was not
-# measured, and the other buckets measured no faster than the generic table. K3 applies
-# top-k after FC2, and the full key keeps this tactic from reaching other shapes, EP sizes,
-# combine formats, helper-expert counts or top-k placements.
+# measured. With this tactic the 128, 192, 256, 384 and 1024 buckets measured no faster
+# than the generic table; 32 and 64 were not measured. K3 applies top-k after FC2, and the
+# full key keeps this tactic from reaching other shapes, EP sizes, combine formats,
+# helper-expert counts or top-k placements.
 _SM107_KIMI_K3_GENPHASE_TACTICS: dict[Tuple, Tuple] = {
     (
         107,
