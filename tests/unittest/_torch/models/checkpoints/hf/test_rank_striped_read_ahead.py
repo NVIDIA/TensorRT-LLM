@@ -281,19 +281,31 @@ def _fake_files(monkeypatch, files):
         pytest.param(
             {
                 "/proc/self/cgroup": "0::/jobs/worker\n",
-                # The process's own protection does not hide its page cache from it.
+                # Under the limit of `jobs`, the process's own cgroup protects all 200 of its page
+                # cache, and the sibling protects 600 of its 800.
                 "/sys/fs/cgroup/jobs/worker/memory.min": "1000\n",
                 "/sys/fs/cgroup/jobs/worker/memory.current": "300\n",
                 "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 200\n",
                 "/sys/fs/cgroup/jobs/memory.current": "1100\n",
                 "/sys/fs/cgroup/jobs/memory.max": "1280\n",
                 "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
-                # The sibling protects all 800 of its page cache.
-                "/sys/fs/cgroup/jobs/sibling/memory.min": "960\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.min": "600\n",
                 "/sys/fs/cgroup/jobs/sibling/memory.stat": "active_file 800\n",
             },
             380,
-            id="v2-protected-sibling-cache-not-credited",
+            id="v2-protected-child-cache-not-credited",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # Reclaim for the cgroup's own limit ignores the cgroup's own protection.
+                "/sys/fs/cgroup/jobs/worker/memory.min": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 150\ninactive_file 200\n",
+            },
+            850,
+            id="v2-own-limit-ignores-own-protection",
         ),
         pytest.param(
             {
