@@ -219,6 +219,38 @@ class DynamicLinearWeightLoader:
             "quant_config."
         )
 
+    def _check_static_nvfp4_input_scale(
+        self,
+        module: Linear,
+        weight_dict: Dict[str, torch.Tensor],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
+    ) -> None:
+        """Require calibration data when NVFP4 activations use a static scale."""
+        if (
+            quant_algo != QuantAlgo.NVFP4
+            or not getattr(
+                getattr(module, "quant_method", None), "quantizes_nvfp4_activations", False
+            )
+            or module.force_dynamic_quantization
+        ):
+            return
+
+        input_scale = weight_dict.get("input_scale")
+        if (
+            input_scale is None
+            or input_scale.numel() != 1
+            or not torch.isfinite(input_scale).all()
+            or not (input_scale > 0).all()
+        ):
+            raise ValueError(
+                f"Static NVFP4 activation quantization for module '{name}' requires a calibrated "
+                "'input_scale' tensor containing one finite, positive value in every checkpoint "
+                "weight entry. Load-time weight quantization does not calibrate activations. "
+                "Provide the calibrated scale or explicitly set "
+                "quant_config.config_groups.<group>.input_activations.dynamic: true."
+            )
+
     def _should_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
     ) -> bool:
@@ -362,13 +394,14 @@ class DynamicLinearWeightLoader:
             ):
                 quant_algo = None
 
-        if getattr(self.quant_config, "ignored_steps", []) and quant_algo is not None:
-            self._retain_unquantized_weight(module, name, weight_dicts)
-
         # Static (pre-quantized) recipes must not be loaded from checkpoints
         # that do not carry the expected scale tensors.
         for weight_dict in weight_dicts:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
+            self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
+
+        if getattr(self.quant_config, "ignored_steps", []) and quant_algo is not None:
+            self._retain_unquantized_weight(module, name, weight_dicts)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
