@@ -42,6 +42,7 @@ from _torch.moe.moe_test_utils import (
     iter_base_test_configs,
     replay_tactics_and_check,
     should_skip_to_accelerate_ci,
+    should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
@@ -1269,6 +1270,8 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
         ({"activation_type": ActivationType.Silu}, True),
         ({"model_configs": [MoeModelConfig(64, 4, 2048, 1408)]}, True),
         ({"model_configs": [MoeModelConfig(60, 8, 2048, 1408)]}, True),
+        ({"model_configs": [MoeModelConfig(60, 4, 4096, 1408)]}, True),
+        ({"swiglu_combos": [(1.702, 1.0, 7.0)]}, True),
         ({"routing_methods": [RenormalizeNaiveMoeRoutingMethod]}, True),
     ],
     ids=[
@@ -1278,6 +1281,8 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
         "silu",
         "more-experts",
         "larger-top-k",
+        "larger-hidden-size",
+        "custom-swiglu",
         "renormalize-naive-routing",
     ],
 )
@@ -1313,12 +1318,35 @@ def test_trtllm_nvfp4_seq8_skip(
         _quant_algo,
         _routing_method_cls,
         skip_reason,
-        _base_test_id,
+        base_test_id,
     ) = configs[0]
     if expected_skip:
         assert skip_reason is not None and "seq_len=8" in skip_reason
     else:
         assert skip_reason is None
+        monkeypatch.setattr(sys.modules[__name__], "MOE_MODEL_CONFIGS", params["model_configs"])
+        monkeypatch.setattr(sys.modules[__name__], "SEQ_LENS_TO_TEST", params["seq_lens"])
+        monkeypatch.setattr(sys.modules[__name__], "DTYPES_TO_TEST", params["dtypes"])
+        generated_ids = {param.id for param in generate_element_wise_test_params()}
+        assert f"act=Relu2-{base_test_id}" in generated_ids
+        assert f"act=Silu-{base_test_id}" not in generated_ids
+
+        for deployment_overrides in (
+            {"moe_tp_size": 2},
+            {"parallel_mode": "DEP"},
+            {"comm_method": "NVLINK_ONE_SIDED"},
+        ):
+            skip_reason = should_skip_trtllm(
+                MoeBackendType.TRTLLM,
+                QuantAlgo.NVFP4,
+                MoeModelConfig(60, 4, 2048, 1408),
+                RenormalizeMoeRoutingMethod,
+                seq_len=8,
+                dtype=torch.bfloat16,
+                activation_type=ActivationType.Relu2,
+                **deployment_overrides,
+            )
+            assert skip_reason is not None and "seq_len=8" in skip_reason
 
 
 def should_skip_gptoss(
@@ -5433,6 +5461,7 @@ def generate_int8_woq_non_aligned_test_params() -> List:
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS],
             [QuantAlgo.W8A16],
+            activation_type=activation_type,
         ):
             # get_quick_skip_reason() rejects every quantized config whose sizes are
             # not 128-aligned. That gate is exactly what this case exists to cover:

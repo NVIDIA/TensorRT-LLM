@@ -17,6 +17,7 @@
 import logging
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
@@ -436,8 +437,8 @@ def should_skip_trtllm(
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
         # Keep the NVFP4 seq=8 skips tracked by https://nvbugs/5979443,
-        # except for the single-GPU Relu2 regression configuration below.
-        is_relu2_regression_case = (
+        # except for the restored single-GPU Relu2 seq=8 case below.
+        is_restored_relu2_seq8_case = (
             model_config == MoeModelConfig(60, 4, 2048, 1408)
             and dtype == torch.bfloat16
             and activation_type == ActivationType.Relu2
@@ -453,7 +454,7 @@ def should_skip_trtllm(
             and model_config.hidden_size >= 2048
             and model_config.intermediate_size >= 1408
             and seq_len == 8
-            and not is_relu2_regression_case
+            and not is_restored_relu2_seq8_case
         ):
             return (
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
@@ -1142,8 +1143,8 @@ def get_quick_skip_reason(
     ``activation_type`` is a parameter rather than a constant because it is a
     selection input: a leaf declares which kinds it reaches, so a caller that
     parametrizes over Relu2 or SiTu and does not pass it here would prune its
-    sweep against the verdict for SwiGLU. Defaulted because today's callers
-    sweep SwiGLU only, and that is the historical shape of every MoE signature.
+    sweep against the verdict for SwiGLU. The default preserves SwiGLU-only
+    callers; generators sweeping other activations must pass their current kind.
     """
     import logging as _logging
 
@@ -1579,16 +1580,30 @@ def module_timer(request):
 # Base Test Config Iterator
 # ============================================================================
 def iter_base_test_configs(
-    swiglu_combos,
-    model_configs,
-    seq_lens,
-    dtypes,
-    backend_types,
-    quant_algos,
-    routing_methods=None,
+    swiglu_combos: list[tuple[float, float, float]],
+    model_configs: list[MoeModelConfig],
+    seq_lens: list[int],
+    dtypes: list[torch.dtype],
+    backend_types: list[MoeBackendType],
+    quant_algos: list[QuantAlgo | None],
+    routing_methods: list[type] | None = None,
     *,
     activation_type: ActivationType = ActivationType.Swiglu,
-):
+) -> Iterator[
+    tuple[
+        float,
+        float,
+        float,
+        MoeModelConfig,
+        int,
+        torch.dtype,
+        MoeBackendType,
+        QuantAlgo | None,
+        type,
+        str | None,
+        str,
+    ]
+]:
     """
     Iterate over base test configurations using itertools.product.
 
@@ -1610,8 +1625,6 @@ def iter_base_test_configs(
                   dtype, backend_type, quant_algo, routing_method_cls, skip_reason, base_test_id)
     """
     if routing_methods is None:
-        from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-
         routing_methods = [RenormalizeMoeRoutingMethod]
 
     for (
