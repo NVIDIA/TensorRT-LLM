@@ -3297,6 +3297,27 @@ def _varlen_launcher(
                 else 0,
             )
         big = num_rows * r_const <= wave
+        if (
+            sm_version not in _BLACKWELL_SM_VERSIONS
+            and num_sms not in _HOPPER_BLACKWELL_BANDWIDTH_SMS
+            and not tpl[5]
+            and not det
+            and n_kernel >= 32 * k
+            and (
+                (
+                    num_rows * r_const <= wave * int(tpl[2])
+                    and k <= 4 * int(tpl[0])
+                    and (n_kernel >= 128 * k if big else n_kernel * (2 if low else 4) <= 3 << 18)
+                )
+                or (main_options.get("regsel") and num_rows * r_const <= 2 * wave * int(tpl[2]))
+            )
+        ):
+            # One wave of co-resident CTAs streams its rows past the other rows' sampled lines, which
+            # a Hopper L2 then drops before their row pass reads them: the row-pass loads mark their
+            # lines evict_first. Rows below 32 * K scores (128 * K at one CTA per SM), rows above
+            # 768 KB at two or more CTAs per SM, 256-thread K = 2048 slabs and later waves re-read
+            # streamed lines; BF16 rows that select from registers re-read none up to two waves
+            main_options["l2ef"] = True
         if low:
             if r_const > 2 and k > 1024:
                 split_aim = 13 * k // 8 if num_rows > 8 else 7 * k // 4

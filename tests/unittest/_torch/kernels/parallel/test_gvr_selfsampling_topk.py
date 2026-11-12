@@ -1200,6 +1200,42 @@ def test_selfsampling_hopper_fp16_ranks_survivors_per_warp(monkeypatch) -> None:
         assert options(256, 131075, 1024, num_sms, sm_version) == (False, 0, True), num_sms
 
 
+def test_selfsampling_hopper_one_wave_row_pass_evicts_first(monkeypatch) -> None:
+    """Main slabs of Hopper parts other than the H20 load their row pass L2 evict_first when every
+    CTA of the batch is co-resident and the row holds 32 * K scores or more (128 * K at one CTA
+    per SM) and at most 768 KB at two or more CTAs per SM, except on 256-thread K = 2048 slabs;
+    BF16 rows that select from registers do so up to two waves. Other batches beyond one wave,
+    the H20 and Blackwell keep plain loads."""
+    requests = _record_compile_requests(monkeypatch)
+
+    def l2ef(rows, n, k, dtype, num_sms=132, sm_version=90):
+        for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+            monkeypatch.setattr(ss_host, cache, {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("l2ef", False)
+
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        assert l2ef(256, 32771, 1024, dtype), dtype  # 32 * K
+        assert l2ef(128, 131075, 1024, dtype), dtype  # one CTA per SM: 128 * K
+        assert not l2ef(128, 65539, 1024, dtype), dtype
+        assert not l2ef(256, 32783, 2048, dtype), dtype  # 16 * K
+        assert not l2ef(1024, 131075, 1024, dtype), dtype  # beyond two waves
+        for num_sms, sm_version in ((78, 90), (148, 100)):
+            assert not l2ef(256, 131075, 1024, dtype, num_sms, sm_version), (dtype, num_sms)
+    assert l2ef(512, 32771, 512, torch.float32)  # one wave of 256-thread slabs
+    assert not l2ef(256, 262127, 1024, torch.float32)  # 1 MB rows
+    assert l2ef(256, 262127, 1024, torch.bfloat16)  # 512 KB rows
+    for dtype in (torch.float32, torch.bfloat16):
+        assert not l2ef(512, 131087, 2048, dtype), dtype  # 256-thread K = 2048 slab
+    # two waves: BF16 rows that select from registers (256-thread slabs) take it, rows on
+    # 512-thread slabs re-read their survivors and do not
+    assert l2ef(1024, 65539, 1024, torch.bfloat16)
+    for dtype in (torch.bfloat16, torch.float16):
+        assert not l2ef(512, 65539, 1024, dtype), dtype
+
+
 @pytest.mark.skipif(
     getSMVersion() != 90
     or torch.cuda.get_device_properties(0).multi_processor_count
