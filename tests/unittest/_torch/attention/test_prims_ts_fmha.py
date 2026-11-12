@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from collections.abc import Iterator
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, create_autospec
@@ -46,6 +47,13 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantMode
+
+
+@pytest.fixture(autouse=True)
+def _reset_workspace_size_caches() -> Iterator[None]:
+    prims_ts_module._get_cached_workspace_size_functions.cache_clear()
+    yield
+    prims_ts_module._get_cached_workspace_size_functions.cache_clear()
 
 
 class _TensorSpec:
@@ -2791,6 +2799,53 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
     assert workspace.numel() == 64
 
 
+@pytest.mark.parametrize("is_mla", [False, True], ids=["standard", "mla"])
+def test_workspace_size_cache_keys_all_arguments(
+    monkeypatch: pytest.MonkeyPatch, is_mla: bool
+) -> None:
+    function_name = (
+        "get_prims_ts_batch_mla_decode_workspace_size"
+        if is_mla
+        else "get_prims_ts_batch_decode_workspace_size"
+    )
+    workspace_size = create_autospec(getattr(prims_ts_package, function_name), return_value=96)
+    monkeypatch.setattr(prims_ts_package, function_name, workspace_size)
+    cached = prims_ts_module._get_cached_workspace_size_functions()[int(is_mla)]
+    assert prims_ts_module._get_cached_workspace_size_functions()[int(is_mla)] is cached
+    assert getattr(prims_ts_package, function_name) is workspace_size
+    args = (2, 4, 512, 64, 32, 96) if is_mla else (2, 8, 2, 128, 32, 96)
+    kwargs = dict(
+        max_q_len=1,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        mask_type="causal",
+        store_softmax_stats=False,
+        device=torch.device("cuda:0"),
+        validate=False,
+    )
+    variants = [(args, kwargs)]
+    for index, value in enumerate(args):
+        variants.append((args[:index] + (value * 2,) + args[index + 1 :], kwargs))
+    for override in (
+        {"max_q_len": 6},
+        {"q_dtype": torch.float8_e4m3fn, "kv_dtype": torch.float8_e4m3fn},
+        {"out_dtype": torch.float16},
+        {"mask_type": "dense"},
+        {"store_softmax_stats": True},
+        {"device": torch.device("cuda:1")},
+        {"validate": True},
+        {"use_kv_bounds": True} if is_mla else {"window_left": 32},
+    ):
+        variants.append((args, kwargs | override))
+    for index, (call_args, call_kwargs) in enumerate(variants, start=1):
+        assert cached(*call_args, **call_kwargs) == 96
+        assert cached(*call_args, **call_kwargs) == 96
+        assert workspace_size.call_count == index
+        assert workspace_size.call_args.args == call_args
+        assert workspace_size.call_args.kwargs == call_kwargs
+
+
 @pytest.mark.parametrize("fp8,with_stats", [(False, False), (True, False), (True, True)])
 def test_mla_workspace_size_cache_tracks_request_geometry(
     monkeypatch: pytest.MonkeyPatch, fp8: bool, with_stats: bool
@@ -2839,10 +2894,13 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     assert workspace_size.call_count == 3
     assert all(call.kwargs["validate"] is False for call in workspace_size.call_args_list)
     assert all(call.kwargs["use_kv_bounds"] is False for call in workspace_size.call_args_list)
-    assert set(fmha._mla_decode_workspace_sizes) == {(2, 1), (2, 6), (4, 8)}
-    assert all(isinstance(size, int) for size in fmha._mla_decode_workspace_sizes.values())
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    assert workspace_size.call_count == 3
+
+    other_layer = PrimsTSFmha(attn)
+    other_layer._multi_processor_count = 1
+    other_layer.prepare_workspace(q, None, None, metadata, forward_args, workspace)
     assert workspace_size.call_count == 3
 
     # A larger table invalidates capacity-bound plans even when existing scratch
@@ -2855,7 +2913,6 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
     assert workspace_size.call_count == 4
     assert workspace_size.call_args.args[5] == 192
-    assert set(fmha._mla_decode_workspace_sizes) == {(2, 1)}
     assert fmha._mla_decode_wrappers == {}
     assert fmha._mla_decode_plan_profiles == set()
     assert workspace.data_ptr() == previous_pointer
@@ -2950,7 +3007,7 @@ def test_mla_context_workspace_tracks_each_chunk_without_decode_size_cache(
         fmha.prepare_workspace(q, k, None, metadata, forward_args, workspace)
         assert workspace.numel() == expected_bytes
     workspace_size.assert_not_called()
-    assert fmha._mla_decode_workspace_sizes == {}
+    assert prims_ts_module._get_cached_workspace_size_functions.cache_info().currsize == 0
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -3010,6 +3067,18 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
     assert workspace_size.call_args.kwargs["kv_dtype"] == expected_dtype
     assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
     assert workspace_size.call_args.kwargs["validate"] is False
+
+    for layer in (fmha, PrimsTSFmha(attn)):
+        layer._multi_processor_count = 1
+        layer.prepare_workspace(
+            torch.empty((2, 12 * 128), dtype=torch.bfloat16),
+            None,
+            None,
+            metadata,
+            forward_args,
+            workspace,
+        )
+    workspace_size.assert_called_once()
 
 
 def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(
