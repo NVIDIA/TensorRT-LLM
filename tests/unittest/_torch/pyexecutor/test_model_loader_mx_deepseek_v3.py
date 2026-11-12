@@ -138,12 +138,14 @@ def _tiny_model(
     rank: int = 0,
     moe_ep_size: int = -1,
     filled: bool = True,
+    config_overrides: dict[str, object] | None = None,
 ) -> nn.Module:
     """Build a two-layer DeepSeek-V3 model on CUDA with deterministic weights.
 
     `moe_ep_size=2` at `tp_size=2` selects the MoE-EP partition; the default
     leaves MoE TP equal to TP. TP=2 builds one rank of the group with
-    collectives stubbed out. The model is built on the CPU and moved to CUDA,
+    collectives stubbed out. `config_overrides` replaces entries of the tiny
+    checkpoint config. The model is built on the CPU and moved to CUDA,
     because the attention backend creates its rotary tables with NumPy.
     """
     if tp_size > 1:
@@ -154,7 +156,7 @@ def _tiny_model(
         monkeypatch.setattr(modeling_deepseekv3_mod, "can_access_peer", lambda _mapping: False)
     model = model_class(
         ModelConfig(
-            pretrained_config=_hf_config(q_lora_rank=q_lora_rank),
+            pretrained_config=_hf_config(q_lora_rank=q_lora_rank, **(config_overrides or {})),
             mapping=mapping_mod.Mapping(
                 world_size=tp_size,
                 rank=rank,
@@ -301,6 +303,8 @@ def _runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
         "rope_type": "default",
         "rope_fusion": True,
         "sliding_window": None,
+        "first_k_dense_replace": 1,
+        "moe_layer_freq": 1,
     }
     values.update(overrides)
     return PostTransformRuntimeConfig(**values)
@@ -709,6 +713,41 @@ def test_deepseek_v3_setup_aliases_leaves_a_loaded_producer_unchanged(
 
 
 @_requires_cutlass_bf16_moe
+@pytest.mark.parametrize(
+    "config_overrides, expected_layer_mlps, expected_dimension",
+    [
+        pytest.param(
+            {"first_k_dense_replace": 0},
+            ("Deepseekv3MoE", "Deepseekv3MoE"),
+            "first_k_dense_replace",
+            id="moe-first-layer",
+        ),
+        pytest.param(
+            {"moe_layer_freq": 2},
+            ("GatedMLP", "GatedMLP"),
+            "moe_layer_freq",
+            id="moe-every-other-layer",
+        ),
+    ],
+)
+def test_deepseek_v3_profile_rejects_another_moe_layer_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    config_overrides: dict[str, object],
+    expected_layer_mlps: tuple[str, ...],
+    expected_dimension: str,
+) -> None:
+    """A checkpoint whose layers do not follow the ABI's dense-first-layer layout falls back."""
+    model = _tiny_model(monkeypatch, filled=False, config_overrides=config_overrides)
+
+    decision = _qualify(model)
+
+    assert tuple(type(layer.mlp).__name__ for layer in model.model.layers) == expected_layer_mlps
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset({expected_dimension})
+
+
+@_requires_cutlass_bf16_moe
 def test_deepseek_v3_cutlass_pin_keeps_shared_experts_unfused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -898,12 +937,25 @@ def test_deepseek_v3_profile_rejects_other_identities(
             {"moe_cluster_size"},
             id="moe-cluster2",
         ),
+        pytest.param({"first_k_dense_replace": 0}, {"first_k_dense_replace"}, id="moe-first-layer"),
+        pytest.param(
+            {"first_k_dense_replace": 3}, {"first_k_dense_replace"}, id="three-dense-layers"
+        ),
+        pytest.param({"moe_layer_freq": 2}, {"moe_layer_freq"}, id="moe-every-other-layer"),
+        pytest.param(
+            {"first_k_dense_replace": None, "moe_layer_freq": None},
+            {"first_k_dense_replace", "moe_layer_freq"},
+            id="undeclared-moe-layer-layout",
+        ),
     ],
 )
 def test_deepseek_v3_profile_rejects_unqualified_runtime_variants(
     overrides: dict[str, object], expected_dimensions: set[str]
 ) -> None:
     """The profile rejects YaRN, FP8, other MoE backends, attention DP, CP, and wider TP.
+
+    It also rejects every MoE layer layout other than a dense first layer
+    followed by MoE layers, including a config that declares none.
 
     `test_bf16_profiles_reject_unqualified_runtime_variants` covers the
     variants that every BF16 profile rejects.

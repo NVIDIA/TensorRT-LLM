@@ -156,13 +156,18 @@ _MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
 # `rope_fusion`), so it keeps the base BF16 dense RoPE pins and adds the Qwen3
 # MoE CUTLASS backend and partition pins. The CUTLASS pin also fixes the router
 # `e_score_correction_bias` dtype (fp32 here, bf16 under the TRTLLM MoE
-# backend) and keeps the shared experts out of the routed-expert tensors.
+# backend) and keeps the shared experts out of the routed-expert tensors. The
+# layout ABI has a dense first layer and MoE in every later layer, so the
+# checkpoint config must declare `first_k_dense_replace=1` and
+# `moe_layer_freq=1`.
 _MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     moe_backends=frozenset({"CUTLASS"}),
     moe_tp_sizes=frozenset({1, 2}),
     moe_ep_sizes=frozenset({1, 2}),
     moe_cluster_sizes=frozenset({1}),
+    first_k_dense_replaces=frozenset({1}),
+    moe_layer_freqs=frozenset({1}),
 )
 
 # TorchLlmArgs fields that only the model classes listing them in

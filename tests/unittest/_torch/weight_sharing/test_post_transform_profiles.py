@@ -689,6 +689,94 @@ def test_unconstrained_weight_block_size_admits_every_block_size(
     )
 
 
+@pytest.mark.parametrize(
+    "pretrained_config, expected",
+    [
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace=1, moe_layer_freq=1), (1, 1), id="deepseek-v3"
+        ),
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace=3, moe_layer_freq=2), (3, 2), id="other-layout"
+        ),
+        pytest.param(SimpleNamespace(), (None, None), id="undeclared"),
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace="1", moe_layer_freq=[1, 1]),
+            (None, None),
+            id="non-integer",
+        ),
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace=True, moe_layer_freq=False),
+            (None, None),
+            id="bool",
+        ),
+    ],
+)
+def test_runtime_config_records_declared_moe_layer_layout(
+    pretrained_config: object, expected: tuple[int | None, int | None]
+) -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=pretrained_config)
+    )
+
+    assert (runtime_config.first_k_dense_replace, runtime_config.moe_layer_freq) == expected
+
+
+def test_runtime_config_leaves_moe_layer_layout_unknown_by_default() -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(SimpleNamespace())
+
+    assert runtime_config.first_k_dense_replace is None
+    assert runtime_config.moe_layer_freq is None
+    assert _runtime_config().first_k_dense_replace is None
+    assert _runtime_config().moe_layer_freq is None
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_dimensions",
+    [
+        pytest.param({"first_k_dense_replace": 0}, {"first_k_dense_replace"}, id="moe-first-layer"),
+        pytest.param(
+            {"first_k_dense_replace": 3}, {"first_k_dense_replace"}, id="three-dense-layers"
+        ),
+        pytest.param({"moe_layer_freq": 2}, {"moe_layer_freq"}, id="moe-every-other-layer"),
+        pytest.param(
+            {"first_k_dense_replace": None, "moe_layer_freq": None},
+            {"first_k_dense_replace", "moe_layer_freq"},
+            id="undeclared",
+        ),
+    ],
+)
+def test_moe_layer_layout_constraint_rejects_other_layouts(
+    overrides: dict[str, object], expected_dimensions: set[str]
+) -> None:
+    constraints = PostTransformRuntimeConstraints(
+        first_k_dense_replaces=frozenset({1}), moe_layer_freqs=frozenset({1})
+    )
+    qualified = {"first_k_dense_replace": 1, "moe_layer_freq": 1}
+
+    assert constraints.unsupported_dimensions(_runtime_config(**qualified)) == frozenset()
+    assert constraints.unsupported_dimensions(
+        _runtime_config(**{**qualified, **overrides})
+    ) == frozenset(expected_dimensions)
+
+
+@pytest.mark.parametrize(
+    "first_k_dense_replace, moe_layer_freq", [(None, None), (0, 1), (1, 1), (3, 2)]
+)
+def test_unconstrained_moe_layer_layout_admits_every_layout(
+    first_k_dense_replace: int | None, moe_layer_freq: int | None
+) -> None:
+    constraints = PostTransformRuntimeConstraints(dtypes=frozenset({"bfloat16"}))
+
+    assert (
+        constraints.unsupported_dimensions(
+            _runtime_config(
+                first_k_dense_replace=first_k_dense_replace, moe_layer_freq=moe_layer_freq
+            )
+        )
+        == frozenset()
+    )
+
+
 def test_rows_pinned_to_different_sm_versions_do_not_overlap() -> None:
     sm90 = PostTransformRuntimeConstraints(sm_versions=frozenset({90}))
     sm100 = PostTransformRuntimeConstraints(sm_versions=frozenset({100, 103}))

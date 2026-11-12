@@ -1234,6 +1234,11 @@ _DOCUMENTED_SLIDING_WINDOWS = {
     None: "",
     frozenset({"none"}): ", no sliding window",
 }
+# Keyed by the profile's (`first_k_dense_replaces`, `moe_layer_freqs`) constraints.
+_DOCUMENTED_MOE_LAYER_LAYOUTS = {
+    (None, None): "",
+    (frozenset({1}), frozenset({1})): "a dense first layer and MoE in every later layer, ",
+}
 # Documented weight-quantization envelopes, keyed by the quant_algorithms,
 # sm_versions, and weight_block_sizes constraints of a dense row. A row with any
 # other combination needs its own description here and in the support table.
@@ -1250,8 +1255,9 @@ _DOCUMENTED_DENSE_QUANTIZATION = {
 def _documented_constraints(profile: PostTransformProfile) -> str:
     """Render the support-table constraint text that a registry profile implies.
 
-    A MoE profile also names its pinned MoE backend and admitted routed-expert
-    partitions, and adds the MoE load balancer and DWDP to the exclusions.
+    A MoE profile also names its pinned MoE backend, MoE layer layout, and
+    admitted routed-expert partitions, and adds the MoE load balancer and DWDP
+    to the exclusions.
     """
     constraints = profile.runtime_constraints
     quantization = _DOCUMENTED_DENSE_QUANTIZATION[
@@ -1312,13 +1318,17 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
     )
     rope_description = _DOCUMENTED_ROPE[(constraints.rope_types, constraints.rope_fusion)]
     sliding_window_description = _DOCUMENTED_SLIDING_WINDOWS[constraints.sliding_windows]
+    moe_layer_layout_description = _DOCUMENTED_MOE_LAYER_LAYOUTS[
+        (constraints.first_k_dense_replaces, constraints.moe_layer_freqs)
+    ]
     embeddings = _format_documented_values(
         constraints.tied_word_embeddings,
         labels={False: "untied", True: "tied"},
     )
     return (
         f"Single-node {model_description}, {quantization}, "
-        f"{attention_backends} attention, {moe_backend_description}{rope_description}"
+        f"{attention_backends} attention, {moe_backend_description}"
+        f"{moe_layer_layout_description}{rope_description}"
         f"{sliding_window_description}, {embeddings} embeddings, {partition_description}, "
         f"PP/CP={pp_cp_sizes}, no LoRA, sparse attention, attention DP, {moe_exclusions}"
         "speculative mode, or separately loaded draft model"
@@ -3422,6 +3432,8 @@ def test_moe_profiles_pin_partition_and_one_backend_per_abi() -> None:
             assert constraints.moe_tp_sizes is None
             assert constraints.moe_ep_sizes is None
             assert constraints.moe_cluster_sizes is None
+            assert constraints.first_k_dense_replaces is None
+            assert constraints.moe_layer_freqs is None
             continue
         moe_profiles += 1
         (moe_backend,) = constraints.moe_backends
@@ -3687,6 +3699,12 @@ def test_phi4mm_root_does_not_inherit_phi3_profile() -> None:
     assert decision.reason is PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
 
 
+# The MoE layer layout that the qualified checkpoints of a model type declare,
+# for the profiles that pin it.
+_QUALIFIED_MOE_LAYER_LAYOUTS: dict[str, dict[str, int]] = {
+    "deepseek_v3": {"first_k_dense_replace": 1, "moe_layer_freq": 1},
+}
+
 # Runtime variants that no BF16 dense profile qualifies, with the dimension each
 # one is rejected on.
 _UNQUALIFIED_RUNTIME_VARIANTS = [
@@ -3832,6 +3850,7 @@ def test_bf16_profiles_reject_unqualified_runtime_variants(
         runtime_config=_bf16_dense_runtime_config(
             rope_fusion=supported_rope_fusion,
             sliding_window=supported_sliding_window,
+            **_QUALIFIED_MOE_LAYER_LAYOUTS.get(model_type, {}),
             **overrides,
         ),
     )
@@ -4069,7 +4088,9 @@ def test_bf16_profiles_reject_wrong_realized_dimension(
         speculative_mode=None,
         protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        runtime_config=_bf16_dense_runtime_config(**realized_overrides),
+        runtime_config=_bf16_dense_runtime_config(
+            **_QUALIFIED_MOE_LAYER_LAYOUTS.get(model_type, {}), **realized_overrides
+        ),
     )
 
     assert not decision.qualified
