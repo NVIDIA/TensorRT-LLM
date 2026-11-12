@@ -36,13 +36,16 @@ Differences from upstream:
 
 from __future__ import annotations
 
+import functools
 import os
-from typing import Optional
+import time
+from typing import Any, NamedTuple, Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.kernel_builder import BuildConfig, DynamicSpec, KernelBuilder
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
@@ -1001,6 +1004,312 @@ def _check_nvfp4_inputs(
             )
 
 
+# The op's name in KernelBuilder, and its kernels' names in a build's key.
+_BUILD_OP = "m3_sparse_decode"
+_KERNEL_NAMES = {
+    _gqa_sparse_decode_kernel: "decode",
+    _gqa_sparse_decode_pair_kernel: "pair_decode",
+    _merge_topk_attn_out_kernel: "merge",
+}
+
+
+class _Operand(NamedTuple):
+    """A tensor argument of the kernels and the strides passed for it. In a build, the
+    value is the tensor's dtype, which Triton compiles for as a 16-byte-aligned tensor."""
+
+    value: Any
+    strides: tuple
+
+
+class _Plan(NamedTuple):
+    """The launch geometry the op chooses for one batch."""
+
+    query_group_size: int
+    num_topk_chunks: int
+    use_linear_softmax: bool
+    launch_options: dict
+    merge_launch_options: dict
+
+
+class _DecodeCall(NamedTuple):
+    """A call's arguments but the top-k table and the batch they depend on."""
+
+    num_heads: int
+    num_kv_heads: int
+    gqa_group_size: int
+    head_dim: int
+    max_topk: int
+    decode_query_len: int
+    sm_scale: float
+    use_scale: bool
+    widen_q: bool
+    compute_dtype: Any
+    use_pdl: bool
+    kv_nvfp4: bool
+    scale_cols: int
+    capability: Optional[tuple[int, int]]
+    q: _Operand
+    k: _Operand
+    v: _Operand
+    kv_scale: _Operand
+    k_sc: _Operand
+    v_sc: _Operand
+    k_gs: _Operand
+    v_gs: _Operand
+    block_table: _Operand
+    seq_lens: _Operand
+    output: _Operand
+
+
+_TENSOR_FIELDS = (
+    "q",
+    "k",
+    "v",
+    "kv_scale",
+    "k_sc",
+    "v_sc",
+    "k_gs",
+    "v_gs",
+    "block_table",
+    "seq_lens",
+    "output",
+)
+# Every other field but sm_scale, which Triton does not specialize on.
+_SCALAR_FIELDS = tuple(
+    name for name in _DecodeCall._fields if name not in _TENSOR_FIELDS and name != "sm_scale"
+)
+
+
+def _plan(call: _DecodeCall, total_q: int, num_topk_chunks: Optional[int] = None) -> _Plan:
+    shape = dict(
+        total_q=total_q,
+        num_kv_heads=call.num_kv_heads,
+        gqa_group_size=call.gqa_group_size,
+        max_topk=call.max_topk,
+        decode_query_len=call.decode_query_len,
+        capability=call.capability,
+    )
+    query_group_size = _sm100f_nvfp4_query_group_size(**shape) if call.kv_nvfp4 else 1
+    if num_topk_chunks is None:
+        if query_group_size == 2:
+            measured_chunks = 8
+        else:
+            measured_chunks = _sm100f_nvfp4_num_topk_chunks(**shape) if call.kv_nvfp4 else None
+        num_topk_chunks = (
+            measured_chunks
+            if measured_chunks is not None
+            else resolve_num_topk_chunks(total_q, call.num_kv_heads, call.max_topk)
+        )
+    elif num_topk_chunks & (num_topk_chunks - 1):
+        raise ValueError(f"num_topk_chunks must be a power of two; got {num_topk_chunks}.")
+    use_linear_softmax = call.kv_nvfp4 and _sm100f_nvfp4_use_linear_softmax(**shape)
+    if query_group_size == 2:
+        launch_options = {"num_warps": 4, "num_stages": 1}
+    else:
+        launch_options = _sm100f_nvfp4_launch_options(**shape) if call.kv_nvfp4 else {}
+    merge_launch_options = _sm100f_nvfp4_merge_launch_options(**shape) if call.kv_nvfp4 else {}
+    return _Plan(
+        query_group_size, num_topk_chunks, use_linear_softmax, launch_options, merge_launch_options
+    )
+
+
+def _launches(
+    call: _DecodeCall, plan: _Plan, total_q: int, topk: _Operand, o: _Operand, lse: _Operand
+) -> list:
+    """The kernels the op launches for ``plan``, as ``(kernel, grid, args, kwargs)``: the
+    producer, then the split-K merge unless one chunk writes the output directly."""
+    pair = plan.query_group_size == 2
+    producer = _gqa_sparse_decode_pair_kernel if pair else _gqa_sparse_decode_kernel
+    # The pair path merges the two sorted selector rows on device. Equal blocks
+    # share one K/V dequantization; divergent blocks update only their owning
+    # query, so the optimization does not rely on runtime selection equality.
+    pair_kernel_options = (
+        {"QUERY_GROUP_SIZE": plan.query_group_size, "MAX_TOPK": call.max_topk} if pair else {}
+    )
+    pdl_launch = {"launch_pdl": True} if call.use_pdl else {}
+    launches = [
+        (
+            producer,
+            ((total_q // plan.query_group_size) * plan.num_topk_chunks, call.num_kv_heads),
+            (
+                call.q.value,
+                call.k.value,
+                call.v.value,
+                call.kv_scale.value,
+                call.k_sc.value,
+                call.v_sc.value,
+                call.k_gs.value,
+                call.v_gs.value,
+                topk.value,
+                o.value,
+                lse.value,
+                call.block_table.value,
+                call.seq_lens.value,
+                total_q,
+                call.gqa_group_size,
+                call.head_dim,
+                call.max_topk,
+                call.sm_scale,
+                call.decode_query_len,
+                *call.q.strides[:3],
+                *call.k.strides[:4],
+                *call.v.strides[:4],
+                *call.k_sc.strides[:2],
+                *call.v_sc.strides[:2],
+                *topk.strides[:3],
+                *o.strides,
+                *lse.strides,
+                call.block_table.strides[0],
+            ),
+            dict(
+                BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+                NUM_TOPK_CHUNKS=plan.num_topk_chunks,
+                USE_SCALE=call.use_scale,
+                WIDEN_Q=call.widen_q,
+                COMPUTE_DTYPE=call.compute_dtype,
+                USE_PDL=call.use_pdl,
+                KV_NVFP4=call.kv_nvfp4,
+                USE_LINEAR_SOFTMAX=plan.use_linear_softmax,
+                SCALE_COLS=call.scale_cols,
+                DIRECT_OUTPUT=plan.num_topk_chunks == 1,
+                **pair_kernel_options,
+                **pdl_launch,
+                **plan.launch_options,
+            ),
+        )
+    ]
+    if plan.num_topk_chunks != 1:
+        launches.append(
+            (
+                _merge_topk_attn_out_kernel,
+                (total_q, call.num_heads),
+                (
+                    o.value,
+                    lse.value,
+                    call.output.value,
+                    call.head_dim,
+                    *o.strides,
+                    *lse.strides,
+                    *call.output.strides[:3],
+                ),
+                dict(
+                    NUM_TOPK_CHUNKS=plan.num_topk_chunks,
+                    USE_PDL=call.use_pdl,
+                    **pdl_launch,
+                    **plan.merge_launch_options,
+                ),
+            )
+        )
+    return launches
+
+
+def _specialization(value: Any) -> Any:
+    """What Triton compiles a runtime argument for: a tensor's dtype, an integer's
+    equality to one and divisibility by 16, a float's kind."""
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return (value == 1, value % 16 == 0, value >= 2**31)
+    if isinstance(value, float):
+        return "float"
+    return str(value)
+
+
+def _batch_operands(call: _DecodeCall, topk: _Operand, total_q: int, local_total_q: int):
+    """The top-k table, partial output and LSE of a batch of ``local_total_q`` query
+    tokens, as dtypes, for a call that has ``total_q``."""
+    strides = topk.strides
+    # The selector's head-major table spans the step's query tokens; another layout
+    # does not depend on them.
+    if strides[0] == total_q * strides[1]:
+        strides = (local_total_q * strides[1], *strides[1:])
+    heads, head_dim = call.num_heads, call.head_dim
+    o = _Operand(torch.float32, (local_total_q * heads * head_dim, heads * head_dim, head_dim, 1))
+    lse = _Operand(torch.float32, (local_total_q * heads, heads, 1))
+    return _Operand(topk.value.dtype, strides), o, lse
+
+
+def _list_builds(call: _DecodeCall, topk: _Operand, total_q: int, shapes) -> list:
+    """One build per distinct kernel compile of the batches in ``shapes``, which
+    ``prebuild`` takes as ``(key, build)``."""
+    operands = [getattr(call, name) for name in _TENSOR_FIELDS] + [topk]
+    if any(op.value.data_ptr() % 16 for op in operands):
+        # A build compiles for aligned tensors; this call would not use its kernels.
+        return []
+    device = torch.cuda.current_device()
+    for kernel in _KERNEL_NAMES:
+        # Triton makes a kernel's per-device cache at its first call on the device. Make
+        # it on this thread: the workers' first compiles would otherwise each make one,
+        # and the kernels of all but the last would be lost.
+        caches = getattr(getattr(kernel, "fn", None), "device_caches", None)
+        if caches is not None:
+            _ = caches[device]
+    as_dtypes = call._replace(
+        **{
+            name: _Operand(getattr(call, name).value.dtype, getattr(call, name).strides)
+            for name in _TENSOR_FIELDS
+        }
+    )
+    builds = {}
+    for shape in shapes:
+        local_total_q = shape["local_batch"] * call.decode_query_len
+        plan = _plan(as_dtypes, local_total_q)
+        if local_total_q % plan.query_group_size or call.decode_query_len % plan.query_group_size:
+            continue
+        batch_topk, o, lse = _batch_operands(as_dtypes, topk, total_q, local_total_q)
+        if plan.num_topk_chunks == 1:
+            out = as_dtypes.output
+            o, lse = _Operand(out.value, (0, *out.strides[:3])), _Operand(out.value, (0, 0, 0))
+        for launch in _launches(as_dtypes, plan, local_total_q, batch_topk, o, lse):
+            kernel, _, args, kwargs = launch
+            # The runtime arguments as Triton specializes them; the constexprs and
+            # launch options by value.
+            key = (
+                _KERNEL_NAMES[kernel],
+                tuple(_specialization(arg) for arg in args),
+                tuple(sorted((name, str(value)) for name, value in kwargs.items())),
+            )
+            builds.setdefault(key, functools.partial(_compile, launch))
+    return list(builds.items())
+
+
+def _compile(launch: tuple) -> bool:
+    """Compile one launch's kernel without running it; True when that took a compile."""
+    kernel, grid, args, kwargs = launch
+    t0 = time.perf_counter()
+    kernel.warmup(*args, grid=grid, **kwargs)
+    # A kernel this process or Triton's cache already holds loads in milliseconds.
+    return time.perf_counter() - t0 >= 0.05
+
+
+def _queue_builds(
+    call: _DecodeCall, topk: _Operand, total_q: int, max_num_requests: Optional[int]
+) -> None:
+    """In a KernelBuilder build pass, queue the compiles that later calls with this
+    call's other arguments launch, for every batch of up to ``max_num_requests``."""
+    local_batch = total_q // call.decode_query_len
+    largest = max(local_batch, max_num_requests or local_batch)
+    # The batch-dependent top-k stride is left out, and so is the batch itself.
+    operands = [getattr(call, name) for name in _TENSOR_FIELDS]
+    operands.append(_Operand(topk.value, topk.strides[1:]))
+    signature = (
+        tuple(
+            (op.value.dtype, op.value.data_ptr() % 16 == 0, tuple(map(_specialization, op.strides)))
+            for op in operands
+        ),
+        tuple(str(getattr(call, name)) for name in _SCALAR_FIELDS),
+    )
+    KernelBuilder.get().prebuild(
+        _BUILD_OP,
+        signature,
+        BuildConfig((DynamicSpec("local_batch", tuple(range(1, largest + 1))),)),
+        {"local_batch": local_batch},
+        functools.partial(_list_builds, call, topk, total_q),
+    )
+
+
 @torch.no_grad()
 def minimax_m3_sparse_attn_decode(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
@@ -1019,6 +1328,7 @@ def minimax_m3_sparse_attn_decode(
     k_global_scale: Optional[torch.Tensor] = None,
     v_global_scale: Optional[torch.Tensor] = None,
     num_topk_chunks: Optional[int] = None,
+    max_num_requests: Optional[int] = None,
 ) -> None:
     """Block-sparse GQA decode attention, written into output in place.
 
@@ -1037,6 +1347,11 @@ def minimax_m3_sparse_attn_decode(
 
     num_topk_chunks overrides the split-K factor and exists for tests: the
     merged result must not depend on it.
+
+    In a KernelBuilder build pass, a call also queues on KernelBuilder's worker
+    threads the compiles of the kernels that calls with its other arguments launch,
+    for every batch of up to max_num_requests requests (only its own without it).
+    In a rehearsal, it then leaves output zero and launches nothing.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
@@ -1096,200 +1411,85 @@ def minimax_m3_sparse_attn_decode(
     else:
         compute_dtype = tl.float32
 
-    query_group_size = (
-        _sm100f_nvfp4_query_group_size(
-            total_q=total_q,
-            num_kv_heads=num_kv_heads,
-            gqa_group_size=gqa_group_size,
-            max_topk=max_topk,
-            decode_query_len=decode_query_len,
-            capability=capability,
-        )
-        if kv_nvfp4
-        else 1
-    )
-    if num_topk_chunks is None:
-        if query_group_size == 2:
-            measured_chunks = 8
-        else:
-            measured_chunks = (
-                _sm100f_nvfp4_num_topk_chunks(
-                    total_q=total_q,
-                    num_kv_heads=num_kv_heads,
-                    gqa_group_size=gqa_group_size,
-                    max_topk=max_topk,
-                    decode_query_len=decode_query_len,
-                    capability=capability,
-                )
-                if kv_nvfp4
-                else None
-            )
-        num_topk_chunks = (
-            measured_chunks
-            if measured_chunks is not None
-            else resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
-        )
-    elif num_topk_chunks & (num_topk_chunks - 1):
-        raise ValueError(f"num_topk_chunks must be a power of two; got {num_topk_chunks}.")
+    def operand(tensor: torch.Tensor) -> _Operand:
+        return _Operand(tensor, tuple(tensor.stride()))
 
-    direct_output = num_topk_chunks == 1
-    if direct_output:
+    call = _DecodeCall(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        gqa_group_size=gqa_group_size,
+        head_dim=head_dim,
+        max_topk=max_topk,
+        decode_query_len=decode_query_len,
+        sm_scale=sm_scale,
+        use_scale=use_scale,
+        widen_q=widen_q,
+        compute_dtype=compute_dtype,
+        use_pdl=_pdl_enabled(),
+        kv_nvfp4=kv_nvfp4,
+        scale_cols=scale_cols,
+        capability=capability if kv_nvfp4 else None,
+        q=operand(q),
+        k=operand(k_paged),
+        v=operand(v_paged),
+        kv_scale=operand(scale_arg),
+        k_sc=operand(k_sc_arg),
+        v_sc=operand(v_sc_arg),
+        k_gs=operand(k_gs_arg),
+        v_gs=operand(v_gs_arg),
+        block_table=operand(block_table),
+        seq_lens=operand(seq_lens),
+        output=operand(output),
+    )
+    topk = operand(topk_idx)
+    builder = KernelBuilder.get()
+    if (
+        num_topk_chunks is None
+        and builder.active()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _queue_builds(call, topk, total_q, max_num_requests)
+    if builder.rehearsing():
+        # A rehearsal's outputs are discarded, and its kernels build on KernelBuilder's
+        # worker threads.
+        output.zero_()
+        return
+
+    plan = _plan(call, total_q, num_topk_chunks)
+    if total_q % plan.query_group_size or decode_query_len % plan.query_group_size:
+        raise ValueError(
+            f"query group {plan.query_group_size} must divide total_q={total_q} and "
+            f"decode_query_len={decode_query_len}."
+        )
+    if plan.num_topk_chunks == 1:
         # With one chunk, acc_o is already normalized and final. Point the
         # producer at the caller's output and compile away the LSE store.
         # Keeping a real dummy pointer preserves Triton's pointer contract.
-        o_arg = output
-        lse_arg = output
-        o_strides = (0, output.stride(0), output.stride(1), output.stride(2))
-        lse_strides = (0, 0, 0)
+        o = _Operand(output, (0, output.stride(0), output.stride(1), output.stride(2)))
+        lse = _Operand(output, (0, 0, 0))
     else:
         # Persistent arena rather than torch.empty, so the partials keep one
         # address across CUDA graph replays. FP32 keeps the split-K factor from
         # perturbing the merged result.
         reserve = torch.cuda.is_current_stream_capturing()
-        o_arg = get_memory_buffers().get_buffer(
-            [num_topk_chunks, total_q, num_heads, head_dim],
-            torch.float32,
-            buffer_name="m3_sparse_decode_o_partial",
-            reserve_buffer=reserve,
-        )
-        lse_arg = get_memory_buffers().get_buffer(
-            [num_topk_chunks, total_q, num_heads],
-            torch.float32,
-            buffer_name="m3_sparse_decode_lse_partial",
-            reserve_buffer=reserve,
-        )
-        o_strides = tuple(o_arg.stride())
-        lse_strides = tuple(lse_arg.stride())
-
-    use_pdl = _pdl_enabled()
-    pdl_launch = {"launch_pdl": True} if use_pdl else {}
-    use_linear_softmax = kv_nvfp4 and _sm100f_nvfp4_use_linear_softmax(
-        total_q=total_q,
-        num_kv_heads=num_kv_heads,
-        gqa_group_size=gqa_group_size,
-        max_topk=max_topk,
-        decode_query_len=decode_query_len,
-        capability=capability,
-    )
-    if query_group_size == 2:
-        launch_options = {"num_warps": 4, "num_stages": 1}
-    else:
-        launch_options = (
-            _sm100f_nvfp4_launch_options(
-                total_q=total_q,
-                num_kv_heads=num_kv_heads,
-                gqa_group_size=gqa_group_size,
-                max_topk=max_topk,
-                decode_query_len=decode_query_len,
-                capability=capability,
+        o = operand(
+            get_memory_buffers().get_buffer(
+                [plan.num_topk_chunks, total_q, num_heads, head_dim],
+                torch.float32,
+                buffer_name="m3_sparse_decode_o_partial",
+                reserve_buffer=reserve,
             )
-            if kv_nvfp4
-            else {}
         )
-
-    # The pair path merges the two sorted selector rows on device. Equal blocks
-    # share one K/V dequantization; divergent blocks update only their owning
-    # query, so the optimization does not rely on runtime selection equality.
-    if total_q % query_group_size or decode_query_len % query_group_size:
-        raise ValueError(
-            f"query group {query_group_size} must divide total_q={total_q} and "
-            f"decode_query_len={decode_query_len}."
-        )
-
-    producer_kernel = (
-        _gqa_sparse_decode_pair_kernel if query_group_size == 2 else _gqa_sparse_decode_kernel
-    )
-    pair_kernel_options = (
-        {"QUERY_GROUP_SIZE": query_group_size, "MAX_TOPK": max_topk}
-        if query_group_size == 2
-        else {}
-    )
-    producer_kernel[
-        (total_q // query_group_size) * num_topk_chunks,
-        num_kv_heads,
-    ](
-        q,
-        k_paged,
-        v_paged,
-        scale_arg,
-        k_sc_arg,
-        v_sc_arg,
-        k_gs_arg,
-        v_gs_arg,
-        topk_idx,
-        o_arg,
-        lse_arg,
-        block_table,
-        seq_lens,
-        total_q,
-        gqa_group_size,
-        head_dim,
-        max_topk,
-        sm_scale,
-        decode_query_len,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_paged.stride(0),
-        k_paged.stride(1),
-        k_paged.stride(2),
-        k_paged.stride(3),
-        v_paged.stride(0),
-        v_paged.stride(1),
-        v_paged.stride(2),
-        v_paged.stride(3),
-        k_sc_arg.stride(0),
-        k_sc_arg.stride(1),
-        v_sc_arg.stride(0),
-        v_sc_arg.stride(1),
-        topk_idx.stride(0),
-        topk_idx.stride(1),
-        topk_idx.stride(2),
-        *o_strides,
-        *lse_strides,
-        block_table.stride(0),
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        NUM_TOPK_CHUNKS=num_topk_chunks,
-        USE_SCALE=use_scale,
-        WIDEN_Q=widen_q,
-        COMPUTE_DTYPE=compute_dtype,
-        USE_PDL=use_pdl,
-        KV_NVFP4=kv_nvfp4,
-        USE_LINEAR_SOFTMAX=use_linear_softmax,
-        SCALE_COLS=scale_cols,
-        DIRECT_OUTPUT=direct_output,
-        **pair_kernel_options,
-        **pdl_launch,
-        **launch_options,
-    )
-    if not direct_output:
-        merge_launch_options = (
-            _sm100f_nvfp4_merge_launch_options(
-                total_q=total_q,
-                num_kv_heads=num_kv_heads,
-                gqa_group_size=gqa_group_size,
-                max_topk=max_topk,
-                decode_query_len=decode_query_len,
-                capability=capability,
+        lse = operand(
+            get_memory_buffers().get_buffer(
+                [plan.num_topk_chunks, total_q, num_heads],
+                torch.float32,
+                buffer_name="m3_sparse_decode_lse_partial",
+                reserve_buffer=reserve,
             )
-            if kv_nvfp4
-            else {}
         )
-        _merge_topk_attn_out_kernel[(total_q, num_heads)](
-            o_arg,
-            lse_arg,
-            output,
-            head_dim,
-            *o_strides,
-            *lse_strides,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            NUM_TOPK_CHUNKS=num_topk_chunks,
-            USE_PDL=use_pdl,
-            **pdl_launch,
-            **merge_launch_options,
-        )
+    for kernel, grid, args, kwargs in _launches(call, plan, total_q, topk, o, lse):
+        kernel[grid](*args, **kwargs)
 
 
 __all__ = [

@@ -966,6 +966,81 @@ def test_nvfp4_sparse_decode_fp8_q_matches_reference():
 
 
 @skip_not_sm100
+def test_a_rehearsal_has_the_kernels_of_every_batch_size_built_for_the_later_launches(monkeypatch):
+    """One call in a KernelBuilder rehearsal launches nothing and has KernelBuilder's
+    workers compile the kernels of every batch of up to max_num_requests requests; each
+    batch then launches without a compile and matches the reference."""
+    import threading
+    from collections import defaultdict
+
+    import triton
+
+    from tensorrt_llm._torch import kernel_builder
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import (
+        triton_sparse_decode,
+    )
+
+    # The op's kernels start with nothing compiled in this process.
+    for kernel in triton_sparse_decode._KERNEL_NAMES:
+        monkeypatch.setattr(kernel.fn, "device_caches", defaultdict(kernel.fn.create_binder))
+    compiled_on = []
+
+    def listener(*, src, metadata, metadata_group, times, cache_hit):
+        compiled_on.append(threading.current_thread().name)
+
+    monkeypatch.setattr(triton.knobs.compilation, "listener", listener)
+    builder = kernel_builder.KernelBuilder(threads=4, enabled=True, rehearse=True)
+    monkeypatch.setattr(kernel_builder.KernelBuilder, "_instance", builder)
+
+    max_batch = 6
+    case = _make_nvfp4_inputs(
+        [700] * max_batch, num_kv_heads=4, group=16, decode_query_len=4, seed=29
+    )
+    q = case.q.to(torch.float8_e4m3fn)
+
+    def run(local_batch, **kwargs):
+        total_q = local_batch * case.decode_query_len
+        out = torch.full((total_q, *q.shape[1:]), float("nan"), device="cuda", dtype=torch.bfloat16)
+        minimax_m3_sparse_attn_decode(
+            q[:total_q].contiguous(),
+            case.k_paged,
+            case.v_paged,
+            case.topk_idx[:, :total_q].contiguous(),
+            case.block_table[:local_batch],
+            case.seq_lens[:local_batch],
+            sm_scale=HEAD_DIM**-0.5,
+            output=out,
+            decode_query_len=case.decode_query_len,
+            **case.scales,
+            **kwargs,
+        )
+        return out
+
+    with builder.rehearsal():
+        assert (run(1, max_num_requests=max_batch) == 0).all()
+    builder.join()
+    stats = builder.stats("m3_sparse_decode")
+    assert stats.submitted > 1 and stats.failed == 0
+    assert compiled_on and all(name.startswith("tllm-kernel-builder") for name in compiled_on)
+
+    compiled_on.clear()
+    for local_batch in range(1, max_batch + 1):
+        total_q = local_batch * case.decode_query_len
+        expected = _reference_sparse_decode(
+            q[:total_q].to(torch.bfloat16),
+            case.k_ref,
+            case.v_ref,
+            case.topk_idx[:, :total_q],
+            case.block_table[:local_batch],
+            case.seq_lens[:local_batch],
+            sm_scale=HEAD_DIM**-0.5,
+            decode_query_len=case.decode_query_len,
+        )
+        torch.testing.assert_close(run(local_batch).float(), expected, rtol=3e-2, atol=3e-2)
+    assert compiled_on == []
+
+
+@skip_not_sm100
 def test_nvfp4_paged_scale_layouts_are_the_ones_the_kernel_reads():
     """Lock the two block-scale layouts and the nibble order.
 
