@@ -1121,6 +1121,91 @@ def test_gdn_verify_agrees_with_the_engines_stock_replay(member, n, monkeypatch)
             assert torch.equal(x[0], y[0])
 
 
+#: Requests the precompile test walks: past every `_GDN_REPLAY_HT_LAUNCH` bucket and the partition.
+GVR_MAX_REQUESTS = 96
+
+
+@pytest.mark.parametrize("pdl", [True, False], ids=["pdl", "no_pdl"])
+@pytest.mark.parametrize("member", list(GVR_GEOM))
+def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(member, pdl, monkeypatch):
+    """The CuTe replay kernels the bind precompiles (`_gdn_replay_launches`) are exactly those
+    `_gdn_verify` launches over 1..`GVR_MAX_REQUESTS` requests, from a generation-only step
+    (the gated norm folded where `_gdn_verify_folds_norm` says) and from a mixed step's verify
+    rows (never folded). Kernels are recorded, not compiled or run."""
+    monkeypatch.setattr(_m, "get_env_enable_pdl", lambda: pdl)
+    monkeypatch.setattr(
+        _m,
+        "_GDN_REPLAY_HT_LAUNCH",
+        tuple((bound, p and pdl, mapping) for bound, p, mapping in _m._GDN_REPLAY_HT_LAUNCH),
+    )
+    launched = []
+    # An empty cache: every launch reaches `_compile`, which records the key instead.
+    monkeypatch.setattr(cr, "_COMPILED", {})
+    monkeypatch.setattr(cr, "_compile", lambda key, kern: launched.append(key) or (lambda *a: None))
+    # The conv runs as its own kernel unless folded; the fold's operands are the engine's layout.
+    monkeypatch.setattr(_m, "causal_conv1d_token_major", lambda mq, *a, **k: mq.contiguous())
+    monkeypatch.setattr(_m, "gdn_conv_fold_supported", lambda *a: True)
+    h, hv = GVR_GEOM[member]
+    key_dim, value_dim = h * GVR_K, hv * GVR_V
+    conv_dim = 2 * key_dim + value_dim
+    bf, nmax, t = torch.bfloat16, GVR_MAX_REQUESTS, GVR_T
+    slots = nmax + 1
+    old = {
+        0: (
+            torch.zeros(slots, 2, GVR_HIST, hv, GVR_V, dtype=bf, device=DEV),
+            torch.zeros(slots, 2, GVR_HIST, h, GVR_K, dtype=bf, device=DEV),
+            torch.zeros(slots, 2, hv, GVR_HIST, device=DEV),
+            torch.zeros(slots, 2, hv, GVR_HIST, device=DEV),
+        )
+    }
+    zeros_i32 = torch.zeros(slots, dtype=torch.int32, device=DEV)
+    pools = types.SimpleNamespace(
+        ssm={0: torch.zeros(slots, hv, GVR_V, GVR_K, dtype=bf, device=DEV)},
+        conv={0: torch.zeros(slots, conv_dim, GVR_CONV_W - 1, dtype=bf, device=DEV)},
+    )
+    core = types.SimpleNamespace(
+        conv_dim=conv_dim,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        num_k_heads=h,
+        head_k_dim=GVR_K,
+        num_v_heads=hv,
+        head_v_dim=GVR_V,
+        eps=1e-6,
+        _bound=types.SimpleNamespace(
+            pools=pools,
+            int_conv={0: torch.zeros(nmax, t, conv_dim, GVR_CONV_W - 1, dtype=bf, device=DEV)},
+            replay=_m._Replay(old, zeros_i32, zeros_i32, GVR_HIST, t),
+        ),
+    )
+    layer = types.SimpleNamespace(
+        conv_w=torch.zeros(conv_dim, GVR_CONV_W, dtype=bf, device=DEV),
+        a_log=torch.zeros(hv, device=DEV),
+        dt_bias=torch.zeros(hv, device=DEV),
+        gnorm=torch.ones(GVR_V, dtype=bf, device=DEV),
+    )
+    proj = torch.zeros(nmax * t, conv_dim + value_dim + 2 * hv, dtype=bf, device=DEV)
+    for n in range(1, nmax + 1):
+        mq, z, a, b = torch.split(proj[: n * t], [conv_dim, value_dim, hv, hv], 1)
+        rows = torch.arange(1, n + 1, dtype=torch.int32, device=DEV)
+        partitioned = n >= _m.CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+        work = zeros_i32[:n] if partitioned else None
+        verify = (torch.arange(n, dtype=torch.int32, device=DEV), work, work, partitioned)
+        _m._gdn_verify(core, mq, a, b, 0, layer, rows, n, t, verify)  # a mixed step's rows
+        fold_norm = _m._gdn_verify_folds_norm(core, n, t)
+        _m._gdn_verify(core, mq, a, b, 0, layer, rows, n, t, verify, z=z if fold_norm else None)
+    want = set(launched)
+    got = cr.precompile_keys(t, h, hv, nmax, **_m._gdn_replay_launches(core, t))
+    assert got == want, (
+        f"precompiled but never launched: {len(got - want)}, launched but not precompiled: "
+        f"{len(want - got)}"
+    )
+    if pdl and hv * 2 <= _m._GDN_REPLAY_PDL_MAX_HEAD_ROWS:
+        assert not any(not dict(key)["pdl"] and dict(key)["tpc"] == 2 for key in got), (
+            "with PDL on, a batch of up to two requests never launches without it"
+        )
+
+
 # ------------------------------------------- causal_conv1d_token_major__verify ---
 
 

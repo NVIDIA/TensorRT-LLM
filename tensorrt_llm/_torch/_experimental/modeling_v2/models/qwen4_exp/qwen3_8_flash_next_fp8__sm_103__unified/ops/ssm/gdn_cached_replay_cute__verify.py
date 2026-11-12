@@ -2223,49 +2223,59 @@ def _kernel_kw(
     )
 
 
-def precompile(
+def precompile_keys(
     t: int,
     h: int,
     hv: int,
     max_requests: int,
     *,
-    pdl: bool,
     partition_from: int,
-    min_requests: int = 1,
-    launch: Optional[Callable[[int], tuple]] = None,
+    launch: Callable[[int], tuple],
     conv_fold: Optional[Callable[[int], bool]] = None,
-) -> int:
-    """Compile every kernel a verify step of `min_requests`..`max_requests` requests launches,
+    fold_norm: Optional[Callable[[int], bool]] = None,
+    norm_eps: Optional[float] = None,
+) -> set:
+    """The `_COMPILED` key of every kernel a verify step of 1..`max_requests` requests launches,
     the way a target calls this entry: work items, and with them no in-kernel commit, from
-    `partition_from` requests on; the q/k L2 norm and the gating in-kernel; bf16 `a` / `b`; no
-    `gated_norm`. By default the default mapping at `pdl` without `conv_fold`; `launch(n)`
-    instead returns `(pdl, config)` for a batch of `n` requests and `conv_fold(n)` whether it
-    folds the conv. A compile costs 5-10 s, so a target runs this at bind, before any step: the
-    captured decode graphs do not reach every mapping (padded graphs skip 9 to 15 requests,
-    which an eager mixed step carries). Returns the number of distinct kernels."""
+    `partition_from` requests on; the q/k L2 norm and the gating in-kernel; bf16 `a` / `b`.
+    `launch(n)` returns `(pdl, config)` for a batch of `n` requests (config None: the default
+    mapping), `conv_fold(n)` whether it folds the conv, and `fold_norm(n)` whether a
+    generation-only batch folds the gated norm (epsilon `norm_eps`); a mixed step's verify rows
+    never fold it, so such a batch reaches both kernels."""
     keys = set()
-    for n in range(min_requests, max_requests + 1):
+    for n in range(1, max_requests + 1):
         partitioned = n >= partition_from
-        n_pdl, config = launch(n) if launch is not None else (pdl, None)
-        kw = _kernel_kw(
-            n,
-            t,
-            h,
-            hv,
-            commit=not partitioned,
-            pdl=n_pdl,
-            l2norm=True,
-            gating=True,
-            g_f32=False,
-            b_f32=False,
-            work_items=partitioned,
-            config=config,
-            fold=conv_fold is not None and conv_fold(n),
-        )
-        key = tuple(sorted(kw.items()))
-        if key not in keys:
-            keys.add(key)
-            _compile(key, _Replay(**kw))
+        n_pdl, config = launch(n)
+        norms = [None] + ([norm_eps] if fold_norm is not None and fold_norm(n) else [])
+        for eps in norms:
+            kw = _kernel_kw(
+                n,
+                t,
+                h,
+                hv,
+                commit=not partitioned,
+                pdl=bool(n_pdl),
+                l2norm=True,
+                gating=True,
+                g_f32=False,
+                b_f32=False,
+                work_items=partitioned,
+                config=config,
+                fold=conv_fold is not None and conv_fold(n),
+                norm_eps=eps,
+            )
+            keys.add(tuple(sorted(kw.items())))
+    return keys
+
+
+def precompile(t: int, h: int, hv: int, max_requests: int, **launches) -> int:
+    """Compile every kernel of `precompile_keys(t, h, hv, max_requests, **launches)`. A compile
+    costs 5-10 s, so a target runs this at bind, before any step: the captured decode graphs do
+    not reach every mapping (padded graphs skip 9 to 15 requests, which an eager mixed step
+    carries). Returns the number of distinct kernels."""
+    keys = precompile_keys(t, h, hv, max_requests, **launches)
+    for key in keys:
+        _compile(key, _Replay(**dict(key)))
     return len(keys)
 
 
