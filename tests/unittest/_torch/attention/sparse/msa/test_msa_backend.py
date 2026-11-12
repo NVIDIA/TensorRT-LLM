@@ -22,6 +22,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import (
+    msa_kv_update as kv_update_module,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
     fused_write_layer_caches,
     fused_write_layer_caches_nvfp4,
@@ -42,26 +45,22 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
 )
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "tail_in_forward", [True, False], ids=["tail_in_forward", "tail_in_prepare"]
-)
 @pytest.mark.parametrize("empty_state", ["empty_batch", "no_requests", "no_lengths"])
 def test_msa_metadata_clears_padded_cache_slot_tail(
-    monkeypatch: pytest.MonkeyPatch, empty_state: str, tail_in_forward: bool
+    monkeypatch: pytest.MonkeyPatch, empty_state: str
 ) -> None:
     """A smaller replay must not reuse the previous step's live cache slots."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
-    monkeypatch.setattr(msa_backend, "TAIL_FILL_IN_FORWARD", tail_in_forward)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_block_table_uploads = {}
     metadata._msa_buffers_ready = True
     metadata.request_ids = [0]
     metadata.kv_cache_manager = SimpleNamespace(
@@ -85,7 +84,7 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
         # live count off it.
         metadata._num_tokens = count
         metadata._build_msa_fields()
-        # TAIL_FILL_IN_FORWARD: the forward (on_update_kv_lens) fills the tail before anything reads it.
+        # The forward (on_update_kv_lens) fills the tail before anything reads it.
         metadata._fill_tail_in_forward()
         assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
             4 - count
@@ -114,6 +113,7 @@ def test_msa_metadata_stages_query_rows_for_dynamic_kv_lens(
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_block_table_uploads = {}
     metadata._msa_buffers_ready = True
     # One four-token page per request, page id 10 + request id.
     metadata.kv_cache_manager = SimpleNamespace(
@@ -1050,6 +1050,9 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
 
     class FakeMetadata:
         _msa_prefill_identity = None
+        # A long decode step: no identity selection.
+        _msa_short_ok = False
+        msa_short_table = None
 
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
@@ -1523,7 +1526,8 @@ def test_nvfp4_step_plans_skip_the_sparse_attention_plan(monkeypatch, dtype):
         msa_backend, "require_msa_module", lambda: SimpleNamespace(fmha_sm100_plan=fmha_sm100_plan)
     )
     monkeypatch.setattr(msa_backend, "_cache_device", lambda metadata: torch.device("cpu"))
-    metadata = _span_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
+    # Longer than the top-k blocks' span: a short step would select every block and plan no proxy pass.
+    metadata = _span_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(16 * 128 + 5, 17 * 128 + 7))
     metadata._set_decode_span()
     metadata._msa_fields_ready = True
     metadata._msa_params = SimpleNamespace(
@@ -2082,7 +2086,7 @@ def test_on_update_kv_lens_is_a_noop_without_speculative_decoding(monkeypatch):
 
 
 class _RecordingKvUpdate:
-    """A model's one-launch KV update (MsaKvUpdate) that takes or declines every step."""
+    """Stands in for MSA's one-launch KV update (kernels.msa_kv_update): takes or declines every step."""
 
     def __init__(self, taken: bool) -> None:
         self._taken = taken
@@ -2124,13 +2128,28 @@ class _RecordingKvUpdate:
         return self._taken
 
 
-def test_default_msa_policy_has_no_kv_update(monkeypatch):
+def test_the_fused_kv_update_declines_host_buffers(monkeypatch):
+    """The fused kernel reads CUDA int32 buffers only: on host buffers it declines, writing nothing."""
     metadata = _kv_lens_update_metadata(
-        monkeypatch, qo_lens=(1,), kv_staged=(5,), kv_corrected=(5,), page_size=4
+        monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
     )
-
-    assert metadata.msa_policy == MsaRuntimePolicy()
-    assert metadata.msa_policy.kv_update is None
+    before = metadata.msa_out_cache_loc.clone()
+    assert not kv_update_module.msa_kv_update(
+        metadata.kv_lens_cuda,
+        metadata.msa_kv_lens_staged,
+        metadata.seq_lens_cuda,
+        metadata.msa_q_batch_row,
+        metadata.msa_q_intra,
+        metadata.msa_block_table,
+        4,
+        2,
+        5,
+        metadata.msa_seq_lens_cuda,
+        None,
+        metadata.msa_out_cache_loc,
+        metadata.msa_n_valid_blocks,
+    )
+    assert torch.equal(metadata.msa_out_cache_loc, before)
 
 
 @pytest.mark.parametrize("prefill_counts", [False, True])
@@ -2144,11 +2163,11 @@ def test_a_taken_kv_update_replaces_the_rederivation(monkeypatch, prefill_counts
         prefill_counts=prefill_counts,
     )
     kv_update = _RecordingKvUpdate(taken=True)
-    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+    monkeypatch.setattr(kv_update_module, "msa_kv_update", kv_update)
 
     metadata.on_update_kv_lens()
 
-    # The hook owns the update: the metadata's own re-derivation does not run.
+    # The fused kernel owns the update: the metadata's torch re-derivation does not run.
     assert metadata.msa_seq_lens_cuda.tolist() == [9, 12]
     assert metadata.msa_out_cache_loc.tolist() == [-1] * 8
     assert metadata.msa_n_valid_blocks.tolist() == [0] * 8
@@ -2174,7 +2193,7 @@ def test_a_declined_kv_update_falls_back_to_the_rederivation(monkeypatch):
         monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
     )
     kv_update = _RecordingKvUpdate(taken=False)
-    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+    monkeypatch.setattr(kv_update_module, "msa_kv_update", kv_update)
 
     metadata.on_update_kv_lens()
 
@@ -2190,7 +2209,7 @@ def test_kv_update_is_not_called_without_dynamic_kv_lens(monkeypatch):
     )
     metadata._msa_kv_lens_dynamic = False
     kv_update = _RecordingKvUpdate(taken=True)
-    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+    monkeypatch.setattr(kv_update_module, "msa_kv_update", kv_update)
 
     metadata.on_update_kv_lens()
 

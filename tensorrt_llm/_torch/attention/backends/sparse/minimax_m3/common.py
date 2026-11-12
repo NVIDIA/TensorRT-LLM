@@ -5,7 +5,8 @@
 Both the Triton reference and the MSA (fmha_sm100) path share these
 backend-neutral pieces: the lowered parameter and per-rank kernel config
 bundles, block-priority sentinels, the paged-cache slot mapping builder, and
-the dense/sparse layer split the model and the KV cache manager both read.
+the dense/sparse layer split the model and the KV cache manager both read, and
+the copy sites of the MSA metadata and KV cache.
 MSA-only helpers live in :mod:`.kernels.msa_utils`.
 """
 
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Tuple
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySiteEnum, Direction
 from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory
 
 from ..params import SparseMetadataParams, SparseParams
@@ -29,6 +31,33 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm.mapping import Mapping
+
+
+class MsaCopySite(CopySiteEnum):
+    """Copy sites of the MiniMax-M3 MSA metadata and KV cache (see ``device_copy``)."""
+
+    # Decode-only steps: the identity selection table and the per-token valid-block counts.
+    SHORT_TABLE = ("msa.short_table", Direction.H2D)
+    N_VALID_BLOCKS = ("msa.n_valid_blocks", Direction.H2D)
+    # New tokens' cache slots, and the -1 fill of the slots past them.
+    OUT_CACHE_LOC = ("msa.out_cache_loc", Direction.H2D)
+    OUT_CACHE_LOC_TAIL = ("msa.out_cache_loc_tail", Direction.FILL)
+    # Flattened page table (fmha_sm100 only), 2-D page table, per-request attended lengths.
+    KV_INDICES = ("msa.kv_indices", Direction.H2D)
+    # Read on the device only inside the forward: a pool with sub-pages (uniform_subpages_per_slot > 0) expands it
+    # into the sub-page table there (msa_subpage_rows), so a plan that merges it needs no flush_after barrier.
+    BLOCK_TABLE = ("msa.block_table", Direction.H2D)
+    # MSA stages the KV prefix sums from the host lengths, so nothing reads this on the device before the replay.
+    SEQ_LENS = ("msa.seq_lens", Direction.H2D)
+    # Host-staged query lengths and query / KV prefix sums.
+    QO_LENS = ("msa.qo_lens", Direction.H2D)
+    CU_Q_LENS = ("msa.cu_q_lens", Direction.H2D)
+    CU_KV_LENS = ("msa.cu_kv_lens", Direction.H2D)
+    # Inputs of on_update_kv_lens: each query token's request row and offset, and the staged KV lengths.
+    Q_BATCH_ROW = ("msa.q_batch_row", Direction.H2D)
+    Q_INTRA = ("msa.q_intra", Direction.H2D)
+    KV_LENS_STAGED = ("msa.kv_lens_staged", Direction.H2D)
+
 
 # Sentinel scores that force init and local blocks into the top-k regardless
 # of their computed score. Init outranks local.

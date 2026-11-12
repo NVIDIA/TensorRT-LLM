@@ -1003,6 +1003,18 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """Return a runtime copy with checkpoint-derived fields populated."""
         return self
 
+    def short_long_seq_len_threshold(self,
+                                     tokens_per_gen_step: int = 0
+                                     ) -> Optional[int]:
+        """The total sequence length that splits the decode CUDA graphs into
+        short and long families, or None for one family.
+
+        ``tokens_per_gen_step`` is one generation step's tokens: the graph key
+        estimates a sequence's length from host token counts, which under the
+        overlap scheduler miss up to the in-flight step's accepted tokens.
+        """
+        return None
+
 
 class SeqLenAwareSparseAttentionConfig(BaseSparseAttentionConfig):
     """Sparse attention config with sequence-length dependent behavior."""
@@ -1019,6 +1031,14 @@ class SeqLenAwareSparseAttentionConfig(BaseSparseAttentionConfig):
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """Whether to capture separate CUDA graphs for short and long sequences."""
         return False
+
+    def short_long_seq_len_threshold(self,
+                                     tokens_per_gen_step: int = 0
+                                     ) -> Optional[int]:
+        """``seq_len_threshold`` when the config asks for the split."""
+        if self.needs_separate_short_long_cuda_graphs():
+            return self.seq_len_threshold
+        return None
 
 
 class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
@@ -1268,6 +1288,20 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
     def get_indices_block_size(self) -> int:
         return self.sparse_block_size
+
+    def short_long_seq_len_threshold(self,
+                                     tokens_per_gen_step: int = 0
+                                     ) -> Optional[int]:
+        """MSA: the top-k blocks' token span less ``tokens_per_gen_step``.
+
+        Within that span a decode step selects every valid block, so the short
+        graph family runs the identity selection and every token it attends
+        must fit in the top-k blocks. The Triton implementation has one family.
+        """
+        if self.implementation != "msa":
+            return None
+        span = self.sparse_topk_blocks * self.sparse_block_size
+        return span - tokens_per_gen_step
 
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import \

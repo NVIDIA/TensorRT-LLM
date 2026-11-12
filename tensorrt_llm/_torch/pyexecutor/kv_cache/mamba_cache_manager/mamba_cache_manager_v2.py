@@ -35,7 +35,7 @@ from typing import (
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -1097,6 +1097,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         state_index_capacity = self.max_batch_size + self._num_reserved_dummy_slots
         self._state_indices_buffer = DeviceCopyBuffer(
             torch.zeros([state_index_capacity], dtype=torch.int32, device="cuda"),
+            site=CopySite.MAMBA_STATE_INDICES,
             pin_memory=prefer_pinned(),
         )
         self._host_state_indices = torch.zeros(
@@ -1115,6 +1116,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._dummy_request_mask_buffer = DeviceCopyBuffer(
             torch.zeros(state_index_capacity, dtype=torch.bool, device="cuda"),
+            site=CopySite.MAMBA_DUMMY_REQUEST_MASK,
             pin_memory=prefer_pinned(),
         )
         self._dummy_request_mask_host = torch.zeros(

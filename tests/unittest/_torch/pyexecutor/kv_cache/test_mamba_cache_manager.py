@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_TOKENS_PER_BLOCK,
@@ -82,6 +81,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -1899,7 +1899,9 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     mgr = object.__new__(CppMambaHybridCacheManager)
     mgr.local_num_mamba_layers = 1
     mgr._use_replay_state_update = True
-    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, True]))
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.tensor([False, True]), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     mgr.prev_num_accepted_tokens = torch.tensor([13, 7], dtype=torch.int32)
     mgr.cache_buf_idx = torch.tensor([1, 0], dtype=torch.int32)
     mgr.replay_step_width = 4
@@ -1917,7 +1919,9 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
 
     mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
     if not hasattr(mgr, "_dummy_request_mask"):
-        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(64, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+        )
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=2, num_contexts=0),
         torch.tensor([3, 2], dtype=torch.int32),
@@ -3470,7 +3474,9 @@ def test_cpp_hybrid_state_indices_skip_context_placeholders(
     mgr.recurrent_states_pool_index = 0
     mgr.blocks_per_window = {LinearCacheType.RECURRENT_STATES.value: (1264, 0)}
     mgr._host_state_indices = torch.zeros(1, dtype=torch.int32)
-    mgr._state_indices_buffer = DeviceCopyBuffer(torch.zeros(1, dtype=torch.int32))
+    mgr._state_indices_buffer = DeviceCopyBuffer(
+        torch.zeros(1, dtype=torch.int32), site=CopySite.MAMBA_STATE_INDICES
+    )
     mgr._row_indices = torch.arange(1, dtype=torch.long)
     mgr._request_id_to_state_index = {}
     mgr._request_id_to_is_dummy = {}
@@ -5866,13 +5872,17 @@ def test_v2_kda_replay_policy_records_acceptance_and_skips_dummy_rows():
     )
     policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
     policy.intermediate_indices = torch.arange(3, dtype=torch.int32)
-    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, False, True]))
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.tensor([False, False, True]), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     mgr._kda_replay = policy
     mgr._speculative_state = policy
 
     mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
     if not hasattr(mgr, "_dummy_request_mask"):
-        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(64, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+        )
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=3, num_contexts=1),
         torch.tensor([1, 3, 2], dtype=torch.int32),
@@ -5897,7 +5907,9 @@ def test_v2_kda_replay_policy_resets_context_slots():
     policy.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
     mgr._kda_replay = policy
     mgr._speculative_state = policy
-    mgr._state_indices_buffer = DeviceCopyBuffer(torch.tensor([2, 1], dtype=torch.int32))
+    mgr._state_indices_buffer = DeviceCopyBuffer(
+        torch.tensor([2, 1], dtype=torch.int32), site=CopySite.MAMBA_STATE_INDICES
+    )
     mgr._host_state_indices = torch.tensor([2, 1], dtype=torch.int32)
 
     mgr._host_state_indices = mgr.cuda_state_indices.clone()
@@ -5987,8 +5999,12 @@ def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft
     mgr._kda_replay.acceptance_pending = set()
     mgr._kda_replay.unseeded_requests = set()
     mgr._host_state_indices = torch.zeros(num_slots, dtype=torch.int32)
-    mgr._state_indices_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.int32))
-    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.bool))
+    mgr._state_indices_buffer = DeviceCopyBuffer(
+        torch.zeros(num_slots, dtype=torch.int32), site=CopySite.MAMBA_STATE_INDICES
+    )
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.zeros(num_slots, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     mgr._dummy_request_mask_host = torch.zeros(num_slots, dtype=torch.bool)
     mgr.kv_cache_map = {}
     mgr.ssm_layer_group_id = 0
@@ -7335,7 +7351,9 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
     policy.prev_num_accepted_tokens = torch.zeros(batch_size, dtype=torch.int32)
     policy.cache_buf_idx = torch.zeros(batch_size, dtype=torch.int32)
     policy.intermediate_indices = torch.arange(batch_size, dtype=torch.int32)
-    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(batch_size, dtype=torch.bool))
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.zeros(batch_size, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     policy.intermediate_conv = torch.empty((1, batch_size, 1))
     policy.old_x = torch.empty(0)
     policy.old_B = torch.empty(0)
@@ -7363,7 +7381,9 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
 
     mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
     if not hasattr(mgr, "_dummy_request_mask"):
-        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(64, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+        )
     mgr.update_mamba_states(
         SimpleNamespace(
             num_seqs=batch_size,
@@ -7397,7 +7417,9 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
         103: False,
     }
     policy = ReplayHistory(tokens_per_gen_step=5)
-    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.bool))
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.zeros(4, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     mgr._dummy_request_mask_host = torch.zeros(4, dtype=torch.bool)
     policy.prev_num_accepted_tokens = torch.full((4,), 13, dtype=torch.int32)
     policy.cache_buf_idx = torch.ones(4, dtype=torch.int32)
@@ -7422,7 +7444,9 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
 
     mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
     if not hasattr(mgr, "_dummy_request_mask"):
-        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(64, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+        )
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=4, num_contexts=1),
         torch.tensor([1, 3, 3, 3], dtype=torch.int32),
@@ -7458,7 +7482,9 @@ def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
 
     mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
     if not hasattr(mgr, "_dummy_request_mask"):
-        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(64, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+        )
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=3, num_contexts=1),
         torch.tensor([1, 2, 3], dtype=torch.int32),
@@ -7887,7 +7913,8 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
     )
     # Stale device indices: the reset must take its slots from _host_state_indices.
     mgr._state_indices_buffer = DeviceCopyBuffer(
-        torch.full((num_slots,), 7, dtype=torch.int32, device=device)
+        torch.full((num_slots,), 7, dtype=torch.int32, device=device),
+        site=CopySite.MAMBA_STATE_INDICES,
     )
     mgr._host_state_indices = torch.tensor([5, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
     mgr._request_id_to_state_index = {10: 4, 11: 2}
@@ -8028,7 +8055,7 @@ def test_v2_state_index_setup_skips_unchanged_uploads(monkeypatch):
     keep values the host never sent. A changed step uploads both again."""
     # The test writes the buffers behind _setup_state_indices to see the skip, which the check of skipped copies
     # reports.
-    monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", False)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.device_copy.CHECK_MODE", False)
 
     class StateCache:
         def __init__(self, slot: int) -> None:

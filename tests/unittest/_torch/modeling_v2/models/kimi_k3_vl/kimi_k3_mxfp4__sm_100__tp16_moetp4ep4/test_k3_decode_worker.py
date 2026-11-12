@@ -31,7 +31,6 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import (
     op as ctx_op,
 )
@@ -52,6 +51,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KimiK3HybridCacheManager,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
@@ -112,7 +112,9 @@ def _kda_manager(cls=KimiK3HybridCacheManager):
     mgr = object.__new__(cls)
     mgr._kda_replay = KDAReplayState(K)
     mgr._kda_replay.prev_num_accepted_tokens = torch.zeros(4, dtype=torch.int32)
-    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.bool))
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.zeros(4, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     return mgr
 
 

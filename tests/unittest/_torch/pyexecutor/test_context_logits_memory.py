@@ -357,7 +357,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
     runner = SimpleNamespace(
         _model=model,
         _mapping=mapping,
-        runtime_hooks=SimpleNamespace(pack_step_inputs=False),
+        _copier=None,
         _context_logits_heads=context_logits_heads(model, mapping, is_spec_decode=False),
         _config=SimpleNamespace(is_spec_decode=False, spec_config=None, use_mrope=False),
         _graphs=graphs,

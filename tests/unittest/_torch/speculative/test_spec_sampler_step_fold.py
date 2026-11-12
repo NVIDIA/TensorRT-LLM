@@ -269,7 +269,6 @@ def test_store_copies_go_on_the_side_stream_when_the_sampler_stored_the_rows():
 
     state = sampler.sample_async(scheduled, outputs, [])
 
-    assert not sampler.d2h_side_stream_copies
     assert state.sampler_event.side_stream_event is not None
 
 
@@ -285,7 +284,6 @@ def test_side_stream_store_copies_match_the_main_stream_copies(draft_width):
     assert main_state.sampler_event.side_stream_event is None
     on_main = _host_outputs(main_state)
     sampler = _sampler()
-    sampler.d2h_side_stream_copies = True
 
     state = sampler.sample_async(scheduled, outputs, [])
 
@@ -298,7 +296,6 @@ def test_side_stream_store_copies_match_the_main_stream_copies(draft_width):
 def test_a_fold_that_stored_the_rows_keeps_the_copies_on_the_main_stream():
     sampler = _sampler()
     sampler.bind_spec_step_fold(_fold(rows_stored=True))
-    sampler.d2h_side_stream_copies = True
     scheduled, outputs = _step(MAX_DRAFT_LEN)
 
     state = sampler.sample_async(scheduled, outputs, [])
@@ -315,7 +312,6 @@ def test_a_fold_that_awaits_the_store_copies_moves_them_to_the_side_stream():
     fold.store_copies_done.record()
     sampler = _sampler()
     sampler.bind_spec_step_fold(fold)
-    sampler.d2h_side_stream_copies = True
     expected = _store_snapshot(sampler)
 
     state = sampler.sample_async(scheduled, outputs, [])
@@ -328,29 +324,12 @@ def test_a_fold_that_awaits_the_store_copies_moves_them_to_the_side_stream():
         assert torch.equal(host[name], expected[name].cpu()), name
 
 
-def test_a_fold_that_awaits_the_store_copies_keeps_them_on_the_main_stream_when_side_copies_are_off():
-    scheduled, outputs = _step(MAX_DRAFT_LEN)
-    fold = _fold(rows_stored=True)
-    fold.store_copies_done = torch.cuda.Event(external=True)
-    sampler = _sampler()
-    sampler.bind_spec_step_fold(fold)
-
-    state = sampler.sample_async(scheduled, outputs, [])
-
-    assert state.sampler_event.side_stream_event is None
-
-
-def test_static_slot_ids_are_off_by_default():
-    assert not _sampler().static_slot_ids
-
-
 @pytest.mark.parametrize("draft_width", [MAX_DRAFT_LEN, MAX_DRAFT_LEN - 1])
 def test_static_slot_ids_store_the_same_rows(draft_width):
     scheduled, outputs = _step(draft_width)
     plain = _sampler()
     expected = _reference_store(_store_snapshot(plain), outputs)
     sampler = _sampler()
-    sampler.static_slot_ids = True
 
     sampler.sample_async(scheduled, outputs, [])
     sampler.sample_async(scheduled, outputs, [])  # second step reuses the uploaded ids
@@ -360,7 +339,6 @@ def test_static_slot_ids_store_the_same_rows(draft_width):
 
 def test_static_slot_ids_follow_a_changed_batch():
     sampler = _sampler()
-    sampler.static_slot_ids = True
 
     first_view = sampler._device_slot_ids([4, 1])
     first = first_view.clone()

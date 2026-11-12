@@ -450,8 +450,15 @@ def torch_empty_cache() -> None:
 
 @pytest.fixture(autouse=True)
 def verify_skipped_device_copies(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "tensorrt_llm._device_copy._verify_skipped_device_copies", True)
+    """Run every test in device-copy check mode.
+
+    Each upload a DeviceCopyBuffer skips, and each ``unchanged`` copy, is verified against the
+    device. Applied when the test's modules imported device_copy at collection, so tests that never
+    touch it do not import the PyTorch backend.
+    """
+    module = sys.modules.get("tensorrt_llm._torch.pyexecutor.device_copy")
+    if module is not None:
+        monkeypatch.setattr(module, "CHECK_MODE", True)
 
 
 @pytest.fixture(scope="module")

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MSA KV-length correction in one launch (this target's ``MsaKvUpdate`` hook)."""
+"""The MSA KV-length correction in one launch (the op MSA's own update in ``kernels/msa_kv_update`` runs)."""
 
 from __future__ import annotations
 
@@ -125,7 +125,7 @@ class MsaKvUpdate(OpWrapper):
         n_valid_blocks[:total_q])`` as the op is supposed to write them.
 
         The in-tree metadata's own torch re-derivation
-        (``MiniMaxM3MsaSparseAttentionMetadata.on_update_kv_lens`` past its hook
+        (``MiniMaxM3MsaSparseAttentionMetadata.on_update_kv_lens`` past its kernel
         call), statement for statement, returning new tensors rather than
         writing the buffers. The buffer arguments only say which outputs exist:
         a ``None`` buffer gives a ``None`` result.

@@ -25,10 +25,10 @@ pytest.importorskip("fla")
 
 from kimi_kda_test_utils import get_production_decode_kernel_path
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 
 
 class _Cfg:
@@ -135,7 +135,8 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
 
         def __init__(self) -> None:
             self._state_indices_buffer = DeviceCopyBuffer(
-                torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+                torch.tensor([9, 4], dtype=torch.int32, device="cuda"),
+                site=CopySite.MAMBA_STATE_INDICES,
             )
 
         def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:

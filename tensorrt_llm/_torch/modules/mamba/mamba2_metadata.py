@@ -22,10 +22,11 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.device_copy import (CopySite,
+                                                        DeviceCopyBuffer)
 from tensorrt_llm._utils import prefer_pinned
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
@@ -463,7 +464,9 @@ class Mamba2Metadata:
                                          dtype=torch.int32,
                                          device="cuda")
         self._state_indices_buffer = DeviceCopyBuffer(
-            self.state_indices, pin_memory=prefer_pinned())
+            self.state_indices,
+            site=CopySite.MAMBA2_METADATA_STATE_INDICES,
+            pin_memory=prefer_pinned())
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.

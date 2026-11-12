@@ -42,8 +42,12 @@ _MUTATORS = {
     "add_",
     "sub_",
 }
-# Calls whose first argument is the destination they write: ``step_inputs.copy_(dst, src)`` and the H2D helpers.
-_COPY_HELPERS = {"copy_", "copy_h2d_if_changed", "copy_h2d_pool_shared"}
+# Calls whose first argument is the destination they write (``dst.copy_(src)`` is a mutator) and the MSA metadata's
+# ``_upload_block_table(dst, src)``.
+_COPY_HELPERS = {"copy_", "_upload_block_table"}
+# Calls whose second argument is the destination they write: ``device_copy.copy(site, dst, src)`` and
+# ``device_copy.fill_tail(site, buf, start, value)``.
+_SITE_COPY_HELPERS = {"copy", "fill_tail"}
 _BACKEND = "attention/backends/sparse/minimax_m3/msa_backend.py"
 # (file relative to tensorrt_llm/_torch, enclosing function) -> writes allowed there
 _ALLOWED = {
@@ -113,6 +117,12 @@ def _write_sites(tree: ast.AST):
                 else (f.attr if isinstance(f, ast.Attribute) else "")
             )
             if name in _COPY_HELPERS and node.args and _mentions(node.args[0], aliases):
+                sites.append((func, node.lineno))
+            if (
+                name in _SITE_COPY_HELPERS
+                and len(node.args) > 1
+                and _mentions(node.args[1], aliases)
+            ):
                 sites.append((func, node.lineno))
         for child in ast.iter_child_nodes(node):
             visit(child, func, aliases)

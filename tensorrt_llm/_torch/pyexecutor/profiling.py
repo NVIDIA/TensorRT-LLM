@@ -625,7 +625,7 @@ class PyExecutorProfileManager:
         boundary_count = 0
         timing_stream = torch.cuda.Stream() if one_timing_event else None
         if one_timing_event:
-            logger.info("[M3 host] iteration timing: one side-stream event per iteration boundary")
+            logger.info("[iteration timing] one side-stream event per iteration boundary")
         # Cumulative fetch counter as of the previous iter log line; the
         # per-iteration ``num_fetched`` on the log line is the delta.
         prev_fetch_requests_cur_rank = 0

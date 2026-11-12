@@ -377,6 +377,31 @@ workspace, page-table KV metadata, and prefill/decode wrapper state.
 sparse-specific runtime state (indexer buffers, routing state, side-cache
 state).
 
+A class-level `TrtllmAttentionMetadata` hook lets a metadata family decide
+engine behaviour that depends on what its own `prepare()` does, instead of a
+model arming it from outside (MiniMax-M3's MSA metadata sets it):
+
+- `skips_unchanged_uploads`: its skippable per-step uploads skip values their
+  destination already holds. This is sound only while nothing else writes
+  those buffers, so the decoder runner then gives the CUDA-graph metadata
+  private buffers. Every graph key's metadata still takes its buffers from one
+  pool, and a captured forward's device writes into a block rerun at each
+  replay, so only a destination its upload alone writes is skippable: MSA's
+  block table, through `_upload_block_table`, which keeps its record in a
+  `device_copy.DeviceCopyBuffer` per destination storage shared by the
+  CUDA-graph metadata copies. MSA's other uploads use the never-skipping
+  `device_copy.copy` / `device_copy.fill_tail`.
+
+The sparse attention config decides whether decode CUDA graphs are keyed by
+short and long contexts: `BaseSparseAttentionConfig.short_long_seq_len_threshold(
+tokens_per_gen_step)` returns the sequence length that splits them, or None.
+`SeqLenAwareSparseAttentionConfig` returns its `seq_len_threshold` when it asks
+for the split; `MiniMaxM3SparseAttentionConfig` returns the top-k blocks' token
+span for the MSA implementation, within which MSA's `prepare()` stages the
+identity selection. The decoder runner passes one generation step's tokens as
+headroom: the graph key's host length estimate misses up to the in-flight
+step's accepted tokens.
+
 `SparseRuntimeParams` is the backend-to-`AttentionOp` carrier only on the
 `TrtllmAttention` path. Its fields are algorithm-specific, not a generic
 sparse-attention ABI; `VanillaAttention` uses its own per-request contract.

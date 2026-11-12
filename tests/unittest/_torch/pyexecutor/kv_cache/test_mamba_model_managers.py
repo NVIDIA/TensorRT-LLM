@@ -10,7 +10,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
@@ -40,6 +39,7 @@ from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     Qwen4ExpHybridCacheManager,
     Qwen4ExpPLECacheParams,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
@@ -398,7 +398,9 @@ def test_mamba2_seed_lifecycle_without_speculative_decoding(monkeypatch):
     manager._setup_model_state()
     seeds = manager.get_mamba_ssm_rand_seed()
     before = seeds.clone()
-    manager._state_indices_buffer = DeviceCopyBuffer(torch.tensor([1], dtype=torch.int32))
+    manager._state_indices_buffer = DeviceCopyBuffer(
+        torch.tensor([1], dtype=torch.int32), site=CopySite.MAMBA_STATE_INDICES
+    )
     manager._host_state_indices = manager.cuda_state_indices.clone()
     manager._reset_context_mamba_slots(num_contexts=1)
     assert manager.get_mamba_ssm_rand_seed() is seeds
@@ -450,7 +452,9 @@ def test_base_manager_requires_model_for_speculative_decoding():
     manager._speculative_state = None
     manager.local_num_mamba_layers = 1
     manager._generation_state_indices = torch.empty(0, dtype=torch.int32)
-    manager._dummy_request_mask_buffer = DeviceCopyBuffer(torch.empty(0, dtype=torch.bool))
+    manager._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.empty(0, dtype=torch.bool), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     with pytest.raises(NotImplementedError, match="model manager"):
         manager.update_mamba_states(
             SimpleNamespace(num_seqs=0, num_contexts=0),
@@ -505,10 +509,14 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     assert manager.intermediate_ssm_states == ([ssm] if mode == "intermediate" else None)
     assert manager.intermediate_conv_states == ([conv] if mode != "plain" else None)
     manager.local_num_mamba_layers = 1
-    manager._state_indices_buffer = DeviceCopyBuffer(torch.tensor([4, 2, 3], dtype=torch.int32))
+    manager._state_indices_buffer = DeviceCopyBuffer(
+        torch.tensor([4, 2, 3], dtype=torch.int32), site=CopySite.MAMBA_STATE_INDICES
+    )
     manager._host_state_indices = manager.cuda_state_indices.clone()
     manager._generation_state_indices = torch.arange(2, dtype=torch.int32)
-    manager._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, False, True]))
+    manager._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.tensor([False, False, True]), site=CopySite.MAMBA_DUMMY_REQUEST_MASK
+    )
     manager._reset_context_mamba_slots(num_contexts=1)
     reset.assert_called_once()
     slots, host_slots = reset.call_args.args

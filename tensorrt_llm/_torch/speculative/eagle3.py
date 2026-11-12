@@ -9,8 +9,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
+from tensorrt_llm._torch.pyexecutor.device_copy import (CopySite,
+                                                        DeviceCopyBuffer)
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -332,8 +333,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             device='cuda',
         )
         self._batch_indices_upload = DeviceCopyBuffer(
-            self.batch_indices_cuda, pin_memory=prefer_pinned())
+            self.batch_indices_cuda,
+            site=CopySite.EAGLE3_BATCH_INDICES,
+            pin_memory=prefer_pinned())
         self._slot_ids_upload = DeviceCopyBuffer(self.slot_ids,
+                                                 site=CopySite.EAGLE3_SLOT_IDS,
                                                  pin_memory=prefer_pinned())
 
         # Set tree flags based on config

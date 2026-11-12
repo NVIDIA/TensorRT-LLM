@@ -800,6 +800,7 @@ def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch):
     before = storage.clone()
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     manager._kv_buffers = {}
+    manager._pool_views = {}
     manager._kv_slot_geometry = lambda i, layout: (
         storage.data_ptr(),
         storage.dtype,

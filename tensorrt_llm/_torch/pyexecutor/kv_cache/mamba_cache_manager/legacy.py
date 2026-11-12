@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1909,6 +1909,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
 
         self._state_indices_buffer = DeviceCopyBuffer(
             torch.zeros([self.max_batch_size], dtype=torch.int32, device="cuda"),
+            site=CopySite.MAMBA_STATE_INDICES,
             pin_memory=prefer_pinned(),
         )
         self._host_state_indices = torch.zeros(
@@ -2360,6 +2361,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
 
         self._dummy_request_mask_buffer = DeviceCopyBuffer(
             torch.zeros(self.max_batch_size, dtype=torch.bool, device=device),
+            site=CopySite.MAMBA_DUMMY_REQUEST_MASK,
             pin_memory=prefer_pinned(),
         )
         self._dummy_request_mask_host = torch.zeros(

@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor.device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
@@ -336,9 +336,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     :meth:`_prepare_page_table_tensor`.
     """
 
-    # Decode-step shortcuts a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
+    # Skip a decode-only block-table copy whose inputs equal the previous copy's into the same destination. Sound
+    # only while nothing else writes the destination: the MSA attention metadata, whose engine keeps its CUDA graph
+    # buffers private, turns it on for its own manager (MiniMaxM3MsaSparseAttentionMetadata.__post_init__).
     skip_unchanged_block_offsets = False
-    reuse_pool_views = False
+    # Hand out one pool view per pool geometry instead of re-wrapping the pool memory on every attention call. The
+    # view is a pure function of the pool's address and geometry (see _pool_view), so this holds for every caller.
+    reuse_pool_views = True
 
     _main_kv_mapper_kind = MapperKind.HND
     _main_kv_view_layout = "NHD"
@@ -822,7 +826,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         if self.skip_unchanged_block_offsets:
             address = dst_tensor.untyped_storage().data_ptr()
-            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            guard = self._unchanged_copies.setdefault(
+                address, DeviceCopyBuffer(dst_tensor, site=None)
+            )
             if num_contexts != 0 or (
                 dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
             ):
@@ -1060,21 +1066,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             page_shape,
             transpose=kv_layout != self._main_kv_layout_name(),
         )
-
-    def configure_decode_shortcuts(
-        self,
-        skip_unchanged_block_offsets: bool,
-        reuse_pool_views: bool,
-    ) -> None:
-        """Turn on the decode-step shortcuts a model opted into.
-
-        ``skip_unchanged_block_offsets``: skip a decode-only block-table copy
-        whose inputs equal the previous copy's into the same destination.
-        ``reuse_pool_views``: hand out one pool view per geometry instead of
-        re-wrapping the pool memory on every attention call.
-        """
-        self.skip_unchanged_block_offsets = skip_unchanged_block_offsets
-        self.reuse_pool_views = reuse_pool_views
 
     def _pool_view(
         self,
@@ -1436,7 +1427,9 @@ class MiniMaxM3DraftKVCacheView:
         )
         if manager.skip_unchanged_block_offsets:
             address = dst_tensor.untyped_storage().data_ptr()
-            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            guard = self._unchanged_copies.setdefault(
+                address, DeviceCopyBuffer(dst_tensor, site=None)
+            )
             if num_contexts != 0 or (
                 dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
             ):

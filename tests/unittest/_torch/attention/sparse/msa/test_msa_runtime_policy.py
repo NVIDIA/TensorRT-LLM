@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 MSA decode-step preparation a model opts into (RuntimeHooks.msa).
+"""MiniMax-M3 MSA decode-step preparation, MSA's own behaviour in every configuration.
 
-Covers the short-sequence identity table the metadata stages, and the KV cache
-manager's block-table and pool-view shortcuts. With the default policy every
-path runs as before; the existing test_msa_backend.py tests cover that.
+Covers the short-sequence identity table the metadata stages (also with unchanged uploads skipped), the records the
+CUDA graph metadata copies share, and the KV cache manager's block-table and pool-view shortcuts.
 """
 
 from unittest.mock import create_autospec
@@ -19,6 +18,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseMetadataParams,
+    MsaCopySite,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -30,10 +30,8 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
     _fill_unused_slots,
 )
-from tensorrt_llm._torch.pyexecutor import h2d_cache
-from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
@@ -82,10 +80,9 @@ def manager(monkeypatch) -> MiniMaxM3KVCacheManagerV2:
 
 
 def _short_table_metadata(
-    policy: MsaRuntimePolicy, manager: MiniMaxM3KVCacheManagerV2, num_contexts: int = 0
+    manager: MiniMaxM3KVCacheManagerV2, num_contexts: int = 0
 ) -> MiniMaxM3MsaSparseAttentionMetadata:
     metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
-    metadata.msa_policy = policy
     metadata._num_contexts = num_contexts
     metadata.kv_cache_manager = manager
     metadata.max_num_sequences = 4
@@ -93,6 +90,7 @@ def _short_table_metadata(
     metadata.cuda_graph_buffers = None
     metadata.is_cuda_graph = False
     metadata.mapping = Mapping()
+    metadata._msa_block_table_uploads = {}
     return metadata
 
 
@@ -112,7 +110,7 @@ def _staged(metadata: MiniMaxM3MsaSparseAttentionMetadata, total_q: int) -> torc
 @requires_cuda
 @pytest.mark.parametrize("n_valid", [[1], [1, 16, 5], [16, 16, 16, 16]])
 def test_short_steps_stage_the_identity_table(manager, n_valid):
-    metadata = _short_table_metadata(MsaRuntimePolicy(short_sequence_identity=True), manager)
+    metadata = _short_table_metadata(manager)
 
     metadata._stage_msa_short_table(torch.tensor(n_valid, dtype=torch.int32), PARAMS)
 
@@ -122,23 +120,13 @@ def test_short_steps_stage_the_identity_table(manager, n_valid):
 
 
 @requires_cuda
-def test_the_default_policy_stages_nothing(manager):
-    metadata = _short_table_metadata(MsaRuntimePolicy(), manager)
-
-    metadata._stage_msa_short_table(torch.tensor([1, 2], dtype=torch.int32), PARAMS)
-
-    assert not metadata._msa_short_ok
-    assert metadata.msa_short_table is None
-
-
-@requires_cuda
 @pytest.mark.parametrize(
     ("n_valid", "num_contexts"),
     [([1, MSA_REQUIRED_TOPK + 1], 0), ([], 0), ([1, 2], 1)],
     ids=["more_than_topk_blocks", "empty_step", "context_step"],
 )
 def test_ineligible_steps_do_not_use_the_identity_table(manager, n_valid, num_contexts):
-    metadata = _short_table_metadata(MsaRuntimePolicy(short_sequence_identity=True), manager)
+    metadata = _short_table_metadata(manager)
     # A previous eligible step staged the table.
     metadata._stage_msa_short_table(torch.tensor([3], dtype=torch.int32), PARAMS)
     assert metadata._msa_short_ok
@@ -151,19 +139,30 @@ def test_ineligible_steps_do_not_use_the_identity_table(manager, n_valid, num_co
 
 @requires_cuda
 @pytest.mark.parametrize("skip_cache", [False, True], ids=["plain", "skip_cache"])
-def test_the_identity_table_follows_each_step(manager, skip_cache):
-    """Also with the engine's skip cache active, which skips the repeated [2, 4] upload."""
-    metadata = _short_table_metadata(MsaRuntimePolicy(short_sequence_identity=True), manager)
+def test_the_identity_table_follows_each_step(manager, skip_cache, monkeypatch):
+    """Also with the metadata skipping unchanged uploads: the short table is pooled CUDA graph metadata, so even the
+    repeated [2, 4] upload is issued."""
+    metadata = _short_table_metadata(manager)
+    monkeypatch.setattr(type(metadata), "skips_unchanged_uploads", skip_cache)
 
-    with h2d_cache.active(H2DSkipCache() if skip_cache else None):
+    issued = []
+    real_copy = device_copy.copy
+
+    def counting_copy(site, dst, src, **kwargs):
+        issued.append(real_copy(site, dst, src, **kwargs))
+        return issued[-1]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(device_copy, "copy", counting_copy)
         for n_valid in ([2, 3], [2, 4], [2, 4], [16], [2, 3]):
             metadata._stage_msa_short_table(torch.tensor(n_valid, dtype=torch.int32), PARAMS)
             assert torch.equal(_staged(metadata, len(n_valid)), _identity(n_valid))
+    assert issued == [True] * 5
 
 
 @requires_cuda
 def test_the_identity_table_grows_past_its_first_bound(manager):
-    metadata = _short_table_metadata(MsaRuntimePolicy(short_sequence_identity=True), manager)
+    metadata = _short_table_metadata(manager)
     metadata._stage_msa_short_table(torch.tensor([1], dtype=torch.int32), PARAMS)
     first_numel = metadata.msa_short_table.numel()
     n_valid = [i % MSA_REQUIRED_TOPK + 1 for i in range(first_numel // MSA_REQUIRED_TOPK)]
@@ -214,7 +213,7 @@ def test_block_offsets_shortcut_is_off_by_default(manager, base_copy):
 
 def test_an_unchanged_decode_copy_is_skipped(manager, base_copy):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    manager.skip_unchanged_block_offsets = True
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -225,7 +224,7 @@ def test_an_unchanged_decode_copy_is_skipped(manager, base_copy):
 
 def test_a_changed_host_table_is_copied(manager, base_copy):
     host = _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    manager.skip_unchanged_block_offsets = True
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -247,7 +246,7 @@ def test_a_changed_host_table_is_copied(manager, base_copy):
 )
 def test_a_changed_batch_is_copied(manager, base_copy, change):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    manager.skip_unchanged_block_offsets = True
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -258,7 +257,7 @@ def test_a_changed_batch_is_copied(manager, base_copy, change):
 
 def test_each_destination_keeps_its_own_record(manager, base_copy):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    manager.skip_unchanged_block_offsets = True
     first = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
     second = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
@@ -272,7 +271,7 @@ def test_each_destination_keeps_its_own_record(manager, base_copy):
 
 def test_a_step_with_contexts_always_copies_and_resets_the_record(manager, base_copy):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    manager.skip_unchanged_block_offsets = True
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -286,7 +285,7 @@ def test_a_step_with_contexts_always_copies_and_resets_the_record(manager, base_
 
 def test_a_failed_block_copy_does_not_leave_a_valid_record(manager, base_copy):
     host = _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    manager.skip_unchanged_block_offsets = True
     dst = torch.zeros_like(host)
     _decode_copy(manager, dst)
     base_copy.side_effect = RuntimeError("copy failed")
@@ -299,7 +298,7 @@ def test_a_failed_block_copy_does_not_leave_a_valid_record(manager, base_copy):
 
 def test_a_different_destination_view_requires_a_new_copy(manager, base_copy):
     host = _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    manager.skip_unchanged_block_offsets = True
     storage = torch.zeros(2 * host.numel(), dtype=host.dtype)
     first = storage[: host.numel()].view_as(host)
     second = storage[host.numel() :].view_as(host)
@@ -351,13 +350,13 @@ def _assert_kv_view(
 
 
 @requires_cuda
-def test_pool_views_are_rebuilt_on_every_call_by_default(manager, pools):
+def test_pool_views_are_rebuilt_on_every_call_without_reuse(manager, pools):
     kv_pool, _ = pools
+    manager.reuse_pool_views = False
 
     first = manager.get_buffers(3)
     second = manager.get_buffers(3)
 
-    assert not manager.reuse_pool_views
     assert first is not second
     _assert_kv_view(first, kv_pool, manager)
     _assert_kv_view(second, kv_pool, manager)
@@ -366,7 +365,7 @@ def test_pool_views_are_rebuilt_on_every_call_by_default(manager, pools):
 @requires_cuda
 def test_reused_pool_views_are_built_once_per_geometry(manager, pools):
     kv_pool, scale_pool = pools
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=False, reuse_pool_views=True)
+    assert manager.reuse_pool_views
 
     view = manager.get_buffers(3)
     scale_view = manager.get_block_scale_buffers(3)
@@ -382,7 +381,6 @@ def test_reused_pool_views_are_built_once_per_geometry(manager, pools):
 @requires_cuda
 def test_reused_pool_views_are_kept_per_inference_mode(manager, pools):
     kv_pool, _ = pools
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=False, reuse_pool_views=True)
 
     view = manager.get_buffers(3)
     with torch.inference_mode():
@@ -397,14 +395,14 @@ def test_reused_pool_views_are_kept_per_inference_mode(manager, pools):
 
 @requires_cuda
 def test_unused_slots_are_filled_after_a_full_buffer_step():
+    """The tail fill is never skipped (pooled CUDA graph metadata), so it follows every live-row write."""
     buf = torch.full((8,), 7, dtype=torch.int32, device="cuda")
-    with h2d_cache.active(H2DSkipCache()):
-        _fill_unused_slots(buf, 3)
-        # A step whose live rows cover the whole buffer overwrites the filled tail.
-        buf.copy_(torch.arange(8, dtype=torch.int32, device="cuda"))
-        _fill_unused_slots(buf, buf.shape[0])
-        buf[:3] = 0
-        _fill_unused_slots(buf, 3)
+    _fill_unused_slots(buf, 3)
+    # A step whose live rows cover the whole buffer overwrites the filled tail.
+    buf.copy_(torch.arange(8, dtype=torch.int32, device="cuda"))
+    _fill_unused_slots(buf, buf.shape[0])
+    buf[:3] = 0
+    _fill_unused_slots(buf, 3)
     assert buf.tolist() == [0, 0, 0, -1, -1, -1, -1, -1]
 
 
@@ -494,7 +492,6 @@ def _expected_subpages(metadata, rows: int) -> torch.Tensor:
 
 @requires_cuda
 def test_the_first_reader_of_a_forward_expands_the_subpage_table(monkeypatch):
-    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
     metadata = _subpage_metadata(rows=3, max_blocks=40, factor=2)
     calls = []
     real = msa_backend.write_subpage_block_table
@@ -513,8 +510,7 @@ def test_the_first_reader_of_a_forward_expands_the_subpage_table(monkeypatch):
 
 
 @requires_cuda
-def test_each_forward_expands_the_current_block_table(monkeypatch):
-    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
+def test_each_forward_expands_the_current_block_table():
     metadata = _subpage_metadata(rows=2, max_blocks=16, factor=4)
     metadata.msa_subpage_rows(0, 2)
     metadata.msa_block_table[:2, :5] += 11
@@ -527,8 +523,7 @@ def test_each_forward_expands_the_current_block_table(monkeypatch):
 
 
 @requires_cuda
-def test_a_captured_forward_expands_the_table_at_every_replay(monkeypatch):
-    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
+def test_a_captured_forward_expands_the_table_at_every_replay():
     metadata = _subpage_metadata(rows=4, max_blocks=32, factor=2)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -609,3 +604,47 @@ def test_a_captured_forward_refills_its_tail_at_every_replay():
         graph.replay()
         torch.cuda.synchronize()
         assert buf.tolist() == [10 * step + i for i in range(5)] + [-1] * 7, step
+
+
+# ---------------------------------------------------------------------------
+# Owner-side skipping is MSA's default
+# ---------------------------------------------------------------------------
+
+
+def test_msa_metadata_skips_unchanged_uploads_and_arms_its_manager(manager):
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    assert MiniMaxM3MsaSparseAttentionMetadata.skips_unchanged_uploads
+    assert not TrtllmAttentionMetadata.skips_unchanged_uploads
+    assert not manager.skip_unchanged_block_offsets
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata.kv_cache_manager = manager
+    metadata._arm_kv_cache_manager()
+    assert manager.skip_unchanged_block_offsets
+
+
+@requires_cuda
+def test_cuda_graph_metadata_copies_share_one_record_set():
+    """Graph metadata of different batch sizes are shallow copies writing the same block table: a write through
+    one copy must make the others send their values again."""
+    import copy
+
+    engine_md = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    engine_md._msa_block_table_uploads = {}
+    graphs = [copy.copy(engine_md) for _ in range(3)]
+    assert all(g._msa_block_table_uploads is engine_md._msa_block_table_uploads for g in graphs)
+
+    table = torch.zeros(4, 3, dtype=torch.int32, device="cuda")
+    dst = table[:2, :2]
+    one = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32).pin_memory()
+    two = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32).pin_memory()
+    assert graphs[0]._upload_block_table(dst, one) is True
+    assert graphs[1]._upload_block_table(dst, two) is True
+    # graphs[1] overwrote the table: graphs[0]'s identical values must be sent again, then skipped.
+    assert graphs[0]._upload_block_table(dst, one) is True
+    assert graphs[2]._upload_block_table(dst, one) is False
+    torch.cuda.synchronize()
+    assert table[:2, :2].tolist() == [[1, 2], [3, 4]]
+    # One DeviceCopyBuffer for the table's storage, with the block-table site, shared by every copy.
+    (shared,) = engine_md._msa_block_table_uploads.values()
+    assert shared.site is MsaCopySite.BLOCK_TABLE and shared.tensor is dst

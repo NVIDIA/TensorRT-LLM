@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite, DeviceCopyBuffer
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.llmapi import DFlashDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -109,7 +109,8 @@ def test_generation_step_keeps_the_dummy_slot_context_empty():
     worker._ctx_len = torch.tensor([5, 0, 0], dtype=torch.long, device="cuda")
     # Gen request 0 owns slot 0; gen request 1 is padding on the dummy slot.
     worker._batch_to_slot_buffer = DeviceCopyBuffer(
-        torch.tensor([0, worker._dummy_slot], dtype=torch.long, device="cuda")
+        torch.tensor([0, worker._dummy_slot], dtype=torch.long, device="cuda"),
+        site=CopySite.DFLASH_BATCH_TO_SLOT,
     )
     buf_shape = (num_slots, num_layers, max_ctx + max_draft_len + 1, num_kv_heads, head_dim)
     worker._ctx_k_buf = torch.zeros(buf_shape, device="cuda")

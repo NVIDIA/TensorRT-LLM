@@ -27,7 +27,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
-from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -36,8 +36,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     DSparkCUDAGraphRunner,
     KeyType,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopyPlan, DeviceCopier, copy_plan_of
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
-from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
@@ -53,7 +53,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler import (
 )
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_manager
@@ -63,12 +62,7 @@ from tensorrt_llm._torch.utils import (
     with_model_extra_attrs,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.llmapi.llm_args import (
-    BaseSparseAttentionConfig,
-    MiniMaxM3SparseAttentionConfig,
-    PrefillCudaGraphBackend,
-    SeqLenAwareSparseAttentionConfig,
-)
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -151,9 +145,10 @@ class DecoderRunner(ScheduledModelRunner):
 
     # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
-    # This engine's skip cache and step-input pack (None: the hook is off), active only during its own forward.
-    _h2d_cache: H2DSkipCache | None = None
-    _step_pack: StepInputPack | None = None
+    # The copy sites the model merges up to a barrier (device_copy); empty by default.
+    copy_plan: CopyPlan = CopyPlan()
+    # This engine's copier (None: an empty plan), active only during its own forward.
+    _copier: DeviceCopier | None = None
     # Whether a batch may keep the greedy tokens a forward sampled in place of the logits. False when the executor
     # runs a guided decoder, which reads the logits of every batch.
     keep_greedy_only_outputs = True
@@ -204,41 +199,25 @@ class DecoderRunner(ScheduledModelRunner):
 
         self._config = config
         self.runtime_hooks = runtime_hooks_of(model)
-        self._h2d_cache = (
-            H2DSkipCache(changed_span=self.runtime_hooks.h2d_changed_span)
-            if self.runtime_hooks.skip_unchanged_h2d
+        self.copy_plan = copy_plan_of(model)
+        self._copier = (
+            DeviceCopier(self.copy_plan, torch.device("cuda", torch.cuda.current_device()))
+            if self.copy_plan
             else None
         )
-        self._step_pack = (
-            StepInputPack(
-                torch.device("cuda", torch.cuda.current_device()),
-                parallel_scatter=self.runtime_hooks.pack_parallel_scatter,
-                in_graph=self.runtime_hooks.pack_in_graph,
-                early_copy=self.runtime_hooks.pack_early_copy,
-                step_epoch=self.runtime_hooks.pack_step_epoch,
-                prologue_op=self.runtime_hooks.pack_prologue_op,
-            )
-            if self.runtime_hooks.pack_step_inputs
-            else None
-        )
-        if self._step_pack is not None and self._step_pack.parallel_scatter:
-            logger.info("[M3 host] step-input pack: parallel scatter for non-overlapping copies")
-        if self._step_pack is not None and self._step_pack.in_graph:
-            logger.info("[M3 host] step-input pack issued by the decode graph's prologue")
-        if self._step_pack is not None and self._step_pack.early_copy:
+        if self._copier is not None:
+            final = self.copy_plan.final_flush
             logger.info(
-                "[M3 host] step-input pack: window uploaded ahead of the replay on a side copy stream"
+                f"[device copy] {len(self.copy_plan.merge)} merged sites, "
+                f"{len(self.copy_plan.flush_after)} barriers, "
+                f"parallel scatter {self.copy_plan.parallel_scatter}, final flush "
+                + (
+                    "eager"
+                    if final is None
+                    else f"in graph (early copy {final.early_copy}, "
+                    f"one-launch prologue {final.prologue_op is not None}, step epoch {final.step_epoch})"
+                )
             )
-        if self._step_pack is not None and self._step_pack.epoch is not None:
-            logger.info(
-                "[M3 host] step epoch: one device counter bumped by the decode graph's prologue"
-            )
-        if self._step_pack is not None and self._step_pack.prologue_op is not None:
-            logger.info(
-                "[M3 host] step-input pack: the decode graph's prologue is one launch (scatter, header, epoch)"
-            )
-        if self._h2d_cache is not None and self._h2d_cache.changed_span:
-            logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
         # Heads that can project context logits eagerly; the model is fixed.
         self._context_logits_heads = context_logits_heads(
             model, mapping, is_spec_decode=config.is_spec_decode
@@ -408,14 +387,13 @@ class DecoderRunner(ScheduledModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> Any:
-        with h2d_cache.active(self._h2d_cache), step_inputs.active(self._step_pack):
+        with device_copy.active(self._copier):
             try:
                 return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
             except BaseException:
-                # A failed step issues none of its packed copies, so forget the shadows recorded for them too.
-                step_inputs.discard()
-                if self._h2d_cache is not None:
-                    self._h2d_cache.clear()
+                # A failed step may not have issued its merged copies: discarding the pack drops them and runs their
+                # on_drop callbacks, so the buffer owners forget the records they made for them.
+                device_copy.discard()
                 raise
 
     def _initialize_moe_workspace_reclaimer(self) -> None:
@@ -515,7 +493,10 @@ class DecoderRunner(ScheduledModelRunner):
             dist=self._dist,
             sparse_attention_config=self._sparse_attention_config,
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
-            private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
+            # A metadata class that skips unchanged uploads is sound only while no other engine writes its buffers.
+            private_metadata_buffers=getattr(
+                self._config.attention_backend.Metadata, "skips_unchanged_uploads", False
+            ),
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
@@ -532,31 +513,14 @@ class DecoderRunner(ScheduledModelRunner):
         )
 
     def _short_long_seq_len_threshold(self) -> int | None:
-        """The total sequence length that splits the short and long decode graph families, or None for one family.
-
-        Set by a sparse attention config that asks for the split, or by a model whose MSA
-        policy stages identity selections for short sequences: a sequence within the
-        top-k blocks attends every valid block. The short family runs the identity selection,
-        so every token it attends must fit in the top-k blocks. The graph key estimates a
-        sequence's length from host token counts, which under the overlap scheduler miss up to
-        the in-flight step's accepted tokens; the identity threshold leaves one generation
-        step's tokens of headroom for that.
-        """
+        """The total sequence length that splits the short and long decode graph families, or None for one family,
+        as the sparse attention config sets it, given one generation step's tokens of headroom."""
         sparse_config = self._sparse_attention_config
-        if (
-            isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
-            and sparse_config.needs_separate_short_long_cuda_graphs()
-        ):
-            return sparse_config.seq_len_threshold
-        if self.runtime_hooks.msa.short_sequence_identity:
-            if not isinstance(sparse_config, MiniMaxM3SparseAttentionConfig):
-                raise ValueError(
-                    "MsaRuntimePolicy.short_sequence_identity requires a MiniMax-M3 sparse "
-                    f"attention config, got {type(sparse_config).__name__}"
-                )
-            topk_span = sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
-            return topk_span - self._get_runtime_tokens_per_gen_step(self._config.max_draft_len)
-        return None
+        if sparse_config is None:
+            return None
+        return sparse_config.short_long_seq_len_threshold(
+            tokens_per_gen_step=self._get_runtime_tokens_per_gen_step(self._config.max_draft_len)
+        )
 
     def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
         if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
@@ -762,16 +726,17 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            # Pack the step's small input copies into one upload and one scatter at the
-            # graph replay. Only a replay of an already captured graph, which always
-            # reaches the flush, may open a pack.
+            # Merge the plan's copies into one upload and one scatter per barrier,
+            # the last at the graph replay. Only a replay of an already captured
+            # graph, which always reaches that flush, may open a pack.
             if (
-                self.runtime_hooks.pack_step_inputs
+                self._copier is not None
+                and self._copier.merges
                 and can_run_graph
                 and not self.cuda_graph_runner.is_warmup_only
                 and not self.cuda_graph_runner.needs_capture(key)
             ):
-                step_inputs.begin()
+                device_copy.begin()
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -853,7 +818,7 @@ class DecoderRunner(ScheduledModelRunner):
                     ),
                 )
             # No-op unless a pack was opened above and the replay did not issue it.
-            step_inputs.flush()
+            device_copy.flush()
             if context_plan is not None and context_plan.handled:
                 outputs = dict(outputs) if isinstance(outputs, dict) else {"logits": outputs}
                 outputs["context_logits_handled"] = True
