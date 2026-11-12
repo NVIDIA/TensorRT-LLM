@@ -4,10 +4,13 @@
 
 A segment is named by a key. The first process to bind the key's abstract Unix socket
 (`\\0trtllm-ple-<uid>-<key>`) owns it: it creates and fills the allocation, then serves the
-allocation's file descriptor to every process that connects (`SCM_RIGHTS`; a peer of another
-uid is refused through `SO_PEERCRED`). A process that cannot bind connects and waits. When the
-owner exits or aborts before publishing, the kernel closes its sockets and the waiter tries to
-own the segment itself. Nothing is written to the filesystem, so a crash leaves nothing behind.
+allocation's file descriptor to every process that connects (`SCM_RIGHTS`). Abstract names carry
+no permissions, so both sides check the other's uid through `SO_PEERCRED`: the owner refuses a
+peer of another uid, and a waiter whose name is held by another uid's socket gets
+`PermissionError` at once. A process that cannot bind connects and waits, at most `timeout_s`
+(also when the name is bound but nothing listens on it). When the owner exits or aborts before
+publishing, the kernel closes its sockets and the waiter tries to own the segment itself.
+Nothing is written to the filesystem, so a crash leaves nothing behind.
 
 Abstract socket names belong to a network namespace: processes in different namespaces do not
 meet, and each keeps its own copy.
@@ -34,6 +37,12 @@ _POLL_SECONDS = 1.0
 def socket_name(key: str) -> str:
     """The abstract socket name of `key` (per uid)."""
     return f"\0trtllm-ple-{os.getuid()}-{key}"
+
+
+def _peer_uid(conn: socket.socket) -> int:
+    """The uid of the process at the other end of the connected Unix socket `conn`."""
+    _, uid, _ = _CRED.unpack(conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _CRED.size))
+    return uid
 
 
 class OwnedSegment:
@@ -83,10 +92,7 @@ class OwnedSegment:
     def _answer(self, conn: socket.socket) -> None:
         with conn:
             try:
-                _, uid, _ = _CRED.unpack(
-                    conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _CRED.size)
-                )
-                if uid != os.getuid():
+                if _peer_uid(conn) != os.getuid():
                     return
                 while not self._ready.wait(_POLL_SECONDS):
                     if self._closed.is_set():
@@ -117,7 +123,8 @@ def acquire(
 ) -> tuple:
     """`(OWNER, OwnedSegment)` when no process owns `key`, else `(ATTACHED, fd, meta)` once
     the owner publishes; an owner that exits or aborts first hands `key` to its waiters.
-    Raises `TimeoutError` when an owner has not published within `timeout_s`."""
+    Raises `TimeoutError` when no owner has published within `timeout_s`, and `PermissionError`
+    when a process of another uid holds the name."""
     name = socket_name(key)
     deadline = time.monotonic() + timeout_s
     next_report = time.monotonic() + report_s
@@ -129,12 +136,17 @@ def acquire(
         try:
             conn.connect(name)
         except (ConnectionRefusedError, FileNotFoundError):
-            # The owner just exited, or is between `bind` and `listen`.
+            # The owner just exited, or is between `bind` and `listen` (or never listens).
             conn.close()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"no owner of {key!r} listens within {timeout_s:.0f} s")
             time.sleep(0.05)
             continue
         got: Optional[tuple] = None
         try:
+            owner_uid = _peer_uid(conn)
+            if owner_uid != os.getuid():
+                raise PermissionError(f"the owner of {key!r} runs as uid {owner_uid}")
             while got is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

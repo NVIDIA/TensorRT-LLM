@@ -615,6 +615,49 @@ def test_chunk_broker_hands_over(owner_dies):
     assert not [f for f in os.listdir("/dev/shm") if key in f]
 
 
+@pytest.mark.cpu_only
+def test_chunk_broker_refuses_a_foreign_owner(monkeypatch):
+    """A waiter whose key's name is held by a socket of another uid raises `PermissionError` (an
+    `OSError`, so `node` falls back) at once instead of waiting for it to publish."""
+    import os
+    import time
+    import uuid
+
+    broker = _host_table_module()._broker
+    key = uuid.uuid4().hex
+    owner = broker.try_own(key)
+    assert owner is not None
+    monkeypatch.setattr(broker, "_peer_uid", lambda conn: os.getuid() + 1)
+    try:
+        start = time.monotonic()
+        with pytest.raises(PermissionError):
+            broker.acquire(key, 60)
+        assert time.monotonic() - start < 5
+    finally:
+        owner.close()
+
+
+@pytest.mark.cpu_only
+def test_chunk_broker_times_out_on_a_name_nobody_listens_on():
+    """A key's name bound by a socket that never listens refuses every connection; the waiter
+    raises `TimeoutError` at its deadline."""
+    import socket
+    import time
+    import uuid
+
+    broker = _host_table_module()._broker
+    key = uuid.uuid4().hex
+    squatter = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    squatter.bind(broker.socket_name(key))
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            broker.acquire(key, 2.0)
+        assert 2.0 <= time.monotonic() - start < 10
+    finally:
+        squatter.close()
+
+
 def _fake_shards(rows_per_shard: int, shards: int, cols: int, seed: int) -> tuple:
     g = torch.Generator().manual_seed(seed)
     data = torch.randint(0, 256, (shards * rows_per_shard, cols), generator=g, dtype=torch.uint8)
