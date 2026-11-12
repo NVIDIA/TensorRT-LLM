@@ -187,7 +187,6 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
         effects=PyExecutorEffects(engine),
         registry=PyExecutorRequestRegistry(engine),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     return engine
 

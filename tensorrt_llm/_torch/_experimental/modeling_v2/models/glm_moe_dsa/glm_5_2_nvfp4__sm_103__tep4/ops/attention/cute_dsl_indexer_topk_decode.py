@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
@@ -24,13 +26,25 @@ def build(
     `ValueError` when `max_columns <= top_k` or `top_k != 2048`: the kernel is
     built for rows longer than top-k only. One compile of a few seconds plus a
     `[next_n, max_columns]` fp32 scratch launch; cached per process.
+
+    Above `CLUSTER_MIN_COLUMNS` columns the handle also carries the cluster-split
+    launchers (a long row split across a cluster of CTAs), compiled and launched
+    here too; `TRTLLM_GLM52_DEC_TOPK_CLUSTER=0` keeps the one-CTA kernel only, and
+    `TRTLLM_GLM52_DEC_TOPK_CLUSTER_PDL=1` launches them with Programmatic Dependent Launch.
     """
     return _kernel.warmup_indexer_topk_decode(
         max_num_columns=int(max_columns),
         top_k=int(top_k),
         next_n=int(next_n),
         device_id=int(device_id),
+        cluster=os.environ.get("TRTLLM_GLM52_DEC_TOPK_CLUSTER", "1") != "0",
+        cluster_pdl=os.environ.get("TRTLLM_GLM52_DEC_TOPK_CLUSTER_PDL", "0") == "1",
     )
+
+
+def uses_cluster(compiled: CompiledIndexerTopkDecode, rows: int) -> bool:
+    """Whether a call with `rows` logits rows launches the cluster-split kernel."""
+    return compiled.launcher_for(rows)[0] > 1
 
 
 def _ordered_key(values: torch.Tensor) -> torch.Tensor:
@@ -89,9 +103,10 @@ class CuteDslIndexerTopkDecode(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # The target scores every generation token of a decode step with the paged
-    # scorer and selects here: up to 32 sequences x MTP 2, fp32, each row as
-    # wide as the engine's max_seq_len (the compile key), possibly row-padded.
-    # It builds next_n 1 and 2. `seq_lens` are KV lengths after this step.
+    # scorer and selects here: up to 32 sequences x MTP 2 (x 4 / 6 at MTP3 /
+    # MTP5), fp32, each row as wide as the engine's max_seq_len (the compile
+    # key), possibly row-padded. It builds next_n 1 and 2, and max_draft_len + 1
+    # at MTP3 / MTP5. `seq_lens` are KV lengths after this step.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one sequence, one token, a context longer than top-k",
@@ -122,15 +137,61 @@ class CuteDslIndexerTopkDecode(OpWrapper):
             why="heavy ties at the k-th value: the lower column wins",
             spec=dict(next_n=2, max_columns=8192, seq_lens=[8192, 6000], width=8192, levels=7),
         ),
+        Cell(
+            why="MTP3, the full decode batch: 32 sequences x 4 at 8192 columns",
+            spec=dict(
+                next_n=4,
+                max_columns=8192,
+                seq_lens=[2050 + 191 * i for i in range(32)],
+                width=8192,
+            ),
+        ),
+        Cell(
+            why="MTP5, the full decode batch: 32 sequences x 6 at 8192 columns",
+            spec=dict(
+                next_n=6,
+                max_columns=8192,
+                seq_lens=[2052 + 193 * i for i in range(32)],
+                width=8192,
+            ),
+        ),
+        Cell(
+            why="MTP5 at 5 sequences: contexts at and below top-k, rows with no key, ends "
+            "straddling top-k inside one sequence",
+            spec=dict(next_n=6, max_columns=8192, seq_lens=[1, 6, 700, 2051, 2053], width=8192),
+        ),
+        Cell(
+            why="MTP5 at 2 sequences, 160K and 64K contexts on a 172032-column engine: the "
+            "cluster split",
+            spec=dict(next_n=6, max_columns=172032, seq_lens=[163840, 65536], width=172032),
+        ),
+        Cell(
+            why="tie groups of thousands past column 32768: the refine's column digits",
+            spec=dict(
+                next_n=1, max_columns=212992, seq_lens=[200000, 70000], width=212992, levels=64
+            ),
+        ),
+        Cell(
+            why="MTP3, heavy ties at the k-th value on a row-padded view",
+            spec=dict(
+                next_n=4,
+                max_columns=8192,
+                seq_lens=[5000, 2600, 8000],
+                width=8000,
+                row_pad=256,
+                levels=7,
+            ),
+        ),
     )
 
     note = """
     `build(device_id, max_columns=, top_k=, next_n=)` compiles and warms one
     `next_n`; the target builds next_n 1 and 2 on its first forward (with
-    `max_columns` = the engine's max_seq_len) and passes the handle for the
-    step's width as `compiled`. A width with no handle -- `max_seq_len <=
-    index_topk`, a failed build, or another MTP width -- takes the stock
-    `indexer_topk_decode` op at the call site.
+    `max_columns` = the engine's max_seq_len), and max_draft_len + 1 (4 / 6) at
+    MTP3 / MTP5, and passes the handle for the step's width as `compiled`. A
+    width with no handle -- `max_seq_len <= index_topk`, a failed build, or
+    another MTP width -- takes the stock `indexer_topk_decode` op at the call
+    site.
 
     The handle rejects, loudly, a different `top_k` / `next_n`, a logits row
     wider than `max_columns`, and non-int32 or non-contiguous `seq_lens` /

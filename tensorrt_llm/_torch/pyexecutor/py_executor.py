@@ -5338,8 +5338,6 @@ class PyExecutor:
             effects=PyExecutorEffects(self),
             registry=PyExecutorRequestRegistry(self),
             enable_attention_dp=getattr(self, "enable_attention_dp", False),
-            force_terminate_ctx_for_partial_reuse=getattr(
-                self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
             is_kv_manager_v2=is_kv_manager_v2,
@@ -11437,6 +11435,14 @@ class PyExecutor:
                         timed_out_requests.append(request)
                     continue
 
+                # Retired by the coordinator's poll: its retry loop owns the
+                # cancellation and multi-rank ADP defers the response to the
+                # loop-head error vote; re-cancelling here would desync that
+                # vote.
+                if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                    new_active_requests.append(request)
+                    continue
+
                 is_cancelled = self.disagg.request_cancellation(request)
                 if is_cancelled:
                     # _handle_errors enters response collectives under ADP.
@@ -11512,8 +11518,8 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
-                # PP=1-only early termination; the coordinator's release_transfer
-                # gates on the same flag so the request terminates exactly once.
+                # PP=1-only early termination; release_transfer completes it
+                # once the request's final transfer claim is released.
                 force_terminate_for_partial_reuse = (
                     self.force_terminate_ctx_for_partial_reuse)
                 if request.is_disagg_context_complete_state:
@@ -11869,11 +11875,19 @@ class PyExecutor:
         a PP-synchronized termination is deferred until all stages agree, so
         the pause below would re-admit a request whose termination is still
         pending. Raises ``NotImplementedError`` in that case.
+
+        Encoder-decoder models raise ``NotImplementedError`` because pending
+        encoder steps can publish old-weight outputs after a reset and
+        unconsumed published outputs survive until re-encoding.
         """
         if self.dist.pp_size > 1:
             raise NotImplementedError(
                 "recompute_active_requests does not support pipeline "
                 f"parallelism (pp_size={self.dist.pp_size}).")
+        if self.is_encoder_decoder:
+            raise NotImplementedError(
+                "recompute_active_requests does not support encoder-decoder models."
+            )
         if self.previous_batch is not None:
             raise RuntimeError(
                 "recompute_active_requests requires a quiescent executor (no "

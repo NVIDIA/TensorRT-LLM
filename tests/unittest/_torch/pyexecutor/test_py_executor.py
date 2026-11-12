@@ -1781,6 +1781,16 @@ def test_recompute_projects_cross_kv_once_per_cycle(encoder_input, pause, record
         assert split_encoder_from_decoder_context_requests([request]) == ([request], [])
 
 
+def test_recompute_active_requests_rejects_encoder_decoder() -> None:
+    executor = _make_handoff_executor()
+    executor.is_encoder_decoder = True
+    executor.dist.pp_size = 1
+    executor.previous_batch = None
+
+    with pytest.raises(NotImplementedError, match="encoder-decoder"):
+        executor.recompute_active_requests()
+
+
 def test_request_terminated_before_first_context_releases_packed_output(recorded_streams):
     cancelled, sibling = (
         _make_encoder_decoder_request(1, "token", 3),
@@ -2147,7 +2157,6 @@ def _make_transfer_coordinator(
     *,
     active_requests=None,
     canceled_request_ids=(),
-    force_terminate_ctx_for_partial_reuse: bool = False,
     tp_size: int = 1,
 ):
     """Coordinator over mocked services; returns (coordinator, transceiver, effects)."""
@@ -2170,7 +2179,6 @@ def _make_transfer_coordinator(
             canceled_request_ids=lambda: list(canceled_request_ids),
         ),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
     )
     return coordinator, transceiver, effects
 
@@ -2231,11 +2239,11 @@ class TestDisaggTerminationGuard:
         AND out of new_active_requests, so it is removed from active_requests
         but retained by AsyncTransferManager. The coordinator's release must
         then terminate it exactly once when the transfer completes
-        (force_terminate_ctx_for_partial_reuse=False)."""
+        (release_transfer terminates the departed request regardless of the
+        flag)."""
         req = Mock()
         coordinator, _, effects = _make_transfer_coordinator(
             active_requests=[],  # already removed by _handle_responses
-            force_terminate_ctx_for_partial_reuse=False,
         )
         coordinator._transfers.end_transfer.return_value = True
 
@@ -2243,21 +2251,19 @@ class TestDisaggTerminationGuard:
 
         effects.terminate_request.assert_called_once_with(req)
 
-    def test_pp1_does_not_double_terminate_on_transfer_complete(self):
-        """PP=1: the early path already terminated the request (and removed it
-        from active_requests). The coordinator's release must skip
-        re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
-        avoid a double free_resources (nvbug/5961736)."""
+    def test_pp1_retries_deferred_termination_on_transfer_complete(self):
+        """The early path cannot free KV while a transfer owns it. Once the
+        final claim is released, the departed request must be terminated even
+        when the PP=1 early-termination optimization was requested."""
         req = Mock()
         coordinator, _, effects = _make_transfer_coordinator(
-            active_requests=[],  # already removed + terminated by early path
-            force_terminate_ctx_for_partial_reuse=True,
+            active_requests=[],  # early termination deferred until transfer release
         )
         coordinator._transfers.end_transfer.return_value = True
 
         coordinator.release_transfer(req)
 
-        effects.terminate_request.assert_not_called()
+        effects.terminate_request.assert_called_once_with(req)
 
 
 # ---------------------------------------------------------------------------
