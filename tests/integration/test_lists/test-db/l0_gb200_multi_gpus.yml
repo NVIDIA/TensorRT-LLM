@@ -19,7 +19,8 @@ l0_gb200_multi_gpus:
   tests:
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
   - unittest/kv_cache_manager_v2_tests/test_host_numa_placement.py ISOLATION
-  - unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_r_cases TIMEOUT (45)
+  # HALO-R cases, each path once; the repeat cases run post-merge.
+  - unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_r_cases -k "not [graphs_single] and not [gate_under_hog]" TIMEOUT (45)
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
@@ -144,6 +145,9 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
   # ---- moved to post-merge (MoE CI optimization) ----
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
+  # HALO-R cases that repeat a pre-merge path: one layer captured (three layers pre-merge) and the
+  # eager hog at 4 CTAs (16 CTAs pre-merge).
+  - unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_r_cases -k "[graphs_single] or [gate_under_hog]" TIMEOUT (45)
   # HALO-R trap cases fault every GPU of the node on purpose; they run only when named by node id.
   - unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_r_traps TIMEOUT (45) ISOLATION
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
