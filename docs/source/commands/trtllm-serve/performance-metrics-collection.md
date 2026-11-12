@@ -57,3 +57,48 @@ work. It introduces no CUDA events or synchronization beyond the existing
 collection/timing settings. The existing device-step profiler timing policy is
 preserved. CPU and
 end-to-end overhead of this refactor have not been benchmarked.
+
+## Create a Grafana dashboard
+
+The [Grafana setup example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/grafana)
+provides a standard-library Python renderer and publisher for Kubernetes serving.
+It discovers engine workers and has E2E, Prefill, Decode and All views. Configure
+your workload pod/job patterns, datasource UIDs, endpoint/container labels and
+Grafana's supported schema-v2 API version in a copy of `example.config.json`.
+The default configuration generates metrics only; Loki, scrape-resource creation
+and trace-PVC panels are optional.
+
+```sh
+cp examples/serve/grafana/example.config.json /tmp/trtllm-dashboard.json
+# Edit the copied configuration for your deployment.
+python3 examples/serve/grafana/dashboard.py render \
+  --config /tmp/trtllm-dashboard.json --output /tmp/trtllm-dashboard-rendered
+python3 examples/serve/grafana/dashboard.py deploy \
+  --config /tmp/trtllm-dashboard.json --output /tmp/trtllm-dashboard-rendered --dry-run
+```
+
+Rendering is offline. The deployment dry-run validates the selected Grafana API
+and enabled Kubernetes resources without publishing them. Run `deploy` without
+`--dry-run` to publish. Use API persistence for API-owned dashboards and
+`configmap-v2` for existing file-sidecar ownership; applying its generated ConfigMap
+alone is incomplete. The tool guards resource versions and reads back saved
+content. ConfigMap checkpoint plus native finalization is not a cross-system
+transaction; the README documents `--finalize-only` recovery.
+
+The 80 default metric templates include physical tier states/resident occupancy,
+restore/eviction turnover, final drops, sampled restore latency/skips and
+completed-request transfer duration. Native ratios use logical byte capacity and
+remain separated by level/tier and reporting rank. Unsupported observations hide
+optional panels. GPU active/available block charts retain their separate meaning:
+available blocks can contain reclaimable prefixes. These panels cannot prove
+which conversation prefix was evicted.
+
+Select one application scrape job path to avoid duplicate engine observations.
+Existing `irate` charts use the last two samples in `counter_lookback`; new tier
+rate/turnover charts average the window, and sampled latency uses a 5-minute
+histogram window. Missing metrics, sparse timing samples, rank coverage and native
+build requirements still apply; dashboard creation does not enable instrumentation.
+
+The template includes optional KV-cache tier and transfer panels whose added
+instrumentation is provided separately by [PR #22083](https://github.com/NVIDIA/TensorRT-LLM/pull/22083).
+This metrics refactor does not introduce those metric families.
