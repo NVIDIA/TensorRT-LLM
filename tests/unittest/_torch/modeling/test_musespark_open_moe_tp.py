@@ -295,6 +295,8 @@ def _tp_backend_on_rank(quantized, tokens):
                 if quantized
                 else None,
                 layer_idx=0,
+                # The comparison must run on the requested TRTLLM backend, not a fallback.
+                allow_backend_degradation=False,
             ).cuda()
             moe.load_weights([weights])
             moe.post_load_weights()
