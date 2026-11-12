@@ -226,6 +226,25 @@ require runnable CPU and serving validation among the candidate stages. Dryrun
 also reports all candidates; it has no `--post-merge` selector mode and does not
 simulate downstream scheduling or shard intersections.
 
+### Multi-GPU scope and approval
+
+On bare `/bot run`, the normal pre-merge file-change rules and auto-trigger tags
+first establish the eligible stage scope. CBTS narrows that scope; a Tier 1 hit
+alone no longer adds a multi-GPU stage excluded by the baseline. This differs
+from the old CBTS filter, which selected affected stages from the full inventory.
+The `ci: full pre-merge approved` label authorizes multi-GPU dispatch; it does
+not itself add stages to the scope. Dispatch also requires eligible multi-GPU
+work and the normal single-GPU prerequisite checks.
+
+Tier 2 only narrows single-GPU coverage. Its `enable_multi_gpu=true` means
+“retain baseline multi-GPU work”, not that coverage proved a multi-GPU impact.
+Coverage decisions retain all multi-GPU stages already in the command scope,
+including Post-Merge PerfSanity stages selected by `--post-merge` or an explicit
+stage flag. These run the original case lists without coverage narrowing.
+Post-Merge multi-GPU stages are intentionally not excluded by the retention
+clause. Auto-trigger retention in coverage mode also remains within the command
+scope. Null decisions use the full command-selected baseline.
+
 ## How it's invoked (CI)
 
 `getCbtsResult` calls `cbts.command main` twice on the L0_MergeRequest agent
