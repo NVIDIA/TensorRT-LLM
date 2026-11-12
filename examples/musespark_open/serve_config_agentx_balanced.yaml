@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Muse Spark Open (816B-A42B) on one GB300 NVL node (4 GPUs, TP4/EP4) for agentic workloads:
+# long multi-turn contexts (up to 1M tokens) where each request mostly extends an earlier one.
+# Balanced configuration, measured with the AgentX benchmark at 24 concurrent sessions.
+# Pass to trtllm-serve with --config; see "Agentic Workloads" in
+# ../../docs/source/deployment-guide/deployment-guide-for-musespark-open-on-trtllm.md.
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+pipeline_parallel_size: 1
+enable_attention_dp: false
+max_batch_size: 24
+max_num_tokens: 8192
+# The model's full context window.
+max_seq_len: 1048576
+trust_remote_code: true
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+attn_backend: TRTLLM
+allreduce_strategy: NCCL
+moe_config:
+  backend: TRTLLM
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 24
+  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+     24]
+# Prefill (context) steps also replay CUDA graphs, captured at these token counts.
+prefill_cuda_graph_backend: breakable
+prefill_capture_num_tokens: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792,
+   2048, 2304, 2560, 2816, 3072, 3584, 4096, 4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192]
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  # FP8 KV cache is required on SM103 when chunked prefill or block reuse is enabled
+  # (head-dimension-64 paged-context FMHA constraint).
+  dtype: fp8
+  enable_block_reuse: true
+  enable_partial_reuse: true
+  block_reuse_config:
+    # Blocks become reusable after every prefill chunk instead of only after the whole prompt,
+    # so requests that share a long prefix can reuse it while it is still being prefilled.
+    policy: all_reusable
+    # Under cache pressure, keep the sliding-window blocks that end each prompt (its last window
+    # plus this many tokens) and evict the other sliding-window blocks first.
+    swa_endpoint_rewind_tokens: 1024
+  tokens_per_block: 32
+  # Fixed split of the GPU KV pool across the two KV layer groups (one per attention window:
+  # the 2,048-token sliding window and the full context).
+  pool_ratio: [0.25, 0.75]
+  free_gpu_memory_fraction: 0.8
+  # Host-memory KV tier per GPU: 160 GiB, 640 GiB per node. Blocks evicted from GPU
+  # memory move here and are copied back on a prefix hit instead of being recomputed.
+  host_cache_size: 171798691840
+# Text-only serving: the vision and audio towers are not loaded, and image, video or audio
+# input is rejected. Remove this line to accept multimodal requests.
+disable_mm_encoder: true
+# Response formatting and detokenization run in separate processes. For trtllm-serve only: remove
+# it for the LLM API (e.g. trtllm-eval), whose outputs otherwise come back without text.
+num_postprocess_workers: 8
+# Streaming responses are sent every 20 decoding steps, which lowers the per-token
+# overhead at high concurrency.
+stream_interval: 20
+# A prompt that extends a recently seen prompt only has its new tail tokenized.
+enable_tokenization_cache: true
+# Per-iteration statistics (batch, KV-cache and prefix-reuse counters), served as JSON at /metrics;
+# collected every 40th step.
+enable_iter_perf_stats: true
+iter_perf_stats_interval: 40

@@ -34,6 +34,7 @@ The examples below use `/path/to/musespark-open-checkpoint` — replace it with 
 * **KV-cache block reuse is supported and enabled** (`enable_block_reuse: true`, `enable_partial_reuse: true`).
 * **Guided decoding is supported** with the `xgrammar` backend (`guided_decoding_backend: xgrammar`), including JSON-schema constrained output.
 * **Speculative decoding is supported** with a DFlash2 drafter, and model-free suffix-automaton (SA) drafting is available as an opt-in; see [Speculative Decoding](#speculative-decoding) below.
+* **Agentic workloads** (long multi-turn sessions, up to the full 1M-token context) have two dedicated configurations; see [Agentic Workloads](#agentic-workloads) below.
 * **Disaggregated serving:** this model runs on the KV cache manager v2 only, which disaggregated serving keeps on the NIXL backend with the Python transceiver runtime (`cache_transceiver_config: {backend: NIXL, transceiver_runtime: PYTHON}`); other transceiver configurations are refused at startup. Some disaggregated configurations additionally require adjusting the attention-kernel library selection with `TLLM_FMHA_LIBS=-fallback` in the server environment (this removes the fallback attention library from the default selection order). On GB300 (`SM103`, aarch64) also set `UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp` in every worker environment: with the default UCX transport list, NIXL memory registration fails at startup (`registerMem: registration failed for the specified or all potential backends`).
 
 ## Deployment Steps
@@ -195,6 +196,88 @@ DFlash runs on the `TRTLLM` attention backend — the backend the validated aggr
 Draft-token acceptance is strict: an accepted token is exactly the token the target model emits at that position. At temperature 0, completions still often differ from the same server with speculation off: draft verification runs the target model through a different attention path than one-token decoding, and the resulting small numeric differences flip which of two near-tied candidate tokens wins. Near-ties are common in this model's reasoning text, so the greedy text often diverges early in the reasoning. KV-cache prefix reuse and batch composition change temperature-0 completions in the same way; at temperature > 0 the effect disappears into ordinary sampling variation.
 
 Suffix-automaton (SA) drafting — model-free speculation that drafts from the request's own token history — is also available as an opt-in for low-concurrency or copy-heavy serving. Its measured trade-offs are covered in the [Muse Spark Open speculative-decoding guide](deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md).
+
+## Agentic Workloads
+
+Agentic coding sessions resend their whole conversation with every request. In the AgentX runs measured below, the median request carried 90,000 to 100,000 input tokens and the 99th percentile 500,000 to 670,000, nearly all of it the context of an earlier request in the same session, and the median response was about 330 tokens. Serving this traffic is mostly a matter of keeping and reusing the KV cache of earlier turns. `examples/musespark_open/` has two configurations for it, measured on one GB300 NVL node:
+
+| Configuration | Concurrent sessions | Total throughput (tokens/s/GPU) | Output speed per session (tokens/s, p50 / p90) | TTFT (s, p50 / p90) |
+|---|---|---|---|---|
+| [`serve_config_agentx_max_throughput.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/examples/musespark_open/serve_config_agentx_max_throughput.yaml) | 48 | 26,169 | 24.1 / 64.6 | 1.3 / 2.7 |
+| [`serve_config_agentx_balanced.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/examples/musespark_open/serve_config_agentx_balanced.yaml) | 24 | 19,306 | 41.9 / 108.6 | 0.9 / 2.2 |
+
+Use the max-throughput configuration to serve the most sessions per node, and the balanced one when each session should get its first token and its output sooner. Launch either one in place of the recommended settings above:
+
+```bash
+MODEL=/path/to/musespark-open-checkpoint
+CONFIG=/path/to/serve_config_agentx_max_throughput.yaml   # from examples/musespark_open/
+
+trtllm-serve ${MODEL} \
+    --host 0.0.0.0 --port 8000 \
+    --config ${CONFIG} \
+    --custom_tokenizer musespark_open \
+    --tool_parser musespark \
+    --reasoning_parser musespark
+```
+
+Startup takes about 6 to 10 minutes, most of it spent capturing CUDA graphs for the decode batch sizes and the prefill token counts.
+
+### What the Agentic Configurations Change
+
+Compared with the recommended settings above:
+
+* **Full context.** `max_seq_len: 1048576`, the model's context window.
+* **KV-cache reuse tuned for long sessions** (KV cache manager v2). Blocks become reusable after every prefill chunk rather than at the end of the prompt (`block_reuse_config.policy: all_reusable`); under cache pressure, the sliding-window blocks that end each prompt are kept longest (`swa_endpoint_rewind_tokens: 1024`); and the GPU KV pool is split at a fixed ratio between the sliding-window and the full-attention layers (`pool_ratio`).
+* **A host-memory KV tier.** `host_cache_size` gives each GPU 160 GiB of host memory for KV blocks evicted from GPU memory, so a session that comes back copies its context back instead of recomputing it. The node needs 640 GiB of host memory for this tier in addition to the server processes: in the measured runs, host memory use peaked at about 820 GiB of 950 GiB. Lower `host_cache_size` on hosts with less.
+* **Prefill CUDA graphs** (`prefill_cuda_graph_backend: breakable` with `prefill_capture_num_tokens`) and the `MAX_UTILIZATION` capacity-scheduler policy.
+* **Serving-side settings:** `num_postprocess_workers: 8`, `stream_interval: 20` and `enable_tokenization_cache: true`. Postprocess workers apply to `trtllm-serve`; with the LLM API (for example `trtllm-eval`), leave `num_postprocess_workers` unset, or the outputs come back without text.
+* **Text only.** `disable_mm_encoder: true` skips loading the vision and audio towers, which leaves more GPU memory for the KV cache; image, video and audio requests are rejected. Remove the line to serve multimodal requests.
+* **No speculative decoding.** On this branch, the DFlash2 drafter keeps a dense context buffer for every batch slot, sized for `max_seq_len`: about 5 GiB per GPU per slot at 1M tokens, which does not fit next to these batch sizes.
+
+Raising concurrency past 48 sessions buys little. In 20-minute runs with these settings (the hour-long results below are the reference), 56 and 64 sessions added 2 % and 5 % throughput, while the p90 time to first token rose from 2.9 s to 8.8 s and 11.0 s:
+
+| Concurrent sessions (= `max_batch_size`) | 16 | 24 | 32 | 40 | 48 | 56 | 64 |
+|---|---|---|---|---|---|---|---|
+| Total throughput (tokens/s/GPU) | 13,415 | 16,188 | 22,108 | 24,486 | 27,639 | 28,185 | 29,084 |
+| Output speed per session (tokens/s, p50) | 53.4 | 34.3 | 30.2 | 27.4 | 25.1 | 21.4 | 18.4 |
+| TTFT p90 (s) | 1.6 | 2.9 | 6.6 | 2.6 | 2.9 | 8.8 | 11.0 |
+
+With the same engine settings, minus the serving-side ones that `trtllm-eval` does not take, GSM8K scores 94.47 with the max-throughput configuration and 95.22 with the balanced one.
+
+### Measuring with AgentX
+
+The numbers come from the AgentX scenario of SemiAnalysis's [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) (aiperf 0.12.0), which replays the public dataset [`semianalysisai/cc-traces-weka-062126`](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126) (Apache-2.0): 393 Claude Code sessions with their sub-agents, recorded as each request's input and output length and its prefix overlap with earlier requests. To measure a server the same way:
+
+```bash
+pip install "git+https://github.com/SemiAnalysisAI/agentx-harness.git@104c7c8086666385fbf3962911b55f68bf08a04a"
+
+aiperf profile --scenario agentx \
+    --url http://localhost:8000 --endpoint /v1/chat/completions --endpoint-type chat --streaming \
+    --model ${MODEL} --tokenizer ${MODEL} --tokenizer-trust-remote-code \
+    --public-dataset semianalysis_cc_traces_weka_062126 --num-dataset-entries 393 \
+    --max-context-length 1048576 --concurrency 48 \
+    --benchmark-duration 3600 --benchmark-grace-period 30 \
+    --warmup-requests-per-lane 10 --warmup-grace-period 1800 \
+    --trace-idle-gap-cap-seconds 300 \
+    --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+    --use-server-token-count --random-seed 42 --failed-request-threshold 0.10 \
+    --stats-interval 30 --slice-duration 1.0 --no-gpu-telemetry \
+    --output-artifact-dir agentx-results
+```
+
+Notes on the measurement:
+
+* Each replayed session starts between 25 % and 75 % of the way into its trace, and each of the concurrent sessions first replays 10 warm-up requests, so the measured hour starts with a populated cache.
+* Total throughput counts input and output tokens; about 96 % of the input tokens are served from the prefix cache.
+* The chat template writes the current date into each prompt, so a date change during a run invalidates every cached prefix. Start the server with a `TZ` whose date does not change during the run.
+* With `--reasoning_parser musespark`, a response whose few output tokens are all reasoning has no `content`, and aiperf counts it as a failed request.
+
+Results of one measured hour per configuration (2026-11-11), on one GB300 NVL node (4 GPUs) at commit `0e868637c8` of this branch, with the checkpoint `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` (revision `4239e4db`):
+
+| Configuration | Sessions | Total (tokens/s/GPU) | Output (tokens/s/GPU) | Output speed per session (tokens/s, p50 / p90) | TTFT (s, p50 / p90 / p99) | Inter-token latency p50 (ms) | Prefix-cache hits | Failed requests |
+|---|---|---|---|---|---|---|---|---|
+| Max-throughput | 48 | 26,169 | 175 | 24.1 / 64.6 | 1.3 / 2.7 / 9.7 | 41.3 | 96.0 % | 6 of 2,969 (0.2 %) |
+| Balanced | 24 | 19,306 | 143 | 41.9 / 108.6 | 0.9 / 2.2 / 6.7 | 23.4 | 96.6 % | 5 of 2,239 (0.2 %) |
 
 ## Testing API Endpoint
 
