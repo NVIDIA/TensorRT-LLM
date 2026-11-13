@@ -2414,7 +2414,8 @@ def run_disaggregated_benchmark(example_dir,
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd)
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
+                             server_start_timeout=1200)
 
     server_host = config.get("hostname", "localhost")
 
