@@ -45,11 +45,10 @@ def _gpt_oss_config(drop=(), **rope_overrides):
 @pytest.fixture
 def host_rope_tables(monkeypatch):
     """create_rope_const_params puts its tables on CUDA; keep them on the host."""
-    host_torch = SimpleNamespace(
-        tensor=lambda data, dtype=None, device=None: torch.as_tensor(data, dtype=dtype),
-        float32=torch.float32,
+    real_tensor = torch.tensor
+    monkeypatch.setattr(
+        interface.torch, "tensor", lambda *a, device=None, **k: real_tensor(*a, **k)
     )
-    monkeypatch.setattr(interface, "torch", host_torch)
 
 
 @pytest.mark.parametrize("truncate", [False, True])
