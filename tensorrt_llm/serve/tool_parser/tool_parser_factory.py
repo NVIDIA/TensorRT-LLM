@@ -22,6 +22,7 @@ from .musespark_parser import MuseSparkToolParser
 from .poolside_v1_parser import PoolsideV1ToolParser
 from .qwen3_coder_parser import Qwen3CoderToolParser
 from .qwen3_tool_parser import Qwen3ToolParser
+from .xing4_0_parser import Xing4_0ToolParser
 
 MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "qwen2": "qwen3",
@@ -42,6 +43,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "glm4_moe": "glm47",
     "glm4_moe_lite": "glm47",
     "glm_moe_dsa": "glm47",
+    "xing4_0": "xing4_0",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4",
     "laguna": "poolside_v1",
@@ -81,6 +83,7 @@ class ToolParserFactory:
         "gemma4": Gemma4ToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,
+        "xing4_0": Xing4_0ToolParser,
         "minimax_m2": MiniMaxM2ToolParser,
         "minimax_m3": MiniMaxM3ToolParser,
         "musespark": MuseSparkToolParser,
