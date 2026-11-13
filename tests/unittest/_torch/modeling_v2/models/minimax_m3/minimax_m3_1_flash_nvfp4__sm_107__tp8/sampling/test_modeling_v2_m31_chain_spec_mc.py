@@ -112,6 +112,9 @@ def test_graph_replay_equals_eager() -> None:
     entry.prebuild(args[0].device)
     ref = entry.chain_spec_mc(*args)
     stream = torch.cuda.Stream()
+    # The eager warm-up on the side stream shares the persistent workspace with the default-stream
+    # calls above (and reads their inputs): order it after them.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         entry.chain_spec_mc(*args)
         torch.cuda.synchronize()
