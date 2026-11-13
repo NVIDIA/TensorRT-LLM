@@ -58,6 +58,8 @@ def _make_stub_executor(rank=0, queued_items=None):
     stub._has_pending_connector_transfers = lambda: False
     # No generation-side receive is retiring.
     stub.disagg = SimpleNamespace(has_retiring_gen_receives=False)
+    # No responses are staged for the idle path to flush.
+    stub._flush_staged_responses = lambda: None
     return stub
 
 
