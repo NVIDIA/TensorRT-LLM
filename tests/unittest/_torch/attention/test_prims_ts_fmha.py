@@ -410,12 +410,13 @@ def test_supports_linear_mla_context(
     kv_len: int,
     helix: bool,
 ) -> None:
+    num_heads = 12 if helix else 96
     supported, reason = _support_result(
         attention_input_type=AttentionInputType.context_only,
         head_dim=192,
         is_mla=True,
-        num_heads=96,
-        num_kv_heads=96,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
         has_separate_kv=True,
         tokens_per_block=128,
         kv_dtype=DataType.FP8 if fp8 else DataType.BF16,
@@ -425,13 +426,17 @@ def test_supports_linear_mla_context(
             "is_spec_decoding_enabled": spec_flags[0],
             "use_spec_decoding": spec_flags[1],
             "helix_context_local_slots": _TensorSpec((4,), torch.int32) if helix else None,
-            "num_generations": 1 if helix else 0,
+            "num_contexts": 3 if helix else 1,
+            "num_generations": 5 if helix else 0,
         },
         forward_overrides={
             "attention_mask": mask,
-            "softmax_stats_tensor": _TensorSpec((4, 96, 2), torch.float32) if store_stats else None,
+            "softmax_stats_tensor": _TensorSpec((4, num_heads, 2), torch.float32)
+            if store_stats
+            else None,
         },
-        kv_lens_override=[kv_len, 64] if helix else [kv_len],
+        # A generation request can own no KV on this rank, independently of context work.
+        kv_lens_override=[kv_len] * 3 + [64, 64, 64, 64, 0] if helix else [kv_len],
     )
     assert supported, reason
 
@@ -473,13 +478,22 @@ def test_supports_linear_mla_context(
         ),
         (
             {
-                "kv_lens_override": [0],
+                "kv_lens_override": [0, 64],
+                "metadata_overrides": {"num_generations": 1},
                 "forward_overrides": {
                     "attention_mask": PredefinedAttentionMask.FULL,
                     "softmax_stats_tensor": None,
                 },
             },
             "at least one KV",
+        ),
+        (
+            {"kv_lens_override": [129, 0], "metadata_overrides": {"num_generations": 1}},
+            "configured maximum sequence length",
+        ),
+        (
+            {"kv_lens_override": [4], "metadata_overrides": {"num_generations": 1}},
+            "host KV lengths",
         ),
     ],
 )
@@ -524,7 +538,9 @@ def test_supports_uniform_linear_fp8_mla(query_width: int, helix: bool, page_siz
         tokens_per_block=page_size,
         helix=helix,
         helix_bounds_valid=query_width > 1,
-        kv_lens_override=[0, 0, 32, 64] if helix else None,
+        query_lens=[1] + [query_width] * 4 if helix else None,
+        metadata_overrides={"num_contexts": 1, "num_ctx_tokens": 1} if helix else None,
+        kv_lens_override=[129, 0, 0, 32, 64] if helix else None,
     )
     assert supported, reason
 
@@ -801,6 +817,14 @@ def test_phase_support_check_preserves_whole_request_semantics(phase: FmhaPhase)
 
     assert not supported
     assert "context head dimension" in reason
+
+    supported, reason = _support_result(
+        attention_input_type=AttentionInputType.mixed,
+        kv_lens_override=[3, 0],
+        phase=phase,
+    )
+    assert not supported
+    assert "at least one KV" in reason
 
 
 def test_is_supported_accepts_and_forwards_phase_keyword(

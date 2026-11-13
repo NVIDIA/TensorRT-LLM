@@ -651,7 +651,13 @@ class PrimsTSFmha(PhasedFmha):
         host_kv_lens = meta.kv_lens_runtime
         if host_kv_lens is None or host_kv_lens.numel() < num_contexts + num_generations:
             return False, "host KV lengths are required for safe policy selection."
-        active_kv_lens = host_kv_lens[: num_contexts + num_generations]
+        # Metadata retains both phases even when MLA dispatches them separately.
+        if input_type == AttentionInputType.context_only:
+            active_kv_lens = host_kv_lens[:num_contexts]
+        elif input_type == AttentionInputType.generation_only:
+            active_kv_lens = host_kv_lens[num_contexts : num_contexts + num_generations]
+        else:
+            active_kv_lens = host_kv_lens[: num_contexts + num_generations]
         allows_empty_chunk = (
             is_mla
             and has_context
