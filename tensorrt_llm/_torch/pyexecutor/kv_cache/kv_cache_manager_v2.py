@@ -6016,17 +6016,20 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @cached_property
     def _mixed_precision_high_groups(self) -> list[int]:
-        """The layer groups of the mixed-precision high layers."""
+        """The buffer groups of the mixed-precision high layers' windows."""
         return sorted(
             {
-                int(self.impl.get_layer_group_id(layer))
+                int(self.impl.get_buffer_group_id(layer, Role.KEY))
                 for layer in self.mixed_precision_high_layers.values()
             }
         )
 
-    def _mixed_precision_reuse_limit(self, req: LlmRequest, kv_cache: _KVCache) -> int | None:
-        """Block boundary to reuse a prefix up to when it came without its last-N window, or None;
-        "recompute" stops N tokens earlier. A paired draft pool takes its target's depth instead."""
+    def _mixed_precision_reuse_limit(
+        self, req: LlmRequest, kv_cache: _KVCache, back_off: int = 0
+    ) -> int | None:
+        """For a prefix that came without its last-N window, the block boundary at least
+        `back_off` tokens before its end to reuse it up to; else None. A paired draft pool takes its
+        target's depth instead."""
         if (
             self.mixed_precision_reuse == "strict"
             or self.is_draft
@@ -6038,10 +6041,8 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.reuse_status[group].complete for group in self._mixed_precision_high_groups
         ):
             return None
-        end = kv_cache.num_committed_tokens
-        if self.mixed_precision_reuse == "recompute":
-            end -= self.last_n
-        limit = max(0, end) // self.tokens_per_block * self.tokens_per_block
+        end = max(0, kv_cache.num_committed_tokens - back_off)
+        limit = end // self.tokens_per_block * self.tokens_per_block
         return None if limit == kv_cache.num_committed_tokens else limit
 
     def _context_reuse_tokens(
@@ -6273,16 +6274,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache = create(tokens)
                 if kv_cache is None:
                     return None
-                window_limit = self._mixed_precision_reuse_limit(req, kv_cache)
-                if window_limit is not None:
-                    # Stop at a block boundary: the window pages after it hold only what this request
-                    # computes.
+                # Stop at a block boundary ("recompute": N tokens earlier) so the window pages after
+                # it hold only what this request computes; a rematch pruned inside a block backs off
+                # to the block's start.
+                back_off = self.last_n if self.mixed_precision_reuse == "recompute" else 0
+                while (
+                    window_limit := self._mixed_precision_reuse_limit(req, kv_cache, back_off)
+                ) is not None:
                     self._remove_kv_cache(req.py_request_id)
                     tokens = self._context_reuse_tokens(req, window_limit)
                     num_lookup_tokens = len(tokens)
                     kv_cache = create(tokens)
                     if kv_cache is None:
                         return None
+                    back_off = 0
                 kv_cache.cuda_stream = self._cache_stream(req.py_request_id)
 
             if not self.enable_block_reuse:

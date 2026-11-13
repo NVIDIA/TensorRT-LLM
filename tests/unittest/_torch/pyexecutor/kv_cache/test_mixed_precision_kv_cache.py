@@ -262,9 +262,23 @@ def test_native_common_reuse_and_window_retention(make_manager, policy, reused_t
         assert shortened.resume(stream)
 
 
-def test_default_reuse_reads_evicted_window_from_history(make_manager):
-    """A prefix whose high-precision last-N pages were evicted is reused in full; its window reads
-    those pages from the low-precision history."""
+@pytest.mark.parametrize(
+    "cached,reused",
+    [
+        # The window, page 3, was evicted.
+        (512, 512),
+        # The window spans the evicted page 3 and the cached page 4: reuse stops at page 4.
+        (576, 512),
+        # The window lies in the cached page 4.
+        (600, 600),
+        # The window is the whole cached page 4.
+        (640, 640),
+    ],
+)
+def test_default_reuse_reads_evicted_window_from_history(make_manager, cached, reused):
+    """A prefix whose high-precision last-N window is cached in part or not at all is reused up to
+    the block boundary at its end, and that window reads the low-precision history; a cached window
+    is reused with the prefix. Either way the request writes its own tokens in high precision."""
     manager = make_manager(config=mixed_config())
     block = manager.tokens_per_block
     staging = MixedPrecisionKVStaging(
@@ -284,42 +298,65 @@ def test_default_reuse_reads_evicted_window_from_history(make_manager):
     manager.try_commit_blocks(source)
     manager.free_resources(source)
 
-    # Per-request snapshots keep the high pages of the source's last window only, so the
-    # window at 512 tokens is missing; REQUIRED would stop reuse at the first page.
-    reader = _request(2, tokens[:512] + [9999])
+    # Per-request snapshots keep the high pages of the source's sink and last window, pages 0 and
+    # 4, only.
+    reader = _request(2, tokens[:cached] + [9999])
     assert manager.prepare_context(reader)
-    assert manager.kv_cache_map[2].num_committed_tokens == 512
+    assert manager.kv_cache_map[2].num_committed_tokens == reused
+    assert manager._mixed_precision_low_prefix_len[2] == (reused if reused <= 512 else 0)
     # Suspended before its first forward, the cache resumes without selecting again.
     manager.kv_cache_map[2].suspend()
-    assert manager.prepare_context(reader) and manager.resize_context(reader, 1)
+    new = cached + 1 - reused
+    assert manager.prepare_context(reader) and manager.resize_context(reader, new)
     low_pages, high_pages = (table[0] for table in manager.get_mixed_precision_page_tables([2], 0))
-    # The sink page was claimed with the prefix and pages 1 and 2 left the window. The window page
-    # 3 holds nothing yet, so it reads the history too.
+    # Pages 1 and 2 left the window, and a window that is not cached in full holds nothing, so
+    # pages 1 to 3 read the history.
     assert high_pages[0] >= 0 and high_pages[1:4] == [kv.BAD_PAGE_INDEX] * 3
     low_before = low[low_pages].clone()
     pool.zero_()
 
-    staging.update([2], [512], [1], capture_graph=False)
+    staging.update([2], [reused], [new], capture_graph=False)
     staging.convert(0)
-    # The sink keeps its high-precision values; pages 1 to 3 decode from the low pool.
+    # The sink and a cached window keep their high-precision values; pages 1 to 3 decode from the
+    # low pool.
     assert torch.equal(pool[0], page_values) and torch.equal(high[high_pages[0]], page_values)
+    assert torch.equal(pool[4][:, : reused - 512], page_values[:, : reused - 512])
     assert torch.equal(pool[3], pool[1]) and not torch.equal(pool[3], page_values)
     assert torch.equal(low[low_pages], low_before)
+
+    # The request's own tokens go to its high-precision page.
+    page, row = divmod(reused, block)
+    pool[page] = torch.randn_like(page_values)
+    staging.convert(0, writeback=True)
+    assert high_pages[page] >= 0
+    assert torch.equal(high[high_pages[page]][:, row : row + new], pool[page][:, row : row + new])
     manager.free_resources(reader)
 
 
-@pytest.mark.parametrize("recompute,reused", [(False, 512), (True, 384)])
+@pytest.mark.parametrize(
+    "mode,cached,reused,low_prefix",
+    [
+        ("default", 512, 512, 512),
+        ("default", 576, 512, 512),
+        ("default", 600, 600, 0),
+        ("default", 640, 640, 0),
+        ("recompute", 512, 384, 384),
+        ("recompute", 576, 384, 384),
+        ("recompute", 640, 640, 0),
+    ],
+)
 @pytest.mark.parametrize("window", ["mixed_dtype", "cold_page"])
-def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
-    """A prefix whose high-precision last-N pages were evicted is reused in full, or with
-    recompute only up to the block boundary before them. Its window reads the history: the high
-    page table drops the pages after the sink."""
-    options = dict(mixed_precision_reuse="recompute" if recompute else "default")
+def test_reuse_without_the_last_n(make_manager, window, mode, cached, reused, low_prefix):
+    """A prefix whose high-precision last-N window is cached in part or not at all is reused up to
+    the block boundary at its end, or with recompute the one at least N tokens before it. Its
+    window reads the history: the high page table drops the pages after the sink up to there. A
+    cached window is reused with the prefix."""
     if window == "mixed_dtype":
-        manager = make_manager(config=mixed_config(**options))
+        manager = make_manager(config=mixed_config(mixed_precision_reuse=mode))
     else:
         manager = make_manager(
-            config=cold_page_config(**options), cold_page_codec_provider=_ColdPageProvider()
+            config=cold_page_config(mixed_precision_reuse=mode),
+            cold_page_codec_provider=_ColdPageProvider(),
         )
     assert [layer.reuse_policy for layer in manager.kv_cache_manager_py_config.layers] == [
         kv.ReusePolicy.REQUIRED,
@@ -328,17 +365,45 @@ def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
     tokens = list(range(640))
     _cache_prompt(manager, tokens)
 
-    # Per-request snapshots keep the high pages of the source's last window only. The window at
-    # 512 tokens is missing; recompute backs off by last_n = 65 tokens to the block boundary at
-    # 384, where the window is missing too. Either way the pages up to `reused` read the history.
-    reader = _request(2, tokens[:512] + [9999])
+    # Per-request snapshots keep the high pages of the source's sink and last window, pages 0 and
+    # 4, only: the window at 512 tokens, page 3, is missing, and so is page 3 of the one at 576.
+    reader = _request(2, tokens[:cached] + [9999])
     assert manager.prepare_context(reader)
     assert manager.kv_cache_map[2].num_committed_tokens == reused
+    assert manager._mixed_precision_low_prefix_len[2] == low_prefix
+    assert manager.resize_context(reader, cached + 1 - reused)
     pages = torch.full((2, 1, 8), -1, dtype=torch.int32)
     manager.fill_mixed_precision_page_tables([2], 0, pages.numpy())
-    reused_pages = reused // manager.tokens_per_block
-    assert pages[0, 0, :reused_pages].ge(0).all() and pages[1, 0, 0] >= 0
-    assert pages[1, 0, 1:reused_pages].eq(kv.BAD_PAGE_INDEX).all()
+    block = manager.tokens_per_block
+    assert pages[0, 0, : -(-(cached + 1) // block)].ge(0).all() and pages[1, 0, 0] >= 0
+    assert pages[1, 0, 1 : -(-low_prefix // block)].eq(kv.BAD_PAGE_INDEX).all()
+    # The page of the request's first token is its own and keeps high precision.
+    assert pages[1, 0, reused // block] >= 0
+    manager.free_resources(reader)
+
+
+def test_default_reuse_backs_off_a_rematch_that_ends_inside_a_block(make_manager):
+    """When native reuse prunes the rematch at a block boundary to the middle of an earlier block,
+    reuse backs off to that block's start, so the page of the request's first token is its own."""
+    manager = make_manager(config=mixed_config())
+    tokens = list(range(640))
+    _cache_prompt(manager, tokens)
+    reuse_tokens = manager._context_reuse_tokens
+
+    def pruned(req, reuse_limit=None):
+        # Stands in for a rematch at 512 tokens that native reuse prunes to 300.
+        return reuse_tokens(req, 300 if reuse_limit == 512 else reuse_limit)
+
+    # The window at 576 tokens misses page 3, so reuse rematches at 512.
+    reader = _request(2, tokens[:576] + [9999])
+    with patch.object(manager, "_context_reuse_tokens", side_effect=pruned):
+        assert manager.prepare_context(reader)
+    assert manager.kv_cache_map[2].num_committed_tokens == 256
+    assert manager._mixed_precision_low_prefix_len[2] == 256
+    assert manager.resize_context(reader, 577 - 256)
+    pages = torch.full((2, 1, 8), -1, dtype=torch.int32)
+    manager.fill_mixed_precision_page_tables([2], 0, pages.numpy())
+    assert pages[1, 0, 0] >= 0 and pages[1, 0, 1] == kv.BAD_PAGE_INDEX and pages[1, 0, 2] >= 0
     manager.free_resources(reader)
 
 
@@ -359,6 +424,32 @@ def test_default_reuse_publishes_no_missing_window(make_manager):
     assert manager.prepare_context(follower)
     assert manager._mixed_precision_low_prefix_len[3] == 512
     manager.free_resources(follower)
+
+
+def test_reuse_limit_backs_off_to_a_block_boundary():
+    """A prefix without its last-N window is reused up to a block boundary at least `back_off`
+    tokens before its end, also when the match was pruned inside a block; a prefix that ends on a
+    boundary or comes with its window keeps its depth."""
+    manager = SimpleNamespace(
+        mixed_precision_reuse="default",
+        is_draft=False,
+        tokens_per_block=128,
+        _mixed_precision_high_groups=[1],
+    )
+    req = SimpleNamespace(is_disagg_generation_init_state=False)
+
+    def limit(tokens, complete=False, back_off=0):
+        cache = SimpleNamespace(
+            num_committed_tokens=tokens, reuse_status={1: SimpleNamespace(complete=complete)}
+        )
+        return KVCacheManagerV2._mixed_precision_reuse_limit(manager, req, cache, back_off)
+
+    assert limit(300) == 256
+    assert limit(384) is None
+    assert limit(300, complete=True) is None
+    assert limit(512, back_off=65) == 384
+    manager.mixed_precision_reuse = "strict"
+    assert limit(300) is None
 
 
 def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
