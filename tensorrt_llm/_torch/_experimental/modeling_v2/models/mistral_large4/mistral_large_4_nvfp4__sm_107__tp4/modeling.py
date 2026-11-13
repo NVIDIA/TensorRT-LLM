@@ -323,12 +323,14 @@ _CTX_WORKSPACE_ROWS = 1 << 19
 # capacity: fixed: the kernel's scheduler, not an engine limit.
 _CTX_DECODE_ROWS = 8192
 # CuTe decode selectors: one CTA per row for next_n=1 at 4K..64K columns, and ten
-# partitions plus a radix merge for DSpark verification at the padded 1M envelope.
+# partitions plus a radix merge for DSpark verification from 20480 columns (the narrowest
+# row the native op splits into ten blocks) to 1048584 (the split kernel's widest row).
+# split_radix_topk_decode keeps the native op for a call the op would not split into ten
+# blocks, or whose rows are not 32-byte aligned with a width that is a multiple of 8.
 # Other shapes retain the native selector.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
-_TOPK_VERIFY_COLUMNS = 1048584
-_TOPK_VERIFY_ROW_STRIDE = 1048832
+_TOPK_VERIFY_COLUMNS = (20480, 1048584)
 _TOPK_VERIFY_ROWS = (4, 8, 16)
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
@@ -845,11 +847,8 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
             self._ix_topk = None
         elif self._ix_topk is None:
             self._ix_topk = build_ix_topk_decode(dev, next_n=1)
-        if not (
-            _TOPK_DECODE_CUTE_DSL
-            and self._max_ctx_len == _TOPK_VERIFY_COLUMNS
-            and self.idx_topk == 2048
-        ):
+        lo, hi = _TOPK_VERIFY_COLUMNS
+        if not (_TOPK_DECODE_CUTE_DSL and lo <= self._max_ctx_len <= hi and self.idx_topk == 2048):
             self._ix_topk_verify = None
         elif self._ix_topk_verify is None:
             self._ix_topk_verify = build_ix_topk_verify(
@@ -874,12 +873,12 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         aux_logits: torch.Tensor,
     ) -> torch.Tensor:
         """Select generation rows with the compiled selector for their static shape."""
+        lo, hi = _TOPK_VERIFY_COLUMNS
         if (
             self._ix_topk_verify is not None
             and next_n == 4
             and logits.shape[0] in _TOPK_VERIFY_ROWS
-            and logits.shape[1] == _TOPK_VERIFY_COLUMNS
-            and logits.stride() == (_TOPK_VERIFY_ROW_STRIDE, 1)
+            and lo <= logits.shape[1] <= hi
             and logits.dtype == torch.float32
         ):
             return split_radix_topk_decode(
