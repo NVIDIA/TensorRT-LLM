@@ -2511,7 +2511,7 @@ def test_a_layer_in_another_format_is_told_a_tactic_of_one_family_serving_every_
 @pytest.mark.parametrize(
     "tactic, quants, widened",
     [
-        ("trtllm.trtllm_gen.fused_moe.nvfp4", {"nvfp4", "none"}, ("trtllm_gen.fused_moe",)),
+        ("trtllm.trtllm_gen.fused_moe.nvfp4", {"nvfp4", "none"}, ("trtllm.trtllm_gen.fused_moe",)),
         ("mega_moe.nvfp4", {"nvfp4", "w4a8_mxfp4_mxfp8"}, ()),
         ("cutlass", {"fp8_block_scales"}, ()),
     ],
