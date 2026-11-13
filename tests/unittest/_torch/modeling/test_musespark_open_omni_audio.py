@@ -16,10 +16,12 @@ Data for the golden test, under LLM_MODELS_ROOT (environment variables override)
                             HF checkpoint dir (model.safetensors.index.json +
                             shards) to pull the 72 audio tensors from.
     Muse-Spark-Open-test-data/audio-goldens (MUSESPARK_AUDIO_GOLDENS)
-                            Directory containing speech_<k>.pt golden files,
-                            each a torch.save dict with keys `wav_24k`
-                            (float32 [N]), `n_tokens` (int), `embeddings`
-                            (bfloat16 [n_tokens, 8192]).
+                            Directory containing the speech_<k>.pt and
+                            tone_<k>.pt golden files, each a torch.save dict
+                            with keys `wav_24k` (float32 [N]), `n_tokens` (int)
+                            and `embeddings` (float32 [n_tokens, 8192]),
+                            written by the generate_audio_goldens.py next to
+                            them.
 Either one absent -> the golden test skips.
 """
 
@@ -324,20 +326,24 @@ def test_tower_causality():
 
 
 # ---------------------------------------------------------------------------
-# (d) golden parity against the reference implementations
+# (d) golden parity against the reference implementation
 # ---------------------------------------------------------------------------
-# Tolerance: on the environment the goldens were produced in (CPU, torch 2.12,
-# any thread count) this port is BITWISE-identical to all six golden files, so
-# the tolerance is pure headroom for other environments: a GPU run or a
-# different torch build changes GEMM tiling and fused-RMSNorm rounding by ~1
-# BF16 ulp per op. Rows come out of an RMSNorm, so entries are O(1); one BF16
-# ulp at |x|=1 is 2^-8 = 3.9e-3, and the tower stacks 13 norms + 13 linears +
-# 8 depthwise convs, each re-rounding to BF16. atol=rtol=1e-2 (~2.5 ulps at
-# unit scale) covers that while still failing hard on a real defect: the one
-# porting bug this test caught (a dropped `.contiguous()` changing a
-# reduction's accumulation order) moved the output by 2.2e-1.
-GOLDEN_ATOL = 1e-2
-GOLDEN_RTOL = 1e-2
+# The goldens hold the float32 output of transformers' `MuseSparkAudioModel`
+# with the checkpoint's BF16 weights, and the comparison runs this tower in
+# float32 too. Two correct implementations then agree to about 1e-5 (8.4e-6 at
+# most on the six goldens), so atol=rtol=1e-3 leaves wide headroom for other
+# CPUs and torch builds while a real defect, which moves the output by far
+# more, still fails.
+#
+# The BF16 path only gets a loose bound. The tower's 13 norms, 13 linears and
+# 8 depthwise convs each re-round to BF16, and a one-ulp difference early on
+# grows to as much as 1.5 at the output, so two correct BF16 implementations
+# differ by that much. Each lands 0.8-12 % from the float32 result in relative
+# L2 on the six goldens, this tower and the reference alike, so the bound only
+# rejects a broken BF16 path.
+GOLDEN_ATOL = 1e-3
+GOLDEN_RTOL = 1e-3
+GOLDEN_BF16_MAX_REL_L2 = 0.25
 
 
 def _under_models_root(*parts) -> str:
@@ -435,26 +441,31 @@ def test_golden_embeddings_parity(golden_path):
     # The golden's own accounting must match the formula.
     assert n_tokens == math.ceil(wav.numel() / SAMPLES_PER_TOKEN)
     assert expected.shape == (n_tokens, HIDDEN_SIZE)
+    assert expected.dtype == torch.float32
 
     tower = _load_real_tower()
-    # The goldens are minted under torch.set_num_threads(1). At the container
-    # default (144 threads here) CPU reductions split differently and the tower
-    # lands 0.0156-0.0469 away -- above the tolerance below, from thread count
-    # alone. Pin it for the comparison and restore it, so one test cannot
-    # reconfigure the rest of the session.
+    # One thread, as the goldens were generated, so reruns repeat exactly. The
+    # setting is restored, so one test cannot reconfigure the rest of the session.
     threads_before = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
         with torch.no_grad():
-            (got,) = tower([wav])
+            (got_bf16,) = tower([wav])
+            (got,) = tower.float()([wav])
     finally:
         torch.set_num_threads(threads_before)
 
+    name = os.path.basename(golden_path)
     assert got.shape == expected.shape
-    assert got.dtype == torch.bfloat16
-    got32, exp32 = got.float(), expected.float()
-    max_abs = (got32 - exp32).abs().max().item()
-    assert torch.allclose(got32, exp32, atol=GOLDEN_ATOL, rtol=GOLDEN_RTOL), (
-        f"{os.path.basename(golden_path)}: max abs diff {max_abs:.4e} exceeds "
-        f"atol={GOLDEN_ATOL}/rtol={GOLDEN_RTOL}"
+    assert got.dtype == torch.float32
+    max_abs = (got - expected).abs().max().item()
+    assert torch.allclose(got, expected, atol=GOLDEN_ATOL, rtol=GOLDEN_RTOL), (
+        f"{name}: float32 max abs diff {max_abs:.4e} exceeds atol={GOLDEN_ATOL}/rtol={GOLDEN_RTOL}"
+    )
+    assert got_bf16.shape == expected.shape
+    assert got_bf16.dtype == torch.bfloat16
+    rel_l2 = ((got_bf16.float() - expected).norm() / expected.norm()).item()
+    assert rel_l2 <= GOLDEN_BF16_MAX_REL_L2, (
+        f"{name}: the BF16 output is {rel_l2:.3f} from the float32 golden in relative L2, "
+        f"above {GOLDEN_BF16_MAX_REL_L2}"
     )
