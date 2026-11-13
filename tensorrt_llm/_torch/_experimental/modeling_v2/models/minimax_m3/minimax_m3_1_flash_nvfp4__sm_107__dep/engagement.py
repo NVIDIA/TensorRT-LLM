@@ -76,7 +76,7 @@ def _activation(backend: Any) -> str:
 
 def megamoe_local_requested(environ: Optional[Mapping[str, str]] = None) -> bool:
     """Whether the MegaMoE backend builds its local arm: on unless the disable switch is exactly ``1``. This must stay
-    the backend's own rule (``megamoe_local_plan.megamoe_local_requested``): any other reading makes the target require
+    the backend's own rule (``local_plan.megamoe_local_requested``): any other reading makes the target require
     an identity the backend did not build and refuse at construction."""
     env = os.environ if environ is None else environ
     return env.get(MEGAMOE_LOCAL_DISABLE_ENV) != "1"

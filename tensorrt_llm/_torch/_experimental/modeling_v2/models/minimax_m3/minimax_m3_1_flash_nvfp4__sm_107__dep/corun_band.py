@@ -3,7 +3,7 @@
 """DEP_CORUN_BAND: at 8-way expert parallelism, the MegaMoE launches of the buckets above 32 up to 64 rows per rank keep
 the shared expert beside the launch on the aux stream; every other bucket keeps the backend's serial scope.
 
-The band is the MegaMoE backend's co-run band (``megamoe_local_plan.shared_corun_band``), which the backend reads from
+The band is the MegaMoE backend's co-run band (``local_plan.shared_corun_band``), which the backend reads from
 the environment when it is built and which defaults to none. ``install`` gives each 8-way MegaMoE backend
 ``DEFAULT_BAND`` where that environment sets no band, before any launch is captured; other expert-parallel sizes keep
 the backend default; where DEP_SE_SIDE engages (``se_side``) the model passes its wider ``se_side.CORUN_BAND``

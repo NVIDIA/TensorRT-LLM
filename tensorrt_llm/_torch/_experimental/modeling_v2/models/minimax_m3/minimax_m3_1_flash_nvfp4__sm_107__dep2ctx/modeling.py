@@ -119,7 +119,6 @@ from tensorrt_llm._torch.moe.fused_moe import (
     SwigluBiasActivation,
     create_moe,
 )
-from tensorrt_llm._torch.moe.fused_moe import mega_moe as _mega_moe
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
@@ -148,6 +147,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from .. import cute_aot, runtime_hooks_compat
 from ..msa import engine as _msa_engine
 from ..ops import swiglu_rows_plan
+from ..ops.moe.megamoe_local.local_impl import MegaMoEDeferredTopkReduce, _route_quant_key
 from . import ctx_boundary_plan as _cbplan
 from . import idx_scorer as _idx_scorer
 from . import tile_select as _tsel
@@ -156,19 +156,10 @@ from .m31_switches import large_prefill_graphs_disabled, m31_disabled
 # This module's torch namespace (namespace_of): its Python custom ops register there.
 _NS = namespace_of(__name__)
 
-# The routed output of a MegaMoE launch that left its top-k reduce to the caller. None on a runtime whose MegaMoE
-# backend has no deferred reduce: every routed output there is already reduced.
-MegaMoEDeferredTopkReduce = getattr(_mega_moe, "MegaMoEDeferredTopkReduce", None)
-
 
 def _is_deferred_topk_reduce(routed) -> bool:
-    return MegaMoEDeferredTopkReduce is not None and isinstance(routed, MegaMoEDeferredTopkReduce)
-
-
-def _route_quant_key(x: torch.Tensor, router_logits: torch.Tensor) -> Tuple:
-    """What identifies a route-quant seat's inputs for the MegaMoE backend: the memory, shape, strides and dtype of
-    both tensors."""
-    return tuple((t.data_ptr(), tuple(t.shape), t.stride(), t.dtype) for t in (x, router_logits))
+    """Whether ``routed`` is the routed output of a MegaMoE launch that left its top-k reduce to the caller."""
+    return isinstance(routed, MegaMoEDeferredTopkReduce)
 
 
 # Legacy dense fallback: cuDNN cannot consume this SDPA layout.

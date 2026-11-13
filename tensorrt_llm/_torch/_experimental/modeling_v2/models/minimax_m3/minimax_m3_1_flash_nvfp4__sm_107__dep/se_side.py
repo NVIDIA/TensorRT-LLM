@@ -102,10 +102,7 @@ def layer_decline_reason(
         return "the MoE forward is not DEP_TAIL's (the stock forward would co-run on the plain aux stream)"
     if not hasattr(backend, "shared_corun_band") or not hasattr(backend, "_lever_environ"):
         return "the MoE backend has no shared-expert co-run band on this runtime"
-    try:
-        from tensorrt_llm._torch.moe.fused_moe.mega_moe import megamoe_local_plan as plan
-    except ImportError:
-        return "the MoE backend has no shared-expert co-run band on this runtime"
+    from ..ops.moe.megamoe_local import local_plan as plan
 
     if (
         plan.SHARED_CORUN_BAND_ENV in backend._lever_environ
