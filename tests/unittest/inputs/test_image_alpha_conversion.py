@@ -118,3 +118,37 @@ def test_pil_input_to_load_image_is_flattened_like_a_decoded_file(make_image) ->
         np.asarray(asyncio.run(async_load_image(make_image(), format="pil")))[0, 0].tolist()
         == _WHITE
     )
+
+
+def test_palette_transparency_moved_into_an_rgba_palette_is_white() -> None:
+    image = _palette_with_transparent_index()
+    image.apply_transparency()
+    assert "transparency" not in image.info and image.palette.mode == "RGBA"
+
+    converted = np.asarray(convert_image_mode(image, "RGB"))
+
+    assert converted[0, 0].tolist() == _WHITE
+    assert converted[2, 2].tolist() == list(_OPAQUE)
+
+
+def test_partial_alpha_is_blended_not_thresholded_for_la() -> None:
+    image = Image.new("LA", (2, 2), (100, 255))
+    image.putpixel((0, 0), (100, 128))
+
+    converted = np.asarray(convert_image_mode(image, "RGB"))
+
+    # (100 * 128 + 255 * 127) / 255 = 177.2
+    assert converted[0, 0].tolist() == [177, 177, 177]
+    assert converted[1, 1].tolist() == [100, 100, 100]
+
+
+def test_partial_alpha_is_blended_for_a_palette_with_byte_transparency() -> None:
+    image = Image.new("P", (2, 2), 1)
+    image.putpalette([100, 100, 100, *_OPAQUE] + [0] * (256 * 3 - 6))
+    image.info["transparency"] = bytes([128])
+    image.putpixel((0, 0), 0)
+
+    converted = np.asarray(convert_image_mode(image, "RGB"))
+
+    assert converted[0, 0].tolist() == [177, 177, 177]
+    assert converted[1, 1].tolist() == list(_OPAQUE)

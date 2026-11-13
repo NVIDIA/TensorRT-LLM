@@ -116,8 +116,12 @@ def rgba_to_rgb(
 
 
 def _has_transparency(image: Image.Image) -> bool:
-    """Whether *image* has an alpha channel or a transparent index / color key."""
-    return image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
+    """Whether *image* has an alpha channel, a transparent index / color key or an RGBA palette."""
+    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+        return True
+    # ``Image.apply_transparency`` moves a palette's transparency into an RGBA
+    # palette and drops ``info["transparency"]``; the image stays mode "P".
+    return image.mode == "P" and image.palette is not None and image.palette.mode == "RGBA"
 
 
 def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
