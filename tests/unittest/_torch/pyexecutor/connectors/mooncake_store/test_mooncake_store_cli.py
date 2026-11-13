@@ -14,26 +14,42 @@
 # limitations under the License.
 """Unit tests for the pool lifecycle `trtllm-serve` owns.
 
-Two seams: the signal that ends `mooncake_master`, which has to release the
-master before the telemetry boundary reports it, and the provisioning a server
-is wrapped in, which has to leave an externally managed pool in charge.
+Three seams: the signal that ends `mooncake_master` or `mooncake_donor`, which
+has to release what the command holds before the telemetry boundary reports
+it; the provisioning a server is wrapped in, which has to leave an externally
+managed pool in charge and hand its ranks the RDMA devices the deployment
+pinned; and the donor's reading of the pool it lends to.
 
 Runs without a Mooncake installation and without a GPU. The master process the
 command holds is a context manager that records its own release, and the signal
 under test arrives from the poll before the command's idle wait, the point at
-which everything it holds is held.
+which everything it holds is held. The Mooncake binding, where a test opens a
+store, records the setup it was given.
 """
 
 import contextlib
 import json
 import os
 import signal
+import sys
+import time
+import types
 from types import SimpleNamespace
 
+import click
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors import mooncake_store
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import donor as donor_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import ledger as ledger_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as master_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import validation as validation_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import CONFIG_PATH_ENV
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import (
+    DONOR_ROLE,
+    SegmentRecord,
+    read_segments,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import provision_pool
 from tensorrt_llm.commands import _telemetry
 from tensorrt_llm.commands import mooncake as mooncake_commands
@@ -112,10 +128,12 @@ class Resource:
         #: `None` until the resource is taken, which distinguishes a command
         #: that gave up beforehand from one that took it.
         self.taken_with = None
+        self.taken_kwargs = None
 
     @contextlib.contextmanager
-    def holding(self, *args, **_kwargs):
+    def holding(self, *args, **kwargs):
         self.taken_with = args
+        self.taken_kwargs = kwargs
         try:
             yield self.held
         finally:
@@ -136,6 +154,7 @@ class CommandUnderTest:
             telemetry_component="server",
             commands={
                 "mooncake_master": mooncake_commands.mooncake_master,
+                "mooncake_donor": mooncake_commands.mooncake_donor,
                 "mooncake_pool_report": mooncake_commands.mooncake_pool_report,
             },
         )
@@ -230,6 +249,104 @@ def test_the_opt_out_the_group_documents_is_accepted(master):
     assert master.resource.released
 
 
+def test_the_master_options_reach_the_binary_after_the_environment(master):
+    """Each option becomes its master flag; --master_arg comes last, so it wins."""
+    signal_on_idle(master, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        master.run(
+            "--eviction_high_watermark_ratio",
+            "0.99",
+            "--default_kv_lease_ttl",
+            "60000",
+            "--allocation_strategy",
+            "random",
+            "--master_arg=--eviction_ratio=0.01",
+        )
+
+    assert master.resource.taken_kwargs["extra_args"] == [
+        "--eviction_high_watermark_ratio=0.99",
+        "--tenant_eviction_high_watermark_ratio=0.99",
+        "--default_kv_lease_ttl=60000",
+        "--allocation_strategy=random",
+        "--eviction_ratio=0.01",
+    ]
+
+
+def test_without_master_options_nothing_is_passed_through(master):
+    """The defaults stay the master's own."""
+    signal_on_idle(master, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        master.run()
+
+    assert master.resource.taken_kwargs["extra_args"] == []
+
+
+def test_the_launched_master_gets_the_environment_flags_then_the_given_ones(monkeypatch, tmp_path):
+    launched = []
+
+    class Process:
+        pid = 1
+
+        def __init__(self, command, **_kwargs):
+            launched.append(command)
+
+        def poll(self):
+            return None
+
+    monkeypatch.setenv(
+        master_module.MASTER_ARGS_ENV, "--eviction_ratio=0.02 --default_kv_lease_ttl=60000"
+    )
+    monkeypatch.setattr(master_module.shutil, "which", lambda binary: f"/opt/bin/{binary}")
+    monkeypatch.setattr(master_module.subprocess, "Popen", Process)
+    monkeypatch.setattr(master_module, "_wait_until_accepting", lambda *a, **k: 0.0)
+
+    master_module._launch_master(str(tmp_path), extra_args=["--eviction_ratio=0.01"])
+
+    (command,) = launched
+    assert command[0] == "/opt/bin/mooncake_master"
+    assert command[-3:] == [
+        "--eviction_ratio=0.02",
+        "--default_kv_lease_ttl=60000",
+        "--eviction_ratio=0.01",
+    ]
+
+
+@pytest.mark.parametrize(
+    "flag", ["--port=1", "--rpc_port=1", "-metrics_port=1", "eviction_ratio=0.1"]
+)
+def test_a_pass_through_flag_cannot_move_a_published_port_or_be_bare(monkeypatch, flag):
+    monkeypatch.delenv(master_module.MASTER_ARGS_ENV, raising=False)
+    with pytest.raises(ValueError):
+        master_module.master_extra_args([flag])
+
+
+def test_the_published_eviction_ratio_is_the_one_the_master_runs_with(monkeypatch):
+    """The master takes the last --eviction_ratio, so the manifest must too."""
+    monkeypatch.setenv(master_module.MASTER_ARGS_ENV, "--eviction_ratio=0.2")
+    args = master_module.master_extra_args(["--default_kv_lease_ttl=60000"])
+    assert master_module.effective_eviction_ratio(0.05, args) == 0.2
+    args = master_module.master_extra_args(["--eviction_ratio=0.1"])
+    assert master_module.effective_eviction_ratio(0.05, args) == 0.1
+    assert master_module.effective_eviction_ratio(0.05, []) == 0.05
+
+
+def test_a_signal_right_after_publication_still_removes_the_ready_file(monkeypatch, tmp_path):
+    path = tmp_path / "ready"
+    replace = os.replace
+
+    def replace_then_signal(source, target):
+        replace(source, target)
+        raise _telemetry.SignalExit(signal.SIGTERM)
+
+    monkeypatch.setattr(mooncake_commands.os, "replace", replace_then_signal)
+    with pytest.raises(_telemetry.SignalExit):
+        with mooncake_commands._announced(str(path), "host 1\n"):
+            pass
+    assert not path.exists()
+
+
 def test_the_pool_report_accepts_the_same_opt_out(monkeypatch, tmp_path):
     """It sits in the same group, so it has to offer the same flag."""
     monkeypatch.setattr(mooncake_store, "format_pool_report", lambda *_args: "no segments")
@@ -252,3 +369,405 @@ def test_an_inherited_config_is_left_in_charge(monkeypatch, tmp_path):
     with provision_pool(pool) as rendered:
         assert rendered is None
     assert os.environ[CONFIG_PATH_ENV] == str(inherited)
+
+
+@pytest.fixture
+def mooncake_binding(monkeypatch):
+    """The Mooncake Python binding, replaced by one that records each store opened."""
+    opened = []
+
+    class DistributedStore:
+        def __init__(self):
+            self.setup_args = None
+            self.closed = False
+            opened.append(self)
+
+        def setup(self, *args):
+            self.setup_args = args
+            return 0
+
+        def close(self):
+            self.closed = True
+
+    package = types.ModuleType("mooncake")
+    store_module = types.ModuleType("mooncake.store")
+    store_module.MooncakeDistributedStore = DistributedStore
+    package.store = store_module
+    monkeypatch.setitem(sys.modules, "mooncake", package)
+    monkeypatch.setitem(sys.modules, "mooncake.store", store_module)
+    return opened
+
+
+@pytest.fixture
+def answering_master(monkeypatch):
+    """A master already up, on a host where InfiniBand detection finds one device."""
+    monkeypatch.setattr(master_module, "wait_for_master", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(master_module, "_highest_rate_ib_devices", lambda *_args: ["mlx5_4"])
+
+
+@pytest.fixture
+def ample_host_memory(monkeypatch):
+    """A node with far more available memory than any donation here asks for."""
+    monkeypatch.setattr(validation_module, "_available_host_memory", lambda: 1 << 50)
+    monkeypatch.setattr(validation_module, "_cgroup_room", lambda: None)
+
+
+@pytest.fixture
+def pool_manifest(tmp_path, monkeypatch, answering_master):
+    """A manifest naming a master that answers at once, as `mooncake_master` writes it."""
+    monkeypatch.setattr(donor_module, "wait_for_master", lambda *_args, **_kwargs: 0.0)
+    path = tmp_path / "pool.json"
+    path.write_text(
+        json.dumps(
+            {
+                "master_server_address": "10.0.0.7:50051",
+                "metadata_server": "P2PHANDSHAKE",
+                "protocol": "rdma",
+                "namespace": "trtllm",
+            }
+        )
+    )
+    return path
+
+
+def run_donor(monkeypatch, *args, on_idle=None):
+    """Run `mooncake_donor` until its first idle wait, then stop it with SIGTERM.
+
+    `on_idle` runs just before the signal, when everything the command holds
+    is held.
+    """
+
+    def idle(_seconds):
+        if on_idle is not None:
+            on_idle()
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(time, "sleep", idle)
+    with pytest.raises(_telemetry.SignalExit):
+        CommandUnderTest(Resource(None), ["mooncake_donor", *args]).run()
+
+
+def test_the_donor_lends_a_segment_to_the_pool_its_manifest_names(
+    tmp_path, monkeypatch, pool_manifest, mooncake_binding, ample_host_memory
+):
+    ready = tmp_path / "donor.ready"
+    run_dir = tmp_path / "run" / "donor-gen0"
+    held = []
+    run_donor(
+        monkeypatch,
+        "--pool_file",
+        str(pool_manifest),
+        "--segment_size",
+        "2GiB",
+        "--device_name",
+        "mlx5_0,mlx5_2",
+        "--local_hostname",
+        "10.0.0.9",
+        "--ready_file",
+        str(ready),
+        "--run_dir",
+        str(run_dir),
+        on_idle=lambda: held.append((ready.read_text(), mooncake_binding[0].closed)),
+    )
+
+    (store,) = mooncake_binding
+    assert store.setup_args == (
+        "10.0.0.9",
+        "P2PHANDSHAKE",
+        2 * 1024**3,
+        donor_module.DEFAULT_DONOR_LOCAL_BUFFER_SIZE,
+        "rdma",
+        "mlx5_0,mlx5_2",
+        "10.0.0.7:50051",
+    )
+    # Announced while mounted, and neither left behind once stopped.
+    assert held == [(f"10.0.0.9 {2 * 1024**3}\n", False)]
+    assert store.closed
+    assert not ready.exists()
+    # Counted in the pool report as memory lent without traffic.
+    (record,) = read_segments(str(tmp_path / "run"))
+    assert (record.host, record.segment_size, record.role) == ("10.0.0.9", 2 * 1024**3, "donor")
+
+
+def test_the_pool_report_counts_donors_apart_from_the_ranks():
+    """A donor's larger segment neither counts as a rank nor breaks the ranks' uniformity."""
+    ranks = [SegmentRecord("10.0.0.1", rank, 240 << 30, "both", "m") for rank in range(2)]
+    donors = [SegmentRecord(f"10.0.0.{9 + i}", 0, 768 << 30, DONOR_ROLE, "") for i in range(2)]
+    lines = ledger_module._capacity_lines(ranks + donors)
+    assert "ranks         : 2 across 1 host(s)" in lines
+    assert "donors        : 2 across 2 host(s)" in lines
+    assert f"capacity      : {2 * 240 + 2 * 768:.1f} GiB" in lines
+    assert "per rank      : 240.0 GiB, uniform" in lines
+    # Donors alone leave no rank size to compare.
+    assert not any(line.startswith("per rank") for line in ledger_module._capacity_lines(donors))
+
+
+def test_the_donor_joins_a_bare_master_on_the_pool_defaults(
+    monkeypatch, pool_manifest, mooncake_binding, ample_host_memory
+):
+    """Without a manifest the pool-wide settings are the defaults a server would take."""
+    run_donor(
+        monkeypatch,
+        "--master_server_address",
+        "10.0.0.7:50051",
+        "--segment_size",
+        str(1024**3),
+        "--local_hostname",
+        "10.0.0.9",
+    )
+
+    (store,) = mooncake_binding
+    _host, metadata, segment, _buffer, protocol, devices, master = store.setup_args
+    # The devices are detected, as a server's provisioning detects them.
+    assert (metadata, segment, protocol, devices, master) == (
+        "P2PHANDSHAKE",
+        1024**3,
+        "rdma",
+        "mlx5_4",
+        "10.0.0.7:50051",
+    )
+    assert store.closed
+
+
+def test_the_donor_reads_a_pool_file_given_as_a_url(
+    monkeypatch, pool_manifest, mooncake_binding, ample_host_memory
+):
+    run_donor(
+        monkeypatch,
+        "--pool_file",
+        f"file://{pool_manifest}",
+        "--segment_size",
+        "1GiB",
+        "--local_hostname",
+        "10.0.0.9",
+    )
+    (store,) = mooncake_binding
+    assert store.setup_args[-1] == "10.0.0.7:50051"
+
+
+@pytest.mark.parametrize(
+    "pool_args",
+    [[], ["--pool_file", "pool.json", "--master_server_address", "10.0.0.7:50051"]],
+)
+def test_the_donor_needs_exactly_one_way_to_find_the_pool(mooncake_binding, pool_args):
+    command = CommandUnderTest(
+        Resource(None), ["mooncake_donor", "--segment_size", "1GiB", *pool_args]
+    )
+    with pytest.raises(click.UsageError, match="exactly one"):
+        command.run()
+    assert mooncake_binding == []
+
+
+@pytest.mark.parametrize("size, complaint", [("2GB", "ambiguous"), ("0", "lends nothing")])
+def test_the_donor_refuses_a_size_it_cannot_lend(mooncake_binding, size, complaint):
+    command = CommandUnderTest(
+        Resource(None),
+        ["mooncake_donor", "--master_server_address", "10.0.0.7:50051", "--segment_size", size],
+    )
+    with pytest.raises(click.BadParameter, match=complaint):
+        command.run()
+    assert mooncake_binding == []
+
+
+def test_the_donor_refuses_a_donation_the_node_cannot_back(
+    tmp_path, monkeypatch, pool_manifest, mooncake_binding
+):
+    monkeypatch.setattr(validation_module, "_available_host_memory", lambda: 40 * 1024**3)
+    monkeypatch.setattr(validation_module, "_cgroup_room", lambda: None)
+    ready = tmp_path / "donor.ready"
+    command = CommandUnderTest(
+        Resource(None),
+        [
+            "mooncake_donor",
+            "--pool_file",
+            str(pool_manifest),
+            "--segment_size",
+            "64GiB",
+            "--ready_file",
+            str(ready),
+        ],
+    )
+    with pytest.raises(ValueError, match="cannot back a 64.0 GiB donation"):
+        command.run()
+    # Refused before Mooncake allocated anything.
+    assert mooncake_binding == []
+    assert not ready.exists()
+
+
+def test_a_failed_setup_lends_nothing(
+    tmp_path, monkeypatch, pool_manifest, mooncake_binding, ample_host_memory
+):
+    store_class = sys.modules["mooncake.store"].MooncakeDistributedStore
+    monkeypatch.setattr(store_class, "setup", lambda self, *args: -1)
+    ready = tmp_path / "donor.ready"
+    run_dir = tmp_path / "run" / "donor-gen0"
+    command = CommandUnderTest(
+        Resource(None),
+        [
+            "mooncake_donor",
+            "--pool_file",
+            str(pool_manifest),
+            "--segment_size",
+            "2GiB",
+            "--ready_file",
+            str(ready),
+            "--run_dir",
+            str(run_dir),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="setup failed with status -1"):
+        command.run()
+    (store,) = mooncake_binding
+    assert store.closed
+    assert not ready.exists()
+    assert read_segments(str(tmp_path / "run")) == []
+
+
+def test_a_container_limit_caps_the_donation_budget(monkeypatch):
+    # Plenty free on the host, little left under the container's limit.
+    monkeypatch.setattr(validation_module, "_available_host_memory", lambda: 900 * 1024**3)
+    monkeypatch.setattr(validation_module, "_cgroup_room", lambda: 50 * 1024**3)
+    with pytest.raises(ValueError, match="only 50.0 GiB is available"):
+        validation_module.validate_donation_budget(64 * 1024**3, 64 * 1024**2)
+    validation_module.validate_donation_budget(16 * 1024**3, 64 * 1024**2)
+
+
+class RecordingLogger:
+    def __init__(self):
+        self.lines = []
+
+    def warning(self, message):
+        self.lines.append(("warning", message))
+
+    def error(self, message):
+        self.lines.append(("error", message))
+
+
+def test_a_failed_close_is_not_reported_as_a_withdrawal(
+    monkeypatch, pool_manifest, mooncake_binding, ample_host_memory
+):
+    store_class = sys.modules["mooncake.store"].MooncakeDistributedStore
+
+    def broken_close(self):
+        raise OSError("close failed")
+
+    monkeypatch.setattr(store_class, "close", broken_close)
+    log = RecordingLogger()
+    monkeypatch.setattr(donor_module, "logger", log)
+    with pytest.raises(OSError, match="close failed"):
+        with donor_module.donate_segment(
+            f"file://{pool_manifest}", 1024**3, local_hostname="10.0.0.9"
+        ):
+            pass
+    assert not any("withdrew" in line for _, line in log.lines)
+    assert any(level == "error" and "may still count" in line for level, line in log.lines)
+
+
+def test_a_failed_setup_is_reported_even_if_close_fails(
+    monkeypatch, pool_manifest, mooncake_binding, ample_host_memory
+):
+    store_class = sys.modules["mooncake.store"].MooncakeDistributedStore
+    monkeypatch.setattr(store_class, "setup", lambda self, *args: -1)
+
+    def broken_close(self):
+        raise OSError("close failed")
+
+    monkeypatch.setattr(store_class, "close", broken_close)
+    log = RecordingLogger()
+    monkeypatch.setattr(donor_module, "logger", log)
+    # The setup failure is what surfaces; the failed close is logged beside it.
+    with pytest.raises(RuntimeError, match="setup failed with status -1"):
+        with donor_module.donate_segment(
+            f"file://{pool_manifest}", 1024**3, local_hostname="10.0.0.9"
+        ):
+            pass
+    assert any(level == "error" and "after a failed setup" in line for level, line in log.lines)
+
+
+def test_the_tightest_cgroup_room_wins(tmp_path):
+    proc = tmp_path / "cgroup"
+    proc.write_text("0::/job/step\n")
+    root = tmp_path / "fs"
+    gib = 1024**3
+    # The step has the larger limit but the job, nearly full, has less room left.
+    for rel, limit, current, file_pages, shmem in (
+        ("job", 100 * gib, 90 * gib, 10 * gib, 0),
+        ("job/step", 500 * gib, 20 * gib, 0, 0),
+    ):
+        directory = root / rel
+        directory.mkdir(parents=True)
+        (directory / "memory.max").write_text(f"{limit}\n")
+        (directory / "memory.current").write_text(f"{current}\n")
+        (directory / "memory.stat").write_text(f"file {file_pages}\nshmem {shmem}\n")
+    # job: 100 - (90 - 10 + 0) = 20 GiB; step: 500 - 20 = 480 GiB.
+    assert validation_module._cgroup_room(str(proc), str(root)) == 20 * gib
+    (root / "job" / "memory.max").write_text("max\n")
+    assert validation_module._cgroup_room(str(proc), str(root)) == 480 * gib
+    assert validation_module._cgroup_room(str(tmp_path / "missing"), str(root)) is None
+
+
+def test_a_raising_setup_is_reported_after_close(
+    monkeypatch, pool_manifest, mooncake_binding, ample_host_memory
+):
+    store_class = sys.modules["mooncake.store"].MooncakeDistributedStore
+
+    def broken_setup(self, *args):
+        raise OSError("ibverbs refused")
+
+    monkeypatch.setattr(store_class, "setup", broken_setup)
+    with pytest.raises(OSError, match="ibverbs refused"):
+        with donor_module.donate_segment(
+            f"file://{pool_manifest}", 1024**3, local_hostname="10.0.0.9"
+        ):
+            pass
+    (store,) = mooncake_binding
+    assert store.closed
+
+
+@pytest.mark.parametrize(
+    "file_pages, shmem, unevictable, room",
+    [
+        (10, 8, 0, 12),  # shared memory sits in "file" but reclaim cannot drop it
+        (60, 0, 60, 10),  # neither can it drop locked pages
+        (5, 8, 0, 10),  # the reclaimable allowance never goes negative
+    ],
+)
+def test_cgroup_room_counts_only_droppable_page_cache(
+    tmp_path, file_pages, shmem, unevictable, room
+):
+    gib = 1024**3
+    proc = tmp_path / "cgroup"
+    proc.write_text("0::/job\n")
+    job = tmp_path / "fs" / "job"
+    job.mkdir(parents=True)
+    (job / "memory.max").write_text(f"{100 * gib}\n")
+    (job / "memory.current").write_text(f"{90 * gib}\n")
+    (job / "memory.stat").write_text(
+        f"file {file_pages * gib}\nshmem {shmem * gib}\nunevictable {unevictable * gib}\n"
+    )
+    assert validation_module._cgroup_room(str(proc), str(tmp_path / "fs")) == room * gib
+
+
+def test_the_donation_budget_keeps_the_reserve_and_counts_the_buffer():
+    gib = 1024**3
+    buffer = 64 * 1024**2
+    available = 100 * gib
+    exact = available - validation_module.NODE_BUDGET_RESERVE_BYTES - buffer
+    validation_module.validate_donation_budget(exact, buffer, available_bytes=available)
+    with pytest.raises(ValueError, match="cannot back"):
+        validation_module.validate_donation_budget(exact + 1, buffer, available_bytes=available)
+
+
+def test_a_finite_cgroup_limit_counts_even_without_statistics(tmp_path):
+    gib = 1024**3
+    proc = tmp_path / "cgroup"
+    proc.write_text("0::/job\n")
+    job = tmp_path / "fs" / "job"
+    job.mkdir(parents=True)
+    (job / "memory.max").write_text(f"{50 * gib}\n")
+    (job / "memory.current").write_text(f"{20 * gib}\n")
+    # No memory.stat: no page-cache allowance, but the limit still binds.
+    assert validation_module._cgroup_room(str(proc), str(tmp_path / "fs")) == 30 * gib
+    # No memory.current either: no room is assumed.
+    (job / "memory.current").unlink()
+    assert validation_module._cgroup_room(str(proc), str(tmp_path / "fs")) == 0
