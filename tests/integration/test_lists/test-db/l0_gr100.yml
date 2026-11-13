@@ -101,6 +101,9 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_m31_tp2_w8_his_wide_gpu.py --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_modeling_v2_m3_prebuild.py --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_modeling_v2_m31_proxy_prebuild.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_modeling_v2_m31_tp2wide_prefill_attn.py --import-mode=importlib
+  # The family MSA attention (msa/): backend, indexer, prefill, prewarm and the NVFP4 index-K reader.
+  - unittest/_torch/modeling_v2/models/minimax_m3/msa
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - unittest/_torch/attention/test_fp4_mla.py
   - unittest/_torch/attention/test_fp4_mla_packed.py
