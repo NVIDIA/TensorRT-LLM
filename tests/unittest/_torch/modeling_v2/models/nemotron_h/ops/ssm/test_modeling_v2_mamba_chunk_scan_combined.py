@@ -457,7 +457,8 @@ _CHILD_MODES = {"cold-call": _child_cold_call}
 
 def test_cold_call_matches_the_reference() -> None:
     """The first call of a process, carried states included, within the band."""
-    root = str(Path(__file__).resolve().parents[1])  # tests/unittest/_torch/modeling_v2
+    # The parent imports _validating through __extra_import_path__; the child gets the same root.
+    root = str((Path(__file__).resolve().parent / __extra_import_path__[0]).resolve())
     existing = os.environ.get("PYTHONPATH")
     env = dict(os.environ, PYTHONPATH=root if not existing else os.pathsep.join([root, existing]))
     proc = subprocess.run(
