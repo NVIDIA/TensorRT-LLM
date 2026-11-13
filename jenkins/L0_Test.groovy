@@ -908,6 +908,25 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
+// Only a successful collection that removed a nonempty original shard is a no-op.
+def isIntentionalCbtsEmpty(result) {
+    return result.intentional_empty == true && result.original_count instanceof Number &&
+        result.original_count > 0 && result.selected_count == 0 &&
+        result.removed_count == result.original_count
+}
+
+def reportCbtsEmptyShard(String stageName) {
+    echo "CBTS: ${stageName} has an empty intersection with its original shard; successful no-op"
+    sh "mkdir -p ${stageName}"
+    // A distinct skipped control record survives empty-results.xml cleanup and
+    // lets normal junit reporting accept the no-op without allowing missing results.
+    writeFile file: "${stageName}/results-cbts-empty.xml", text: """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites><testsuite name="${stageName}" tests="1" failures="0" errors="0" skipped="1">
+<testcase classname="cbts" name="original-shard-empty-intersection"><skipped message="No CBTS-selected cases belong to this original shard"/></testcase>
+</testsuite></testsuites>
+"""
+}
+
 def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
@@ -975,9 +994,14 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
     if (durationsPath) {
         testListCmd += ["--durations-path=${durationsPath}"]
     }
-    if (fileExists("${testDBList}.cbts")) {
-        testListCmd += ["--cbts-test-list=${testDBList}.cbts"]
+    def cbtsResultPath = "${testDBList}.cbts-result.json"
+    def cbtsIntersection = fileExists("${testDBList}.cbts")
+    sh "rm -f ${cbtsResultPath}"
+    if (cbtsIntersection) {
+        testListCmd += ["--cbts-test-list=${testDBList}.cbts",
+                        "--cbts-shard-result=${cbtsResultPath}"]
     }
+    def intentionalCbtsEmpty = false
     testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
     try {
@@ -1014,6 +1038,9 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
             return shouldInclude
         }
         echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
+        if (cbtsIntersection && fileExists(cbtsResultPath)) {
+            intentionalCbtsEmpty = isIntentionalCbtsEmpty(readJSON(file: cbtsResultPath))
+        }
     } catch (Exception e) {
         echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
         error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
@@ -1093,7 +1120,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
             regular: regularTestList,
             isolate: isolateTestList,
             regularCount: 0,
-            isolateCount: 0
+            isolateCount: 0,
+            cbtsEmptyShard: intentionalCbtsEmpty
         ]
     }
 }
@@ -3130,6 +3158,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode,
                     coverageConfigFile
                 ]
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    filesToKeepWhenRetry += ["${testListPathNode}.cbts"]
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     filesToKeepWhenRetry += [
                         s3SecretKeyPathNode
@@ -6517,6 +6548,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Process shard test list and create separate files for regular and isolate tests
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, clusterDurationsPath)
+        if (preprocessedLists.cbtsEmptyShard) {
+            reportCbtsEmptyShard(stageName)
+            return
+        }
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")

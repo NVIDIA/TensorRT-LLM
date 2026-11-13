@@ -18,6 +18,7 @@ import datetime
 import gc
 import importlib
 import importlib.util
+import json
 import logging
 import os
 import platform
@@ -871,6 +872,12 @@ def pytest_addoption(parser):
         "Intersect the original shard with this CBTS test list after splitting",
     )
     parser.addoption(
+        "--cbts-shard-result",
+        action="store",
+        default=None,
+        help="Write CBTS collection counts for the CI runner",
+    )
+    parser.addoption(
         "--workspace",
         "--ws",
         action="store",
@@ -1142,7 +1149,13 @@ def pytest_collection_modifyitems(session, config, items):
         deselected = [item for item in items if item.nodeid not in cbts_names]
         items[:] = [item for item in items if item.nodeid in cbts_names]
         config.hook.pytest_deselected(items=deselected)
-        config._cbts_empty_shard = not items
+        config._cbts_empty_shard = bool(deselected) and not items
+        config._cbts_shard_result = {
+            "original_count": len(items) + len(deselected),
+            "selected_count": len(items),
+            "removed_count": len(deselected),
+            "intentional_empty": config._cbts_empty_shard,
+        }
         print(f"CBTS: kept {len(items)} cases in the original shard; "
               f"removed {len(deselected)}")
     for item in items:
@@ -1643,4 +1656,9 @@ def pytest_sessionfinish(session, exitstatus):
             and getattr(session.config, "_cbts_empty_shard", False)
             and not session.testsfailed):
         session.exitstatus = pytest.ExitCode.OK
+    result_path = session.config.getoption("--cbts-shard-result")
+    result = getattr(session.config, "_cbts_shard_result", None)
+    if (result_path and result and not session.testsfailed
+            and session.exitstatus == pytest.ExitCode.OK):
+        Path(result_path).write_text(json.dumps(result), encoding="utf-8")
     _prefetch_hooks.pytest_sessionfinish(session, exitstatus)
