@@ -799,7 +799,8 @@ def compute_dflash_ctx_buffer_bytes(
     pooled-context K/V buffers.
 
     Mirrors the allocation exactly: ``max_batch_size + 1`` slots (one scratch
-    slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
+    slot for padding/warmup dummies; the allocation passes its request-slot
+    count, the executor's seq-slot pool, as ``max_batch_size``), capacity ``max_ctx_len + block_size``
     per slot, ``kv_factor`` halves for every drafter attention layer (K and V,
     so 2; the MLA drafter keeps one latent and no V, so 1). The dense layout
     holds ``kv_factor`` contiguous ``[slots, L, capacity, Hkv, D]`` tensors;
@@ -1008,7 +1009,7 @@ class K3DFlashWorker(SpecWorkerBase):
         self._fused_kv_rewind_armed = False
         self._batch_to_slot_buffer = None
         self._max_ctx = 0
-        self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
+        self._ctx_k_buf = None  # [request slots+1, L, max_ctx+block, nkv, hd]
         self._ctx_v_buf = None
         # Set by _lazy_init_ctx_buffers; every context write switches on the
         # cache layout rather than on which kernel reads it.
@@ -1026,7 +1027,7 @@ class K3DFlashWorker(SpecWorkerBase):
         # Static per-slot page table for the private arena. When bound to the
         # manager it is replaced by _ctx_block_tables, refreshed per iteration.
         self._ctx_page_table = None
-        self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
+        self._ctx_block_tables = None  # [request slots+1, max_blocks_per_seq] int32
         self._ctx_block_indptr = None
         # Pages the manager handed this request, per batch row. Saturates at
         # the table width on the default backend -- dflash_allocated_ctx_limit.
@@ -1780,7 +1781,6 @@ class K3DFlashWorker(SpecWorkerBase):
         self._ctx_block_offset = 0
         self._ctx_reuse_addressable = False
         self._paged_latent_prepare = False
-        max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
         # max_position_embeddings does not: K3's drafter advertises 1048576,
@@ -1822,11 +1822,17 @@ class K3DFlashWorker(SpecWorkerBase):
         # An FP8 drafter context (context_kv_dtype) is held in an FP8 pool.
         pool_dtype = torch.float8_e4m3fn if getattr(draft_model, "context_kv_fp8", False) else dtype
 
-        # Reserve slot index max_batch as a scratch slot for padding/unknown
-        # dummies; real requests only draw slots 0..max_batch-1, so dummy
-        # writes land here and can't corrupt a real request's context.
-        self._dummy_slot = max_batch
-        num_slots = max_batch + 1
+        # Real requests draw slots 0..num_req_slots-1; the next slot is a
+        # scratch slot for padding/unknown dummies, so dummy writes can't
+        # corrupt a real request's context. The slots are allocated once and
+        # reused for every later batch shape, so they span the executor's whole
+        # seq-slot pool, which already counts requests paused in place by GEN
+        # slot preemption and, under pipeline parallelism or overlap headroom,
+        # more than one micro-batch. max_num_requests is no bound: it is the
+        # captured bucket on CUDA graph metadata.
+        num_req_slots = spec_metadata.num_seq_slots
+        self._dummy_slot = num_req_slots
+        num_slots = num_req_slots + 1
         # CUDA-graph padding uses ids counting down from
         # CUDA_GRAPH_DUMMY_REQUEST_ID; a floor of one draft block separates them
         # from real ids. Imported lazily to avoid an import cycle.
@@ -1837,10 +1843,10 @@ class K3DFlashWorker(SpecWorkerBase):
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
         self._batch_to_slot_buffer = DeviceCopyBuffer(
-            torch.zeros(max_batch, dtype=torch.long, device="cuda"),
+            torch.zeros(num_req_slots, dtype=torch.long, device="cuda"),
             pin_memory=prefer_pinned(),
         )
-        self._free_slots = deque(range(max_batch))
+        self._free_slots = deque(range(num_req_slots))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
 
@@ -1999,7 +2005,7 @@ class K3DFlashWorker(SpecWorkerBase):
             )
 
         logger.info(
-            f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
+            f"DFlash: allocated ctx buffers: request_slots={num_req_slots}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}, "
