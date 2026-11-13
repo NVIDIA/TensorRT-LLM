@@ -9,13 +9,28 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
     cute_dsl_fp8_block_scale_linear as baseline,
 )
 
-# (M, N, K) -> (Split-K slices, warps per CTA).
-_TACTICS = {
-    (4, 1024, 6144): (24, 8),
-    (4, 1536, 6144): (16, 8),
-    (4, 6144, 768): (1, 8),
-    (4, 6144, 1024): (4, 8),
+# The decode target's per-rank FP8 projections at TP8 and TP4: (N, K) -> (Split-K slices, warps
+# per CTA). One tactic per (N, K) serves every M in _ROWS, on the assumption that streaming the
+# weights dominates at these M. The TP8 rows are the fastest probed M=4 tactics at the kernel's
+# default prefetch depth. The TP4-only rows are not probed: each keeps the warps and, as nearly
+# as K allows, the K128 slots per CTA of the nearest probed shape with the same N or K.
+_NK_TACTICS = {
+    (1024, 6144): (24, 8),  # TP8 wq
+    (1536, 6144): (16, 4),  # TP8 shared-expert gate/up
+    (4096, 6144): (12, 4),  # TP8 and TP4 indexer wq_b
+    (6144, 768): (1, 4),  # TP8 shared-expert down
+    (6144, 1024): (1, 4),  # TP8 wo
+    (6144, 3072): (4, 8),  # TP8 dense down
+    (6144, 6144): (12, 4),  # TP8 dense gate/up, TP4 dense down
+    (2048, 6144): (16, 4),  # TP4 wq
+    (3072, 6144): (12, 4),  # TP4 shared-expert gate/up
+    (6144, 1536): (2, 4),  # TP4 shared-expert down
+    (6144, 2048): (2, 4),  # TP4 wo
+    (12288, 6144): (12, 4),  # TP4 dense gate/up
 }
+_ROWS = (1, 2, 4, 8, 12, 16)
+# (M, N, K) -> (Split-K slices, warps per CTA).
+_TACTICS = {(m, n, k): tactic for (n, k), tactic in _NK_TACTICS.items() for m in _ROWS}
 
 
 @torch.library.custom_op("trtllm::cute_dsl_fused_fp8_block_scale_linear", mutates_args=())

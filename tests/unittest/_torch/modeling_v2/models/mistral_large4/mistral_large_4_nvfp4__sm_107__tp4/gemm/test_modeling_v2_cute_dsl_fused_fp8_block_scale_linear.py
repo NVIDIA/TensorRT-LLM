@@ -174,10 +174,12 @@ def test_fused_catalog_changing_input_graph(n, k):
         assert_within_ulp(output, expected, element_ulp=4, rms_ulp=2)
 
 
-# The wq projection's per-rank width: 1024 under TP8, a tuned cell at M=4, and 2048 under TP4,
-# which the entry leaves to the MXFP8 kernel.
-@pytest.mark.parametrize("n,fused", ((1024, True), (2048, False)), ids=("tp8", "tp4"))
-def test_decode_target_dispatch(n, fused):
+# The wq projection's per-rank width is 1024 under TP8 and 2048 under TP4. Both are tuned cells
+# up to 16 rows; 32 rows exceed the fused kernel and stay on the MXFP8 kernel.
+@pytest.mark.parametrize(
+    "m,n,fused", ((4, 1024, True), (16, 2048, True), (32, 1024, False)), ids=("tp8", "tp4", "m32")
+)
+def test_decode_target_dispatch(m, n, fused):
     from importlib import import_module
 
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -198,7 +200,7 @@ def test_decode_target_dispatch(n, fused):
 
     target = object.__new__(modeling.DecodeTarget)
     weight, scale = _weights(n, 6144, 23)
-    x = _input(4, 6144, 11).contiguous()
+    x = _input(m, 6144, 11).contiguous()
     with Operations() as operations:
         actual = target._linear_fp8(x, weight, scale)
     seen = any("trtllm.cute_dsl_fused_fp8_block_scale_linear" in name for name in operations.seen)
