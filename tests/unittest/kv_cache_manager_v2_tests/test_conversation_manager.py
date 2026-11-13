@@ -1,205 +1,125 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Conversation drop-plan ownership and completion ordering."""
+"""Conversation completion ordering and native block-key retention checks."""
 
+from collections import deque
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+from tensorrt_llm.runtime import kv_cache_manager_v2 as native
 
-pytestmark = pytest.mark.cpu_only
 
-
-def _request(
-    request_id: int,
-    conversation_id: str = "DYNAMO_SESSION_ID",
-    *,
-    cache_salt: str | None = None,
-    lora_task_id: int | None = None,
-) -> SimpleNamespace:
+def _request(request_id: int, salt: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
         is_dummy_request=False,
-        py_conversation_params=SimpleNamespace(conversation_id=conversation_id),
-        cache_salt=cache_salt,
-        lora_task_id=lora_task_id,
+        py_conversation_params=SimpleNamespace(conversation_id="shared"),
+        cache_salt=salt,
+        lora_task_id=None,
     )
 
 
-def _cache(tokens: tuple[int, ...] = (1, 2, 3, 4)) -> MagicMock:
-    cache = MagicMock()
-    cache.committed_tokens = list(tokens)
-    cache.tokens_per_block = 4
-    cache.reuse_scope = SimpleNamespace(lora_id=None, salt=None)
-    return cache
-
-
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("completion", ["finish", "empty_plan", "clear"])
 def test_overlapping_completion_after_owner_cleanup(completion: str) -> None:
     manager = ConversationManager(max_num_turns=1)
     owner, overlapping = _request(1), _request(2)
     manager.prepare_request(owner)
     manager.prepare_request(overlapping)
-    cache = _cache()
+    cache = MagicMock(num_committed_tokens=4, tokens_per_block=4)
     cache.plan_committed_block_drop.return_value = None
-
     if completion == "finish":
         manager.finish_request(owner)
     elif completion == "empty_plan":
         manager.save_drop_plan(owner, cache)
     else:
         manager.clear()
-
     cache.reset_mock()
     manager.save_drop_plan(overlapping, cache)
     cache.plan_committed_block_drop.assert_not_called()
     assert not manager._conversation_states
 
 
-def test_overlapping_completion_preserves_new_owner() -> None:
-    manager = ConversationManager(max_num_turns=1)
-    owner, overlapping, successor = _request(1), _request(2), _request(3)
-    manager.prepare_request(owner)
-    manager.prepare_request(overlapping)
-    manager.finish_request(owner)
-    manager.prepare_request(successor)
-    cache = _cache()
+@pytest.fixture
+def native_cache() -> Iterator[SimpleNamespace]:
+    torch.empty(1, device="cuda")
+    stream = torch.cuda.Stream()
+    manager = native.KVCacheManager(
+        native.KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[native.GpuCacheTierConfig(quota=1 << 20)],
+            layers=[
+                native.AttentionLayerConfig(
+                    layer_id=0,
+                    buffers=[native.BufferConfig(role="key", size=256)],
+                    sliding_window_size=8,
+                )
+            ],
+        )
+    )
+    conversation = ConversationManager(max_num_turns=1)
+    caches = []
 
-    manager.save_drop_plan(overlapping, cache)
-    manager.finish_request(overlapping)
-    cache.plan_committed_block_drop.assert_not_called()
+    def create(tokens: list[int], salt: str | None = None) -> native._KVCache:
+        cache = manager.create_kv_cache(native.ReuseScope(salt=salt), tokens)
+        caches.append(cache)
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(len(tokens), len(tokens))
+        cache.commit(tokens[cache.num_committed_tokens :])
+        cache.stop_committing()
+        return cache
 
-    manager.save_drop_plan(successor, cache)
-    cache.plan_committed_block_drop.assert_called_once_with()
-    state = manager._conversation_states["DYNAMO_SESSION_ID", None, None]
-    assert state.current_request_id is None
-    assert list(state.planned_drop_handles) == [cache.plan_committed_block_drop.return_value]
-
-
-def test_repeated_completion_does_not_plan_again() -> None:
-    manager = ConversationManager(max_num_turns=1)
-    request = _request(1)
-    manager.prepare_request(request)
-    cache = _cache()
-    cache.plan_committed_block_drop.return_value = None
-
-    manager.save_drop_plan(request, cache)
-    manager.save_drop_plan(request, cache)
-
-    cache.plan_committed_block_drop.assert_called_once_with()
-    assert not manager._conversation_states
-
-
-def test_overlapping_completion_preserves_saved_plan() -> None:
-    manager = ConversationManager(max_num_turns=1)
-    owner, overlapping, successor = _request(1), _request(2), _request(3)
-    manager.prepare_request(owner)
-    manager.prepare_request(overlapping)
-    cache = _cache()
-    first_plan, next_plan = MagicMock(), MagicMock()
-    cache.plan_committed_block_drop.side_effect = [first_plan, next_plan]
-
-    manager.save_drop_plan(owner, cache)
-    manager.save_drop_plan(overlapping, cache)
-    cache.plan_committed_block_drop.assert_called_once_with()
-    first_plan.drop.assert_not_called()
-
-    manager.prepare_request(successor)
-    manager.save_drop_plan(successor, cache)
-    first_plan.drop.assert_called_once_with()
-    next_plan.drop.assert_not_called()
-    state = manager._conversation_states["DYNAMO_SESSION_ID", None, None]
-    assert list(state.planned_drop_handles) == [next_plan]
+    try:
+        yield SimpleNamespace(manager=manager, conversation=conversation, create=create)
+    finally:
+        conversation.clear()
+        for cache in caches:
+            if cache.status != native._KVCache.Status.CLOSED:
+                cache.close()
+        manager.shutdown()
 
 
-def test_overlapping_completion_cannot_plan_for_active_owner() -> None:
-    manager = ConversationManager(max_num_turns=1)
-    owner, overlapping = _request(1), _request(2)
-    manager.prepare_request(owner)
-    manager.prepare_request(overlapping)
-    cache = _cache()
-
-    manager.save_drop_plan(overlapping, cache)
-    manager.finish_request(overlapping)
-
-    cache.plan_committed_block_drop.assert_not_called()
-    assert manager._conversation_states["DYNAMO_SESSION_ID", None, None].current_request_id == 1
+def test_cached_block_keys_match_native_hash_chain(native_cache: SimpleNamespace) -> None:
+    tokens = list(range(16))
+    cache = native_cache.create(tokens, "scope")
+    for length in (4, 8, 16):
+        keys = native.sequence_to_blockchain_keys(4, cache.reuse_scope, tokens[:length])
+        assert cache._get_committed_prefix_key(length) == deque(keys, maxlen=1)[0][1]
+    assert cache._get_committed_prefix_key(0) is None
+    assert cache._get_committed_prefix_key(20) is None
+    cache.close()
+    assert cache._get_committed_prefix_key(4) is None
 
 
 @pytest.mark.parametrize(
-    "first_scope, second_scope",
+    "candidate,salt,continues",
     [
-        ((None, "tenant-A"), (None, "tenant-B")),
-        ((None, None), (None, "")),
-        ((None, "tenant-中文"), (None, "tenant-中文\x00other")),
-        ((1, "same-salt"), (2, "same-salt")),
-        ((None, "same-salt"), (0, "same-salt")),
+        (list(range(100, 116)), "scope", False),
+        (list(range(4)) + list(range(100, 112)), "scope", False),
+        (list(range(4)), "scope", False),
+        (list(range(16)) + list(range(100, 108)), "scope", True),
+        (list(range(16)), "other-scope", False),
     ],
 )
-def test_same_session_isolates_active_requests_and_plans_by_reuse_scope(
-    first_scope: tuple[int | None, str | None], second_scope: tuple[int | None, str | None]
+def test_only_continuing_history_advances_retention(
+    native_cache: SimpleNamespace, candidate: list[int], salt: str, continues: bool
 ) -> None:
-    manager = ConversationManager(max_num_turns=1)
-    first = _request(1, lora_task_id=first_scope[0], cache_salt=first_scope[1])
-    second = _request(2, lora_task_id=second_scope[0], cache_salt=second_scope[1])
-    successor = _request(3, lora_task_id=second_scope[0], cache_salt=second_scope[1])
-    first_cache, second_cache, successor_cache = _cache(), _cache(), _cache()
-    manager.prepare_request(first)
-    manager.prepare_request(second)
+    manager, conversation = native_cache.manager, native_cache.conversation
+    tokens = list(range(16))
+    first = native_cache.create(tokens, "scope")
+    conversation.prepare_request(_request(1, "scope"))
+    conversation.save_drop_plan(_request(1, "scope"), first)
+    first.close()
+    scope = native.ReuseScope(salt="scope")
+    assert manager.probe_reuse(scope, tokens) == len(tokens)
 
-    manager.save_drop_plan(first, first_cache)
-    manager.save_drop_plan(second, second_cache)
-
-    first_cache.plan_committed_block_drop.assert_called_once_with()
-    second_cache.plan_committed_block_drop.assert_called_once_with()
-    first_cache.plan_committed_block_drop.return_value.drop.assert_not_called()
-    second_cache.plan_committed_block_drop.return_value.drop.assert_not_called()
-
-    manager.prepare_request(successor)
-    manager.save_drop_plan(successor, successor_cache)
-    second_cache.plan_committed_block_drop.return_value.drop.assert_called_once_with()
-    first_cache.plan_committed_block_drop.return_value.drop.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "next_tokens",
-    [
-        (10, 11, 12, 13, 14, 15, 16, 17),
-        (1, 2, 3, 4, 50, 60, 70, 80),
-        (1, 2, 3, 4),
-        (1, 2, 3, 4, 5, 60, 70, 80),
-    ],
-)
-def test_unrelated_prefix_cannot_advance_conversation_retention(
-    next_tokens: tuple[int, ...],
-) -> None:
-    manager = ConversationManager(max_num_turns=1)
-    first, unrelated = _request(1), _request(2)
-    first_cache = _cache((1, 2, 3, 4, 5, 6))
-    unrelated_cache = _cache(next_tokens)
-    manager.prepare_request(first)
-    manager.save_drop_plan(first, first_cache)
-    manager.prepare_request(unrelated)
-    manager.save_drop_plan(unrelated, unrelated_cache)
-
-    unrelated_cache.plan_committed_block_drop.assert_not_called()
-    first_cache.plan_committed_block_drop.return_value.drop.assert_not_called()
-    state = manager._conversation_states["DYNAMO_SESSION_ID", None, None]
-    assert state.current_request_id is None
-    assert list(state.planned_drop_handles) == [first_cache.plan_committed_block_drop.return_value]
-
-
-def test_extending_partial_block_prefix_advances_retention() -> None:
-    manager = ConversationManager(max_num_turns=1)
-    first, continuation = _request(1), _request(2)
-    first_cache = _cache((1, 2, 3, 4, 5, 6))
-    continuation_cache = _cache((1, 2, 3, 4, 5, 6, 7, 8, 9))
-    manager.prepare_request(first)
-    manager.save_drop_plan(first, first_cache)
-    manager.prepare_request(continuation)
-    manager.save_drop_plan(continuation, continuation_cache)
-
-    continuation_cache.plan_committed_block_drop.assert_called_once_with()
-    first_cache.plan_committed_block_drop.return_value.drop.assert_called_once_with()
+    second = native_cache.create(candidate, salt)
+    conversation.prepare_request(_request(2, salt))
+    conversation.save_drop_plan(_request(2, salt), second)
+    second.close()
+    assert manager.probe_reuse(scope, tokens) == (0 if continues else len(tokens))

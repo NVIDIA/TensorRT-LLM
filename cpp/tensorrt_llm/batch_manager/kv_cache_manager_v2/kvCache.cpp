@@ -2681,6 +2681,20 @@ PlannedDropHandle::~PlannedDropHandle()
     }
 }
 
+std::optional<BlockKey> KvCache::committedPrefixKey(int numTokens) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockShared();
+    if (mStatus == Status::CLOSED || numTokens <= 0 || numTokens % mTokensPerBlock != 0
+        || numTokens > numCommittedTokens())
+    {
+        return std::nullopt;
+    }
+    auto const& block = mBlocks[BlockOrdinal{numTokens / mTokensPerBlock - 1}].treeBlock;
+    return block && block->tokens.size() == static_cast<size_t>(mTokensPerBlock) ? std::optional<BlockKey>{block->key}
+                                                                                 : std::nullopt;
+}
+
 std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
 {
     KVCM2_REJECT_IF_POISONED();

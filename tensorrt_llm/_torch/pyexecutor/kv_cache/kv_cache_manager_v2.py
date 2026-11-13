@@ -103,7 +103,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
-    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
@@ -495,11 +494,6 @@ def _request_conversation_key(request: LlmRequest) -> tuple[str, int | None, str
     return conversation_id, request.lora_task_id, request.cache_salt
 
 
-def _conversation_prefix_hash(kv_cache: _KVCache, tokens: Sequence[TokenIdExt]) -> bytes:
-    keys = sequence_to_blockchain_keys(kv_cache.tokens_per_block, kv_cache.reuse_scope, tokens)
-    return deque(keys, maxlen=1)[0][1]
-
-
 @dataclass(slots=True)
 class _ConversationState:
     current_request_id: Optional[int] = None
@@ -528,11 +522,13 @@ class ConversationManager:
         if state is None or state.current_request_id != request_id:
             return
 
-        tokens = kv_cache.committed_tokens
-        if state.prefix_hash is not None and (
-            len(tokens) < state.prefix_length
-            or _conversation_prefix_hash(kv_cache, tokens[: state.prefix_length])
-            != state.prefix_hash
+        prefix_length = (
+            kv_cache.num_committed_tokens // kv_cache.tokens_per_block * kv_cache.tokens_per_block
+        )
+        prefix_hash = kv_cache._get_committed_prefix_key(prefix_length)
+        if prefix_hash is None or (
+            state.prefix_hash is not None
+            and kv_cache._get_committed_prefix_key(state.prefix_length) != state.prefix_hash
         ):
             # An ID collision or a fork does not advance another history's retention plans.
             self.finish_request(request)
@@ -545,8 +541,8 @@ class ConversationManager:
                 f"{conversation_key[0]} have been dropped."
             )
         else:
-            state.prefix_length = len(tokens)
-            state.prefix_hash = _conversation_prefix_hash(kv_cache, tokens)
+            state.prefix_length = prefix_length
+            state.prefix_hash = prefix_hash
             state.planned_drop_handles.append(drop_handle)
             if len(state.planned_drop_handles) > self._max_num_turns:
                 state.planned_drop_handles.popleft().drop()
