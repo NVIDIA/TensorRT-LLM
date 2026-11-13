@@ -1420,6 +1420,14 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # conversation_id -> estimated prompt tokens of its latest request,
         # for the backlog load of its next request ("always" only).
         self._conv_num_tokens: dict[str, int] = {}
+        # The requests in flight that set their conversation's entry above,
+        # chained in the order they set it: request key -> [conversation_id,
+        # the entry before it, key of the previous request in flight, key of
+        # the next]. A request that fails is taken out of the chain, so that
+        # a retry is not taken for a turn whose prompt the server holds.
+        # conversation_id -> key of the last request in its chain.
+        self._conv_tokens_undo: dict[object, list] = {}
+        self._conv_tokens_setter: dict[str, object] = {}
         self._num_new_conversations = 0
         self._num_new_conversations_followed = 0
         if self._follow_every_match:
@@ -1727,6 +1735,60 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         if content_hashes is not None:
             self._conv_content_trie.remove(conv_id, content_hashes)
         self._conv_num_tokens.pop(conv_id, None)
+        self._conv_tokens_setter.pop(conv_id, None)
+
+    def _record_conversation_tokens_setter(self, key: object, conv_id: str,
+                                           previous: Optional[int]):
+        """Note that the request *key* set *conv_id*'s prompt-token entry.
+
+        *previous* is the entry before it. Call with ``self._lock`` held.
+        """
+        prev_key = self._conv_tokens_setter.get(conv_id)
+        if prev_key is not None:
+            self._conv_tokens_undo[prev_key][3] = key
+        self._conv_tokens_undo[key] = [conv_id, previous, prev_key, None]
+        self._conv_tokens_setter[conv_id] = key
+
+    def _finish_conversation_tokens(self, key: object, success: bool):
+        """Settle the prompt-token entry the request *key* set, if any.
+
+        A request that succeeds leaves its entry, and the requests of its
+        conversation in flight before it no longer set the entry. One that
+        fails is taken out of its conversation's chain: if a later request is
+        in flight, that one puts back the entry from before the failed one
+        should it fail too; otherwise that entry is put back now. Call with
+        ``self._lock`` held.
+        """
+        undo = self._conv_tokens_undo.pop(key, None)
+        if undo is None:
+            return
+        conv_id, previous, prev_key, next_key = undo
+        if success:
+            if prev_key is not None:
+                self._conv_tokens_undo[prev_key][3] = None
+            if next_key is not None:
+                self._conv_tokens_undo[next_key][2] = None
+            elif self._conv_tokens_setter.get(conv_id) == key:
+                del self._conv_tokens_setter[conv_id]
+            return
+        if prev_key is not None:
+            self._conv_tokens_undo[prev_key][3] = next_key
+        if next_key is not None:
+            later = self._conv_tokens_undo[next_key]
+            later[1], later[2] = previous, prev_key
+            return
+        if self._conv_tokens_setter.get(conv_id) != key:
+            # A later request succeeded, or placing the conversation again
+            # dropped its entry, since.
+            return
+        if previous is None:
+            self._conv_num_tokens.pop(conv_id, None)
+        else:
+            self._conv_num_tokens[conv_id] = previous
+        if prev_key is None:
+            del self._conv_tokens_setter[conv_id]
+        else:
+            self._conv_tokens_setter[conv_id] = prev_key
 
     def _request_tokens(self, request: OpenAIRequest) -> tuple[int, float]:
         """``(estimated prompt tokens, tokens per hash block)`` of *request*.
@@ -1858,12 +1920,18 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     # Sticky hit: keep the pinned server, refresh LRU only.
                     server = self._session_table[conv_id][0]
                     self._session_table.move_to_end(conv_id)
+                    previous = self._conv_num_tokens.get(conv_id)
                     load = self._known_conversation_load(conv_id, num_tokens)
                 else:
                     # New conversation_id (or its server is gone/excluded).
+                    # Placing it drops its entry: the server holds none of it.
+                    previous = None
                     server, load = self._place_conversation(
                         conv_id, content_hashes, exclude_server, num_tokens,
                         block_tokens)
+                if num_tokens is not None:
+                    self._record_conversation_tokens_setter(
+                        id(request), conv_id, previous)
                 await self._register_request(server, request)
                 self._add_content_load(server, request,
                                        weight if load is None else load)
@@ -1908,10 +1976,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True,
                              req_id: Optional[int] = None):
-        del session, success, req_id
+        del session, req_id
         async with self._lock:
             server = await self._unregister_request(request)
             self._remove_content_load(server, request)
+            self._finish_conversation_tokens(id(request), success)
             loads = {s: self._get_content_load(s) for s in self._servers}
             logger.debug(f"ConversationRouter: FINISH server={server}, "
                          f"content_loads={loads}")
@@ -1968,10 +2037,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             block_tokens = routing_key.get("block_tokens")
         self._validate_servers_available()
         async with self._lock:
-            load = None
+            load = previous = None
             if conv_id and self._is_routable_session(conv_id, exclude_server):
                 server = self._session_table[conv_id][0]
                 self._session_table.move_to_end(conv_id)
+                previous = self._conv_num_tokens.get(conv_id)
                 load = self._known_conversation_load(conv_id, num_tokens)
             elif conv_id:
                 if (content_hashes is None
@@ -1997,15 +2067,18 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 self._server_content_load.get(server, 0) + load)
             if req_id is not None:
                 self._coord_pending[req_id] = (server, load)
+                if conv_id and num_tokens is not None:
+                    self._record_conversation_tokens_setter(("req_id", req_id),
+                                                            conv_id, previous)
         return server, {
             "server_info": self._server_info.get(server, {})
         }, req_id
 
     async def finish_request_by_id(self, req_id, success=True):
-        del success
         if req_id is None:
             return
         async with self._lock:
+            self._finish_conversation_tokens(("req_id", req_id), success)
             pending = self._coord_pending.pop(req_id, None)
             if pending is None:
                 return

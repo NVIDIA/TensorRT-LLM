@@ -3390,3 +3390,124 @@ async def test_conversation_router_follow_always_keys_without_id_count_tokens():
     await router.finish_request_by_id(1)
     await router.finish_request_by_id(2)
     assert sum(router._server_content_load.values()) == 0
+
+
+_LONG_PROMPT = list(range(20_000, 50_000))  # 30000 tokens
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_follow_always_retry_after_failure_counts_whole_prompt(
+):
+    """A failed request leaves no prompt behind for the backlog of its retry.
+
+    Its retry is loaded with the whole prompt; a request that succeeds leaves
+    its prompt, and a failure puts back no entry a later request has set.
+    """
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                **_FOLLOW_ALWAYS_ARGS)
+    first = _conv_token_request("conv", _LONG_PROMPT)
+    server, _ = await router.get_next_server(first)
+    await router.finish_request(first, success=False)
+
+    retry = _conv_token_request("conv", _LONG_PROMPT)
+    assert (await router.get_next_server(retry))[0] == server
+    assert router._get_content_load(server) == 30_000
+    await router.finish_request(retry)
+
+    # Succeeded: the next turn adds only its growth.
+    turn = _conv_token_request("conv", _LONG_PROMPT + [7] * 100)
+    assert (await router.get_next_server(turn))[0] == server
+    assert router._get_content_load(server) == 100
+
+    # The turn fails after a later turn was routed: the later turn's entry stays.
+    later = _conv_token_request("conv", _LONG_PROMPT + [7] * 200)
+    assert (await router.get_next_server(later))[0] == server
+    await router.finish_request(turn, success=False)
+    await router.finish_request(later)
+    last = _conv_token_request("conv", _LONG_PROMPT + [7] * 300)
+    await router.get_next_server(last)
+    assert router._get_content_load(server) == 100
+    await router.finish_request(last)
+    assert sum(router._server_content_load.values()) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_follow_always_key_retry_after_failure_counts_whole_prompt(
+):
+    """Coordinator path: as above, finishing by the disagg req_id."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                **_FOLLOW_ALWAYS_ARGS)
+    first = _conv_token_request("conv", _LONG_PROMPT)
+    server, _, _ = await router.get_next_server_by_key(
+        router.content_routing_key(first), req_id=1)
+    await router.finish_request_by_id(1, success=False)
+
+    retry = _conv_token_request("conv", _LONG_PROMPT)
+    assert (await router.get_next_server_by_key(router.routing_key(retry),
+                                                req_id=2))[0] == server
+    assert router._server_content_load[server] == 30_000
+    await router.finish_request_by_id(2)
+
+    turn = _conv_token_request("conv", _LONG_PROMPT + [7] * 100)
+    await router.get_next_server_by_key(router.routing_key(turn), req_id=3)
+    assert router._server_content_load[server] == 100
+
+    later = _conv_token_request("conv", _LONG_PROMPT + [7] * 200)
+    await router.get_next_server_by_key(router.routing_key(later), req_id=4)
+    await router.finish_request_by_id(3, success=False)
+    await router.finish_request_by_id(4)
+    last = _conv_token_request("conv", _LONG_PROMPT + [7] * 300)
+    await router.get_next_server_by_key(router.routing_key(last), req_id=5)
+    assert router._server_content_load[server] == 100
+    await router.finish_request_by_id(5)
+    assert sum(router._server_content_load.values()) == 0
+    assert not router._conv_tokens_undo and not router._conv_tokens_setter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("by_key", [False, True], ids=["request", "req_id"])
+@pytest.mark.parametrize("earlier_fails_first", [True, False],
+                         ids=["earlier-first", "later-first"])
+async def test_conversation_router_follow_always_two_failed_requests_leave_no_entry(
+        by_key, earlier_fails_first):
+    """Two requests of a conversation in flight both fail.
+
+    Whichever finishes first, neither leaves its prompt behind: the retry
+    counts its whole prompt.
+    """
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                **_FOLLOW_ALWAYS_ARGS)
+    earlier = _conv_token_request("conv", _LONG_PROMPT)
+    later = _conv_token_request("conv", _LONG_PROMPT + [7] * 100)
+    retry = _conv_token_request("conv", _LONG_PROMPT + [7] * 100)
+
+    async def route(request, req_id, content=False):
+        if not by_key:
+            return (await router.get_next_server(request))[0]
+        key = (router.content_routing_key(request)
+               if content else router.routing_key(request))
+        return (await router.get_next_server_by_key(key, req_id=req_id))[0]
+
+    async def finish(request, req_id, success):
+        if by_key:
+            await router.finish_request_by_id(req_id, success=success)
+        else:
+            await router.finish_request(request, success=success)
+
+    server = await route(earlier, 1, content=True)
+    assert await route(later, 2) == server
+    order = [(earlier, 1), (later, 2)]
+    if not earlier_fails_first:
+        order.reverse()
+    for request, req_id in order:
+        await finish(request, req_id, success=False)
+
+    assert await route(retry, 3) == server
+    load = (router._server_content_load[server]
+            if by_key else router._get_content_load(server))
+    assert load == 30_100
+    await finish(retry, 3, success=True)
+    assert not router._conv_tokens_undo and not router._conv_tokens_setter
