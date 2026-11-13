@@ -59,10 +59,7 @@ from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
 from .utils.periodic_junit import (PeriodicJUnitXML,
                                    register_pytest_timeout_evidence)
 
-try:
-    from llm import trt_environment
-except ImportError:
-    trt_environment = None
+ALL_PYTEST_ITEMS: list[pytest.Item] | None = None
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -181,17 +178,9 @@ def cached_in_llm_models_root(path_relative_to_llm_models_root,
     return wrapper
 
 
-# Fixture about whether the current pipeline is running in TRT environment.
-@pytest.fixture(scope="session")
-def is_trt_environment():
-    return trt_environment is not None
-
-
 # Helper function to get llm_root. Do not define it as a fixture so that this
 # function can be used during test collection phase.
-def get_llm_root(trt_config=None, gitlab_token=None):
-    if trt_environment:
-        return trt_environment.setup_tensorrt_llm_repo(trt_config, gitlab_token)
+def get_llm_root():
     llm_repo_root = os.environ.get("LLM_ROOT", None)
     if llm_repo_root is None:
         llm_repo_root = os.path.dirname(
@@ -302,6 +291,7 @@ def medusa_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="function")
 def deepseek_v3_model_root(request):
     models_root = llm_models_root()
+    deepseek_v3_model_root = ""
     if request.param == "DeepSeek-V3":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3")
     elif request.param == "DeepSeek-V3-Lite-bf16":
@@ -321,6 +311,7 @@ def deepseek_v3_model_root(request):
 @pytest.fixture(scope="function")
 def gpt_oss_model_root(request):
     models_root = os.path.join(llm_models_root(), "gpt_oss")
+    gpt_oss_model_root = ""
     if request.param == "gpt-oss-20b":
         gpt_oss_model_root = os.path.join(models_root, "gpt-oss-20b")
     assert exists(gpt_oss_model_root), f"{gpt_oss_model_root} does not exist!"

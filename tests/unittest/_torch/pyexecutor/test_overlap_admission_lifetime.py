@@ -3,6 +3,7 @@
 
 from types import MethodType, SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -16,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -44,18 +46,24 @@ def _admission_executor(
         is_benchmark_disagg=False,
         is_warmup=False,
         _enable_non_overlap_adp_forward_intent=True,
+        _fetch_hint_enabled=False,
         _kv_load_tracker=KvLoadTracker(None, rank=rank, enabled=False),
         _kv_cache_capacity={},
         _kv_connector_moves_kv=False,
         _kv_connector_deadlines={},
         kv_cache_transceiver=None,
+        canceled_req_ids=[],
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
     )
-    executor._fetch_and_enqueue_requests = lambda queue, live: executor.observed_live_counts.append(
-        live
+    executor._fetch_and_enqueue_requests = (
+        lambda queue, live, **_: executor.observed_live_counts.append(live)
     )
-    for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
+    for name in (
+        "_get_request_admission_capacity",
+        "_pop_from_waiting_queue",
+        "_cancel_queued_context_requests",
+    ):
         setattr(executor, name, MethodType(getattr(PyExecutor, name), executor))
     return executor
 
@@ -68,7 +76,7 @@ def _fetch_all_ranks(
     # Produce peer payloads through the real router before simulating transport.
     payloads = []
     for executor, active in zip(executors, residents, strict=True):
-        executor.dist.tp_allgather = lambda payload: [payload]
+        executor.dist.tp_allgather_int64 = lambda payload: np.asarray([payload], dtype=np.int64)
         state = executor.adp_router.gather_all_rank_states(active)[0]
         payloads.append(state.serialize())
 
@@ -76,9 +84,13 @@ def _fetch_all_ranks(
     for rank, (executor, queue, active) in enumerate(
         zip(executors, queues, residents, strict=True)
     ):
-        executor.dist.tp_allgather = lambda payload, rank=rank: [
-            payload if peer == rank else peer_payload for peer, peer_payload in enumerate(payloads)
-        ]
+        executor.dist.tp_allgather_int64 = lambda payload, rank=rank: np.asarray(
+            [
+                payload if peer == rank else peer_payload
+                for peer, peer_payload in enumerate(payloads)
+            ],
+            dtype=np.int64,
+        )
         admitted.append(PyExecutor._fetch_new_requests(executor, queue, active))
     return admitted
 
@@ -94,7 +106,7 @@ def _enqueue_cohort(queues: list[FCFSWaitingQueue], first_id: int, count: int) -
         queue.add_requests(
             RequestQueueItem(
                 request_id,
-                ExecutorRequest(input_token_ids=[1, 2], max_tokens=1),
+                ExecutorRequest.adapt(Request(input_token_ids=[1, 2], max_tokens=1)),
             )
             for request_id in range(first_id, first_id + count)
         )

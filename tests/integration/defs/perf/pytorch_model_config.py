@@ -381,9 +381,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Single-node experimental adaptation of the NVFP4 DSpark generation
-        # recipe in tests/scripts/perf/disaggregated/
-        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Single-node experimental NVFP4 DSpark generation recipe.
         # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
         # The blog does not provide a tuned single-node NVFP4 DSpark config.
         {
@@ -543,6 +541,38 @@ def get_model_yaml_config(model_label: str,
         },
         {
             'patterns': ['glm_5.3_flash_fp8_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        # NVFP4 on SM100 requires the Modeling V2 split/fused targets.
+        {
+            'patterns': [
+                'glm_5.3_flash_nvfp4-serve-pytorch',
+                'glm_5.3_flash_nvfp4_mtp-serve-pytorch',
+            ],
+            'config': {
+                'modeling_v2': 'require',
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 8192,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_nvfp4_mtp-serve-pytorch'],
             'config': {
                 'speculative_config': {
                     'decoding_type': 'MTP',

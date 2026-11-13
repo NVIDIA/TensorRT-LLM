@@ -313,7 +313,9 @@ def test_polling_continues_for_save_after_load_completion(use_kv_cache_manager_v
     assert not executor.async_transfer_manager.has_any_inflight_requests()
 
     executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
-    executor.executor_request_queue.get_from_request_queue.assert_called_with(None)
+    executor.executor_request_queue.get_from_request_queue.assert_called_with(
+        None, wait_for_batch=True
+    )
     executor.is_shutdown = True
     assert executor.should_stop_processing
 

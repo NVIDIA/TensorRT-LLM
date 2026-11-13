@@ -271,19 +271,20 @@ PERF_METRIC_LOG_QUERIES = {
     "token_throughput": re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "total_token_throughput": re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "user_throughput": re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
-    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
-    "median_itl": re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
-    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
-    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_itl": re.compile(r"Median ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     "mean_e2el": re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     "median_e2el": re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     "p99_e2el": re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
+
 
 # Spec-decoding-only metrics: parsed from benchmark output but only stored
 # (and regression-checked) when the test runs with speculative decoding.
@@ -964,7 +965,8 @@ def add_perf_metric_value(
 ) -> None:
     """Populate `new_data` with per-test perf metrics from `metrics`.
 
-    - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
+    - Copies available values in PERF_METRIC_LOG_QUERIES as `d_<name>`;
+      explicit N/A measurements are omitted from upload and comparison.
     - Adds `d_al` only when spec_decoding=True *and* the value was parsed;
       non-spec rows omit it so OpenSearch baselines don't blend the two
       populations, and spec rows exempted from reporting it (AgentX) omit it
@@ -987,7 +989,9 @@ def add_perf_metric_value(
     whose mean is absent, before results are uploaded.
     """
     for metric_name in PERF_METRIC_LOG_QUERIES:
-        new_data[f"d_{metric_name}"] = metrics[metric_name]
+        value = metrics[metric_name]
+        if value is not None:
+            new_data[f"d_{metric_name}"] = value
     if spec_decoding:
         # 'al' is legitimately absent for AgentX lanes: aiperf does not propagate
         # TRT-LLM's non-standard avg_decoded_tokens_per_iter field. Omit the
@@ -3124,11 +3128,13 @@ class DisaggTestCmds(NamedTuple):
 
         Reused across runs; slurm_launch_draft.sh clears it before each attempt.
         The step id is excluded so all roles (separate srun steps) agree on it.
-        A DWDP ctx task sees SLURM_JOB_ID only under DWDP_SAVED_ENV_PREFIX.
+        Every role reads SLURM_JOB_ID from its own pytest environment. The worker
+        launchers (trtllm-llmapi-launch, dwdp_ctx_rank.sh) hide it, and slurm_run.sh
+        unsets it for the disagg server and the benchmark, so all roles of a Slurm
+        run use "local". A DWDP ctx task must not take the copy that dwdp_ctx_rank.sh
+        saves, or its CTX files land where the disagg server never looks.
         """
-        run_id = os.environ.get(
-            "SLURM_JOB_ID", os.environ.get(f"{DWDP_SAVED_ENV_PREFIX}SLURM_JOB_ID", "local")
-        )
+        run_id = os.environ.get("SLURM_JOB_ID", "local")
         return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
 
     def _hostname_file(self, server_idx: int, worker_name: str = "") -> str:
@@ -3713,7 +3719,8 @@ class DisaggTestCmds(NamedTuple):
         urls = []
         for rank in range(world_size):
             path = os.path.join(reserved_dir, f"{rank}.txt")
-            urls.append(wait_for_reported_addr(path, max(1, int(deadline - time.time()))))
+            host, port = wait_for_reported_addr(path, max(1, int(deadline - time.time())))
+            urls.append(f"{host}:{port}")
 
         # Same LLM args a plain ctx server gets from its --config file, with
         # the speculative model / load balancer paths already resolved.
@@ -4749,6 +4756,7 @@ class PerfSanityTestConfig:
         model_name = metadata.get("model_name", "")
         assert model_name, "model_name is required in metadata section"
 
+        gen_server_config = None
         # Use self.benchmark_mode instead of reading from config file
         benchmark_mode = self.benchmark_mode
         # The mode segments of the test id, reused verbatim as the config name so
@@ -5333,7 +5341,7 @@ class PerfSanityTestConfig:
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
 
-        def parse_metrics_from_output(output: str) -> Optional[Dict[str, float]]:
+        def parse_metrics_from_output(output: str) -> dict[str, float | None]:
             """Parse all metrics from a single output string."""
             metrics = {}
             all_queries = {
@@ -5363,7 +5371,10 @@ class PerfSanityTestConfig:
                         continue
                     match = regex.search(line)
                     if match:
-                        metrics[metric_type] = float(match.group(1))
+                        # Preserve explicit N/A as a present key so validation
+                        # can distinguish it from missing or malformed output.
+                        value = match.group(1)
+                        metrics[metric_type] = None if value == "N/A" else float(value)
                         break
             return metrics
 

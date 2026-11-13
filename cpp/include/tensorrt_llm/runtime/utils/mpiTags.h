@@ -31,7 +31,13 @@ enum class MpiTag : int
 
     // Asynchronous context-transfer coordination.
     kContextTransferEvent = 1028,
-    kContextTransferUpdate = 1029
+    kContextTransferUpdate = 1029,
+
+    // NCCL window allocation host consensus.
+    kNcclWindowAllocation = 1030,
+
+    // NCCL communicator bootstrap.
+    kNcclUniqueId = 1031
 };
 
 } // namespace tensorrt_llm::mpi

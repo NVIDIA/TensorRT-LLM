@@ -148,10 +148,6 @@ def _register_fake():
     ) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::validate_allreduce_tuning_buckets")
-    def _(buckets: List[int]) -> None:
-        return None
-
     @torch.library.register_fake("trtllm::clear_allreduce_tactic_cache")
     def _() -> None:
         return None
@@ -192,7 +188,8 @@ def _register_fake():
           rmsnorm_fusion,
           scale=None,
           fusion_op: int = 0,
-          fp8_payload: bool = False):
+          fp8_payload: bool = False,
+          trigger_completion_at_end: bool = True):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
@@ -1218,6 +1215,7 @@ def _register_fake():
         old_g: torch.Tensor,
         cache_buf_idx: torch.Tensor,
         prev_num_accepted_tokens: torch.Tensor,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
         return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),

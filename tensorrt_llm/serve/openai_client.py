@@ -18,7 +18,6 @@ import errno
 import json
 import os
 import traceback
-import zlib
 from abc import ABC, abstractmethod
 from contextlib import aclosing
 from typing import (
@@ -37,7 +36,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 import msgspec
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -49,6 +48,7 @@ from tensorrt_llm.serve.disagg_auth import (
     build_subagent_affinity_headers,
     request_requires_internal_disagg_auth,
 )
+from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -140,6 +140,21 @@ _GENERATION_LEG_RETRYABLE_ERRORS = (
 _REFUSED_AFFINITY_PORT_BYPASS_SECS = 10.0
 
 
+# The disagg server is a transparent relay: worker responses come from the
+# same trusted codebase, and a deployment may attach extra top-level fields to
+# them (orchestrator-side telemetry, token transports, ...). Validate the known
+# schema but keep unknown fields -- the protocol models are extra="forbid", so
+# validating worker output with them either 500s the request or silently strips
+# whatever the deployment attached. Strictness belongs at the request boundary,
+# not on the relay of our own workers' output.
+class RelayedCompletionResponse(CompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
+class RelayedChatCompletionResponse(ChatCompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
 class OpenAIClient(ABC):
     async def send_request(
         self,
@@ -150,13 +165,13 @@ class OpenAIClient(ABC):
     ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
-                "v1/completions", request, CompletionResponse, server, hooks, req_id
+                "v1/completions", request, RelayedCompletionResponse, server, hooks, req_id
             )
         elif isinstance(request, ChatCompletionRequest):
             return await self._send_request(
                 "v1/chat/completions",
                 request,
-                ChatCompletionResponse,
+                RelayedChatCompletionResponse,
                 server,
                 hooks,
                 req_id,
@@ -239,6 +254,11 @@ def _server_base_url(server: str) -> str:
     return f"http://{server}".rstrip("/")
 
 
+def _server_netloc(server_or_url: str) -> str:
+    """Return host:port of a router server entry or of a URL built from one."""
+    return urlsplit(_server_base_url(server_or_url)).netloc
+
+
 class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
@@ -293,7 +313,7 @@ class OpenAIHttpClient(OpenAIClient):
         self._refused_affinity_ports: dict[str, float] = {}
 
     def _url_server(self, server: str, request: UCompletionRequest) -> str:
-        """host:port to send a request routed to server to.
+        """Server entry to send a request routed to server to, with the scheme of server kept.
 
         With frontend affinity, a request carrying a conversation id goes to
         the affinity port of the frontend picked by crc32(conversation_id) % K;
@@ -308,14 +328,15 @@ class OpenAIHttpClient(OpenAIClient):
         if not conversation_id:
             return server
         num_frontends, stride = self._frontend_affinity
-        host, _, port = server.rpartition(":")
-        frontend = zlib.crc32(conversation_id.encode()) % num_frontends
+        host, _, port = server.rstrip("/").rpartition(":")
+        frontend = frontend_of_conversation(conversation_id, num_frontends)
         affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
-        refused_at = self._refused_affinity_ports.get(affinity_server)
+        refused_key = _server_netloc(affinity_server)
+        refused_at = self._refused_affinity_ports.get(refused_key)
         if refused_at is not None:
             if get_steady_clock_now_in_seconds() - refused_at < _REFUSED_AFFINITY_PORT_BYPASS_SECS:
                 return server
-            del self._refused_affinity_ports[affinity_server]
+            del self._refused_affinity_ports[refused_key]
         return affinity_server
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
@@ -641,13 +662,31 @@ class OpenAIHttpClient(OpenAIClient):
                         f"Context frontend affinity port of {url} refused the connection: "
                         f"{e} - sending to the shared port {fallback_url}"
                     )
-                    self._refused_affinity_ports[urlsplit(url).netloc] = (
+                    self._refused_affinity_ports[_server_netloc(url)] = (
                         get_steady_clock_now_in_seconds()
                     )
                     url, fallback_url = fallback_url, None
                     affinity_refusals = 1
                     continue
                 if streaming_status_rejected:
+                    raise
+                # A 4xx from the worker is the request's own fault (malformed
+                # body, context length exceeded, ...) and will fail the same way
+                # every time, so retrying only burns another prefill attempt.
+                # It reaches this block only because the 4xx is re-raised above
+                # as an aiohttp.ClientResponseError -- a ClientError subclass --
+                # to carry the response body up; the retry budget here is meant
+                # for transport failures, not for server-side rejections.
+                # 408 and 429 are transient, not deterministic: keep them retryable.
+                if (
+                    isinstance(e, aiohttp.ClientResponseError)
+                    and 400 <= e.status < 500
+                    and e.status not in (408, 429)
+                ):
+                    logger.error(
+                        f"Client error to {url}: {e} - not retrying, {e.status} is deterministic",
+                        traceback.format_exc(),
+                    )
                     raise
                 if lines_yielded > 0:
                     logger.error(

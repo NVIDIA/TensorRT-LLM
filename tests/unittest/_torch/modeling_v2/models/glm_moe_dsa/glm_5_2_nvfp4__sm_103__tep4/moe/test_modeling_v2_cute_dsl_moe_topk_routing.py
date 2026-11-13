@@ -12,6 +12,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_routing import (  # noqa: E402, E501
     MAP_KEYS,
+    TILE,
     TOP_K,
     allocate_maps,
     canonical_maps,
@@ -20,12 +21,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_topk_routing import (  # noqa: E402, E501
     PREFILL_MAX_ROWS,
+    WIDE_RANGES,
+    WIDE_SCHEDULES,
     CompiledTopkRouting,
     allocate_decode_outputs,
     allocate_prefill_scratch,
     build_decode,
     build_prefill,
+    build_wide,
     selection_margin,
+    wide_range,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_topk_routing import (  # noqa: E402, E501
     cute_dsl_moe_topk_routing as op,
@@ -50,12 +55,27 @@ _COMPILED: dict = {}
 
 def _compiled(spec) -> CompiledTopkRouting:
     rows = spec["rows"]
+    if spec.get("wide"):
+        hist = spec.get("expert_hist", False)
+        cluster, trim = spec.get("schedule", (8, False))
+        key = ("wide", wide_range(rows), spec["splits"], hist, cluster, trim)
+        if key not in _COMPILED:
+            _COMPILED[key] = build_wide(
+                rows,
+                spec["splits"],
+                torch.cuda.current_device(),
+                expert_hist=hist,
+                cluster=cluster,
+                trim=trim,
+            )
+        return _COMPILED[key]
     if rows > 64:
         key = "prefill"
         if key not in _COMPILED:
             _COMPILED[key] = build_prefill(torch.cuda.current_device())
         return _COMPILED[key]
-    key = (rows, spec["splits"], spec["signal_gg1"], spec.get("fuse_zero", False))
+    hist = spec.get("expert_hist", False)
+    key = (rows, spec["splits"], spec["signal_gg1"], spec.get("fuse_zero", False), hist)
     if key not in _COMPILED:
         _COMPILED[key] = build_decode(
             rows,
@@ -63,6 +83,7 @@ def _compiled(spec) -> CompiledTopkRouting:
             torch.cuda.current_device(),
             signal_gg1=spec["signal_gg1"],
             fuse_zero=spec.get("fuse_zero", False),
+            expert_hist=hist,
         )
     return _COMPILED[key]
 
@@ -71,13 +92,16 @@ def _inputs(spec, g):
     """Logits as each router writes them (`[rows, 256]`, or four K partials), and a bias
     wide enough to skew selection so experts take several tiles at the large counts."""
     rows = spec["rows"]
-    if rows > 64:
+    if rows > 64 and not spec.get("wide"):
         logits = torch.randn(rows, EXPERTS, generator=g, device="cuda")
     elif spec["splits"] == 1:
         logits = torch.randn(rows, EXPERTS, generator=g, device="cuda")
     else:
         logits = torch.randn(rows, spec["splits"], EXPERTS, generator=g, device="cuda") * 0.5
     bias = torch.randn(EXPERTS, generator=g, device="cuda") * 0.1
+    if spec.get("hot"):
+        # Every row selects this rank's second expert: past 128 rows it spans two tiles.
+        bias[spec["offset"] + 1] += 4.0
     return logits.contiguous(), bias
 
 
@@ -117,8 +141,13 @@ def test_certified_cells(cell) -> None:
     if spec.get("fuse_zero"):
         zero = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
     compiled = _compiled(spec)
+    hist = None
+    if spec.get("expert_hist"):
+        hist = torch.full((64,), -1, dtype=torch.int32, device="cuda")
     with validating(op):
-        weights, ids, maps = op(logits, bias, offset, ROUTED_SCALE, outputs, zero, compiled)
+        weights, ids, maps = op(
+            logits, bias, offset, ROUTED_SCALE, outputs, zero, compiled, expert_hist=hist
+        )
     ref_w, ref_ids, ref_maps = op.reference(
         logits, bias, offset, ROUTED_SCALE, outputs, zero, compiled
     )
@@ -142,6 +171,111 @@ def test_certified_cells(cell) -> None:
             assert torch.equal(got[k], ref_maps[k]), f"{k} differs from the reference"
     if zero is not None:
         assert bool((zero == 0).all()), "the fused zero plane was not cleared"
+    if hist is not None:
+        # This step's token count per local expert, every expert written (zeros included).
+        local = ids[(ids >= offset) & (ids < offset + 64)].long() - offset
+        want = torch.bincount(local, minlength=64).to(torch.int32)
+        assert torch.equal(hist, want), "expert_hist is not the step's per-expert counts"
+
+
+#: The wide kernel's row counts under test: each token-warp range at its edges, one tile per
+#: expert (<= 128 rows) and two, MTP3's 128 and MTP5's 192 verify rows.
+WIDE_ROWS = (65, 127, 128, 129, 191, 192, 200, 256)
+#: The skew of `_skewed_logits`, relative to EP rank 1's window.
+SKEW_OFFSET = 64
+HOT = SKEW_OFFSET + 1
+EMPTY = tuple(range(SKEW_OFFSET + 10, SKEW_OFFSET + 14))
+TIED = tuple((SKEW_OFFSET + 20 + 2 * p, SKEW_OFFSET + 21 + 2 * p) for p in range(8))
+
+
+def _skewed_logits(rows: int, splits: int, g: torch.Generator):
+    """Logits no degenerate draw satisfies: a hot local expert every row takes (two tiles past
+    128 rows), four local experts no row takes, and eight tied pairs (equal partials and
+    bias, so equal scores bit for bit), the window favoured so about half the winners are
+    local. Returns `(logits as the kernel reads them, the same summed in split order, bias)`."""
+    planes = torch.randn(rows, splits, EXPERTS, generator=g, device="cuda") * (
+        1.0 if splits == 1 else 0.5
+    )
+    bias = torch.randn(EXPERTS, generator=g, device="cuda") * 0.2
+    bias[SKEW_OFFSET : SKEW_OFFSET + 64] += 0.3
+    bias[HOT] = 4.0
+    bias[list(EMPTY)] = -4.0
+    for a, b in TIED:
+        planes[:, :, b] = planes[:, :, a]
+        bias[b] = bias[a]
+    summed = planes[:, 0]
+    for s in range(1, splits):
+        summed = summed + planes[:, s]
+    logits = planes[:, 0] if splits == 1 else planes
+    return logits.contiguous(), summed.contiguous(), bias
+
+
+@pytest.mark.parametrize("schedule", WIDE_SCHEDULES, ids=("cl8", "cl16trim"))
+@pytest.mark.parametrize("splits", (1, 4))
+@pytest.mark.parametrize("rows", WIDE_ROWS)
+def test_wide_matches_the_prefill_top_k_bitwise(rows: int, splits: int, schedule) -> None:
+    """The wide kernel takes the prefill top-k's place on MTP3 / MTP5 decode steps. On the same
+    scores (the K partials summed in split order, as the kernel sums them) its ids and weights
+    equal the prefill kernel's bit for bit -- both select with the decode arithmetic -- and its
+    maps the same tile layout exactly (canonical form: rows within an expert are claimed by
+    atomics), which is `reference_maps` of those ids. Its counts are the step's. Over the four
+    EP windows every `(token, k)` is routed on exactly one rank. On both schedules alike: the
+    8-CTA cluster, and the 16-CTA one (half the token-warps per CTA, 16 ranks' histograms) with
+    the trimmed winner lookup.
+
+    The draw is checked not to be degenerate: the hot expert takes every row (two tiles past
+    128), the cold ones none, and some tied pair is split at the selection edge with the
+    lower id taken."""
+    g = torch.Generator(device="cuda").manual_seed(rows * 10 + splits)
+    logits, summed, bias = _skewed_logits(rows, splits, g)
+    wide = _compiled(dict(rows=rows, splits=splits, wide=True, expert_hist=True, schedule=schedule))
+    prefill = _compiled(dict(rows=max(rows, 65)))
+    seen = torch.zeros(rows * TOP_K, dtype=torch.long, device="cuda")
+    for offset in (0, 64, 128, 192):
+        out_p, out_w = _outputs(rows), _outputs(rows)
+        hist = torch.full((64,), -1, dtype=torch.int32, device="cuda")
+        w_p, ids_p, maps_p = op(summed, bias, offset, ROUTED_SCALE, out_p, None, prefill)
+        with validating(op):
+            w, ids, maps = op(
+                logits, bias, offset, ROUTED_SCALE, out_w, None, wide, expert_hist=hist
+            )
+        assert torch.equal(ids, ids_p), "ids differ from the prefill top-k's"
+        assert torch.equal(w, w_p), "weights differ from the prefill top-k's"
+        check_maps(maps, ids, offset)
+        got = canonical_maps(maps, rows * TOP_K)
+        want = canonical_maps(maps_p, rows * TOP_K)
+        ref = reference_maps(ids, offset)
+        for k in MAP_KEYS:
+            assert torch.equal(got[k], want[k]), f"{k} differs from the prefill top-k's"
+            assert torch.equal(got[k], ref[k]), f"{k} differs from reference_maps"
+        local = ids[(ids >= offset) & (ids < offset + 64)].long() - offset
+        counts = torch.bincount(local, minlength=64)
+        assert torch.equal(hist, counts.to(torch.int32)), "expert_hist is not the step's counts"
+        tiles = int(maps["num_non_exiting_tiles"][0])
+        limit = maps["tile_idx_to_mn_limit"][:tiles].tolist()
+        p2e = maps["permuted_idx_to_expanded_idx"]
+        for t, hi in enumerate(limit):
+            rows_t = p2e[t * TILE : hi].long()
+            seen.index_add_(0, rows_t, torch.ones_like(rows_t))
+        if offset == SKEW_OFFSET:
+            expert = got["tile_idx_to_expert_idx"]
+            assert int(counts[HOT - offset]) == rows, "the hot expert does not take every row"
+            assert int((expert == HOT - offset).sum()) == (rows + TILE - 1) // TILE
+            assert all(int(counts[e - offset]) == 0 for e in EMPTY), "a cold expert has rows"
+            straddles = 0
+            for a, b in TIED:
+                ha, hb = (ids == a).any(1), (ids == b).any(1)
+                assert not bool((hb & ~ha).any()), f"tie {a}/{b} broken toward the higher id"
+                straddles += int((ha & ~hb).sum())
+            assert straddles > 0, "no tied pair split at the selection edge in this draw"
+    assert bool((seen == 1).all()), "a (token, k) is routed on 0 or 2+ ranks"
+
+
+def test_wide_ranges_cover_the_mtp_decode_widths() -> None:
+    """The three handles tile 65..256 without overlap; MTP3's 128 and MTP5's 192 verify rows
+    each sit in one."""
+    assert WIDE_RANGES == ((65, 128), (129, 192), (193, 256))
+    assert wide_range(128) == (65, 128) and wide_range(192) == (129, 192)
 
 
 def _unreachable(*args) -> None:

@@ -524,5 +524,10 @@
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
 
+# GLM-5.3-Flash (glm5_next)
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
+/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
+/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia
+
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval

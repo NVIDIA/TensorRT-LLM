@@ -119,6 +119,7 @@ def check_cache_reset_events_through_control_rpc(tmp_path, ranks=1):
             # to establish that every rank's live subscriber is receiving.
             ready = set()
             last_seen = [-1] * ranks
+            cursors = None
             deadline = time.monotonic() + 30
             while len(ready) < ranks and time.monotonic() < deadline:
                 refs = llm._collective_rpc("reset_for_subscription_probe", non_block=True)

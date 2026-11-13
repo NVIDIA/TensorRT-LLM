@@ -46,6 +46,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from .activation import (materialize_activation_params,
+                         resolve_activation_support)
 from .interface import MoEWeightLoadingMode
 
 # The declarations aligns with moe_kernels.h
@@ -7594,7 +7596,9 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module) -> None:
+        # GEMM1 ScaleC stores FC1 input scale / FC2 input scale; ScaleGate
+        # stores the raw FC1 dequant scale, also used to quantize the input.
         fc31_input_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
                                           requires_grad=False)
@@ -7625,7 +7629,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         dst_fc31_input_scale.copy_(w1_input_scale)
         dst_fc2_input_scale.copy_(w2_input_scale)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
@@ -7651,6 +7655,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
                 w1_input_scale, w3_input_scale, w2_input_scale,
                 tmp_fc31_input_scale[expert_id], tmp_fc2_input_scale[expert_id])
 
+        # Keep GEMM1's output-scale ratio separate from the raw input scale.
         module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max() /
                                              tmp_fc2_input_scale.max())
         module.fc31_input_gate_dequant.data.copy_(tmp_fc31_input_scale.max())
@@ -7658,6 +7663,36 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
         # Step2: Load weight block scales.
         super().load_quant_scales(module, weights)
+
+        # Bias is consumed before the GEMM dequant scale.
+        # FC1's output scale includes FC2 quantization, so use its gate scale
+        # (the FC1 dequant scale alone) for the accumulator-unit conversion.
+        if module.bias:
+            module.w3_w1_bias.data.div_(
+                module.fc31_input_gate_dequant.view(-1, 1))
+            module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
+
+    def cache_derived_state(self, module: torch.nn.Module) -> None:
+        """Restore activation registers after materialization or weight transfer.
+
+        Args:
+            module: Weight owner holding the semantic activation configuration
+                and the loaded FC1 gate dequantization scales.
+        """
+        super().cache_derived_state(module)
+        params = materialize_activation_params(
+            module.activation,
+            resolve_activation_support(module),
+            num_local_experts=module.expert_size_per_partition,
+            device=module.fc31_input_gate_dequant.device,
+            owner=type(module).__name__,
+        )
+        if params.alpha is not None:
+            module.act_alpha.data.copy_(params.alpha)
+        for target, value in ((module.act_beta, params.beta), (module.act_clamp,
+                                                               params.clamp)):
+            if value is not None:
+                target.data.copy_(value / module.fc31_input_gate_dequant)
 
 
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):

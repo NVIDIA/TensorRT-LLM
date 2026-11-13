@@ -486,7 +486,6 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             effects=PyExecutorEffects(executor),
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
-            force_terminate_ctx_for_partial_reuse=False,
         )
     return executor
 

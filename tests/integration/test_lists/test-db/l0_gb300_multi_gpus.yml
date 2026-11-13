@@ -61,6 +61,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/kernels/serial
   - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
+  # Sparse KV offload LongBench v2 parity, FP8 variants (the NVFP4 and block-reuse ones are pre-merge).
+  - accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_kv_cache_offload[kv_dtype=fp8] TIMEOUT (30)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_kv_cache_offload TIMEOUT (30)
   # GLM-5.3-Flash: ADP/MTP/FP8-KV and non-speculative prefix reuse.
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv] TIMEOUT (60)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4] TIMEOUT (60)
@@ -85,6 +88,11 @@ l0_gb300_multi_gpus:
   - unittest/_torch/multi_gpu/test_ll_exchange.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  # Muse Spark Open's fused expert finalize + TP4 all-reduce over CUDA IPC; each
+  # test spawns its four ranks with MPIPoolExecutor.
+  - unittest/_torch/modeling/test_musespark_open_finalize_allreduce.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_lifecycle.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_stress.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py

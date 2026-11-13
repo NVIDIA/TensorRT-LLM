@@ -26,6 +26,7 @@ from tensorrt_llm._torch.weight_sharing import (
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
@@ -112,6 +113,13 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
 _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_fusion=frozenset({False}),
+)
+# Tied Qwen3 checkpoints alias `lm_head.weight` to `model.embed_tokens.weight`
+# at construction, so the shared table is transferred once and the tied profile
+# has its own layout ABI.
+_MX_QWEN3_BF16_DENSE_TIED_RUNTIME_CONSTRAINTS = replace(
+    _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    tied_word_embeddings=frozenset({True}),
 )
 # Mistral realizes a per-layer attention window from its checkpoint config.
 # The dense profile is qualified only when every layer runs full attention.
@@ -999,6 +1007,19 @@ class ModelLoader:
             runtime_constraints=_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
         PostTransformProfile(
+            profile_id="qwen3-for-causal-lm-bf16-tied-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3",
+                "Qwen3ForCausalLM"),
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_QWEN3_BF16_DENSE_TIED_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
             profile_id="mistral-for-causal-lm-bf16-target-v1",
             root_model_class=LazyRootModelIdentity(
                 "tensorrt_llm._torch.models.modeling_mistral",
@@ -1124,6 +1145,8 @@ class ModelLoader:
             'trust_remote_code': llm_args.trust_remote_code,
             'mm_encoder_only': llm_args.mm_encoder_only,
         }
+        if llm_args.model_kwargs is not None:
+            config_kwargs['model_kwargs'] = llm_args.model_kwargs
         if llm_args.parallel_config:
             config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 

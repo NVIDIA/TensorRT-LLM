@@ -139,7 +139,6 @@ def _manager(pools=2, rows=4, max_blocks=16):
     m.enable_swa_scratch_reuse = False
     m.enable_block_reuse = False
     m._use_per_layer_page_tables = False
-    m.sparse_metadata_batch = None
     return m
 
 

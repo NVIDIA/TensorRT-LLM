@@ -11,6 +11,7 @@ import sys
 import unittest
 from collections.abc import Iterator
 from dataclasses import replace
+from queue import Queue
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest import mock
@@ -31,23 +32,34 @@ from _torch.pyexecutor.engine_test_utils import (
 )
 
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
+import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs as graphs_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.models.modeling_utils import remove_weights
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
-from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    DraftTargetDecodingConfig,
+    PrefillCudaGraphBackend,
+    SparseKvCacheOffloadConfig,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -264,7 +276,7 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderWa
     # The warmup resolves its chunk-alignment variant off the model's Mamba
     # metadata class; a model declaring none takes the ``Mamba2Metadata``
     # default, i.e. no alignment rewrite.
-    engine.model = SimpleNamespace()
+    engine.model = SimpleNamespace(modules=lambda: iter(()))
     batch = object()
     engine._dummy_requests = SimpleNamespace(
         release_batch_context=lambda *_a, **_kw: _released_batch(batch)
@@ -999,6 +1011,28 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Expected exactly 2 empty_cache calls; got order={calls}",
         )
 
+    def test_guided_decoder_runs_the_context_warmup_before_the_autotuner(self) -> None:
+        """A capturable guided decoder rules out the general warmup's
+        generation requests, not its context requests: those still run, then
+        the release of the MoE workspaces and the cache, then the autotuner."""
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
+        model_engine._inputs.guided_decoder = Mock()
+        tracker = _Tracker()
+        calls, _ = _run_warmup_tracked(model_engine, resource_manager, tracker=tracker)
+        (((_, configs), _),) = tracker.call_args["general_warmup"]
+        self.assertTrue(configs, "Expected context warmup requests")
+        self.assertTrue(
+            all(num_gen_tokens == 0 for _, num_gen_tokens in configs),
+            f"Expected context requests only; got {configs}",
+        )
+        self.assertIn((model_engine._config.max_num_tokens, 0), configs)
+        general_idx = calls.index("general_warmup")
+        self.assertEqual(
+            calls[general_idx : general_idx + 5],
+            ["general_warmup", "moe_clear", "empty_cache", "autotuner", "empty_cache"],
+            f"Expected the context warmup and its release before the autotuner; got {calls}",
+        )
+
     def test_helix_cp_runs_only_the_generation_autotuner_warmup(self) -> None:
         """With Helix CP, can_run_general_warmup is False and the context
         warmups (general, Mamba hybrid) are skipped; the autotuner warmup still
@@ -1529,12 +1563,17 @@ class TestWarmupCleanup(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("has_guided_decoder", [False, True])
 @pytest.mark.parametrize(
     "world_size,dwdp_size,is_fatal",
     [(1, 0, False), (2, 0, True), (1, 4, True)],
 )
-def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bool) -> None:
+def test_general_warmup_oom_policy(
+    world_size: int, dwdp_size: int, is_fatal: bool, has_guided_decoder: bool
+) -> None:
     engine = _general_warmup_engine(world_size=world_size, dwdp_size=dwdp_size)
+    guided_decoder = Mock() if has_guided_decoder else None
+    engine._inputs.guided_decoder = guided_decoder
     error = torch.OutOfMemoryError("asymmetric OOM")
     engine._forward_warmup = mock.Mock(side_effect=error if is_fatal else [error, None])
 
@@ -1550,12 +1589,115 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
         # The remaining shape is never attempted: this rank's peers are
         # already stuck in the failed forward's collectives.
         engine._forward_warmup.assert_called_once()
+        if guided_decoder is not None:
+            guided_decoder.reset_warmup_state.assert_not_called()
     else:
         assert engine._forward_warmup.call_count == 2
         # A retry after an OOM between dispatch() and combine() has to start
         # from a clean MoE all-to-all state.
         engine._reset_moe_alltoall_state.assert_called_once_with()
         empty_cache.assert_called_once_with()
+        if guided_decoder is not None:
+            guided_decoder.reset_warmup_state.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("callback_pending", [False, True])
+def test_general_warmup_oom_restores_guided_batch_queue(callback_pending: bool) -> None:
+    """A failed warmup must not shift the next request's grammar snapshot."""
+    engine = _general_warmup_engine(world_size=1, dwdp_size=0)
+    decoder = object.__new__(CapturableGuidedDecoder)
+    decoder.queue = Queue()
+    decoder._num_added_batches = 0
+    decoder.requests = None
+    decoder.requests_hostfunc = None
+    decoder.max_num_draft_tokens = 1
+    engine._inputs.guided_decoder = decoder
+    pending_callbacks: list[Callable[[], None]] = []
+    consumed: list[int] = []
+
+    def enqueue_callback(fn: Callable[..., None], *args: object, **kwargs: object) -> None:
+        pending_callbacks.append(lambda: fn(*args, **kwargs))
+
+    def synchronize() -> None:
+        while pending_callbacks:
+            pending_callbacks.pop(0)()
+            consumed.append(decoder.requests_hostfunc.requests[0].request_id)
+
+    decoder.stream = Mock(synchronize=Mock(side_effect=synchronize))
+
+    def batch(request_id: int, *, guided: bool = False) -> SimpleNamespace:
+        request = SimpleNamespace(
+            py_request_id=request_id,
+            py_guided_decoding_params=object() if guided else None,
+            py_seq_slot=0,
+            py_batch_idx=None,
+            is_context_init_state=True,
+            is_last_context_chunk=True,
+            is_generation_in_progress_state=False,
+            llm_request_type=None,
+            py_decoding_iter=0,
+            get_last_tokens=lambda _: 1,
+            py_draft_tokens=[],
+            py_num_accepted_draft_tokens=0,
+        )
+        return SimpleNamespace(
+            all_requests=lambda: [request], num_context_requests=1, num_generation_requests=0
+        )
+
+    engine._dummy_requests = SimpleNamespace(
+        create_warmup_request=lambda _resources, tokens, _gen: batch(tokens),
+        release_batch_context=lambda requests, _resources: _released_batch(requests),
+    )
+
+    def forward(requests: SimpleNamespace, *_args: object, **_kwargs: object) -> None:
+        assert not pending_callbacks
+        assert decoder.queue.empty()
+        assert decoder.requests is None
+        assert decoder.requests_hostfunc is None
+        decoder.add_batch(requests)
+        if decoder.requests.requests[0].request_id == 128:
+            if callback_pending:
+                # OOM after submitting fetch_batch, before recording the
+                # completion event: recovery must drain the stream itself.
+                decoder.fetch_batch()
+            raise torch.OutOfMemoryError("warmup forward failed after enqueue")
+        decoder.fetch_batch()
+        decoder.stream.synchronize()
+
+    engine._forward_warmup = forward
+    with (
+        _no_cuda_side_effects(),
+        patch("tensorrt_llm._torch.hostfunc.launch_hostfunc", side_effect=enqueue_callback),
+    ):
+        engine._general_warmup_impl(object(), [(128, 0), (64, 0)])
+        assert decoder.queue.empty()
+        assert consumed == ([128, 64] if callback_pending else [64])
+
+        decoder.add_batch(batch(1000, guided=True))
+        decoder.fetch_batch()
+        decoder.stream.synchronize()
+
+    assert consumed[-1] == 1000
+    (guided_request,) = decoder.requests_hostfunc.valid_requests()
+    assert guided_request.require_matcher_init()
+    # The host functions hold the batch the host thread numbered last, so a
+    # build failure is reported under the real request's batch.
+    assert decoder.requests_hostfunc.batch_id == decoder.last_added_batch_id
+    assert decoder.queue.empty()
+
+
+@pytest.mark.cpu_only
+def test_general_warmup_aborts_if_guided_state_cannot_be_reset() -> None:
+    engine = _general_warmup_engine(world_size=1, dwdp_size=0)
+    engine._inputs.guided_decoder = Mock()
+    engine._inputs.guided_decoder.reset_warmup_state.side_effect = RuntimeError("drain failed")
+    engine._forward_warmup = Mock(side_effect=torch.OutOfMemoryError("warmup OOM"))
+
+    with _no_cuda_side_effects(), pytest.raises(RuntimeError, match="drain failed"):
+        engine._general_warmup_impl(object(), [(128, 0), (64, 0)])
+
+    engine._forward_warmup.assert_called_once()
 
 
 @pytest.mark.cpu_only
@@ -1681,3 +1823,96 @@ class TestSamplingWarmup(unittest.TestCase):
             any("Skipping warm up as no KV Cache manager allocated." in log for log in logs)
         )
         self.assertGreaterEqual(warmup._metrics["sampling_warmup_seconds"], 0)
+
+
+class _OffloadingSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Any sparse attention algorithm that offloads KV history to host memory."""
+
+    algorithm: str = "offloading"
+
+    def get_kv_cache_offload_config(self) -> SparseKvCacheOffloadConfig:
+        return SparseKvCacheOffloadConfig()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (None, False),
+        (DeepSeekSparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True), True),
+        (_OffloadingSparseAttentionConfig(), True),
+    ],
+    ids=["none", "dsa", "dsv4", "dsv4_offload", "any_offload"],
+)
+def test_only_kv_cache_offload_makes_a_worker_decode_only(config, expected: bool) -> None:
+    assert is_decode_only(config) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_total_draft_tokens", "expected"),
+    [(0, [(1, 1), (13, 13)]), (2, [(3, 1), (39, 13)])],
+)
+def test_generation_warmup_shapes_drop_context_tokens(
+    max_total_draft_tokens: int, expected: list[tuple[int, int]]
+) -> None:
+    warmup = SimpleNamespace(_config=SimpleNamespace(max_total_draft_tokens=max_total_draft_tokens))
+    configs = [(1, 0), (1, 1), (3, 1), (258, 0), (13, 13), (39, 13), (2, 0), (2, 1)]
+
+    assert DecoderWarmup._generation_warmup_shapes(warmup, configs) == expected
+
+
+@pytest.mark.cpu_only
+def test_generation_warmup_shapes_keep_generation_batches_stated_without_draft_tokens() -> None:
+    """The general and max-shape warmups state a generation batch as one token per
+    request whatever the draft length; it is still a pure-generation batch."""
+    warmup = SimpleNamespace(_config=SimpleNamespace(max_total_draft_tokens=2))
+    configs = [(1, 0), (1, 1), (258, 0), (13, 13), (2, 0)]
+
+    assert DecoderWarmup._generation_warmup_shapes(warmup, configs) == [(3, 1), (39, 13)]
+
+
+@pytest.mark.cpu_only
+def test_decode_only_skips_prefill_cuda_graph_capture() -> None:
+    """A decode-only worker never runs a context batch, so prefill graphs are dead weight."""
+    graphs = SimpleNamespace(
+        _config=SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            torch_compile_enabled=True,
+            prefill_cuda_graph_num_tokens=[16],
+        ),
+        sparse_attention_config=_OffloadingSparseAttentionConfig(),
+        _dummy_requests=SimpleNamespace(create_warmup_request=Mock()),
+    )
+
+    DecoderCudaGraphs._capture_prefill_cuda_graphs(graphs, Mock())
+
+    graphs._dummy_requests.create_warmup_request.assert_not_called()
+
+
+@pytest.mark.parametrize("decode_only", [False, True], ids=["default", "decode_only"])
+def test_decode_only_warmup_requests_generation_shapes_only(decode_only: bool) -> None:
+    """Every warmup phase of a decode-only worker builds pure-generation batches."""
+    with _warmup_and_resources() as (warmup, resource_manager):
+        shapes: list[tuple[int, int]] = []
+
+        def record(resources, num_tokens, num_gen_requests, **kwargs):
+            shapes.append((num_tokens, num_gen_requests))
+            return None  # No batch, so each phase skips its forward.
+
+        with (
+            patch.object(decoder_warmup_module, "is_decode_only", return_value=decode_only),
+            patch.object(graphs_module, "is_decode_only", return_value=decode_only),
+            patch.object(warmup._dummy_requests, "create_warmup_request", side_effect=record),
+            patch.object(warmup._graphs, "_capture_generation_cuda_graphs"),
+        ):
+            warmup.run(resource_manager)
+
+        assert shapes
+        context_shapes = [shape for shape in shapes if shape[0] != shape[1]]
+        if decode_only:
+            assert context_shapes == [], shapes
+        else:
+            assert context_shapes, shapes
