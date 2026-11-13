@@ -406,9 +406,10 @@ def test_forced_nccl_ep_allows_missing_moe_max_num_tokens(
 
 def test_nccl_ep_downgrades_unsupported_low_precision_combine(
     monkeypatch: pytest.MonkeyPatch,
-):
+) -> None:
     """Strategy selection may request combine quantization for BF16 workloads."""
-    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda mapping=None: True)
+    monkeypatch.setattr(nccl_ep_utils, "_ep_comm_key", lambda _: ())
 
     strategy = NcclEP(
         mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
@@ -591,7 +592,8 @@ def test_nccl_ep_quantized_transport_selection(
     quant_algo: QuantAlgo | None,
     low_precision_combine: bool,
 ) -> None:
-    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda mapping=None: True)
+    monkeypatch.setattr(nccl_ep_utils, "_ep_comm_key", lambda _: ())
     monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
     strategy = NcclEP(
         mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
