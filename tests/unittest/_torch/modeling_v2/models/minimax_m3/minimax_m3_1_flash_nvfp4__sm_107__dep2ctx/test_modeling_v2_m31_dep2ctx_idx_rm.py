@@ -376,3 +376,40 @@ def test_tsel_rows_switch_keeps_the_builtin_select_for_row_major(monkeypatch) ->
     assert (
         tile_select.select(torch.randn(4, 40, 300), nvb, 0, 1) is not None and calls[0][0] == "tile"
     )
+
+
+# ---- DEP2CTX_IDX_SCORER_K64 (opt-in, not bitwise) -------------------------------------------------------------------
+
+
+def _scorer_module(monkeypatch, mma_k):
+    prefill = SimpleNamespace(
+        uses_sm107_fp8_mma=lambda cc: mma_k == 64, mma_inst_k=lambda cc: mma_k
+    )
+    mod = SimpleNamespace(Q8KV8PrefillIndexerSm100=prefill)
+    monkeypatch.setattr(idx_scorer, "install_msa_cutlass_compatibility", lambda: None)
+    monkeypatch.setattr(idx_scorer, "importlib", SimpleNamespace(import_module=lambda name: mod))
+    idx_scorer._STATE.pop("module", None)
+    return mod
+
+
+@pytest.mark.parametrize(
+    "mma_k, k64, ok", [(32, False, True), (64, False, False), (64, True, True), (32, True, True)]
+)
+def test_k64_needs_its_opt_in(monkeypatch, mma_k, k64, ok) -> None:
+    mod = _scorer_module(monkeypatch, mma_k)
+    monkeypatch.setattr(idx_scorer, "IDX_SCORER_K64", k64)
+    assert (idx_scorer._module() is mod) is ok
+
+
+@pytest.mark.parametrize("enabled, on", [((), False), (("DEP2CTX_IDX_SCORER_K64",), True)])
+def test_k64_is_off_by_default_and_named_not_bitwise(monkeypatch, enabled, on) -> None:
+    """The opt-in under a given process environment (the switches are read once at import, so the default is checked
+    on the registry with no TRTLLM_M31_ENABLE_ variable set, whatever this process has)."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx import (  # noqa: E501
+        m31_switches,
+    )
+
+    assert "DEP2CTX_IDX_SCORER_K64" in m31_switches.OPT_INS
+    assert "not bitwise" in m31_switches.OPT_INS["DEP2CTX_IDX_SCORER_K64"]
+    monkeypatch.setattr(m31_switches, "_ENABLED", frozenset(enabled))
+    assert m31_switches.m31_enabled("DEP2CTX_IDX_SCORER_K64") is on
