@@ -2,7 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Collected entry point for the FP8 target's collective matrices: each `_<entry>_op_matrix.py`
 beside this file is its own launcher, which `_rank_job` runs in a fresh interpreter on `world`
-sm_103 GPUs of one node."""
+sm_103 GPUs of one node.
+
+Pre-merge CI runs this directory in the GB300 multi-GPU stage (`l0_gb300.yml`), which it
+schedules only when a file listed in `getMultiGpuFileChanged` (`jenkins/L0_MergeRequest.groovy`)
+changes; neither the target's `csrc/` and `ops/comm/` nor this directory is listed. A change to
+them is run with `/bot run --add-multi-gpu-test`
+(`docs/source/developer-guide/ci-overview.md`, Multi-GPU Tests)."""
 
 from pathlib import Path
 
