@@ -319,7 +319,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 )
 
     @pytest.mark.skip_less_device_memory(60000)
-    def test_nvfp4_mla(self, monkeypatch):
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True],
+                             ids=["unchunked", "chunked"])
+    def test_nvfp4_mla(self, monkeypatch: pytest.MonkeyPatch,
+                       enable_chunked_prefill: bool) -> None:
         from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
             _fp4_mla_attention_backend, fp4_mla_generation_backend_supported)
         if not fp4_mla_generation_backend_supported(
@@ -343,7 +346,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                 attn_backend="TRTLLM",
                 kv_cache_config=kv_cache_config,
-                enable_chunked_prefill=False,
+                enable_chunked_prefill=enable_chunked_prefill,
                 cuda_graph_config=CudaGraphConfig(),
                 max_num_tokens=8192,
                 max_batch_size=1350,

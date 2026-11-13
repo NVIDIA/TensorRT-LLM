@@ -201,7 +201,6 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_modelopt_mixed_precision_map_is_normalized
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modeling/test_modeling_pplx_decider.py
-  - unittest/_torch/modeling/test_modeling_speculative.py
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
@@ -217,10 +216,7 @@ l0_cpu:
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py
-  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
-  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
-  - unittest/_torch/models/test_modeling_utils.py::test_quantization_passes_match_declared_fused_checkpoint_names
-  - unittest/_torch/models/test_modeling_utils.py::test_exclusion_preserves_only_explicit_module_kv_policy
+  - unittest/_torch/models/test_modeling_utils.py
   - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_moe_deterministic_config.py

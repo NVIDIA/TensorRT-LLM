@@ -199,6 +199,11 @@ class AttentionMetadata:
     cache_indirection: Optional[torch.Tensor] = None
     cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
     forward_scratch_buffers: Optional[Buffers] = None
+    """Runner-local storage shared across graphs within one forward, not persistent state.
+
+    Warmup registers capacity; capture must not grow it. CUDAGraphRunner.clear()
+    releases the pool, unlike the potentially process-wide cuda_graph_buffers.
+    """
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
@@ -523,6 +528,11 @@ class AttentionMetadata:
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        forward_scratch_buffers belongs to the caller's runner and is shared by
+        its graphs within one forward. Warmup must register capacity before
+        capture; persistent state must not use this pool. The runner releases
+        it in clear(), independently of cuda_graph_buffers.
 
         When encode_only is True, initialize seq_lens as ones(max_batch_size)
         and leave num_contexts at the caller's discretion.
@@ -1314,6 +1324,18 @@ class AttentionBackend(Generic[TMetadata]):
         profiling peak before reserving additional memory. Backends whose
         workspace is not chunk-bounded return zero, as does the default.
         """
+        return 0
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Workspace tokens actually staged by the fresh-prefill profiling path."""
         return 0
 
     @classmethod

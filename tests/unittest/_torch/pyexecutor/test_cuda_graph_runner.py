@@ -500,13 +500,15 @@ def _decoder_runner(
     return CUDAGraphRunner(config)
 
 
-def test_runner_can_clear_after_static_input_initialization_fails(monkeypatch) -> None:
+def test_runner_can_clear_after_static_input_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dataclasses import replace
 
     config = replace(_decoder_runner().config, use_cuda_graph=True)
-    partially_built = []
+    partially_built: list[CUDAGraphRunner] = []
 
-    def fail_initialization(runner):
+    def fail_initialization(runner: CUDAGraphRunner) -> None:
         partially_built.append(runner)
         raise ValueError("static inputs rejected")
 

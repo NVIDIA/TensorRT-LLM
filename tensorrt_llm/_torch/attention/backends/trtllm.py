@@ -2359,8 +2359,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
                       and is_sm_100f())
-        short_seq_mha_enabled = int(
-            os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+        from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+        short_seq_mha_enabled = _get_short_seq_mha_threshold() > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled
         return int(
             thop.get_context_mla_workspace_bytes_per_token(
@@ -2392,6 +2393,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Mirrors MLA::contextWorkspaceLayout's buffer_batch_size * query_tokens floor
         # and the cached-partition capacity prepared by this backend's metadata.
         return runtime_features.chunked_prefill_buffer_batch_size * max_num_tokens
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Credit only the dense staging used by the profiling attention route."""
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        if (sparse_algorithm == "dsa"
+                and model_config.quant_config.quant_mode.has_fp8_kv_cache()
+                and is_sm_100f(get_sm_version())):
+            from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+            threshold = _get_short_seq_mha_threshold()
+            if 0 < threshold < profiled_prompt_len:
+                return 0
+        return min(max_num_tokens, max_batch_size * profiled_prompt_len)
 
     @classmethod
     def runtime_workspace_fixed_bytes(cls, model_config: "ModelConfig",

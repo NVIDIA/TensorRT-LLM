@@ -53,7 +53,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 @pytest.mark.parametrize("draft_kind", ["eagle3", "external_model", "external_drafter"])
 @pytest.mark.parametrize("override", [None, QuantAlgo.FP8], ids=["inherit", "explicit_fp8"])
 def test_draft_construction_preserves_kv_override_through_exclusion(
-    monkeypatch, draft_kind: str, override: QuantAlgo | None
+    monkeypatch: pytest.MonkeyPatch, draft_kind: str, override: QuantAlgo | None
 ) -> None:
     pretrained = PretrainedConfig(
         hidden_size=128,
@@ -103,8 +103,15 @@ def test_draft_construction_preserves_kv_override_through_exclusion(
         ),
     )
     monkeypatch.setattr(speculative_modeling, "get_spec_worker", lambda *args, **kwargs: None)
+    loaded_configs: list[ModelConfig] = []
 
-    def build_draft(_target_config, loaded_config, _target_head, _target_model):
+    def build_draft(
+        _target_config: ModelConfig,
+        loaded_config: ModelConfig,
+        _target_head: nn.Module | None,
+        _target_model: nn.Module | None,
+    ) -> nn.Module:
+        loaded_configs.append(loaded_config)
         layer = nn.Module()
         layer.self_attn = Attention(
             hidden_size=128,
@@ -128,6 +135,9 @@ def test_draft_construction_preserves_kv_override_through_exclusion(
     attention = model.draft_model.layers[0].self_attn
     assert attention.quant_config.quant_algo is None
     assert attention.quant_config.kv_cache_quant_algo == (override or QuantAlgo.NVFP4)
+    assert attention._preserve_kv_cache_quant_algo is (override is not None)
+    assert loaded_configs[-1].extra_attrs is target_config.extra_attrs
+    assert target_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
     assert "preserve_kv_cache_quant_algo" not in target_config.extra_attrs
 
 
@@ -151,7 +161,7 @@ def test_draft_kv_cache_quant_algo_override_updates_all_layers() -> None:
     _set_draft_kv_cache_quant_algo(draft, target)
 
     assert draft.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-    assert draft.extra_attrs["preserve_kv_cache_quant_algo"] is True
+    assert draft._preserve_kv_cache_quant_algo is True
     assert layer_quant_0.kv_cache_quant_algo == QuantAlgo.FP8
     assert layer_quant_1.kv_cache_quant_algo == QuantAlgo.FP8
     assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4

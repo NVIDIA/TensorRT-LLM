@@ -305,6 +305,13 @@ The core contract is:
   (default `0`); the estimator credits staging covered by its profiling peak.
   Dense chunked FP8 context MLA declares its complete partition/query buffer here;
   sparse gather implementations retain their own layouts and default to zero.
+- `runtime_workspace_profiled_tokens(model_config, *, profiled_prompt_len,
+  max_num_tokens, max_batch_size)` — staging tokens actually exercised by the
+  fresh-prefill profiling route (default `0`). A zero prompt length means no
+  profiling forward ran. The backend owns this declaration alongside the floor:
+  FP8 DSA above its short-MHA threshold uses sparse absorption, so that profile
+  receives no dense K/V staging credit. The estimator does not duplicate backend
+  routing rules when subtracting credit from the staging floor.
 - `runtime_workspace_fixed_bytes(model_config, mapping, **capacities)` — retained
   workspace sized by serving capacity rather than admitted attended-KV length
   (default `0`)
@@ -364,6 +371,14 @@ includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
 Sparse metadata subtypes consume only `SparseMetadataParams`, not
 backend-owned `SparseParams`.
+
+Runner-created graph metadata can carry `forward_scratch_buffers`. These buffers
+are valid within one forward and shared by one runner's CUDA graphs, not across
+runners or concurrent forwards. Warmup must register enough capacity; capture
+probes capacity without growing the pool. `CUDAGraphRunner.clear()` releases it.
+Unlike `cuda_graph_buffers`, which may use a process-wide pool, this storage must
+not hold persistent plans or caches. Triton FP4 MLA opts its per-forward decode
+scratch into this pool; CuTe DSL partials remain metadata-local.
 
 **`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
 block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix

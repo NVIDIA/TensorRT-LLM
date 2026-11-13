@@ -1607,6 +1607,7 @@ def _run_mla_workspace_estimation(
     max_batch_size: int = 8,
     runtime_chunk_size: int | None = None,
     real_backend_floor: bool = False,
+    workspace_bytes_per_token: int = 1,
 ) -> tuple[KvCacheCreator, KvCacheConfig, Mock]:
     """Run the estimation with a 512-byte KV budget and a 1 byte/token context-MLA workspace."""
 
@@ -1710,7 +1711,7 @@ def _run_mla_workspace_estimation(
         # of KV and 128 bytes of workspace unless chunk profiling covered it.
         patch(
             "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
-            return_value=1,
+            return_value=workspace_bytes_per_token,
         ),
         patch(
             "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
@@ -1881,7 +1882,7 @@ def test_estimation_fp8_dsa_credits_only_dense_profile_staging(
 
 @pytest.mark.parametrize(
     ("max_batch_size", "max_seq_len", "max_num_tokens", "override", "additional_bytes"),
-    [(8, 128, 48, 128, 48), (1, 16, 16, 8, 0), (8, 128, 16, 8, None)],
+    [(8, 128, 48, 128, 48), (1, 16, 16, 8, None), (8, 128, 16, 8, None)],
     ids=["credited_floor", "reachable_ceiling", "sequence_length_floor"],
 )
 def test_estimation_cap_warning_prices_the_uncredited_cap_term(
@@ -1936,16 +1937,16 @@ def test_estimation_dense_floor_uses_clamped_engine_token_capacity(
 
 
 @pytest.mark.parametrize(
-    ("world_size", "fixed_bytes", "local_floor_fits", "match"),
+    ("world_size", "fixed_bytes", "bounded", "local_floor_fits", "match"),
     [
-        (1, 512, False, "fixed cost"),
-        (2, 512, False, "fixed cost"),
-        (2, 0, True, "another rank"),
+        (1, 512, False, False, "fixed KV cache cost leaves"),
+        (2, 512, True, False, "workspace floor"),
+        (2, 0, True, True, "another rank"),
     ],
     ids=["budget_within_fixed", "this_rank", "another_rank"],
 )
 def test_estimation_mla_workspace_floor_fails_on_every_rank(
-    world_size: int, fixed_bytes: int, local_floor_fits: bool, match: str
+    world_size: int, fixed_bytes: int, bounded: bool, local_floor_fits: bool, match: str
 ) -> None:
     """A floor that leaves no variable KV budget fails on every rank, before any manager collective."""
     distributed = Mock()
@@ -1958,7 +1959,7 @@ def test_estimation_mla_workspace_floor_fails_on_every_rank(
             sm=100,
             chunked_workspace_profiled=False,
             chunked_prefill=True,
-            bounded=True,
+            bounded=bounded,
             kv_cost=CacheCost(slope=3, intercept=fixed_bytes),
             mapping=Mapping(world_size=world_size, tp_size=world_size, rank=0),
         )
@@ -1966,6 +1967,27 @@ def test_estimation_mla_workspace_floor_fails_on_every_rank(
         distributed.get.return_value.allreduce.assert_called_once_with(
             int(not local_floor_fits), op=ReduceOp.MAX
         )
+
+
+@pytest.mark.parametrize("workspace_bytes_per_token", [0, 1], ids=["no_workspace", "workspace"])
+def test_estimation_workspace_failure_vote_includes_zero_rate_ranks(
+    workspace_bytes_per_token: int,
+) -> None:
+    distributed = Mock()
+    distributed.get.return_value.allreduce.return_value = 1
+    with (
+        patch("tensorrt_llm._torch.pyexecutor._util.Distributed", distributed),
+        pytest.raises(ResourceError, match="another rank"),
+    ):
+        _run_mla_workspace_estimation(
+            sm=100,
+            chunked_workspace_profiled=False,
+            chunked_prefill=True,
+            bounded=True,
+            mapping=Mapping(world_size=2, tp_size=2, rank=0),
+            workspace_bytes_per_token=workspace_bytes_per_token,
+        )
+    distributed.get.return_value.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
 
 
 @pytest.mark.parametrize("estimating", [False, True])

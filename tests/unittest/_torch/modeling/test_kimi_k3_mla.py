@@ -311,7 +311,7 @@ def _load_mla_checkpoint_every_layer(
 
 
 def _fp4_mla_unavailable() -> bool:
-    """Whether the selected generation backend can execute FP4 MLA."""
+    """Whether the selected generation backend cannot execute FP4 MLA."""
     if not torch.cuda.is_available():
         return True
     return not fp4_mla_generation_backend_supported(
@@ -468,7 +468,7 @@ def _k3_mla_nvfp4_kv_errors(
 
 @pytest.mark.skipif(
     _fp4_mla_unavailable(),
-    reason="FP4 MLA requires SM100 or SM103, or SM107 with the CuTe DSL runtime",
+    reason="FP4 MLA requires Triton on SM100/SM103 or Triton/CuTe DSL on SM107",
 )
 @pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
 def test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface(
@@ -502,7 +502,7 @@ def test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface(
 
 @pytest.mark.skipif(
     _fp4_mla_unavailable(),
-    reason="FP4 MLA requires SM100 or SM103, or SM107 with the CuTe DSL runtime",
+    reason="FP4 MLA requires Triton on SM100/SM103 or Triton/CuTe DSL on SM107",
 )
 def test_k3_mla_fp8_fallback_layer_on_nvfp4_cache_matches_huggingface(
     monkeypatch: pytest.MonkeyPatch,
@@ -525,7 +525,7 @@ def test_k3_mla_fp8_fallback_layer_on_nvfp4_cache_matches_huggingface(
 
 @pytest.mark.skipif(
     _fp4_mla_unavailable(),
-    reason="FP4 MLA requires SM100 or SM103, or SM107 with the CuTe DSL runtime",
+    reason="FP4 MLA requires Triton on SM100/SM103 or Triton/CuTe DSL on SM107",
 )
 def test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface(
     monkeypatch: pytest.MonkeyPatch,

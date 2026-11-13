@@ -109,7 +109,7 @@ def _fp4_mla_packed_plan_geometry(
         return None
     if not metadata.fp4_mla_state.device_page_table:
         return None
-    # The fixed-stride generation page-table capacity (see _max_generation_pages).
+    # The fixed-stride generation page-table capacity.
     max_pages = int(metadata.fp4_mla_state.page_table_stride)
     if max_pages <= 0:
         return None

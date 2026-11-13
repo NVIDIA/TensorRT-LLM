@@ -909,15 +909,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         max_total_draft_tokens is set by the engine's update_spec_dec_param; the
         other checks mirror TrtllmAttentionMetadata's generation block-offset capacity predicate.
         """
-        params = self.kv_cache_params
-        runtime_features = self.runtime_features
-        return bool(
-            self.max_total_draft_tokens
-            or self.draft_kv_cache_manager is not None
-            or self.is_spec_decoding_enabled
-            or (params is not None and params.num_extra_kv_tokens)
-            or (runtime_features is not None and runtime_features.has_speculative_draft_tokens)
-        )
+        return bool(self.max_total_draft_tokens) or self._generation_block_offsets_need_capacity()
 
     def _fill_tail_in_forward(self) -> None:
         """TAIL_FILL_IN_FORWARD: -1 over msa_out_cache_loc past the live slots prepare() staged (see the prepare()

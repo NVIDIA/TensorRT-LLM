@@ -28,6 +28,8 @@ import triton.language as tl
 
 from .fp4_mla_kernels import _fp4_mla_swizzled_sf_offset
 
+# TODO(https://nvbugs/7023200): Remove unused ASSUME_FULL_PAGES, ASSUME_VALID_PAGES and USE_TMA_P_LOAD variants.
+
 _LOG2_E = tl.constexpr(1.4426950408889634)
 # Triton 3.6.0/sm_100 fails NVWSInsertTmemAref::hasOneUse() for the
 # chained residual-Q dot_scaled path. Enable only after verifying a fixed
@@ -513,7 +515,7 @@ def _fp4_mla_qk_scores_tile(
     return scores, safe_physical_page
 
 
-@triton.jit(do_not_specialize=["MAX_PAGES"])
+@triton.jit(do_not_specialize=["max_pages"])
 def _fp4_mla_attention_page_stats_kernel(
     page_max_ptr,
     page_sum_ptr,
@@ -556,7 +558,7 @@ def _fp4_mla_attention_page_stats_kernel(
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES,
+    max_pages,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -692,7 +694,7 @@ def _fp4_mla_attention_page_stats_kernel(
                 valid_compact_page = (page_table_start + page_rel >= 0) & (
                     page_table_start + page_rel < page_ids_len
                 )
-            p_page = query_idx * MAX_PAGES + page_rel
+            p_page = query_idx * max_pages + page_rel
             p_rows = p_page * NUM_HEADS + offs_h
             safe_p_rows = (
                 p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
@@ -760,7 +762,7 @@ def _fp4_mla_attention_page_stats_kernel(
         tl.store(page_sum_ptr + out_offsets, page_sum, mask=mask_h)
 
 
-@triton.jit(do_not_specialize=["MAX_PAGES"])
+@triton.jit(do_not_specialize=["max_pages"])
 def _fp4_mla_attention_page_stats_grouped_kernel(
     page_max_ptr,
     page_sum_ptr,
@@ -801,7 +803,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES,
+    max_pages,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -932,7 +934,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
     page_lo = page_group * GROUP_PAGES
     page_hi = page_lo + GROUP_PAGES
     for page_rel in tl.range(page_lo, page_hi, num_stages=PAGE_LOOP_STAGES):
-        if page_rel < MAX_PAGES:
+        if page_rel < max_pages:
             page_start = page_rel * PAGE_SIZE
             page_max = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
             page_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -1022,7 +1024,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
                 even_probs, odd_probs = tl.split(pairs)
                 packed = _fp4_e2m1_quantize_packed(even_probs, odd_probs)
 
-                p_page = query_idx * MAX_PAGES + page_rel
+                p_page = query_idx * max_pages + page_rel
                 if ASSUME_VALID_PAGES and NUM_HEADS == 128 and BLOCK_H == 128:
                     sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
                         p_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
@@ -1052,7 +1054,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
             tl.store(page_sum_ptr + out_offsets, page_sum)
 
 
-@triton.jit(do_not_specialize=["MAX_PAGES"])
+@triton.jit(do_not_specialize=["max_pages"])
 def _fp4_mla_attention_page_stats_mtp_kernel(
     page_max_ptr,
     page_sum_ptr,
@@ -1093,7 +1095,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES,
+    max_pages,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1270,7 +1272,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
             even_probs, odd_probs = tl.split(pairs)
             packed = _fp4_e2m1_quantize_packed(even_probs, odd_probs)
 
-            p_page = query_idx_r * MAX_PAGES + page_rel
+            p_page = query_idx_r * max_pages + page_rel
             p_rows = (p_page * NUM_HEADS + offs_h).to(tl.int64)
             sf_offsets = _fp4_mla_swizzled_sf_offset(
                 p_rows[:, None], scale_cols[None, :], SF_PER_PAGE
@@ -1287,7 +1289,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
         tl.store(page_sum_ptr + out_offsets, page_sum)
 
 
-@triton.jit(do_not_specialize=["MAX_PAGES", "num_pages"])
+@triton.jit(do_not_specialize=["max_pages", "num_pages"])
 def _fp4_mla_attention_reduce_stats_kernel(
     max_ptr,
     denom_ptr,
@@ -1298,7 +1300,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
     page_stats_s0,
     page_stats_s1,
     NUM_HEADS: tl.constexpr,
-    MAX_PAGES,
+    max_pages,
     BLOCK_H: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
@@ -1315,7 +1317,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
     safe_offs_h = tl.where(mask_h, offs_h, 0)
 
     max_score = tl.full((BLOCK_H,), -float("inf"), tl.float32)
-    for page_idx in tl.range(0, MAX_PAGES):
+    for page_idx in tl.range(0, max_pages):
         page_valid = page_idx < num_pages
         page_offsets = gen_idx * page_stats_s0 + page_idx * page_stats_s1 + safe_offs_h
         page_max = tl.load(
@@ -1325,7 +1327,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
 
     safe_max = tl.where(max_score > -float("inf"), max_score, 0.0)
     denom = tl.zeros((BLOCK_H,), tl.float32)
-    for page_idx in tl.range(0, MAX_PAGES):
+    for page_idx in tl.range(0, max_pages):
         page_valid = page_idx < num_pages
         page_offsets = gen_idx * page_stats_s0 + page_idx * page_stats_s1 + safe_offs_h
         page_max = tl.load(
@@ -1339,7 +1341,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
     tl.store(denom_ptr + gen_idx * stats_s0 + safe_offs_h, denom, mask=mask_h)
 
 
-@triton.jit(do_not_specialize=["GROUP_PAGES", "num_pages"])
+@triton.jit(do_not_specialize=["group_pages", "num_pages"])
 def _fp4_mla_attention_group_reduce_stats_kernel(
     group_max_ptr,
     group_sum_ptr,
@@ -1351,7 +1353,7 @@ def _fp4_mla_attention_group_reduce_stats_kernel(
     page_stats_s0,
     page_stats_s1,
     NUM_HEADS: tl.constexpr,
-    GROUP_PAGES,
+    group_pages,
     BLOCK_H: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
@@ -1359,7 +1361,7 @@ def _fp4_mla_attention_group_reduce_stats_kernel(
     """First level of a two-level softmax-stats reduction.
 
     Each program owns one ``(query, head_block, page_group)`` and combines the
-    ``GROUP_PAGES`` per-page ``(max, sum)`` pairs in its group into a single
+    ``group_pages`` per-page ``(max, sum)`` pairs in its group into a single
     online-softmax partial ``(group_max, group_denom)``. ``group_denom`` is the
     page sums rescaled to ``group_max``.  A small follow-up combine
     (``_fp4_mla_attention_reduce_stats_kernel`` over the compact group buffer)
@@ -1378,8 +1380,8 @@ def _fp4_mla_attention_group_reduce_stats_kernel(
 
     group_max = tl.full((BLOCK_H,), -float("inf"), tl.float32)
     group_sum = tl.zeros((BLOCK_H,), tl.float32)
-    page_lo = group_idx * GROUP_PAGES
-    page_hi = page_lo + GROUP_PAGES
+    page_lo = group_idx * group_pages
+    page_hi = page_lo + group_pages
     for page_idx in tl.range(page_lo, page_hi, num_stages=PIPELINE_STAGES):
         page_valid = page_idx < num_pages
         page_offsets = gen_idx * page_stats_s0 + page_idx * page_stats_s1 + safe_offs_h
@@ -1403,7 +1405,7 @@ def _fp4_mla_attention_group_reduce_stats_kernel(
     tl.store(group_sum_ptr + out_offsets, group_sum, mask=mask_h)
 
 
-@triton.jit(do_not_specialize=["MAX_PAGES"])
+@triton.jit(do_not_specialize=["max_pages"])
 def _fp4_mla_attention_prob_scale_kernel(
     p_sf_ptr,
     max_ptr,
@@ -1419,7 +1421,7 @@ def _fp4_mla_attention_prob_scale_kernel(
     PAGE_SIZE: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES,
+    max_pages,
     BLOCK_H: tl.constexpr,
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_PAGES: tl.constexpr,
@@ -1464,7 +1466,7 @@ def _fp4_mla_attention_prob_scale_kernel(
     denom = tl.load(denom_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
     factor = tl.where(denom > 0.0, tl.math.exp2((page_max - max_score) * _LOG2_E) / denom, 0.0)
 
-    p_page = query_idx * MAX_PAGES + page_rel
+    p_page = query_idx * max_pages + page_rel
     p_rows = p_page * NUM_HEADS + offs_h
     safe_p_rows = (
         p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
@@ -1482,7 +1484,7 @@ def _fp4_mla_attention_prob_scale_kernel(
     tl.store(p_sf_ptr + sf_offsets, scales * factor[:, None], mask=mask_h[:, None])
 
 
-@triton.jit(do_not_specialize=["MAX_PAGES", "PAGES_PER_SPLIT"])
+@triton.jit(do_not_specialize=["max_pages", "pages_per_split"])
 def _fp4_mla_attention_pv_kernel(
     out_ptr,
     p_fp4_ptr,
@@ -1512,7 +1514,7 @@ def _fp4_mla_attention_pv_kernel(
     FP4_BLOCK: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES,
+    max_pages,
     P_GLOBAL_SCALE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -1524,7 +1526,7 @@ def _fp4_mla_attention_pv_kernel(
     ASSUME_FULL_V: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
     PAGE_SPLIT: tl.constexpr = 1,
-    PAGES_PER_SPLIT=0,
+    pages_per_split=0,
     PARTIAL_OUT: tl.constexpr = False,
     partial_out_ptr=None,
     partial_s0: tl.constexpr = 0,
@@ -1616,11 +1618,11 @@ def _fp4_mla_attention_pv_kernel(
     out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
     acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
     if PAGE_SPLIT > 1:
-        page_lo = split_idx * PAGES_PER_SPLIT
-        page_hi = tl.minimum(page_lo + PAGES_PER_SPLIT, MAX_PAGES)
+        page_lo = split_idx * pages_per_split
+        page_hi = tl.minimum(page_lo + pages_per_split, max_pages)
     else:
         page_lo = 0
-        page_hi = MAX_PAGES
+        page_hi = max_pages
     for page_rel in tl.range(page_lo, page_hi, num_stages=PV_LOOP_STAGES):
         page_start = page_rel * PAGE_SIZE
         if ASSUME_FULL_PAGES or page_start < kv_len:
@@ -1640,7 +1642,7 @@ def _fp4_mla_attention_pv_kernel(
                 )
                 safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
 
-            p_page = query_idx * MAX_PAGES + page_rel
+            p_page = query_idx * max_pages + page_rel
             p_rows = p_page * NUM_HEADS + offs_h
             safe_p_rows = (
                 p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)

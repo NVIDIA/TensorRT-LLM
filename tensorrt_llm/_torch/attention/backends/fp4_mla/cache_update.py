@@ -1028,7 +1028,6 @@ def scatter_fp4_mla_kv_cache(
             v_packed_base=v_packed_base,
             v_page_offset=v_page_offset,
         )
-        v_pack_page_ids = metadata.fp4_mla_state.paged_kv_indices
     else:
         generation_state = _scatter_fp4_mla_kv_cache_2d_generation(
             metadata,
@@ -1055,9 +1054,6 @@ def scatter_fp4_mla_kv_cache(
             v_page_offset=v_page_offset,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=helix_is_inactive_rank,
-        )
-        v_pack_page_ids = _fp4_mla_generation_page_ids(
-            metadata, metadata.num_seqs - metadata.num_contexts
         )
     cutedsl_repack_page_indptr = None
     cutedsl_repack_kv_lens = None
@@ -1092,7 +1088,9 @@ def scatter_fp4_mla_kv_cache(
                 metadata.page_size,
             )
         else:
-            cutedsl_v_pack_page_ids = v_pack_page_ids
+            cutedsl_v_pack_page_ids = _fp4_mla_generation_page_ids(
+                metadata, metadata.num_seqs - metadata.num_contexts
+            )
         _repack_cutedsl_v_packed_cache(
             persistent_v_packed,
             kv_cache,

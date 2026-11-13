@@ -440,9 +440,7 @@ class MLA(nn.Module):
             rms_norm_eps = 1e-6
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
-        self._preserve_kv_cache_quant_algo = bool(
-            config.extra_attrs.get("preserve_kv_cache_quant_algo", False)
-        )
+        self._preserve_kv_cache_quant_algo = config._preserve_kv_cache_quant_algo
         # Construction settings used by sparse module hooks.
         self.rms_norm_eps = rms_norm_eps
         self.reduce_output = reduce_output

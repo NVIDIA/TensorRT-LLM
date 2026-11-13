@@ -330,6 +330,7 @@ class ModelConfig(Generic[TConfig]):
     enable_torch_compile_for_embedding = False
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
+    _preserve_kv_cache_quant_algo: bool = field(default=False, repr=False)
 
     # Model-provided per-layer KV geometry. It is stored per config rather than
     # in extra_attrs because one-model drafters share extra_attrs with the
@@ -381,20 +382,22 @@ class ModelConfig(Generic[TConfig]):
         """Publish unsharded per-layer KV geometry to generic runtime code."""
         self._kv_cache_layer_specs = tuple(layer_specs)
 
-    def __setattr__(self, key, value):
+    def __setattr__(self, key: str, value: object) -> None:
         """
         Prevent modification of frozen instance attributes.
         However, we allow modification of 'extra_attrs' attributes for torch.compile
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
         '_kv_cache_layer_specs' is set by models that publish per-layer KV geometry.
+        '_preserve_kv_cache_quant_algo' scopes an explicit draft KV precision override.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config', '_kv_cache_layer_specs'):
+                           'quant_config', '_kv_cache_layer_specs',
+                           '_preserve_kv_cache_quant_algo'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)

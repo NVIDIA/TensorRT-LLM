@@ -5546,6 +5546,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Smaller values may leave more memory for KV cache, but the reserve cannot drop below the backend's "
         "staging floor after crediting staging actually measured during profiling. An override "
         "below that floor still limits admission without necessarily freeing more memory. "
+        "Takes effect only when the estimator reserves this workspace: block reuse without "
+        "chunked prefill, or chunked prefill whose staging profiling could not measure. "
+        "It is ignored otherwise, including on decode-only workers. "
         "The scheduler defers context requests whose summed attended KV exceeds the admitted cap."
     )
 

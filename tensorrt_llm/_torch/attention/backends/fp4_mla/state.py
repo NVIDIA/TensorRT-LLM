@@ -23,7 +23,7 @@ class Fp4MlaState:
     """State shared by RoPE/cache append and all FP4 FMHAs in one batch.
 
     Allocate through the metadata buffer allocator. CUDA graphs of one runner
-    share per-forward decode scratch through metadata.forward_scratch_buffers;
+    share per-forward Triton decode scratch through metadata.forward_scratch_buffers;
     CUDAGraphRunner.clear() releases it. Persistent caches remain metadata-local.
     This state is not layer-local: MTP and metadata preparation update it before
     any FMHA runs.
@@ -49,6 +49,7 @@ class Fp4MlaState:
     device_page_table: bool = False
     device_page_table_valid: bool = False
     page_table_stride: int = 0
+    generation_max_pages: int = 0
     context_repack_max_touched_pages: int = 1
     cache_pool_id: int = 0
     cache_page_index_scale: int = 0

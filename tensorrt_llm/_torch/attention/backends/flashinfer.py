@@ -39,6 +39,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
+from ...memory_buffer_utils import Buffers
 from ...metadata import KVCacheParams
 from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -1295,14 +1296,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._mla_decode_planned = False
         self._multi_item_params = None
 
-    def create_cuda_graph_metadata(self,
-                                   max_batch_size: int,
-                                   sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None,
-                                   encode_only: bool = False,
-                                   *,
-                                   forward_scratch_buffers=None) -> Self:
+    def create_cuda_graph_metadata(
+            self,
+            max_batch_size: int,
+            sub_cross_metadata: bool = False,
+            max_draft_tokens: int = 0,
+            buffers=None,
+            encode_only: bool = False,
+            *,
+            forward_scratch_buffers: Optional[Buffers] = None) -> Self:
         metadata = super().create_cuda_graph_metadata(
             max_batch_size,
             sub_cross_metadata,

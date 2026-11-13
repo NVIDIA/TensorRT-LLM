@@ -72,6 +72,7 @@ from .config import _HPUpdatePhase as _HPUpdatePhase
 from .decode import _cutedsl_pad_q_and_sf_kernel as _cutedsl_pad_q_and_sf_kernel
 from .decode import _cutedsl_swizzled_sf_offset as _cutedsl_swizzled_sf_offset
 from .decode import _run_triton_attention_decode as _run_triton_attention_decode
+from .decode import _select_triton_block_v as _select_triton_block_v
 from .decode import run_fp4_mla_attention_decode
 from .layout import _ensure_workspace_tensor as _ensure_workspace_tensor
 from .layout import _get_fp4_mla_global_scale as _get_fp4_mla_global_scale
@@ -91,7 +92,6 @@ from .layout import (
 from .metadata import _fp4_mla_append_metadata_kernel as _fp4_mla_append_metadata_kernel
 from .metadata import _fp4_mla_generation_hp_page_ids as _fp4_mla_generation_hp_page_ids
 from .metadata import _fp4_mla_generation_lengths_kernel as _fp4_mla_generation_lengths_kernel
-from .metadata import _fp4_mla_generation_num_blocks_device as _fp4_mla_generation_num_blocks_device
 from .metadata import _fp4_mla_generation_page_ids as _fp4_mla_generation_page_ids
 from .metadata import (
     _fp4_mla_materialize_page_table_kernel as _fp4_mla_materialize_page_table_kernel,
@@ -124,7 +124,6 @@ from .v_cache import _get_fp4_mla_v_packed_pool as _get_fp4_mla_v_packed_pool
 from .v_cache import _get_fp4_mla_v_packed_pool_base as _get_fp4_mla_v_packed_pool_base
 from .v_cache import _get_fp4_mla_v_scale_pool_base as _get_fp4_mla_v_scale_pool_base
 from .v_cache import _repack_cutedsl_v_packed_cache as _repack_cutedsl_v_packed_cache
-from .v_cache import _select_triton_block_v as _select_triton_block_v
 from .v_cache import _v_packed_shape as _v_packed_shape
 from .v_cache import rebuild_fp4_mla_disagg_imported_cache
 

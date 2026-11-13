@@ -69,8 +69,7 @@ def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
         "draft_kv_cache_quant_algo_override")
     if override is not None:
         algo = QuantAlgo(override)
-        draft_config.extra_attrs = dict(draft_config.extra_attrs,
-                                        preserve_kv_cache_quant_algo=True)
+    draft_config._preserve_kv_cache_quant_algo = override is not None
     draft_config.quant_config.kv_cache_quant_algo = algo
     if override is not None and draft_config.quant_config_dict is not None:
         for layer_quant_config in draft_config.quant_config_dict.values():

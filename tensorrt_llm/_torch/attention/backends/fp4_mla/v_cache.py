@@ -17,19 +17,11 @@ from .config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _ceil_div,
-    _env_int,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
 )
 from .fp4_mla_kernels import _fp4_mla_rebuild_v_scale_from_k_scale_kernel
 from .layout import get_fp4_mla_v_scale_pool_size
-
-
-def _select_triton_block_v(num_queries: int) -> int:
-    env_block_v = _env_int("TRTLLM_FP4_MLA_BLOCK_V")
-    if env_block_v is not None:
-        return env_block_v
-    return 32 if num_queries <= 32 else 128
 
 
 def _v_packed_shape(

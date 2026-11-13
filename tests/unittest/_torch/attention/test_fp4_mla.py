@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 from _torch.helpers import triton_num_compiled
 
 import tensorrt_llm
@@ -428,6 +429,7 @@ def test_fp4_mla_rope_generation_forwards_helix_cache_ownership(
     assert len(calls) == 3
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("sm_version", "backend", "cp_size", "helix", "error"),
     [
@@ -446,9 +448,11 @@ def test_validate_fp4_mla_config_accepts_only_helix_context_parallelism(
     helix: bool,
     error: str | None,
 ) -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla import config as fp4_config
     from tensorrt_llm._torch.pyexecutor import model_loader
 
     monkeypatch.setattr(model_loader, "supports_fp4_mla_attention", lambda config: True)
+    monkeypatch.setattr(fp4_config, "_cutedsl_backend_available", lambda: True)
     monkeypatch.setattr(model_loader, "get_sm_version", lambda: sm_version)
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
     model_config = SimpleNamespace(
@@ -508,6 +512,76 @@ def test_validate_fp4_mla_config_uses_worker_role(
             model_loader.validate_fp4_mla_config(config, args)
 
 
+def _validate_fp4_mla_model_loader(
+    monkeypatch: pytest.MonkeyPatch, backend: str, sm_version: int
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader
+
+    monkeypatch.setattr(model_loader, "supports_fp4_mla_attention", lambda config: True)
+    monkeypatch.setattr(model_loader, "get_sm_version", lambda: sm_version)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
+    model_config = SimpleNamespace(
+        sparse_attention_config=None,
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)),
+        mapping=Mapping(),
+        spec_config=None,
+    )
+    args = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True),
+        cache_transceiver_config=None,
+    )
+    model_loader.validate_fp4_mla_config(model_config, args)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("available", [False, True], ids=["unavailable", "available"])
+def test_validate_fp4_mla_config_checks_cutedsl_availability(
+    monkeypatch: pytest.MonkeyPatch, available: bool
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla import config as fp4_config
+
+    monkeypatch.setattr(fp4_config, "_cutedsl_backend_available", lambda: available)
+    if available:
+        _validate_fp4_mla_model_loader(monkeypatch, "cutedsl", 107)
+    else:
+        with pytest.raises(ValueError, match="CuTe DSL backend is unavailable"):
+            _validate_fp4_mla_model_loader(monkeypatch, "cutedsl", 107)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "variable",
+    [
+        pytest.param(None, id="unset"),
+        "TRTLLM_FP4_MLA_PREPACK_V",
+        "TRTLLM_FP4_MLA_TRITON_PREPACK_V",
+        "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
+    ],
+)
+def test_validate_fp4_mla_config_warns_for_removed_triton_options(
+    monkeypatch: pytest.MonkeyPatch, variable: str | None
+) -> None:
+    from tensorrt_llm.logger import logger
+
+    for name in (
+        "TRTLLM_FP4_MLA_PREPACK_V",
+        "TRTLLM_FP4_MLA_TRITON_PREPACK_V",
+        "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    if variable is not None:
+        monkeypatch.setenv(variable, "1")
+    warnings: list[str] = []
+    monkeypatch.setattr(logger, "warning_once", warnings.append)
+    _validate_fp4_mla_model_loader(monkeypatch, "triton", 103)
+    if variable is None:
+        assert not warnings
+    else:
+        assert any(variable in message and "have no effect" in message for message in warnings)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("spec_config", "keeps_separate_draft_kv_cache"),
     [
@@ -2609,6 +2683,7 @@ def _build_fp4_mla_attention_decode_case(
     torch.cuda.synchronize()
 
     metadata.num_contexts = 0
+    metadata.fp4_mla_state.generation_max_pages = metadata.fp4_mla_state.page_table_stride
     metadata.fp4_mla_state.num_context_blocks = 0
     metadata.fp4_mla_state.num_generation_blocks = (
         len(seq_lens) * metadata.fp4_mla_state.page_table_stride
@@ -2775,7 +2850,7 @@ def _fp4_mla_attention_decode_reference(
     assert indptr[0] == 0
     assert indptr[-1] == storage.shape[0]
     query_len_per_seq = q_nope.shape[0] // num_seqs
-    max_pages = max(indptr[seq_idx + 1] - indptr[seq_idx] for seq_idx in range(num_seqs))
+    max_pages = p_dequant.shape[0] // (q_nope.shape[0] * num_heads) if p_dequant is not None else 0
     outputs = []
     softmax_stats = []
     for seq_idx in range(num_seqs):
@@ -2825,6 +2900,21 @@ def _fp4_mla_attention_decode_reference(
                     p_start = p_page * num_heads
                     p_pages.append(p_dequant[p_start : p_start + num_heads, :valid_tokens])
                 p = torch.cat(p_pages, dim=-1)
+                padded_tokens = (
+                    triton.cdiv(effective_kv_len, metadata.page_size) * metadata.page_size
+                )
+                padding = (0, padded_tokens - effective_kv_len)
+                probability_error = torch.nn.functional.pad(p - probs, padding).reshape(
+                    num_heads, -1, metadata.page_size
+                )
+                reference_probabilities = torch.nn.functional.pad(probs, padding).reshape(
+                    num_heads, -1, metadata.page_size
+                )
+                error_norm = torch.linalg.vector_norm(probability_error, dim=-1)
+                reference_norm = torch.linalg.vector_norm(reference_probabilities, dim=-1)
+                assert bool(torch.all(error_norm <= 0.25 * reference_norm).item()), (
+                    "FP4 MLA packed probabilities disagree with the independent softmax"
+                )
 
             outputs.append(torch.matmul(p, v_cache.float()))
     return torch.stack(outputs, dim=0), torch.stack(softmax_stats, dim=0)
@@ -3040,9 +3130,6 @@ def test_fp4_mla_attention_decode_cutedsl_matches_reference(
     reason="requires SM100, SM103 or SM107 for Triton FP4 MLA",
 )
 @pytest.mark.parametrize(
-    "legacy_prepack_env", [None, "TRTLLM_FP4_MLA_PREPACK_V", "TRTLLM_FP4_MLA_TRITON_PREPACK_V"]
-)
-@pytest.mark.parametrize(
     "num_heads,query_len_per_seq,seq_lens",
     [
         (96, 1, [131, 512]),
@@ -3055,13 +3142,8 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
     num_heads: int,
     seq_lens: list[int],
     query_len_per_seq: int,
-    legacy_prepack_env: str | None,
 ) -> None:
     """The fused generation update quantizes Q for the triton decode on SM100/SM103."""
-    monkeypatch.delenv("TRTLLM_FP4_MLA_PREPACK_V", raising=False)
-    monkeypatch.delenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", raising=False)
-    if legacy_prepack_env is not None:
-        monkeypatch.setenv(legacy_prepack_env, "1")
     _assert_fp4_mla_attention_decode_accuracy(
         monkeypatch,
         backend="triton",
@@ -3074,45 +3156,120 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
 
 
 @pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
-def test_fp4_mla_eager_decode_keeps_exact_page_capacity(monkeypatch) -> None:
-    _assert_fp4_mla_attention_decode_accuracy(
-        monkeypatch,
-        backend="triton",
-        fused_v_transpose=False,
-        num_heads=128,
-        seq_lens=[8195, 8195],
-        seed=29,
-        runtime_metadata=True,
-        expected_page_stride=65,
-        query_scale=2.0,
+def test_fp4_mla_mixed_decode_scratch_uses_generation_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    num_heads = 128
+    query_len_per_seq = 4
+    generation_lengths = [131, 512]
+    context_length = 131072
+    manager, fixture_metadata, all_queries, kv_lora_rank, rope_dim = (
+        _build_fp4_mla_attention_decode_case(
+            seq_lens=[*generation_lengths, context_length],
+            num_heads=num_heads,
+            seed=29,
+            query_len_per_seq=query_len_per_seq,
+            query_scale=2.0,
+        )
     )
+    try:
+        metadata = trtllm_backend.TrtllmAttentionMetadata(
+            max_num_requests=3,
+            max_num_tokens=128 + len(generation_lengths) * query_len_per_seq,
+            num_contexts=1,
+            seq_lens=torch.tensor([128, query_len_per_seq, query_len_per_seq], dtype=torch.int32),
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[
+                    context_length - 128,
+                    *(length - query_len_per_seq for length in generation_lengths),
+                ],
+            ),
+            kv_cache_manager=manager,
+            request_ids=[2, 0, 1],
+            prompt_lens=[context_length, *generation_lengths],
+            runtime_features=trtllm_backend.AttentionRuntimeFeatures(
+                has_speculative_draft_tokens=True
+            ),
+        )
+        metadata.prepare()
+        query = all_queries[: len(generation_lengths) * query_len_per_seq]
+        output = torch.empty_like(query[..., :kv_lora_rank])
+        run_fp4_mla_attention_decode(
+            metadata,
+            layer_idx=0,
+            local_layer=0,
+            q=query,
+            output=output,
+            sm_scale=0.1,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=rope_dim,
+            prequantized_q=fixture_metadata.fp4_mla_state.prequantized_q,
+            prequantized_q_sf=fixture_metadata.fp4_mla_state.prequantized_q_sf,
+            q_batch_capacity=fixture_metadata.fp4_mla_state.q_batch_capacity,
+        )
+        expected_generation_pages = triton.cdiv(
+            max(generation_lengths) + query_len_per_seq - 1, FP4_MLA_TOKENS_PER_BLOCK
+        )
+        assert metadata.fp4_mla_state.page_table_stride == triton.cdiv(
+            context_length + query_len_per_seq - 1, FP4_MLA_TOKENS_PER_BLOCK
+        )
+        workspaces = metadata.fp4_mla_state.workspaces
+        assert workspaces["_fp4_mla_attention_p_buf"].shape == (
+            query.shape[0] * expected_generation_pages * num_heads,
+            FP4_MLA_TOKENS_PER_BLOCK // 2,
+        )
+        assert workspaces["_fp4_mla_attention_page_max_buf"].shape == (
+            query.shape[0],
+            expected_generation_pages,
+            num_heads,
+        )
+        reference, _ = _fp4_mla_attention_decode_reference(
+            metadata,
+            query[..., :kv_lora_rank],
+            query[..., kv_lora_rank:],
+            sm_scale=0.1,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=rope_dim,
+        )
+        torch.testing.assert_close(output.float(), reference, rtol=0.15, atol=0.15)
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
-def test_fp4_mla_decode_bounds_reduce_specializations_across_batches(monkeypatch) -> None:
+@pytest.mark.parametrize("kernel_set", ["reduce", "pv"])
+def test_fp4_mla_decode_reuses_specializations(
+    monkeypatch: pytest.MonkeyPatch, kernel_set: str
+) -> None:
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_triton
 
-    kernels = [
-        fp4_mla_triton._fp4_mla_attention_reduce_stats_kernel,
-        fp4_mla_triton._fp4_mla_attention_group_reduce_stats_kernel,
-    ]
+    if kernel_set == "reduce":
+        kernels = (
+            fp4_mla_triton._fp4_mla_attention_reduce_stats_kernel,
+            fp4_mla_triton._fp4_mla_attention_group_reduce_stats_kernel,
+        )
+        target_ctas = 3 * torch.cuda.get_device_properties(0).multi_processor_count
+        cases = tuple((target_ctas // groups + 1, 8195) for groups in (64, 32))
+    else:
+        kernels = (fp4_mla_triton._fp4_mla_attention_pv_kernel,)
+        cases = tuple((2, pages * FP4_MLA_TOKENS_PER_BLOCK - 1) for pages in (68, 76))
     compiled = None
-    target_ctas = 3 * torch.cuda.get_device_properties(0).multi_processor_count
-    # Cross group-length boundaries (2, 3 and 5 pages on B200/B300) while
-    # keeping the page capacity and reduction tensor alignment unchanged.
-    batches = tuple(target_ctas // groups + 1 for groups in (64, 32, 16))
-    for batch_size in batches:
+    for batch_size, sequence_length in cases:
         _assert_fp4_mla_attention_decode_accuracy(
             monkeypatch,
             backend="triton",
             fused_v_transpose=False,
             num_heads=128,
-            seq_lens=[8195] * batch_size,
+            seq_lens=[sequence_length] * batch_size,
             seed=29,
             runtime_metadata=True,
+            expected_page_stride=triton.cdiv(sequence_length, FP4_MLA_TOKENS_PER_BLOCK),
             query_scale=2.0,
+            pool_capacity_tokens=65536 if kernel_set == "pv" else None,
         )
-        counts = [triton_num_compiled(kernel) for kernel in kernels]
+        counts = tuple(triton_num_compiled(kernel) for kernel in kernels)
         assert all(counts)
         if compiled is not None:
             assert counts == compiled
@@ -3120,34 +3277,9 @@ def test_fp4_mla_decode_bounds_reduce_specializations_across_batches(monkeypatch
 
 
 @pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
-def test_fp4_mla_decode_reuses_pv_specializations_across_page_counts(monkeypatch) -> None:
-    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_triton
-
-    kernel = fp4_mla_triton._fp4_mla_attention_pv_kernel
-    compiled = None
-    for pages in (68, 76, 84):
-        _assert_fp4_mla_attention_decode_accuracy(
-            monkeypatch,
-            backend="triton",
-            fused_v_transpose=False,
-            num_heads=128,
-            seq_lens=[pages * 128 - 1] * 2,
-            seed=29,
-            runtime_metadata=True,
-            query_scale=2.0,
-            pool_capacity_tokens=65536,
-        )
-        count = triton_num_compiled(kernel)
-        assert count > 0
-        if compiled is not None:
-            assert count == compiled
-        compiled = count
-
-
-@pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
 @pytest.mark.parametrize("query_len_per_seq", [1, 4], ids=["plain", "mtp3"])
 def test_fp4_mla_decode_graphs_share_runner_scratch_and_match_reference(
-    monkeypatch, query_len_per_seq: int
+    monkeypatch: pytest.MonkeyPatch, query_len_per_seq: int
 ) -> None:
     from _torch.pyexecutor.engine_test_utils import _make_request_stub
 
@@ -3159,8 +3291,6 @@ def test_fp4_mla_decode_graphs_share_runner_scratch_and_match_reference(
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv("TRTLLM_FP4_MLA_PREPACK_V", "1")
-    monkeypatch.setenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", "1")
     seq_len = 68 * FP4_MLA_TOKENS_PER_BLOCK - 1
     kernel_launches = []
 

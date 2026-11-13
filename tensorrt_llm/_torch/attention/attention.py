@@ -744,8 +744,7 @@ class Attention(nn.Module):
             use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         self.quant_config = config.get_quant_config()
-        self._preserve_kv_cache_quant_algo = bool(
-            config.extra_attrs.get("preserve_kv_cache_quant_algo", False))
+        self._preserve_kv_cache_quant_algo = config._preserve_kv_cache_quant_algo
         self.attn_backend = config.attn_backend
 
         sparse_attn_cfg = config.sparse_attention_config

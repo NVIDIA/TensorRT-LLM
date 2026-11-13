@@ -410,6 +410,7 @@ def test_ctx_cap_no_cap_during_warmup():
         (200, 64, 272, 200),
     ],
 )
+@pytest.mark.cpu_only
 def test_workspace_reserve_honors_staging_floor(
     floor: int,
     profiled: int,
@@ -436,6 +437,7 @@ def test_workspace_reserve_reports_fixed_cost_without_a_staging_floor() -> None:
     assert "lower max_num_tokens" not in str(raised.value)
 
 
+@pytest.mark.cpu_only
 def test_workspace_reserve_rejects_unaffordable_floor() -> None:
     with pytest.raises(ResourceError, match="workspace floor"):
         get_mla_context_workspace_reserve(
