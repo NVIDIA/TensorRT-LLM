@@ -664,6 +664,7 @@ includes full requested and observed dispatch/expert matrices.
 | `deepseek_r1` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k3` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
+| `inkling_2_small` | 384 | 8 | 4608 | 2304 | pass `--quant` | `DEEPSEEK_V3` |
 | `kimi_k3_1_pro` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5_3_flash` | 288 | 8 | 4096 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `minimax_m3_1_flash` | 128 | 4 | 6144 | 3072 | pass `--quant` | `MINIMAX_M3` |
@@ -688,6 +689,13 @@ down/up projections sit outside the MoE layer and are not benchmarked.
 score-correction bias, routed scaling factor 1.5, and SwiGLU clamp 10. It benchmarks
 the routed-expert branch; the checkpoint's separate shared expert, vision encoder,
 and DSpark draft experts are outside this preset.
+
+`inkling_2_small` uses FP32 sigmoid routing with a single expert group,
+normalized top-8 weights scaled by 8, and SiTU gate/linear softcaps 4/25.
+The routed-expert width is 4608. The benchmark records the actual epilogue;
+backend/quantization paths without SiTU retain the existing SwiGLU proxy.
+The explicit `--quant` selects the module's quantization; it does not reproduce
+the checkpoint's mixed layer precisions or checkpoint-specific quantization recipe.
 
 `kimi_k3_1_pro` uses the checkpoint's latent routed-expert width 3584 and
 SiTU gate/linear softcaps 4/25. The benchmark records the actual epilogue;

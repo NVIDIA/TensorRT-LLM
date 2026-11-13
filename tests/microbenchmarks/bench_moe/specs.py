@@ -502,6 +502,21 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         situ_beta=4.0,  # text_config.activation_situ_beta
         situ_linear_beta=25.0,  # text_config.activation_situ_linear_beta
     ),
+    "inkling_2_small": ModelSpec(
+        name="inkling_2_small",
+        num_experts=384,
+        top_k=8,
+        hidden_size=4608,
+        intermediate_size=2304,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=8.0,
+        router_fp32=True,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    ),
     "kimi_k3_1_pro": ModelSpec(
         name="kimi_k3_1_pro",
         num_experts=896,
