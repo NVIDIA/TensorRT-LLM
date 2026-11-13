@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Layout of the NVFP4 DSA KV cache: ``fp8rope`` records where the cache can hold them."""
+"""Layout of the NVFP4 DSA KV cache: ``fp8rope`` records where PrimTS reads them in place."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha import prims_ts_dsa_sparse_mla
 from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
     NVFP4_MLA_KV_CACHE_LAYOUT_ENV,
     NVFP4_MLA_RECORD_LAYOUT,
@@ -74,15 +75,37 @@ def _request_layout(monkeypatch, layout):
         monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, layout)
 
 
-@pytest.mark.parametrize("layout", [None, "auto", "residual", "fp8rope"])
-def test_record_layout_has_no_scale_pool(monkeypatch, layout):
+def _set_record_reader(monkeypatch, unsupported_reason):
+    """Make the PrimTS record reader of this process available (None) or unavailable."""
+    monkeypatch.setattr(
+        prims_ts_dsa_sparse_mla,
+        "get_nvfp4_mla_record_reader_unsupported_reason",
+        lambda mapping=None: unsupported_reason,
+    )
+
+
+@pytest.mark.parametrize(
+    "layout, reader_unsupported_reason, expected",
+    [
+        (None, None, NVFP4_MLA_RECORD_LAYOUT),
+        ("auto", None, NVFP4_MLA_RECORD_LAYOUT),
+        (None, "no reader.", NVFP4_MLA_RESIDUAL_LAYOUT),
+        ("auto", "no reader.", NVFP4_MLA_RESIDUAL_LAYOUT),
+        ("residual", None, NVFP4_MLA_RESIDUAL_LAYOUT),
+        ("fp8rope", None, NVFP4_MLA_RECORD_LAYOUT),
+        # An explicit request for records is kept; generation then gathers them.
+        ("fp8rope", "no reader.", NVFP4_MLA_RECORD_LAYOUT),
+    ],
+)
+def test_record_layout_has_no_scale_pool(monkeypatch, layout, reader_unsupported_reason, expected):
     _request_layout(monkeypatch, layout)
+    _set_record_reader(monkeypatch, reader_unsupported_reason)
     sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=128)
     manager = _make_manager(sparse_config)
     try:
         roles = manager._get_layer_roles_by_local_id(0)
         pointers = manager.kv_cache_pool_pointers
-        if layout == "residual":
+        if expected == NVFP4_MLA_RESIDUAL_LAYOUT:
             assert manager.mla_kv_cache_layout == NVFP4_MLA_RESIDUAL_LAYOUT
             assert manager.mla_kv_cache_residual_dim == 64
             assert Role.KEY_BLOCK_SCALE in roles
@@ -141,6 +164,7 @@ def test_cache_that_cannot_hold_records_keeps_the_residual_layout(
         head_dim, rope_head_dim, kv_cache_config, kv_cache_offload
     )
     assert (reason is None) == (unsupported is None)
+    _set_record_reader(monkeypatch, None)
 
     for layout in (None, "auto"):
         _request_layout(monkeypatch, layout)
@@ -157,6 +181,42 @@ def test_cache_that_cannot_hold_records_keeps_the_residual_layout(
     else:
         with pytest.raises(ValueError, match=unsupported):
             resolve_nvfp4_mla_kv_cache_layout(reason)
+
+
+@pytest.mark.parametrize("layout", [None, "auto"])
+def test_auto_stores_records_only_where_they_are_read_in_place(monkeypatch, layout):
+    _request_layout(monkeypatch, layout)
+    seen = []
+
+    def reader_unsupported_reason(mapping=None):
+        seen.append(mapping)
+        return "requires SM100, SM103 or SM107, got SM120."
+
+    monkeypatch.setattr(
+        prims_ts_dsa_sparse_mla,
+        "get_nvfp4_mla_record_reader_unsupported_reason",
+        reader_unsupported_reason,
+    )
+    mapping = Mapping()
+    assert resolve_nvfp4_mla_kv_cache_layout(None, mapping) == NVFP4_MLA_RESIDUAL_LAYOUT
+    assert seen == [mapping]
+    _set_record_reader(monkeypatch, None)
+    assert resolve_nvfp4_mla_kv_cache_layout(None, mapping) == NVFP4_MLA_RECORD_LAYOUT
+
+
+@pytest.mark.parametrize("layout", ["residual", "fp8rope"])
+def test_explicit_layout_does_not_ask_for_the_record_reader(monkeypatch, layout):
+    _request_layout(monkeypatch, layout)
+
+    def reader_unsupported_reason(mapping=None):
+        raise AssertionError("an explicit layout does not depend on the record reader")
+
+    monkeypatch.setattr(
+        prims_ts_dsa_sparse_mla,
+        "get_nvfp4_mla_record_reader_unsupported_reason",
+        reader_unsupported_reason,
+    )
+    assert resolve_nvfp4_mla_kv_cache_layout(None, Mapping()) == layout
 
 
 def test_unknown_layout_request_is_rejected(monkeypatch):

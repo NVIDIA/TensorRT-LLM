@@ -67,8 +67,9 @@ def get_requested_nvfp4_mla_kv_cache_layout() -> str:
     scales, no global scale and no scale pool. ``residual`` keeps the 576 E2M1 values, plus
     residual E2M1 codes for the RoPE part when ``TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION`` is on,
     in the data pool and their E4M3 block scales in the scale pool, all under one global scale.
-    ``auto`` (default) takes ``fp8rope`` for a cache that can hold records and ``residual`` for
-    any other; :func:`resolve_nvfp4_mla_kv_cache_layout` settles it for one cache.
+    ``auto`` (default) takes ``fp8rope`` for a cache that can hold records where PrimTS reads
+    them in place, and ``residual`` for any other;
+    :func:`resolve_nvfp4_mla_kv_cache_layout` settles it for one cache.
     """
     layout = os.environ.get(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_AUTO_LAYOUT)
     if layout not in (NVFP4_MLA_AUTO_LAYOUT, NVFP4_MLA_RESIDUAL_LAYOUT, NVFP4_MLA_RECORD_LAYOUT):
@@ -79,12 +80,20 @@ def get_requested_nvfp4_mla_kv_cache_layout() -> str:
     return layout
 
 
-def resolve_nvfp4_mla_kv_cache_layout(record_unsupported_reason: Optional[str]) -> str:
+def resolve_nvfp4_mla_kv_cache_layout(
+    record_unsupported_reason: Optional[str], mapping: Optional[Mapping] = None
+) -> str:
     """Return the layout of one NVFP4 DSA latent cache: ``residual`` or ``fp8rope``.
+
+    ``auto`` stores records only where generation reads them in place: a cache that cannot hold
+    them, or a process whose PrimTS record reader cannot run, keeps the ``residual`` layout.
+    ``fp8rope`` stores records in every cache that can hold them; generation gathers them for
+    TRTLLM-Gen where the reader cannot run.
 
     Args:
         record_unsupported_reason: Why the cache cannot hold ``fp8rope`` records, worded as the
             predicate of a sentence about that layout; None if it can.
+        mapping: The mapping the cache serves; Helix rules out the in-place read.
 
     Raises:
         ValueError: ``fp8rope`` is requested for a cache that cannot hold records.
@@ -92,16 +101,30 @@ def resolve_nvfp4_mla_kv_cache_layout(record_unsupported_reason: Optional[str]) 
     requested = get_requested_nvfp4_mla_kv_cache_layout()
     if requested == NVFP4_MLA_RESIDUAL_LAYOUT:
         return NVFP4_MLA_RESIDUAL_LAYOUT
-    if record_unsupported_reason is None:
-        return NVFP4_MLA_RECORD_LAYOUT
-    if requested == NVFP4_MLA_RECORD_LAYOUT:
-        raise ValueError(
-            f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout {record_unsupported_reason}"
+    if record_unsupported_reason is not None:
+        if requested == NVFP4_MLA_RECORD_LAYOUT:
+            raise ValueError(
+                f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout "
+                f"{record_unsupported_reason}"
+            )
+        logger.info_once(
+            f"The NVFP4 DSA KV cache uses the {NVFP4_MLA_RESIDUAL_LAYOUT!r} layout: the "
+            f"{NVFP4_MLA_RECORD_LAYOUT!r} layout {record_unsupported_reason}.",
+            key=f"nvfp4_mla_kv_cache_layout_fallback:{record_unsupported_reason}",
         )
+        return NVFP4_MLA_RESIDUAL_LAYOUT
+    if requested == NVFP4_MLA_RECORD_LAYOUT:
+        return NVFP4_MLA_RECORD_LAYOUT
+    # The FMHA library imports this module for the layout names.
+    from ...fmha.prims_ts_dsa_sparse_mla import get_nvfp4_mla_record_reader_unsupported_reason
+
+    reader_unsupported_reason = get_nvfp4_mla_record_reader_unsupported_reason(mapping)
+    if reader_unsupported_reason is None:
+        return NVFP4_MLA_RECORD_LAYOUT
     logger.info_once(
-        f"The NVFP4 DSA KV cache uses the {NVFP4_MLA_RESIDUAL_LAYOUT!r} layout: the "
-        f"{NVFP4_MLA_RECORD_LAYOUT!r} layout {record_unsupported_reason}.",
-        key=f"nvfp4_mla_kv_cache_layout_fallback:{record_unsupported_reason}",
+        f"The NVFP4 DSA KV cache uses the {NVFP4_MLA_RESIDUAL_LAYOUT!r} layout because PrimTS "
+        f"cannot read {NVFP4_MLA_RECORD_LAYOUT!r} records in place: {reader_unsupported_reason}",
+        key=f"nvfp4_mla_kv_cache_layout_fallback:{reader_unsupported_reason}",
     )
     return NVFP4_MLA_RESIDUAL_LAYOUT
 
@@ -571,7 +594,8 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             resolve_nvfp4_mla_kv_cache_layout(
                 _get_nvfp4_mla_record_unsupported_reason(
                     head_dim, rope_head_dim, kv_cache_config, sparse_params.enable_kv_cache_offload
-                )
+                ),
+                mapping,
             )
             if dtype == DataType.NVFP4
             else None
@@ -1134,7 +1158,8 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             layout = resolve_nvfp4_mla_kv_cache_layout(
                 _get_nvfp4_mla_record_unsupported_reason(
                     head_dim, rope_head_dim, kwargs.get("kv_cache_config"), False
-                )
+                ),
+                mapping,
             )
             residual_dim = get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim, layout)
             num_attention_layers = KVCacheManager._resolve_num_attention_layers(
