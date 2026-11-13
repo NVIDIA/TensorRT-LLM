@@ -326,7 +326,7 @@ class LocalMoeState(_stock.M3MoeState):
             "extra_domains": list(ext),
             "sm_domain": [int(v) for v in lm.sm_domain],
             "smap": lmap,
-            "smap_md5": hashlib.md5(bytes(str(lmap), "ascii")).hexdigest(),
+            "smap_md5": hashlib.md5(bytes(str(lmap), "ascii"), usedforsecurity=False).hexdigest(),
             "smem_per_cta": mod.BIG,
             "fc1_geometry": int(mod.FC1_GEOMETRY),
             "smem_per_sm": smem_sm,
