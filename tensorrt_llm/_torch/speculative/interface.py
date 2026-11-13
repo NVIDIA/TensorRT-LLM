@@ -382,12 +382,12 @@ def draft_layer_picks_rows(layer: nn.Module | None,
 
 class DraftRowPick:
     """A worker's ``draft_layer_picks_rows`` decision for its draft layers,
-    resolved again (and logged) whenever their classes change: a model may
-    re-class its draft layers after the worker is built."""
+    resolved again (and logged) whenever their classes or the decline reason
+    change: a model may re-class its draft layers after the worker is built."""
 
     def __init__(self, layers_name: str) -> None:
         self._layers_name = layers_name
-        self._layer_classes: tuple[type, ...] | None = None
+        self._key: tuple[tuple[type, ...], str | None] | None = None
         self._picks_rows = False
 
     def resolve(self,
@@ -396,8 +396,8 @@ class DraftRowPick:
                 decline: str | None = None) -> bool:
         """``decline``: the reason this worker cannot pick (None: it can)."""
         layer_classes = tuple(type(layer) for layer in layers)
-        if layer_classes != self._layer_classes:
-            self._layer_classes = layer_classes
+        if (layer_classes, decline) != self._key:
+            self._key = (layer_classes, decline)
             self._picks_rows = (decline is None and len(layers) > 0 and all(
                 draft_layer_picks_rows(layer, mapping) for layer in layers))
             names = ", ".join(sorted({c.__name__

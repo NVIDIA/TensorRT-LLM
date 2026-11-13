@@ -33,6 +33,13 @@ from tensorrt_llm._torch.speculative.mtp import MTPWorker
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
+
+@pytest.fixture(autouse=True)
+def _row_pick_enabled(monkeypatch):
+    """Picking on, whatever the environment says."""
+    monkeypatch.delenv("TLLM_SPEC_DISABLE_DRAFT_ROW_PICK", raising=False)
+
+
 H = 64
 VOCAB = 97
 
@@ -284,15 +291,14 @@ def _compare(ref_layer, ref, layer, out, b, n_rows):
     return picked
 
 
-@pytest.mark.parametrize("fast_paths", [False, True])
 # Mixed contexts and generations; contexts only with a single draft step.
 @pytest.mark.parametrize("num_contexts,num_gens,k", [(2, 3, 3), (3, 0, 1)])
-def test_mtp_eagle_step0_pick_matches_full(fast_paths, num_contexts, num_gens, k):
+def test_mtp_eagle_step0_pick_matches_full(num_contexts, num_gens, k):
     b = num_contexts + num_gens
     ref_layer = _PlainMtpLayer(seed=7)
-    ref = _run_loop(ref_layer, True, fast_paths, num_contexts, num_gens, k, 3)
+    ref = _run_loop(ref_layer, True, False, num_contexts, num_gens, k, 3)
     layer = _PickingMtpLayer(seed=7)
-    out = _run_loop(layer, True, fast_paths, num_contexts, num_gens, k, 3)
+    out = _run_loop(layer, True, False, num_contexts, num_gens, k, 3)
     n_rows = ref_layer.kv_writes[0].shape[0]
     assert _compare(ref_layer, ref, layer, out, b, n_rows)
     # The post-attention part ran on one row per request on every step.
@@ -311,8 +317,10 @@ def test_eagle3_step0_pick_matches_full():
     assert layer.post_rows == [b] * k
 
 
-@pytest.mark.parametrize("layer_cls", [_PlainMtpLayer, _OverridingMtpLayer])
-def test_layer_without_pick_support_is_unaffected(layer_cls):
+# On the spec-decode fast paths (with the step-0 epilogue) even a supporting
+# layer does not pick.
+@pytest.mark.parametrize("layer_cls", [_PlainMtpLayer, _OverridingMtpLayer, _PickingMtpLayer])
+def test_unpicked_step0_is_unaffected(layer_cls):
     num_contexts, num_gens, k = 2, 3, 3
     ref_layer = _PlainMtpLayer(seed=7)
     ref = _run_loop(ref_layer, True, True, num_contexts, num_gens, k, 3)
@@ -426,7 +434,6 @@ def test_step0_pick_under_attention_dp():
 def test_draft_row_pick_gates(monkeypatch):
     """``draft_layer_picks_rows`` and the ``DraftRowPick`` decision, which is
     resolved again whenever the draft layer classes change."""
-    monkeypatch.delenv("TLLM_SPEC_DISABLE_DRAFT_ROW_PICK", raising=False)
     assert draft_layer_picks_rows(_PickingMtpLayer(0))
     assert not draft_layer_picks_rows(None)
     assert not draft_layer_picks_rows(_PlainMtpLayer(0))

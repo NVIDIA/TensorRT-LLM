@@ -441,7 +441,8 @@ runs its attention on every input row (writing the draft KV cache of each) but
 the rest of the layer (norms, MLP or MoE) only on the one row per request the
 drafter reads: the last prompt row of a context request, the last accepted row
 of a generation request. Vanilla MTP does not pick rows under attention data
-parallelism. `TLLM_SPEC_DISABLE_DRAFT_ROW_PICK=1` turns this off. The picked rows
+parallelism, and MTP-Eagle does not pick them on the spec-decode fast paths.
+`TLLM_SPEC_DISABLE_DRAFT_ROW_PICK=1` turns this off. The picked rows
 are numerically equivalent to the full layer's but not bitwise identical for
 MoE draft layers, whose kernels may round differently at another row count, so
 an occasional draft token can differ.

@@ -98,7 +98,7 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
         is_mtp_eagle=True,
         draft_kv_cache_context=draft_context,
         _run_draft_forward=run_draft_forward,
-        _step0_draft_layer_picks_rows=lambda draft_model: False,
+        _step0_draft_layer_picks_rows=lambda draft_model, use_epilogue: False,
     )
 
     from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker

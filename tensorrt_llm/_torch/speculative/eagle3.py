@@ -23,7 +23,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
-from .fused_accept import step0_epilogue, step0_gather_ids
+from .fused_accept import step0_epilogue
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, DraftRowPick,
                         SpecMetadata, SpecWorkerBase,
                         supports_sharded_target_sampling)
@@ -518,15 +518,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             self.is_mtp_eagle and isinstance(draft_model, MTPForCausalLM)
             and draft_model.folds_kv_lens_increment)
 
-    def _step0_draft_layer_picks_rows(self, draft_model: nn.Module) -> bool:
+    def _step0_draft_layer_picks_rows(self, draft_model: nn.Module,
+                                      use_epilogue: bool) -> bool:
         """Whether the draft layer of step 0 takes ``pick_rows`` (see
-        draft_layer_picks_rows)."""
+        draft_layer_picks_rows). Not with the step-0 epilogue, which gathers
+        the rows from the full output itself."""
         if self.is_mtp_eagle:
             mtp_layers = getattr(draft_model, "mtp_layers", None)
             draft_layer = mtp_layers[0] if mtp_layers else None
         else:
             draft_layer = getattr(draft_model, "model", None)
-        return self._step0_row_pick.resolve([draft_layer], self.mapping)
+        return self._step0_row_pick.resolve(
+            [draft_layer],
+            self.mapping,
+            decline="spec-decode fast paths" if use_epilogue else None)
 
     @property
     def max_draft_len(self) -> int:
@@ -925,24 +930,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # reads (step 0's gather ids) are known before the forward, and
                 # the layer runs everything after its attention on them only.
                 # Under attention DP every rank makes the same decision (it
-                # depends on the model only), and the post-attention
-                # collectives get the per-request counts the later steps use.
+                # depends on the model and config only), and the
+                # post-attention collectives get the per-request counts the
+                # later steps use.
                 pick_rows = None
-                if i == 0 and self._step0_draft_layer_picks_rows(draft_model):
+                if i == 0 and self._step0_draft_layer_picks_rows(
+                        draft_model, use_epilogue):
                     # set_spec_metadata_all_rank_num_tokens sets both.
                     assert (spec_metadata.all_rank_num_tokens is None
                             or spec_metadata.subseq_all_rank_num_tokens
                             is not None)
-                    if use_epilogue:
-                        pick_rows = step0_gather_ids(
-                            pre_draft_seq_lens, num_accepted_tokens,
-                            num_contexts, batch_size, runtime_draft_len,
-                            attn_metadata.num_ctx_tokens)
-                    if pick_rows is None:
-                        pick_rows = self._step0_gather_ids(
-                            step0_seq_lens, num_accepted_tokens, spec_metadata,
-                            num_contexts, num_gens, runtime_draft_len,
-                            attn_metadata.num_ctx_tokens)
+                    pick_rows = self._step0_gather_ids(
+                        step0_seq_lens, num_accepted_tokens, spec_metadata,
+                        num_contexts, num_gens, runtime_draft_len,
+                        attn_metadata.num_ctx_tokens)
                     inputs["pick_rows"] = pick_rows
                     logger.info_once(
                         f"Draft step 0 picks {batch_size} of "
@@ -978,8 +979,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                            accepted_tokens=accepted_tokens if
                                            token_buffer is not None else None,
                                            last_out=token_buffer[0] if
-                                           token_buffer is not None else None,
-                                           picked_gather_ids=pick_rows)
+                                           token_buffer is not None else None)
                     if step0 is None:
                         token_buffer = None  # needs the epilogue's row 0
                 if i == 0 and step0 is not None:
