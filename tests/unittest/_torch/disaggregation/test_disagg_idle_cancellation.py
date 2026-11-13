@@ -2042,5 +2042,98 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
         for rank, engine in enumerate(engines)
     )
     assert all(
-        [name for name, _ in engine.dist.calls] == ["tp_allgather"] * 4 for engine in engines
+        [name for name, _ in engine.dist.calls] == ["tp_allgather"] * 3 for engine in engines
     )
+
+
+@pytest.mark.parametrize("peer_owns_receive", [False, True])
+def test_legacy_tp_cancel_with_request_missing_on_peer(
+    executor: PyExecutor, peer_owns_receive: bool
+) -> None:
+    """A peer with no active copy must still participate in cancellation."""
+    group = FakeDistGroup(world_size=2, tp_size=2, timeout_s=1)
+    engines = []
+    request = _request(1)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    for rank in range(2):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        engine.active_requests = [request] if rank == 0 else []
+        engine.canceled_req_ids = [1]
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        engine.previous_batch = None
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        if rank == 1 and peer_owns_receive:
+            transceiver._recv_reqs = {1: _request(1)}
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        engine.disagg.request_cancellation = Mock(return_value=True)
+        engine._try_cancel_request = Mock(return_value=True)
+        engines.append(engine)
+
+    group.run(lambda rank: engines[rank]._handle_canceled_requests())
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    if peer_owns_receive:
+        assert not request.is_finished
+        engines[1].kv_cache_transceiver._recv_reqs.clear()
+        group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert request.is_finished_due_to_cancellation
+    assert all(not engine.canceled_req_ids for engine in engines)
+
+
+def test_legacy_tp_cancel_propagates_to_peer_with_active_request(executor: PyExecutor) -> None:
+    """A peer missing the cancel ID must drain its own transfer before retirement."""
+    group = FakeDistGroup(world_size=2, tp_size=2, timeout_s=1)
+    engines = []
+    requests = []
+    for rank in range(2):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        request = _request(1)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1] if rank == 0 else []
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        engine.previous_batch = None
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        engine.disagg.request_cancellation = Mock(return_value=True)
+        engines.append(engine)
+        requests.append(request)
+
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    engines[1].disagg.request_cancellation.assert_not_called()
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(request.is_finished_due_to_cancellation for request in requests)
+    assert all(not engine.canceled_req_ids for engine in engines)

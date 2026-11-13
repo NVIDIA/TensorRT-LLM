@@ -11104,8 +11104,10 @@ class PyExecutor:
             if request.state not in (LlmRequestState.CONTEXT_INIT,
                                      LlmRequestState.GENERATION_IN_PROGRESS):
                 continue
-            if self.kv_cache_transceiver.supports_idle_request_cancellation(
-                    request) is True:
+            if (self.kv_cache_transceiver.supports_idle_request_cancellation(
+                    request) is True
+                    or (request.is_generation_only_request
+                        and self.disagg.requires_gen_cancellation_consensus)):
                 model_ids.add(request.py_request_id)
         return model_ids
 
@@ -11126,8 +11128,12 @@ class PyExecutor:
         Returns:
             Newly activated requests that were not retired by cancellation.
         """
-        if (self.kv_cache_transceiver is None or not self.canceled_req_ids
+        if (self.kv_cache_transceiver is None
                 or getattr(self, "kv_connector_manager", None) is not None):
+            return new_requests
+
+        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        if not self.canceled_req_ids and not replicated_gen_cancel:
             return new_requests
 
         supports_idle_cancel = self.kv_cache_transceiver.supports_idle_request_cancellation
@@ -11143,7 +11149,6 @@ class PyExecutor:
             for req in previous_batch.scheduled_requests.all_requests()
         } if previous_batch is not None else set())
         cancelled_model_ids.difference_update(previous_ids)
-        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
         ready_to_cancel = []
         retired_ids = set()
         failed_ids = set()
@@ -11165,7 +11170,8 @@ class PyExecutor:
                     LlmRequestState.DISAGG_TRANS_ERROR,
                 ))
             model_cancelled = request.py_request_id in cancelled_model_ids
-            legacy_gen_waiting = replicated_gen_cancel and generation_waiting
+            legacy_gen_waiting = replicated_gen_cancel and (generation_waiting
+                                                            or model_cancelled)
             if legacy_gen_waiting and request.py_request_id in previous_ids:
                 continue
             if (not (context_waiting or generation_waiting or model_cancelled)
@@ -11189,7 +11195,16 @@ class PyExecutor:
                 continue
             ready_to_cancel.append(request)
 
-        for request in self.disagg.align_gen_cancellation(ready_to_cancel):
+        if replicated_gen_cancel:
+            ready_to_cancel, propagated_ids, completed_ids = (
+                self.disagg.align_gen_cancellation(ready_to_cancel,
+                                                   self.active_requests,
+                                                   self.canceled_req_ids))
+            self.canceled_req_ids[:] = sorted(propagated_ids)
+        else:
+            completed_ids = set()
+
+        for request in ready_to_cancel:
             cancel_id = (request.parent_request_id
                          if request.is_child else request.py_request_id)
             handled_cancel_ids.add(cancel_id)
@@ -11210,7 +11225,7 @@ class PyExecutor:
             retired_ids.add(request.py_request_id)
 
         if not cancel_queued:
-            self.waiting_queue.remove_by_ids(handled_cancel_ids)
+            self.waiting_queue.remove_by_ids(handled_cancel_ids | completed_ids)
         self.active_requests[:] = [
             req for req in self.active_requests
             if req.py_request_id not in retired_ids
@@ -11222,8 +11237,9 @@ class PyExecutor:
         }
         self.canceled_req_ids[:] = [
             request_id for request_id in self.canceled_req_ids
-            if request_id in active_cancel_ids or (
-                not cancel_queued and request_id not in handled_cancel_ids)
+            if request_id not in completed_ids and (
+                request_id in active_cancel_ids or
+                (not cancel_queued and request_id not in handled_cancel_ids))
         ]
         return [
             req for req in new_requests if req.py_request_id not in retired_ids
@@ -11304,13 +11320,18 @@ class PyExecutor:
             if req_id not in canceled_req_ids_set:
                 continue
 
+            if (request.is_generation_only_request
+                    and self.disagg.requires_gen_cancellation_consensus):
+                still_pending_canceled_ids.append(req_id)
+                continue
+
             is_cancelled = self._try_cancel_request(request)
             if is_cancelled:
                 ready_to_cancel.append(request)
             else:
                 still_pending_canceled_ids.append(req_id)
 
-        aligned = self.disagg.align_gen_cancellation(ready_to_cancel)
+        aligned = ready_to_cancel
         aligned_ids = {request.py_request_id for request in aligned}
         still_pending_canceled_ids.extend(
             request.parent_request_id if request.is_child else request.

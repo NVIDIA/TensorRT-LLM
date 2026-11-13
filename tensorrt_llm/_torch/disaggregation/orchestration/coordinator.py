@@ -532,7 +532,9 @@ class DisaggTransferCoordinator:
             and self._transceiver.supports_idle_request_cancellation() is not True
         )
 
-    def align_gen_cancellation(self, ready: List[LlmRequest]) -> List[LlmRequest]:
+    def align_gen_cancellation(
+        self, ready: List[LlmRequest], active: List[LlmRequest], cancel_ids: List[int]
+    ) -> Tuple[List[LlmRequest], Set[int], Set[int]]:
         """Keep GEN cancellations only after every batch rank can retire them.
 
         Call at a shared cancellation boundary, even when this rank has no
@@ -540,16 +542,52 @@ class DisaggTransferCoordinator:
         retaining the request and cancel ID keeps idle retries reachable.
         """
         if not self.requires_gen_cancellation_consensus:
-            return ready
-        gen_ready = self._align_gen_requests(
-            [request for request in ready if request.is_generation_only_request]
-        )
-        ready_ids = {request.py_request_id for request in gen_ready}
-        return [
+            return ready, set(cancel_ids), set()
+        gen_active = {
+            request.py_request_id: (
+                request.parent_request_id if request.is_child else request.py_request_id
+            )
+            for request in active
+            if request.is_generation_only_request and not request.is_finished
+        }
+        # A request can have left the executor's active list while a receive
+        # still owns its destination. Absence from that list alone does not
+        # prove that the peer can release the replicated request.
+        owned = list(getattr(self._transceiver, "_recv_reqs", {}).values())
+        owned.extend(request for request, _ in self._unpublished_gen_receives.values())
+        owned.extend(self._retiring_gen_receives.values())
+        for request in owned:
+            gen_active[request.py_request_id] = (
+                request.parent_request_id if request.is_child else request.py_request_id
+            )
+        gen_ready = {
+            request.py_request_id for request in ready if request.is_generation_only_request
+        }
+        payload = (list(cancel_ids), gen_active, list(gen_ready))
+        gather = self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
+        peers = gather(payload, small_payload=True)
+        all_cancel_ids = set().union(*(set(peer[0]) for peer in peers))
+        requests = {rid: client for _, active_ids, _ in peers for rid, client in active_ids.items()}
+        complete = {
+            client
+            for client in all_cancel_ids
+            if any(owner == client for owner in requests.values())
+            and all(
+                rid in set(peer_ready)
+                for _, peer_active, peer_ready in peers
+                for rid, owner in peer_active.items()
+                if owner == client
+            )
+        }
+        aligned = [
             request
             for request in ready
-            if not request.is_generation_only_request or request.py_request_id in ready_ids
+            if not request.is_generation_only_request
+            or (request.parent_request_id if request.is_child else request.py_request_id)
+            in complete
         ]
+        propagated = set(cancel_ids) | (all_cancel_ids & set(requests.values()))
+        return aligned, propagated, complete
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
