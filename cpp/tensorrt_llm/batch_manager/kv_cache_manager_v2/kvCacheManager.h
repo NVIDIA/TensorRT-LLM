@@ -188,8 +188,8 @@ public:
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
-        bool enableRequestStats = false,
-        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt);
+        bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     //! Restore expired, unreferenced pages to the default retention priority.
     void refreshRetention();
@@ -202,6 +202,9 @@ public:
     BlockRadixTree::ReuseMatch matchReuse(
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+    // GPU-resident pages of the same match, counted per locality domain.
+    std::vector<int> probeReuseDomains(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
     // Read-only, advisory key of the first full block past the reusable prefix.
     // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
@@ -247,6 +250,10 @@ public:
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;
+    int numLocalityDomains() const noexcept;
+    // Contiguous mapped extents of a buffer as (address, page count) pairs. A single pair unless
+    // the GPU tier is localized, whose pools are mapped in interleaved per-domain chunks.
+    std::vector<std::pair<MemAddress, size_t>> getMappedBufferViews(LayerId layerId, DataRole role) const;
     bool enablePartialMatch() const noexcept;
 
     // Partial commit is independent of partial matching so beam search can

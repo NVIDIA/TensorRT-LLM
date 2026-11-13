@@ -65,6 +65,11 @@ Page::~Page()
         });
 }
 
+std::optional<LocalityDomainId> Page::localityDomainId() const
+{
+    return hasValidSlot() ? manager->localityDomainOf(cacheLevel, lifeCycle, slotId()) : std::nullopt;
+}
+
 PageStatus Page::status() const noexcept
 {
     auto h = holder.lock();
@@ -540,8 +545,9 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         for (auto const& page : pages)
             if (page->cacheLevel != kHotLevel)
                 ++requirements[storeMgr->getPoolGroupIndex(kHotLevel, page->lifeCycle)];
-        storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
-        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder);
+        storeMgr->prepareFreeSlots(
+            kHotLevel, requirements, migrationRecorder, dropRecorder, kvCache.localityDomainId());
+        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder, kvCache.localityDomainId());
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).

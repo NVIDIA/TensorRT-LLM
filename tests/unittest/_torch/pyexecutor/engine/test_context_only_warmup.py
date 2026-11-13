@@ -25,6 +25,7 @@ def _warmup_fixture(context_only: bool, available: int = 64):
         tokens_per_block=128,
         num_extra_kv_tokens=0,
         _kv_alloc_extra_tokens=0,
+        num_locality_domains=1,
         _has_cp_helix=False,
         _stream=SimpleNamespace(cuda_stream=0),
         _create_kv_cache=Mock(

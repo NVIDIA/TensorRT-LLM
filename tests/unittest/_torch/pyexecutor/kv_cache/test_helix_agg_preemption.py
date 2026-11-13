@@ -287,9 +287,9 @@ def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name:
         assert manager.get_kv_cache_stats().max_num_blocks == POOL_PAGES
 
         def record_context_preemption(
-            *args, _preempt=scheduler._try_preempt_for_pages, _rank=cp_rank
+            *args, _preempt=scheduler._try_preempt_for_pages, _rank=cp_rank, **kwargs
         ):
-            preempted = _preempt(*args)
+            preempted = _preempt(*args, **kwargs)
             context_preemptions[_rank] += preempted
             return preempted
 

@@ -323,7 +323,10 @@ class DecoderRunner(ScheduledModelRunner):
         self, mm_item_scheduler: MultimodalItemScheduler | None
     ) -> DecoderInputPreparer:
         """Build the input preparer over this runner's buffers."""
-        return DecoderInputPreparer(**self._input_preparer_kwargs(mm_item_scheduler))
+        return DecoderInputPreparer(
+            **self._input_preparer_kwargs(mm_item_scheduler),
+            attention_runtime_features=self._attention_runtime_features,
+        )
 
     def _make_cuda_graphs(self) -> DecoderCudaGraphs:
         """Build the CUDA graph component; call after the input preparer."""

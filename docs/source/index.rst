@@ -72,6 +72,7 @@ Welcome to TensorRT LLM's Documentation!
    features/embeddings.md
    features/kvcache.md
    features/kv-hints.md
+   features/locality-domains.md
    features/kv-cache-compression.md
    features/long-sequence.md
    features/lora.md

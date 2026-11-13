@@ -119,6 +119,9 @@ inline constexpr FileDescriptor kBadFileDescriptor = -1;
 using PageIndex = StrongIndex<int, struct PageIndexTag, -1>;
 inline constexpr PageIndex kBadPageIndex{-1};
 
+// Index of a GPU locality domain.
+using LocalityDomainId = StrongIndex<int, struct LocalityDomainIdTag>;
+
 // Eviction priority (0 = highest priority to evict, 100 = lowest).
 using Priority = int;
 inline constexpr Priority kPriorityMin = 0;
