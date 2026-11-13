@@ -129,6 +129,30 @@ def main() -> None:
     print(f"{args.mode} rank={rank}: finished_cancel={request.is_finished}", flush=True)
     MPI.COMM_WORLD.Barrier()
 
+    if args.mode in ("fixed", "forced-skew"):
+        # Drive the loop-head vote: `_cancel_waiting_disagg_requests` runs the
+        # cancellation consensus directly, without a model batch. Rank 1's
+        # receive is still not drained, so no rank may retire the request yet.
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        if not request.is_finished:
+            # Physical retirement readiness follows the fake drain order: rank 0
+            # has drained its receive, rank 1 still owns transfer resources.
+            engine.disagg.request_cancellation = lambda request, r=rank: r == 0
+            remaining = engine._cancel_waiting_disagg_requests([])
+            assert remaining == []
+            assert not request.is_finished
+            assert engine.canceled_req_ids == [42]
+            print(f"{args.mode} rank={rank}: vote held retirement", flush=True)
+            MPI.COMM_WORLD.Barrier()
+            # Every rank's drain settles; the vote retires the batch together.
+            engine.disagg.request_cancellation = lambda request: True
+            remaining = engine._cancel_waiting_disagg_requests([])
+            assert remaining == []
+            assert request.is_finished
+            assert engine.canceled_req_ids == []
+            print(f"{args.mode} rank={rank}: vote completed cancellation", flush=True)
+
     candidate = TransferRequest(
         43, is_context_only_request=False, state=LlmRequestState.DISAGG_GENERATION_INIT
     )
