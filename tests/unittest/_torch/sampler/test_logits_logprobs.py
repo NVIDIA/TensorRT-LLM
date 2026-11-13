@@ -286,6 +286,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
                 token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
             )
 
+            sampled_in_topk = False
             if logprobs_k > 0:
                 sampled_token_rank = token_logprobs[sampled_token_id].rank
                 sampled_in_topk = sampled_token_rank <= logprobs_k
@@ -562,12 +563,12 @@ def test_logprobs_against_logits(
         # The last context logprob dict and the first generation logprob dict should agree on
         # the top-n entries (n = min(prompt_logprobs_k, logprobs_k)) and the sampled token's logprob.
         if prompt_logprobs_k is not None and logprobs_k is not None:
-            last_context_logprob = context_logprobs[-1]
-            first_generation_logprob = generation_logprobs[0]
+            last_context_logprob = output.outputs[0].prompt_logprobs[-1]
+            first_generation_logprob = output.outputs[0].logprobs[0]
             less_prompt_logprobs = prompt_logprobs_k <= logprobs_k
             expected = last_context_logprob if less_prompt_logprobs else first_generation_logprob
             compare = first_generation_logprob if less_prompt_logprobs else last_context_logprob
-            sampled_token_id = generation_tokens[0]
+            sampled_token_id = output.outputs[0].token_ids[0]
             assert sampled_token_id in last_context_logprob, (
                 f"Sampled token {sampled_token_id} is not a valid key in the last entry "
                 f"of the context logprob dict: {list(last_context_logprob.keys())}"

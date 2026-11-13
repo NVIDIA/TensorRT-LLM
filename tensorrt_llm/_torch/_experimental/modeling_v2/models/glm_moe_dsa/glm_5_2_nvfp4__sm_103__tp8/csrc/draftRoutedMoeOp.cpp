@@ -110,7 +110,7 @@ CUtensorMap const& weightMap(
 } // namespace
 
 //! Routed experts of the MTP draft layer (see draftRoutedMoe.h): native DeepSeek-V3
-//! routing of ``router_logits`` with ``routing_bias``, FC1 + SwiGLU + FC2 + finalize on the FlashInfer TRT-LLM-Gen
+//! routing of ``router_logits`` with ``routing_bias``, FC1 + SwiGLU + FC2 + finalize on the TRT-LLM-Gen
 //! BF16 layouts of ``w3_w1`` / ``w2``. Returns the finalized routed output ``[R, 6144]`` (BF16). ``h_scratch`` and
 //! ``route_scratch`` are written (declared mutated in the schema) and reused by every call; calls sharing them must
 //! be ordered on one stream. ``debug_fc2`` (optional, ``[R, 8, 6144]`` BF16)

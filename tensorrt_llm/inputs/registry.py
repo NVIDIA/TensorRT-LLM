@@ -37,6 +37,7 @@ from tensorrt_llm.checkpoint_format import CheckpointFormat
 from .._errors import ConfigInputError, UnsupportedError
 from ..logger import logger
 from ..sampling_params import SamplingParams
+from . import multimodal
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .model_config import resolve_top_level_model_type
@@ -251,6 +252,26 @@ class BaseMultimodalInputProcessor(ABC):
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
         """Return per-modality decode defaults, below server and request overrides."""
         return {}
+
+    def get_disagg_prefill_inputs(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_params: multimodal.MultimodalParams,
+    ) -> Optional[multimodal.MultimodalInputLayout]:
+        """Export exact encoder-side prompt layout for models that preserve it.
+
+        Returning None keeps the model's existing prefill reconstruction path.
+        Models that return a layout accept it as ``encoder_inputs`` in their
+        ``build_disagg_prefill_multimodal_inputs`` method.
+
+        Args:
+            prompt_token_ids: Fully expanded prompt produced by preprocessing.
+            multimodal_params: Processed media and layout metadata for the prompt.
+
+        Returns:
+            Encoder layout to carry to prefill, or None to use reconstruction.
+        """
+        return None
 
     def get_mm_item_metadata(
         self,

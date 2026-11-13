@@ -548,6 +548,38 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # NVFP4 on SM100 requires the Modeling V2 split/fused targets.
+        {
+            'patterns': [
+                'glm_5.3_flash_nvfp4-serve-pytorch',
+                'glm_5.3_flash_nvfp4_mtp-serve-pytorch',
+            ],
+            'config': {
+                'modeling_v2': 'require',
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 8192,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_nvfp4_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
         # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).

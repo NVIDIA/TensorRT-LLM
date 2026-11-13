@@ -6,6 +6,7 @@ import dataclasses
 import json
 import math
 import time
+import traceback
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -232,6 +233,9 @@ class GenerationResultBase:
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
+        self.ctx_computed_tokens = 0
+        self.ctx_first_begin = -1
+        self.ctx_num_chunks = 0
         self.per_pos_drafted = None
         self.per_pos_accepted = None
         # Cumulative (accepted, drafted) draft-token totals attached by the
@@ -580,6 +584,11 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        """Update outputs, completion state, and handoff metadata from a response.
+
+        Args:
+            response: Executor or postprocessing result for this request.
+        """
         req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
             req_perf_metrics_dict = response.request_perf_metrics
@@ -594,6 +603,10 @@ class GenerationResultBase:
             self.avg_decoded_tokens_per_iter = (
                 response.avg_decoded_tokens_per_iter)
             self.cached_tokens = response.cached_tokens
+            self.ctx_computed_tokens = getattr(response, 'ctx_computed_tokens',
+                                               0)
+            self.ctx_first_begin = getattr(response, 'ctx_first_begin', -1)
+            self.ctx_num_chunks = getattr(response, 'ctx_num_chunks', 0)
             if isinstance(response.res, CompletionOutput):
                 # in streaming mode
                 self._outputs[0] = response.res
@@ -659,6 +672,11 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
+            self.ctx_computed_tokens = getattr(response_result,
+                                               'ctx_computed_tokens', 0)
+            self.ctx_first_begin = getattr(response_result, 'ctx_first_begin',
+                                           -1)
+            self.ctx_num_chunks = getattr(response_result, 'ctx_num_chunks', 0)
             self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
@@ -697,6 +715,7 @@ class GenerationResultBase:
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
                     multimodal_embedding_handles=None,
+                    multimodal_input_layout=None,
                 )
 
             finish_reasons = response_result.finish_reasons
@@ -789,6 +808,15 @@ class GenerationResultBase:
         else:
             raise ValueError(f"Unknown response type: {response}")
 
+    def _num_prompt_tokens(self) -> int:
+        """Prompt length without expanding an int32-buffer prompt into a list."""
+        num = getattr(getattr(self, "_generation_request", None),
+                      "num_prompt_tokens", None)
+        if isinstance(num, int):
+            return num
+        prompt_token_ids = getattr(self, "prompt_token_ids", None)
+        return len(prompt_token_ids) if prompt_token_ids is not None else 0
+
     def record_stats(self,
                      output: CompletionOutput,
                      stats: Optional[dict[str, float]] = None,
@@ -819,10 +847,10 @@ class GenerationResultBase:
             metrics_stats.update(processed_metrics_stat)
         # Record prompt tokens only for the first candidate to avoid
         # double-counting the shared prompt across n candidates.
-        prompt_token_ids = getattr(self, "prompt_token_ids", None)
         if output.finish_reason and sequence_index == 0:
-            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
-                metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+            num_prompt_tokens = self._num_prompt_tokens()
+            if num_prompt_tokens > 0:
+                metrics_stats[MetricNames.PROMPT_TOKENS] = num_prompt_tokens
 
         # Request-scoped metrics: only record for the first candidate to avoid
         # double-counting across n candidates.
@@ -846,6 +874,9 @@ class GenerationResultBase:
                     metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
                         [spec_dec.total_draft_tokens]
 
+            # The ids themselves are needed only here, for prompt logprobs.
+            prompt_token_ids = (getattr(self, "prompt_token_ids", None)
+                                if output.prompt_logprobs else None)
             if output.prompt_logprobs and prompt_token_ids:
                 try:
                     prompt_lps = []
@@ -867,8 +898,8 @@ class GenerationResultBase:
                         if math.isfinite(ppl):
                             metrics_stats[MetricNames.PREFILL_PERPLEXITY] = ppl
                 except (ValueError, TypeError):
-                    logger.debug("Failed to compute prefill perplexity",
-                                 exc_info=True)
+                    logger.debug("Failed to compute prefill perplexity:\n"
+                                 f"{traceback.format_exc()}")
 
         # Candidate-scoped metric: generation perplexity is computed per candidate
         # from this candidate's logprobs.
@@ -895,8 +926,8 @@ class GenerationResultBase:
                         mean_lp = sum(gen_lps) / len(gen_lps)
                         gen_ppl = math.exp(-mean_lp)
                 except (ValueError, TypeError):
-                    logger.debug("Failed to compute generation perplexity",
-                                 exc_info=True)
+                    logger.debug("Failed to compute generation perplexity:\n"
+                                 f"{traceback.format_exc()}")
             if gen_ppl is not None and math.isfinite(gen_ppl):
                 metrics_stats[MetricNames.GENERATION_PERPLEXITY] = gen_ppl
 
@@ -959,10 +990,10 @@ class GenerationResultBase:
                           sampling_params.n)
             safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_ID,
                           self.id)
-            if prompt_token_ids := getattr(self, "prompt_token_ids", None):
+            if num_prompt_tokens := self._num_prompt_tokens():
                 safe_set_attr(span,
                               tracing.SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
-                              len(prompt_token_ids))
+                              num_prompt_tokens)
             safe_set_attr(span,
                           tracing.SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS,
                           output.length)

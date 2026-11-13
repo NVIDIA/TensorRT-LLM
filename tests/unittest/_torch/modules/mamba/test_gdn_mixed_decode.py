@@ -142,13 +142,34 @@ def test_mixed_decode_matches_decode_only(
         else None
     )
     actual_conv, actual_state = conv.clone(), state.clone()
-    with patch.object(
-        gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
-    ) as prefill_call:
+    # The prefill scan has two entry points (the adapter, and the single-launch direct
+    # path taken with a preallocated output on SM100, which returns False elsewhere and
+    # then falls back to the adapter); both run for real, only observed.
+    direct_launches = []
+    real_direct = gdn_mixer.chunk_gated_delta_rule_indexed_direct
+
+    def observe_direct(*args, **kwargs):
+        launched = real_direct(*args, **kwargs)
+        if launched:
+            direct_launches.append(args)
+        return launched
+
+    with (
+        patch.object(
+            gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
+        ) as scan_call,
+        patch.object(gdn_mixer, "chunk_gated_delta_rule_indexed_direct", observe_direct),
+    ):
         actual = layer.forward_extend(actual_conv, actual_state, output=output, **common)
-    # Only the prefill requests go through the prefill kernel.
-    assert prefill_call.call_count == 1
-    assert prefill_call.call_args.kwargs["cu_seqlens"].shape[0] == num_prefills + 1
+    # Only the prefill requests go through the prefill kernel, in a single scan.
+    assert scan_call.call_count + len(direct_launches) == 1
+    scan_cu_seqlens = (
+        scan_call.call_args.kwargs["cu_seqlens"]
+        if scan_call.call_count
+        # (q, k, v, g, beta), output, cu_seqlens, ssm_states, state_indices
+        else direct_launches[0][6]
+    )
+    assert scan_cu_seqlens.shape[0] == num_prefills + 1
 
     torch.testing.assert_close(actual[:, prefill_length:], expected_decode, rtol=0, atol=0)
     torch.testing.assert_close(
@@ -207,6 +228,7 @@ def test_forward_core_runs_prefill_groups_from_host_offsets(
         state_indices=indices,
         query_start_loc=positions,
         query_start_loc_long=positions.long(),
+        arange_long=lambda n: torch.arange(n + 1, device="cuda", dtype=torch.int64),
         replay_work_items=None,
         replay_n_writes=None,
     )
