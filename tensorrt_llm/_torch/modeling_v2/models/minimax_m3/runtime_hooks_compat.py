@@ -6,9 +6,11 @@ The M3.1 targets request step-loop hooks by field name, and some of those fields
 ``RuntimeHooks`` or ``MsaRuntimePolicy``. Both dataclasses are frozen, so passing such a field would raise. ``build``
 passes every requested field the engine has, and handles each one it lacks by what running without it costs:
 
-* ``MAIN_DEFAULT``: the engine already behaves this way by default (E4M3 saturating KV-cache writes, a zeroed and
-  exactly sized MSA KV pool). Running without the field is the same, unless the process turned that default off
-  (``missing_defaults``), which declines the target.
+* ``MAIN_DEFAULT`` / ``MSA_MAIN_DEFAULT``: the engine already behaves this way by default (E4M3 saturating KV-cache
+  writes, a zeroed and exactly sized MSA KV pool, int32 prompt-token arrays for every request, no accepted-draft
+  count upload, drafter batch maps re-uploaded only on change, block ids copied from the page-index views, the MSA
+  sub-page table and out-cache-loc tail staged inside the forward). Running without the field is the same, unless
+  the process turned that default off (``missing_defaults``), which declines the target.
 * ``PERF_ONLY`` / ``MSA_PERF_ONLY``: the same tokens, with more host or device work per step.
 * ``DRAFT_ONLY``: the drafts, so the acceptance length, may change; the verified tokens do not.
 * ``CONDITIONAL``: needed only by a configuration the family's ``route`` declines while the engine lacks it.
@@ -36,6 +38,7 @@ __all__ = [
     "CONDITIONAL",
     "DRAFT_ONLY",
     "MAIN_DEFAULT",
+    "MSA_MAIN_DEFAULT",
     "MSA_PERF_ONLY",
     "MsaRuntimePolicy",
     "PERF_ONLY",
@@ -47,11 +50,19 @@ __all__ = [
     "requested",
 ]
 
-MAIN_DEFAULT: FrozenSet[str] = frozenset({"fp8_saturating_casts", "msa_kv_cache_fixes"})
+MAIN_DEFAULT: FrozenSet[str] = frozenset(
+    {
+        "context_token_array",
+        "fp8_saturating_casts",
+        "msa_kv_cache_fixes",
+        "skip_accepted_draft_upload",
+        "spec_batch_map_changed_only",
+        "token_array_all_requests",
+    }
+)
 PERF_ONLY: FrozenSet[str] = frozenset(
     {
         "context_onehot_index_fill",
-        "context_token_array",
         "defer_gen_reuse_commit",
         "dflash_host_ctx_alloc",
         "install_tactic_pins",
@@ -65,12 +76,9 @@ PERF_ONLY: FrozenSet[str] = frozenset(
         "prefill_capture_max_num_tokens",
         "proxy_ms_reuse",
         "sparse_attention",
-        "skip_accepted_draft_upload",
         "skip_unchanged_draft_block_offsets",
-        "spec_batch_map_changed_only",
         "spec_slot_ids_changed_only",
         "spec_tail_bookkeep",
-        "token_array_all_requests",
     }
 )
 DRAFT_ONLY: FrozenSet[str] = frozenset({"disagg_draft_kv", "draft_kv_reserve_guard"})
@@ -78,10 +86,9 @@ DRAFT_ONLY: FrozenSet[str] = frozenset({"disagg_draft_kv", "draft_kv_reserve_gua
 CONDITIONAL: FrozenSet[str] = frozenset({"draft_pool_fixes"})
 # The release of a model's prefill CUDA graphs, which resets the pointer guard of the graphs that baked the addresses.
 REQUIRED: FrozenSet[str] = frozenset({"prefill_graphs_released"})
+MSA_MAIN_DEFAULT: FrozenSet[str] = frozenset({"block_ids_from_views", "forward_staging"})
 MSA_PERF_ONLY: FrozenSet[str] = frozenset(
     {
-        "block_ids_from_views",
-        "forward_staging",
         "kv_update_tail",
         "long_family_min_total_tokens",
         "prefill_proxy_kv_splits",
@@ -155,7 +162,9 @@ def build(
     unknown = sorted(set(hooks) - have)
     msa_unknown = sorted(set(msa) - msa_have)
     unclassified = [name for name in unknown if name not in _CLASSIFIED]
-    unclassified += [f"msa.{name}" for name in msa_unknown if name not in MSA_PERF_ONLY]
+    unclassified += [
+        f"msa.{name}" for name in msa_unknown if name not in MSA_PERF_ONLY | MSA_MAIN_DEFAULT
+    ]
     if unclassified:
         raise TypeError(
             f"{target}: runtime hook fields this engine does not have and runtime_hooks_compat does not classify: "
@@ -184,7 +193,8 @@ def build(
                     dropped.setdefault(kind, []).append(name)
     for name in msa_unknown:
         if _enabled(msa[name]):
-            dropped.setdefault("perf only", []).append(f"msa.{name}")
+            kind = "the engine default" if name in MSA_MAIN_DEFAULT else "perf only"
+            dropped.setdefault(kind, []).append(f"msa.{name}")
     if dropped and target not in _LOGGED:
         _LOGGED.add(target)
         logger.info(
