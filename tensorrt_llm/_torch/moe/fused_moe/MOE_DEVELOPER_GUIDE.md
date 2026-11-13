@@ -313,7 +313,7 @@ A family package has one layout, so a new leaf has an obvious place:
   (`grouped_gemm/base.py`, `grouped_gemm/eligibility.py`).
 - One module per registered leaf, named after what tells it from its siblings:
   the `quant` segment in `cutlass/` and `marlin/`, provider and `quant` in
-  `trtllm_gen/` (`trtllm_nvfp4.py`, `flashinfer_bf16.py`), and in `cutedsl/`,
+  `trtllm_gen/` (`trtllm_nvfp4.py`, `trtllm_bf16.py`), and in `cutedsl/`,
   which holds several kernels, the kernel first (`grouped_gemm/nvfp4.py`,
   `fused_fc12.py`).
 - Modules several leaves share, named for what they hold: a kernel ABI
