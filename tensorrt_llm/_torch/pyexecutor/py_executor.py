@@ -8058,10 +8058,14 @@ class PyExecutor:
         # consumed: no further item will arrive to wake a blocking get(), so
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
-        # on `shutdown_event`.
+        # on `shutdown_event`. A rank with a pending cancellation is not idle
+        # either: the loop-head vote calls a TP+CP collective on every rank,
+        # and a blocking fetch here would hold that vote. The pending cancel
+        # can also be ready only on a peer, so waiting for a locally live
+        # request would not necessarily end.
         pending_retirement = self.disagg.has_retiring_gen_receives
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown
+                and not self.canceled_req_ids and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
                 and not pending_retirement)
         if idle:
@@ -11084,12 +11088,12 @@ class PyExecutor:
         Returns:
             Executor request IDs excluded from further model scheduling.
         """
-        if (not getattr(self, "canceled_req_ids", None)
-                or self.kv_cache_transceiver is None
-                or getattr(self, "kv_connector_manager", None) is not None
-                or self.dist.pp_size != 1):
-            return set()
         replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        if (not getattr(self, "canceled_req_ids", None)
+                or self.kv_cache_transceiver is None or self.dist.pp_size != 1
+                or (getattr(self, "kv_connector_manager", None) is not None
+                    and not replicated_gen_cancel)):
+            return set()
         restricted_model = (
             getattr(self, "is_encoder_decoder", False)
             or getattr(self, "_mm_encoder_item_scheduling_enabled", False))
@@ -11130,11 +11134,14 @@ class PyExecutor:
         Returns:
             Newly activated requests that were not retired by cancellation.
         """
-        if (self.kv_cache_transceiver is None
-                or getattr(self, "kv_connector_manager", None) is not None):
-            return new_requests
-
         replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        if (self.kv_cache_transceiver is None
+                or (getattr(self, "kv_connector_manager", None) is not None
+                    and not replicated_gen_cancel)):
+            # A connector owns its requests' cancellation, except where the
+            # replicated GEN consensus runs: those requests retire only through
+            # the rank vote, which this rank must join even with a connector.
+            return new_requests
         if not self.canceled_req_ids and not replicated_gen_cancel:
             return new_requests
 
@@ -11181,6 +11188,14 @@ class PyExecutor:
                         and not legacy_gen_waiting)):
                 continue
             if model_cancelled and not self._try_cancel_request(request):
+                continue
+            if (legacy_gen_waiting
+                    and getattr(self, "kv_connector_manager", None) is not None
+                    and not self._try_cancel_request(request)):
+                # A connector still holds asynchronous work for this request (a
+                # pending load termination or preemption). Its retirement must
+                # wait for the connector hooks, exactly like local cancellation
+                # would, but the consensus batch vote still runs below.
                 continue
             if (generation_waiting
                     and id(request) in self._held_transfer_failures()):
