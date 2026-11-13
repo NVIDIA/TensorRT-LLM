@@ -6,6 +6,7 @@ import concurrent.futures
 import os
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, Optional
@@ -402,8 +403,8 @@ class RPCClient:
                             raise
                         except Exception as e:
                             # Log the error but continue reading unless it's a critical error
-                            logger.error(f"Error processing response: {e}",
-                                         exc_info=True)
+                            logger.error(f"Error processing response: {e}\n"
+                                         f"{traceback.format_exc()}")
 
                             # For critical errors, propagate and exit
                             if isinstance(e, (ConnectionError, zmq.ZMQError)):

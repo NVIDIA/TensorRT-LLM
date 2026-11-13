@@ -62,8 +62,7 @@ async def test_ctx_failure_releases_pending_gen_placement(
                 body["role"], body["routing_key"], body["req_id"], body["exclude_server"]
             )
 
-        if reserved_before_cancel:
-            selected = await reserve()
+        selected = await reserve() if reserved_before_cancel else None
         selection_paused.set()
         await release_selection.wait()
         if not reserved_before_cancel:

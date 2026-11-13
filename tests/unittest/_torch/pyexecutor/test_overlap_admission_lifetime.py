@@ -3,6 +3,7 @@
 
 from types import MethodType, SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -45,6 +46,7 @@ def _admission_executor(
         is_benchmark_disagg=False,
         is_warmup=False,
         _enable_non_overlap_adp_forward_intent=True,
+        _fetch_hint_enabled=False,
         _kv_load_tracker=KvLoadTracker(None, rank=rank, enabled=False),
         _kv_cache_capacity={},
         _kv_connector_moves_kv=False,
@@ -54,8 +56,8 @@ def _admission_executor(
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
     )
-    executor._fetch_and_enqueue_requests = lambda queue, live: executor.observed_live_counts.append(
-        live
+    executor._fetch_and_enqueue_requests = (
+        lambda queue, live, **_: executor.observed_live_counts.append(live)
     )
     for name in (
         "_get_request_admission_capacity",
@@ -74,7 +76,7 @@ def _fetch_all_ranks(
     # Produce peer payloads through the real router before simulating transport.
     payloads = []
     for executor, active in zip(executors, residents, strict=True):
-        executor.dist.tp_allgather = lambda payload: [payload]
+        executor.dist.tp_allgather_int64 = lambda payload: np.asarray([payload], dtype=np.int64)
         state = executor.adp_router.gather_all_rank_states(active)[0]
         payloads.append(state.serialize())
 
@@ -82,9 +84,13 @@ def _fetch_all_ranks(
     for rank, (executor, queue, active) in enumerate(
         zip(executors, queues, residents, strict=True)
     ):
-        executor.dist.tp_allgather = lambda payload, rank=rank: [
-            payload if peer == rank else peer_payload for peer, peer_payload in enumerate(payloads)
-        ]
+        executor.dist.tp_allgather_int64 = lambda payload, rank=rank: np.asarray(
+            [
+                payload if peer == rank else peer_payload
+                for peer, peer_payload in enumerate(payloads)
+            ],
+            dtype=np.int64,
+        )
         admitted.append(PyExecutor._fetch_new_requests(executor, queue, active))
     return admitted
 

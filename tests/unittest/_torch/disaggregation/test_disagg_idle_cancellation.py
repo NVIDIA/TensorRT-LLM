@@ -145,7 +145,12 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.is_encoder_decoder = False
     engine._mm_encoder_item_scheduling_enabled = False
     engine.dist = SimpleNamespace(
-        rank=0, tp_size=1, pp_size=1, world_size=1, mapping=SimpleNamespace(tp_group=[0])
+        rank=0,
+        tp_size=1,
+        pp_size=1,
+        world_size=1,
+        mapping=SimpleNamespace(tp_group=[0]),
+        tp_allreduce=lambda value, op=None: value,
     )
     engine.executor_request_queue = ExecutorRequestQueue(
         dist=engine.dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=0.0
@@ -160,7 +165,9 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.model_engine = SimpleNamespace(wait_for_input_copy=Mock(), is_spec_decode=False)
     engine.draft_model_engine = None
     engine._maybe_record_hang_diagnostic_phase = Mock()
-    engine.async_transfer_manager = SimpleNamespace(requests_in_transfer=lambda: {})
+    engine.async_transfer_manager = SimpleNamespace(
+        requests_in_transfer=lambda: {}, has_any_inflight_requests=lambda: False
+    )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._fp4_mla_bridge_enabled = True
     transceiver._ever_had_recv_session = False
@@ -632,8 +639,11 @@ def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary
     )
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
-    executor.kv_cache_manager = Mock(spec=["update_resources", "is_preemption_pending"])
+    executor.kv_cache_manager = Mock(
+        spec=["update_resources", "is_preemption_pending", "has_pending_preemption"]
+    )
     executor.kv_cache_manager.is_preemption_pending.return_value = False
+    executor.kv_cache_manager.has_pending_preemption.return_value = False
     executor.resource_manager = Mock(spec=["free_resources", "update_resources"])
     executor.model_engine.attn_metadata = object()
     executor.model_engine.kv_cache_dtype_byte_size = 2
@@ -701,8 +711,11 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
     executor.sampler.update_requests = sampler.update_requests
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
-    executor.kv_cache_manager = Mock(spec=["update_resources", "is_preemption_pending"])
+    executor.kv_cache_manager = Mock(
+        spec=["update_resources", "is_preemption_pending", "has_pending_preemption"]
+    )
     executor.kv_cache_manager.is_preemption_pending.return_value = False
+    executor.kv_cache_manager.has_pending_preemption.return_value = False
     executor.resource_manager = Mock(spec=["free_resources", "update_resources"])
     executor.model_engine.attn_metadata = object()
     executor.model_engine.kv_cache_dtype_byte_size = 2

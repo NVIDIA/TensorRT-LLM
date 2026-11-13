@@ -271,6 +271,24 @@ class Distributed(ABC):
     def tp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
+    def allgather_ints(self, values: List[int]) -> List[List[int]]:
+        """All-gather one fixed-width vector of Python ints per TP rank.
+
+        Rides ``tp_allgather_int64``: one buffer collective under MPI and the
+        CUDA-staged CPU-tensor path under TorchDist, falling back to the
+        object gather where that is unavailable.  Every rank must pass the
+        same number of values: fixed-size gathers have no size exchange.
+        Returns one plain ``list[int]`` per rank, indexed by TP rank.
+        """
+        width = len(values)
+        result = self.tp_allgather_int64(values).tolist()
+        if any(len(row) != width for row in result):
+            raise RuntimeError(
+                f"allgather_ints: rank {self.rank} sent {width} values but "
+                f"received rows of widths {[len(row) for row in result]}; "
+                "every rank must send the same fixed-width vector")
+        return result
+
     @abstractmethod
     def cp_allgather(self, obj, *, small_payload: bool = False):
         pass

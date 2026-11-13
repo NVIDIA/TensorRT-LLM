@@ -111,7 +111,7 @@ def _capture_manager_kwargs(
     )
     model_engine = (
         SimpleNamespace(
-            model=SimpleNamespace(model_config=model_config),
+            model=SimpleNamespace(model_config=model_config, modules=lambda: iter(())),
             max_cuda_graph_batch_size=4,
             input_processor=Mock(spec=BaseMultimodalInputProcessor) if is_multimodal else None,
         )

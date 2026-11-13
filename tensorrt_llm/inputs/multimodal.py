@@ -761,6 +761,63 @@ class MultimodalInput:
 
 
 @dataclass
+class MultimodalInputLayout:
+    """Tensor-free encoder prompt snapshot carried across E/P transport.
+
+    Prefill consumes this snapshot into ``(prompt_token_ids, MultimodalParams)``.
+    It is not an execution view and owns no encoder cache references.
+    """
+
+    prompt_token_ids: List[int]
+    multimodal_lengths: List[int]
+    multimodal_positions: List[int]
+    multimodal_embedding_lengths: List[int]
+    multimodal_item_run_cu_offsets: Optional[List[int]] = None
+    multimodal_run_positions: Optional[List[int]] = None
+    multimodal_run_lengths: Optional[List[int]] = None
+    special_token_offsets: Optional[List[int]] = None
+    item_types: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        """Validate the prompt snapshot before it crosses the E/P boundary."""
+        _validate_int_list(self.prompt_token_ids, "prompt_token_ids")
+        _validate_int_list(self.multimodal_embedding_lengths,
+                           "multimodal_embedding_lengths")
+        _validate_multimodal_positions_and_lengths(
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            len(self.multimodal_embedding_lengths),
+            "multimodal_embedding_lengths",
+        )
+
+        if any(length <= 0 for length in self.multimodal_embedding_lengths):
+            raise ValueError("multimodal_embedding_lengths must be positive")
+
+        _validate_multimodal_runs(
+            len(self.multimodal_lengths),
+            self.multimodal_lengths,
+            self.multimodal_item_run_cu_offsets,
+            self.multimodal_run_positions,
+            self.multimodal_run_lengths,
+            "multimodal_lengths",
+        )
+        self._validate_optional_metadata()
+
+    def _validate_optional_metadata(self) -> None:
+        """Validate optional framing offsets and model-specific item tags."""
+        if self.special_token_offsets is not None:
+            _validate_int_list(self.special_token_offsets,
+                               "special_token_offsets")
+            if any(offset < 0 for offset in self.special_token_offsets):
+                raise ValueError("special_token_offsets must be non-negative")
+        if self.item_types is not None:
+            _validate_int_list(self.item_types, "item_types")
+            if len(self.item_types) != len(self.multimodal_lengths):
+                raise ValueError("item_types length must match "
+                                 "multimodal_lengths")
+
+
+@dataclass
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal embedding caching and reuse per request sequence.
 

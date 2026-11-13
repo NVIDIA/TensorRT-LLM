@@ -18,6 +18,7 @@ pytestmark = pytest.mark.cpu_only
 def test_all_padding_families_preserve_real_slot_ownership(monkeypatch, physical_k):
     # Exercise the real initialization and host prepare methods. This deliberately
     # does not validate device copies, graph replay, or target KV-cache contents.
+    dummy = None
     original_zeros = torch.zeros
     original_empty = torch.empty
     original_full = torch.full

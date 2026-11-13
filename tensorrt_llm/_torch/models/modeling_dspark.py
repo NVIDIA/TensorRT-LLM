@@ -2902,7 +2902,7 @@ class _DSparkHeadMixin:
         # runs one slot past the block and reads the next request's anchor.
         # An explicit false still selects the legacy layout.
         shift_label = resolve_dspark_head_config(cfg, "shift_label")
-        self._dspark_shift_label = True if shift_label is None else bool(shift_label)
+        self.shift_label = True if shift_label is None else bool(shift_label)
         self._dspark_markov_rank = int(resolve_dspark_head_config(cfg, "markov_rank") or 0)
         self._dspark_markov_head_type = str(
             resolve_dspark_head_config(cfg, "markov_head_type") or "vanilla"

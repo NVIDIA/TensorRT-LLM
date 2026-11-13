@@ -1472,6 +1472,7 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
         graph_metadata.reset_routing()
         return model(replay_input, graph_metadata.csa2_positions, graph_metadata)
 
+    captured = None
     graph = None
     pointers = None
     for cached in (5, 7):
