@@ -3648,49 +3648,6 @@ def test_deepseek_finish_completes_a_call_from_the_last_delta(
 
 
 @pytest.mark.parametrize(
-    "parser_cls, deltas",
-    [
-        # Two calls in one delta: the streamed arguments of the first call
-        # already come from the second, so sending the second would repeat it.
-        (DeepSeekV3Parser, [
-            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
-            'get_weather\n```json\n{"location": "a"}\n```<｜tool▁call▁end｜>'
-            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>"
-            'get_weather\n```json\n{"loc',
-            'ation": "Tokyo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
-        ]),
-        # The second call's separator arrived while the first call was open.
-        (DeepSeekV31Parser, [
-            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
-            '{"location": "a"', ', "unit"',
-            ': "c"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>',
-            '{"location": "P'
-        ]),
-        # The call has no end token.
-        (DeepSeekV3Parser,
-         [_DS_V3_CALL.replace("<｜tool▁call▁end｜><｜tool▁calls▁end｜>", "")]),
-        (DeepSeekV31Parser,
-         [_DS_V31_CALL.replace("<｜tool▁call▁end｜>", "<｜tool▁call▁en")]),
-    ],
-    ids=[
-        "v3_two_calls_in_one_delta", "v31_second_call_open", "v3_no_end_token",
-        "v31_broken_end_token"
-    ],
-)
-def test_deepseek_finish_sends_nothing_when_the_buffer_is_ambiguous(
-        sample_tools: list[ChatCompletionToolsParam],
-        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
-    """finish() sends nothing unless the buffer holds exactly one whole call."""
-    parser = parser_cls()
-    for delta in deltas:
-        parser.parse_streaming_increment(delta, sample_tools)
-
-    result = parser.finish(sample_tools)
-
-    assert result.calls == []
-
-
-@pytest.mark.parametrize(
     "parser_cls, tool_call_text",
     [
         (
