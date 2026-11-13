@@ -531,8 +531,7 @@ bool MHA::convertMMHAParamsToXQAParams(
         // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
         xqaParams.data_type = DATA_TYPE_E4M3;
     }
-    if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+    if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90)
     {
         xqaParams.multi_block_mode = false;
     }
@@ -3214,8 +3213,7 @@ bool MLA::fillXqaParams(XQAParams& xqaParams, FmhaParams const& p, bool forConfi
             // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
             xqaParams.data_type = DATA_TYPE_E4M3;
         }
-        if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-            || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+        if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90)
         {
             xqaParams.multi_block_mode = false;
         }
