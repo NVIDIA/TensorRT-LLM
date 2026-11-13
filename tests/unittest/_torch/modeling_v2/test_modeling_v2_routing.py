@@ -1568,3 +1568,272 @@ def test_glm52_without_an_fp8_kv_cache_does_not_match():
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match="KV cache bf16"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+# MiniMax-M3.1-Flash: the MiniMax-M3 architecture class and shape with a 1e7 RoPE base, sparse attention on every
+# layer, and MXFP8 dense projections with packed NVFP4 routed experts.
+_M31_LAYOUT = dict(
+    rope_theta=10_000_000, sparse_attention_config=dict(sparse_attention_freq=[1] * 60)
+)
+_M31_QUANTIZATION = dict(moe_quant_algo="NVFP4", moe_quant_format="nvfp4-pack-quantized")
+# The M3.1 target directories and classes ``route`` returns, by topology.
+_M31_TARGETS = {
+    "tp2": ("minimax_m3_1_flash_nvfp4__sm_107__tp2", "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2"),
+    "tp8": ("minimax_m3_1_flash_nvfp4__sm_107__tp8", "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8"),
+    "tp2ctx": (
+        "minimax_m3_1_flash_nvfp4__sm_107__tp2ctx",
+        "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx",
+    ),
+    "dep2ctx": (
+        "minimax_m3_1_flash_nvfp4__sm_107__dep2ctx",
+        "ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx",
+    ),
+    "dep": ("minimax_m3_1_flash_nvfp4__sm_107__dep", "ModelingV2MiniMaxM31FlashNvfp4Sm107Dep"),
+}
+_M31_LAYOUTS = {
+    "tp2": _M3_TP2,
+    "tp8": _M3_TP8,
+    "tp2ctx": dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
+    "dep2ctx": dict(
+        world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True
+    ),
+    "dep": dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8, enable_attention_dp=True),
+}
+# The standalone MiniMax DSpark drafter's config.json: the geometry and target layers the M3.1 targets serve.
+_M31_DRAFTER = dict(
+    architectures=["DSparkMiniMaxDraftModel"],
+    model_type="dspark_minimax",
+    hidden_size=6144,
+    vocab_size=200064,
+    num_key_value_heads=4,
+    head_dim=128,
+    dspark_target_layer_ids=[3, 17, 31, 45, 59],
+)
+
+
+@pytest.fixture
+def _m31_route(monkeypatch):
+    """``route`` with the M3.1 target modules stubbed and the checkpoint's quantization read as M3.1's.
+
+    The stubs check the decision, not that the modeling code imports on this host; the disaggregated serving role is
+    unset unless a test sets it.
+    """
+    import sys
+    import types
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    for directory, name in _M31_TARGETS.values():
+        stub = types.ModuleType(f"{_M3_TARGETS}.{directory}.modeling")
+        setattr(stub, name, type(name, (), {"__module__": stub.__name__}))
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    monkeypatch.setattr(routing, "_quant_algo", lambda _config: QuantAlgo.MXFP8)
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    monkeypatch.delenv("TRTLLM_M3_KV_POOL_ZERO_INIT", raising=False)
+    return routing
+
+
+def _m31_model_config(topology="tp2", spec_config=None, layout=None, kv_checkpoint=None):
+    """The M3.1 checkpoint as ``route`` reads it: text shape, layout, declared expert quantization and mapping."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            text_config=_m3_text_config(**(layout or _M31_LAYOUT)),
+            quantization_config=_M31_QUANTIZATION,
+        ),
+        mapping=Mapping(**(topology if isinstance(topology, dict) else _M31_LAYOUTS[topology])),
+        spec_config=spec_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=kv_checkpoint),
+    )
+
+
+def _m31_dspark(tmp_path, **drafter):
+    """A standalone DSpark speculative config whose drafter checkpoint declares ``_M31_DRAFTER`` + ``drafter``."""
+    import json
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps(dict(_M31_DRAFTER, **drafter)))
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+    return DSparkDecodingConfig(max_draft_len=7, speculative_model=str(tmp_path))
+
+
+@pytest.mark.parametrize("topology", sorted(_M31_TARGETS))
+@pytest.mark.parametrize("speculation", ["none", "dspark"])
+def test_minimax_m3_1_route_picks_the_target_by_topology(
+    _m31_route, tmp_path, topology, speculation
+):
+    """Each M3.1 topology has its own target directory on sm107, with no speculation or a standalone DSpark
+    drafter."""
+    spec_config = _m31_dspark(tmp_path) if speculation == "dspark" else None
+    resolved = _m31_route.route(
+        _m31_model_config(topology, spec_config), _m3_llm_args("auto", "nvfp4"), (10, 7)
+    )
+    directory, name = _M31_TARGETS[topology]
+    assert resolved.__module__ == f"{_M3_TARGETS}.{directory}.modeling"
+    assert resolved.__name__ == name
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+def test_minimax_m3_1_route_takes_an_fp8_or_nvfp4_kv_cache(_m31_route, kv_dtype):
+    resolved = _m31_route.route(_m31_model_config("tp8"), _m3_llm_args("auto", kv_dtype), (10, 7))
+    assert resolved.__name__ == _M31_TARGETS["tp8"][1]
+
+
+@pytest.mark.parametrize(
+    "capability, topology, kv_dtype, reason",
+    [
+        ((10, 3), "tp2", "nvfp4", r"not sm107 \(Rubin\)"),
+        ((10, 0), "tp8", "nvfp4", r"not sm107 \(Rubin\)"),
+        ((10, 7), "tp2", "auto", "a KV cache other than FP8 or NVFP4"),
+        ((10, 7), _M3_TP4, "nvfp4", r"a parallel layout no target runs \(there is no tp4 target\)"),
+        (
+            (10, 7),
+            dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1, enable_attention_dp=True),
+            "nvfp4",
+            "a parallel layout no target runs",
+        ),
+    ],
+    ids=["sm103", "sm100", "bf16_kv_cache", "tp4", "dep8_tp_experts"],
+)
+def test_minimax_m3_1_route_declines_with_the_reason(
+    _m31_route, capability, topology, kv_dtype, reason
+):
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+    with pytest.raises(NoTarget, match=f"^MiniMax-M3.1-Flash: .*{reason}"):
+        _m31_route.route(_m31_model_config(topology), _m3_llm_args("auto", kv_dtype), capability)
+
+
+@pytest.mark.parametrize(
+    "drafter, reason",
+    [
+        (dict(architectures=["DFlashDraftModel"]), r"drafter architecture \['DFlashDraftModel'\]"),
+        (dict(dspark_target_layer_ids=[1, 2, 3]), r"drafter target layers \[1, 2, 3\]"),
+        (dict(hidden_size=4096), "drafter hidden_size 4096, not 6144"),
+    ],
+    ids=["architecture", "target_layers", "geometry"],
+)
+def test_minimax_m3_1_route_declines_another_dspark_drafter(_m31_route, tmp_path, drafter, reason):
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+    spec_config = _m31_dspark(tmp_path, **drafter)
+    with pytest.raises(NoTarget, match=reason):
+        _m31_route.route(
+            _m31_model_config("tp2", spec_config), _m3_llm_args("auto", "nvfp4"), (10, 7)
+        )
+
+
+def test_minimax_m3_1_route_declines_another_speculative_mode(_m31_route):
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+    with pytest.raises(NoTarget, match="speculative decoding NGRAM, not standalone DSpark"):
+        _m31_route.route(_m31_model_config("tp2", _NGRAM), _m3_llm_args("auto", "nvfp4"), (10, 7))
+
+
+def test_minimax_m3_1_route_declines_a_windowed_draft_pool_that_needs_a_resize(
+    _m31_route, tmp_path
+):
+    """A windowed drafter with chunked prefill and no host KV cache needs the separate draft pool's history-first
+    resize, which this engine does not have; a host KV cache, or no chunked prefill, keeps the target."""
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+    spec_config = _m31_dspark(tmp_path, sliding_window=4096)
+    config = _m31_model_config("tp2", spec_config)
+    chunked = _llm_args(
+        "auto", kv_cache_config=dict(dtype="nvfp4"), enable_chunked_prefill=True, max_seq_len=65536
+    )
+    with pytest.raises(NoTarget, match="history-first resize"):
+        _m31_route.route(config, chunked, (10, 7))
+    with_host_cache = _llm_args(
+        "auto",
+        kv_cache_config=dict(dtype="nvfp4", host_cache_size=1 << 30),
+        enable_chunked_prefill=True,
+        max_seq_len=65536,
+    )
+    assert _m31_route.route(config, with_host_cache, (10, 7)).__name__ == _M31_TARGETS["tp2"][1]
+    unchunked = _llm_args("auto", kv_cache_config=dict(dtype="nvfp4"), max_seq_len=65536)
+    assert _m31_route.route(config, unchunked, (10, 7)).__name__ == _M31_TARGETS["tp2"][1]
+
+
+@pytest.mark.parametrize("topology", ["tp2", "tp8", "dep"])
+def test_minimax_m3_1_route_declines_a_windowed_drafter_on_a_generation_worker(
+    _m31_route, monkeypatch, tmp_path, topology
+):
+    """A disaggregated generation worker does not receive the drafter's windowed KV from the context worker on this
+    engine; the context worker itself is unaffected."""
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+    spec_config = _m31_dspark(tmp_path, sliding_window=4096)
+    config = _m31_model_config(topology, spec_config)
+    args = _llm_args("auto", kv_cache_config=dict(dtype="nvfp4"), max_seq_len=65536)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+    with pytest.raises(NoTarget, match="disaggregated generation worker"):
+        _m31_route.route(config, args, (10, 7))
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    assert _m31_route.route(config, args, (10, 7)).__name__ == _M31_TARGETS[topology][1]
+
+
+def test_minimax_m3_1_route_declines_when_the_kv_pool_is_not_zeroed(_m31_route, monkeypatch):
+    """The targets rely on the engine's zero-initialized MSA KV pool when the engine has no hook for it."""
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import runtime_hooks_compat
+
+    if runtime_hooks_compat.has_hook("msa_kv_cache_fixes"):
+        pytest.skip("this engine carries the MSA KV cache fixes as a hook")
+    monkeypatch.setenv("TRTLLM_M3_KV_POOL_ZERO_INIT", "0")
+    with pytest.raises(NoTarget, match="must be zero-initialized"):
+        _m31_route.route(_m31_model_config("tp2"), _m3_llm_args("auto", "nvfp4"), (10, 7))
+
+
+@pytest.mark.parametrize("topology", ["tp2ctx", "dep2ctx", "dep"])
+def test_minimax_m3_checkpoint_keeps_its_message_on_an_m3_1_topology(
+    _m31_route, monkeypatch, topology
+):
+    """An M3 checkpoint on a topology only the M3.1 targets run is declined with the MiniMax-M3 message."""
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+    monkeypatch.setattr(_m31_route, "_quant_algo", lambda _config: QuantAlgo.MIXED_PRECISION)
+    config = _m31_model_config(topology, layout=_M3_LAYOUT)
+    with pytest.raises(NoTarget) as excinfo:
+        _m31_route.route(config, _m3_llm_args("auto", "nvfp4"), (10, 7))
+    assert "MiniMax-M3.1-Flash" not in str(excinfo.value)
+    assert "sm107 (Rubin) with 2, 4 or 8 ranks" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("capability", [(10, 3), (10, 7)])
+def test_minimax_m3_1_checkpoint_is_not_taken_by_the_m3_targets(_m31_route, capability):
+    """The M3.1 checkpoint has the M3 shape, so the M3 layout check is what keeps it off the M3 tp4 / tp8 targets."""
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+    assert _m31_route._layout_mismatch(_m3_text_config(**_M31_LAYOUT)) is not None
+    with pytest.raises(NoTarget, match="MiniMax-M3.1-Flash"):
+        _m31_route.route(_m31_model_config(_M3_TP4), _m3_llm_args("auto", "nvfp4"), capability)
+
+
+def test_minimax_m3_1_dep_target_is_built_only_when_modeling_v2_is_set():
+    """The DEP generation target is ``@disable_v2_by_default``: read from its source, since its module needs a GPU
+    build to import."""
+    import ast
+    from pathlib import Path
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    directory, name = _M31_TARGETS["dep"]
+    source = Path(routing.__file__).parent / directory / "modeling.py"
+    (node,) = [
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == name
+    ]
+    assert "disable_v2_by_default" in [ast.unparse(d) for d in node.decorator_list]
+    for topology in ("tp2", "tp8", "tp2ctx", "dep2ctx"):
+        directory, name = _M31_TARGETS[topology]
+        source = Path(routing.__file__).parent / directory / "modeling.py"
+        (node,) = [
+            n
+            for n in ast.parse(source.read_text()).body
+            if isinstance(n, ast.ClassDef) and n.name == name
+        ]
+        assert "disable_v2_by_default" not in [ast.unparse(d) for d in node.decorator_list]
