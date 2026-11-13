@@ -36,15 +36,23 @@ from .backends.utils import create_attention
 def _dense_fp8_serves_recipe(attention_config) -> bool:
     """Whether TRTLLM self-attention runs the per-tensor FP8 recipe on trtllm-gen dense FP8.
 
-    PrimTS serves the same recipe when it is enabled and keeps precedence.
+    PrimTS serves the same recipe and keeps precedence when it is enabled and runs on this
+    device. Enabled alone is not enough: on SM107 (Rubin) PrimTS is enabled but unavailable,
+    and the FMHA manager still picks trtllm-gen dense FP8.
     """
     if attention_config is None or attention_config.sparse_attention_config is not None:
         return False
     if not is_per_tensor_fp8(attention_config.quant_attention_config):
         return False
+    from tensorrt_llm._utils import get_sm_version
+
     from ...attention.backends.fmha.registry import FMHA_LIBS, get_enabled_fmha_lib_classes
 
-    return FMHA_LIBS["prims_ts"] not in get_enabled_fmha_lib_classes()
+    prims_ts = FMHA_LIBS["prims_ts"]
+    prims_ts_serves = (
+        prims_ts in get_enabled_fmha_lib_classes() and get_sm_version() in prims_ts.SUPPORTED_SMS
+    )
+    return not prims_ts_serves
 
 
 class QKVMode(str, Enum):
@@ -142,11 +150,15 @@ class Attention(nn.Module):
         # self-attention only. The CuTeDSL SOL backend delegates cross-attention per
         # call instead; see SOLCuTeDSLAttention._can_serve. The trtllm-gen dense FP8
         # recipe keeps cross-attention in FP8 on cuDNN.
+        # cuDNN takes no key_padding_mask, so cross-attention routed to cuDNN FP8 keeps a
+        # VANILLA backend for calls that pass one.
+        masked_fallback_backend = None
         if is_separate_qkv_cross_attention and dense_fp8_trtllm:
             backend_name = "CUDNN"
+            masked_fallback_backend = "VANILLA"
             logger.info_once(
                 f"{type(self).__name__}: TRTLLM per-tensor FP8 attention runs cross-attention "
-                "on CUDNN FP8.",
+                "on CUDNN FP8 (VANILLA for calls with a key_padding_mask).",
                 key=(type(self).__name__, "dense_fp8_cross_attention"),
             )
         elif is_separate_qkv_cross_attention and (base_backend == "TRTLLM" or is_vsa):
@@ -309,18 +321,21 @@ class Attention(nn.Module):
         self.sparse_params = sparse_params
 
         # Create compute backend
-        self.attn = create_attention(
-            backend=backend_name,
-            layer_idx=self.layer_idx,
-            num_heads=backend_num_heads,
-            head_dim=self.head_dim,
-            num_kv_heads=backend_num_kv_heads,
-            quant_config=self.quant_config,
-            dtype=self.dtype,
-            attention_config=config.attention,
-            attention_metadata_state=attention_metadata_state,
-            sparse_params=sparse_params,
-        )
+        def _create_backend(name: str):
+            return create_attention(
+                backend=name,
+                layer_idx=self.layer_idx,
+                num_heads=backend_num_heads,
+                head_dim=self.head_dim,
+                num_kv_heads=backend_num_kv_heads,
+                quant_config=self.quant_config,
+                dtype=self.dtype,
+                attention_config=config.attention,
+                attention_metadata_state=attention_metadata_state,
+                sparse_params=sparse_params,
+            )
+
+        self.attn = _create_backend(backend_name)
 
         if enable_sequence_parallel and is_separate_qkv_cross_attention and vgm is not None:
             ring_size = vgm.ring_size
@@ -330,12 +345,20 @@ class Attention(nn.Module):
                     "parallelism; use enable_sequence_parallel=False or Ulysses/Attention2D."
                 )
 
-        self.attn = wrap_parallel_attention(
-            self.attn,
-            visual_gen_mapping=vgm,
-            enable_sequence_parallel=enable_sequence_parallel,
-            use_ulysses=use_ulysses,
-            async_ulysses=use_ulysses and async_ulysses,
+        def _wrap(attn):
+            return wrap_parallel_attention(
+                attn,
+                visual_gen_mapping=vgm,
+                enable_sequence_parallel=enable_sequence_parallel,
+                use_ulysses=use_ulysses,
+                async_ulysses=use_ulysses and async_ulysses,
+            )
+
+        self.attn = _wrap(self.attn)
+        self._masked_attn = (
+            _wrap(_create_backend(masked_fallback_backend))
+            if masked_fallback_backend is not None
+            else None
         )
 
         # FUSE_QKV self-attention with full-dim QK norm hands e4m3 Q/K/V straight to a backend
@@ -793,7 +816,12 @@ class Attention(nn.Module):
         end; a padding row written as history would be attended by every later forward
         of the rollout.
         """
-        backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
+        attn = (
+            self._masked_attn
+            if self._masked_attn is not None and kwargs.get("key_padding_mask") is not None
+            else self.attn
+        )
+        backend_layout = getattr(attn, "preferred_layout", AttentionTensorLayout.NHD)
 
         batch_size = q.shape[0]
         seq_len = q.shape[1]
@@ -826,12 +854,12 @@ class Attention(nn.Module):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
-        if kwargs.get("kv") is not None and not self.attn.support_kv_cache():
+        if kwargs.get("kv") is not None and not attn.support_kv_cache():
             raise NotImplementedError(
-                f"{type(self.attn).__name__} does not support a K/V cache "
+                f"{type(attn).__name__} does not support a K/V cache "
                 "(support_kv_cache() is False for this backend/parallel configuration)."
             )
-        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
+        out = attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:

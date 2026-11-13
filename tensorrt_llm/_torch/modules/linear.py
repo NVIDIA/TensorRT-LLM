@@ -845,12 +845,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def supports_cublas_epilogues(self, module: Linear) -> bool:
         """Whether cuBLASLt epilogues can serve this layer: a static input scale, BF16 output,
-        the cuBLAS GEMM path and no tensor-parallel output reduction."""
+        the cuBLAS GEMM path and no tensor-parallel partial output."""
         bias = getattr(module, "bias", None)
         return (self.get_static_input_scale(module) is not None
                 and module.dtype == torch.bfloat16
                 and (bias is None or bias.dtype == torch.bfloat16)
-                and not module.reduces_output_across_ranks()
+                and not module.produces_partial_output()
                 and not _fp8_per_tensor_uses_cute_dsl_sm107())
 
     def apply_gelu_fp8_out(self, module: Linear, input: torch.Tensor,
@@ -4849,19 +4849,25 @@ class Linear(nn.Module):
         self._fp8_fuse_bias = self.quant_method.supports_cublas_epilogues(self)
         return self._fp8_fuse_bias
 
-    def reduces_output_across_ranks(self) -> bool:
-        """Whether forward() all-reduces partial outputs across tensor-parallel ranks."""
-        return (self.tp_mode == TensorParallelMode.ROW and self.reduce_output
-                and self.tp_size > 1)
+    def produces_partial_output(self) -> bool:
+        """Whether each rank's GEMM output is a partial sum across tensor-parallel ranks.
+
+        True for any row-parallel layer with tp_size > 1, whether forward() reduces it
+        (reduce_output) or a wrapper reduces it later (e.g. token-sharded TP's
+        reduce-scatter, which sets reduce_output=False). Fused epilogues on such an output
+        (bias, FP8 quantization) would run before the reduction and count the bias once
+        per rank.
+        """
+        return self.tp_mode == TensorParallelMode.ROW and self.tp_size > 1
 
     def forward_without_bias(
             self, input: Union[torch.Tensor,
                                Fp4QuantizedTensor]) -> torch.Tensor:
         """The output without the bias, for callers that add the bias in a later fused kernel.
 
-        Only for layers without a tensor-parallel output reduction.
+        Only for layers whose output is not a tensor-parallel partial sum.
         """
-        if self.reduces_output_across_ranks() or self.gather_output:
+        if self.produces_partial_output() or self.gather_output:
             raise ValueError(
                 "forward_without_bias does not support tensor-parallel output reduction."
             )

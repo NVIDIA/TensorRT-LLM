@@ -380,10 +380,13 @@ def test_cross_attention_runs_on_cudnn_fp8(monkeypatch):
             enable_sequence_parallel=False,
         )
 
-    assert isinstance(cross_attention().attn, CuDNNAttention)
-    # PrimTS serves the recipe when enabled; cross-attention keeps the VANILLA fallback.
+    attn = cross_attention()
+    assert isinstance(attn.attn, CuDNNAttention)
+    # cuDNN FP8 does not take key_padding_mask; masked calls go to VANILLA.
+    assert isinstance(attn._masked_attn, VanillaAttention)
+    # PrimTS has no SM107 kernels, so enabling it does not change the routing.
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
-    assert isinstance(cross_attention().attn, VanillaAttention)
+    assert isinstance(cross_attention().attn, CuDNNAttention)
 
 
 @_SM107_ONLY
