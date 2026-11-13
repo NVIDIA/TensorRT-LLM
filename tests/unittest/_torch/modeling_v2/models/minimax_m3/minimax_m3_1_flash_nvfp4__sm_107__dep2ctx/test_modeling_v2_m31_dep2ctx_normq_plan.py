@@ -213,6 +213,33 @@ def test_the_default_depths():
     assert plan.topk_dual_choice() is True
 
 
+def test_the_launch_choice_arguments():
+    """``cbnqLaunchChoice`` on the op's arguments: the CBNQ_2CTA kill switch forces the previous launch whatever depth
+    is asked; a deeper ring asks for the carveout; other depths fall back to the defaults; the CBNQ_P2 and
+    CBNQ_TOPK_DUAL kill switches turn their forms off."""
+    assert plan.launch_choice(two_cta=False, stages=8) == (3, False)
+    assert plan.launch_choice(stages=6) == (6, True)
+    assert plan.launch_choice(stages=5) == (3, False)
+    assert plan.p2_choice(p2=False) == (False, 3)
+    assert plan.p2_choice(p2_stages=4) == (True, 4)
+    assert plan.p2_choice(p2_stages=6) == (True, 3)
+    assert plan.topk_dual_choice(dual=False) is False
+    # sm_107 at hidden 6144: the P2 form unless switched off.
+    vr = dict(max_threads_per_sm=1024, smem_optin=OPTIN_SM10X, smem_per_sm=SMEM_PER_SM_SM10X)
+    assert plan.launch_form(H, True, **vr) == (2, 2, 3)
+    assert plan.launch_form(H, True, p2=False, **vr) == (1, 1, 3)
+
+
+def test_the_boundary_passes_the_launch_choice():
+    """The dep2ctx boundary passes the registry's CBNQ switches and the plan's depths to every ring op call."""
+    src = (_PLAN.parent / "modeling.py").read_text()
+    assert 'p2=not m31_disabled("CBNQ_P2")' in src
+    assert 'two_cta=not m31_disabled("CBNQ_2CTA")' in src
+    assert "stages=_cbplan.L6_STAGES" in src and "p2_stages=_cbplan.P2_STAGES" in src
+    assert '_CBNQ_TOPK_DUAL = not m31_disabled("CBNQ_TOPK_DUAL")' in src
+    assert src.count("**_CBNQ_CHOICE") == 3 and "dual=_CBNQ_TOPK_DUAL" in src
+
+
 _CU = _PLAN.parent / "csrc" / "ctxBoundaryNormQuantSm107.cu"
 
 
@@ -222,9 +249,18 @@ def test_cpp_defaults_match_the_plan():
     src = _CU.read_text()
     assert f"constexpr int kCbnqL6DefaultStages = {plan.L6_STAGES};" in src
     assert f"constexpr int kCbnqP2DefaultStages = {plan.P2_STAGES};" in src
-    assert (
-        "return CbnqLaunchChoice{kCbnqL6DefaultStages, false, true, kCbnqP2DefaultStages};" in src
-    )
+    # the op's choice: the CBNQ_2CTA kill switch forces the previous launch; a deeper ring asks for the carveout
+    assert "return CbnqLaunchChoice{kCbnqStages, false, p.p2, p2Stages};" in src
+    assert "return CbnqLaunchChoice{stages, stages > kCbnqStages, p.p2, p2Stages};" in src
+    header = (_CU.parent / "ctxBoundaryNormQuantSm107.h").read_text()
+    for default in (
+        "bool p2 = true;",
+        "bool twoCta = true;",
+        f"int stages = {plan.L6_STAGES};",
+        f"int p2Stages = {plan.P2_STAGES};",
+        "bool dual = true;",
+    ):
+        assert default in header, default
 
 
 SM107 = (1024, SMEM_PER_SM_SM10X)  # threads, shared memory per SM: one 768-thread CTA

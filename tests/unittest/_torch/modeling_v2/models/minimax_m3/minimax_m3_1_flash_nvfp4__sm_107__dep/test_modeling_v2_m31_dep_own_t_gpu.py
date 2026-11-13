@@ -179,7 +179,7 @@ def _band(out: torch.Tensor, args, kwargs, toks):
     return (num / den) ** 0.5, worst
 
 
-def _own_t(args, kwargs, out=None, seq_lens=None):
+def _own_t(args, kwargs, out=None, seq_lens=None, fast_plan=True):
     """OWN-T straight through its op, into ``out`` ([T, 8192] BF16) or a new buffer."""
     q, k, v, topk, table, seqs = args
     if out is None:
@@ -202,6 +202,7 @@ def _own_t(args, kwargs, out=None, seq_lens=None):
         ROWS,
         kwargs["sm_scale"],
         True,
+        fast_plan,
     )
     return out
 
@@ -581,3 +582,14 @@ def test_a_step_wider_than_the_reserve_raises_and_writes_nothing(monkeypatch):
         lc2_decode.dep_lc2_decode(*args, output=out, **kwargs)
     torch.cuda.synchronize()
     assert bool((out == 3.0).all())
+
+
+@pytest.mark.parametrize("reqs", [1, 16, 56])
+def test_the_fastplan_kill_switch_keeps_the_bits(reqs):
+    """fast_plan=False (DEP_OWNT_FASTPLAN off) loads the union's block weights in the plan instead of deriving them:
+    the same split, so the same rows bit for bit."""
+    args, kwargs = _step(reqs, seed=100 + reqs)
+    fast = _own_t(args, kwargs).clone()
+    loaded = _own_t(args, kwargs, fast_plan=False)
+    torch.cuda.synchronize()
+    assert torch.equal(fast.view(torch.int16), loaded.view(torch.int16))

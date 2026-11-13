@@ -470,3 +470,64 @@ def test_topk_fold_form_matches_the_plan(rows, write_norm):
     assert dual == int(want_dual)
     assert ctas == 1 and smem == plan.topk_smem_bytes(plan.STAGES, plan.TOPK, H)
     assert grid == plan.grid(rows, ctas, props.multi_processor_count)
+
+
+# ---- the launch-choice arguments (CBNQ_P2 / CBNQ_2CTA / CBNQ_TOPK_DUAL kill switches, ring depths) ----------------
+_CHOICES = [
+    dict(p2=False),
+    dict(two_cta=False),
+    dict(p2=False, two_cta=False),
+    dict(stages=4),
+    dict(p2=False, stages=6),
+    dict(p2=False, stages=8),
+    dict(p2_stages=4),
+]
+
+
+@pytest.mark.parametrize(
+    "choice", _CHOICES, ids=lambda c: ",".join(f"{k}={v}" for k, v in c.items())
+)
+@pytest.mark.parametrize("rows", [129, 8192])
+def test_every_launch_choice_writes_the_same_bits(choice, rows):
+    """Each launch the op's choice arguments select writes the default launch's outputs bit for bit, and its form is
+    the plan's for the same arguments."""
+    x, r, w = _inputs(rows, "stress", rows + 17)
+    gs = torch.tensor([GS], device="cuda")
+    base_inter, got_inter = x.clone(), x.clone()
+    base = _ops.minimax_m31_ctx_boundary_normq(base_inter, r, w, EPS, True, True, gs)
+    got = _ops.minimax_m31_ctx_boundary_normq(got_inter, r, w, EPS, True, True, gs, **choice)
+    torch.cuda.synchronize()
+    assert torch.equal(_u8(got_inter), _u8(base_inter))
+    for a, b in zip(got, base):
+        assert torch.equal(_u8(a), _u8(b)), choice
+    plan = _plan()
+    props = torch.cuda.get_device_properties(0)
+    chunks, _, stages = plan.launch_form(
+        H,
+        True,
+        props.max_threads_per_multi_processor,
+        props.shared_memory_per_block_optin,
+        props.shared_memory_per_multiprocessor,
+        **choice,
+    )
+    form = _ops.minimax_m31_ctx_boundary_normq_form(x, True, True, True, True, **choice)
+    assert (int(form[0]), int(form[4])) == (chunks, stages), choice
+
+
+@pytest.mark.parametrize("rows", [129, 4096])
+def test_the_one_group_fold_writes_the_same_bits(rows):
+    """dual=False (CBNQ_TOPK_DUAL off) runs the one-group fold: its form says so and every output equals the dual
+    fold's."""
+    plane, scores, shared, residual = _fold_inputs(rows, "randn", 77 + rows)
+    w = torch.ones(H, dtype=torch.bfloat16, device="cuda")
+    a_shared, b_shared = shared.clone(), shared.clone()
+    a = _ops.minimax_m31_ctx_boundary_normq_topk(a_shared, plane, scores, residual, w, EPS, True)
+    b = _ops.minimax_m31_ctx_boundary_normq_topk(
+        b_shared, plane, scores, residual, w, EPS, True, dual=False
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(_u8(a_shared), _u8(b_shared))
+    for u, v in zip(a, b):
+        assert torch.equal(_u8(u), _u8(v))
+    t = torch.empty(rows, H, dtype=torch.bfloat16, device="cuda")
+    assert int(_ops.minimax_m31_ctx_boundary_normq_topk_form(t, True, dual=False)[0]) == 0

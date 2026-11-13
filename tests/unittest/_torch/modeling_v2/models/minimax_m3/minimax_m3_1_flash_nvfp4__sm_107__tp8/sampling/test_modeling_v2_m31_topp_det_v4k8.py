@@ -209,3 +209,30 @@ def test_v4k8_engagement_and_switches():
     assert len(on) == 1 and "list path on, 8 pass histograms on" in on[0]
     assert len(no_list) == 1 and "list path off, 8 pass histograms on" in no_list[0]
     assert len(no_k8) == 1 and "list path on, 8 pass histograms off" in no_k8[0]
+
+
+@pytest.mark.parametrize("combo", COMBOS)
+@pytest.mark.parametrize("rows", [1, 8])
+def test_the_topp_v6_kill_switch_keeps_the_bits(rows, combo):
+    """chain_prefetch=False (TOPP_V6 off) runs the staged summation: still bitwise the v1/v2 renorm."""
+    v12, v3 = _ops()
+    r = _Runner(v12, v3)
+    bad = 0
+    for cls in CLASSES:
+        for mode in ("p95", "with_p1"):
+            probs, tp = _make(cls, rows, 31 + rows), _top_p(mode, rows, 1)
+            out = torch.empty_like(probs)
+            v3(
+                probs,
+                tp,
+                r.ws3,
+                out,
+                r.g(rows),
+                True,
+                True,
+                combo[0],
+                combo[1],
+                chain_prefetch=False,
+            )
+            bad += _bad_rows(out, r.ref(probs, tp))
+    assert bad == 0
