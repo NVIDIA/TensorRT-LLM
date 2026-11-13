@@ -17,7 +17,8 @@
 
 Serves the generation phase of DSA layers (512 + 64 latent, e.g. GLM-5) whose latent cache uses the
 ``fp8rope`` NVFP4 layout, which ``TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT`` selects by default for the
-caches that can hold it. Each cache row is the 352-byte record that
+caches that can hold it where this library can run
+(:func:`get_nvfp4_mla_record_reader_unsupported_reason`). Each cache row is the 352-byte record that
 ``BatchSparseMLADecodePagedTSWrapper`` reads as
 ``kv_cache_format="nvfp4.fp8rope"``: the kernel loads the selected records, expands their E2M1 NoPE
 values with the E4M3 block scales in its loader, and runs FP8 QK/PV MMAs. Generation therefore needs
@@ -130,6 +131,26 @@ def _metadata_unsupported_reason(metadata) -> Optional[str]:
     return None
 
 
+def get_nvfp4_mla_record_reader_unsupported_reason(mapping=None) -> Optional[str]:
+    """Why no DSA layer of this process can read NVFP4 records in place, if so.
+
+    Covers what is known before the layers and the cache exist: the library is enabled, the GPU
+    and the CuTe DSL toolchain can run it, and ``mapping``, if given, does not use Helix. The
+    cache manager asks this to settle the ``auto`` layout, which stores records only where
+    generation reads them in place.
+    """
+    from .registry import get_enabled_fmha_lib_classes
+
+    if PrimsTSDsaSparseMlaFmha not in get_enabled_fmha_lib_classes():
+        return "TLLM_FMHA_LIBS leaves out prims_ts_dsa_sparse_mla."
+    reason = _gpu_unsupported_reason()
+    if reason is not None:
+        return reason
+    if mapping is not None and mapping.has_cp_helix():
+        return "Helix parallelism is not supported."
+    return get_prims_ts_toolchain_unsupported_reason()
+
+
 def _layer_lists_library(attn: "TrtllmAttention") -> bool:
     """Whether the layer's FMHA list holds :class:`PrimsTSDsaSparseMlaFmha` (cached per list)."""
     manager = getattr(attn, "_fmha_manager", None)
@@ -161,13 +182,7 @@ def prims_ts_reads_nvfp4_mla_records(metadata, attn: Optional["TrtllmAttention"]
         return False
     if attn is not None:
         return _layer_lists_library(attn)
-    from .registry import get_enabled_fmha_lib_classes
-
-    if PrimsTSDsaSparseMlaFmha not in get_enabled_fmha_lib_classes():
-        return False
-    if _gpu_unsupported_reason() is not None:
-        return False
-    return get_prims_ts_toolchain_unsupported_reason() is None
+    return get_nvfp4_mla_record_reader_unsupported_reason() is None
 
 
 class PrimsTSDsaSparseMlaFmha(Fmha):
@@ -200,8 +215,8 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
         reason = cls._unavailable_reason(attn)
         if reason is not None:
             logger.info_once(
-                "PrimTS DSA sparse MLA FMHA is unavailable, DSA generation gathers the NVFP4 "
-                f"records for TRTLLM-Gen instead: {reason}",
+                "PrimTS DSA sparse MLA FMHA is unavailable, DSA generation gathers FP8 rows "
+                f"from the NVFP4 cache for TRTLLM-Gen instead: {reason}",
                 key=f"prims_ts_dsa_sparse_mla_unavailable:{reason}",
             )
             return False

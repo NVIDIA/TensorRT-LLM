@@ -115,6 +115,32 @@ def test_metadata_leaves_out_the_gather_rows_only_when_the_library_can_run(monke
 
 
 @pytest.mark.cpu_only
+def test_record_reader_is_known_before_the_layers_and_the_cache(monkeypatch):
+    """What the cache manager asks to settle the ``auto`` layout."""
+    reason = prims_ts_dsa_sparse_mla.get_nvfp4_mla_record_reader_unsupported_reason
+    monkeypatch.setattr(registry, "get_enabled_fmha_lib_classes", lambda: [PrimsTSDsaSparseMlaFmha])
+    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(
+        prims_ts_dsa_sparse_mla, "get_prims_ts_toolchain_unsupported_reason", lambda: None
+    )
+    assert reason() is None
+    assert reason(SimpleNamespace(has_cp_helix=lambda: False)) is None
+    assert "Helix" in reason(SimpleNamespace(has_cp_helix=lambda: True))
+
+    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "get_sm_version", lambda: 120)
+    assert "SM120" in reason()
+    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(
+        prims_ts_dsa_sparse_mla,
+        "get_prims_ts_toolchain_unsupported_reason",
+        lambda: "no CuTe DSL",
+    )
+    assert reason() == "no CuTe DSL"
+    monkeypatch.setattr(registry, "get_enabled_fmha_lib_classes", lambda: [])
+    assert "TLLM_FMHA_LIBS" in reason()
+
+
+@pytest.mark.cpu_only
 def test_sm107_needs_the_rubin_helpers_of_the_cute_dsl(monkeypatch):
     monkeypatch.setattr(registry, "get_enabled_fmha_lib_classes", lambda: [PrimsTSDsaSparseMlaFmha])
     monkeypatch.setattr(
@@ -160,8 +186,8 @@ def test_layer_may_hold_records_unless_the_residual_layout_is_requested(monkeypa
 
 @pytest.fixture
 def written_records(monkeypatch):
-    """A default-layout cache (records) that the native MLA writer filled from known latents."""
-    monkeypatch.delenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, raising=False)
+    """A record cache that the native MLA writer filled from known latents."""
+    monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_RECORD_LAYOUT)
     manager = DSACacheManagerV2(
         KvCacheConfig(max_tokens=4096, enable_block_reuse=False),
         CacheType.SELFKONLY,

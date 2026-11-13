@@ -657,12 +657,17 @@ The FMHA package is split by role:
   set and `TLLM_FMHA_LIBS=-prims_ts_dsa_sparse_mla` removes it.
   The cache manager settles the layout of an NVFP4 DSA cache and publishes it
   as `mla_kv_cache_layout`. `TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT` defaults to
-  `auto`: `DSACacheManagerV2` stores `fp8rope` records unless the cache cannot
-  hold them (a latent other than 512 + 64, a mixed-precision KV cache, or
-  KV-cache offload, whose arena reads NVFP4 latents with a block-scale pool)
-  and then keeps the `residual` layout, as `DSACacheManager` always does;
-  `fp8rope` raises there instead, and `residual` selects that layout
-  everywhere. Records carry no global scale: the native cache ops take the
+  `auto`: `DSACacheManagerV2` stores `fp8rope` records where generation reads
+  them in place. It keeps the `residual` layout, as `DSACacheManager` always
+  does, when the cache cannot hold records (a latent other than 512 + 64, a
+  mixed-precision KV cache, or KV-cache offload, whose arena reads NVFP4
+  latents with a block-scale pool) and when
+  `get_nvfp4_mla_record_reader_unsupported_reason()` names a reason known
+  before the layers exist: the library is disabled, the GPU or the CuTe DSL
+  toolchain cannot run it, or the mapping uses Helix. `fp8rope` stores records
+  whether or not they are read in place and raises for a cache that cannot
+  hold them; `residual` selects that layout everywhere. Records carry no
+  global scale: the native cache ops take the
   layer's NVFP4 scale for the `residual` layout only, so a layer needs no
   knowledge of the layout.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
