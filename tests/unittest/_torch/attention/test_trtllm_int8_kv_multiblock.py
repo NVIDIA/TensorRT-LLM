@@ -262,9 +262,20 @@ def test_int8_kv_generation_uses_multi_block(
     out_int8, cache_int8, grids_int8, repeats_int8 = _generation_step(DataType.INT8, *args)
     out_bf16, cache_bf16, grids_bf16, _ = _generation_step(DataType.BF16, *args)
 
-    # Both caches hold identical values, including the INT8-quantized new tokens.
-    for kv_int8, kv_bf16 in zip(cache_int8, cache_bf16, strict=True):
-        torch.testing.assert_close(kv_int8, kv_bf16, atol=0, rtol=0)
+    # Both caches hold exactly the input values, including the INT8-quantized new tokens.
+    for i, (kv_int8, kv_bf16) in enumerate(zip(cache_int8, cache_bf16, strict=True)):
+        tokens = slice(i * q_len, (i + 1) * q_len)
+        expected = (
+            torch.stack(
+                [
+                    torch.cat([inputs[1][i], inputs[3][tokens]]),
+                    torch.cat([inputs[2][i], inputs[4][tokens]]),
+                ]
+            ).double()
+            * KV_SCALE
+        )
+        torch.testing.assert_close(kv_int8, expected, atol=0, rtol=0)
+        torch.testing.assert_close(kv_bf16, expected, atol=0, rtol=0)
 
     # The XQA kernel serves both steps, and splits each sequence into sub-sequences.
     assert grids_int8 and grids_bf16
