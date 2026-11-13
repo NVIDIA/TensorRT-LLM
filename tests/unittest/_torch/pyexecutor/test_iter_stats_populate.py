@@ -229,7 +229,10 @@ def _build_fake_self(
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
     fake.dist.rank = rank
-    fake.waiting_queue = list(waiting_items)
+    from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+
+    fake.waiting_queue = FCFSWaitingQueue()
+    fake.waiting_queue.add_requests(waiting_items)
     fake.active_requests = list(active_requests)
     fake.canceled_req_ids = list(canceled_ids)
     fake.inflight_req_ids = set(inflight_ids)
@@ -1370,3 +1373,37 @@ def test_attention_dp_idle_heartbeat_requires_global_idle(
     for record in records:
         assert record.stats.inflight_batching_stats.num_scheduled_requests == 0
         assert record.stats.iter_latency_ms == iter_latency_ms
+
+
+def test_queued_scan_skips_unreadable_active_request_state():
+    """A released native request must not fail stats collection."""
+
+    class _Released:
+        py_request_id = 9001
+        parent_request_id = None
+        is_child = False
+        is_finished = False
+        is_context_init_state = True
+        is_disagg_generation_init_state = False
+
+        @property
+        def context_remaining_length(self):
+            raise RuntimeError("request released")
+
+    class _ReleasedGen(_Released):
+        py_request_id = 9002
+        is_context_init_state = False
+        is_disagg_generation_init_state = True
+
+        def get_num_tokens(self, beam):
+            raise RuntimeError("request released")
+
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [],
+        num_ctx_tokens=0,
+        active_requests=[_Released(), _ReleasedGen()],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 0
+    assert ifb.num_queued_gen_requests == 0

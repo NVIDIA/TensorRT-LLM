@@ -19,11 +19,83 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 
 from ..executor_request_queue import RequestQueueItem
+
+
+class QueuedLoadTracker:
+    """Incremental (requests, tokens) totals for the requests in a waiting queue.
+
+    Queue-depth statistics are read on every sampled iteration, so the totals
+    are maintained on insert/remove instead of rescanning the queue. Entries are
+    keyed by request id; re-adding a present id is a no-op and removing an
+    absent id is ignored, so the put-back path (pop, then prepend) stays
+    consistent. Items without a readable ``input_token_ids`` are not counted,
+    matching the former per-sample scan.
+    """
+
+    def __init__(self) -> None:
+        # request id -> (is_generation_only, tokens)
+        self._entries: dict[int, tuple[bool, int]] = {}
+        self.num_ctx_requests = 0
+        self.num_ctx_tokens = 0
+        self.num_gen_requests = 0
+        self.num_gen_kv_tokens = 0
+
+    def __contains__(self, request_id: int) -> bool:
+        return request_id in self._entries
+
+    def add(self, item: RequestQueueItem) -> None:
+        if item.id in self._entries or not item.is_normal_request or item.request is None:
+            return
+        try:
+            tokens = int(item.request.num_input_tokens)
+            is_gen = item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY
+        except (AttributeError, TypeError) as e:
+            logger.warning(
+                f"Excluding queued item {item.id} from queued counters: "
+                f"input_token_ids not readable ({type(e).__name__})"
+            )
+            return
+        self._entries[item.id] = (is_gen, tokens)
+        self._apply(is_gen, tokens, 1)
+
+    def discard(self, request_id: int) -> None:
+        entry = self._entries.pop(request_id, None)
+        if entry is not None:
+            self._apply(entry[0], entry[1], -1)
+
+    def _apply(self, is_gen: bool, tokens: int, sign: int) -> None:
+        if is_gen:
+            self.num_gen_requests += sign
+            self.num_gen_kv_tokens += sign * tokens
+        else:
+            self.num_ctx_requests += sign
+            self.num_ctx_tokens += sign * tokens
+
+    def totals(self, excluded_ids: Iterable[int] = ()) -> tuple[int, int, int, int]:
+        """Return (ctx_requests, ctx_tokens, gen_requests, gen_kv_tokens).
+
+        ``excluded_ids`` (e.g. cancelled requests) are subtracted without
+        mutating the tracker; the cost is O(len(excluded_ids)), not O(queue).
+        """
+        ctx_req, ctx_tok = self.num_ctx_requests, self.num_ctx_tokens
+        gen_req, gen_tok = self.num_gen_requests, self.num_gen_kv_tokens
+        for request_id in set(excluded_ids):
+            entry = self._entries.get(request_id)
+            if entry is None:
+                continue
+            if entry[0]:
+                gen_req -= 1
+                gen_tok -= entry[1]
+            else:
+                ctx_req -= 1
+                ctx_tok -= entry[1]
+        return ctx_req, ctx_tok, gen_req, gen_tok
 
 
 class WaitingQueue(ABC):
@@ -96,6 +168,8 @@ class WaitingQueue(ABC):
         """Remove requests with the given IDs."""
         pass
 
+    queued_load: QueuedLoadTracker
+
     @abstractmethod
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
@@ -113,7 +187,17 @@ class WaitingQueue(ABC):
 
 
 class FCFSWaitingQueue(deque, WaitingQueue):
-    """A first-come-first-served queue that supports deque operations."""
+    """A first-come-first-served queue that supports deque operations.
+
+    Mutate it only through the WaitingQueue methods: raw deque calls bypass
+    ``queued_load``.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.queued_load = QueuedLoadTracker()
+        for item in self:
+            self.queued_load.add(item)
 
     @staticmethod
     def _warn_if_priority_set(request: RequestQueueItem) -> None:
@@ -128,6 +212,7 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         """Add a request to the queue according to FCFS policy."""
         self._warn_if_priority_set(request)
         self.append(request)
+        self.queued_load.add(request)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Add multiple requests to the queue according to FCFS policy."""
@@ -135,10 +220,14 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         for request in requests:
             self._warn_if_priority_set(request)
         self.extend(requests)
+        for request in requests:
+            self.queued_load.add(request)
 
     def pop_request(self) -> RequestQueueItem:
         """Pop a request from the queue according to FCFS policy."""
-        return self.popleft()
+        request = self.popleft()
+        self.queued_load.discard(request.id)
+        return request
 
     def peek_request(self) -> RequestQueueItem:
         """Peek at the next request in the queue without removing it."""
@@ -153,6 +242,7 @@ class FCFSWaitingQueue(deque, WaitingQueue):
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Prepend a request to the front of the queue."""
         self.appendleft(request)
+        self.queued_load.add(request)
 
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Prepend all requests from another iterable to the front of this queue.
@@ -160,13 +250,18 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         Requests are inserted in input order: the first item in ``requests``
         ends up at the front of the queue.
         """
-        self.extendleft(reversed(list(requests)))
+        requests = list(requests)
+        self.extendleft(reversed(requests))
+        for request in requests:
+            self.queued_load.add(request)
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
         """Remove requests with the given IDs."""
         filtered_requests = [req for req in self if req.id not in request_ids]
         self.clear()
         self.extend(filtered_requests)
+        for request_id in request_ids:
+            self.queued_load.discard(request_id)
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
@@ -210,6 +305,7 @@ class PriorityWaitingQueue(WaitingQueue):
         # request of the same priority.
         self._counter = itertools.count()
         self._prepend_counter = itertools.count(-1, -1)
+        self.queued_load = QueuedLoadTracker()
 
     def _get_priority(self, item: RequestQueueItem) -> float:
         if item.request is not None:
@@ -219,10 +315,12 @@ class PriorityWaitingQueue(WaitingQueue):
     def _push(self, item: RequestQueueItem) -> None:
         entry = (-self._get_priority(item), next(self._counter), item)
         heapq.heappush(self._heap, entry)
+        self.queued_load.add(item)
 
     def _push_front(self, item: RequestQueueItem) -> None:
         entry = (-self._get_priority(item), next(self._prepend_counter), item)
         heapq.heappush(self._heap, entry)
+        self.queued_load.add(item)
 
     def add_request(self, request: RequestQueueItem) -> None:
         """Add a request to the queue in priority order."""
@@ -238,6 +336,7 @@ class PriorityWaitingQueue(WaitingQueue):
         if not self._heap:
             raise IndexError("pop from an empty queue")
         _, _, item = heapq.heappop(self._heap)
+        self.queued_load.discard(item.id)
         return item
 
     def peek_request(self) -> RequestQueueItem:
@@ -285,6 +384,8 @@ class PriorityWaitingQueue(WaitingQueue):
         """Remove requests with the given IDs."""
         self._heap = [e for e in self._heap if e[2].id not in request_ids]
         heapq.heapify(self._heap)
+        for request_id in request_ids:
+            self.queued_load.discard(request_id)
 
     def __bool__(self) -> bool:
         return len(self._heap) > 0

@@ -590,3 +590,67 @@ class TestPriorityWaitingQueue:
     def test_is_waiting_queue_subclass(self):
         """PriorityWaitingQueue is a WaitingQueue."""
         assert isinstance(PriorityWaitingQueue(), WaitingQueue)
+
+
+def _load_item(request_id: int, tokens: int, generation_only: bool = False) -> RequestQueueItem:
+    from tensorrt_llm.bindings.executor import RequestType
+
+    request = Mock()
+    request.num_input_tokens = tokens
+    request.priority = DEFAULT_REQUEST_PRIORITY
+    request.request_type = (
+        RequestType.REQUEST_TYPE_GENERATION_ONLY
+        if generation_only
+        else RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+    )
+    return RequestQueueItem(request_id, request)
+
+
+@pytest.mark.parametrize(
+    "make_queue",
+    [FCFSWaitingQueue, PriorityWaitingQueue],
+    ids=["fcfs", "priority"],
+)
+class TestQueuedLoadTracker:
+    """queued_load must match a rescan after every mutation."""
+
+    @staticmethod
+    def _expected(queue):
+        ctx = [i.request.num_input_tokens for i in queue if i.id % 2 == 0]
+        gen = [i.request.num_input_tokens for i in queue if i.id % 2 == 1]
+        return len(ctx), sum(ctx), len(gen), sum(gen)
+
+    def test_tracks_add_pop_prepend_remove(self, make_queue):
+        queue = make_queue()
+        # Even ids are context, odd ids are generation-only.
+        queue.add_requests(
+            [_load_item(i, 10 * (i + 1), generation_only=i % 2 == 1) for i in range(6)]
+        )
+        assert queue.queued_load.totals() == self._expected(queue)
+
+        popped = [queue.pop_request(), queue.pop_request()]
+        assert queue.queued_load.totals() == self._expected(queue)
+
+        queue.prepend_requests(popped)  # put-back path
+        assert queue.queued_load.totals() == self._expected(queue)
+
+        queue.remove_by_ids({3, 4, 99})
+        assert queue.queued_load.totals() == self._expected(queue)
+        assert 3 not in queue.queued_load and 5 in queue.queued_load
+
+        while queue:
+            queue.pop_request()
+        assert queue.queued_load.totals() == (0, 0, 0, 0)
+
+    def test_totals_excludes_ids_without_mutating(self, make_queue):
+        queue = make_queue()
+        queue.add_requests([_load_item(0, 100), _load_item(1, 50, generation_only=True)])
+        assert queue.queued_load.totals({0, 1, 7}) == (0, 0, 0, 0)
+        assert queue.queued_load.totals() == (1, 100, 1, 50)
+
+    def test_ignores_non_normal_and_unreadable_items(self, make_queue):
+        queue = make_queue()
+        control = RequestQueueItem(5, None, is_canceled_request=True)
+        unreadable = RequestQueueItem(6, Mock(num_input_tokens=None))
+        queue.add_requests([control, unreadable])
+        assert queue.queued_load.totals() == (0, 0, 0, 0)

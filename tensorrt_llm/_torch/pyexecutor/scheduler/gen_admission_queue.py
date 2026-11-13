@@ -35,7 +35,7 @@ from typing import Mapping, Optional
 
 from tensorrt_llm.logger import logger
 
-from .waiting_queue import WaitingQueue
+from .waiting_queue import QueuedLoadTracker, WaitingQueue
 
 GEN_ADMISSION_ENV = "TLLM_GEN_ADMISSION_TTFT_PERCENTILE"
 
@@ -337,6 +337,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         # Key for never-stamped items: the latest key seen, the same on every rank.
         self._last_key = 0.0
         self.admitted_by_tier: collections.Counter = collections.Counter()
+        self.queued_load = QueuedLoadTracker()
 
     def enable_rank0(self) -> Optional[FirstTokenTimer]:
         """Log on this rank and, for ``auto``, time admission -> first token."""
@@ -387,6 +388,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._compact()
         self._order = None
         bisect.insort(self._entries, entry, key=lambda e: (e[0], e[1]))
+        self.queued_load.add(entry[4])
 
     def _build_order(self) -> list[tuple]:
         """(entry, tier) in admission order: each one is the pick once those before it are gone."""
@@ -478,6 +480,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._order.pop()
         self._popped.add(entry[1])
         item = entry[4]
+        self.queued_load.discard(item.id)
         item._gen_admission_tier = tier
         return item
 
@@ -508,6 +511,8 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._compact()
         self._order = None
         self._entries = [e for e in self._entries if e[4].id not in request_ids]
+        for request_id in request_ids:
+            self.queued_load.discard(request_id)
 
     def __bool__(self) -> bool:
         return len(self) > 0

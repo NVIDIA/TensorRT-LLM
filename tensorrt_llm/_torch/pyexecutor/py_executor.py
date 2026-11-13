@@ -3205,14 +3205,14 @@ class PyExecutor:
         return req_stats
 
     def _update_iter_stats(
-        self,
-        stats,
-        iter_latency_ms,
-        num_completed_requests,
-        scheduled_batch,
-        micro_batch_id,
-        scheduled_batch_stats: Optional[ScheduledBatchStats] = None
-    ) -> IterationStats:
+            self,
+            stats,
+            iter_latency_ms,
+            num_completed_requests,
+            scheduled_batch,
+            micro_batch_id,
+            scheduled_batch_stats: Optional[ScheduledBatchStats] = None,
+            collect_kv_iteration_stats: bool = True) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
         scheduled_batch_stats = (scheduled_batch_stats or ScheduledBatchStats())
 
@@ -3256,13 +3256,17 @@ class PyExecutor:
             # sampled construction iterations reach this point, so a check on
             # the live counter could never match.
             # Guard: only fetch once per record iteration.
-            if (stats.iter % self._kv_iter_stats_interval == 0
-                    and self._last_kv_iter_stats_fetch_iter != stats.iter):
-                self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
-                )
-                self._last_kv_iter_stats_fetch_iter = stats.iter
-            else:
-                self._latest_kv_iter_stats = None
+            # Queue-only snapshots pass collect_kv_iteration_stats=False: the
+            # C++ delta fetch and the two cached fields below belong to
+            # measured iterations and must not be consumed or cleared here.
+            if collect_kv_iteration_stats:
+                if (stats.iter % self._kv_iter_stats_interval == 0
+                        and self._last_kv_iter_stats_fetch_iter != stats.iter):
+                    self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
+                    )
+                    self._last_kv_iter_stats_fetch_iter = stats.iter
+                else:
+                    self._latest_kv_iter_stats = None
 
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
@@ -3426,17 +3430,24 @@ class PyExecutor:
         num_queued_gen_kv_tokens = 0
         seen_queued_ids = set()
         canceled_ids = set(self.canceled_req_ids)
+        waiting_load = None
         if not self.enable_attention_dp or self.dist.rank == 0:
+            # The waiting queue keeps incremental totals (only accepted normal
+            # requests enter it); only the ingress queue is scanned, and it is
+            # normally drained every iteration.
             request_queue = self.executor_request_queue.get_request_queue()
             with request_queue.mutex:
-                queued_items = list(request_queue.queue)
-            queued_items.extend(self.waiting_queue)
-            canceled_ids.update(item.id for item in queued_items
+                intake_items = list(request_queue.queue)
+            canceled_ids.update(item.id for item in intake_items
                                 if item.is_canceled_request)
-            for item in queued_items:
+            waiting_load = self.waiting_queue.queued_load
+            (num_queued_context_requests, num_queued_ctx_tokens,
+             num_queued_gen_requests,
+             num_queued_gen_kv_tokens) = waiting_load.totals(canceled_ids)
+            for item in intake_items:
                 if (not item.is_normal_request or item.request is None
-                        or item.id in seen_queued_ids
-                        or item.id in canceled_ids):
+                        or item.id in seen_queued_ids or item.id in canceled_ids
+                        or item.id in waiting_load):
                     continue
                 seen_queued_ids.add(item.id)
                 try:
@@ -3462,20 +3473,31 @@ class PyExecutor:
             if (self._is_stats_dummy_request(req) or req.is_finished
                     or req.py_request_id in excluded_request_ids
                     or req.py_request_id in self.inflight_req_ids
-                    or req.py_request_id in seen_queued_ids):
+                    or req.py_request_id in seen_queued_ids
+                    or (waiting_load is not None
+                        and req.py_request_id in waiting_load)):
                 continue
             cancel_id = (req.parent_request_id
                          if req.is_child else req.py_request_id)
             if cancel_id in canceled_ids:
                 continue
+            # Native getters raise RuntimeError on a request whose C++ state
+            # was already released; skip it rather than fail stats collection.
             if req.is_context_init_state:
-                remaining_tokens = max(0, req.context_remaining_length)
+                try:
+                    remaining_tokens = max(0, req.context_remaining_length)
+                except RuntimeError:
+                    continue
                 if remaining_tokens:
                     num_queued_context_requests += 1
                     num_queued_ctx_tokens += remaining_tokens
             elif req.is_disagg_generation_init_state:
+                try:
+                    gen_kv_tokens = req.get_num_tokens(0)
+                except RuntimeError:
+                    continue
                 num_queued_gen_requests += 1
-                num_queued_gen_kv_tokens += req.get_num_tokens(0)
+                num_queued_gen_kv_tokens += gen_kv_tokens
 
         stats.num_queued_requests = (num_queued_context_requests +
                                      num_queued_gen_requests)
@@ -3545,7 +3567,8 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           use_latest_kv_iter_stats: bool = True):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -3575,8 +3598,11 @@ class PyExecutor:
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
         # KV stats explicitly.
+        # Queue-only snapshots pass use_latest_kv_iter_stats=False so they
+        # never re-report a measured iteration's KV deltas.
         if not self.enable_attention_dp:
-            kv_iter_stats = self._latest_kv_iter_stats
+            kv_iter_stats = (self._latest_kv_iter_stats
+                             if use_latest_kv_iter_stats else None)
             # Same reasoning for the per-loop timings: non-ADP captures them
             # at append time. ADP passes the values that were saved with the
             # IterationStats at queue time.
@@ -8152,12 +8178,16 @@ class PyExecutor:
         if not engine_idle and self.iter_counter % self.iter_perf_stats_interval:
             return
         self._quiescent_stats_iter = self.iter_counter
-        stats = self._update_iter_stats(self._get_init_iter_stats(0, 0.0), 0.0,
-                                        0, ScheduledRequests(), 0)
+        stats = self._update_iter_stats(self._get_init_iter_stats(0, 0.0),
+                                        0.0,
+                                        0,
+                                        ScheduledRequests(),
+                                        0,
+                                        collect_kv_iteration_stats=False)
         if self.enable_attention_dp:
             self._adp_iter_stats.queue(stats,
                                        is_rank0=self.dist.rank == 0,
-                                       kv_iter_stats=self._latest_kv_iter_stats,
+                                       kv_iter_stats=None,
                                        host_step_time_ms=0.0,
                                        prev_device_step_time_ms=0.0,
                                        gpu_forward_time_ms=0.0,
@@ -8170,7 +8200,8 @@ class PyExecutor:
                 self._append_iter_stats(stats,
                                         host_step_time_ms=0.0,
                                         prev_device_step_time_ms=0.0,
-                                        gpu_forward_time_ms=0.0)
+                                        gpu_forward_time_ms=0.0,
+                                        use_latest_kv_iter_stats=False)
 
     def _get_request_admission_capacity(self) -> int:
         """Return the maximum number of distinct requests admitted at once."""
