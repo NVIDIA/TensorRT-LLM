@@ -1104,15 +1104,19 @@ class CSA2CacheManager(KVCacheManagerV2):
         the generation worker rebuilds the sliding-window caches past a request's split, which a
         context-only worker keeps none of (``remote_tail_excluded_pool_views``). The persistent
         caches hold fixed packed FP8/FP4 records whatever the staging type
-        (``kv_cache_config.dtype``) is, so the spec quantizes them as ``"csa2_packed"``."""
+        (``kv_cache_config.dtype``) is, so the spec quantizes them as ``"csa2_packed"``. The
+        sliding windows it keeps hold draft tokens, reuse backoff and replay captures beyond the
+        window attention reads (``retention_margins``)."""
         spec = super().page_table_spec()
-        rebuilt = {CSA2CacheRole.SWA.role} if self.bounded_replay_on_generation else set()
+        replay = getattr(self, "bounded_replay_on_generation", False)
+        rebuilt = {CSA2CacheRole.SWA.role} if replay else set()
         return replace(
             spec,
             role_layouts={},
             default_layout=Replicated(),
             request_rebuilt_roles=spec.request_rebuilt_roles | rebuilt,
             quant_mode="csa2_packed",
+            retention_margins=True,
         )
 
     def get_disagg_role_mapper_kinds(self):

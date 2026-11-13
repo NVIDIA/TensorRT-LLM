@@ -18,7 +18,6 @@ from typing import List, Optional
 
 import msgpack
 
-from tensorrt_llm._torch.disaggregation.base.role_layout import RankTopology
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
@@ -89,23 +88,6 @@ class RankInfo:
         if self.attention is None:
             return self.tp_size
         return self.tp_size // self.dp_size if self.attention.enable_attention_dp else self.tp_size
-
-    @property
-    def topology(self) -> RankTopology:
-        """This rank's parallel place, the one form role layouts read it in (``grid_place``).
-
-        Not a field, so it adds nothing to what ``to_bytes`` sends a peer."""
-        return RankTopology(
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            pp_size=self.pp_size,
-            pp_rank=self.pp_rank,
-            cp_size=self.cp_size,
-            cp_rank=self.cp_rank,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            attention_dp=self.attention is not None and bool(self.attention.enable_attention_dp),
-        )
 
     def to_bytes(self) -> bytes:
         data = asdict(self)

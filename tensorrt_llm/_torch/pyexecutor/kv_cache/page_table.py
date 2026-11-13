@@ -13,13 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """What a ``KVCacheManagerV2`` says of its pages that its runtime config and storage do not: its
-``PageTableSpec``, such as how each role's bytes spread over ranks (``RoleLayoutV2``)."""
+``PageTableSpec``, such as how each role's bytes spread over ranks (``RoleLayoutV2``); and what a
+buffer (``BufferSite``) or a rank's place (``rank_topology``) says about it."""
 
 from __future__ import annotations
 
 import types
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
+
+from ...disaggregation.base.role_layout import RankTopology
 
 # The role layouts a manager's spec names (disaggregation.base.role_layout), for managers to
 # import from here.
@@ -32,6 +35,7 @@ from ...disaggregation.base.role_layout import Sectioned as Sectioned
 
 __all__ = [
     "QUANT_MODES",
+    "BufferSite",
     "ByHead",
     "Own",
     "PageTableSpec",
@@ -41,6 +45,8 @@ __all__ = [
     "Sectioned",
     "kv_dtype_name",
     "layer_groups",
+    "rank_topology",
+    "state_split",
 ]
 
 QUANT_MODES = frozenset({"fp8", "nvfp4", "fp8_ds_mla", "csa2_packed"})
@@ -58,7 +64,53 @@ def layer_groups(manager: object) -> list[list[int]]:
     ]
 
 
+def rank_topology(mapping: object) -> RankTopology:
+    """The rank's place as native's ``RankInfo`` reads it from the mapping: under attention data
+    parallelism each tensor-parallel rank is a data-parallel rank of its own."""
+    if mapping is None:
+        return RankTopology()
+    adp = bool(getattr(mapping, "enable_attention_dp", False))
+    tp_size, tp_rank = int(getattr(mapping, "tp_size", 1)), int(getattr(mapping, "tp_rank", 0))
+    return RankTopology(
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        pp_size=int(getattr(mapping, "pp_size", 1)),
+        pp_rank=int(getattr(mapping, "pp_rank", 0)),
+        cp_size=int(getattr(mapping, "cp_size", 1)),
+        cp_rank=int(getattr(mapping, "cp_rank", 0)),
+        dp_size=tp_size if adp else int(getattr(mapping, "dp_size", 1)),
+        dp_rank=tp_rank if adp else 0,
+        attention_dp=adp,
+    )
+
+
 # -- what a manager says of its pages: its PageTableSpec ------------------------------------------
+
+
+@dataclass(frozen=True)
+class BufferSite:
+    """One buffer as a manager's spec leaves it to its role layout (``RoleLayoutV2.resolve``).
+
+    Attributes:
+        layer: The manager's internal layer id.
+        role: The buffer's role.
+        size: Bytes of the buffer in one page's slot.
+        tokens: Tokens of one page, or of one sub-page where the buffer has several per page.
+        state: Whether the layer keeps recurrent state rather than attention KV.
+        kv_heads: (KV heads on this rank, KV heads over all tensor ranks or None) of the layer.
+        split: The parallel dimensions the layer's buffers split over: the tensor ranks for
+            attention, those of the manager's recurrent state for state.
+        ranks: Ranks in the grid of ``split``.
+    """
+
+    layer: int
+    role: str
+    size: int
+    tokens: int
+    state: bool
+    kv_heads: tuple[int, int | None]
+    split: tuple[str, ...]
+    ranks: int
 
 
 def _frozen_roles(roles: Iterable[str], name: str) -> frozenset[str]:
@@ -112,6 +164,9 @@ class PageTableSpec:
             type. Under the cold-page first/last-N window both are the model's KV type, as
             ``("bf16", "bf16")``: the high layer holds a copy of its layer's page, and only pages
             leaving the GPU are quantized. None without.
+        retention_margins: Whether the windows it keeps may hold margins of its own beyond the
+            window its attention reads, such as draft tokens, a rewind or a lifecycle of their
+            own: they then do not say how far back it reads.
 
     Raises:
         TypeError: If a role set is one role, or a layout is not a ``RoleLayoutV2``.
@@ -128,6 +183,7 @@ class PageTableSpec:
     layer_ids: Mapping[int, tuple[int, int]] | None = None
     quant_mode: str | None = None
     mixed_precision: tuple[str, str] | None = None
+    retention_margins: bool = False
 
     def __post_init__(self) -> None:
         layouts = {str(role): layout for role, layout in dict(self.role_layouts).items()}
@@ -152,6 +208,7 @@ class PageTableSpec:
             if len(names) != 2:
                 raise ValueError(f"mixed precision names a low and a high type, not {names}")
             object.__setattr__(self, "mixed_precision", names)
+        object.__setattr__(self, "retention_margins", bool(self.retention_margins))
 
     def layout_of(self, role: str) -> RoleLayoutV2 | None:
         """The layout of ``role``: this rank's own share for a role that never moves (untransferred
@@ -168,3 +225,20 @@ def kv_dtype_name(manager: object) -> str | None:
     none."""
     dtype = getattr(manager, "dtype", None)
     return None if dtype is None else str(getattr(dtype, "name", dtype))
+
+
+def state_split(manager: object) -> tuple[str, ...]:
+    """The parallel dimensions a manager's recurrent state splits over, as its pools are sized
+    (``config_utils.mamba_effective_tp_size``): tensor times context ranks under Helix, and under
+    Helix with attention data parallelism on one tensor rank its context ranks; otherwise the
+    tensor ranks of an attention data-parallel group (``grid_place``), which TRT-LLM's mappings
+    make one rank alone under attention data parallelism, so the state is then whole on every
+    rank."""
+    mapping = manager.mapping
+    adp = bool(getattr(mapping, "enable_attention_dp", False))
+    if getattr(manager, "_has_cp_helix", False):
+        if not adp:
+            return ("tp", "cp")
+        if int(getattr(mapping, "tp_size", 1)) == 1:
+            return ("cp",)
+    return ("tp",)

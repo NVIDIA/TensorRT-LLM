@@ -39,11 +39,10 @@ import dataclasses
 import numbers
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Mapping, Protocol, TypeVar
+from typing import Any, ClassVar, Mapping
 
 __all__ = [
     "GRID_DIMENSIONS",
-    "BufferSite",
     "ByHead",
     "Own",
     "Piece",
@@ -54,7 +53,6 @@ __all__ = [
     "Sectioned",
     "check_pieces",
     "grid_place",
-    "recurrent_state_split",
     "role_layout_from_dict",
 ]
 
@@ -74,60 +72,20 @@ other layers and data-parallel ranks other requests, so neither splits a page.""
 
 def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
     """``(size, rank)`` of this rank in the grid of the parallel dimensions ``dims``, outer to
-    inner, the last minor. Under attention data parallelism each tensor-parallel rank serves its own
-    requests and holds its buffers whole, so "tp" counts this rank alone."""
+    inner, the last minor. "tp" counts the tensor-parallel ranks of this rank's attention
+    data-parallel group (``RankTopology.tp_size_per_dp_group``), which serve the same requests: this
+    rank alone where each tensor-parallel rank serves its own."""
     size, rank = 1, 0
     for dim in dims:
         if dim == "tp":
-            n, r = (1, 0) if topology.attention_dp else (topology.tp_size, topology.tp_rank)
+            n = topology.tp_size_per_dp_group
+            r = topology.tp_rank % n
         elif dim == "cp":
             n, r = topology.cp_size, topology.cp_rank
         else:
             raise ValueError(f"{dim!r} is no grid dimension; one of {GRID_DIMENSIONS}")
         size, rank = size * n, rank * n + r
     return size, rank
-
-
-def recurrent_state_split(topology: RankTopology) -> tuple[str, ...]:
-    """The parallel dimensions recurrent state splits over, outer to inner, so that
-    ``grid_place(topology, recurrent_state_split(topology))`` is the shard grid the native transfer
-    and the pool sizing give recurrent state (``MambaPolicy._mamba_tp``,
-    ``mamba_effective_tp_size``). Without attention data parallelism: over tensor then context
-    ranks, CP minor, or over tensor ranks alone without context parallelism. Under attention data
-    parallelism: over context ranks at one tensor rank, else held whole ("tp" counts this rank
-    alone)."""
-    if topology.cp_size > 1:
-        if topology.attention_dp:
-            return ("cp",) if topology.tp_size == 1 else ("tp",)
-        return ("tp", "cp")
-    return ("tp",)
-
-
-_Positions = TypeVar("_Positions")
-
-
-class BufferSite(Protocol):
-    """The facts of one rank's buffer of a role that a layout in a manager's spec resolves
-    against (``RoleLayoutV2.resolve``).
-
-    Attributes:
-        size: The buffer's bytes on this rank.
-        kv_heads: For attention, (the layer's KV heads on this rank, the layer's KV heads over all
-            ranks of the split or None if unknown); the total counts each head once, however many
-            ranks hold it.
-        state: Whether the buffer is recurrent state rather than attention.
-        split: The parallel dimensions the buffer's layer group splits over, outer to inner
-            (``GRID_DIMENSIONS``).
-        ranks: The ranks of that split, ``grid_place(topology, split)[0]``.
-        tokens: The token positions of a page.
-    """
-
-    size: int
-    kv_heads: tuple[int, int | None]
-    state: bool
-    split: tuple[str, ...]
-    ranks: int
-    tokens: int
 
 
 _ROLE_LAYOUTS: dict[str, type[RoleLayoutV2]] = {}
@@ -241,9 +199,10 @@ class RoleLayoutV2:
         spec as a whole (``quant_mode``, ``mixed_precision``) and peers' byte sizes."""
         return None
 
-    def resolve(self, site: BufferSite) -> RoleLayoutV2:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         """The layout of one buffer, filling what a manager's spec leaves to each buffer from its
-        facts (``BufferSite``): this layout itself by default."""
+        facts (``pyexecutor.kv_cache.page_table.BufferSite``: its size, tokens, heads, and the
+        dimensions its layer group splits over): this layout itself by default."""
         return self
 
     def check(self, size: int) -> None:
@@ -267,15 +226,22 @@ class RoleLayoutV2:
         same bytes under another such count may share names: yes by default."""
         return True
 
+    def rescale(self, size: int, ranks: int, to_ranks: int) -> tuple[RoleLayoutV2, int] | None:
+        """The same space laid out over ``to_ranks`` ranks of the split rather than the ``ranks``
+        over which a buffer holds ``size`` bytes: the layout of a buffer there and its bytes, its
+        pieces then those ``pieces`` gives over ``to_ranks``; None where the layout cannot say, by
+        default, or the space does not split evenly so."""
+        return None
+
     def positions(self, page: int, end: int, tokens_per_page: int) -> range:
         """For a positional layout: the token positions of page ``page`` (its position among a
         request's pages, from 0, of ``tokens_per_page`` positions each) that the buffer holds once
         the request has written every position below ``end``."""
         raise NotImplementedError(f"role layout {self.name!r} holds no token positions")
 
-    def index_of(self, positions: _Positions, tokens_per_page: int) -> _Positions:
+    def index_of(self, positions, tokens_per_page: int):
         """For a positional layout: the index holding each of ``positions`` (an integer or an
-        integer array; the result is of the same kind) in pages of ``tokens_per_page`` positions."""
+        integer array; the result is the same) in pages of ``tokens_per_page`` positions."""
         raise NotImplementedError(f"role layout {self.name!r} holds no token positions")
 
     def stride(self, size: int) -> int:
@@ -286,6 +252,13 @@ class RoleLayoutV2:
     def to_dict(self) -> dict:
         """The layout as plain values for a peer, which ``role_layout_from_dict`` reads back."""
         return {"name": self.name, **_sparse(self)}
+
+    def document(self) -> dict:
+        """The layout apart from its element type, for an identity that names the element type on
+        its own: its name and its fields not at their defaults."""
+        fields = _sparse(self)
+        fields.pop("dtype", None)
+        return {"layout": self.name, **fields}
 
 
 def role_layout_from_dict(data: Mapping) -> RoleLayoutV2:
@@ -335,6 +308,9 @@ class Replicated(RoleLayoutV2):
     def space(self, size: int, ranks: int) -> tuple:
         return ("replicated", size)
 
+    def rescale(self, size: int, ranks: int, to_ranks: int) -> tuple[RoleLayoutV2, int] | None:
+        return self, size
+
 
 @dataclass(frozen=True)
 class Own(RoleLayoutV2):
@@ -357,7 +333,7 @@ class Own(RoleLayoutV2):
     def __post_init__(self) -> None:
         object.__setattr__(self, "split", _split(self.split, "an owned layout"))
 
-    def resolve(self, site: BufferSite) -> RoleLayoutV2:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         return dataclasses.replace(self, split=site.split)
 
     def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
@@ -401,7 +377,7 @@ class Sectioned(RoleLayoutV2):
         object.__setattr__(self, "split", _split(self.split, "a sectioned layout"))
         _dtype(self)
 
-    def resolve(self, site: BufferSite) -> RoleLayoutV2:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         return dataclasses.replace(self, split=site.split)
 
     def check(self, size: int) -> None:
@@ -420,6 +396,16 @@ class Sectioned(RoleLayoutV2):
 
     def space(self, size: int, ranks: int) -> tuple:
         return _typed(self, ("sectioned", tuple(ranks * n for n in self.section_bytes)))
+
+    def rescale(self, size: int, ranks: int, to_ranks: int) -> tuple[RoleLayoutV2, int] | None:
+        """Each section's bytes over all ranks split over ``to_ranks``; None where they do not
+        split evenly."""
+        sections = []
+        for n in self.section_bytes:
+            if n * ranks % to_ranks:
+                return None
+            sections.append(n * ranks // to_ranks)
+        return dataclasses.replace(self, section_bytes=tuple(sections)), sum(sections)
 
 
 @dataclass(frozen=True)
@@ -478,7 +464,7 @@ class ByHead(RoleLayoutV2):
         object.__setattr__(self, "split", _split(self.split, "a head split"))
         _dtype(self)
 
-    def resolve(self, site: BufferSite) -> RoleLayoutV2:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         head_bytes, total = self.head_bytes, self.total
         if head_bytes is None and not site.state:
             kv_heads, kv_total = site.kv_heads
@@ -551,6 +537,15 @@ class ByHead(RoleLayoutV2):
     def even(self, ranks: int) -> bool:
         return self.total % ranks == 0 or ranks % self.total == 0
 
+    def rescale(self, size: int, ranks: int, to_ranks: int) -> tuple[RoleLayoutV2, int] | None:
+        """The heads each of ``to_ranks`` ranks holds as KV caches split them: ``ceil(total /
+        to_ranks)`` from head ``rank * total // to_ranks`` (``pieces``), so ``total // to_ranks``
+        where the ranks divide the total, one head shared by several ranks where they exceed it,
+        and overlapping runs of heads otherwise; None for heads not resolved."""
+        if self.head_bytes is None or self.total is None:
+            return None
+        return self, -(-self.total // to_ranks) * self.head_bytes
+
 
 @dataclass(frozen=True)
 class RingSlots(RoleLayoutV2):
@@ -589,12 +584,15 @@ class RingSlots(RoleLayoutV2):
     def space(self, size: int, ranks: int) -> tuple:
         return _typed(self, ("ring", size // self.slots))
 
+    def rescale(self, size: int, ranks: int, to_ranks: int) -> tuple[RoleLayoutV2, int] | None:
+        return self, size
+
     def positions(self, page: int, end: int, tokens_per_page: int) -> range:
         first = page * tokens_per_page
         written = min(end, first + tokens_per_page)
         return range(max(first, written - self.slots), written)
 
-    def index_of(self, positions: _Positions, tokens_per_page: int) -> _Positions:
+    def index_of(self, positions, tokens_per_page: int):
         return positions % self.slots
 
     def stride(self, size: int) -> int:
@@ -629,8 +627,7 @@ def check_pieces(layout: RoleLayoutV2, size: int, ranks: int, rank: int) -> None
 
 @dataclass(frozen=True)
 class RankTopology:
-    """This rank's parallel sizes and ranks, as native RankInfo carries them; a RankInfo gives
-    its own (``RankInfo.topology``).
+    """This rank's parallel sizes and ranks, as native RankInfo carries them.
 
     Attributes:
         tp_size: Positive tensor-parallel group size.
@@ -641,12 +638,16 @@ class RankTopology:
         cp_rank: Zero-based context-parallel rank, less than cp_size.
         dp_size: Positive attention data-parallel group size.
         dp_rank: Zero-based attention data-parallel rank, less than dp_size.
-        attention_dp: Whether attention uses data parallelism; each tensor-parallel rank then
-            occupies its own attention data-parallel rank.
+        attention_dp: Whether attention uses data parallelism: the tensor-parallel ranks then form
+            dp_size groups of consecutive ranks, each serving its own requests, and dp_rank names
+            this rank's group. TRT-LLM's mappings make each tensor-parallel rank a group of its own
+            (dp_size == tp_size).
 
     Raises:
         ValueError: If a size is not a positive integer, a rank is not a non-negative integer, any
-            such value is a boolean, or a rank lies outside its size."""
+            such value is a boolean, or a rank lies outside its size; under attention data
+            parallelism, also if dp_size does not divide tp_size, is 1 while tp_size is not, or
+            dp_rank is not the group of tp_rank."""
 
     tp_size: int = 1
     tp_rank: int = 0
@@ -666,3 +667,57 @@ class RankTopology:
                 raise ValueError(f"{name} rank {rank} of {size}")
             object.__setattr__(self, f"{name}_size", size)
             object.__setattr__(self, f"{name}_rank", rank)
+        if not self.attention_dp:
+            return
+        if self.tp_size % self.dp_size:
+            raise ValueError(
+                f"attention data parallelism over {self.dp_size} groups of {self.tp_size} tensor "
+                "ranks: the groups must split them evenly"
+            )
+        if self.dp_size == 1 < self.tp_size:
+            raise ValueError(
+                f"attention data parallelism over one group of all {self.tp_size} tensor ranks: "
+                "give dp_size the number of groups, or turn attention_dp off"
+            )
+        width = self.tp_size // self.dp_size
+        if self.dp_rank != self.tp_rank // width:
+            raise ValueError(
+                f"dp rank {self.dp_rank} at tensor rank {self.tp_rank}: each of the {self.dp_size} "
+                f"attention data-parallel groups holds {width} consecutive tensor ranks"
+            )
+
+    @property
+    def tp_size_per_dp_group(self) -> int:
+        """Tensor-parallel ranks of one attention data-parallel group, which serve the same
+        requests and split its buffers: tp_size // dp_size under attention data parallelism, else
+        tp_size."""
+        return self.tp_size // self.dp_size if self.attention_dp else self.tp_size
+
+    @classmethod
+    def unchecked(
+        cls,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        pp_size: int = 1,
+        pp_rank: int = 0,
+        cp_size: int = 1,
+        cp_rank: int = 0,
+        dp_size: int = 1,
+        dp_rank: int = 0,
+        attention_dp: bool = False,
+    ) -> RankTopology:
+        """The constructor's topology of these values, without its checks and conversions, for
+        values already checked."""
+        topology = object.__new__(cls)
+        topology.__dict__.update(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            pp_size=pp_size,
+            pp_rank=pp_rank,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            attention_dp=attention_dp,
+        )
+        return topology
