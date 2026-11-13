@@ -315,6 +315,26 @@ def get_spec_managers(
     return spec_resource_manager, getattr(spec_resource_manager, "spec_tree_manager", None)
 
 
+def supports_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mapping | None) -> bool:
+    """Whether the decode CUDA graphs can capture the temperature-only sampling variant."""
+    # It draws the sampled rows on vocabulary-sharded logits without the watermark, so a
+    # watermark configuration keeps the ordinary sampler.
+    return (
+        config.cuda_graph_config is not None
+        and config.spec_decode_fast_paths
+        and config.watermark_config is None
+        and supports_sharded_target_sampling(config.spec_config, mapping)
+    )
+
+
+def captures_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mapping | None) -> bool:
+    """Whether temperature-only batches get graphs of their own rather than the advanced ones."""
+    listed = getattr(config.cuda_graph_config, "sampling_variants", None)
+    return supports_temperature_only_graphs(config, mapping) and (
+        listed is None or "temperature_only" in listed
+    )
+
+
 def create_spec_metadata(
     config: DecoderRunnerConfig,
     pretrained_config: object,
@@ -322,7 +342,7 @@ def create_spec_metadata(
     mapping: Mapping | None = None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
-    return get_spec_metadata(
+    spec_metadata = get_spec_metadata(
         config.spec_config,
         pretrained_config,
         config.max_batch_size,
@@ -330,15 +350,14 @@ def create_spec_metadata(
         spec_resource_manager=spec_resource_manager,
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
-        # The decode CUDA graphs then capture the temperature-only variant. It draws the
-        # sampled rows on vocabulary-sharded logits without the watermark, so a watermark
-        # configuration keeps the ordinary sampler.
-        temperature_only_graphs=config.cuda_graph_config is not None
-        and config.spec_decode_fast_paths
-        and config.watermark_config is None
-        and supports_sharded_target_sampling(config.spec_config, mapping),
+        # The decode CUDA graphs then capture the temperature-only variant.
+        temperature_only_graphs=captures_temperature_only_graphs(config, mapping),
         watermark_config=config.watermark_config,
     )
+    if spec_metadata is not None:
+        listed = getattr(config.cuda_graph_config, "sampling_variants", None)
+        spec_metadata.greedy_graphs = listed is None or "greedy" in listed
+    return spec_metadata
 
 
 def update_spec_metadata(

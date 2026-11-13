@@ -119,6 +119,7 @@ def _fake_meta():
         dummy_slot_row=0,
         group_all_greedy_sample=None,
         temperature_only_graphs=False,
+        greedy_graphs=True,
         _sampling_scan_cache=None,
     )
 
@@ -253,6 +254,7 @@ def _populate_meta(mode, draft_len=1):
         dummy_slot_row=0,
         group_all_greedy_sample=None,
         temperature_only_graphs=False,
+        greedy_graphs=True,
         _sampling_scan_cache=None,
         max_num_requests=4,
         max_draft_len=draft_len,

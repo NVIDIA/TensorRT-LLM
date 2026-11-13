@@ -298,6 +298,7 @@ def test_sampling_parameter_rows_follow_metadata_not_stale_request_windows(ragge
         group_all_greedy_sample=None,
         _sampling_scan_cache=None,
         temperature_only_graphs=False,
+        greedy_graphs=True,
         use_rejection_sampling=False,
         enable_penalty=False,
     )

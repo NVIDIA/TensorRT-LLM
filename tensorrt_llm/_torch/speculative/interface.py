@@ -660,6 +660,8 @@ class SpecMetadata:
     # for the current batch (see _temperature_only).
     temperature_only_graphs: bool = False
     temperature_only: bool = False
+    # Whether all-greedy batches have CUDA graphs of their own; without them they take the sampled path.
+    greedy_graphs: bool = True
     # Skip the Philox seed and offset uploads on all-greedy batches (deploy-time;
     # from the model's RuntimeHooks). The argmax path never reads them, and the
     # next sampled batch rewrites every row it reads.
@@ -1512,7 +1514,8 @@ class SpecMetadata:
         # All-greedy iff EVERY request is greedy -- note a non-greedy request
         # may still enable no filter (e.g. temperature=1.0 with top_k/top_p
         # unset), so this cannot be derived from which filters are in use.
-        self.is_all_greedy_sample = not has_non_greedy_requests
+        # Without greedy graphs, greedy rows take the sampled path and still decode greedily.
+        self.is_all_greedy_sample = not has_non_greedy_requests and self.greedy_graphs
 
         # Apply the group-synchronized value last (semantics: see the
         # ``group_all_greedy_sample`` field comment). Local contract: rescans

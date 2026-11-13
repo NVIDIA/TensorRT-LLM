@@ -153,6 +153,14 @@ class KeyType(NamedTuple):
     ragged_verify_bucket: Optional[int] = None
 
 
+def sampling_variant(spec_metadata: Optional[SpecMetadata]) -> str:
+    """The one-engine sampling variant of a batch, as cuda_graph_config.sampling_variants names it."""
+    if getattr(spec_metadata, "is_all_greedy_sample", True):
+        return "greedy"
+    return ("temperature_only" if getattr(spec_metadata, "temperature_only",
+                                          False) else "advanced")
+
+
 def _save_spec_decode_capture_state(
         attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
     if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
@@ -232,6 +240,8 @@ class CUDAGraphRunnerConfig:
     private_metadata_buffers: bool = False
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
+    # One-engine sampling variants that have graphs (cuda_graph_config.sampling_variants); None for all.
+    sampling_variants: Optional[frozenset[str]] = None
     static_input_ids: Optional[torch.Tensor] = None
     """The decoder runner's own int32 input-id buffer. When given (with
     ``static_position_ids``), the graphs' static inputs are views of the
@@ -524,11 +534,11 @@ class CUDAGraphRunner:
         # both variants and dispatch at replay based on actual batch state.
         # Default to True (greedy fast-path) when the metadata doesn't carry
         # this field (non-one-engine paths or non-spec batches).
-        is_all_greedy_sample = bool(
-            getattr(spec_metadata, "is_all_greedy_sample", True))
+        # maybe_get_cuda_graph checks the same variant against the captured ones.
+        variant = sampling_variant(spec_metadata)
+        is_all_greedy_sample = variant == "greedy"
         # The temperature-only variant of the advanced-sampling graphs.
-        temperature_only = (not is_all_greedy_sample and bool(
-            getattr(spec_metadata, "temperature_only", False)))
+        temperature_only = variant == "temperature_only"
 
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
@@ -733,7 +743,12 @@ class CUDAGraphRunner:
             return None, None, None
 
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
-        can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
+        # A batch of an uncaptured sampling variant runs eagerly; under attention
+        # DP the agreement below then takes every rank's step eager with it.
+        can_run_cuda_graph = (
+            self._can_run_cuda_graph_batch(batch) and
+            (spec_metadata is None or self.config.sampling_variants is None or
+             sampling_variant(spec_metadata) in self.config.sampling_variants))
         batch_size = batch.batch_size
         shapes_agree, forced_sample_type = self._agree_graph_shape(
             batch, can_run_cuda_graph, promoted_context_request_ids)
