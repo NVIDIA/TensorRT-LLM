@@ -77,6 +77,10 @@ DEEPSEEK_V41_MODELS = {
     "deepseek_v41_flash_nvfp4",
     "deepseek_v41_flash_nvfp4_dspark",
 }
+GLM53_FLASH_NVFP4_MODELS = {
+    "glm_5.3_flash_nvfp4",
+    "glm_5.3_flash_nvfp4_mtp",
+}
 QWEN38_MTP_MODELS = {
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
@@ -87,6 +91,7 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *GLM53_FLASH_NVFP4_MODELS,
     *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
@@ -124,6 +129,10 @@ OPENAI_CHAT_BACKEND_MODELS = {
 
 # Spec-dec models and their non-speculative controls use real text in serve tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
+    **{
+        model: "cnn_dailymail"
+        for model in GLM53_FLASH_NVFP4_MODELS
+    },
     **{
         model: "cnn_dailymail"
         for model in DEEPSEEK_V41_MODELS
@@ -1636,7 +1645,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # Allow time for NVFP4 checkpoint loading and executor warmup.
                 server_timeout = 3600
             elif self._config.model_name in {
-                    "glm_5.3_flash_fp8", "glm_5.3_flash_fp8_mtp"
+                    "glm_5.3_flash_fp8",
+                    "glm_5.3_flash_fp8_mtp",
+                    *GLM53_FLASH_NVFP4_MODELS,
             }:
                 # Weight loading and executor warmup can exceed 10 minutes.
                 server_timeout = 3600
