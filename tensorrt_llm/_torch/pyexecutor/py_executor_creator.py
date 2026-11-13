@@ -1019,9 +1019,12 @@ def _create_py_executor(
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
         # about pages appended since the last report, so it would keep
-        # addressing a slot another request now owns.
+        # addressing a slot another request now owns. mooncake-store saves only
+        # prompt blocks under speculative decoding, which are filled before the
+        # first draft, so it never does.
         if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
+                and v2_selection is True
+                and not uses_connector(kv_connector_config, "mooncake-store")):
             raise NotImplementedError(
                 "KV connector is not supported with speculative decoding. "
                 "Disable speculative decoding to run a connector.")
