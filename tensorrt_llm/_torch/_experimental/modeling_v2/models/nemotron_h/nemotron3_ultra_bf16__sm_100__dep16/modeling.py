@@ -64,7 +64,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    disable_v2_by_default,
+    step_contract_enabled,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -1154,6 +1157,7 @@ class DecodeTarget:
         return x
 
 
+@disable_v2_by_default
 class ModelingV2Nemotron3UltraBf16Sm100Dep16(
     DecoderModelForCausalLM[NemotronUltraBf16Dep16ModelingV2, PretrainedConfig]
 ):

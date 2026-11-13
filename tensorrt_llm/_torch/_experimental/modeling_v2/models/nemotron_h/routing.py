@@ -6,7 +6,8 @@
 compared against the deployments the targets below were written for. When none
 fits it raises ``NoTarget`` stating those facts. In ``auto`` the engine then
 uses the built-in NemotronH implementation; in ``require`` it raises that
-error.
+error. The targets are opt-in (``disable_v2_by_default``): with ``modeling_v2``
+unset the engine keeps the built-in model.
 
 The order is: the checkpoint and the GPU, then the parallel layout, then the
 engine choices. A NemotronH checkpoint that is not Nemotron-3 Ultra (Nano,
@@ -292,6 +293,11 @@ def route(
         raise NoTarget(
             f"use_kv_cache_manager_v2={kv_cache_config.use_kv_cache_manager_v2}; the targets "
             "read the hybrid recurrent-state pools of KV cache manager V2"
+        )
+    if llm_args.kv_cache_compression_config is not None:
+        raise NoTarget(
+            f"kv_cache_compression_config={type(llm_args.kv_cache_compression_config).__name__}: "
+            "the targets were gated without KV cache compression and do not implement it"
         )
     reuse_opt_in = None if nvfp4 else _BF16_BLOCK_REUSE_ENVS.get(layout)
     if kv_cache_config.enable_block_reuse and not (

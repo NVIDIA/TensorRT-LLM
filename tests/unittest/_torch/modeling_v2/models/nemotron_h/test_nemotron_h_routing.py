@@ -620,3 +620,32 @@ def test_ultra_bf16_ray_engine_without_an_extension_keeps_its_target(mapping, ta
     config = _model_config(_ultra_bf16_config(), **mapping)
     llm_args = _llm_args(mode, orchestrator_type="ray")
     assert _qualified(modeling_v2_resolve(config, llm_args)) == target
+
+
+@pytest.mark.parametrize(
+    "mapping", [_TEP8, _TP8EP2, _DEP16, _DEP32], ids=["tep8", "tp8ep2", "dep16", "dep32"]
+)
+def test_ultra_bf16_targets_are_opt_in(mapping):
+    """With modeling_v2 unset the engine keeps the built-in NemotronH; setting it selects the
+    target (the other tests here)."""
+    llm_args = TorchLlmArgs(model=_DUMMY_MODEL, kv_cache_config=_kv())
+    assert "modeling_v2" not in llm_args.model_fields_set
+    assert modeling_v2_resolve(_model_config(_ultra_bf16_config(), **mapping), llm_args) is None
+
+
+@pytest.mark.parametrize("mapping", [_TEP4, _DEP4], ids=["tep4", "dep4"])
+def test_ultra_nvfp4_targets_are_opt_in(_on_sm107, mapping):
+    llm_args = TorchLlmArgs(model=_DUMMY_MODEL, kv_cache_config=_nvfp4_kv())
+    assert modeling_v2_resolve(_nvfp4_config(**mapping), llm_args) is None
+
+
+@pytest.mark.parametrize("mapping", [_TEP8, _DEP16], ids=["tep8", "dep16"])
+def test_ultra_bf16_refuses_kv_cache_compression(mapping):
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
+
+    config = _model_config(_ultra_bf16_config(), **mapping)
+    _refused(
+        config,
+        "kv_cache_compression_config",
+        kv_cache_compression_config=ColdPageQuantizationCompressionConfig(),
+    )
