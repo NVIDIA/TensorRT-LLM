@@ -315,6 +315,25 @@ CTXNORMQ = not m31_disabled("CTXNORMQ")
 # logits are bitwise today's. The op comes from the build; without it the boundary keeps the base op.
 # Kill switch: TRTLLM_M31_DISABLE_TP2AGG_ROUTER_F32=1.
 ROUTER_F32 = not m31_disabled("TP2AGG_ROUTER_F32")
+# OPROJ_PUSH_GEMM: on TP2 decode-graph steps of PUSH_GEMM_MIN_ROWS..PUSH_GEMM_MAX_ROWS rows, the o_proj's pinned MXFP8
+# GEMM (FlashInfer's dense block-scaled GEMM with a Lamport-push epilogue, kernels/lamport_push_gemm) stores its rows
+# straight into the attention boundary's one-shot Lamport slots (both ranks, the stock push's -0 word rule), and the
+# boundary runs the one-shot all-reduce + residual + RMSNorm without its push loop, also writing the MXFP8 of the norm
+# (native_ops.minimax_m31_ar_prepushed, the stock quantize's device functions); the next pinned generic MXFP8 linear
+# (the shared expert / dense gate_up) takes it instead of quantizing (_PUSH_GEMM_MX). Bitwise to the stock chain: the
+# prebuild compares the GEMM's slot bytes with the stock GEMM (at the engine's MXFP8 tactic table, which this model's
+# RuntimeHooks arm) on the real o_proj weights at every tactic and declines on any difference; a step takes the path
+# only while that table is armed. Kill switch TRTLLM_M31_DISABLE_OPROJ_PUSH_GEMM=1 restores the stock o_proj GEMM and
+# boundary.
+OPROJ_PUSH_GEMM = not m31_disabled("OPROJ_PUSH_GEMM")
+PUSH_GEMM_MIN_ROWS = 49  # capacity: fixed: the o_proj GEMV serves 1..48 rows (no pinned GEMM there)
+PUSH_GEMM_MAX_ROWS = (
+    256  # capacity: fixed: the one-shot Lamport all-reduce's rows (the pinned table's 256 bucket)
+)
+PUSH_GEMM_N, PUSH_GEMM_K = (
+    6144,
+    4096,
+)  # capacity: fixed: the TP2 o_proj shape the epilogue is built for
 # Native CUDA ops for the SwiGLU-OAI activation and the MoE finalize, bit for bit the Triton kernels they replace on
 # every band. NATIVE_SWIGLU: mv2_minimax_m3::minimax_m31_swiglu_oai_vec (16-byte vectors, the in-tree swigluOai pair
 # sequence verbatim); kill switch TRTLLM_M31_DISABLE_NATIVE_SWIGLU=1. NATIVE_FINALIZE:
@@ -2325,6 +2344,15 @@ def _linear(
     w, s = core.w[wk], core.w[sk]
     x = x.contiguous()
     mode = _mx_mode(core.mxfp8)
+    # OPROJ_PUSH_GEMM: a PushGemmTarget is used only by the MX-TAC pinned GEMM branches below; no other path sees it.
+    push_gemm = push if isinstance(push, PushGemmTarget) else None
+    if push_gemm is not None:
+        push = None
+    # OPROJ_PUSH_GEMM: the attention boundary's MXFP8 norm, taken where the stock path is the pinned generic quantize +
+    # GEMM.
+    push_mx = (
+        _PUSH_GEMM_MX.take(x) if OPROJ_PUSH_GEMM and _PUSH_GEMM_MX.pending is not None else None
+    )
     # TP2W_S2_TAIL: the fused MoE tail's MXFP8 activation of x, used where the stock path quantizes x itself before
     # the same GEMM (bit-identical operands). Decode graphs (tuned_quantize_gemm) take it too: their pinned MX-TAC
     # branch below quantizes with m3_mxfp8_pinned_quantize, the bytes the fused tail writes.
@@ -2367,6 +2395,23 @@ def _linear(
     rows = x.shape[0]
     n, k = w.shape
     prequant = m3_prequant.SLOT.take(x)
+    if (
+        push_mx is not None
+        and s2 is None
+        and prequant is None
+        and MX_TAC_TP4
+        and core.mxfp8.quant_method.tune_decode_graph_backends
+        and linear_path(n, k, rows, False, low_m_gemm) == GENERIC_GEMM_PATH
+    ):
+        # The stock bf16 branch below is m3_mxfp8_pinned_quantize + this GEMM: the boundary wrote those bytes.
+        output = m3_mxfp8_pinned_gemm(
+            push_mx[0], push_mx[1], w, s, torch.bfloat16, MXFP8_DECODE_GEMM_TACTIC
+        )
+        _note_mx_tac("bf16", n, k, rows)
+        m3_report.work(
+            "OPROJ_PUSH_GEMM_MXFP8", f"[{n}, {k}] GEMM on the boundary's MXFP8 ({rows} rows)"
+        )
+        return output, False
     if (
         s2 is not None
         and prequant is None
@@ -2412,6 +2457,10 @@ def _linear(
         if path == PREQUANT_GEMM_PATH:
             uncovered(MX_GEMV_PATH, f"the [{n}, {k}] projection at rows the GEMV does not serve")
         if pinned:
+            if push_gemm is not None and push_gemm.accepts(n, k, rows):
+                push_gemm.run(act, act_scale, w, s)
+                _note_mx_tac("mxfp8", n, k, rows)
+                return push_gemm.out, True
             output = m3_mxfp8_pinned_gemm(
                 act, act_scale, w, s, torch.bfloat16, MXFP8_DECODE_GEMM_TACTIC
             )
@@ -2433,6 +2482,10 @@ def _linear(
         )
     if pinned and x.dtype == torch.bfloat16:
         act, act_scale = m3_mxfp8_pinned_quantize(x, MXFP8_DECODE_QUANT_TACTIC)
+        if push_gemm is not None and push_gemm.accepts(n, k, rows):
+            push_gemm.run(act, act_scale, w, s)
+            _note_mx_tac("bf16", n, k, rows)
+            return push_gemm.out, True
         output = m3_mxfp8_pinned_gemm(
             act, act_scale, w, s, torch.bfloat16, MXFP8_DECODE_GEMM_TACTIC
         )
@@ -4639,6 +4692,11 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             PACK_CPP_SCATTER=STEP_PACK_CPP_SCATTER,
             DRAFT_SILU_GENERIC_CPP=DRAFT_SILU_GENERIC_CPP,
         )
+        # OPROJ_PUSH_GEMM: the o_proj epilogue's tactics, their byte check and the boundary op, before warmup /
+        # capture, on the real workspace and weights.
+        start_push_gemm = time.perf_counter()
+        _push_gemm_init(self)
+        times["push_gemm_s"] = round(time.perf_counter() - start_push_gemm, 3)
         # PUSH16 / GEMV_PUSHOPT set-up lines (the switches are read at import; the GEMVs below compile their push
         # cells).
         logger.info(
@@ -5854,6 +5912,176 @@ class PrefillTarget:
         return output
 
 
+# OPROJ_PUSH_GEMM: the attention boundary's MXFP8 norm for the next pinned generic MXFP8 linear (shared expert or
+# dense gate_up).
+_PUSH_GEMM_MX = m3_prequant.PrequantSlot()
+_PUSH_GEMM_STATE: dict = {}
+
+
+class PushGemmTarget:
+    """The o_proj's OPROJ_PUSH_GEMM target (decided before the attention from the row count and prebuild state only, so
+    every rank agrees): the launcher, the pinned tactic and the boundary's allreduce_in-shaped tensor (shape only)."""
+
+    def __init__(self, launcher, tactic, rows: int, hidden: int, device):
+        self.launcher, self.tactic, self.rows = launcher, tactic, rows
+        self.out = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+
+    def accepts(self, n: int, k: int, rows: int) -> bool:
+        return (n, k) == (PUSH_GEMM_N, PUSH_GEMM_K) and rows == self.rows
+
+    def run(self, act, act_scale, w, s):
+        self.launcher.run(self.tactic, act, act_scale, w, s, self.out)
+
+
+def _push_gemm_op():
+    """``native_ops.minimax_m31_ar_prepushed`` when the build carries it and OPROJ_PUSH_GEMM is on, else None. Decided
+    once per process."""
+    if "op" not in _PUSH_GEMM_STATE:
+        op = getattr(native_ops, "minimax_m31_ar_prepushed", None) if OPROJ_PUSH_GEMM else None
+        _PUSH_GEMM_STATE["op"] = op
+    return _PUSH_GEMM_STATE["op"]
+
+
+def _engine_pinned_tactics():
+    """The engine's SM107 MXFP8 tactic table (``tensorrt_llm._torch.custom_ops.mxfp8_cute_pinned_tactics``): the
+    decode graph's stock GEMM (m3_mxfp8_pinned_gemm) runs FlashInfer at its tactic once this model's RuntimeHooks
+    (mxfp8_pinned_tactics) armed it, which the executor does after the model is built."""
+    from tensorrt_llm._torch.custom_ops import mxfp8_cute_pinned_tactics as engine_pins
+
+    return engine_pins
+
+
+def _push_gemm_tactic(rows: int):
+    """The family table's tactic of the o_proj at ``rows`` (non-split-K only), or None. The prebuild check proves its
+    bytes equal the stock GEMM's at the engine table's tactic."""
+    from ..ops.gemm import mxfp8_cute_pinned_tactics as family_pins
+
+    if not family_pins.ENABLED:
+        return None
+    tactic = family_pins.TACTICS.get(
+        (PUSH_GEMM_N, PUSH_GEMM_K, max(64, 1 << (rows - 1).bit_length()))
+    )
+    return tactic if tactic is not None and tactic[4] == 1 else None
+
+
+def _push_gemm_stock_is_pinned() -> bool:
+    """Whether the stock decode GEMM runs the engine table's tactics in this process (armed: the GEMM the prebuild
+    check compared). Host state only, the same on every rank."""
+    engine_pins = _engine_pinned_tactics()
+    return bool(engine_pins.ENABLED and engine_pins._ARMED[0])
+
+
+def _push_gemm_check(launcher, tactic, rows: int, w, s) -> Optional[str]:
+    """The launcher's slot bytes at ``tactic`` against the stock decode-graph GEMM (m3_mxfp8_pinned_quantize +
+    m3_mxfp8_pinned_gemm, engine tactic table armed) on the real weights, with the stock push's -0 word rule applied to
+    the stock output. Stores into scratch slots (the workspace is untouched). Returns the first difference, or None."""
+    dev = w.device
+    g = torch.Generator(device=dev).manual_seed(rows)
+    x = (torch.randn(rows, PUSH_GEMM_K, generator=g, device=dev) * 4).to(torch.bfloat16)
+    x[: max(1, rows // 8)] = 0  # all-zero rows: the GEMM writes signed zeros there
+    act, act_scale = m3_mxfp8_pinned_quantize(x, MXFP8_DECODE_QUANT_TACTIC)
+    # The stock GEMM as the decode graph runs it: with the engine table armed (the executor arms it after the model is
+    # built, so the prebuild sees it unarmed; a step takes this GEMM only once it is armed).
+    engine_pins = _engine_pinned_tactics()
+    armed = engine_pins._ARMED[0]
+    engine_pins._ARMED[0] = True
+    try:
+        ref = m3_mxfp8_pinned_gemm(act, act_scale, w, s, torch.bfloat16, MXFP8_DECODE_GEMM_TACTIC)
+    finally:
+        engine_pins._ARMED[0] = armed
+    words = ref.contiguous().view(torch.int32).clone()
+    words[words == -(2**31)] = 0
+    sentinel = torch.tensor(0x7FC07FC0, dtype=torch.int32, device=dev)
+    scratch = sentinel.expand(6, rows, PUSH_GEMM_N // 2).contiguous()
+    flag = torch.zeros(
+        1, dtype=torch.int32, device=dev
+    )  # slot 0: the local and peer sections are scratch[0], [1]
+    dummy = torch.empty((rows, PUSH_GEMM_N), dtype=torch.bfloat16, device=dev)
+    launcher.run(
+        tactic,
+        act,
+        act_scale,
+        w,
+        s,
+        dummy,
+        slots=[scratch[i].data_ptr() for i in range(6)],
+        flag_addr=flag.data_ptr(),
+    )
+    torch.cuda.synchronize(dev)
+    for i in (0, 1):
+        bad = int((scratch[i] != words).sum().item())
+        if bad:
+            return f"{bad} words differ from the stock GEMM at {rows} rows, tactic {tactic}"
+    if not bool((scratch[2:] == sentinel).all().item()):
+        return f"the GEMM wrote outside slot 0 at {rows} rows, tactic {tactic}"
+    return None
+
+
+def _push_gemm_init(core) -> None:
+    """Prebuild (before warmup and capture, every rank, real weights): load the op, build the launcher on
+    core.allreduce's own Lamport workspace, compile every pinned o_proj tactic of PUSH_GEMM_MIN_ROWS..PUSH_GEMM_MAX_ROWS
+    and check its bytes against the stock GEMM. Leaves core._push_gemm_launcher None (never taken) with one reason line
+    otherwise. A rank that declines runs the stock push + all-reduce on the same slots, which the other rank's prepushed
+    boundary reads the same way."""
+    core._push_gemm_launcher = None
+    why = None
+    ar = getattr(core, "allreduce", None)
+    ws = getattr(ar, "workspace", None) if ar is not None else None
+    if not OPROJ_PUSH_GEMM:
+        why = "switched off (TRTLLM_M31_DISABLE_OPROJ_PUSH_GEMM)"
+    elif core.mapping.tp_size != 2:
+        why = f"tp_size {core.mapping.tp_size} != 2"
+    elif (
+        ar is None
+        or ar.strategy not in (AllReduceStrategy.AUTO, AllReduceStrategy.ONESHOT)
+        or getattr(ar, "mnnvl_allreduce", None) is not None
+        or getattr(ar, "symm_mem_allreduce", None) is not None
+    ):
+        why = "the boundary all-reduce is not the one-shot Lamport"
+    elif ws is None or ws.dtype != torch.int64 or not ws.is_cuda or ws.numel() < 7:
+        why = "no Lamport workspace"
+    elif _push_gemm_op() is None:
+        why = "the minimax_m31_ar_prepushed op is not built"
+    else:
+        first = min(core.attn_layers) if hasattr(core, "attn_layers") else 0
+        w, s = core.w[f"l{first}_o_w"], core.w[f"l{first}_o_s"]
+        rows_checked = (PUSH_GEMM_MIN_ROWS, 64, 65, 128, 129, PUSH_GEMM_MAX_ROWS)
+        tactics = {
+            r: _push_gemm_tactic(r) for r in range(PUSH_GEMM_MIN_ROWS, PUSH_GEMM_MAX_ROWS + 1)
+        }
+        if tuple(w.shape) != (PUSH_GEMM_N, PUSH_GEMM_K):
+            why = f"o_proj {list(w.shape)} is not [{PUSH_GEMM_N}, {PUSH_GEMM_K}]"
+        elif any(t is None for t in tactics.values()):
+            why = "no non-split-K pinned tactic for every row count (TRTLLM_M31_DISABLE_MXFP8_CUTE_PIN?)"
+        else:
+            from .kernels import lamport_push_gemm as _lpg
+
+            try:
+                launcher = _lpg.LamportPushGemmLauncher(
+                    ws, core.mapping.tp_rank, PUSH_GEMM_N, PUSH_GEMM_K
+                )
+                for t in sorted(set(tactics.values())):
+                    launcher.compile(t)
+                for r in rows_checked:
+                    why = _push_gemm_check(launcher, tactics[r], r, w, s)
+                    if why is not None:
+                        break
+            except Exception as e:  # noqa: BLE001 - a FlashInfer / CuTe DSL API change declines, once, loudly
+                why = (
+                    f"the epilogue GEMM does not build on this FlashInfer ({type(e).__name__}: {e})"
+                )
+            if why is None:
+                launcher._alpha[ws.device] = torch.ones(1, dtype=torch.float32, device=ws.device)
+                core._push_gemm_launcher = launcher
+                logger.info(
+                    f"[M3.1] OPROJ_PUSH_GEMM ready rank={core.mapping.tp_rank}: rows "
+                    f"{PUSH_GEMM_MIN_ROWS}..{PUSH_GEMM_MAX_ROWS}, tactics {sorted(set(tactics.values()))}, "
+                    f"bytes equal to the stock GEMM at rows {rows_checked}"
+                )
+    if why is not None:
+        logger.info(f"[M3.1] OPROJ_PUSH_GEMM not taken rank={core.mapping.tp_rank}: {why}")
+
+
 class DecodeTarget:
     """A pure generation step (no context rows), of any width.
 
@@ -6216,6 +6444,56 @@ class DecodeTarget:
         )
         return fused
 
+    def _push_gemm_target(self, num_tokens: int, residual) -> Optional[PushGemmTarget]:
+        """OPROJ_PUSH_GEMM's o_proj target for this decode-graph step, or None: from the row count, the residual's
+        shape and prebuild state only (every rank agrees)."""
+        launcher = getattr(self.core, "_push_gemm_launcher", None)
+        if launcher is None or not PUSH_GEMM_MIN_ROWS <= num_tokens <= PUSH_GEMM_MAX_ROWS:
+            return None
+        if not _push_gemm_stock_is_pinned():
+            return None  # the stock GEMM is FlashInfer's default tactic here: not the checked bytes
+        if (
+            residual is None
+            or residual.dim() != 2
+            or residual.shape != (num_tokens, PUSH_GEMM_N)
+            or residual.dtype != torch.bfloat16
+            or not residual.is_contiguous()
+        ):
+            return None
+        tactic = _push_gemm_tactic(num_tokens)
+        if tactic is None:
+            return None
+        return PushGemmTarget(launcher, tactic, num_tokens, PUSH_GEMM_N, residual.device)
+
+    def _push_gemm_boundary(self, target: PushGemmTarget, residual, norm_w):
+        """The attention boundary after an OPROJ_PUSH_GEMM o_proj: the one-shot all-reduce without its push loop +
+        residual + RMSNorm, and the norm's MXFP8 (published in _PUSH_GEMM_MX for the next pinned generic MXFP8
+        linear)."""
+        core = self.core
+        rows, hidden = target.rows, PUSH_GEMM_N
+        normed = torch.empty_like(residual)
+        updated = torch.empty_like(residual)
+        q = torch.empty((rows, hidden), dtype=torch.float8_e4m3fn, device=residual.device)
+        sf = torch.empty(
+            ((rows + 127) // 128 * 128) * (hidden // 32), dtype=torch.uint8, device=residual.device
+        )
+        _push_gemm_op()(
+            core.mapping.tp_rank,
+            core.allreduce.workspace,
+            target.out,
+            residual,
+            updated,
+            normed,
+            norm_w,
+            core.rms_eps,
+            False,
+            q,
+            sf,
+        )
+        _PUSH_GEMM_MX.publish(normed, q, sf)
+        m3_report.work("OPROJ_PUSH_GEMM", f"{rows} rows, tactic {target.tactic}")
+        return normed, updated
+
     def _layer(self, i: int, plan: DecodePlan, position_ids, hidden, residual, step, capture=None):
         """``capture``: (out, fc_norm weight, eps) for the feed-forward boundary to write the layer's Eagle3 capture
         norm (CAPTURE_NORM_IN_BOUNDARY, for a capture layer on this path); a fused boundary that writes it sets
@@ -6236,9 +6514,18 @@ class DecodeTarget:
             )
         push = plan.attn_mc_ar and decode_graph and ATTN_PUSH.covers(num_tokens)
         armed = self._attn_push_target(num_tokens) if push else None
-        hidden, attn_pushed = self._attention(i, position_ids, hidden, step, armed)
+        push_gemm = (
+            self._push_gemm_target(num_tokens, residual)
+            if armed is None and not plan.attn_mc_ar and decode_graph
+            else None
+        )
+        hidden, attn_pushed = self._attention(
+            i, position_ids, hidden, step, armed if push_gemm is None else push_gemm
+        )
         post_norm = core.w[f"l{i}_post_norm"]
-        if armed is not None and attn_pushed:
+        if push_gemm is not None and attn_pushed:
+            hidden, residual = self._push_gemm_boundary(push_gemm, residual, post_norm)
+        elif armed is not None and attn_pushed:
             taken(ATTN_PUSH.path, num_tokens)
             if num_tokens > ATTN_PUSH_BASE_TOKENS:
                 _note_wide_push(core, num_tokens, armed[4])
