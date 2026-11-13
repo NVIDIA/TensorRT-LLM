@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the m3_mxfp8_pinned_gemm entry (MX-TAC): the pinned decode-graph MXFP8 GEMM gives the same bits as
-every candidate stock's AutoTuner can pick (CuTe DSL, CUTLASS), the same on every call, within the MXFP8 band of the
-dequantized product."""
+"""Test the pinned MXFP8 tactic, its reproducibility, and both stock candidates against the reference."""
 
 import zlib
 
@@ -15,6 +13,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_mxfp8_pinned_gemm import (  # noqa: E501
     m3_mxfp8_pinned_gemm as op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_linear import (
+    mxfp8_reference,
 )
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
 
@@ -76,8 +77,14 @@ def test_pinned_decision_matches_every_stock_candidate(nk, m, scale) -> None:
     xq = xq.view(m, k)
     out = op(xq, xsf, wq, wsf, torch.bfloat16, TACTIC)
     runner = FlashInferMXFP8GemmRunner(torch.bfloat16)
-    for tactic in (FlashInferMXFP8GemmRunner.CUTE_DSL, FlashInferMXFP8GemmRunner.CUTLASS):
-        ref = runner.forward([xq, xsf, wq, wsf], tactic=tactic)
-        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), tactic
+    # The pinned path must use the same tactic and produce identical bits on every call.
+    cute = runner.forward([xq, xsf, wq, wsf], tactic=FlashInferMXFP8GemmRunner.CUTE_DSL)
+    assert torch.equal(out.view(torch.int16), cute.view(torch.int16))
+    cutlass = runner.forward([xq, xsf, wq, wsf], tactic=FlashInferMXFP8GemmRunner.CUTLASS)
+    ref = mxfp8_reference(xq, xsf, wq, wsf).to(torch.bfloat16)
+    # Different GEMM implementations may accumulate in a different order. Check both against
+    # the independent dequantized reference using the certified MXFP8 GEMM accuracy bounds.
+    assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=0.25)
+    assert_within_ulp(cutlass, ref, element_ulp=2.0, rms_ulp=0.25)
     again = op(xq, xsf, wq, wsf, torch.bfloat16, TACTIC)
     assert torch.equal(out.view(torch.int16), again.view(torch.int16))

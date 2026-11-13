@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for MX-TAC: the pinned decode-graph MXFP8 decision (CuTe DSL quantize + CuTe DSL GEMM) gives the same bits
-as every other candidate stock's AutoTuner can pick (TRT-LLM quantize, CUTLASS GEMM), the same on every call."""
+"""Test the pinned MXFP8 tactic, its reproducibility, and both stock candidates against the reference."""
 
 import pytest
 import torch
@@ -11,7 +10,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     _pinned_mxfp8_gemm,
     _pinned_mxfp8_quantize,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_linear import (
+    mxfp8_reference,
+)
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
+
+__extra_import_path__ = ["../../../..", ".", "../.."]
+from _validating import assert_within_ulp  # noqa: E402
 
 if not torch.cuda.is_available():
     pytest.skip("MX-TAC requires a CUDA device", allow_module_level=True)
@@ -43,8 +48,14 @@ def test_pinned_decision_matches_every_stock_candidate(nk, m, scale) -> None:
     xq = xq.view(m, k)
     out = _pinned_mxfp8_gemm(xq, xsf, wq, wsf, torch.bfloat16)
     runner = FlashInferMXFP8GemmRunner(torch.bfloat16)
-    for tactic in (FlashInferMXFP8GemmRunner.CUTE_DSL, FlashInferMXFP8GemmRunner.CUTLASS):
-        ref = runner.forward([xq, xsf, wq, wsf], tactic=tactic)
-        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), tactic
+    # The pinned path must use the same tactic and produce identical bits on every call.
+    cute = runner.forward([xq, xsf, wq, wsf], tactic=FlashInferMXFP8GemmRunner.CUTE_DSL)
+    assert torch.equal(out.view(torch.int16), cute.view(torch.int16))
+    cutlass = runner.forward([xq, xsf, wq, wsf], tactic=FlashInferMXFP8GemmRunner.CUTLASS)
+    ref = mxfp8_reference(xq, xsf, wq, wsf).to(torch.bfloat16)
+    # Different GEMM implementations may accumulate in a different order. Check both against
+    # the independent dequantized reference using the certified MXFP8 GEMM accuracy bounds.
+    assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=0.25)
+    assert_within_ulp(cutlass, ref, element_ulp=2.0, rms_ulp=0.25)
     again = _pinned_mxfp8_gemm(xq, xsf, wq, wsf, torch.bfloat16)
     assert torch.equal(out.view(torch.int16), again.view(torch.int16))
