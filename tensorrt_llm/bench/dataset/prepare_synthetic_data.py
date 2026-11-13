@@ -58,8 +58,12 @@ def token_norm_dist(root_args, **kwargs):
     num_reqs = len(input_lens)
     # A different seed than the input lengths: with the same seed both lengths are drawn from the
     # same standard-normal sequence, so every request's output length would follow its input length.
+    # np.random.seed only accepts seeds below 2**32, so wrap the derived seed.
     output_lens = get_norm_dist_lengths(
-        kwargs["output_mean"], kwargs["output_stdev"], num_reqs, root_args.random_seed + 1
+        kwargs["output_mean"],
+        kwargs["output_stdev"],
+        num_reqs,
+        (root_args.random_seed + 1) % 2**32,
     )
     input_ids = gen_random_tokens(input_lens, root_args.tokenizer, root_args.random_seed)
     _, print_task_ids, lora_config = _generate_task_ids_and_lora_config(root_args, num_reqs)

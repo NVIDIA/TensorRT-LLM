@@ -36,12 +36,12 @@ class _Tokenizer:
         return [self.vocab_size - 1]
 
 
-def _lengths(tmp_path, command, args):
+def _lengths(tmp_path, command, args, random_seed=420):
     output = tmp_path / "dataset.jsonl"
     root_args = SimpleNamespace(
         tokenizer=_Tokenizer(),
         output=str(output),
-        random_seed=420,
+        random_seed=random_seed,
         task_id=-1,
         rand_task_id=None,
         lora_dir=None,
@@ -55,41 +55,66 @@ def _lengths(tmp_path, command, args):
     return ([len(row["input_ids"]) for row in rows], [row["output_tokens"] for row in rows])
 
 
-@pytest.mark.parametrize(
-    "command, args",
-    [
-        pytest.param(
-            prepare_synthetic_data.token_norm_dist,
-            [
-                "--input-mean",
-                "1000",
-                "--input-stdev",
-                "200",
-                "--output-mean",
-                "500",
-                "--output-stdev",
-                "100",
-            ],
-            id="norm",
-        ),
-        pytest.param(
-            prepare_synthetic_data.token_unif_dist,
-            [
-                "--input-min",
-                "100",
-                "--input-max",
-                "2000",
-                "--output-min",
-                "50",
-                "--output-max",
-                "1000",
-            ],
-            id="unif",
-        ),
-    ],
-)
+_COMMANDS = [
+    pytest.param(
+        prepare_synthetic_data.token_norm_dist,
+        [
+            "--input-mean",
+            "1000",
+            "--input-stdev",
+            "200",
+            "--output-mean",
+            "500",
+            "--output-stdev",
+            "100",
+        ],
+        id="norm",
+    ),
+    pytest.param(
+        prepare_synthetic_data.token_unif_dist,
+        [
+            "--input-min",
+            "100",
+            "--input-max",
+            "2000",
+            "--output-min",
+            "50",
+            "--output-max",
+            "1000",
+        ],
+        id="unif",
+    ),
+]
+
+
+@pytest.mark.parametrize("command, args", _COMMANDS)
 def test_input_and_output_lengths_are_not_correlated(tmp_path, command, args):
     input_lens, output_lens = _lengths(tmp_path, command, args)
     # Both lengths used to come from one random sequence, which made them perfectly correlated.
     assert len(set(input_lens)) > 1 and len(set(output_lens)) > 1
     assert abs(np.corrcoef(input_lens, output_lens)[0, 1]) < 0.3
+
+
+@pytest.mark.parametrize("command, args", _COMMANDS)
+def test_same_seed_is_reproducible(tmp_path, command, args):
+    first = _lengths(tmp_path / "first", command, args)
+    second = _lengths(tmp_path / "second", command, args)
+    assert first == second
+
+
+def test_norm_dist_accepts_max_numpy_seed(tmp_path):
+    # The output lengths use ``random_seed + 1``, which must stay within numpy's 32-bit seed range.
+    args = [
+        "--input-mean",
+        "1000",
+        "--input-stdev",
+        "0",
+        "--output-mean",
+        "500",
+        "--output-stdev",
+        "0",
+    ]
+    input_lens, output_lens = _lengths(
+        tmp_path, prepare_synthetic_data.token_norm_dist, args, random_seed=2**32 - 1
+    )
+    assert set(input_lens) == {1000} and set(output_lens) == {500}
