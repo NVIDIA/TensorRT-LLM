@@ -10,30 +10,40 @@ holds every call to this entry's `reference` on that call's own inputs (output a
 state buffers, the Triton entry's bands) and every output to the exact twin (the fp32 token-by-token
 recurrence over every accepted token). With `strided_gates` the raw a / b reach the kernel as
 column views of an input-projection-shaped buffer, as the target hands them over.
+
+Beyond the cells: CUDA-graph replay bitwise eager, the launch mappings bitwise each other, the
+history and its bookkeeping at replay slots of their own (a manager's KVCM pages) bitwise the
+coupled run -- through this entry and through the target's verify dispatch -- and `precompile`
+covering every verify step.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.ssm.gdn_cached_replay_cute__verify as cr  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+    modeling as M,
+)
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
 _MV2_TESTS = Path(__file__).resolve().parents[4]
 if str(_MV2_TESTS) not in sys.path:
     sys.path.insert(0, str(_MV2_TESTS))
-from _validating import certifying  # noqa: E402,F401 — fixture by name
+from _validating import certifying, validating  # noqa: E402,F401 — certifying: fixture by name
 
 _spec = importlib.util.spec_from_file_location(
     "cached_replay_harness",
-    # The Triton entry's test, in the family tree (tests/unittest/_torch/modeling_v2/models/qwen4_exp/ssm).
+    # The Triton entry's test, in the family tree (tests/unittest/_torch/modeling_v2/models/qwen4_exp/ops/ssm).
     _MV2_TESTS
-    / "models/qwen4_exp/ssm"
+    / "models/qwen4_exp/ops/ssm"
     / "test_modeling_v2_fused_recurrent_gated_delta_rule_cached_replay_update.py",
 )
 trep = importlib.util.module_from_spec(_spec)
@@ -278,20 +288,360 @@ def test_launch_mappings_agree(n, t, pdl) -> None:
             assert torch.equal(x, y), f"{name}: {cfg} vs {_MAPPINGS[0]}"
 
 
+# ── replay slots of their own ────────────────────────────────────────────
+
+
+def _replay_pages(slots, layers, h, hv):
+    """The history and its bookkeeping in pages of their own, as a manager keeps them in its
+    KVCM pool: one page per replay slot holding every layer's `old_u`, then every layer's
+    `old_k`, then every layer's `old_G`, then the pending count and the half (int32), and 8
+    bytes nobody writes; every byte 0xFF (NaN history, counts of -1) until written. The
+    `[layers, slots, ...]` history views have the page as their slot stride, the bookkeeping
+    columns the page as their element stride; `data` is the `[slots, page]` bytes, `tail`
+    the offset of the unwritten bytes."""
+    regions = (
+        (torch.bfloat16, (2, trep.HIST, hv, V)),
+        (torch.bfloat16, (2, trep.HIST, h, K)),
+        (torch.float32, (2, hv, trep.HIST)),
+    )
+    sizes = [math.prod(shape) * dtype.itemsize for dtype, shape in regions]
+    page = layers * sum(sizes) + 16
+    data = torch.full((slots, page), 0xFF, dtype=torch.uint8, device=DEV)
+    flat = data.view(-1)
+    views, offset = [], 0
+    for (dtype, shape), size in zip(regions, sizes):
+        es = dtype.itemsize
+        rows = torch.empty(shape, device="meta").stride()
+        views.append(
+            torch.as_strided(
+                flat.view(dtype),
+                (layers, slots, *shape),
+                (size // es, page // es, *rows),
+                offset // es,
+            )
+        )
+        offset += layers * size
+    pnat, buf = (
+        torch.as_strided(flat.view(torch.int32), (slots,), (page // 4,), offset // 4 + field)
+        for field in (0, 1)
+    )
+    return SimpleNamespace(
+        data=data, u=views[0], k=views[1], G=views[2], pnat=pnat, buf=buf, tail=offset + 8
+    )
+
+
+class _ReplaySlotBench(trep._Bench):
+    """The harness's bench (the same draws for the same seed) with the history and its
+    bookkeeping moved to replay slots of their own (`_replay_pages`): row `i`'s at
+    `replay_indices[i]`, a permutation of slots past the checkpoint pool's, so no row's replay
+    slot is a checkpoint slot. The work items carry the replay slot as their fifth field; the
+    kernel is handed their first `width` fields (4: it reads the replay slot from
+    `replay_indices`), the manager's all-layer commit the full items. `writes` is the coupled
+    bench's alone (it reads the bookkeeping at the checkpoint slots)."""
+
+    def __init__(self, spec, seed, width):
+        super().__init__(spec, seed, exact=False)
+        n, slots = self.n, self.state_indices.long()
+        cpu = torch.Generator().manual_seed(seed + 1)
+        replay = torch.randperm(2 * n, generator=cpu)[:n] + self.slots
+        self.replay_indices = replay.to(DEV, torch.int32)
+        rows = self.replay_indices.long()
+        self.pages = _replay_pages(self.slots + 2 * n, self.layers, self.h, self.hv)
+        pages = self.pages
+        for paged, coupled in zip(
+            (pages.u, pages.k, pages.G), (self.old_x, self.old_B, self.old_dt)
+        ):
+            paged[:, rows] = coupled[:, slots]
+        pages.pnat[rows] = self.pnat[slots]
+        pages.buf[rows] = self.buf[slots]
+        self.old_x, self.old_B, self.old_dt = pages.u, pages.k, pages.G
+        self.pnat, self.buf = pages.pnat, pages.buf
+        self.meta = trep.ReplayStateUpdateMetadata(self.pnat, self.buf, self.t, trep.HIST)
+        self.item_width = width
+        self.kernel_items = None
+
+    def prepare(self):
+        if self.path == "all_layer":
+            self.work_items.zero_()
+            trep._build_replay_work_items_triton(
+                self.live,
+                self.pnat,
+                self.buf,
+                self.work_items,
+                self.n_writes,
+                self.t,
+                trep.HIST,
+                self.replay_indices,
+            )
+            full = self.work_items.shape[1]
+            self.kernel_items = (
+                self.work_items
+                if self.item_width == full
+                else self.work_items[:, : self.item_width].contiguous()
+            )
+
+    def kwargs(self, layer, act):
+        kw = super().kwargs(layer, act)
+        kw["replay_indices"] = self.replay_indices
+        if self.kernel_items is not None:
+            kw["replay_work_items"] = self.kernel_items
+        return kw
+
+    def accept(self, accepted):
+        trep._advance_replay_state(self.meta, self.replay_indices, accepted)
+
+
+_SLOT_STATE = ("checkpoint", "old_u", "old_k", "old_G", "pending count", "half")
+
+
+def _slot_state(bench):
+    """A bench's checkpoints, and its rows' history and bookkeeping at their history slots
+    (the replay slots, when it has them)."""
+    rows = getattr(bench, "replay_indices", bench.state_indices).long()
+    return (
+        bench.backing,
+        bench.old_x[:, rows],
+        bench.old_B[:, rows],
+        bench.old_dt[:, rows],
+        bench.pnat[rows],
+        bench.buf[rows],
+    )
+
+
+#: Replay-slot runs: requests, the work-item width the kernel is handed (None: no work items,
+#: the small path), and whether the kernel commits wrapping rows itself.
+_REPLAY_SLOT_RUNS = {
+    "small_n1": (1, None, True),
+    "small_n4": (4, None, True),
+    "w4_in_kernel": (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 4, True),
+    "w4_all_layer": (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 4, False),
+    "w5_all_layer": (32, 5, False),
+}
+
+
 @pytest.mark.parametrize("heads", cr.GEOMETRIES, ids=[f"{h}x{hv}" for h, hv in cr.GEOMETRIES])
-def test_precompile_covers_every_step(heads) -> None:
+@pytest.mark.parametrize(
+    "n,width,in_kernel", list(_REPLAY_SLOT_RUNS.values()), ids=list(_REPLAY_SLOT_RUNS)
+)
+def test_separate_replay_slots_match_coupled(
+    n,
+    width,
+    in_kernel,
+    heads,
+    certifying,  # noqa: F811 — fixture by name
+) -> None:
+    """Replay slots that differ from the checkpoint slots give, bit for bit, the coupled run.
+
+    The coupled side is the harness's bench: history and bookkeeping at the checkpoint slots.
+    The other (`_ReplaySlotBench`) keeps the same history and bookkeeping at a permuted set of
+    replay slots past the checkpoint pool's, in pages holding every layer's rows (a slot stride
+    of the whole page, the bookkeeping as strided int32 fields of it), 0xFF elsewhere. Both run
+    verify steps through this entry -- strided a / b and PDL, as the target hands them over --
+    with checkpoint wraps committed in-kernel (without work items, or with them and
+    `in_kernel_commit`) or by the manager's all-layer commit, the kernel handed the work items
+    at `width` fields (4: the replay slot from `replay_indices`; 5: from the items' fifth
+    field), then advance their bookkeeping with the same acceptance. Each replay-slot call is
+    also held to this entry's `reference` given the same `replay_indices`, and no byte of the
+    pages outside the rows' replay slots is written.
+    """
+    certifying(op)
+    t = 4
+    path = "small" if width is None else "all_layer"
+    spec = _rank_spec(heads, path=path, n=n, t=t, layers=2, steps=trep.HIST // t + 3)
+    seed = 31 + n
+    coupled = trep._Bench(spec, seed, exact=False)
+    paged = _ReplaySlotBench(spec, seed, width or trep.REPLAY_WORK_ITEM_WIDTH)
+    sides = (coupled, paged)
+    rows = paged.replay_indices.long()
+    assert not torch.isin(rows, coupled.state_indices.long()).any()
+    wraps = appends = 0
+    for step in range(coupled.steps):
+        wrapped = coupled.writes()[1].numel()
+        wraps += wrapped
+        appends += n - wrapped
+        for side in sides:
+            side.prepare()
+        if width is not None:
+            assert torch.equal(coupled.n_writes, paged.n_writes)
+        for layer in range(coupled.layers):
+            act = coupled.inputs()
+            a, b = _gates(coupled, act, True)
+            outs = []
+            for side in sides:
+                kw = dict(side.kwargs(layer, act), g=a, beta=b, launch_with_pdl=True)
+                if in_kernel:
+                    kw.update(in_kernel_commit=True, use_all_layer_commit=False)
+                if side is paged:
+                    ref = op.reference(**kw)
+                outs.append(op(**kw))
+            pool, u, k, G = paged.state(layer)
+            trep._compare(
+                (outs[1], pool, u[rows], k[rows], G[rows]),
+                (ref[0], ref[1], ref[2][rows], ref[3][rows], ref[4][rows]),
+            )
+            assert torch.equal(outs[0], outs[1]), f"step {step} layer {layer}: outputs differ"
+        if not in_kernel:
+            for side in sides:
+                side.commit()
+        accepted = coupled.draw_acceptance()
+        for side in sides:
+            side.accept(accepted)
+        for name, x, y in zip(_SLOT_STATE, _slot_state(coupled), _slot_state(paged)):
+            assert torch.equal(x, y), f"step {step}: {name} differs"
+    assert wraps > 0 and appends > 0, f"the run never wrapped or appended ({wraps}, {appends})"
+    pages = paged.pages
+    elsewhere = torch.ones(pages.data.shape[0], dtype=torch.bool, device=DEV)
+    elsewhere[rows] = False
+    assert (pages.data[elsewhere] == 0xFF).all(), "a page outside the rows' replay slots moved"
+    assert (pages.data[:, pages.tail :] == 0xFF).all(), "a page's bytes past its rows moved"
+
+
+def _dispatch_core(bench, separate):
+    """What `_verify_state` and `_gdn_verify` read, over `bench`'s pool, history and
+    bookkeeping: the GDN core's geometry and bind (the pools, the replay buffers, a manager
+    with the all-layer commit on and, with `separate`, replay slots of its own), and the mamba
+    metadata the step's prepare fills (`bench.prepare`)."""
+    replay = SimpleNamespace(
+        ring=None,
+        old={
+            layer: (
+                bench.old_x[layer],
+                bench.old_B[layer],
+                bench.old_dt[layer],
+                bench.old_dA[layer],
+            )
+            for layer in range(bench.layers)
+        },
+        cache_buf_idx=bench.buf,
+        prev_num_accepted=bench.pnat,
+        history=trep.HIST,
+    )
+    cm = SimpleNamespace(
+        use_gdn_cached_replay_all_layer_commit=True,
+        replay_layer_group_id=1 if separate else None,
+    )
+    core = SimpleNamespace(
+        conv_dim=bench.width,
+        key_dim=bench.h * K,
+        value_dim=bench.hv * V,
+        num_k_heads=bench.h,
+        head_k_dim=K,
+        num_v_heads=bench.hv,
+        head_v_dim=V,
+        _bound=SimpleNamespace(
+            pools=SimpleNamespace(ssm=dict(enumerate(bench.pool))),
+            replay=replay,
+            cm=cm,
+            int_idx=torch.arange(bench.n, dtype=torch.int32, device=DEV),
+        ),
+    )
+    mm = SimpleNamespace(
+        replay_work_items=bench.work_items,
+        replay_n_writes=bench.n_writes,
+        replay_state_indices=bench.replay_indices if separate else bench.state_indices,
+    )
+    return core, mm
+
+
+@pytest.mark.parametrize("heads", cr.GEOMETRIES, ids=[f"{h}x{hv}" for h, hv in cr.GEOMETRIES])
+@pytest.mark.parametrize("separate", [False, True], ids=["coupled", "replay_slots"])
+@pytest.mark.parametrize("n,t", [(1, 4), (4, 4), (32, 4), (5, 3)])
+def test_target_dispatch_matches_the_plain_call(n, t, separate, heads) -> None:
+    """The target's verify dispatch over a bf16 pool (`_verify_state`, then `_gdn_verify` per
+    layer, as the decode target calls them: `a` / `b` column views of the input projection,
+    the conv output as `packed_qkv`, PDL after the conv) against the call it replaces
+    (contiguous `a` / `b`, no PDL), each on its own copy of the pool, the history and the
+    bookkeeping, over consecutive verify steps with random partial acceptance in between:
+    outputs, checkpoints, history and bookkeeping bitwise equal at every step, with the
+    entry's guard on. With `separate` the dispatched side's manager keeps the history and its
+    bookkeeping at replay slots of its own (`_ReplaySlotBench`), which `_verify_state` takes
+    from the metadata's `replay_state_indices` and `_gdn_verify` hands this entry as
+    `replay_indices`. From `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests both sides take
+    the work items and the manager's all-layer commit; below it the kernel commits wraps."""
+    path = "all_layer" if n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE else "small"
+    spec = _rank_spec(heads, path=path, n=n, t=t, layers=2, steps=trep.HIST // t + 3)
+    seed = 77 + n
+    plain = trep._Bench(spec, seed, exact=False)
+    disp = (
+        _ReplaySlotBench(spec, seed, trep.REPLAY_WORK_ITEM_WIDTH)
+        if separate
+        else trep._Bench(spec, seed, exact=False)
+    )
+    core, mm = _dispatch_core(disp, separate)
+    wraps = 0
+    with validating(op):
+        for step in range(plain.steps):
+            wraps += plain.writes()[1].numel()
+            plain.prepare()
+            disp.prepare()
+            verify = M._verify_state(core, mm, n)
+            assert verify[3] == (path == "all_layer"), (
+                "the all-layer commit exactly when partitioned"
+            )
+            if separate:
+                assert torch.equal(verify[4], disp.replay_indices), "the rows' replay slots"
+            else:
+                assert verify[4] is None, "no replay slots of its own: the checkpoint slots"
+            for layer in range(plain.layers):
+                act = plain.inputs()
+                a, b = _gates(plain, act, True)
+                want = op(**plain.kwargs(layer, act))
+                gating = SimpleNamespace(a_log=disp.a_log[layer], dt_bias=disp.dt_bias[layer])
+                got = M._gdn_verify(
+                    core,
+                    None,
+                    a.reshape(n * t, -1),
+                    b.reshape(n * t, -1),
+                    layer,
+                    gating,
+                    disp.state_indices,
+                    n,
+                    t,
+                    verify,
+                    mq_out=act["packed"],
+                )
+                assert torch.equal(got.view_as(want), want), f"step {step} layer {layer}"
+            plain.commit()
+            disp.commit()
+            accepted = plain.draw_acceptance()
+            plain.accept(accepted)
+            disp.accept(accepted)
+            for name, x, y in zip(_SLOT_STATE, _slot_state(disp), _slot_state(plain)):
+                assert torch.equal(x, y), f"step {step}: {name} differs"
+    assert wraps > 0, "no history wrapped: no checkpoint commit was exercised"
+
+
+@pytest.mark.parametrize("heads", cr.GEOMETRIES, ids=[f"{h}x{hv}" for h, hv in cr.GEOMETRIES])
+@pytest.mark.parametrize("separate", [False, True], ids=["coupled", "replay_slots"])
+def test_precompile_covers_every_step(heads, separate) -> None:
     """After `precompile`, as the target runs it at bind, a verify step of any request count
     compiles nothing: steps at each launch mapping's edges, 9 to 15 requests (an eager mixed
     step's, which no padded decode graph captures) among them, the partitioned ones with work
-    items and the all-layer commit as the target hands them over."""
+    items (the metadata's width) and the all-layer commit as the target hands them over. With
+    `separate` the manager keeps the history at replay slots of its own: precompiled with
+    `separate_replay_slots`, every step passes `replay_indices` and work items carrying the
+    replay slot (`_ReplaySlotBench`)."""
     t, partition_from = 4, CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-    kernels = cr.precompile(t, *heads, 40, pdl=True, partition_from=partition_from)
+    width = trep.REPLAY_WORK_ITEM_WIDTH
+    kernels = cr.precompile(
+        t,
+        *heads,
+        40,
+        pdl=True,
+        partition_from=partition_from,
+        work_item_width=width,
+        separate_replay_slots=separate,
+    )
     assert kernels > 0, kernels
     compiled = len(cr._COMPILED)
     for n in (1, 2, 3, 8, 9, 12, 15, 16, 17, 40):
         path = "all_layer" if n >= partition_from else "small"
         spec = _rank_spec(heads, path=path, n=n, t=t, steps=1, layers=1, slots=64)
-        bench = trep._Bench(spec, 5150 + n, exact=False)
+        bench = (
+            _ReplaySlotBench(spec, 5150 + n, width)
+            if separate
+            else trep._Bench(spec, 5150 + n, exact=False)
+        )
         bench.prepare()
         act = bench.inputs()
         kw = bench.kwargs(0, act)

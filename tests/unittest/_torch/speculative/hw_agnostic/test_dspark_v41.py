@@ -253,6 +253,16 @@ def test_v41_block32_dequant_uses_each_tile_scale():
             )
 
 
+def test_v41_draft_rejects_fp8_attention_projections(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "fp8")
+    assert DSv41DSparkDraftModel.supports_fp8_attn_projections is False
+    mapping = SimpleNamespace(tp_size=1, enable_attention_dp=False)
+    with pytest.raises(ValueError, match="not supported by this DSpark drafter"):
+        modeling_dspark._use_dspark_bf16_linear(
+            mapping, fp8_supported=DSv41DSparkDraftModel.supports_fp8_attn_projections
+        )
+
+
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):
     captured = {}
 

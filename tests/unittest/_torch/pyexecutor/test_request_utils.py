@@ -139,6 +139,16 @@ def _broadcast_round_trip(request: trtllm.Request | ExecutorRequest) -> Executor
     return pickle.loads(pickle.dumps(items))[0].request
 
 
+@pytest.mark.parametrize("watermarking", [None, False])
+def test_request_envelope_preserves_watermark_opt_out(watermarking) -> None:
+    request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+    request.py_watermarking = watermarking
+    restored = _broadcast_round_trip(request)
+    # A non-root rank must see the opt-out, or it samples a different token than the leader.
+    assert restored.inputs.watermarking is watermarking
+    assert executor_request_to_llm_request(42, restored, [], False).py_watermarking is watermarking
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("original_end_id", [None, 99])
 def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> None:
@@ -152,10 +162,16 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
     request.py_logprobs_simple_format = enabled
     request.py_return_routed_experts = enabled
     request.py_original_end_id = original_end_id
+    request.py_context_logits_explicit = enabled
+    request.py_prompt_logprobs = 3 if enabled else 0
+    request.py_prompt_logprobs_simple_format = enabled
     request.py_arrival_time = 123.0
 
     restored = _broadcast_round_trip(request)
     for attribute in (
+        "py_context_logits_explicit",
+        "py_prompt_logprobs",
+        "py_prompt_logprobs_simple_format",
         "py_logprobs_mode",
         "py_logprobs_simple_format",
         "py_return_routed_experts",
@@ -167,6 +183,9 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
         )
 
     translated = executor_request_to_llm_request(42, restored, [], False)
+    assert translated.py_context_logits_explicit is enabled
+    assert translated.py_prompt_logprobs == request.py_prompt_logprobs
+    assert translated.py_prompt_logprobs_simple_format is enabled
     assert translated.py_logprobs_mode == request.py_logprobs_mode
     assert translated.py_logprobs_simple_format is enabled
     assert translated.py_return_routed_experts is enabled

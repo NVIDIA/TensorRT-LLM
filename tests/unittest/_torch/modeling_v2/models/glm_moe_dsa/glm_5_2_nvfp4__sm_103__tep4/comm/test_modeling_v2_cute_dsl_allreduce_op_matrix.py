@@ -1,22 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Collected entry point for the GLM-5.2 target's Lamport all-reduce entries.
+"""Collected entry point for the GLM-5.2 target's Lamport collective entries.
 
-One job certifies all three -- `cute_dsl_allreduce`,
-`cute_dsl_allreduce_add_rmsnorm` and `cute_dsl_allreduce_add_rmsnorm_quant_nvfp4`
--- because they share one workspace and its device slot counter. The matrix is
+One job certifies all four -- `cute_dsl_allreduce`,
+`cute_dsl_allreduce_add_rmsnorm`, `cute_dsl_allreduce_add_rmsnorm_quant_nvfp4`
+and `cute_dsl_allgather_widen` -- because they share one workspace and its
+device slot counter. The matrix is
 `_cute_dsl_allreduce_op_matrix.py` beside this file, its own 4-rank launcher;
 `_rank_job` (in the shared comm test directory) starts it in a fresh
 interpreter and turns its exit code into an assertion.
 """
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 __extra_import_path__ = ["../../../../comm"]
-import _rank_job  # noqa: E402 — needs the path declared above
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _rank_job
+else:
+    import _rank_job  # noqa: E402 — needs the path declared above
 
 
 def _sm103_devices() -> int:

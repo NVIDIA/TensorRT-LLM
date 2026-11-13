@@ -26,9 +26,10 @@ write/read round trip.
 
 There are two launch shapes:
 
-* ``fused_topk_routing_block_kernel`` serves T<=16 (small decode batches);
-* ``fused_topk_routing_cluster_kernel`` serves 16*CLUSTER_CTAS tokens, with
-  CLUSTER_CTAS in {2, 4}; T=64 therefore uses a 4-CTA cluster.
+* ``fused_topk_routing_block_kernel`` serves T<=8, one token per warp of a
+  256-thread CTA (small decode batches);
+* ``fused_topk_routing_cluster_kernel`` serves 8*CLUSTER_CTAS tokens, with
+  CLUSTER_CTAS in {2, 4, 8}; T=64 therefore uses an 8-CTA cluster.
 
 Within either path, two warps map the 64 local experts.  Since an expert has at
 most T<=64 rows and TILE=128, active-expert prefixing is a ballot plus popcount,
@@ -69,7 +70,11 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.experimental import primitives as prims
 
-_BLOCK = 512
+# 256 threads per CTA (8 token-warps; T=64 runs an 8-CTA cluster). At 512 the 4-CTA
+# cluster put 16 token-warps on each SM and the kernel stalled on issue and math-pipe
+# contention (ncu at T=64: 8.32 -> 7.07 us); indices, weights, tile maps and counters
+# are identical.
+_BLOCK = 256
 _WARP = 32
 _WARPS = _BLOCK // _WARP
 _FULL_MASK = 0xFFFFFFFF

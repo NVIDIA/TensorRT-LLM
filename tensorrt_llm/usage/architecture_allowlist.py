@@ -101,6 +101,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Phi4MMForCausalLM",
         "PixtralForConditionalGeneration",
         "PixtralVisionModel",
+        "PplxDeciderForDecision",
         "Qwen2ForCausalLM",
         "Qwen2ForProcessRewardModel",
         "Qwen2ForRewardModel",
