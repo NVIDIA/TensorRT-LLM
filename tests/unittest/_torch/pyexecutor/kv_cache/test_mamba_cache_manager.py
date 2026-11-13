@@ -1646,6 +1646,77 @@ def test_v2_kda_replay_commit_clears_draft_count_without_sync():
 
 
 @skip_no_cuda
+@pytest.mark.parametrize("draft_records", [False, True], ids=["replay_caches", "draft_records"])
+def test_v2_kda_replay_suspend_compiles_no_commit_kernel(draft_records, monkeypatch):
+    """The manager compiles the kernels a suspend's draft commit launches when it binds its pools: no warmup forward
+    suspends a request, and the first suspend in serving would otherwise compile them while every request waits."""
+    from _torch.helpers import triton_num_compiled
+
+    from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
+
+    if not draft_records and not _kda_kernels.is_kda_mtp_verify_available():
+        pytest.skip("needs the fused KDA verify kernel (sm_100 / sm_103 with the CuTe DSL)")
+    # Forget this process's earlier compiles, so the counts are this manager's.
+    triton_kernels = (
+        _kda_kernels._store_kda_replay_conv_window_kernel,
+        _kda_kernels._replay_kda_token_records_kernel,
+    )
+    for kernel in triton_kernels:
+        kernel.device_caches.clear()
+    cute_compiled = {}
+    if not draft_records:
+        monkeypatch.setattr(_kda_kernels._load_mtp_module(), "_compiled_cache", cute_compiled)
+
+    def num_compiled():
+        return sum(triton_num_compiled(kernel) for kernel in triton_kernels) + len(cute_compiled)
+
+    mgr = _v2_kda_replay_manager_with_large_slots(kda_draft_records=draft_records)
+    request = None
+    try:
+        compiled_at_bind = num_compiled()
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=2
+        )
+        mgr._kda_replay.prev_num_accepted_tokens[mgr._request_id_to_state_index[1]] = 2
+        mgr.suspend_request(request)
+        torch.cuda.synchronize()
+        assert num_compiled() == compiled_at_bind
+        # The conv-window store, and the drafts' replay: a kda_mtp_decode variant or the records kernel.
+        assert compiled_at_bind == 2
+        assert mgr.resume_request(request)
+    finally:
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("draft_records", [False, True], ids=["replay_caches", "draft_records"])
+def test_v2_kda_replay_commit_prewarm_leaves_the_slot_states(draft_records):
+    """The bind-time commit prewarm seeds slot 0's replay conv window from the live pool and commits zero drafts, which
+    leaves the slot's SSM and conv states bit for bit as they were."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import is_kda_mtp_verify_available
+
+    if not draft_records and not is_kda_mtp_verify_available():
+        pytest.skip("needs the fused KDA verify kernel (sm_100 / sm_103 with the CuTe DSL)")
+    mgr = _v2_kda_replay_manager_with_large_slots(kda_draft_records=draft_records)
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(5)
+        for layer_offset, states in enumerate(zip(mgr.all_ssm_states, mgr.all_conv_states)):
+            for buffer in (*states, *mgr._kda_replay.pool_layers[layer_offset].values()):
+                buffer[0] = torch.randn(buffer.shape[1:], generator=generator, device="cuda")
+        expected = [states[0].clone() for states in (*mgr.all_ssm_states, *mgr.all_conv_states)]
+        mgr._kda_replay.prev_num_accepted_tokens[0] = 2
+        mgr._kda_replay.prewarm_commit_kernels()
+        torch.cuda.synchronize()
+        for states, before in zip((*mgr.all_ssm_states, *mgr.all_conv_states), expected):
+            assert torch.equal(states[0], before)
+        assert int(mgr._kda_replay.prev_num_accepted_tokens[0]) == 2
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
 def test_padding_slot_not_held_by_parked_real():
     """Padding must not resolve to a slot owned by a parked real
     request outside the current batch."""
@@ -5986,7 +6057,7 @@ def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
     assert mgr.committed_slots == ([0, 2] if seeded else [2])
 
 
-def _v2_kda_replay_manager_with_large_slots():
+def _v2_kda_replay_manager_with_large_slots(**kwargs):
     """A real V2 hybrid manager at Kimi K3's per-rank KDA shapes (6 heads, K = V = 128, conv width 4) on 6 layers. An
     SSM slot (~2.25 MiB) is larger than the 2 MiB allocation grain, so the SSM pool holds a handful of slots and runs
     out before the attention pages do. max_util_for_resume 1.0 lets resume admit caches until the pool is full."""
@@ -6018,6 +6089,7 @@ def _v2_kda_replay_manager_with_large_slots():
         vocab_size=1024,
         conv_state_layout="q_k_v",
         kda_replay_num_spec=2,
+        **kwargs,
     )
 
 

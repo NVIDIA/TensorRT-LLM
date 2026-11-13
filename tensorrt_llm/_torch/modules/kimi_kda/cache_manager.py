@@ -602,6 +602,11 @@ class KDAReplayState:
             )
         self._stack_seed_views()
         logger.info(f"Mamba Cache (kda-replay) is allocated for {cache_size} state slots")
+        try:
+            self.prewarm_commit_kernels()
+        except Exception as e:
+            # A miss only moves these compiles to the first suspend.
+            logger.warning(f"KDA commit kernel prewarm skipped. {type(e).__name__}: {e}")
 
     def _stack_seed_views(self) -> None:
         """Stack what seed_transferred_slots writes, so it runs on all layers at once."""
@@ -781,13 +786,37 @@ class KDAReplayState:
 
     def commit_pending_drafts(self, slot: int) -> None:
         """Fold accepted drafts and the replay conv window into the persistent states."""
-        from ._kda_kernels import commit_kda_pending_drafts
-
         assert self.prev_num_accepted_tokens is not None
         slots = torch.full(
             (1,), slot, dtype=torch.int32, device=self.prev_num_accepted_tokens.device
         )
-        num_accepted = self.prev_num_accepted_tokens.index_select(0, slots)
+        self._commit_drafts(slots, self.prev_num_accepted_tokens.index_select(0, slots))
+        self.prev_num_accepted_tokens[slot].zero_()
+
+    def prewarm_commit_kernels(self) -> None:
+        """Compile the kernels ``commit_pending_drafts`` launches.
+
+        Only suspending a request commits its pending drafts, and no warmup
+        forward suspends one, so the first suspend in serving would compile
+        them while every request in flight waits. Run before any request holds
+        a slot: it seeds slot 0's replay conv window from the live pool and
+        commits zero drafts, which leaves slot 0's states as they were.
+        """
+        if not self._ssm_states or self.prev_num_accepted_tokens is None:
+            return
+        from ._kda_kernels import copy_kda_replay_conv_window
+
+        slots = torch.zeros(1, dtype=torch.int32, device=self.prev_num_accepted_tokens.device)
+        for layer, conv_states in enumerate(self._conv_states):
+            replay = self._layer_cache_fields(layer)
+            copy_kda_replay_conv_window(
+                conv_states, replay["kda_conv_q"], replay["kda_conv_k"], replay["kda_conv_v"], slots
+            )
+        self._commit_drafts(slots, torch.zeros_like(slots))
+
+    def _commit_drafts(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
+        from ._kda_kernels import commit_kda_pending_drafts
+
         for layer, (ssm_states, conv_states) in enumerate(zip(self._ssm_states, self._conv_states)):
             replay = self._layer_cache_fields(layer)
             commit_kda_pending_drafts(
@@ -804,7 +833,6 @@ class KDAReplayState:
                 num_accepted,
                 state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
             )
-        self.prev_num_accepted_tokens[slot].zero_()
 
     def _layer_replay_buffers(self) -> tuple[torch.Tensor, ...]:
         buffers = (
