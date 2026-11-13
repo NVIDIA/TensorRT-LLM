@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._errors import RuntimeInitError
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, MetaInitMode
@@ -70,6 +71,8 @@ def create_model_with_meta_tensors(
         with MetaInitMode():
             model = AutoModelForCausalLM.from_config(config_copy)
         return model, config_copy, True
+    except RuntimeInitError:
+        raise
     except Exception:
         logger.info(f"Fallback to regular model init: {traceback.format_exc(limit=10)}")
         model = AutoModelForCausalLM.from_config(config)
