@@ -27,7 +27,7 @@ Without the variable the hook logs a warning when it is built, then passes every
 chunk through and writes nothing.
 
 Each process that runs the hook (the server, or each post-processing worker)
-appends one JSON line per finished output to
+appends JSON lines for finished outputs and partial capture segments to
 ``$TRTLLM_RAW_OUTPUT_DIR/<UTC hour>/raw-<pid>.jsonl``, for example
 ``2026-11-04T05/raw-1234.jsonl``.
 """
@@ -57,14 +57,15 @@ def _utc_now() -> str:
 
 
 class _Pending:
-    """What one in-flight output has produced so far."""
+    """The retained history segment of one in-flight output."""
 
-    __slots__ = ("frames", "token_ids", "started_at", "last")
+    __slots__ = ("frames", "token_ids", "started_at", "last", "history_reason")
 
     def __init__(self, first: PostProcessorHookChunk) -> None:
         self.frames: list[str] = []
         self.token_ids: list[int] = []
         self.started_at = _utc_now()
+        self.history_reason: str | None = None
         # The latest chunk seen for the output; its ``text`` is the full text so far.
         self.last = first
 
@@ -90,33 +91,45 @@ class RawOutputDump:
     - ``frames``: the text each chunk added (``chunk.text_diff``), in order;
       chunks that added none are left out. They show where the stream was
       split, which is where incremental parsers go wrong.
-    - ``token_ids``, ``num_output_tokens``: the generated token ids, collected
-      from ``chunk.token_ids_diff``, and their count. They also show tokens that
-      detokenization leaves out of ``text``, such as skipped special tokens.
+    - ``token_ids``, ``num_output_tokens``: the captured history of generated
+      token ids from ``chunk.token_ids_diff``, and its count, not necessarily
+      the final output's total. They also show tokens that detokenization
+      leaves out of ``text``, such as skipped special tokens.
     - ``frames_consistent``: whether ``frames`` add up to ``text``.
-    - ``streaming``, ``aborted``: from the final chunk.
-    - ``started_at``, ``finished_at``: UTC ISO-8601 times of the output's first
-      chunk and of the record.
-    - ``partial``, ``end_reason``: false and null for an output that finished.
+    - ``streaming``, ``aborted``: from the last observed chunk.
+    - ``started_at``, ``finished_at``: UTC ISO-8601 times of the current retained
+      segment's first chunk and of the record.
+    - ``partial``, ``end_reason``: whether capture ended early or its history is
+      incomplete or uncertain, and why. They can be true and set even after a
+      normal final chunk; they are not the model's stop reason.
     - ``event``: always ``"raw_output"``.
 
-    A record matches its output exactly when the request generates one sequence
-    (``n`` and ``best_of`` of 1, the default). When it generates several
-    (``n`` or ``best_of`` above 1, which includes beam search), ``frames`` and
-    ``token_ids`` are what the hook was handed for that output index, which need
-    not be one sequence's own history: ``token_ids`` can repeat ids, and when
-    sampling with ``best_of`` above ``n`` the index is a rank that can change
+    ``frames`` and ``token_ids`` preserve the history handed to the hook, not a
+    reconstruction of the final output: for example, a stop-word correction
+    can remove text or token ids already seen in earlier chunks. When a request
+    generates several sequences (``n`` or ``best_of`` above 1, which includes
+    beam search), these channels are what the hook was handed for that output
+    index, which need not be one sequence's own history: ``token_ids`` can repeat
+    ids, and when sampling with ``best_of`` above ``n`` the index is a rank that can change
     between chunks, so one record can join chunks of different sequences.
     ``text`` is always the text at the output's last chunk, and
     ``frames_consistent`` is false when ``frames`` do not add up to it.
 
-    A request that ends in an error gets no final chunk; :meth:`on_request_end`
-    writes what each of its outputs had generated, with ``partial`` true and
-    ``end_reason`` set. An output that gets neither (without the worker pool, a
+    When :meth:`on_request_end` reports an error, retained segments that produced
+    text or token ids are written with ``partial`` true and ``end_reason`` set;
+    already evicted segments are not rewritten. An output that gets neither a
+    final chunk nor that callback (without the worker pool, a
     stream whose client disconnects first) stays in flight. At most
     :attr:`max_pending` outputs are kept in flight: past that, the least
     recently updated one is written with ``partial`` true and ``end_reason``
-    ``"evicted"``.
+    ``"evicted"``. If it later resumes, its new segment is also marked
+    ``"evicted"``, even if that segment receives a final chunk. At most
+    ``max_pending`` evicted keys are remembered. If that budget overflows,
+    future new segments without a known eviction marker are conservatively
+    marked ``"history_unavailable"`` until the hook instance restarts, including
+    newly started outputs. Already retained segments keep their history status;
+    capture continues in either case. ``partial`` false means no known history
+    gap, not that the recorded history equals the final output snapshot.
 
     The hook seam fails a request whose hook raises. A debug dump must not, so
     this hook never raises: a record that cannot be written is dropped and
@@ -133,9 +146,12 @@ class RawOutputDump:
         self._file_name = f"raw-{os.getpid()}.jsonl"
         # Ordered from the least to the most recently updated output.
         self._pending: OrderedDict[tuple[int, int], _Pending] = OrderedDict()
+        self._evicted_keys: set[tuple[int, int]] = set()
+        # Once an eviction cannot be remembered, an unknown key may be a continuation.
+        self._history_uncertain = False
         # One instance can be called from more than one thread of its process (for
         # example, threads each waiting on an ``LLM`` result): ``_lock`` guards the
-        # pending state and the drop count, ``_write_lock`` keeps each line whole.
+        # pending/history state and the drop count, ``_write_lock`` keeps each line whole.
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._dropped = 0
@@ -171,6 +187,7 @@ class RawOutputDump:
         with self._lock:
             keys = [key for key in self._pending if key[0] == request_id]
             ended = [self._pending.pop(key) for key in keys]
+            self._evicted_keys = {key for key in self._evicted_keys if key[0] != request_id}
         for pending in ended:
             self._write_or_drop(pending, reason)
 
@@ -183,10 +200,16 @@ class RawOutputDump:
         """
         key = (chunk.request_id, chunk.output_index)
         ended = []
+        warn_uncertain = False
         with self._lock:
             pending = self._pending.pop(key, None)
             if pending is None:
                 pending = _Pending(chunk)
+                if key in self._evicted_keys:
+                    self._evicted_keys.remove(key)
+                    pending.history_reason = "evicted"
+                elif self._history_uncertain:
+                    pending.history_reason = "history_unavailable"
             pending.last = chunk
             # A chunk that added no text (the final call often adds none) is not a frame.
             if chunk.text_diff:
@@ -203,14 +226,28 @@ class RawOutputDump:
             else:
                 self._pending[key] = pending
             while len(self._pending) > self.max_pending:
-                ended.append((self._pending.popitem(last=False)[1], "evicted"))
+                evicted_key, evicted = self._pending.popitem(last=False)
+                ended.append((evicted, "evicted"))
+                if len(self._evicted_keys) < self.max_pending:
+                    self._evicted_keys.add(evicted_key)
+                elif not self._history_uncertain:
+                    self._history_uncertain = True
+                    warn_uncertain = True
+        if warn_uncertain:
+            logger.warning(
+                "Raw output eviction history reached its key limit; future new captures "
+                "without a known eviction marker are marked history_unavailable until "
+                "the hook restarts. Recording continues."
+            )
         return ended
 
     def _write_or_drop(self, pending: _Pending, end_reason: str | None) -> None:
         """Write the record of ``pending``; a record that cannot be written is counted as dropped.
 
-        An output that ended early (``end_reason`` set) without producing text or
-        token ids is not written.
+        An output that ended early (the actual ``end_reason`` set) without
+        producing text or token ids in its retained segment is not written.
+        Capture-history reasons are applied only in ``_write``: a normal final
+        chunk remains eligible even when its retained segment is empty.
         """
         if end_reason is not None and not (pending.frames or pending.token_ids):
             return
@@ -221,6 +258,8 @@ class RawOutputDump:
 
     def _write(self, pending: _Pending, end_reason: str | None = None) -> None:
         """Append the record of one output to this process's file for the current hour."""
+        if end_reason is None:
+            end_reason = pending.history_reason
         chunk = pending.last
         finished_at = _utc_now()
         record = {
@@ -244,8 +283,8 @@ class RawOutputDump:
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         directory = os.path.join(self._dir, finished_at[:_HOUR_PREFIX_LEN])
-        # One open per record: records are written once per finished output, not per
-        # chunk, and the hook has no shutdown call that could close a kept-open file.
+        # One open per record, when a retained segment finishes rather than per chunk;
+        # the hook has no shutdown call that could close a kept-open file.
         with self._write_lock:
             os.makedirs(directory, exist_ok=True)
             with open(os.path.join(directory, self._file_name), "a", encoding="utf-8") as file:

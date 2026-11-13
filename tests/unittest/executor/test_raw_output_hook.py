@@ -24,6 +24,7 @@ import glob
 import json
 import os
 import queue
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -551,6 +552,244 @@ def test_an_evicted_output_that_produced_nothing_is_not_written(dump_dir):
 
     assert list(hook._pending) == [(1, 0)]
     assert records_in(dump_dir) == []
+
+
+def _capture_chunk(
+    hook: RawOutputDump,
+    result: FakeResult,
+    text: str = "",
+    token_ids: tuple[int, ...] = (),
+    *,
+    final: bool = False,
+) -> None:
+    """Use the existing result fixture and check pass-through and both key bounds."""
+    output = result.outputs[0]
+    advance(output, text, token_ids)
+    result._done = final
+    expected_text, expected_ids = output.text, list(output.token_ids)
+    apply_post_processor_hook(hook, result, streaming=True)
+    assert output.text == expected_text
+    assert output.token_ids == expected_ids
+    assert len(hook._pending) <= hook.max_pending
+    assert len(hook._evicted_keys) <= hook.max_pending
+    assert hook._pending.keys().isdisjoint(hook._evicted_keys)
+    assert hook._dropped == 0
+
+
+@pytest.mark.parametrize("prefix, prefix_ids", [("a", (0,)), ("", (2,))])
+def test_a_resumed_evicted_output_marks_its_captured_history(
+    dump_dir: Path, monkeypatch: pytest.MonkeyPatch, prefix: str, prefix_ids: tuple[int, ...]
+) -> None:
+    """Hidden-token prefixes need the eviction marker even when frames add up to text."""
+    tick = 0
+
+    def utc_now() -> str:
+        nonlocal tick
+        timestamp = f"2026-11-13T00:00:{tick:02d}+00:00"
+        tick += 1
+        return timestamp
+
+    monkeypatch.setattr(raw_output_hook, "_utc_now", utc_now)
+    hook = RawOutputDump()
+    hook.max_pending = 1
+    first, second = FakeResult(request_id=7), FakeResult(request_id=8)
+    _capture_chunk(hook, first, prefix, prefix_ids)
+    _capture_chunk(hook, second, "x", (23,))
+    _capture_chunk(hook, first, "b", (1,), final=True)
+
+    evicted, resumed = records_in(dump_dir)
+    assert evicted["token_ids"] == list(prefix_ids)
+    assert evicted["end_reason"] == "evicted"
+    assert resumed["text"] == prefix + "b"
+    assert resumed["frames"] == ["b"]
+    assert resumed["token_ids"] == [1]
+    assert resumed["num_output_tokens"] == 1
+    assert resumed["partial"] is True
+    assert resumed["end_reason"] == "evicted"
+    assert resumed["frames_consistent"] is (prefix == "")
+    assert evicted["started_at"] == "2026-11-13T00:00:00+00:00"
+    assert evicted["finished_at"] == "2026-11-13T00:00:02+00:00"
+    assert resumed["started_at"] == "2026-11-13T00:00:03+00:00"
+    assert resumed["finished_at"] == "2026-11-13T00:00:04+00:00"
+    assert first.outputs[0].length == 2
+    assert hook._evicted_keys == set()
+
+
+@pytest.mark.parametrize("end_reason", [None, "error"])
+def test_an_empty_resumed_final_is_written_but_an_empty_callback_segment_is_not(
+    dump_dir: Path, end_reason: str | None
+) -> None:
+    hook = RawOutputDump()
+    hook.max_pending = 1
+    first, second = FakeResult(request_id=7), FakeResult(request_id=8)
+    _capture_chunk(hook, first, "a", (0,))
+    _capture_chunk(hook, second, "x", (23,))
+    _capture_chunk(hook, first, final=end_reason is None)
+    if end_reason is not None:
+        hook.on_request_end(first.id, end_reason)
+
+    records = [record for record in records_in(dump_dir) if record["request_id"] == "7"]
+    if end_reason is None:
+        assert len(records) == 2
+        assert records[-1]["text"] == "a"
+        assert records[-1]["frames"] == []
+        assert records[-1]["token_ids"] == []
+        assert records[-1]["num_output_tokens"] == 0
+        assert records[-1]["partial"] is True
+        assert records[-1]["end_reason"] == "evicted"
+    else:
+        assert len(records) == 1, "the actual callback still suppresses its empty segment"
+    assert (first.id, 0) not in hook._pending
+    assert (first.id, 0) not in hook._evicted_keys
+
+
+@pytest.mark.parametrize("reason", ["error", "postprocessing_error", ""])
+def test_the_actual_end_reason_takes_priority_over_evicted_history(
+    dump_dir: Path, reason: str
+) -> None:
+    hook = RawOutputDump()
+    hook.max_pending = 1
+    first, second = FakeResult(request_id=7), FakeResult(request_id=8)
+    _capture_chunk(hook, first, "a", (0,))
+    _capture_chunk(hook, second, "x", (23,))
+    _capture_chunk(hook, first, "b", (1,))
+
+    hook.on_request_end(first.id, reason)
+
+    resumed = records_in(dump_dir)[-1]
+    assert resumed["request_id"] == "7"
+    assert resumed["partial"] is True
+    assert resumed["end_reason"] == reason
+    assert resumed["text"] == "ab"
+    assert resumed["frames"] == ["b"]
+    assert resumed["token_ids"] == [1]
+    assert hook._pending == {}
+    assert hook._evicted_keys == {(second.id, 0)}
+
+
+def test_marker_overflow_marks_unknown_new_segments_without_tainting_retained_ones(
+    dump_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hook = RawOutputDump()
+    hook.max_pending = 1
+    warnings = []
+
+    def note_warning(message: str) -> None:
+        assert not hook._lock.locked(), "logging must not hold the pending lock"
+        warnings.append(message)
+
+    monkeypatch.setattr(raw_output_hook.logger, "warning", note_warning)
+    first, second, third, fourth = (FakeResult(request_id=i) for i in range(7, 11))
+    _capture_chunk(hook, first, "a", (0,))
+    _capture_chunk(hook, second, "b", (1,))
+    assert hook._history_uncertain is False
+    _capture_chunk(hook, third, "x", (23,))
+    assert hook._history_uncertain is True
+    assert hook._evicted_keys == {(first.id, 0)}
+
+    # The third output's history was known complete before its arrival overflowed the markers.
+    _capture_chunk(hook, third, final=True)
+    _capture_chunk(hook, second, "b", (1,), final=True)
+    _capture_chunk(hook, first, "a", (0,), final=True)
+    assert hook._evicted_keys == set()
+    _capture_chunk(hook, fourth, "x", (23,), final=True)
+
+    records = records_in(dump_dir)
+    assert [record["end_reason"] for record in records] == [
+        "evicted",
+        "evicted",
+        None,
+        "history_unavailable",
+        "evicted",
+        "history_unavailable",
+    ]
+    assert [record["partial"] for record in records] == [True, True, False, True, True, True]
+    assert records[2]["text"] == "x"
+    assert records[3]["text"] == "bb"
+    assert records[3]["token_ids"] == [1]
+    assert records[-1]["text"] == "x", "even fresh output is still recorded after saturation"
+    assert hook._pending == {}
+    assert len(warnings) == 1
+    assert "history_unavailable" in warnings[0]
+
+
+def test_ending_a_request_clears_only_its_markers_and_does_not_clear_uncertainty(
+    dump_dir: Path,
+) -> None:
+    hook = RawOutputDump()
+    hook.max_pending = 2
+    first, second, third, fourth = (FakeResult(request_id=i) for i in range(7, 11))
+    for result in (first, second, third, fourth):
+        _capture_chunk(hook, result, "a", (0,))
+    assert hook._evicted_keys == {(first.id, 0), (second.id, 0)}
+
+    hook.on_request_end(first.id, "error")
+    assert hook._evicted_keys == {(second.id, 0)}
+    assert set(hook._pending) == {(third.id, 0), (fourth.id, 0)}
+    fifth, sixth = FakeResult(request_id=11), FakeResult(request_id=12)
+    _capture_chunk(hook, fifth, "b", (1,))
+    _capture_chunk(hook, sixth, "x", (23,))
+    assert hook._history_uncertain is True
+    assert hook._evicted_keys == {(second.id, 0), (third.id, 0)}
+    hook.on_request_end(second.id, "error")
+    hook.on_request_end(third.id, "error")
+    assert hook._evicted_keys == set()
+    assert hook._history_uncertain is True
+
+    # Clearing all markers cannot recover an eviction identity that did not fit.
+    _capture_chunk(hook, fourth, "b", (1,), final=True)
+    record = records_in(dump_dir)[-1]
+    assert record["request_id"] == str(fourth.id)
+    assert record["partial"] is True
+    assert record["end_reason"] == "history_unavailable"
+
+
+def test_repeated_eviction_consumes_and_recreates_markers_within_the_budget(
+    dump_dir: Path,
+) -> None:
+    hook = RawOutputDump()
+    hook.max_pending = 1
+    first, second = FakeResult(request_id=7), FakeResult(request_id=8)
+    _capture_chunk(hook, first, "a", (0,))
+    _capture_chunk(hook, second, "x", (23,))
+    _capture_chunk(hook, first, "b", (1,))
+    assert hook._evicted_keys == {(second.id, 0)}
+    _capture_chunk(hook, second, "b", (1,))
+    assert hook._evicted_keys == {(first.id, 0)}
+    _capture_chunk(hook, first, final=True)
+    _capture_chunk(hook, second, final=True)
+
+    assert hook._pending == {}
+    assert hook._evicted_keys == set()
+    assert hook._history_uncertain is False
+    assert all(record["end_reason"] == "evicted" for record in records_in(dump_dir))
+    assert records_in(dump_dir)[-1]["text"] == "xb"
+
+
+def test_zero_pending_capacity_still_records_evicted_and_uncertain_final_segments(
+    dump_dir: Path,
+) -> None:
+    hook = RawOutputDump()
+    hook.max_pending = 0
+    result = FakeResult(request_id=7)
+    _capture_chunk(hook, result, "a", (0,))
+    assert hook._pending == {}
+    assert hook._evicted_keys == set()
+    assert hook._history_uncertain is True
+    _capture_chunk(hook, result, "b", (1,), final=True)
+    _capture_chunk(hook, FakeResult(request_id=8), "x", (23,), final=True)
+
+    records = records_in(dump_dir)
+    assert [record["end_reason"] for record in records] == [
+        "evicted",
+        "history_unavailable",
+        "history_unavailable",
+    ]
+    assert all(record["partial"] for record in records)
+    assert records[1]["text"] == "ab"
+    assert records[1]["frames"] == ["b"]
+    assert records[1]["num_output_tokens"] == 1
+    assert records[2]["text"] == "x"
 
 
 class _Pipe:

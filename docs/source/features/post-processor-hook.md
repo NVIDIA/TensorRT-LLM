@@ -158,7 +158,7 @@ trtllm-serve <model> \
 
 With `TRTLLM_RAW_OUTPUT_DIR` unset, the hook logs a warning when it is built, then passes every chunk
 through and writes nothing. Each process that runs the hook (the server, or each post-processing
-worker) appends one JSON line per finished output — not per chunk — to
+worker) appends JSON lines for finished outputs and partial capture segments — not per chunk — to
 `$TRTLLM_RAW_OUTPUT_DIR/<UTC hour>/raw-<pid>.jsonl`, where `<UTC hour>` looks like `2026-11-04T05`:
 
 | Field | Meaning |
@@ -169,10 +169,10 @@ worker) appends one JSON line per finished output — not per chunk — to
 | `text` | The output's full detokenized text. |
 | `frames` | The text each chunk added, in order; chunks that added none are left out. |
 | `frames_consistent` | Whether `frames` add up to `text`; see below. |
-| `token_ids`, `num_output_tokens` | The generated token ids and their count. |
-| `streaming`, `aborted` | From the output's final chunk. |
-| `started_at`, `finished_at` | UTC ISO-8601 times of the output's first chunk and of the record. |
-| `partial`, `end_reason` | `false` and `null` for an output that finished; see below. |
+| `token_ids`, `num_output_tokens` | The captured history of generated token ids and its count, not necessarily the final output's total. |
+| `streaming`, `aborted` | From the output's last observed chunk. |
+| `started_at`, `finished_at` | UTC ISO-8601 times of the current retained segment's first chunk and of the record. |
+| `partial`, `end_reason` | Whether capture ended early or its history is incomplete or uncertain, and why; may be `true` and set even after a normal final chunk. These are not the model's stop reason. |
 | `event` | Always `"raw_output"`. |
 
 The ids are written as strings: a disaggregated id can be larger than 2^53, past which a JSON reader
@@ -181,21 +181,39 @@ incremental parsers fail at chunk boundaries: a tool-call marker split across tw
 as one emitted whole once the chunks are joined. `token_ids` also shows tokens that detokenization
 leaves out of `text`, such as skipped special tokens.
 
-A record matches its output exactly when the request generates one sequence (`n` and `best_of` of 1,
-the default). When it generates several (`n` or `best_of` above 1, which includes beam search),
-`frames` and `token_ids` are what the hook was handed for that output index, which need not be one
-sequence's own history: `token_ids` can repeat ids, and when sampling with `best_of` above `n` the
-index is a rank that can change between chunks, so one record can join chunks of different
-sequences. `text` is always the text at the output's last chunk, and `frames_consistent` is `false`
-when `frames` do not add up to it.
+`frames` and `token_ids` preserve the history handed to the hook, rather than reconstructing a
+final output snapshot. Even with one sequence (`n` and `best_of` of 1), a stop-word correction can
+remove text or token ids already seen in earlier chunks; those earlier frames and ids stay in the
+record. When a request generates several sequences (`n` or `best_of` above 1, which includes beam
+search), an output index need not retain one sequence's own history: `token_ids` can repeat ids, and
+when sampling with `best_of` above `n` the index is a rank that can change between chunks, so one
+record can join chunks of different sequences. `text` is always the text at the output's last
+observed chunk, and `frames_consistent` is `false` when `frames` do not add up to it. Neither a true
+`frames_consistent` nor a false `partial` guarantees that the captured history equals the final
+output snapshot.
 
-A request that ends in an error is written with `"partial": true` and `end_reason` set to the reason
-`on_request_end` reports (see [Per-request state](#per-request-state)), so output cut off by an error
-is kept and told apart from a finished one. An output that gets neither a final chunk nor
+When `on_request_end` reports an error (see [Per-request state](#per-request-state)), retained
+segments that produced text or token ids are written with `"partial": true` and `end_reason` set
+to that reason. Already evicted segments are not rewritten, and an empty retained segment adds
+no line for the callback. An output that gets neither a final chunk nor
 `on_request_end` (see the same section) stays in flight. The hook keeps at most `max_pending` outputs
 (4096) in flight: past that, it writes the least recently updated one with `"partial": true` and
-`end_reason` `"evicted"`. To keep more or fewer, set `max_pending` in a subclass and pass the
-subclass's import path to `--post_processor_hook`.
+`end_reason` `"evicted"`. If that output later resumes, the hook records a new segment: `text` is
+still the full current text, but `frames`, `token_ids`, and `num_output_tokens` cover only the
+retained segment. It is also marked `"partial": true` and `"end_reason": "evicted"`, even if it
+receives a normal final chunk. An actual error reported by `on_request_end` takes precedence over
+the capture-history reason.
+
+The hook remembers at most `max_pending` evicted keys, releasing a request's markers on
+`on_request_end` and consuming a key's marker when it resumes. If the marker budget overflows,
+recording continues, but subsequent new segments without a known marker are conservatively marked
+`"partial": true` and `"end_reason": "history_unavailable"`. This includes genuinely new outputs:
+the hook cannot distinguish them from an output whose eviction identity did not fit. This
+uncertainty stays latched until the hook instance restarts, even if all remembered markers are
+later released. Already retained segments keep their history status. `partial` being false means
+no known capture-history gap, not a guarantee of final-snapshot equality. To keep more or fewer
+pending outputs and markers, set `max_pending` in a subclass and pass the subclass's import path
+to `--post_processor_hook`.
 
 A hook that raises fails the request (see *Hook errors fail closed* below). A debug dump must not, so
 this hook never raises: a record that cannot be written — for example, because the directory is not
