@@ -7,6 +7,7 @@ import os
 import sys
 import traceback
 import warnings
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from enum import Enum
@@ -1927,6 +1928,28 @@ class ModelLoader:
             return "unknown"
         return mode_name.lower()
 
+    @staticmethod
+    def _draft_checkpoint_load_kwargs(model: torch.nn.Module) -> dict[str, Any]:
+        """Name the checkpoint key prefixes the draft reads, so loaders may skip files without them."""
+        key_prefixes = getattr(getattr(model, "draft_model", None),
+                               "checkpoint_key_prefixes", None)
+        if isinstance(key_prefixes, str):
+            key_prefixes = (key_prefixes, )
+        if isinstance(key_prefixes, Sequence) and key_prefixes:
+            return {"key_prefixes": tuple(key_prefixes)}
+        return {}
+
+    @staticmethod
+    def _select_draft_weights(weights, draft_load_kwargs: dict[str, Any]):
+        """Keep only the keys under the draft's prefixes, so it gets the same keys whichever files were read."""
+        key_prefixes = draft_load_kwargs.get("key_prefixes")
+        if not key_prefixes:
+            return weights
+        return {
+            name: value
+            for name, value in weights.items() if name.startswith(key_prefixes)
+        }
+
     def _load_separate_draft_weights(
             self, model: DecoderModelForCausalLM,
             checkpoint_loader: BaseCheckpointLoader) -> None:
@@ -1935,7 +1958,7 @@ class ModelLoader:
         Each draft config initializes its own architecture mapper so replacement
         MTP weights use the draft's quantization and MoE backend.
         """
-        draft_load_kwargs = {}
+        draft_load_kwargs = self._draft_checkpoint_load_kwargs(model)
         if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
             # This loader instance still owns the target model's MX session.
             # Preserve it while the native loader reads the auxiliary draft
@@ -1963,8 +1986,10 @@ class ModelLoader:
         with timing_metric(
                 ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.value,
                 self._metrics):
-            self._call_load_weights(model.load_draft_weights, draft_weights,
-                                    draft_weight_mapper)
+            self._call_load_weights(
+                model.load_draft_weights,
+                self._select_draft_weights(draft_weights, draft_load_kwargs),
+                draft_weight_mapper)
             if torch.cuda.is_available():  # CPU guard
                 torch.cuda.synchronize()
 
@@ -2531,6 +2556,7 @@ class ModelLoader:
                                               model) -> None:
         """Keep loader-specific work alive through draft materialization."""
         self._startup_metadata["draft_checkpoint_io_policy"] = None
+        draft_load_kwargs = self._draft_checkpoint_load_kwargs(model)
         with _timed_checkpoint_weight_session(
                 checkpoint_loader,
                 self.spec_config.speculative_model,
@@ -2539,7 +2565,8 @@ class ModelLoader:
                 value,
                 ModelLoaderMetricNames.DRAFT_CHECKPOINT_FINALIZATION_SECONDS.
                 value,
-                mapping=self.mapping) as weights:
+                mapping=self.mapping,
+                **draft_load_kwargs) as weights:
             if model.draft_config is not None:
                 draft_model_arch = model.draft_config.pretrained_config.architectures[
                     0]
@@ -2559,8 +2586,10 @@ class ModelLoader:
             with timing_metric(
                     ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.
                     value, self._metrics):
-                self._call_load_weights(model.load_draft_weights, weights,
-                                        draft_weight_mapper)
+                self._call_load_weights(
+                    model.load_draft_weights,
+                    self._select_draft_weights(weights, draft_load_kwargs),
+                    draft_weight_mapper)
                 if torch.cuda.is_available():  # CPU guard
                     torch.cuda.synchronize()
         self._startup_metadata["draft_checkpoint_io_policy"] = \

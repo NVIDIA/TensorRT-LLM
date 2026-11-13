@@ -1,18 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+from collections import OrderedDict
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
 from unittest.mock import MagicMock
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import (
     CheckpointCatalog,
     CheckpointTensor,
 )
+from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead as read_ahead
+from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as weight_loader_module
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.mistral.checkpoint_loader import MistralCheckpointLoader
@@ -23,6 +30,7 @@ from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
     WeightLoadPlan,
     WeightLoadPlanCoverage,
 )
+from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkForCausalLM
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
@@ -817,3 +825,125 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
     assert "draft_checkpoint_preparation_seconds" in loader.metrics
     assert "draft_weight_population_seconds" in loader.metrics
     assert "draft_checkpoint_finalization_seconds" in loader.metrics
+
+
+@pytest.mark.parametrize(
+    "entry, policy",
+    [("session", "native"), ("session", "rank_striped_read_ahead"), ("separate", "native")],
+)
+def test_draft_load_reads_only_the_shards_holding_draft_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, policy: str
+) -> None:
+    # One CPU rank without MPI, as in the rank-striped read-ahead tests.
+    monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
+    monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", raising=False)
+    monkeypatch.setattr(weight_loader_module, "_WEIGHT_CACHE", OrderedDict())
+    monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", False)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_rank", lambda: 0)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_size", lambda: 1)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_barrier", lambda: None)
+    monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: 1 << 40)
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", lambda: 1 << 40)
+    read_files = []
+    load_file = HfWeightLoader._load_safetensors_file
+    monkeypatch.setattr(
+        HfWeightLoader,
+        "_load_safetensors_file",
+        staticmethod(lambda path: read_files.append(Path(path).name) or load_file(path)),
+    )
+    shards = {
+        "model-00001-of-00005.safetensors": {
+            "embed.weight": torch.randn(16, 8),
+            "layers.0.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "mtp.1.confidence_head.proj.weight": torch.randn(1, 8),
+        },
+        "model-00002-of-00005.safetensors": {
+            "layers.1.ffn.experts.0.w1.weight": torch.randint(0, 256, (8, 4), dtype=torch.uint8),
+        },
+        "model-00003-of-00005.safetensors": {
+            "layers.2.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "mtp.0.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "mtp.0.ffn.experts.0.w1.weight": torch.randint(0, 256, (8, 4), dtype=torch.uint8),
+        },
+        "model-00004-of-00005.safetensors": {
+            "mtp.1.norm.weight": torch.randn(8),
+            "mtp.1.ffn.experts.0.w1.scale": torch.randint(0, 256, (8, 1), dtype=torch.uint8),
+        },
+        "model-00005-of-00005.safetensors": {
+            "mtp.2.norm.weight": torch.randn(8),
+        },
+    }
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    for file_name, tensors in shards.items():
+        save_file(tensors, str(checkpoint_dir / file_name))
+    # The index omits the first shard's draft key; selection reads the shards' own headers.
+    weight_map = {
+        key: file_name
+        for file_name, tensors in shards.items()
+        for key in tensors
+        if not key.startswith("mtp.1.confidence_head.")
+    }
+    (checkpoint_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    dspark = object.__new__(DSv4DSparkForCausalLM)
+    torch.nn.Module.__init__(dspark)
+    dspark.num_stages = 2
+    holders = [
+        "model-00001-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+    ]
+
+    def load_draft(draft_model: torch.nn.Module | None) -> tuple[dict[str, torch.Tensor], str]:
+        received = {}
+        read_files.clear()
+        model = SimpleNamespace(
+            draft_config=None,
+            draft_model=draft_model,
+            load_draft_weights=lambda weights, weight_mapper=None: received.update(weights.items()),
+        )
+        loader = ModelLoader.__new__(ModelLoader)
+        loader._metrics = {}
+        loader._startup_metadata = {}
+        loader.spec_config = SimpleNamespace(speculative_model=str(checkpoint_dir))
+        loader.mapping = Mapping()
+        loader.weight_mapper = object()
+        weight_loader = HfWeightLoader(checkpoint_io_policy=policy)
+        checkpoint_loader = HfCheckpointLoader(weight_loader=weight_loader)
+        if entry == "session":
+            loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+        else:
+            loader._load_separate_draft_weights(model, checkpoint_loader)
+        return received, weight_loader.last_checkpoint_io_status.effective
+
+    def assert_same_draft_tensors(
+        draft: dict[str, torch.Tensor], full: dict[str, torch.Tensor]
+    ) -> None:
+        # The two-stage draft gets exactly the stage 0 and 1 keys.
+        assert set(draft) == {key for key in full if key.startswith(("mtp.0.", "mtp.1."))}
+        for key in draft:
+            assert draft[key].dtype == full[key].dtype
+            assert draft[key].shape == full[key].shape
+            assert torch.equal(
+                draft[key].reshape(-1).view(torch.uint8), full[key].reshape(-1).view(torch.uint8)
+            )
+
+    full, effective = load_draft(None)
+    assert effective == policy
+    assert sorted(read_files) == sorted(shards)
+    assert set(full) == {key for tensors in shards.values() for key in tensors}
+    draft, effective = load_draft(dspark)
+    assert effective == policy
+    assert sorted(read_files) == holders
+    assert_same_draft_tensors(draft, full)
+
+    # With the raw weight cache on, the draft keeps the full file set and reuses the target's entry.
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+    load_draft(None)
+    assert sorted(read_files) == sorted(shards)
+    cached, effective = load_draft(dspark)
+    assert effective == "native"
+    assert read_files == []
+    assert_same_draft_tensors(cached, full)
