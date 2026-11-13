@@ -278,6 +278,15 @@ def route(
         )
     if (llm_args.max_beam_width or 1) != 1:
         raise NoTarget(f"max_beam_width={llm_args.max_beam_width}; beam search is not implemented")
+    if llm_args.ray_worker_extension_cls is not None:
+        # The RL weight-sync extensions (llmapi/rlhf_utils.py) are the engine's only in-flight
+        # weight update; refusing here keeps an RL engine off a target before training starts.
+        raise NoTarget(
+            f"ray_worker_extension_cls={llm_args.ray_worker_extension_cls!r}: in-flight weight "
+            "updates stream partial checkpoints, and the targets load a whole checkpoint only "
+            "(AsyncLLM installs tensorrt_llm.llmapi.rlhf_utils.WorkerExtension by default; pass "
+            "ray_worker_extension_cls=None to an engine that never updates its weights)"
+        )
     kv_cache_config = llm_args.kv_cache_config
     if kv_cache_config.use_kv_cache_manager_v2 is not True:
         raise NoTarget(
