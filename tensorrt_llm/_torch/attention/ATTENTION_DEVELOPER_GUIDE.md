@@ -678,7 +678,11 @@ The FMHA package is split by role:
   `gqa_split_kv` and `gqa_segmented` take the generation calls their
   `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
   size conditions are evaluated at the upper bound of the selection-cache
-  cell (`generation_selection_cell`).
+  cell (`generation_selection_cell`). The segment attention of
+  `gqa_kv_replica` and `gqa_segmented` requests the LSE, for which FlashInfer
+  takes softmax stats off the front of the FMHA workspace: these calls run on
+  the trtllm-gen slice extended in place, and `GqaDecodeFmha.prepare_workspace`
+  sizes the attention workspace for the layer's largest such call.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the fallback library on the native phased

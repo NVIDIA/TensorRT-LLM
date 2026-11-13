@@ -355,8 +355,7 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
 
 
 @functools.cache
-def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float, device: int):
-    # The device argument scopes this compilation cache to its CUDA device.
+def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "DSpark RMSNorm/RoPE draft-block must be warmed up before CUDA graph capture"
@@ -603,8 +602,7 @@ def cute_dsl_dspark_rmsnorm_rope_draft_block(
     block_size = x.shape[1]
     if block_size not in (5, 6):
         raise ValueError("DSpark draft block size must be 5 or 6")
-    with torch.cuda.device(x.device):
-        compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps, x.device.index)
+    compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
     output = x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
     compiled(
         x.view(-1, _DSV4_DSPARK_HEAD_DIM),
@@ -629,22 +627,35 @@ def _(
 def _validate_dspark_preparation(
     x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor
 ) -> None:
-    if (
-        x.ndim != 3
-        or x.shape[-1] != _DSV4_DSPARK_HEAD_DIM
-        or x.dtype != torch.bfloat16
-        or weight.dtype != x.dtype
-        or weight.shape != (_DSV4_DSPARK_HEAD_DIM,)
-        or freqs.dtype != torch.float32
-        or freqs.shape != (x.shape[0] * x.shape[1], _DSV4_DSPARK_ROPE_DIM // 2, 2)
-        or not all(
-            t.is_cuda and t.device == x.device and t.is_contiguous() for t in (x, weight, freqs)
-        )
-    ):
+    if x.ndim != 3 or x.shape[-1] != _DSV4_DSPARK_HEAD_DIM or x.dtype != torch.bfloat16:
         raise ValueError(
-            "DSpark preparation requires contiguous BF16 [batch, tokens, 512] inputs, "
-            "BF16 [512] weights and FP32 [batch * tokens, 32, 2] frequencies"
+            f"DSpark preparation input must be BF16 [batch, tokens, {_DSV4_DSPARK_HEAD_DIM}], "
+            f"got {x.dtype} {tuple(x.shape)}"
         )
+    if weight.dtype != x.dtype or weight.shape != (_DSV4_DSPARK_HEAD_DIM,):
+        raise ValueError(
+            f"DSpark preparation weight must be BF16 [{_DSV4_DSPARK_HEAD_DIM}], "
+            f"got {weight.dtype} {tuple(weight.shape)}"
+        )
+    expected_freqs_shape = (x.shape[0] * x.shape[1], _DSV4_DSPARK_ROPE_DIM // 2, 2)
+    if freqs.dtype != torch.float32 or freqs.shape != expected_freqs_shape:
+        raise ValueError(
+            f"DSpark preparation frequencies must be FP32 {list(expected_freqs_shape)}, "
+            f"got {freqs.dtype} {tuple(freqs.shape)}"
+        )
+    for name, tensor in (("input", x), ("weight", weight), ("frequencies", freqs)):
+        if not tensor.is_cuda:
+            raise ValueError(
+                f"DSpark preparation {name} must be a CUDA tensor, got {tensor.device}"
+            )
+        if tensor.device != x.device:
+            raise ValueError(
+                f"DSpark preparation {name} must be on {x.device}, got {tensor.device}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(
+                f"DSpark preparation {name} must be contiguous, got strides {tensor.stride()}"
+            )
 
 
 def precompile_dspark_fp8_input_fusions(
@@ -690,7 +701,7 @@ def _compile_dspark_rmsnorm_fp8_quant(hidden_dim: int, eps: float):
         cutlass.Float8E4M3FN, (rows, hidden_dim), stride_order=(1, 0)
     )
     scale_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float8E8M0FNU, (scale_elems,), stride_order=(0,)
+        cutlass.Uint8, (scale_elems,), stride_order=(0,)
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = DSparkRMSNormFP8QuantKernel(hidden_dim, eps)
@@ -730,7 +741,7 @@ def _compile_dspark_concat_fp8_quant(hidden_dim: int):
         cutlass.Float8E4M3FN, (output_rows, hidden_dim), stride_order=(1, 0)
     )
     scale_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float8E8M0FNU, (scale_elems,), stride_order=(0,)
+        cutlass.Uint8, (scale_elems,), stride_order=(0,)
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = DSparkConcatFP8QuantKernel(hidden_dim)
@@ -765,7 +776,7 @@ def cute_dsl_dspark_rmsnorm_fp8_quant(
         x_flat,
         weight,
         output,
-        output_scale.view(torch.float8_e8m0fnu),
+        output_scale,
     )
     return output, output_scale
 
@@ -805,7 +816,7 @@ def cute_dsl_dspark_concat_fp8_quant(
         first,
         second,
         output,
-        output_scale.view(torch.float8_e8m0fnu),
+        output_scale,
     )
     return output, output_scale
 

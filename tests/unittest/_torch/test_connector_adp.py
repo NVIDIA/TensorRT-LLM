@@ -116,6 +116,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor._profile_manager = MagicMock()
     executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.draft_model_engine = None
+    executor.enable_joint_kv_cache_reuse = False
     executor.sampler = None
     executor.worker_thread = MagicMock()
     executor._shutdown_sleep_wakeup_listeners = MagicMock()
@@ -1482,6 +1483,7 @@ def test_prefix_load_recovery_lifetime(
     manager.accept_prefix_load(request, 0, 4, [[2, 3]])
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [request]
+    context = generation = None
     if mixed_batch:
         context, generation = _request(8), _request(9)
         generation.state = LlmRequestState.GENERATION_IN_PROGRESS
