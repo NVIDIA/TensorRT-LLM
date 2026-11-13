@@ -61,6 +61,12 @@ def test_spec_names_mixed_precision_types_as_a_pair():
         PageTableSpec(mixed_precision=("nvfp4",))
 
 
+def test_spec_states_retention_margins_as_a_flag():
+    """Windows hold no margins beyond the window attention reads unless the spec says so."""
+    assert PageTableSpec().retention_margins is False
+    assert PageTableSpec(retention_margins=1).retention_margins is True
+
+
 def test_spec_refuses_what_it_cannot_mean():
     with pytest.raises(ValueError, match="quant_mode"):
         PageTableSpec(quant_mode="fp8-ds-mla")

@@ -14,12 +14,15 @@ know about its pages that its runtime config and storage do not. The result is a
 - `layer_ids`: the global layer id and model layer of every layer the storage holds, as the
   transfer names it (`_disagg_layer_names`).
 - `quant_mode` (one of `QUANT_MODES`) and `mixed_precision`: how the KV data is quantized.
+- `retention_margins`: whether the windows it keeps hold margins beyond the window attention
+  reads, such as draft tokens.
 
 A role layout (`RoleLayoutV2`, `disaggregation/base/role_layout.py`) says which pieces of one
 space of bytes each rank's buffer holds. The kinds are `ByHead` (head-major or token-major),
 `Sectioned`, `Replicated`, `RingSlots` and `Own`. A layout in a spec is a template; the reader
-resolves it against each buffer's facts (`BufferSite`). Two ranks' buffers correspond when their
-resolved layouts give the same `space`, and the bytes to move are the overlaps of their `pieces`.
+resolves it against each buffer's facts (`page_table.BufferSite`). Two ranks' buffers correspond
+when their resolved layouts give the same `space`, and the bytes to move are the overlaps of their
+`pieces`.
 
 ## Status
 
@@ -34,8 +37,8 @@ each manager's spec agrees with its hooks.
   derived or rebuilt per request. Add it to the manager's case in the parity test.
 - A manager that names its layers differently from its model layers overrides
   `_disagg_layer_names`, as the FP4 MLA cache layout does.
-- Recurrent state splits over `recurrent_state_split(topology)`, which matches the native
-  transfer's shard grid.
+- Recurrent state splits over `state_split(manager)`, which matches the native transfer's
+  shard grid; a rank's place is `rank_topology(mapping)`.
 - In a class that marks its overrides with `@override`, an override of `page_table_spec` or
   `_disagg_layer_names` carries it too.
 

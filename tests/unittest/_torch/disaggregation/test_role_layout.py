@@ -15,11 +15,11 @@
 """Role layouts: which pieces of a role's byte space each rank's buffer holds."""
 
 import collections
+import dataclasses
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar
 
-import msgpack
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.role_layout import (
@@ -33,12 +33,8 @@ from tensorrt_llm._torch.disaggregation.base.role_layout import (
     Sectioned,
     check_pieces,
     grid_place,
-    recurrent_state_split,
     role_layout_from_dict,
 )
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -118,7 +114,7 @@ def test_head_split_of_its_own_heads_states_their_total_for_attention():
 
 def test_head_split_keeps_a_total_its_spec_states():
     # MLA's one latent head, which every rank of TP4 holds whole.
-    layout = ByHead(total=1).resolve(_site(576, kv_heads=(1, None), ranks=4))
+    layout = ByHead(total=1).resolve(_site(576, kv_heads=(1, 4), ranks=4))
 
     assert layout == ByHead(head_bytes=576, total=1)
     assert [layout.pieces(576, 4, rank) for rank in range(4)] == [(Piece(0, 0, 576),)] * 4
@@ -224,6 +220,9 @@ def test_ring_keeps_the_latest_positions_of_its_page():
 )
 def test_layouts_read_back_what_they_write(layout):
     assert role_layout_from_dict(layout.to_dict()) == layout
+    # The element type does not name the layout.
+    assert "dtype" not in layout.document()
+    assert layout.document()["layout"] == layout.name
 
 
 def test_unknown_layout_name_is_refused():
@@ -336,6 +335,17 @@ def test_grid_place_under_attention_dp_holds_buffers_whole():
     topology = RankTopology(tp_size=4, tp_rank=3, dp_size=4, dp_rank=3, attention_dp=True)
 
     assert grid_place(topology, ("tp",)) == (1, 0)
+    assert topology.tp_size_per_dp_group == 1
+
+
+def test_grid_place_under_attention_dp_counts_the_tensor_ranks_of_the_group():
+    """TP4 in two attention DP groups: tensor rank 3 is the second of group 1's ranks 2 and 3."""
+    topology = RankTopology(tp_size=4, tp_rank=3, dp_size=2, dp_rank=1, attention_dp=True)
+
+    assert topology.tp_size_per_dp_group == 2
+    assert grid_place(topology, ("tp",)) == (2, 1)
+    with_context = dataclasses.replace(topology, cp_size=2, cp_rank=1)
+    assert grid_place(with_context, ("tp", "cp")) == (4, 3)
 
 
 def test_rank_topology_checks_its_ranks():
@@ -343,79 +353,46 @@ def test_rank_topology_checks_its_ranks():
         RankTopology(tp_size=2, tp_rank=2)
     with pytest.raises(ValueError, match="positive"):
         RankTopology(pp_size=0)
-
-
-@pytest.mark.parametrize("attention_dp", [False, True])
-@pytest.mark.parametrize("cp_size", [1, 2])
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_recurrent_state_splits_as_the_native_transfer_shards_it(tp_size, cp_size, attention_dp):
-    for tp_rank in range(tp_size):
-        for cp_rank in range(cp_size):
-            topology = RankTopology(
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                cp_size=cp_size,
-                cp_rank=cp_rank,
-                dp_size=tp_size if attention_dp else 1,
-                dp_rank=tp_rank if attention_dp else 0,
-                attention_dp=attention_dp,
-            )
-            rank_info = SimpleNamespace(
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                cp_size=cp_size,
-                cp_rank=cp_rank,
-                attention=SimpleNamespace(enable_attention_dp=attention_dp),
-            )
-
-            split = recurrent_state_split(topology)
-
-            assert grid_place(topology, split) == MambaPolicy._mamba_tp(rank_info), topology
+    assert RankTopology.unchecked(tp_size=2, tp_rank=1).tp_rank == 1
 
 
 @pytest.mark.parametrize(
-    "attention_dp, tp_place",
+    "fields, words",
     [
-        (None, (4, 3)),  # an attention-free stage: the TP ranks split it
-        (False, (4, 3)),
-        # Under attention data parallelism each TP rank holds its buffers whole.
-        (True, (1, 0)),
+        (dict(tp_size=4, dp_size=3, dp_rank=0), "split them evenly"),
+        (dict(tp_size=4, tp_rank=3), "one group of all 4 tensor ranks"),
+        (dict(tp_size=4, tp_rank=3, dp_size=2, dp_rank=0), "2 consecutive tensor ranks"),
     ],
+    ids=["groups_not_dividing", "one_group", "rank_outside_its_group"],
 )
-def test_rank_info_gives_its_parallel_place(attention_dp, tp_place):
-    attention = None
-    if attention_dp is not None:
-        attention = AttentionInfo(
-            kv_heads_per_rank=2,
-            tokens_per_block=32,
-            dims_per_head=128,
-            element_bytes=2,
-            enable_attention_dp=attention_dp,
-            is_mla=False,
-        )
-    rank_info = RankInfo(
-        instance_name="gen_0",
-        instance_rank=3,
-        tp_size=4,
-        tp_rank=3,
-        pp_size=2,
-        pp_rank=1,
-        layer_num_per_pp=[16, 16],
-        sender_endpoints=[],
-        self_endpoint="tcp://10.0.0.1:5001",
-        transfer_engine_info=b"",
-        dp_size=4 if attention_dp else 1,
-        dp_rank=3 if attention_dp else 0,
-        cp_size=2,
-        cp_rank=1,
-        attention=attention,
+def test_rank_topology_checks_its_attention_dp_groups(fields, words):
+    with pytest.raises(ValueError, match=words):
+        RankTopology(attention_dp=True, **fields)
+
+
+def test_rescale_lays_the_same_space_out_over_another_rank_count():
+    # 8 heads of 256 bytes held 4 per rank over TP2: 2 per rank over 4 ranks, the same space.
+    heads = ByHead(head_bytes=256, total=8)
+    assert heads.rescale(1024, 2, 4) == (heads, 512)
+    assert heads.rescale(1024, 2, 4)[0].space(512, 4) == heads.space(1024, 2)
+    # Over more ranks than heads, ranks holding the same head hold it whole.
+    assert ByHead(head_bytes=256, total=2).rescale(256, 2, 4) == (
+        ByHead(head_bytes=256, total=2),
+        256,
     )
-
-    topology = rank_info.topology
-
-    assert (topology.tp_size, topology.tp_rank) == (4, 3)
-    assert (topology.pp_size, topology.pp_rank, topology.cp_size, topology.cp_rank) == (2, 1, 2, 1)
-    assert topology.attention_dp is bool(attention_dp)
-    assert grid_place(topology, ("tp",)) == tp_place
-    # `topology` is a property, so `to_bytes()` does not serialize it.
-    assert "topology" not in msgpack.unpackb(rank_info.to_bytes(), strict_map_key=False)
+    # Over ranks the heads do not divide: ceil(8 / 3) heads each, as KV caches split them.
+    assert heads.rescale(1024, 2, 3) == (heads, 3 * 256)
+    assert [p.at // 256 for v in range(3) for p in heads.pieces(768, 3, v)] == [0, 2, 5]
+    assert ByHead().rescale(1024, 2, 4) is None, "heads not resolved"
+    # Sections split by byte: 32, 16 and 16 bytes per rank over TP2 are 16, 8 and 8 over 4.
+    sections = Sectioned((32, 16, 16))
+    scaled, size = sections.rescale(64, 2, 4)
+    assert (scaled.section_bytes, size) == ((16, 8, 8), 32)
+    assert scaled.space(size, 4) == sections.space(64, 2)
+    assert scaled.pieces(size, 4, 3) == (Piece(48, 0, 16), Piece(88, 16, 8), Piece(120, 24, 8))
+    assert Sectioned((3, 2)).rescale(5, 1, 2) is None, "3 bytes do not split over 2 ranks"
+    # Every rank holds a replicated buffer or a ring alike; a rank's own share has no space to
+    # lay out over other ranks.
+    assert Replicated().rescale(100, 2, 8) == (Replicated(), 100)
+    assert RingSlots(4).rescale(64, 2, 8) == (RingSlots(4), 64)
+    assert Own().rescale(100, 2, 4) is None
