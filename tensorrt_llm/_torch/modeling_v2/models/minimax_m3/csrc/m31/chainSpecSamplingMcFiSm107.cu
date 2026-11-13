@@ -90,7 +90,7 @@ __device__ __forceinline__ void loadResidual(
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh, FlashInfer v0.6.18). Copyright (c) 2024 by
+// FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh, FlashInfer v0.7.2). Copyright (c) 2024 by
 // FlashInfer team, licensed under the Apache License, Version 2.0. Copied with its template parameters fixed
 // (VEC_SIZE 4, BLOCK_THREADS 1024) and its shared array passed in; formatting kept. FlashInfer's headers are not on
 // the TensorRT-LLM C++ include path.
@@ -222,8 +222,8 @@ __global__ void __launch_bounds__(kBlockSize, 1)
     if (tid == 0)
     {
         curandStatePhilox4_32_10_t state;
-        curand_init(static_cast<unsigned long long>(params.seed[0]), static_cast<unsigned long long>(row),
-            static_cast<unsigned long long>(params.offset[0]), &state);
+        curand_init(static_cast<unsigned long long>(params.seed[row]), static_cast<unsigned long long>(row),
+            static_cast<unsigned long long>(params.offset[row]), &state);
         int32_t pos = numDraft;
         for (int32_t i = 0; i < numDraft; ++i)
         {

@@ -502,8 +502,10 @@ class M3MoeState:
         num_ctas: Optional[int] = None,
         shared: bool = False,
         inter: int = INTER,
+        handoff: Optional[bool] = None,
     ):
-        """``inter``: the routed intermediate per rank; this engine is built for INTER (768) only."""
+        """``inter``: the routed intermediate per rank; this engine is built for INTER (768) only. ``handoff``: whether
+        the MOE_HANDOFF tables apply (None: HANDOFF, the kill switch; False: the plain m3_moe schedule)."""
         if inter != INTER:
             raise ValueError(
                 f"m3_moe (TP4): routed intermediate {inter} per rank is not supported (only {INTER})"
@@ -565,7 +567,8 @@ class M3MoeState:
         _HALFPLAN_TAKEN[0] = False
         # One token: the trailing FC2s weigh nothing in the last phase's balance. Group 0's FC1 ranges are the same
         # for every distinct-expert count (early0).
-        lag = (LAG_BY_M[num_tokens - 1] if HANDOFF else 0) or M3_MOE_LAG
+        self.handoff = handoff = HANDOFF if handoff is None else bool(handoff)
+        lag = (LAG_BY_M[num_tokens - 1] if handoff else 0) or M3_MOE_LAG
         plan, nb_cap = make_phase_plan(
             self.num_ctas,
             num_tokens,
@@ -626,7 +629,7 @@ class M3MoeState:
             self.config["early0"] = 0
         if lag != M3_MOE_LAG:
             self.config["lag"] = lag
-        if HANDOFF:
+        if handoff:
             for key, tab in (
                 ("vpoll", VPOLL_BY_M),
                 ("epi_vskip", EPI_VSKIP_BY_M),

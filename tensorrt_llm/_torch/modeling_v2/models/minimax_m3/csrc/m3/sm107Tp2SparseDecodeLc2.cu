@@ -35,6 +35,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 TRTLLM_MV2_NAMESPACE_BEGIN
@@ -548,11 +549,9 @@ __global__ void __launch_bounds__(kThreads) m3_lc_attn_kernel(__grid_constant__ 
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
         float rcp;
         asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"(448.0F));
-        float const sfv = amax * rcp;
-        int const bits = __float_as_int(sfv);
-        int e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0);
-        e = min(e, 254);
-        float const qs = amax != 0.F ? __int_as_float((254 - e) << 23) : 0.F;
+        int const e = __nv_cvt_float_to_e8m0(amax * rcp, __NV_SATFINITE, cudaRoundPosInf);
+        // trtllm::mxfp8_quantize's scale: byte 0 (0 < amax <= 448 * 2^-127) quantizes to zero like an all-zero block.
+        float const qs = amax != 0.F && e != 0 ? __int_as_float((254 - e) << 23) : 0.F;
         float const xq = x * qs;
         uint16_t q2;
         asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(q2) : "f"(0.F), "f"(xq));

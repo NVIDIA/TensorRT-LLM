@@ -33,7 +33,8 @@ namespace torch_ext
 //! SFP_MC_FI (see minimax_m3_1_flash_nvfp4__sm_107__dep/csrc/samplingFromProbsMcFiSm107.h):
 //! flashinfer.sampling.sampling_from_probs's int32 tokens [rows] (deterministic, tensor seed / offset), bitwise, on
 //! rows x ctas_per_row CTAs. probs: float32 [rows, vocab] on the device, 16-byte aligned, with a row stride divisible
-//! by 4 floats. seed / offset: int64 CUDA tensors with at least one entry (FlashInfer reads element 0 for every row).
+//! by 4 floats. seed / offset: 1-D int64 CUDA tensors of one entry (broadcast to every row) or one entry per row, as
+//! FlashInfer 0.7.2 reads them.
 //! workspace: a zero-initialized byte buffer of at least rows x minimax_m31_sampling_from_probs_mc_fi_ws_bytes(),
 //! reused across calls; ctas_per_row divides 1024 (no co-residency limit).
 torch::Tensor minimaxM31SamplingFromProbsMcFi(torch::Tensor const& probs, torch::Tensor const& seed,
@@ -53,8 +54,10 @@ torch::Tensor minimaxM31SamplingFromProbsMcFi(torch::Tensor const& probs, torch:
     for (auto const* t : {&seed, &offset})
     {
         TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->get_device() == probs.get_device()
-                && t->scalar_type() == torch::kInt64 && t->numel() >= 1,
-            name, ": seed and offset must be contiguous int64 CUDA tensors with at least one entry on probs' device");
+                && t->scalar_type() == torch::kInt64 && t->dim() == 1 && (t->numel() == 1 || t->numel() == rows),
+            name,
+            ": seed and offset must be contiguous 1-D int64 CUDA tensors on probs' device with one entry or one per "
+            "row");
     }
     TORCH_CHECK(rows <= 65535 && ctasPerRow >= 1 && ctasPerRow <= 1024 && 1024 % ctasPerRow == 0, name,
         ": rows <= 65535; ctas_per_row must divide 1024");
@@ -73,8 +76,9 @@ torch::Tensor minimaxM31SamplingFromProbsMcFi(torch::Tensor const& probs, torch:
         return tokens;
     }
     auto const err = TRTLLM_MV2_NS::kernels::minimaxM31::invokeSamplingFromProbsMcFi(probs.const_data_ptr<float>(),
-        probs.stride(0), seed.const_data_ptr<int64_t>(), offset.const_data_ptr<int64_t>(), tokens.data_ptr<int32_t>(),
-        static_cast<int32_t>(rows), static_cast<int32_t>(vocabSize), static_cast<int>(ctasPerRow), workspace.data_ptr(),
+        probs.stride(0), seed.const_data_ptr<int64_t>(), seed.numel() > 1 ? 1 : 0, offset.const_data_ptr<int64_t>(),
+        offset.numel() > 1 ? 1 : 0, tokens.data_ptr<int32_t>(), static_cast<int32_t>(rows),
+        static_cast<int32_t>(vocabSize), static_cast<int>(ctasPerRow), workspace.data_ptr(),
         at::cuda::getCurrentCUDAStream(probs.get_device()));
     TORCH_CHECK(err == cudaSuccess, name, " launch failed: ", cudaGetErrorString(err));
     return tokens;

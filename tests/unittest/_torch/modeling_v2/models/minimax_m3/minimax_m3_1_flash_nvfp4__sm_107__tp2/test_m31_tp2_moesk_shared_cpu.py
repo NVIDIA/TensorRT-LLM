@@ -204,6 +204,27 @@ def test_shared_moesk_actual_host_and_resource_admission():
             assert not captured[-1].get("sfa_bulk") and not captured[-1].get("k128")
             scope["_MOESK_KILLED"] = False
             checks += 1
+            # TP2WC_MOE_ENGINE builds the reference engine on the plain schedule: the eight-row state with the
+            # MOE_HANDOFF tables carries epi_vskip, which the reference engine refuses; handoff=False carries none of
+            # the keys it refuses.
+            engine_src = ast.parse((family / "kernels/m3ll/tp4_moe_engine.py").read_text())
+            not_taken = next(
+                ast.literal_eval(n.value)
+                for n in engine_src.body
+                if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "NOT_TAKEN_KEYS" for t in n.targets)
+            )
+            for handoff, carries in ((None, True), (False, False)):
+                try:
+                    cls("cuda", num_tokens=8, shared=True, num_ctas=188, handoff=handoff)
+                except StopAtCompile:
+                    pass
+                else:
+                    raise AssertionError("must stop before allocations")
+                assert bool(captured[-1].get("epi_vskip")) == carries
+                if not carries:
+                    assert not [k for k in not_taken if captured[-1].get(k)], captured[-1]
+            checks += 1
         for rows in (0, 9):
             try:
                 cls("cuda", num_tokens=rows, shared=True, num_ctas=188)
@@ -228,6 +249,7 @@ def test_shared_moesk_actual_host_and_resource_admission():
         tensor.dtype = "bf16"
         tensor.shape = (4, 6144)
         tensor.is_contiguous = lambda: True
+        tensor.device = "cuda"
         for name in (
             "w3_w1_weight",
             "w2_weight",
@@ -269,7 +291,7 @@ def test_shared_moesk_actual_host_and_resource_admission():
             # The word-image operand precedes the FC2 scale words, img32, cnt and (hvpf) the flat FC2 weight bytes.
             assert calls[0][-6] == ("IMAGE" if bulk else layer.w3_w1_weight_scale)
             checks += 1
-    assert checks == 27
+    assert checks == 28
 
 
 def test_tp2_moesk_kill_switch_env():

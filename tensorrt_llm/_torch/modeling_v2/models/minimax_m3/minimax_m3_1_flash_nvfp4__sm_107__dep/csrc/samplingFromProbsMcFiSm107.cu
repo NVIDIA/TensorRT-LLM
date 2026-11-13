@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * deterministicInclusiveSum is FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh, v0.6.18),
+ * deterministicInclusiveSum is FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh, v0.7.2),
  * Copyright (c) 2024 by FlashInfer team, licensed under the Apache License, Version 2.0; copied with its template
  * parameters fixed (VEC_SIZE 4, BLOCK_THREADS 1024) and its shared array passed in.
  */
@@ -66,6 +66,8 @@ struct Params
     int64_t rowStride;
     int64_t const* seed;
     int64_t const* offset;
+    int32_t seedStride;
+    int32_t offsetStride;
     int32_t* outputTokenIds;
     int32_t vocabSize;
 };
@@ -252,8 +254,8 @@ __global__ void __launch_bounds__(kBlockSize, 1) samplingFromProbsMcFiKernel(Par
     if (tid == 0)
     {
         curandStatePhilox4_32_10_t state;
-        curand_init(static_cast<unsigned long long>(p.seed[0]), static_cast<unsigned long long>(row),
-            static_cast<unsigned long long>(p.offset[0]), &state);
+        curand_init(static_cast<unsigned long long>(p.seed[row * p.seedStride]), static_cast<unsigned long long>(row),
+            static_cast<unsigned long long>(p.offset[row * p.offsetStride]), &state);
         float const u = curand_uniform(&state);
         float aggregate = 0.0f;
         int32_t chunk = -1;
@@ -323,20 +325,21 @@ __global__ void __launch_bounds__(kBlockSize, 1) samplingFromProbsMcFiKernel(Par
 
 } // namespace
 
-cudaError_t invokeSamplingFromProbsMcFi(float const* probs, int64_t rowStride, int64_t const* seed,
-    int64_t const* offset, int32_t* outputTokenIds, int32_t rows, int32_t vocabSize, int ctasPerRow, void* workspace,
-    cudaStream_t stream)
+cudaError_t invokeSamplingFromProbsMcFi(float const* probs, int64_t rowStride, int64_t const* seed, int32_t seedStride,
+    int64_t const* offset, int32_t offsetStride, int32_t* outputTokenIds, int32_t rows, int32_t vocabSize,
+    int ctasPerRow, void* workspace, cudaStream_t stream)
 {
     if (rows <= 0)
     {
         return cudaSuccess;
     }
     if (rows > 65535 || vocabSize < 1 || vocabSize % 4 != 0 || vocabSize > kSamplingFromProbsMcMaxVocab
-        || ctasPerRow < 1 || kBlockSize % ctasPerRow != 0 || rowStride % 4 != 0 || workspace == nullptr)
+        || ctasPerRow < 1 || kBlockSize % ctasPerRow != 0 || rowStride % 4 != 0 || workspace == nullptr
+        || (seedStride != 0 && seedStride != 1) || (offsetStride != 0 && offsetStride != 1))
     {
         return cudaErrorInvalidValue;
     }
-    Params const p{probs, rowStride, seed, offset, outputTokenIds, vocabSize};
+    Params const p{probs, rowStride, seed, offset, seedStride, offsetStride, outputTokenIds, vocabSize};
     dim3 const grid(static_cast<unsigned>(ctasPerRow), static_cast<unsigned>(rows));
     samplingFromProbsMcFiKernel<<<grid, kBlockSize, 0, stream>>>(p, static_cast<RowWorkspace*>(workspace));
     return cudaGetLastError();

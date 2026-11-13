@@ -98,6 +98,15 @@ def test_an_input_inside_the_contract_reaches_the_op(fake_op, monkeypatch, log_l
     assert _not_taken(log_lines) == []
 
 
+def test_a_one_entry_seed_and_offset_reach_the_op(fake_op, monkeypatch, log_lines):
+    # FlashInfer 0.7.2 broadcasts a one-entry seed / offset tensor to every row.
+    _as_cuda_tensors(monkeypatch)
+    probs, seed, offset = _inputs()
+    assert sfp_mc_fi.sampling_from_probs_mc_fi(probs, seed[:1], offset[:1]) == "tokens"
+    assert len(fake_op.calls) == 1
+    assert _not_taken(log_lines) == []
+
+
 def test_a_row_strided_view_reaches_the_op(fake_op, monkeypatch, log_lines):
     _as_cuda_tensors(monkeypatch)
     probs = torch.zeros(12, 4100)[:, :4096]
@@ -116,7 +125,9 @@ def test_a_row_strided_view_reaches_the_op(fake_op, monkeypatch, log_lines):
         ("vocab_odd", "vocab not a multiple of 4 in 4..262144 (first: vocab 4098)"),
         ("rows_over_cap", "rows outside 1..48 (first: 49 rows)"),
         ("seed_int32", "seed not int64 (first: torch.int32)"),
-        ("seed_empty", "seed empty (first: 0 entries)"),
+        ("seed_empty", "seed not one entry or one per row (first: (0,))"),
+        ("seed_short", "seed not one entry or one per row (first: (5,))"),
+        ("offset_2d", "offset not one entry or one per row (first: (12, 1))"),
         ("offset_strided", "offset not contiguous (first: (2,))"),
     ],
 )
@@ -140,6 +151,10 @@ def test_inputs_outside_the_contract_are_declined(fake_op, monkeypatch, log_line
         seed = seed.int()
     elif change == "seed_empty":
         seed = seed[:0]
+    elif change == "seed_short":
+        seed = seed[:5]
+    elif change == "offset_2d":
+        offset = offset.view(rows, 1)
     elif change == "offset_strided":
         offset = torch.zeros(2 * rows, dtype=torch.int64)[::2]
     assert sfp_mc_fi.sampling_from_probs_mc_fi(probs, seed, offset) is None
