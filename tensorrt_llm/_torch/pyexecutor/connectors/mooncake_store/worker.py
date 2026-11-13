@@ -95,6 +95,7 @@ from .gpudirect import PEERMEM_ENV, allocation_range, format_diagnosis, select_r
 from .keys import KeyNamespace
 from .ledger import record_segment
 from .metadata import MooncakeStoreMetadata, RequestTransfers
+from .save_retry import SaveRetryResult, put_with_retries, save_retry_enabled
 from .staging import (
     HostStagingPool,
     describe_batch_for_get,
@@ -668,6 +669,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._put_config = _replicate_config(
             self._soft_pin_ttl_ms, ["probe"] if self._group_blocks else None
         )
+        # Retry refused puts unless DISABLE_ENV turns it off; counters for the log.
+        self._save_retry = save_retry_enabled()
+        self._save_retry_totals: Dict[str, int] = defaultdict(int)
 
         self._store, self._segment_host = _open_store(self._config)
         record_segment(
@@ -1832,6 +1836,49 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                         else:
                             self._outstanding_saves[entry.request_id] = remaining
 
+    def _probe_existing(self, keys: Sequence[str]) -> List[Optional[int]]:
+        """Existence statuses for `keys`; with save retries, a failed probe reads as absent."""
+        if not self._save_retry:
+            return self._store.batch_is_exist(list(keys))
+        try:
+            present = self._store.batch_is_exist(list(keys))
+        except Exception:  # noqa: BLE001 - an unanswered probe certifies nothing
+            return [None] * len(keys)
+        if not isinstance(present, (list, tuple)) or len(present) != len(keys):
+            return [None] * len(keys)
+        return [
+            value if isinstance(value, int) and not isinstance(value, bool) else None
+            for value in present
+        ]
+
+    def _record_save_retry(self, outcome: SaveRetryResult, keys: Sequence[str]) -> None:
+        """Count what one batch's retries did and log exhausted or recovered keys."""
+        totals = self._save_retry_totals
+        for name in (
+            "attempted_keys",
+            "retried_keys",
+            "recovered_keys",
+            "recovered_by_probe",
+            "exception_attempts",
+            "invalid_results",
+        ):
+            totals[name] += getattr(outcome, name)
+        totals["failed_keys"] += len(outcome.failed_indices)
+        if outcome.failed_indices:
+            logger.warning(
+                f"mooncake-store rank {self._rank} save retries exhausted: "
+                f"failed_keys={len(outcome.failed_indices)}/{len(keys)} "
+                f"attempts={outcome.put_attempts} codes={outcome.failure_codes} "
+                f"first_key={keys[outcome.failed_indices[0]]} "
+                f"cumulative_failed_keys={totals['failed_keys']}"
+            )
+        elif outcome.recovered_keys:
+            logger.info(
+                f"mooncake-store rank {self._rank} save retries recovered "
+                f"{outcome.recovered_keys} keys ({outcome.recovered_by_probe} by probe) "
+                f"in {outcome.put_attempts} attempts"
+            )
+
     def _put(self, transfers: Sequence[RequestTransfers]) -> None:
         keys, addresses, sizes, _ = self._resolve(transfers)
         if not keys:
@@ -1851,7 +1898,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             # Skip pages another rank or another instance already wrote. The
             # scheduler holds no store handle, and the answer changes between
             # the time it builds metadata and now.
-            present = self._store.batch_is_exist(list(batch_keys))
+            present = self._probe_existing(batch_keys)
             pending = [
                 index
                 for index, status in enumerate(present)
@@ -1869,17 +1916,39 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
                 # The store reads the slots on this thread, so fill them first.
                 _sync_stream(handle)
-            put_args = ([batch_keys[i] for i in pending], source_addresses, source_sizes)
+            pending_keys = [batch_keys[i] for i in pending]
             if self._group_blocks:
                 # One group per key that survived the existence filter.
-                put_args += (
-                    _replicate_config(self._soft_pin_ttl_ms, [batch_groups[i] for i in pending]),
+                pending_groups = [batch_groups[i] for i in pending]
+
+                def config_for(indices, groups=pending_groups):
+                    return _replicate_config(self._soft_pin_ttl_ms, [groups[i] for i in indices])
+
+            else:
+
+                def config_for(indices):
+                    return self._put_config
+
+            if self._save_retry:
+                # No staging slot is reused and the save thread retires none of
+                # these pages until this synchronous call returns.
+                outcome = put_with_retries(
+                    self._store,
+                    pending_keys,
+                    source_addresses,
+                    source_sizes,
+                    config_for=config_for,
                 )
-            elif self._put_config is not None:
-                put_args += (self._put_config,)
-            # With neither option set this is the plain three-argument put.
-            results = self._store.batch_put_from_multi_buffers(*put_args)
-            failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
+                failures = len(outcome.failed_indices)
+                self._record_save_retry(outcome, pending_keys)
+            else:
+                put_args = (pending_keys, source_addresses, source_sizes)
+                config = config_for(range(len(pending_keys)))
+                # Without either option this is the plain three-argument put.
+                if config is not None:
+                    put_args += (config,)
+                results = self._store.batch_put_from_multi_buffers(*put_args)
+                failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
             if failures:
                 # A dropped write only costs a future cache miss, which is not
                 # worth failing a request that already answered.

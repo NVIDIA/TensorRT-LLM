@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheRegion,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import gpudirect as gpudirect_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import save_retry as save_retry_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import (
@@ -1254,6 +1255,72 @@ def test_worker_reports_the_saves_it_queued(store_config, fake_store, monkeypatc
         assert worker.take_submitted_saves() == {7}
         # Cleared on return.
         assert worker.take_submitted_saves() == set()
+
+
+# ---- put retries ----
+
+
+def _refuse_first_put_of(fake_store, monkeypatch, refused_index):
+    """Make the first put refuse one key; later puts store normally."""
+    store_put = fake_store.batch_put_from_multi_buffers
+    calls = []
+
+    def put(keys, addresses, sizes, *args, **kwargs):
+        calls.append(list(keys))
+        results = store_put(keys, addresses, sizes, *args, **kwargs)
+        if len(calls) == 1:
+            fake_store.objects.discard(keys[refused_index])
+            results[refused_index] = -200
+        return results
+
+    monkeypatch.setattr(fake_store, "batch_put_from_multi_buffers", put)
+    return calls
+
+
+def _freeze_retry_clock(monkeypatch):
+    """Keep the retry window open however long the test pauses; the
+    scripted-clock tests of put_with_retries cover the deadline itself."""
+    put_with_retries = worker_module.put_with_retries
+    monkeypatch.setattr(
+        worker_module,
+        "put_with_retries",
+        lambda *args, **kwargs: put_with_retries(*args, clock=lambda: 0.0, **kwargs),
+    )
+
+
+def test_worker_retries_only_a_refused_page(store_config, fake_store, monkeypatch):
+    monkeypatch.delenv(save_retry_module.DISABLE_ENV, raising=False)
+    _freeze_retry_clock(monkeypatch)
+    calls = _refuse_first_put_of(fake_store, monkeypatch, 1)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        _save_two_pages(worker)
+        assert len(calls) == 2
+        assert calls[1] == calls[0][1:]
+        assert worker._save_retry_totals["recovered_keys"] == 1
+        assert worker._save_retry_totals["failed_keys"] == 0
+
+
+def test_worker_puts_once_with_retries_disabled(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(save_retry_module.DISABLE_ENV, "1")
+    calls = _refuse_first_put_of(fake_store, monkeypatch, 1)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        _save_two_pages(worker)
+        assert len(calls) == 1
+        assert worker._save_retry_totals == {}
+
+
+def test_worker_retry_names_only_the_retried_pages_groups(store_config, fake_store, monkeypatch):
+    """A grouped retry carries one group per retried key, not the first put's list."""
+    monkeypatch.delenv(save_retry_module.DISABLE_ENV, raising=False)
+    _freeze_retry_clock(monkeypatch)
+    built = _record_put_configs(monkeypatch)
+    set_pool_setting(store_config, soft_pin_ttl_ms=5000, group_blocks=True)
+    _refuse_first_put_of(fake_store, monkeypatch, 0)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(2)]
+        _save_two_pages(worker)
+        groups = [worker._namespaces[0].group(digest) for digest in hashes]
+    assert [entry.group_ids for entry in built] == [["probe"], groups, groups[:1]]
 
 
 # ---- soft-pinned and grouped puts ----
