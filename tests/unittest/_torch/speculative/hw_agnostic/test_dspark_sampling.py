@@ -93,7 +93,6 @@ def _metadata(
     top_k: int = INT32_MAX,
     top_p: float = 1.0,
     min_p: float = 0.0,
-    temperature_only: bool = False,
     method: str = "standard",
     mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL,
     device: str = "cpu",
@@ -109,7 +108,6 @@ def _metadata(
         request_offsets=1000 * torch.arange(batch, dtype=torch.int64, device=device),
         use_rejection_sampling=True,
         max_draft_len=draft_len,
-        draft_temperature_only=temperature_only,
         rejection_sample_method=method,
         # Slots in reverse batch order, so a batch-order write would be caught.
         batch_slot_ids=torch.arange(batch, dtype=torch.long, device=device).flip(0),
@@ -194,8 +192,8 @@ def _expected_rows(
 
 @pytest.mark.parametrize(
     "options",
-    [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
-    ids=["block", "temperature_only"],
+    [dict(rejection_sample_method="block")],
+    ids=["block"],
 )
 @pytest.mark.cpu_only
 def test_llm_args_reject_the_options_without_rejection_sampling(options: dict) -> None:
@@ -213,17 +211,15 @@ def test_spec_metadata_carries_the_rejection_options() -> None:
         num_nextn_predict_layers=1,
         use_rejection_sampling=True,
         rejection_sample_method="block",
-        draft_temperature_only=True,
     )
     model_config = types.SimpleNamespace(
         num_hidden_layers=32, hidden_size=128, vocab_size=1024, torch_dtype=None
     )
     metadata = get_spec_metadata(config, model_config, max_num_requests=4, max_num_tokens=64)
     assert metadata.rejection_sample_method == "block"
-    assert metadata.draft_temperature_only is True
 
 
-_REJECTION_OPTIONS = [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)]
+_REJECTION_OPTIONS = [dict(rejection_sample_method="block")]
 
 
 @pytest.mark.cpu_only
@@ -312,7 +308,7 @@ def test_llm_args_reject_watermarking_with_block_verification(method: str) -> No
             build()
 
 
-@pytest.mark.parametrize("option", _REJECTION_OPTIONS, ids=["block", "temperature_only"])
+@pytest.mark.parametrize("option", _REJECTION_OPTIONS, ids=["block"])
 @pytest.mark.parametrize("setting", list(_SETTINGS))
 @pytest.mark.cpu_only
 def test_rejection_options_are_rejected_where_they_would_not_apply(
@@ -444,19 +440,16 @@ def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_con
 
 
 @pytest.mark.parametrize("sampler", ["ancestral", "block", "step"])
-@pytest.mark.parametrize("temperature_only", [False, True])
 @pytest.mark.cpu_only
-def test_sampled_drafts_use_the_draft_sampling_parameters(
-    temperature_only: bool, sampler: str
-) -> None:
+def test_sampled_drafts_use_the_draft_sampling_parameters(sampler: str) -> None:
     """The ancestral hook and the shared block and step samplers draw with the request's
-    filters, or with its temperature alone under draft_temperature_only."""
+    filters."""
     generator = torch.Generator().manual_seed(5)
     worker = _worker()
     drafter = _drafter(generator)
     base = torch.randn(B, K, V, generator=generator)
     anchors = torch.randint(V, (B,), generator=generator)
-    meta = _metadata(B, top_k=20, top_p=0.95, min_p=0.05, temperature_only=temperature_only)
+    meta = _metadata(B, top_k=20, top_p=0.95, min_p=0.05)
     calls = []
 
     if sampler == "ancestral":
@@ -477,41 +470,13 @@ def test_sampled_drafts_use_the_draft_sampling_parameters(
 
     assert len(calls) == (K if sampler == "ancestral" else 1)
     for step, call in enumerate(calls):
-        if temperature_only:
-            assert (call["top_ks"] == INT32_MAX).all()
-            assert (call["top_ps"] == 1.0).all() and (call["min_ps"] == 0.0).all()
-        else:
-            assert (call["top_ks"] == 20).all()
-            torch.testing.assert_close(call["top_ps"], torch.full((rows,), 0.95))
-            torch.testing.assert_close(call["min_ps"], torch.full((rows,), 0.05))
+        assert (call["top_ks"] == 20).all()
+        torch.testing.assert_close(call["top_ps"], torch.full((rows,), 0.95))
+        torch.testing.assert_close(call["min_ps"], torch.full((rows,), 0.05))
         if sampler == "ancestral":
             # Each position draws from its own draft slot of the request's window.
             expected_offset = meta.request_offsets + meta.rng_draft_slot(step) * _RNG_SLOT_SPAN
             assert torch.equal(call["offset"], expected_offset)
-
-
-@pytest.mark.parametrize(
-    "mode", [AdvancedSamplingMode.FULL, AdvancedSamplingMode.NO_TOPK], ids=["fused", "flashinfer"]
-)
-@pytest.mark.cpu_only
-def test_draft_sampling_params_temperature_only_keeps_the_temperature(
-    mode: AdvancedSamplingMode,
-) -> None:
-    meta = _metadata(
-        B, temperature=0.6, top_k=20, top_p=0.9, min_p=0.1, temperature_only=True, mode=mode
-    )
-    temps, top_ks, top_ps, min_ps = SpecWorkerBase._draft_sampling_params(meta, 1, B, repeat=2)
-    torch.testing.assert_close(temps, torch.full((2 * (B - 1),), 0.6))
-    if mode.is_fused:
-        assert (top_ks == INT32_MAX).all() and top_ks.dtype == torch.int32
-        assert (top_ps == 1.0).all() and (min_ps == 0.0).all()
-    else:
-        # No filter kernel runs on the flashinfer path, top-p's at p = 1 included.
-        assert top_ks is None and top_ps is None and min_ps is None
-    meta.draft_temperature_only = False
-    _, top_ks, top_ps, min_ps = SpecWorkerBase._draft_sampling_params(meta, 1, B, repeat=2)
-    assert (top_ks == 20).all()
-    torch.testing.assert_close(top_ps, torch.full((2 * (B - 1),), 0.9))
 
 
 # CUDA graphs and the real sampler kernels
@@ -533,17 +498,11 @@ def _capture(fn: Callable[[], Any]) -> tuple[torch.cuda.CUDAGraph, Any]:
 
 @_needs_cuda
 @pytest.mark.parametrize(
-    "temperature_only, mode",
-    [
-        (True, AdvancedSamplingMode.FULL),
-        (False, AdvancedSamplingMode.FULL),
-        (True, AdvancedSamplingMode.NO_TOPK),
-    ],
-    ids=["temperature_only", "filtered", "temperature_only-flashinfer"],
+    "mode",
+    [AdvancedSamplingMode.NO_TOPK_NO_TOPP, AdvancedSamplingMode.FULL],
+    ids=["unfiltered", "filtered"],
 )
-def test_sampled_block_captures_in_a_cuda_graph(
-    temperature_only: bool, mode: AdvancedSamplingMode
-) -> None:
+def test_sampled_block_captures_in_a_cuda_graph(mode: AdvancedSamplingMode) -> None:
     generator = torch.Generator().manual_seed(31)
     vocab, num_gens = 4096, 6
     worker = _worker()
@@ -556,7 +515,6 @@ def test_sampled_block_captures_in_a_cuda_graph(
         num_slots=num_gens + 1,
         temperature=0.8,
         top_p=0.9,
-        temperature_only=temperature_only,
         mode=mode,
         device="cuda",
     )
@@ -578,7 +536,7 @@ def test_sampled_block_captures_in_a_cuda_graph(
     torch.testing.assert_close(stored.sum(-1), torch.ones(num_gens - 1, K, device="cuda"))
     assert (stored.gather(-1, tokens[:-1].long().unsqueeze(-1)) > 0).all()
     assert ((tokens >= 0) & (tokens < vocab)).all()
-    if temperature_only:
+    if mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP:
         expected = _expected_rows(drafter, base[:-1], anchors[:-1], tokens[:-1], temperature=0.8)
         torch.testing.assert_close(stored, expected, atol=1e-5, rtol=1e-4)
     else:
@@ -594,14 +552,7 @@ def test_sampled_block_captures_in_a_cuda_graph(
 
 @_needs_cuda
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16], ids=["fp32_w", "bf16_w"])
-@pytest.mark.parametrize(
-    "temperature_only, mode",
-    [(True, AdvancedSamplingMode.FULL), (False, AdvancedSamplingMode.NO_TOPK_NO_TOPP)],
-    ids=["temperature_only", "no_topk_no_topp"],
-)
-def test_unfiltered_chain_draws_follow_the_stored_proposals(
-    temperature_only: bool, mode: AdvancedSamplingMode, w_dtype: torch.dtype
-) -> None:
+def test_unfiltered_chain_draws_follow_the_stored_proposals(w_dtype: torch.dtype) -> None:
     """Without filters the fused chain draws ancestrally, also with ancestral_draft_sampling
     off: the joint of two positions is p(d0) p(d1 | d0) under the stored rows, and a greedy
     row takes the argmax chain. BF16 Markov weights over FP32 logits are the checkpoint
@@ -618,8 +569,7 @@ def test_unfiltered_chain_draws_follow_the_stored_proposals(
         vocab=vocab,
         draft_len=draft_len,
         temperature=temperature,
-        temperature_only=temperature_only,
-        mode=mode,
+        mode=AdvancedSamplingMode.NO_TOPK_NO_TOPP,
         device="cuda",
     )
     meta.request_temperatures[-1] = 0.0  # one greedy request

@@ -207,13 +207,6 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
-        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -846,13 +839,6 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
-        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -1093,7 +1079,7 @@
         },
         "ancestral_draft_sampling": {
           "default": false,
-          "description": "Sampled drafts of a standalone drafter with a Markov head are drawn ancestrally when the deployment drops the draft filters (draft_temperature_only=True or advanced_sampling_mode='no_topk_no_topp'): each position is sampled given the token drawn before it by a fused Triton chain, so the stored proposals are the drafter's joint distribution, which raises acceptance. If true, all other sampled drafts are drawn ancestrally too, at one sampler call per draft position. False (default) chains the Markov bias of the other sampled drafts through the greedy argmax and samples every position at once. Requires use_rejection_sampling=True; standalone drafters only, not supported with confidence scheduling.",
+          "description": "Sampled drafts of a standalone drafter with a Markov head are drawn ancestrally when the deployment drops the sampling filters (advanced_sampling_mode='no_topk_no_topp'): each position is sampled given the token drawn before it by a fused Triton chain, so the stored proposals are the drafter's joint distribution, which raises acceptance. If true, all other sampled drafts are drawn ancestrally too, at one sampler call per draft position. False (default) chains the Markov bias of the other sampled drafts through the greedy argmax and samples every position at once. Requires use_rejection_sampling=True; standalone drafters only, not supported with confidence scheduling.",
           "status": "prototype",
           "title": "Ancestral Draft Sampling",
           "type": "boolean"
@@ -1196,13 +1182,6 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
-        },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
         },
         "enable_confidence_scheduling": {
           "default": false,
@@ -3813,13 +3792,6 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
-        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -4276,13 +4248,6 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
-        },
         "dynamic_tree_max_topK": {
           "anyOf": [
             {
@@ -4578,13 +4543,6 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
-        },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
         },
         "dynamic_tree_max_topK": {
           "anyOf": [
@@ -5952,13 +5910,6 @@
           "title": "Draft Moe Dtype",
           "type": "string"
         },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
-        },
         "dynamic_tree_max_topK": {
           "anyOf": [
             {
@@ -6963,13 +6914,6 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
-        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -7236,13 +7180,6 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
-        },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
         },
         "enable_penalty": {
           "default": false,
@@ -7963,13 +7900,6 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
-        },
         "enable_global_pool": {
           "default": false,
           "description": "When True, each request searches all active SA states for the longest match, not just its own. Improves acceptance rates when requests share common patterns. Limitations: at most 1024 concurrent slots; suffix matching is capped at 64 tokens per request.",
@@ -8233,13 +8163,6 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
-        },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
         },
         "eagle3_layers_to_capture": {
           "anyOf": [
@@ -8834,13 +8757,6 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
-        },
-        "draft_temperature_only": {
-          "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
-          "status": "prototype",
-          "title": "Draft Temperature Only",
-          "type": "boolean"
         },
         "drafter": {
           "description": "A Drafter requires the Python LLM API.",

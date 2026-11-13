@@ -362,7 +362,6 @@ def get_spec_metadata(spec_config,
         # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
         metadata.rejection_sample_method = spec_config.rejection_sample_method
-        metadata.draft_temperature_only = spec_config.draft_temperature_only
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
         metadata.temperature_only_graphs = temperature_only_graphs

@@ -1365,8 +1365,7 @@ class DSparkWorker(DFlashWorker):
         stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
         raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
         int32 draft tokens and the stored vocab width. When the deployment drops
-        the draft filters (``draft_temperature_only`` or the
-        ``NO_TOPK_NO_TOPP`` sampling mode) drafts take the fused
+        the sampling filters (the ``NO_TOPK_NO_TOPP`` sampling mode) drafts take the fused
         :func:`markov_sampled_chain`; other sampled drafts take a per-position
         sampler loop and only with ``ancestral_draft_sampling``. Otherwise,
         without a Markov head, for argmax drafts, or for a drafter that also
@@ -1379,9 +1378,9 @@ class DSparkWorker(DFlashWorker):
         )
         # Deploy-time unfiltered drafts take the fused chain, which costs no more
         # than the block sampler, so they are drawn ancestrally without the option.
-        fused_chain = gen_logits.is_cuda and (
-            spec_metadata.draft_temperature_only
-            or spec_metadata.advanced_sampling_mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP
+        fused_chain = (
+            gen_logits.is_cuda
+            and spec_metadata.advanced_sampling_mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP
         )
         if not (
             (self.spec_config.ancestral_draft_sampling or fused_chain)

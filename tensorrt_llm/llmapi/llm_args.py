@@ -2612,17 +2612,6 @@ class DecodingBaseConfig(StrictBaseModel):
         "Linear-chain one-model paths only: not supported with the dynamic "
         "tree, relaxed thinking acceptance or DSpark confidence scheduling.")
 
-    draft_temperature_only: bool = Field(
-        default=False,
-        status="prototype",
-        description="If true, rejection-sampled drafts are drawn from the "
-        "temperature-scaled draft distribution without the request's top-k / "
-        "top-p / min-p filters; with rejection-sampling verification this "
-        "changes the acceptance rate, not the output distribution. Requires "
-        "use_rejection_sampling=True; not supported with the dynamic tree, "
-        "relaxed thinking acceptance (which accepts drafts without the "
-        "rejection rule) or DSpark confidence scheduling.")
-
     allow_advanced_sampling: bool = Field(
         default=False,
         status="deprecated",
@@ -2744,8 +2733,6 @@ class DecodingBaseConfig(StrictBaseModel):
         if self.rejection_sample_method != "standard":
             options.append(
                 f"rejection_sample_method={self.rejection_sample_method!r}")
-        if self.draft_temperature_only:
-            options.append("draft_temperature_only=True")
         return options
 
     def _reject_rejection_options_with(self, setting: str) -> None:
@@ -2761,7 +2748,7 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_rejection_sampling_options(self) -> "DecodingBaseConfig":
-        """Both options act only through the rejection path."""
+        """The options act only through the rejection path."""
         options = self._rejection_options_set()
         if options and not self.use_rejection_sampling:
             raise ValueError(f"{' and '.join(options)} require(s) "
@@ -4081,9 +4068,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         status="prototype",
         description=
         "Sampled drafts of a standalone drafter with a Markov head are drawn "
-        "ancestrally when the deployment drops the draft filters "
-        "(draft_temperature_only=True or "
-        "advanced_sampling_mode='no_topk_no_topp'): each position is sampled "
+        "ancestrally when the deployment drops the sampling filters "
+        "(advanced_sampling_mode='no_topk_no_topp'): each position is sampled "
         "given the token drawn before it by a fused Triton chain, so the stored "
         "proposals are the drafter's joint distribution, which raises "
         "acceptance. If true, all other sampled drafts are drawn ancestrally "

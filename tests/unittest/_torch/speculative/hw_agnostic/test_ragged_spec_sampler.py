@@ -60,7 +60,6 @@ def _penalty_mapping_meta(
         qo_indptr=None,
         total_verify_tokens=None,
         rejection_sample_method="standard",
-        draft_temperature_only=False,
     )
     if verify_lens is not None:
         lens = torch.tensor(verify_lens, dtype=torch.int32)

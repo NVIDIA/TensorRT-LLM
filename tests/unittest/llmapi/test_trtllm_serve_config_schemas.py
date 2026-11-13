@@ -578,8 +578,6 @@ def test_dspark_context_recompute_tail_type(
         ("rejection_sample_method", "block", True),
         ("rejection_sample_method", "blocks", False),
         ("rejection_sample_method", "Block", False),
-        ("draft_temperature_only", True, True),
-        ("draft_temperature_only", "yes", False),
     ],
 )
 def test_rejection_sampling_option_values(

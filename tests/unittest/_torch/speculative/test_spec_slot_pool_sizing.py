@@ -66,7 +66,6 @@ def test_slot_pool_size_is_applied_centrally(monkeypatch):
         enable_penalty=False,
         advanced_sampling_mode=AdvancedSamplingMode.FULL,
         rejection_sample_method="standard",
-        draft_temperature_only=False,
     )
 
     out = get_spec_metadata(
@@ -98,7 +97,6 @@ def test_unknown_slot_pool_leaves_the_max_num_requests_fallback(monkeypatch):
         enable_penalty=False,
         advanced_sampling_mode=AdvancedSamplingMode.FULL,
         rejection_sample_method="standard",
-        draft_temperature_only=False,
     )
 
     get_spec_metadata(

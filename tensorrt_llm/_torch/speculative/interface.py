@@ -670,10 +670,6 @@ class SpecMetadata:
     # DecodingBaseConfig.rejection_sample_method): "standard" (token-level) or
     # "block" (block verification, see block_verification.py).
     rejection_sample_method: RejectionSampleMethod = "standard"
-    # Whether rejection-sampled drafts ignore the request's top-k / top-p /
-    # min-p and draw from the temperature-scaled draft distribution (deploy-time;
-    # from DecodingBaseConfig.draft_temperature_only).
-    draft_temperature_only: bool = False
     # Stage the per-step Philox seed/offset uploads into the engine's step-input
     # pack (RuntimeHooks.pack_spec_rng_uploads) instead of copying each one.
     pack_rng_uploads: bool = False
@@ -2775,18 +2771,13 @@ class SpecWorkerBase(nn.Module, ABC):
                Optional[torch.Tensor]]:
         """Per-row ``(temperatures, top_ks, top_ps, min_ps)`` for drawing drafts.
 
-        The request's parameters, or with ``draft_temperature_only`` its
-        temperature alone (filters disabled; ``None`` filters on the
-        flashinfer backends, see :meth:`_unfiltered_sampling_params`). ``start`` / ``end`` select the
-        requests; ``repeat`` expands each to the rows a block sampler flattens.
+        The request's own parameters. ``start`` / ``end`` select the requests;
+        ``repeat`` expands each to the rows a block sampler flattens.
         """
         temperatures = spec_metadata.request_temperatures[start:end]
         top_ks = spec_metadata.request_top_ks[start:end]
         top_ps = spec_metadata.request_top_ps[start:end]
         min_ps = spec_metadata.request_min_ps[start:end]
-        if spec_metadata.draft_temperature_only:
-            top_ks, top_ps, min_ps = SpecWorkerBase._unfiltered_sampling_params(
-                spec_metadata.advanced_sampling_mode, temperatures)
         if repeat > 1:
             temperatures, top_ks, top_ps, min_ps = [
                 None if t is None else t.repeat_interleave(repeat)
@@ -3061,8 +3052,7 @@ class SpecWorkerBase(nn.Module, ABC):
             # The target distribution of the acceptance ratio p / q: the
             # request's own filters, computed by the same backend selection on
             # the same mode as the stored draft probs q (see
-            # advanced_sample_draft; with draft_temperature_only q carries the
-            # temperature alone). A backend mismatch corrupts acceptance
+            # advanced_sample_draft). A backend mismatch corrupts acceptance
             # silently rather than raising.
             target_probs_flat = self._compute_probs_from_logits(
                 spec_metadata.advanced_sampling_mode, gen_logits, temperatures,

@@ -3313,16 +3313,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.parametrize(
-        "rejection_sample_method,draft_temperature_only,context_recompute_tail",
+        "rejection_sample_method,fused_chain,context_recompute_tail",
         [("standard", True, None), ("block", False, 64)],
         ids=["standard-fused_chain", "block-per_position"])
     def test_dspark_rejection_sampling(self, rejection_sample_method,
-                                       draft_temperature_only,
-                                       context_recompute_tail):
+                                       fused_chain, context_recompute_tail):
         """Sampled DSpark drafts under rejection sampling, with prefix reuse.
 
-        The two ancestral draft paths run end to end: temperature-only drafts
-        take the fused Markov chain, and filtered drafts with
+        The two ancestral draft paths run end to end: a no_topk_no_topp
+        deployment takes the fused Markov chain, and filtered drafts with
         ancestral_draft_sampling take the per-position sampler. They pair
         with token-level and block verification. Every prompt runs twice, so
         the repeat takes a prefix-cache hit and the target recomputes the
@@ -3340,18 +3339,19 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             attention_backend="VANILLA",
             use_rejection_sampling=True,
             rejection_sample_method=rejection_sample_method,
-            draft_temperature_only=draft_temperature_only,
-            ancestral_draft_sampling=not draft_temperature_only,
+            advanced_sampling_mode=("no_topk_no_topp"
+                                    if fused_chain else "full"),
+            ancestral_draft_sampling=not fused_chain,
             context_recompute_tail=context_recompute_tail)
         kv_cache_config = KvCacheConfig(enable_block_reuse=True,
                                         free_gpu_memory_fraction=0.6)
-        # Qwen3's recommended non-thinking sampling; the target keeps the
-        # filters in both cases.
+        # Qwen3's recommended non-thinking sampling; the no_topk_no_topp
+        # deployment samples by temperature alone.
+        filters = {} if fused_chain else dict(top_k=20, top_p=0.8)
         sampling_params = SamplingParams(max_tokens=256,
                                          temperature=0.7,
-                                         top_k=20,
-                                         top_p=0.8,
-                                         seed=0)
+                                         seed=0,
+                                         **filters)
 
         with LLM(model=target_model_dir,
                  max_batch_size=8,
@@ -3394,7 +3394,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 print(f"[AL] test_dspark_rejection_sampling"
                       f"[{rejection_sample_method}] repeat={repeat}: "
                       f"{acceptance_length:.3f}")
-                # 4.94-4.99 on RTX PRO 6000 (VANILLA), both passes.
+                # 4.94-5.09 on RTX PRO 6000 (VANILLA), both passes.
                 assert acceptance_length >= 4.0, (
                     f"acceptance length {acceptance_length:.3f} < 4.0 "
                     f"(repeat={repeat})")
