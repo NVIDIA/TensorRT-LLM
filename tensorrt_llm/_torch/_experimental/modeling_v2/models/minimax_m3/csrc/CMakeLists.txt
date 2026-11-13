@@ -70,6 +70,17 @@ add_modeling_v2_target(
 # Runs the family's shared code only.
 add_modeling_v2_target(minimax_m3 minimax_m3_1_flash_nvfp4__sm_107__tp2ctx
                        ARCHS 100f 107a)
+# The MiniMax-M3.1-Flash GB300 targets: sm_103 (100f) only.
+add_modeling_v2_target(
+  minimax_m3 minimax_m3_1_flash_nvfp4__sm_103__tp4
+  ARCHS 100f
+  SOURCES *.cu *.cpp
+  REQUIRES MULTI_DEVICE)
+add_modeling_v2_target(
+  minimax_m3 minimax_m3_1_flash_nvfp4__sm_103__tp8
+  ARCHS 100f
+  SOURCES *.cu *.cpp
+  REQUIRES MULTI_DEVICE)
 
 # The MiniMax-M3 targets call the shared fixed copies in m3/ (family_ops()), so
 # a build that selects only them still builds the family library.
