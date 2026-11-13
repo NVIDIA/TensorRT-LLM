@@ -251,6 +251,7 @@ def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, f
             v = packed_qkv_3d[..., 2 * key_width :].view(N, T, HV, V)
             assert packed_qkv.is_contiguous()
             assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+        a_raw = b_raw = None
         if fused_gating:
             packed_ba = torch.randn(N * T, 2 * HV, device=device, dtype=dtype)
             packed_ba[:, HV:].mul_(0.5)
@@ -279,8 +280,8 @@ def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, f
             q,
             k,
             v,
-            a_raw if fused_gating else g,
-            b_raw if fused_gating else beta,
+            a_raw if a_raw is not None else g,
+            b_raw if b_raw is not None else beta,
             pool_replay,
             state_indices,
             old_v,
@@ -479,6 +480,8 @@ def test_gdn_cached_replay_all_layer_commit_matches_reference(state_layout):
     state_num_layers = None
     state_layer_stride = None
     state_slot_stride = None
+    state_views = None
+    actual_states = None
     if state_layout == "indirect":
         state_numel = HV * V * K
         state_views = []
@@ -531,7 +534,7 @@ def test_gdn_cached_replay_all_layer_commit_matches_reference(state_layout):
         n_writes=n_writes,
         history_size=HIST,
     )
-    if state_layout in ("affine", "indirect"):
+    if state_views is not None:
         actual_states = torch.stack(state_views)
 
     torch.testing.assert_close(actual_states.float(), expected_states.float(), rtol=2e-2, atol=2e-2)

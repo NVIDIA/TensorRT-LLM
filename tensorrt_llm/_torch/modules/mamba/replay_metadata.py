@@ -217,6 +217,13 @@ class ReplayMamba2Metadata(Mamba2Metadata):
             self.replay_state_indices = self.state_indices
         self._prepare_replay_work_items(kv_cache_manager, batch_size, attn_metadata.num_contexts)
 
+    def prepare_steady_gen_step(self, attn_metadata: AttentionMetadata) -> None:
+        # The replay slots stay in place with the state slots; the work items follow the
+        # accepted tokens of the previous step.
+        super().prepare_steady_gen_step(attn_metadata)
+        batch_size = attn_metadata.seq_lens.shape[0]
+        self._prepare_replay_work_items(attn_metadata.kv_cache_manager, batch_size, 0)
+
     def _prepare_replay_state_indices(self, kv_cache_manager, batch_request_ids) -> None:
         """Fill the static replay-slot buffer, or alias the state slots."""
         if getattr(kv_cache_manager, "replay_layer_group_id", None) is None:

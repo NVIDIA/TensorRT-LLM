@@ -183,23 +183,40 @@ target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
 cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
 
 In disaggregated serving, direct worker launches require
-`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` on both the context and generation workers
-to enable shared draft-KV transfer. The `disaggregated_mpi_worker` launcher
-enables this setting automatically when both servers enable compatible
-speculation and use the same `tensor_parallel_size` and
-`enable_attention_dp`.
+`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` (or `auto`, which shares wherever the layout
+allows it) on both the context and generation workers to enable shared
+draft-KV transfer. The `disaggregated_mpi_worker` launcher enables this setting
+automatically when its config lists both context and generation servers, both
+enable compatible speculation, and they shard attention alike: the same
+`tensor_parallel_size`, where `enable_attention_dp` counts as 1 because every
+rank keeps all KV heads. A config that lists only one side (for example, a
+context-only MPI world) leaves sharing off unless the variable is `1`. A
+two-sided config with attention DP on both sides and different
+`tensor_parallel_size` values shards attention alike too, so it also shares;
+set `TRTLLM_DISAGG_SHARED_DRAFT_KV=0` to keep separate draft KV caches.
 
 When sharing is enabled, the context server's draft pages are transferred to
 the generation server with the target pages, so the drafter starts generation
 with the prompt context instead of an empty one. This requires the draft layers
 to have the target's rank-local KV-head count; the draft dtype and head
 dimension may differ, except that an NVFP4 target KV cache requires an
-identical draft layout. Both servers must use the same layout.
+identical draft layout unless both caches are K-only (MLA). Both servers must
+use the same layout.
+
+Hybrid recurrent/attention targets whose cache manager opts in (Kimi K3) also
+hold a standalone DSpark drafter's layers, after their own. In every case the
+drafter decides whether it shares: it declares whether its block attention reads
+the manager's pages at the run's `tokens_per_block`
+(`DFlashForCausalLM.reads_managed_ctx_pages`). By default only
+`attention_backend="TRTLLM"` does, at the page sizes its trtllm-gen kernels
+support; a drafter whose other backends read paged context declares that itself.
 
 The drafter keeps a separate draft KV cache manager instead when any of the
-following applies: context parallelism larger than 1, a per-layer KV-head count
-on the target or drafter, a specialized KV cache manager (for example, hybrid Mamba
-models), Gemma 4 hybrid attention, or, in disaggregated serving, a draft layout
+following applies: context parallelism larger than 1 (helix context parallelism
+is shared only with a drafter that reads a helix-sharded context), a per-layer
+KV-head count on the target or drafter, a specialized KV cache manager that does
+not opt in (for example, most hybrid Mamba models), Gemma 4 hybrid attention, or,
+in disaggregated serving, a draft layout
 that cannot be transferred with the target's. When the layers are shared, the
 worker log reports `target and draft KV layers share one KV cache manager` at
 startup.

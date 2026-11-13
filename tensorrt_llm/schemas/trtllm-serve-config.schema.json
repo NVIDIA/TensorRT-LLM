@@ -77,6 +77,12 @@
           "title": "Enable Kv Cache Aware Routing",
           "type": "boolean"
         },
+        "enable_packed_sync": {
+          "default": false,
+          "description": "Pack the per-iteration attention-DP host collectives of the disaggregated executor loops (error and KV-timeout votes, rank state, can-queue and the CUDA-graph padding vector) into two fixed-width all-gathers. Inactive, with an info log naming the reason, in modes the packing does not cover (for example PP or CP, speculative decoding, KV connectors, an aggregated executor). Every rank must see the same value.",
+          "title": "Enable Packed Sync",
+          "type": "boolean"
+        },
         "kv_cache_routing_account_for_in_transfer": {
           "default": false,
           "description": "In-transfer load accounting in KV cache-aware routing. When True, requests still streaming KV to the GEN worker (tracked by the PyExecutor AsyncTransferManager but no longer in active_requests) are folded back into the per-rank load reported via RankState. This can improve balance under heavy disagg traffic but inflates num_active_requests reported upstream, which lets the inference loop's idle-fetch wait expire even when no requests are runnable and causes empty fetch cycles. Default False preserves the prior behaviour (fetch blocks when truly idle). Only used when enable_kv_cache_aware_routing is True.",
@@ -7308,6 +7314,48 @@
         {
           "additionalProperties": false,
           "properties": {
+            "ca_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the CA certificate used to verify etcd. Enables TLS for an `etcd://` cluster_uri.",
+              "title": "Ca Cert"
+            },
+            "cert_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client certificate. Requires `cert_key` and `ca_cert`.",
+              "title": "Cert Cert"
+            },
+            "cert_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client key. Requires `cert_cert` and `ca_cert`.",
+              "title": "Cert Key"
+            },
             "cluster_name": {
               "default": "",
               "title": "Cluster Name",
@@ -7337,6 +7385,48 @@
                 }
               ],
               "default": null
+            },
+            "password": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Password for an `etcd://` cluster_uri. Requires `user` and `ca_cert`.",
+              "title": "Password"
+            },
+            "record_auth_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Shared secret used to sign and verify the records in an `etcd://` cluster storage. When set, records without a valid signature are ignored by readers. Set the same value on the disaggregated server and on every worker.",
+              "title": "Record Auth Key"
+            },
+            "user": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "User name for an `etcd://` cluster_uri. Requires `password` and `ca_cert`.",
+              "title": "User"
             }
           },
           "required": [
@@ -7545,7 +7635,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
+      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input, and encoder requests beyond it wait for later iterations. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
       "status": "prototype",
       "title": "Encoder Max Batch Size"
     },
@@ -7559,7 +7649,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
+      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits the total encoder tokens of the requests encoded in one iteration: encoder requests beyond it wait for later iterations, and a request whose encoder tokens alone exceed it is rejected. It also limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
       "status": "prototype",
       "title": "Encoder Max Num Tokens"
     },

@@ -45,6 +45,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
 )
@@ -63,6 +65,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -93,7 +96,7 @@ from .common import (
 )
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
@@ -108,6 +111,39 @@ GB = 1 << 30
 # allocated after the pools, outside the GPU cache quota.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
+
+
+def _insert_draft_pool_ratio(
+    target_ratio: Sequence[float],
+    life_cycle_block_bytes: Sequence[int],
+    full_history: Sequence[bool],
+    draft_life_cycle: int,
+) -> list[float]:
+    """Pool ratio per lifecycle with the drafter's share inserted.
+
+    ``target_ratio`` lists the other lifecycles' shares in registration order.
+    The drafter keeps one context entry per target token, so its share is
+    solved for as many blocks as the scarcest full-history target lifecycle
+    holds: ``d / B_draft == (1 - d) * min_i(r_i / B_i)``. The target shares
+    keep their split of ``1 - d``.
+    """
+    target_ids = [i for i in range(len(life_cycle_block_bytes)) if i != draft_life_cycle]
+    if len(target_ratio) != len(target_ids):
+        raise ValueError(
+            f"pool_ratio has {len(target_ratio)} entries for {len(target_ids)} target layer groups"
+        )
+    blocks_per_byte = [
+        ratio / life_cycle_block_bytes[i]
+        for ratio, i in zip(target_ratio, target_ids)
+        if full_history[i]
+    ]
+    if not blocks_per_byte:
+        raise ValueError("the drafter's pool share needs a full-history target layer group")
+    draft_blocks = life_cycle_block_bytes[draft_life_cycle] * min(blocks_per_byte)
+    draft_share = draft_blocks / (1 + draft_blocks)
+    ratio = [share * (1 - draft_share) for share in target_ratio]
+    ratio.insert(draft_life_cycle, draft_share)
+    return ratio
 
 
 class InforwardSnapshotEntry(NamedTuple):
@@ -160,6 +196,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Recurrent snapshots use their own commit/history endpoints without draft backoff.
     _supports_reuse_match_backoff = False
 
+    @classmethod
+    @override
+    def accepts_appended_draft_layers(cls) -> bool:
+        """Hybrid managers lay out their own target layers; subclasses
+        validated with a standalone drafter override this to append its layers."""
+        return False
+
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
@@ -207,7 +250,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         **kwargs,
     ) -> None:
-        """See the class docstring."""
+        """See the class docstring.
+
+        Args:
+            layer_specs: Draft-owned attention layers a standalone drafter
+                keeps in this manager, appended after the target layers that
+                the mask arguments describe (see ``_append_draft_layers``).
+        """
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(f"Unsupported convolution state layout: {conv_state_layout!r}")
         if "model_type" in kwargs:
@@ -219,6 +268,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"(got {kwargs['model_type']!r}); pass "
                 "conv_state_layout='x_b_c' or 'q_k_v' instead"
             )
+        draft_layer_specs = tuple(kwargs.pop("layer_specs", None) or ())
+        mamba_layer_mask, layer_mask, num_kv_heads = self._append_draft_layers(
+            draft_layer_specs,
+            mamba_layer_mask,
+            layer_mask,
+            num_kv_heads,
+            k_only=kv_cache_type == CacheTypeCpp.SELFKONLY,
+        )
+        num_layers += len(draft_layer_specs)
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers
@@ -270,6 +328,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layer_idx for layer_idx in self.pp_layers if mamba_layer_mask[layer_idx]
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        local_ids = {layer_idx: offset for offset, layer_idx in enumerate(self.pp_layers)}
+        self._appended_draft_layer_specs = {
+            local_ids[layer.global_layer_id]: layer
+            for layer in draft_layer_specs
+            if layer.global_layer_id in local_ids
+        }
 
         if self.local_num_mamba_layers > 0:
             tp_size = _mamba_effective_tp_size(mapping)
@@ -404,6 +468,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._setup_state_pool()
 
+    @staticmethod
+    def _append_draft_layers(
+        draft_layer_specs: Sequence[KVCacheLayerSpec],
+        mamba_layer_mask: list[bool],
+        layer_mask: list[bool] | None,
+        num_kv_heads: int | list[int | None],
+        *,
+        k_only: bool,
+    ) -> tuple[list[bool], list[bool] | None, int | list[int | None]]:
+        """Masks and KV heads with a standalone drafter's layers appended.
+
+        The masks describe this manager's recurrent and target attention
+        layers; the drafter's layers follow them in global layer id order and
+        keep the storage of their specs.
+        """
+        if not draft_layer_specs:
+            return mamba_layer_mask, layer_mask, num_kv_heads
+        num_target_layers = len(mamba_layer_mask)
+        expected_ids = list(range(num_target_layers, num_target_layers + len(draft_layer_specs)))
+        if [layer.global_layer_id for layer in draft_layer_specs] != expected_ids:
+            raise ValueError(
+                "MambaHybridCacheManagerV2 layer_specs must be the drafter's layers "
+                f"{expected_ids} after the target layers"
+            )
+        for layer in draft_layer_specs:
+            if layer.owner is not KVCacheLayerOwner.DRAFT:
+                raise ValueError(
+                    "MambaHybridCacheManagerV2 describes its target layers itself; "
+                    f"layer_specs may add only draft-owned layers (layer {layer.global_layer_id})"
+                )
+            if layer.kv_factor != (1 if k_only else 2):
+                raise ValueError(
+                    f"draft layer {layer.global_layer_id} has kv_factor {layer.kv_factor}, "
+                    "unlike the target cache type"
+                )
+        if layer_mask is None:
+            layer_mask = [False] * num_target_layers
+        if isinstance(num_kv_heads, int):
+            num_kv_heads = [num_kv_heads] * num_target_layers
+        num_draft = len(draft_layer_specs)
+        return (
+            list(mamba_layer_mask) + [False] * num_draft,
+            list(layer_mask) + [True] * num_draft,
+            # Placeholders: the base manager takes the rank-local heads from the specs.
+            list(num_kv_heads) + [layer.num_kv_heads for layer in draft_layer_specs],
+        )
+
     @override
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # A transferred recurrent state summarizes and overwrites the whole prefix.
@@ -435,6 +546,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         **kwargs,
     ):
         spec_config = kwargs.get("spec_config")
+        # Appended draft layers grow with every token like the target's pages.
+        draft_layer_specs = kwargs.pop("layer_specs", None) or ()
+        kwargs.pop("shared_draft_block_width", None)
+        draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
         num_reserved_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size
         ) + int(mapping.enable_attention_dp)
@@ -503,7 +618,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             kv_cache_config=kv_cache_config,
             **kwargs,
         )
-        return slope, intercept + attention_intercept + fixed_region_bytes
+        return slope + draft_slope, intercept + attention_intercept + fixed_region_bytes
+
+    @classmethod
+    @override
+    def _get_per_request_layer_tokens(cls, *args, layer_specs=None, **kwargs):
+        # ``layer_specs`` holds only the appended draft layers here; the
+        # recurrent and target layers keep the base estimate (None for hybrids).
+        return super()._get_per_request_layer_tokens(*args, layer_specs=None, **kwargs)
 
     @classmethod
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
@@ -921,7 +1043,61 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # Adds the FP4 MLA HP-ring virtual layers and the fallback-layer
             # lifecycle; SSM layers are left unchanged.
             result = layout_policy._build_cache_config(self, result)
-        return result
+        return self._with_draft_pool_ratio(result)
+
+    def _with_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Give appended draft layers of their own lifecycle a pool share.
+
+        A configured ``pool_ratio`` lists the target's lifecycles; the draft
+        lifecycle's share is inserted for token parity (see
+        ``_insert_draft_pool_ratio``). Native lifecycles are registered in
+        layer and buffer order.
+        """
+        ratio = config.initial_pool_ratio
+        if ratio is None or not self._appended_draft_layer_specs:
+            return config
+        keys: List[tuple] = []
+        block_bytes: List[int] = []
+        draft_keys = set()
+        target_keys = set()
+        for layer in config.layers:
+            # Empty buffers are dropped before the native manager sees them.
+            for buffer in (buffer for buffer in layer.buffers if buffer.size):
+                policy = (
+                    buffer.reuse_policy if buffer.reuse_policy is not None else layer.reuse_policy
+                )
+                if isinstance(layer, SsmLayerConfig):
+                    key = ("ssm", policy)
+                else:
+                    life_cycle = AttnLifeCycle.make(
+                        layer.sliding_window_size,
+                        layer.num_sink_tokens,
+                        config.tokens_per_block,
+                        policy,
+                    )
+                    key = (life_cycle.window_size, life_cycle.num_sink_blocks, policy)
+                if key not in keys:
+                    keys.append(key)
+                    block_bytes.append(0)
+                block_bytes[keys.index(key)] += buffer.size
+                is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
+                (draft_keys if is_draft else target_keys).add(key)
+        if len(ratio) == len(keys):
+            return config
+        if len(draft_keys) != 1 or draft_keys & target_keys or len(ratio) != len(keys) - 1:
+            raise ValueError(
+                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
+                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)})"
+            )
+        full_history = [
+            key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
+        ]
+        return replace(
+            config,
+            initial_pool_ratio=_insert_draft_pool_ratio(
+                ratio, block_bytes, full_history, keys.index(draft_keys.pop())
+            ),
+        )
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""

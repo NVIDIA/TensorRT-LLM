@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fla.flashinfer_chunk import invalidate_int32_cu_seqlens_cache
 from tensorrt_llm._torch.modules.mamba import gdn_mixer
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
@@ -60,6 +61,9 @@ class _Step:
         self.manager = SimpleNamespace(
             mamba_layer_cache=lambda layer_idx: SimpleNamespace(conv=self.conv, temporal=self.ssm),
             inforward_snapshot_stage_views=lambda layer_idx: (self.stage_ssm, self.stage_conv),
+            # The all-layer pool views the hybrid cache managers expose (one local layer here).
+            all_ssm_states=self.ssm.unsqueeze(0),
+            all_conv_states=self.conv.unsqueeze(0),
             conv_state_shape=[QKV_DIM, D_CONV - 1],
             inforward_snapshot_rows=STAGE_ROWS,
             inforward_snapshot_max_tail=4,
@@ -93,6 +97,11 @@ class _Step:
         mamba.query_start_loc_long = mamba._cu_seqlens_long[: n + 1]
         mamba.state_indices[:n].copy_(torch.tensor([slot for slot, _, _, _ in requests]))
         mamba.has_initial_states[:n].copy_(torch.tensor([init for _, _, init, _ in requests]))
+        # What Mamba2Metadata.prepare resets for every iteration.
+        invalidate_int32_cu_seqlens_cache()
+        mamba.prefill_needs_state_reset = True
+        mamba.state_reset_done = False
+        mamba.gdn_iteration_context = None
         mamba.inforward_split = None
         plan = {
             rid: InforwardSnapshotEntry(row, length - after, length - after, after)
@@ -218,6 +227,26 @@ def test_prefill_graph_matches_eager(harness, warm, cases):
         harness.check(requests, seed, initial)
     # Each case replayed the warmup's graph.
     assert harness.graph.num_break_graphs == 1
+
+
+def test_prefill_graph_never_writes_into_the_shared_scratch(harness):
+    initial = _initial(harness.step)
+    harness.step.load(initial)
+    harness.run(_FRESH, seed=1, capture=True)
+    # The shared scratch grows on demand and frees the buffer it replaces, so a graph
+    # captured against it would replay into memory that then belongs to something else.
+    device, bf16 = torch.device("cuda", torch.cuda.current_device()), torch.bfloat16
+    scratch = gdn_mixer._gdn_prefill_scratch
+    live = [
+        scratch.conv_out(QKV_DIM, NUM_TOKENS, bf16, device),
+        *scratch.post_conv(NUM_TOKENS, 4, 128, 8, 128, bf16, device),
+    ]
+    for view in live:
+        view.fill_(7.0)
+    harness.step.load(initial)
+    harness.run([(6, 37, False, 0)], seed=2)  # the graph alone: no eager run to refill them
+    assert harness.graph.num_break_graphs == 1
+    assert all(bool((view == 7.0).all()) for view in live)
 
 
 def test_prefill_graph_does_not_replay_against_moved_metadata(harness):

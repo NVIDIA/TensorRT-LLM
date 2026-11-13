@@ -16,7 +16,7 @@
 import contextlib
 import itertools
 import math
-from typing import NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -24,9 +24,14 @@ import triton.language as tl
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.modules.fla.flashinfer_chunk import \
+    invalidate_int32_cu_seqlens_cache
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
+
+if TYPE_CHECKING:
+    from .gdn_mixer import GdnIterationContext
 
 
 # num_seqs and N follow the batch; specializing them (on == 1 or % 16) would
@@ -302,6 +307,12 @@ class Mamba2Metadata:
                                               dtype=torch.bool,
                                               device="cuda")
         self.use_initial_states = False
+        # Host gate for the GDN state reset (see gdn_mixer._reset_prefill_states):
+        # True when a context request of this iteration starts without a
+        # recurrent state; state_reset_done flips once the first GDN layer has
+        # cleared those slots for every layer.
+        self.prefill_needs_state_reset = True
+        self.state_reset_done = False
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
@@ -313,10 +324,21 @@ class Mamba2Metadata:
                                          device="cuda")
         self._state_indices_buffer = DeviceCopyBuffer(
             self.state_indices, pin_memory=prefer_pinned())
+        # The decode requests' slots of a mixed iteration in their own buffer:
+        # the FlashInfer decode kernel wants an aligned base pointer, which the
+        # tail slice ``state_indices[num_contexts:]`` only has when the number
+        # of context requests is a multiple of 4 (see _mixed_decode_recurrent).
+        self.state_indices_decode = torch.zeros(max_batch_size,
+                                                dtype=torch.int32,
+                                                device="cuda")
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
+        # Per-iteration GdnIterationContext (Qwen3NextGatedDeltaNet.forward_core):
+        # the first GDN layer of an iteration builds it once and the other
+        # layers reuse it. Cleared by prepare() and prepare_steady_gen_step().
+        self.gdn_iteration_context: Optional["GdnIterationContext"] = None
 
         # Pre-allocated buffers.
         self._arange_buffer = torch.arange(max_batch_size + 1,
@@ -334,6 +356,29 @@ class Mamba2Metadata:
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
+
+    def arange_long(self, n: int) -> torch.Tensor:
+        """``[0, 1, ..., n]`` as int64 on the device: the cu_seqlens of ``n`` one-token sequences."""
+        return self._arange_buffer_long[:n + 1]
+
+    def prepare_steady_gen_step(self, attn_metadata: AttentionMetadata):
+        """``prepare()`` for a decode-only batch whose request layout (ids,
+        order, state slots, padding rows) is unchanged since the last
+        ``prepare()``: the state indices and the dummy-request mask are still
+        in place, so their host walk and H2D copies are skipped; only the
+        per-step bookkeeping is refreshed."""
+        self.prefill_needs_state_reset = False
+        self.state_reset_done = False
+        self.gdn_iteration_context = None
+        batch_size = attn_metadata.seq_lens.shape[0]
+        kv_cache_manager = attn_metadata.kv_cache_manager
+
+        self.query_start_loc = None
+        self.query_start_loc_long = self._arange_buffer_long[:batch_size + 1]
+
+        flush = getattr(kv_cache_manager, "flush_state_transfers", None)
+        if flush is not None:
+            flush()
 
     def _prepare_inforward_split(self, attn_metadata: AttentionMetadata,
                                  kv_cache_manager, plan, num_contexts: int,
@@ -443,6 +488,14 @@ class Mamba2Metadata:
         return plan
 
     def prepare(self, attn_metadata: AttentionMetadata):
+        # The cu_seqlens buffers below are rewritten in place: drop the GDN
+        # launch path's per-iteration int32 casts of them first.
+        invalidate_int32_cu_seqlens_cache()
+        # Every iteration starts with the reset undone; the context branch below
+        # decides whether any request needs it at all.
+        self.prefill_needs_state_reset = False
+        self.state_reset_done = False
+        self.gdn_iteration_context = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
@@ -504,6 +557,11 @@ class Mamba2Metadata:
                 self._state_indices_buffer.update(
                     self.state_indices_cpu[:batch_size])
 
+        num_decodes = batch_size - num_contexts
+        if num_contexts > 0 and num_decodes > 0:
+            self.state_indices_decode[:num_decodes].copy_(
+                self.state_indices[num_contexts:batch_size], non_blocking=True)
+
         if num_contexts > 0:
             torch.cumsum(context_lens,
                          dim=0,
@@ -555,6 +613,13 @@ class Mamba2Metadata:
             # Keep a host boolean gate for chunk metadata construction.
             self.use_initial_states = bool(
                 self.has_initial_states_cpu[:num_contexts].any())
+            # Only context requests without a state need their slots zeroed;
+            # continuation chunks (the common case under prefix reuse) skip the
+            # reset launches in every GDN layer. Warmup forces the flag on so the
+            # reset kernel is compiled before the first real iteration.
+            self.prefill_needs_state_reset = bool(
+                Mamba2Metadata._warmup_force_initial_states
+                or not self.has_initial_states_cpu[:num_contexts].all())
 
             if self.use_initial_states:
                 _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,

@@ -471,6 +471,7 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
     def test_moe_alltoall_prepare(self, ep_rank: int, ep_size: int,
                                   expert_count: int, slot_count: int,
                                   top_k: int, max_token_count_per_rank: int):
+        gathered_expert_statics = None
         torch.cuda.set_device(0)
 
         cpu_expert_ids_all_ranks_lists = []

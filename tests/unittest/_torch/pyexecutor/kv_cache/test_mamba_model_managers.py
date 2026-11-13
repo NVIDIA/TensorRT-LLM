@@ -1281,8 +1281,10 @@ def test_kda_acceptance_reset_relocation_and_transfer():
         destination_state_indices=torch.tensor([1, 2]),
         is_dummy_request=torch.tensor([False, True]),
     )
-    state.update(batch)
-    assert state.prev_num_accepted_tokens.tolist() == [1, 2, 2, 4, 5]
+    # The acceptance record is a CUDA kernel; CPU bookkeeping is refused unchanged.
+    with pytest.raises(ValueError, match="unsupported tensor layout"):
+        state.update(batch)
+    assert state.prev_num_accepted_tokens.tolist() == [1, 1, 2, 4, 5]
     state.reset_slots(torch.tensor([1]), [1])
     assert state.prev_num_accepted_tokens[1] == 0
     for conv in manager.all_conv_states:
@@ -1951,12 +1953,27 @@ def test_k3_resolves_transfer_requests_before_calling_algorithm():
     replay.seed_transferred_slots.assert_not_called()
 
 
-@pytest.mark.parametrize("draft_lengths", [[], [0, 0], [1, 0], [1, 1]])
+@pytest.mark.parametrize(
+    "draft_lengths",
+    [
+        [],
+        [0, 0],
+        [1, 0],
+        pytest.param(
+            [1, 1],
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="the acceptance record needs CUDA"
+            ),
+        ),
+    ],
+)
 def test_k3_host_acceptance_handles_empty_mixed_and_completed_requests(draft_lengths):
     manager = object.__new__(KimiK3HybridCacheManager)
     manager.local_num_mamba_layers = 1
     replay = KDAReplayState(2)
-    replay.prev_num_accepted_tokens = torch.tensor([5, 6], dtype=torch.int32)
+    replay.prev_num_accepted_tokens = torch.tensor(
+        [5, 6], dtype=torch.int32, device="cuda" if torch.cuda.is_available() else "cpu"
+    )
     manager._kda_replay = replay
     manager._request_id_to_state_index = {101: 0}
     manager._request_id_to_is_dummy = {}

@@ -851,6 +851,7 @@ def stress_test(config,
 
             # Run baseline accuracy test first if enabled
             baseline_accuracy_success = True
+            baseline_accuracy_value = None
             if stress_config and stress_config.enable_accuracy_test:
                 baseline_accuracy_success, baseline_accuracy_value = run_accuracy_test(
                     model_path, test_server_config, stress_config, "baseline")
