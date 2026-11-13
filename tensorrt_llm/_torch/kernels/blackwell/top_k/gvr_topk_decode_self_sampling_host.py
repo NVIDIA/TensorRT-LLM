@@ -2097,6 +2097,33 @@ def _code_radix_cluster_plan_fp16(k: int, n_kernel: int, num_rows: int, num_sms:
     return None
 
 
+def _row_window_16bit(blk: int, vpt: int, clus: int = 1) -> int:
+    """Scores of a row a 16-bit register plan classifies: ``clus * blk * vpt`` four-score vectors
+    and a scalar tail of at most ``blk`` scores (threads ``tid < tail`` of the last CTA)."""
+    return 4 * clus * blk * vpt + blk
+
+
+def _fit_row_window_16bit(
+    blk: int, vpt: int, minb: int, n: int, clus: int = 1
+) -> tuple[int, int, int]:
+    """``(blk, vpt, minb)`` whose row window holds ``n`` scores; unchanged when it already does.
+
+    Plans with several CTAs per SM (``minb`` > 1) keep BLK and take the smallest covering VPT up
+    to 8. Others double BLK and halve VPT and MINB (same vector batch, more warps per CTA) while
+    VPT is even and BLK < 1024, then take the smallest covering VPT.
+    """
+    if _row_window_16bit(blk, vpt, clus) >= n:
+        return blk, vpt, minb
+    covering_vpt = -(-(n - blk) // (4 * clus * blk))
+    if minb > 1 and covering_vpt <= 8:
+        return blk, covering_vpt, minb
+    while _row_window_16bit(blk, vpt, clus) < n and blk < 1024 and vpt % 2 == 0:
+        blk, vpt, minb = 2 * blk, vpt // 2, max(minb // 2, 1)
+    if _row_window_16bit(blk, vpt, clus) < n:
+        vpt = -(-(n - blk) // (4 * clus * blk))
+    return blk, vpt, minb
+
+
 def _varlen_launcher(
     num_rows: int,
     npad: int,
@@ -2242,6 +2269,7 @@ def _varlen_launcher(
     )
     if crc is not None:
         crc_blk, crc_vpt, crc_cs, crc_list = crc
+        crc_blk, crc_vpt, _ = _fit_row_window_16bit(crc_blk, crc_vpt, 1, n_kernel, crc_cs)
         fn = dev.get_compiled__reg(
             (crc_blk, crc_vpt, 1, 1, True, False, False, 1024),
             varlen=True,
@@ -2659,6 +2687,12 @@ def _varlen_launcher(
         ):
             plan_free["tpl"] = (256, 4 if n_kernel <= 4200 else 8, 4, 1, True, True, False, 1024)
             plan_free["block"] = 256
+        if low:
+            # the BLK-halving remaps above can leave more than BLK scores past the vector batch
+            fit = _fit_row_window_16bit(*plan_free["tpl"][:3], n_kernel)
+            if fit != tuple(plan_free["tpl"][:3]):
+                plan_free["tpl"] = fit + tuple(plan_free["tpl"][3:])
+                plan_free["block"] = fit[0]
         stage_output = False
         reg_parts = 1
         tpl_r = tuple(plan_free["tpl"])

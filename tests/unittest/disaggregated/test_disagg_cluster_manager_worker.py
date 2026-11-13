@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import secrets
 import subprocess
 import tempfile
 import time
@@ -25,16 +26,17 @@ pytestmark = pytest.mark.cpu_only
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 
-storage_types = ["http", "etcd"]
+storage_types = ["http", "etcd", "etcd-signed"]
 
 
-def worker_config(cluster_uri="http://localhost:18000"):
+def worker_config(cluster_uri="http://localhost:18000", record_auth_key=None):
     return DisaggClusterConfig(cluster_uri=cluster_uri,
                                cluster_name="test",
                                minimal_instances=MinimalInstances(
                                    context_servers=1, generation_servers=1),
                                inactive_timeout_sec=INACTIVE_TIMEOUT,
-                               heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+                               heartbeat_interval_sec=HEARTBEAT_INTERVAL,
+                               record_auth_key=record_auth_key)
 
 
 @pytest.mark.asyncio
@@ -146,7 +148,7 @@ async def test_refresh_timeout_past_grace_returns_without_retry():
 def get_uri(storage_type):
     if storage_type == "http":
         return f"http://localhost:18000"
-    elif storage_type == "etcd":
+    elif storage_type in ("etcd", "etcd-signed"):
         return f"etcd://localhost:2379"
     else:
         raise ValueError(f"Invalid storage type: {storage_type}")
@@ -154,7 +156,9 @@ def get_uri(storage_type):
 
 @pytest.fixture(scope="module")
 def config(request):
-    return worker_config(get_uri(request.param))
+    record_auth_key = (secrets.token_hex(16)
+                       if request.param == "etcd-signed" else None)
+    return worker_config(get_uri(request.param), record_auth_key)
 
 
 @pytest.fixture(scope="module")
@@ -170,7 +174,8 @@ def storage_server(config):
                 ["etcd", "--data-dir", temp_dir, "--log-level", "debug"])
             time.sleep(2)  # wait for etcd to start
             yield create_cluster_storage(
-                config.cluster_uri, config.cluster_name), config.cluster_uri
+                config.cluster_uri, config.cluster_name,
+                **config.cluster_storage_options()), config.cluster_uri
         etcd.kill()
         etcd.wait()
     else:
@@ -178,9 +183,10 @@ def storage_server(config):
 
 
 @pytest_asyncio.fixture(scope="function")
-async def storage_client(storage_server):
+async def storage_client(config, storage_server):
     _, cluster_uri = storage_server
-    return create_cluster_storage_client(cluster_uri, "test")
+    return create_cluster_storage_client(cluster_uri, "test",
+                                         **config.cluster_storage_options())
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -202,7 +208,8 @@ async def test_init_workers_first(config, storage_server):
         # init workers before initializing the manager, so the manager should be able to
         # get the pre-registered workers
         server, storage_uri = storage_server
-        storage_client = create_cluster_storage_client(storage_uri, "test")
+        storage_client = create_cluster_storage_client(
+            storage_uri, "test", **config.cluster_storage_options())
         ctx_worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
                                          config, storage_client)
         gen_worker = DisaggClusterWorker(ServerRole.GENERATION, "127.0.0.1",
@@ -380,3 +387,30 @@ async def test_cluster_worker_heartbeat(cluster_manager, storage_client,
     finally:
         await ctx_worker.deregister_worker()
         await gen_worker.deregister_worker()
+
+
+@pytest.mark.parametrize("config", ["etcd-signed"], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(20)
+@pytest.mark.asyncio(scope="module")
+async def test_signed_cluster_ignores_workers_without_the_key(
+        cluster_manager, storage_server, storage_client, config):
+    _, cluster_uri = storage_server
+    unsigned_worker = DisaggClusterWorker(
+        ServerRole.CONTEXT, "127.0.0.1", 8003, config,
+        create_cluster_storage_client(cluster_uri, "test"))
+    signed_worker = DisaggClusterWorker(ServerRole.GENERATION, "127.0.0.1",
+                                        8004, config, storage_client)
+    try:
+        await cluster_manager.watch_workers()
+        assert await unsigned_worker.register_worker()
+        await unsigned_worker.deregister_worker()
+        assert await signed_worker.register_worker()
+        # The unsigned worker's registration and removal are not reported.
+        expected = [(signed_worker.worker_info, WatchEventType.SET)]
+        assert await asyncio.wait_for(cluster_manager.get_worker_events(),
+                                      timeout=5) == expected
+        assert cluster_manager.current_ctx_worker_num == 0
+    finally:
+        await unsigned_worker.deregister_worker()
+        await signed_worker.deregister_worker()

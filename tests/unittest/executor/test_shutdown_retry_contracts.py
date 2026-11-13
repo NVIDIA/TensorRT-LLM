@@ -3,9 +3,11 @@
 """CPU-only lifecycle contracts for retryable Ray and RPC shutdown."""
 
 import ast
+import gc
 import sys
 import threading
 import types
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -716,6 +718,96 @@ def test_mpi_worker_without_per_layer_eplb_keeps_best_effort_teardown(monkeypatc
         "background",
     ]
     assert worker.doing_shutdown and worker.engine is None
+
+
+@pytest.mark.parametrize(
+    "per_layer_dynamic, expected_calls",
+    [
+        (False, ["shutdown", "local_cleanup"]),
+        (True, ["shutdown", ("terminal_cleanup", True)]),
+    ],
+    ids=["rank_local", "collective"],
+)
+def test_mpi_worker_teardown_frees_engine_before_empty_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    per_layer_dynamic: bool,
+    expected_calls: list[str | tuple[str, bool]],
+) -> None:
+    """The MPI worker teardown frees the engine before it returns GPU memory.
+
+    A long-lived MPI worker hosts successive LLMs, so GPU memory that the engine
+    still holds when ``empty_cache()`` runs carries into the next LLM.
+    """
+
+    class CyclicEngine:
+        # The self-reference makes the engine collectable only by the garbage
+        # collector, as for an executor whose threads and callbacks point back
+        # at it.
+        shutdown_all_ranks = True
+
+        def __init__(self) -> None:
+            self.cycle = self
+            self.calls: list[str | tuple[str, bool]] = []
+
+        def can_enqueue_requests(self) -> bool:
+            return False
+
+        def shutdown(self) -> None:
+            self.calls.append("shutdown")
+
+        def local_cleanup(self) -> None:
+            self.calls.append("local_cleanup")
+
+        def terminal_cleanup(self, *, local_safe: bool) -> None:
+            self.calls.append(("terminal_cleanup", local_safe))
+
+    engine = CyclicEngine()
+    engine_ref = weakref.ref(engine)
+    engine_calls = engine.calls
+    engine_alive_at_empty_cache = []
+    fake_distributed = types.ModuleType("torch.distributed")
+    fake_distributed.is_initialized = lambda: False
+    fake_torch = types.ModuleType("torch")
+    fake_torch.distributed = fake_distributed
+    fake_torch.cuda = SimpleNamespace(
+        empty_cache=lambda: engine_alive_at_empty_cache.append(engine_ref() is not None)
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", fake_distributed)
+    worker_cls = _extract_class(
+        _ROOT / "tensorrt_llm/executor/worker.py",
+        "GenerationExecutorWorker",
+        {"shutdown", "_shutdown_rank_local"},
+        {
+            "uses_collective_shutdown": _uses_collective_shutdown,
+            "logger_debug": lambda *args, **kwargs: None,
+            "mpi_rank": lambda: 0,
+            "mpi_comm": lambda: SimpleNamespace(allgather=lambda value: [value]),
+            "sys": sys,
+            "_MEGA_MOE_DEEPGEMM_MODULE": "missing_teardown_gc_megamoe",
+            "gc": gc,
+        },
+    )
+    worker = worker_cls()
+    worker.doing_shutdown = False
+    worker.rpc_server = None
+    worker.engine = engine
+    del engine
+    worker.llm_args = _llm_args(per_layer_dynamic=per_layer_dynamic, backend="pytorch")
+    worker._handle_background_error = lambda: None
+
+    # Only the teardown's own collection may free the engine.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        worker.shutdown()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    assert engine_calls == expected_calls
+    assert engine_alive_at_empty_cache == [False]
+    assert worker.engine is None
 
 
 def test_finalizer_does_not_retry_a_failed_collective_shutdown():

@@ -125,6 +125,7 @@ def test_allgather_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
     torch.manual_seed(42)
     dtype = torch.bfloat16
     world_size = 2
+    test_tensor = test_tensor_list = None
     if var_len:
         test_tensor_list = [
             torch.randn((seq_len * (i + 1), hidden_size), dtype=dtype)

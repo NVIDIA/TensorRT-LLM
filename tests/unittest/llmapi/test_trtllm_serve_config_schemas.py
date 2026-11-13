@@ -79,6 +79,21 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             {"disagg_cluster": {"cluster_uri": "etcd://localhost:2379", "cluster_nmae": "bad"}},
             False,
         ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "disagg_cluster": {
+                    "cluster_uri": "etcd://localhost:2379",
+                    "user": "u",
+                    "password": "p",
+                    "ca_cert": "/ca.pem",
+                    "cert_key": "/key.pem",
+                    "cert_cert": "/cert.pem",
+                    "record_auth_key": "secret",
+                }
+            },
+            True,
+        ),
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
@@ -205,6 +220,19 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"num_workers": 2, "server_keep_alive_timeout": 20}, True),
         (generator.DISAGG_SCHEMA, {"checkpoint_io_policy": "native"}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"checkpoint_io_policy": "unknown"}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64 - 1}}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"watermark_config": {"key": 0, "algorithm": "gumbel_dual_key", "context_width": 64}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": -1}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "context_width": 0}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "context_width": 65}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "algorithm": "synthid"}}, False),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": 7}}}, True),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": -1}}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
@@ -332,6 +360,51 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             },
             False,
         ),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"cache_backend": "seacache"}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "cache_config": {
+                    "cache_backend": "seacache",
+                    "threshold": 0.3,
+                    "max_warmup_steps": 4,
+                    "max_continuous_cached_steps": -1,
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "threshold": 0}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "threshold": -0.1}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_continuous_cached_steps": -2}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_warmup_steps": -1}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_consecutive_cached_steps": 2}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "thresh": 0.2}},
+            False,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"cache_backend": "seacach"}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"threshold": 0.3}}, False),
     ],
 )
 def test_config_validation(
@@ -405,6 +478,33 @@ def test_runtime_rejects_untagged_union_values(owner: str, field: str, value: di
     with pytest.raises(ValidationError) as excinfo:
         TypeAdapter(model.model_fields[field].annotation).validate_python(value)
     assert "union_tag_not_found" in {error["type"] for error in excinfo.value.errors()}
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("preemption", "valid"),
+    [
+        ({}, True),
+        ({"tpot_budget": 0.1}, True),
+        ({"target_output_tps": 40}, True),
+        ({"tpot_budget": None, "target_output_tps": 40}, True),
+        ({"tpot_budget": 0.1, "target_output_tps": None}, True),
+        ({"tpot_budget": None, "target_output_tps": None}, True),
+        ({"tpot_budget": 0}, False),
+        ({"tpot_budget": -0.1}, False),
+        ({"tpot_budget": 1}, False),
+        ({"target_output_tps": 0}, False),
+        ({"target_output_tps": -1}, False),
+        ({"tpot_budget": 0.1, "target_output_tps": 40}, False),
+        ({"policy": "wait"}, False),
+    ],
+)
+def test_gen_preemption_fields(
+    schemas: dict[str, dict], filename: str, preemption: dict, valid: bool
+) -> None:
+    config = {"scheduler_config": {"gen_preemption": preemption}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
@@ -706,6 +806,44 @@ def test_llm_model_fields_have_schema(schemas: dict[str, dict]) -> None:
         _assert_model_fields_in_schema(TorchLlmArgs, schema["properties"])
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("config_name", "algorithm"),
+    [("DeepSeekSparseAttentionConfig", "dsa"), ("DeepSeekV4SparseAttentionConfig", "deepseek_v4")],
+)
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_sparse_offload_indexer_default(
+    schemas: dict[str, dict], filename: str, config_name: str, algorithm: str, enabled: bool | None
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import (
+        DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
+    )
+
+    config_cls = {
+        "dsa": DeepSeekSparseAttentionConfig,
+        "deepseek_v4": DeepSeekV4SparseAttentionConfig,
+    }[algorithm]
+    sparse_config: dict[str, str | bool] = {"algorithm": algorithm}
+    if enabled is not None:
+        sparse_config["enable_kv_cache_offload"] = enabled
+    schema = schemas[filename]
+    definition = schema["$defs"][config_name]
+    field = "use_cute_dsl_paged_mqa_logits"
+    assert definition["properties"][field]["default"] is True
+    assert config_cls.model_validate(sparse_config).use_cute_dsl_paged_mqa_logits is True
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"sparse_attention_config": sparse_config})
+    for value in (False, True):
+        explicit = {**sparse_config, field: value}
+        assert validator.is_valid({"sparse_attention_config": explicit})
+        assert config_cls.model_validate(explicit).use_cute_dsl_paged_mqa_logits is value
+    for invalid in (None, "invalid", 2):
+        assert not validator.is_valid(
+            {"sparse_attention_config": {**sparse_config, field: invalid}}
+        )
+
+
 def test_model_field_guard_detects_missing_fields_and_aliases() -> None:
     class Config(BaseModel):
         plain: int
@@ -846,6 +984,26 @@ def test_auth_key_schema_matches_runtime(schemas: dict[str, dict], value: object
         if filename == generator.DISAGG_SCHEMA:
             for section in ("context_servers", "generation_servers"):
                 assert validator.is_valid({section: config}) == valid
+
+
+@pytest.mark.parametrize(
+    "name", ["user", "password", "ca_cert", "cert_key", "cert_cert", "record_auth_key"]
+)
+@pytest.mark.parametrize("value", [None, "example", " ", "", 123, False, ["x"]])
+def test_disagg_cluster_etcd_settings_schema_matches_runtime(
+    schemas: dict[str, dict], name: str, value: object
+) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig
+
+    valid = value is None or isinstance(value, str) and bool(value)
+    if not valid:
+        with pytest.raises(ValueError) as error:
+            DisaggClusterConfig("etcd://localhost:2379", **{name: value})
+        assert str(error.value) == f"disagg_cluster {name} must be a non-empty string"
+
+    config = {"disagg_cluster": {"cluster_uri": "etcd://localhost:2379", name: value}}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        assert Draft202012Validator(schemas[filename]).is_valid(config) == valid
 
 
 def test_disagg_router_default_is_derived(monkeypatch: pytest.MonkeyPatch) -> None:

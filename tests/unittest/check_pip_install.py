@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -84,7 +85,6 @@ def verify_license_files():
     # Parse the output to get the list of files
     output_lines = result.stdout.strip().split('\n')
     try:
-        import json
         found_files = json.loads(output_lines[-1])
     except (json.JSONDecodeError, IndexError):
         print("ERROR: Could not parse license files from output!")

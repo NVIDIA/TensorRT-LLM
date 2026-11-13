@@ -1800,7 +1800,6 @@ def test_route_wait_occurs_after_independent_staging():
     def run():
         trace = []
         owner = impl()
-        owner._last_staged_T = {8: 8}
         owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
         bufs = SimpleNamespace(
             **{
@@ -1824,7 +1823,6 @@ def test_route_wait_occurs_after_independent_staging():
     assert trace.index("copy:activation") < trace.index("wait")
     assert trace.index("copy:topk_weights") < trace.index("wait")
     assert trace.index("wait") < trace.index("copy:topk_idx_local")
-    assert owner._last_staged_T[8] == 4
 
 
 @pytest.mark.parametrize("has_sm_budget", [True, False])

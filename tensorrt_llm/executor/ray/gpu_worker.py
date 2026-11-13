@@ -18,7 +18,7 @@ import os
 from functools import wraps
 from pathlib import Path
 from queue import Queue
-from typing import Any, List, Optional, Type
+from typing import TYPE_CHECKING, Any, List, Optional, Type
 
 import ray
 import torch
@@ -41,6 +41,12 @@ from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_worker_mixin import RpcWorkerMixin
+
+if TYPE_CHECKING:
+    from tensorrt_llm.logger import Logger
+
+# Bound lazily in __init__ because Ray cannot pickle the logger; declared for type checkers.
+logger: "Logger"
 
 __all__ = [
     "RayGPUWorker",
@@ -513,9 +519,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if self.engine is not None:
             self.engine.shutdown()
-            local_cleanup = getattr(self.engine, "local_cleanup", None)
-            if local_cleanup is not None:
-                local_cleanup()
+            if getattr(self.engine, "local_cleanup", None) is not None:
+                self.engine.local_cleanup()
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"

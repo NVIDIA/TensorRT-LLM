@@ -595,6 +595,22 @@
           "title": "Algorithm",
           "type": "string"
         },
+        "mixed_precision_first_n": {
+          "default": 0,
+          "description": "Number of leading tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision First N",
+          "type": "integer"
+        },
+        "mixed_precision_last_n": {
+          "default": 0,
+          "description": "Number of most recent tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages. Rejected when a sliding-window layer keeps the same tokens (its window is this value plus one, with the same sink pages): the high layers would share that layer's page group, which the cold-page codec cannot split.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision Last N",
+          "type": "integer"
+        },
         "nvfp4_residual_dim": {
           "default": 64,
           "description": "64 (default): use two independently scaled FP4 components for the 64 DeepSeek-V4 target cold-page RoPE values: a main component and its residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. Ignored for other models, draft caches, and when skip_rope_quantization preserves the original RoPE precision.",
@@ -1397,6 +1413,13 @@
           "title": "Enable Heuristic Topk",
           "type": "boolean"
         },
+        "enable_kv_cache_offload": {
+          "default": false,
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 the ratio-4 compressed cache. Each decode step fetches the units the indexer selects into a per-request GPU cache; the indexer and sliding-window caches remain on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
+          "status": "prototype",
+          "title": "Enable Kv Cache Offload",
+          "type": "boolean"
+        },
         "gvr_deterministic_topk": {
           "default": false,
           "description": "Make the self-sampling GVR Top-K deterministic: the selected index set is {score > tau} plus the smallest indices among the ties at tau, and the output order is a fixed function of the input (decode and prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect with enable_heuristic_topk=True and use_self_sampling_topk=True; ignored otherwise.",
@@ -1485,6 +1508,11 @@
           "title": "Indexer Rope Interleave",
           "type": "boolean"
         },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
+        },
         "q_split_threshold": {
           "default": 8192,
           "description": "If number of packed tokens in prefill chunk exceeds this threshold,             q tokens will be evenly distributed across ranks for indexer computation.             If negative, q split will always be disabled.",
@@ -1564,7 +1592,7 @@
         },
         "enable_kv_cache_offload": {
           "default": false,
-          "description": "Offload ratio-4 compressed attention KV history to host memory with KV cache manager v2. The indexer and sliding-window caches remain on GPU. This feature is under development and currently cannot be enabled for inference.",
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 the ratio-4 compressed cache. Each decode step fetches the units the indexer selects into a per-request GPU cache; the indexer and sliding-window caches remain on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
           "type": "boolean"
@@ -1656,6 +1684,11 @@
           "description": "Whether to use interleaved RoPE layout for the indexer.",
           "title": "Indexer Rope Interleave",
           "type": "boolean"
+        },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
         },
         "q_split_threshold": {
           "default": 8192,
@@ -2097,6 +2130,48 @@
             {
               "additionalProperties": false,
               "properties": {
+                "ca_cert": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Path to the PEM file of the CA certificate used to verify etcd. Enables TLS for an `etcd://` cluster_uri.",
+                  "title": "Ca Cert"
+                },
+                "cert_cert": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Path to the PEM file of the client certificate. Requires `cert_key` and `ca_cert`.",
+                  "title": "Cert Cert"
+                },
+                "cert_key": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Path to the PEM file of the client key. Requires `cert_cert` and `ca_cert`.",
+                  "title": "Cert Key"
+                },
                 "cluster_name": {
                   "default": "",
                   "title": "Cluster Name",
@@ -2126,6 +2201,48 @@
                     }
                   ],
                   "default": null
+                },
+                "password": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Password for an `etcd://` cluster_uri. Requires `user` and `ca_cert`.",
+                  "title": "Password"
+                },
+                "record_auth_key": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Shared secret used to sign and verify the records in an `etcd://` cluster storage. When set, records without a valid signature are ignored by readers. Set the same value on the disaggregated server and on every worker.",
+                  "title": "Record Auth Key"
+                },
+                "user": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "User name for an `etcd://` cluster_uri. Requires `password` and `ca_cert`.",
+                  "title": "User"
                 }
               },
               "required": [
@@ -2334,7 +2451,7 @@
             }
           ],
           "default": null,
-          "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
+          "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input, and encoder requests beyond it wait for later iterations. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
           "status": "prototype",
           "title": "Encoder Max Batch Size"
         },
@@ -2348,7 +2465,7 @@
             }
           ],
           "default": null,
-          "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
+          "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits the total encoder tokens of the requests encoded in one iteration: encoder requests beyond it wait for later iterations, and a request whose encoder tokens alone exceed it is rejected. It also limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
           "status": "prototype",
           "title": "Encoder Max Num Tokens"
         },
@@ -2741,7 +2858,7 @@
           "title": "Model Kwargs"
         },
         "modeling_v2": {
-          "default": "off",
+          "default": "auto",
           "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
           "enum": [
             "off",
@@ -3537,6 +3654,19 @@
           "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
           "status": "prototype",
           "title": "Video Pruning Rate"
+        },
+        "watermark_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WatermarkConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Enables statistical text watermarking of generated tokens (Gumbel-max). Requests may opt out with SamplingParams.watermarking=False unless allow_request_opt_out is False. Greedy and beam-search requests cannot carry a watermark and are generated normally. The key is a secret and must match at detection time (see tensorrt_llm.watermark).",
+          "status": "prototype"
         }
       },
       "type": "object"
@@ -4686,6 +4816,61 @@
         "dtype"
       ],
       "title": "EncodeExtraInputSpec",
+      "type": "object"
+    },
+    "GenPreemptionConfig": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "tpot_budget": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "target_output_tps": {
+              "type": "null"
+            }
+          }
+        }
+      ],
+      "description": "GEN slot preemption on a disaggregated generation worker.\n\nWhen every slot is taken and the next waiting request is at risk of missing\nits TTFT target, a decode request is paused in place for it. Set at most\none field to bound the TPOT cost (neither: off). Needs the auto GEN\nadmission policy and the KV cache manager V2 scheduler.",
+      "properties": {
+        "target_output_tps": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-request output tokens/s floor kept by about 80% of requests.",
+          "status": "prototype",
+          "title": "Target Output Tps"
+        },
+        "tpot_budget": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1.0,
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Allowed mean-TPOT increase from pauses, as a fraction (0.10 = +10%).",
+          "status": "prototype",
+          "title": "Tpot Budget"
+        }
+      },
+      "title": "GenPreemptionConfig",
       "type": "object"
     },
     "GmsConfig": {
@@ -8083,6 +8268,11 @@
           "title": "Enable Prefix Aware Scheduling",
           "type": "boolean"
         },
+        "gen_preemption": {
+          "$ref": "#/$defs/GenPreemptionConfig",
+          "description": "GEN slot preemption on disaggregated generation workers.",
+          "status": "prototype"
+        },
         "use_python_scheduler": {
           "default": false,
           "description": "Use pure-Python scheduler instead of C++ scheduler.",
@@ -8177,6 +8367,37 @@
         }
       },
       "title": "SleepConfig",
+      "type": "object"
+    },
+    "SparseKvCacheOffloadConfig": {
+      "additionalProperties": false,
+      "description": "Memory sizing for sparse attention KV cache offload.\n\nWith offload, the KV history a sparse attention layer selects from lives in\nhost memory, and each request keeps a GPU cache of the units its selections\nname.",
+      "properties": {
+        "gpu_cache_factor": {
+          "default": 2.0,
+          "description": "Size of each request's GPU cache for offloaded attention history, in selections: the cache holds this many times the units one decode step selects, plus the unit being written, rounded up to whole pages. A larger cache keeps more history on the GPU between decode steps, so fewer units are fetched from host memory, at the cost of GPU memory per request.",
+          "minimum": 1.0,
+          "status": "prototype",
+          "title": "Gpu Cache Factor",
+          "type": "number"
+        },
+        "host_history_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pinned host memory in bytes, per rank, for offloaded attention history and the staging buffers that publish it to the GPU. The KV cache manager holds the history pools within it, beside the GPU KV cache quota, which it does not lower; a size too small for the batches the manager must always hold, such as one max_seq_len request, is rejected. It is separate from kv_cache_config.host_cache_size, the host tier that evicted KV cache pages move to, and the two together must fit this rank's share of available host memory and the pinned-memory limit. When unset, the history pools come first: they may take the host memory automatic sizing may pin, beside the staging buffers and, unless kv_cache_config.host_cache_size or a disk tier is set, room in the host tier for one max_seq_len request. Either way it is an upper bound: the history pools share their slot count with the GPU KV cache pools, so they pin only what the GPU quota's slots pair with. When unset, the automatic host tier takes the host memory they leave, up to the GPU KV cache quota.",
+          "status": "prototype",
+          "title": "Host History Size"
+        }
+      },
+      "title": "SparseKvCacheOffloadConfig",
       "type": "object"
     },
     "TelemetryConfig": {
@@ -8552,6 +8773,89 @@
       ],
       "title": "WaitingQueuePolicy",
       "type": "string"
+    },
+    "WatermarkConfig": {
+      "additionalProperties": false,
+      "description": "Configuration of the statistical text watermark applied while sampling.\n\nThe watermark is keyed: the same ``key`` and sampling settings are needed\nto detect it later. ``key`` is a secret and is excluded from ``repr``.",
+      "properties": {
+        "algorithm": {
+          "default": "gumbel",
+          "description": "Watermarking algorithm. 'gumbel' replaces the random draw of the final token selection with a keyed Gumbel-max draw, which leaves the output distribution unchanged on average over keys. 'gumbel_dual_key' is the same for ordinary decoding and additionally supports speculative decoding with rejection sampling: draft tokens are drawn under the key, and the tokens that replace rejected drafts (or follow the last accepted one) under a second key derived from it, which keeps the output distribution exact.",
+          "enum": [
+            "gumbel",
+            "gumbel_dual_key"
+          ],
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "allow_request_opt_out": {
+          "default": true,
+          "description": "Whether a request may disable watermarking with SamplingParams.watermarking=False. Set to False to enforce the watermark on every request that can carry one.",
+          "title": "Allow Request Opt Out",
+          "type": "boolean"
+        },
+        "allow_target_only_watermarking": {
+          "default": false,
+          "description": "Only relevant to rejection-sampling speculative decoding. Accepted draft tokens are then not watermarked, so the signal weakens in proportion to the acceptance rate.",
+          "title": "Allow Target Only Watermarking",
+          "type": "boolean"
+        },
+        "context_width": {
+          "default": 4,
+          "description": "Number of preceding tokens that seed each sampling decision. Larger values make the mark less robust to edits.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Context Width",
+          "type": "integer"
+        },
+        "deduplicate_contexts": {
+          "default": "single_turn",
+          "description": "How repeated contexts are treated. A repeated context would repeat its token and be counted as independent evidence, so it falls back to ordinary sampling. 'none' disables this; 'single_turn' deduplicates within the tokens this request generates; 'all' also searches the prompt (for instance earlier turns of a conversation) and leaves the first context_width generated tokens unwatermarked, so short answers do not share a random context across requests.",
+          "enum": [
+            "none",
+            "single_turn",
+            "all"
+          ],
+          "title": "Deduplicate Contexts",
+          "type": "string"
+        },
+        "deduplicate_contexts_max_history": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 8192,
+          "description": "How many generated positions back the repeated-context search reaches. None means the whole generation.",
+          "title": "Deduplicate Contexts Max History"
+        },
+        "key": {
+          "description": "Secret key, an integer in [0, 2**64). Detection needs the same value.",
+          "exclusiveMaximum": 18446744073709551616,
+          "minimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Key",
+          "type": "integer"
+        },
+        "prf": {
+          "const": "philox",
+          "default": "philox",
+          "description": "Pseudo-random function that turns (key, context) into per-token random numbers. Fast and parallel, but not a cryptographic PRF: it does not protect against key recovery or forgery.",
+          "title": "Prf",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "title": "WatermarkConfig",
+      "type": "object"
     }
   },
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-disagg-config.schema.json",
@@ -8974,6 +9278,48 @@
         {
           "additionalProperties": false,
           "properties": {
+            "ca_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the CA certificate used to verify etcd. Enables TLS for an `etcd://` cluster_uri.",
+              "title": "Ca Cert"
+            },
+            "cert_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client certificate. Requires `cert_key` and `ca_cert`.",
+              "title": "Cert Cert"
+            },
+            "cert_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client key. Requires `cert_cert` and `ca_cert`.",
+              "title": "Cert Key"
+            },
             "cluster_name": {
               "default": "",
               "title": "Cluster Name",
@@ -9003,6 +9349,48 @@
                 }
               ],
               "default": null
+            },
+            "password": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Password for an `etcd://` cluster_uri. Requires `user` and `ca_cert`.",
+              "title": "Password"
+            },
+            "record_auth_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Shared secret used to sign and verify the records in an `etcd://` cluster storage. When set, records without a valid signature are ignored by readers. Set the same value on the disaggregated server and on every worker.",
+              "title": "Record Auth Key"
+            },
+            "user": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "User name for an `etcd://` cluster_uri. Requires `password` and `ca_cert`.",
+              "title": "User"
             }
           },
           "required": [
@@ -9223,7 +9611,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
+      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input, and encoder requests beyond it wait for later iterations. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
       "status": "prototype",
       "title": "Encoder Max Batch Size"
     },
@@ -9237,7 +9625,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
+      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits the total encoder tokens of the requests encoded in one iteration: encoder requests beyond it wait for later iterations, and a request whose encoder tokens alone exceed it is rejected. It also limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
       "status": "prototype",
       "title": "Encoder Max Num Tokens"
     },
@@ -9660,7 +10048,7 @@
       "title": "Model Kwargs"
     },
     "modeling_v2": {
-      "default": "off",
+      "default": "auto",
       "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
       "enum": [
         "off",
@@ -10482,6 +10870,19 @@
       "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
       "status": "prototype",
       "title": "Video Pruning Rate"
+    },
+    "watermark_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WatermarkConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Enables statistical text watermarking of generated tokens (Gumbel-max). Requests may opt out with SamplingParams.watermarking=False unless allow_request_opt_out is False. Greedy and beam-search requests cannot carry a watermark and are generated normally. The key is a secret and must match at detection time (see tensorrt_llm.watermark).",
+      "status": "prototype"
     }
   },
   "required": [],
