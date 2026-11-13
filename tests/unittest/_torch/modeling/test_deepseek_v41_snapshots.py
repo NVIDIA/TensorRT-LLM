@@ -304,6 +304,7 @@ def test_encoder_snapshot_resumes_without_replay(
             assert manager.prepare_context(fresh)
             assert fresh.py_ced_replay is plan
             assert manager.context_replay_tokens(fresh) == 0
+        output = None
         start = 256
         for i, length in enumerate(chunks):
             final = i == len(chunks) - 1

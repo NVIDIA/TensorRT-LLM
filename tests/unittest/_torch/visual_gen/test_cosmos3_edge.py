@@ -708,6 +708,29 @@ class TestStrictLoading:
             "norm",
         }
 
+    def test_quantizer_buffers_stay_out_of_the_skip_summary(self, monkeypatch):
+        """ModelOpt quantizer buffers are unused and must not be named in the
+        skip summary. An unrecognized key still has to be warned about."""
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 as tf_module
+
+        infos = []
+        warnings = []
+        monkeypatch.setattr(tf_module.logger, "info", infos.append)
+        monkeypatch.setattr(tf_module.logger, "warning", warnings.append)
+        sd = _edge_state_dict(_reduced_edge_config())
+        sd["layers.0.self_attn.to_q.input_quantizer._amax"] = torch.zeros(())
+        sd["not_a_real_module.weight"] = torch.zeros(1)
+        self._model().load_weights(sd)
+
+        skip_logs = [m for m in infos if "intentionally unused" in m]
+        assert len(skip_logs) == 1
+        assert "quantizer" not in skip_logs[0]
+        skipped_families = {name.strip() for name in skip_logs[0].rsplit(": ", 1)[1].split(",")}
+        assert skipped_families == {"lm_head", "norm"}
+        unknown = [m for m in warnings if "Skipping unknown checkpoint key" in m]
+        assert len(unknown) == 1
+        assert "not_a_real_module.weight" in unknown[0]
+
     def test_model_prefixed_skip_keys_are_intentional(self, monkeypatch):
         """Checkpoints that namespace top-level tensors under "model." must
         have their skip keys recognized (prefix normalization runs before the
@@ -868,6 +891,7 @@ class TestEdgeDefaults:
     def test_hf_id_registered(self):
         hf_ids = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"].hf_ids
         assert "nvidia/Cosmos3-Edge" in hf_ids
+        assert "nvidia/Cosmos3-Edge-FP8" in hf_ids
         assert "nvidia/Cosmos3-Edge-Policy-DROID" in hf_ids
 
     def test_policy_manifest_overrides_policy_sampling_only(self):

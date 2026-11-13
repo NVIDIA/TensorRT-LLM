@@ -60,7 +60,6 @@ from _torch.moe.moe_test_utils import (
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
-    skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
 from _torch.moe.quantize_utils import get_test_quant_params
@@ -334,7 +333,6 @@ def _run_autotune_test(
     backend_type,
     quant_algo,
     run_all_tactics=False,
-    use_flashinfer=False,
 ):
     """Run autotune phase and tactic replay test.
 
@@ -352,9 +350,7 @@ def _run_autotune_test(
         _ = run_forward_fn()
 
     # Check if we should run full tactic replay
-    if not run_all_tactics or not supports_autotuner_capture(
-        backend_type, quant_algo, use_flashinfer
-    ):
+    if not run_all_tactics or not supports_autotuner_capture(backend_type, quant_algo):
         # Simple accuracy check for unsupported backends or when run_all_tactics is False
         with torch.inference_mode():
             output = run_forward_fn()
@@ -776,12 +772,6 @@ def _test_moe_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels.
-            # The flag lives on the leaf, which ConfigurableMoE holds as ``backend``.
-            use_flashinfer = getattr(
-                getattr(fused_moe, "backend", fused_moe), "use_flashinfer", False
-            )
-
             # Run tests
             if enable_autotune:
                 _setup_autotuner_for_test(mapping)
@@ -791,7 +781,6 @@ def _test_moe_worker_impl(
                     ref_output,
                     backend_type,
                     quant_algo,
-                    use_flashinfer=use_flashinfer,
                 )
             else:
                 output = run_forward()
@@ -1314,8 +1303,7 @@ def generate_multi_gpu_test_params(
                 # TP modes shard intermediate_size; EP modes don't
                 moe_tp_size = 4 if parallel_mode in ("DTP", "TTP") else 1
                 # Match the canonical predicate used by the worker impl so
-                # backend skip checks (e.g. the W4A8_MXFP4_FP8 + TRTLLM-Gen
-                # gpt-oss SwiGLU kernel-bug skip) fire on multi-GPU runs too.
+                # backend skip checks also apply to multi-GPU runs.
                 swiglu_gptoss_style = (
                     swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
                 )
@@ -1595,7 +1583,6 @@ def test_configurable_moe_single_gpu(
     """
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
-    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -1825,7 +1812,6 @@ def test_configurable_moe_multi_gpu(
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
-    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -2380,8 +2366,6 @@ def test_configurable_moe_multi_gpu_eplb(
     routing_method_cls,
     moe_multi_gpu_executor,
 ):
-    skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
-
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
         model_config.hidden_size,

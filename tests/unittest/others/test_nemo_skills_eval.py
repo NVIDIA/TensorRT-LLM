@@ -189,7 +189,7 @@ def test_arena_judge_score():
 # --- The py3.12 scipy shim keeps its leading newline (needs nemo_skills) ------
 def test_scicode_grader_shim_leading_newline():
     pytest.importorskip("nemo_skills", reason="nemo_skills not installed; shim guard skipped")
-    import nemo_skills.evaluation.evaluator.scicode as sc
+    import nemo_skills.evaluation.evaluator.scicode as sc  # pyrefly: ignore [missing-import]
 
     original = sc.eval_prefix
     original_shim = getattr(sc, "_trtllm_simps_shim", False)

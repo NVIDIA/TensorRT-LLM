@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.conversation_id import SUBAGENT_AFFINITY_HEADER
@@ -216,10 +217,17 @@ def test_worker_rejects_protected_fields_without_cache_transceiver_config():
         server._validate_internal_disagg_request(request, raw_request=None)
 
 
-def _make_affinity_request(role: ServerRole) -> ChatCompletionRequest:
-    return ChatCompletionRequest(
+def _make_affinity_request(
+    role: ServerRole, completion: bool = False
+) -> ChatCompletionRequest | CompletionRequest:
+    body = (
+        {"prompt": [1, 2, 3]}
+        if completion
+        else {"messages": [{"role": "user", "content": "hello"}]}
+    )
+    return (CompletionRequest if completion else ChatCompletionRequest)(
         model="test-model",
-        messages=[{"role": "user", "content": "hello"}],
+        **body,
         conversation_params=ConversationParams(
             conversation_id="child", subagent_affinity_id="parent"
         ),
@@ -230,14 +238,15 @@ def _make_affinity_request(role: ServerRole) -> ChatCompletionRequest:
     )
 
 
+@pytest.mark.parametrize("completion", [False, True], ids=["chat", "completion"])
 @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
 @pytest.mark.parametrize("configured_role", [False, True])
-def test_worker_affinity_survives_wire_roundtrip(role: ServerRole, configured_role: bool) -> None:
-    request = _make_affinity_request(role)
+def test_worker_affinity_survives_wire_roundtrip(
+    role: ServerRole, configured_role: bool, completion: bool
+) -> None:
+    request = _make_affinity_request(role, completion)
     headers = build_subagent_affinity_headers("secret", request, role)
-    wire_request = ChatCompletionRequest.model_validate_json(
-        request.model_dump_json(exclude_unset=True)
-    )
+    wire_request = type(request).model_validate_json(request.model_dump_json(exclude_unset=True))
     assert wire_request.conversation_params.subagent_affinity_id is None
     server = object.__new__(OpenAIServer)
     server.server_role = role if configured_role else None
@@ -247,6 +256,24 @@ def test_worker_affinity_survives_wire_roundtrip(role: ServerRole, configured_ro
 
     assert scheduling.subagent_affinity_id == "parent"
     assert wire_request.conversation_params.conversation_id == "child"
+
+
+def test_completion_handler_passes_affinity_to_generate(tmp_path) -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT, completion=True)
+    headers = build_subagent_affinity_headers("secret", request, ServerRole.CONTEXT)
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(
+            AggConfig(role=ServerRole.CONTEXT, model_name="test-model")
+        )
+        server._internal_disagg_auth_key = "secret"
+        response = env.client(server.app).post(
+            "/v1/completions",
+            content=request.model_dump_json(exclude_unset=True),
+            headers={"content-type": "application/json", **headers},
+        )
+        assert response.status_code == 200, response.text
+        (call,) = server.generator.generate_calls
+        assert call.kwargs["scheduling_params"].subagent_affinity_id == "parent"
 
 
 @pytest.mark.parametrize("key", [None, "secret"])
