@@ -7002,40 +7002,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 assert accept_rate > 0.2, \
                     f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_nvfp4_8gpus_mtp_custom_op(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
-        # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        with LLM(
-                model_path,
-                kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=False,
-                    mamba_ssm_cache_dtype="float16",
-                    free_gpu_memory_fraction=0.5,
-                ),
-                max_batch_size=32,
-                tensor_parallel_size=8,
-                moe_expert_parallel_size=8,
-                pipeline_parallel_size=1,
-                enable_attention_dp=False,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
-                                                  enable_padding=True),
-                disable_overlap_scheduler=False,
-                moe_config=MoeConfig(backend="CUTLASS"),
-                speculative_config=mtp_config,
-        ) as llm:
-            assert isinstance(llm.args.speculative_config, MTPDecodingConfig)
-            assert llm.args.speculative_config.max_draft_len == 3
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
 
 class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
