@@ -190,6 +190,7 @@ def test_llm_beam_search_pp2() -> None:
              cuda_graph_config=None) as llm:
         outputs = llm.generate(prompts, sampling_params=sampling_params)
 
+    assert len(outputs) == len(reference_outputs) == len(prompts)
     for prompt, output, reference in zip(prompts, outputs, reference_outputs):
         beams = output.outputs
         assert [list(beam.token_ids) for beam in beams
