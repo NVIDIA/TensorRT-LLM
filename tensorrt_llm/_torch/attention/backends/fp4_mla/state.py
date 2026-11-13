@@ -173,6 +173,9 @@ class Fp4MlaState:
         metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():
             metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
+        self.generation_max_pages = (
+            self.page_table_stride if num_seqs > metadata.num_contexts else 0
+        )
         self.on_update_kv_lens(metadata)
 
     def restore_from_spec_dec(self, metadata: TrtllmAttentionMetadata) -> None:
@@ -183,6 +186,8 @@ class Fp4MlaState:
         metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():
             metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
+        self.device_page_table_valid = False
+        self.invalidate_generation_lengths()
 
     def populate_append_metadata(self, metadata: TrtllmAttentionMetadata) -> None:
         num_seqs = metadata.num_contexts + metadata.num_generations

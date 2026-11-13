@@ -4,6 +4,7 @@
 """TRTLLM FP4 MLA helper tests."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -63,6 +64,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
@@ -3236,6 +3238,139 @@ def test_fp4_mla_mixed_decode_scratch_uses_generation_lengths(
         torch.testing.assert_close(output.float(), reference, rtol=0.15, atol=0.15)
     finally:
         manager.shutdown()
+
+
+@pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
+@pytest.mark.parametrize("mixed_batch", [False, True], ids=["all-context", "mixed"])
+def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
+    monkeypatch: pytest.MonkeyPatch, mixed_batch: bool
+) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    final_lengths = [4096, 132] if mixed_batch else [132]
+    sequence_lengths = [128, 3] if mixed_batch else [128]
+    cached_lengths = [3967, 128] if mixed_batch else [3]
+    batch_size = len(final_lengths)
+    manager, fixture_metadata, queries, kv_lora_rank, rope_dim = (
+        _build_fp4_mla_attention_decode_case(
+            seq_lens=final_lengths,
+            num_heads=128,
+            seed=29,
+            query_len_per_seq=1,
+        )
+    )
+    try:
+        metadata = trtllm_backend.TrtllmAttentionMetadata(
+            max_num_requests=batch_size,
+            max_num_tokens=sum(sequence_lengths),
+            num_contexts=1,
+            seq_lens=torch.tensor(sequence_lengths, dtype=torch.int32),
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lengths),
+            kv_cache_manager=manager,
+            request_ids=list(range(batch_size)),
+            prompt_lens=[length - 1 for length in final_lengths],
+            runtime_features=trtllm_backend.AttentionRuntimeFeatures(
+                has_speculative_draft_tokens=True
+            ),
+        )
+        worker = Eagle3OneModelWorker(MTPDecodingConfig(max_draft_len=2))
+        spec_metadata = SimpleNamespace(
+            runtime_draft_len=2,
+            batch_indices_cuda=torch.arange(batch_size - 1, dtype=torch.int32, device="cuda"),
+            wants_advanced_draft_sampling=False,
+        )
+
+        def shared_head(hidden: torch.Tensor, *_unused: object) -> torch.Tensor:
+            return torch.zeros((hidden.shape[0], 4), device="cuda")
+
+        draft_model = SimpleNamespace(
+            mtp_layers=[SimpleNamespace(shared_head=shared_head)], lm_head=None
+        )
+
+        def sample_tokens(*_args: object, **_kwargs: object) -> torch.Tensor:
+            return torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+
+        decoded_substep = False
+
+        def draft_forward(
+            _model: object, draft_inputs: dict[str, object], _spec: object, step: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            nonlocal decoded_substep
+            active = cast(trtllm_backend.TrtllmAttentionMetadata, draft_inputs["attn_metadata"])
+            if step == 1:
+                assert active.num_contexts == 0
+                output = torch.empty_like(queries[..., :kv_lora_rank])
+                run_fp4_mla_attention_decode(
+                    active,
+                    layer_idx=0,
+                    local_layer=0,
+                    q=queries,
+                    output=output,
+                    sm_scale=0.1,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=rope_dim,
+                    prequantized_q=fixture_metadata.fp4_mla_state.prequantized_q,
+                    prequantized_q_sf=fixture_metadata.fp4_mla_state.prequantized_q_sf,
+                    q_batch_capacity=fixture_metadata.fp4_mla_state.q_batch_capacity,
+                )
+                required_pages = triton.cdiv(max(final_lengths), FP4_MLA_TOKENS_PER_BLOCK)
+                assert (
+                    active.fp4_mla_state.workspaces["_fp4_mla_attention_page_max_buf"].shape[1]
+                    >= required_pages
+                )
+                reference, _ = _fp4_mla_attention_decode_reference(
+                    active,
+                    queries[..., :kv_lora_rank],
+                    queries[..., kv_lora_rank:],
+                    sm_scale=0.1,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=rope_dim,
+                )
+                torch.testing.assert_close(output.float(), reference, rtol=0.15, atol=0.15)
+                decoded_substep = True
+            hidden = torch.zeros((active.num_tokens, 8), device="cuda")
+            return hidden, hidden
+
+        monkeypatch.setattr(worker, "_run_draft_forward", draft_forward)
+        monkeypatch.setattr(worker, "sample_draft_tokens", sample_tokens)
+        for _draft_round in range(2):
+            metadata.num_contexts = 1
+            metadata.prepare()
+            assert metadata.fp4_mla_state.generation_max_pages == (2 if mixed_batch else 0)
+            if mixed_batch:
+                assert (
+                    metadata.fp4_mla_state.generation_max_pages
+                    < metadata.fp4_mla_state.page_table_stride
+                )
+            decoded_substep = False
+            worker._prepare_attn_metadata_for_spec_dec(metadata)
+            try:
+                worker._forward_linear_draft_loop(
+                    {
+                        "position_ids": torch.arange(sum(sequence_lengths), device="cuda"),
+                        "attn_metadata": metadata,
+                    },
+                    metadata,
+                    spec_metadata,
+                    draft_model,
+                    draft_kv_cache_manager=None,
+                    num_contexts=1,
+                    batch_size=batch_size,
+                    num_accepted_tokens=torch.tensor(
+                        [1, 3] if mixed_batch else [1], dtype=torch.int32, device="cuda"
+                    ),
+                    original_all_rank_num_tokens=None,
+                )
+            finally:
+                worker._restore_attn_metadata_from_spec_dec(metadata)
+            assert decoded_substep
+            assert not metadata.fp4_mla_state.device_page_table_valid
+            assert metadata.fp4_mla_state.generation_lengths_num_tokens == -1
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
