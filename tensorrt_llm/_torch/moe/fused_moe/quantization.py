@@ -987,9 +987,11 @@ class UnquantizedMegaMoECuteDslMethod(UnquantizedFusedMoEMethod):
     after the expert is copied in, on the routed weights and the EPLB host
     staging alike, so both hold the kernel layout and dynamic EPLB migrates
     kernel-ready rows. That needs both halves of an expert in one call, hence
-    full loading only. Relu2 has one FC1 row per feature (w1 alone; w3 is
-    empty), which the kernel reads as loaded; it keeps full loading too, so
-    the leaf has one loading contract.
+    full loading only for a gated activation. Relu2 has one FC1 row per
+    feature (w1 alone; w3 is empty), which the kernel reads as loaded, so a
+    partial load (an RL weight sync streams experts in buckets) overwrites
+    exactly the rows it carries; with no derived buffers, that is a complete
+    hot reload (``TrtllmCutedslMegaMoeBf16Impl._hot_reload_refusal``).
     """
 
     # Rows per gate block and per up block of the gated FC1 epilogue.
@@ -1020,12 +1022,15 @@ class UnquantizedMegaMoECuteDslMethod(UnquantizedFusedMoEMethod):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
-        if allow_partial_loading:
+        if allow_partial_loading and module.is_gated_activation:
             raise NotImplementedError(
-                "MegaMoE-CuteDSL only supports full initial weight loading: "
-                "a gated activation's FC1 gate/up interleave needs both halves "
-                "of an expert in one load, and Relu2 keeps the same contract.")
-        super().load_weights(module, weights, weight_loading_mode)
+                "MegaMoE-CuteDSL loads a gated activation's experts whole: the "
+                "FC1 gate/up interleave needs both halves of an expert in one "
+                "load.")
+        super().load_weights(module,
+                             weights,
+                             weight_loading_mode,
+                             allow_partial_loading=allow_partial_loading)
 
     def load_expert_w3_w1_weight(self,
                                  module: torch.nn.Module,

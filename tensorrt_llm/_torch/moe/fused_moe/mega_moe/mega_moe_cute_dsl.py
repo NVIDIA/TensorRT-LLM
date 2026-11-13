@@ -1152,12 +1152,27 @@ class MegaMoECuteDslBase(MoEImplBase):
         super().cache_derived_state()
 
     def pre_reload_weights(self) -> None:
-        raise NotImplementedError(
-            "MegaMoE-CuteDSL does not support hot weight reloading: the NVFP4 "
-            "leaf releases its source weights after packing them, and the BF16 "
-            "leaf loads whole experts only, because a gated activation's FC1 "
-            "gate/up interleave needs both halves of an expert in one load."
-        )
+        # An RL weight sync (llmapi/rlhf_utils.py) calls this once, streams the
+        # new weights in through partial loads, then runs the post-load hooks.
+        # A leaf that cannot take its new weights in place refuses here, before
+        # any weight changes; one that can takes the standard path, which also
+        # refuses any EPLB, static or dynamic.
+        refusal = self._hot_reload_refusal()
+        if refusal is not None:
+            raise NotImplementedError(
+                f"MegaMoE-CuteDSL does not support hot weight reloading {refusal}."
+            )
+        if self.quant_method is None:
+            self.create_weights()
+        super().pre_reload_weights()
+
+    def _hot_reload_refusal(self) -> Optional[str]:
+        """Why this leaf cannot reload its weights in place, or None when it can.
+
+        Leaves opt in: the default refuses, so a leaf never takes new weights
+        into buffers it does not rebuild.
+        """
+        return f"for {type(self).__name__}"
 
     @abc.abstractmethod
     def _build_weight_view(self) -> MegaMoECuteDslWeightView:
@@ -2029,6 +2044,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MegaMoECuteDslBase):
             raise NotImplementedError("MegaMoECuteDsl supports NVFP4 quantization only.")
         return NVFP4MegaMoECuteDslMethod()
 
+    def _hot_reload_refusal(self) -> Optional[str]:
+        return "for NVFP4: the leaf releases its source weights after packing them"
+
     def _build_weight_view(self) -> MegaMoECuteDslWeightView:
         """Bundle the MegaMoE-format weight tensors registered by the
         quant method. ``run_moe`` calls this once per chunk so the
@@ -2261,6 +2279,19 @@ class TrtllmCutedslMegaMoeBf16Impl(MegaMoECuteDslBase):
         # format after resolution picked the unquantized leaf.
         self._check_quant_config_is_my_format()
         return UnquantizedMegaMoECuteDslMethod()
+
+    def _hot_reload_refusal(self) -> Optional[str]:
+        # The kernel reads w3_w1_weight / w2_weight themselves (no derived
+        # buffers), so new weights land in place and the post-load hooks have
+        # nothing to rebuild. Relu2's FC1 rows are read as loaded, so partial
+        # loads (a weight sync's buckets) can carry any subset of experts; a
+        # gated activation's FC1 is regrouped per expert as it loads.
+        if self.is_gated_activation:
+            return (
+                "for a gated activation: the FC1 gate/up interleave needs both "
+                "halves of an expert in one load"
+            )
+        return None
 
     def _build_weight_view(self) -> MegaMoECuteDslWeightView:
         """The kernel reads ``w3_w1_weight`` / ``w2_weight`` themselves (a

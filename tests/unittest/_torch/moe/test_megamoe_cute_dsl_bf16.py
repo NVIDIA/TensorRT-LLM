@@ -713,9 +713,15 @@ def test_megamoe_bf16_cpu_relu2_fc1_rows_load_as_is():
 @pytest.mark.cpu_only
 def test_megamoe_bf16_cpu_weight_method_shapes_and_refusals():
     method = UnquantizedMegaMoECuteDslMethod()
-    with pytest.raises(NotImplementedError, match="full initial weight loading"):
+    # A gated activation's FC1 interleave needs both halves of an expert in
+    # one load, so its partial loads (an RL weight sync's buckets) are refused
+    # before anything is copied; Relu2 takes them (see the EP1 hot-reload test).
+    with pytest.raises(NotImplementedError, match="gated activation's experts whole"):
         method.load_weights(
-            SimpleNamespace(), {}, MoEWeightLoadingMode.VANILLA, allow_partial_loading=True
+            SimpleNamespace(is_gated_activation=True),
+            {},
+            MoEWeightLoadingMode.VANILLA,
+            allow_partial_loading=True,
         )
 
     def module(**overrides) -> torch.nn.Module:
@@ -745,6 +751,25 @@ def test_megamoe_bf16_cpu_weight_method_shapes_and_refusals():
         assert layer.w3_w1_weight.shape == (2, expand, 64)
         assert layer.w2_weight.shape == (2, 64, 64)
         assert layer.w3_w1_weight.dtype == layer.w2_weight.dtype == torch.bfloat16
+
+
+@pytest.mark.cpu_only
+def test_megamoe_bf16_cpu_hot_reload_refusals():
+    """Which leaves take an RL weight sync in place, and the reason the others give.
+
+    Relu2 BF16 reloads into the tensors the kernel reads; a gated activation
+    regroups FC1 per expert as it loads, and NVFP4 frees its source weights after
+    packing, so both refuse in ``pre_reload_weights``, before any weight changes.
+    """
+    bf16 = TrtllmCutedslMegaMoeBf16Impl._hot_reload_refusal
+    assert bf16(SimpleNamespace(is_gated_activation=False)) is None
+    assert "gate/up interleave" in bf16(SimpleNamespace(is_gated_activation=True))
+    nvfp4 = TrtllmCutedslMegaMoeNvfp4Impl._hot_reload_refusal
+    assert "releases its source weights" in nvfp4(SimpleNamespace())
+
+    refusing = SimpleNamespace(_hot_reload_refusal=lambda: "for a test leaf")
+    with pytest.raises(NotImplementedError, match="hot weight reloading for a test leaf"):
+        TrtllmCutedslMegaMoeBf16Impl.pre_reload_weights(refusing)
 
 
 @pytest.mark.cpu_only
@@ -1848,6 +1873,117 @@ def test_megamoe_bf16_ep1_matches_fp32_reference(
                     overall_bound=_overall_rel_l2(shape),
                 )
             ]
+    assert not failures, "\n".join(failures)
+
+
+# An RL weight sync on Relu2 (Nemotron-H's experts), the llmapi/rlhf_utils.py
+# sequence: pre_reload_weights, partial loads, process_weights_after_loading,
+# post_load_weights. The shape has FC1 CTA tiles without rows (1152 = 9 x 128).
+_RELOAD_SHAPE = _Shape(num_experts=8, top_k=4, hidden_size=1024, intermediate_size=1152)
+_RELOAD_TOKENS = (7, 256, 1000)
+
+
+def test_megamoe_bf16_ep1_relu2_hot_reload_matches_reference(monkeypatch: pytest.MonkeyPatch):
+    """A loaded Relu2 layer takes new weights in place.
+
+    A full sync in two buckets (every FC1 with the even experts' FC2, then the
+    odd experts' FC2) leaves the layer on the new weights' reference, and a graph
+    captured before the sync replays on them. A sync that carries only some
+    experts' FC2 leaves the others' FC2 as they were.
+    """
+    shape, case = _RELOAD_SHAPE, _RELU2
+    _skip_under_multi_rank_launch()
+    _skip_unless_bf16_megamoe_runs(shape, case, ep_size=1)
+    # Scope the capture state to this test (see the CUDA-graph replay test).
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_CAPTURED_SHARED_PTRS", set())
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_GRAPH_CAPTURE_SEEN", False)
+    device = torch.device("cuda", torch.cuda.current_device())
+    failures = []
+    with torch.device(device):
+        old = _make_weights(shape, seed=11, device=device, gated=False)
+        new = _make_weights(shape, seed=12, device=device, gated=False)
+        backend = _load(
+            _make_backend(
+                TrtllmCutedslMegaMoeBf16Impl,
+                shape,
+                case,
+                Mapping(),
+                moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+                max_num_tokens=_EP1_MAX_NUM_TOKENS,
+            ),
+            old,
+        )
+        even = list(range(0, shape.num_experts, 2))
+        odd = list(range(1, shape.num_experts, 2))
+        every = list(range(shape.num_experts))
+
+        def bucket(source: _Weights, experts: List[int], projections: Tuple[str, ...]) -> Dict:
+            return {
+                f"{e}.{p}.weight": source.checkpoint[f"{e}.{p}.weight"]
+                for e in experts
+                for p in projections
+            }
+
+        def sync(*buckets: Dict) -> None:
+            # In place: captured graphs and the cached CuTe weight views keep
+            # these addresses, and there is no saved metadata to rebuild from.
+            addresses = (backend.w3_w1_weight.data_ptr(), backend.w2_weight.data_ptr())
+            backend.pre_reload_weights()
+            for weights in buckets:
+                backend.load_weights([weights], allow_partial_loading=True)
+            backend.process_weights_after_loading()
+            backend.post_load_weights()
+            assert (backend.w3_w1_weight.data_ptr(), backend.w2_weight.data_ptr()) == addresses
+            assert backend.rebuild_tensor_metadata == {}
+
+        def check(tag: str, expected: _Weights) -> None:
+            for num_tokens in _RELOAD_TOKENS:
+                x, expert_ids, routing_weights = _make_tokens(
+                    num_tokens, shape, case, seed=100 + num_tokens, device=device
+                )
+                backend.set_adaptive_launch_tokens(num_tokens)
+                with torch.inference_mode():
+                    output = _run(backend, x, expert_ids, routing_weights)
+                    reference = _reference_moe(x, expected, expert_ids, routing_weights, case)
+                failures.extend(
+                    f"{tag} T={num_tokens}: {message}"
+                    for message in _compare(output, reference, overall_bound=_overall_rel_l2(shape))
+                )
+
+        check("as loaded", old)
+        # Serving captures its graphs once, before any sync: an eager forward
+        # (as the warmup does), then the capture.
+        x, expert_ids, routing_weights = _make_tokens(7, shape, case, seed=1, device=device)
+
+        def forward() -> torch.Tensor:
+            backend.set_adaptive_launch_tokens(7)  # each launch consumes its hint
+            return _run(backend, x, expert_ids, routing_weights)
+
+        with torch.inference_mode():
+            forward()
+            graph = torch.cuda.CUDAGraph()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.graph(graph, stream=stream):
+                captured = forward()
+            torch.cuda.current_stream().wait_stream(stream)
+        sync(
+            bucket(new, every, ("w1", "w3")) | bucket(new, even, ("w2",)), bucket(new, odd, ("w2",))
+        )
+        with torch.inference_mode():
+            graph.replay()
+            torch.cuda.synchronize()
+            reference = _reference_moe(x, new, expert_ids, routing_weights, case)
+        failures.extend(
+            f"graph replay after a full sync: {message}"
+            for message in _compare(captured, reference, overall_bound=_overall_rel_l2(shape))
+        )
+        check("after a full sync", new)
+        # Back to the old FC1 everywhere, but the old FC2 only on the even experts.
+        sync(bucket(old, every, ("w1", "w3")) | bucket(old, even, ("w2",)))
+        mixed_w2 = new.w2.clone()
+        mixed_w2[even] = old.w2[even]
+        check("after a partial sync", _Weights({}, old.w1, old.w3, mixed_w2))
     assert not failures, "\n".join(failures)
 
 
