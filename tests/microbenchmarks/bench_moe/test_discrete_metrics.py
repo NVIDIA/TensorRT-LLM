@@ -40,6 +40,8 @@ perf-behavior change is explicit and reviewed.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -47,6 +49,8 @@ import torch
 # Test 1: backend selection (pure CPU, always runnable, gates pre-merge)
 # --------------------------------------------------------------------------- #
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+from .specs import BUILT_IN_MODELS
 
 # (moe_backend, architecture, quant_algo, sm_version, expected_backend)
 # sm_version is mocked so the test is hardware-independent and runs on CPU.
@@ -104,6 +108,30 @@ def test_moe_backend_selection(
         f"quant={quant_algo} resolved to {resolved!r}, expected {expected_backend!r}. "
         f"A silent fallback here is the PERF_FIX_HISTORY Cat 3.4 regression class."
     )
+
+
+@pytest.mark.parametrize("model_name", ["glm_5_3_flash", "deepseek_v4_1_flash"])
+def test_swiglu_clamp_rejects_relu2_override(model_name: str) -> None:
+    with pytest.raises(ValueError, match="swiglu_clamp requires activation_type=SWIGLU"):
+        replace(BUILT_IN_MODELS[model_name], activation_type="RELU2")
+
+
+@pytest.mark.parametrize("clamp", [0.0, -1.0])
+def test_swiglu_clamp_requires_positive_value(clamp: float) -> None:
+    with pytest.raises(ValueError, match="swiglu_clamp must be positive"):
+        replace(BUILT_IN_MODELS["glm_5_3_flash"], swiglu_clamp=clamp)
+
+
+def test_swiglu_clamp_accepts_swiglu() -> None:
+    model = replace(BUILT_IN_MODELS["glm_5_3_flash"], activation_type="SWIGLU")
+    assert model.activation_type == "SWIGLU"
+    assert model.swiglu_clamp == 10.0
+
+
+def test_relu2_without_swiglu_clamp() -> None:
+    model = replace(BUILT_IN_MODELS["glm_5_3_flash"], activation_type="RELU2", swiglu_clamp=None)
+    assert model.activation_type == "RELU2"
+    assert model.swiglu_clamp is None
 
 
 # --------------------------------------------------------------------------- #

@@ -172,6 +172,8 @@ class ModelSpec:
         if self.swiglu_clamp is not None:
             if self.swiglu_clamp <= 0:
                 raise ValueError("swiglu_clamp must be positive.")
+            if self.activation_type != "SWIGLU":
+                raise ValueError("swiglu_clamp requires activation_type=SWIGLU.")
             if self.swiglu_gptoss_style:
                 raise ValueError(
                     "Plain SwiGLU clamp and gpt-oss activation are mutually exclusive."
