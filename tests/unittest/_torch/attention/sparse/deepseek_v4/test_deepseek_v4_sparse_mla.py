@@ -1258,6 +1258,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
             k_pe = inp["gen_k_pe_list"][step]
             latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
+            uniform_q = uniform_q_pe = uniform_latent = None
             if uniform_metadata is not None:
                 uniform_q = fused_q.clone()
                 uniform_q_pe = q_pe.clone()
@@ -1786,4 +1787,4 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
 
 if __name__ == "__main__":
-    test_deepseek_v4_sparse_mla(context_lengths=[4399], num_generation_steps=2)
+    test_deepseek_v4_sparse_mla(context_lengths=[4399], generation_seq_len_q=1)

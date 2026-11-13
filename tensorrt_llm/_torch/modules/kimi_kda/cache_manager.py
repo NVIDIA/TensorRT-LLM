@@ -839,10 +839,11 @@ class KDAReplayState:
             replay_slots: ``[num_generations]`` replay slots of the generation rows;
                 ``batch.destination_state_indices`` when ``None``.
         """
-        self.record_acceptance(
+        self._record_acceptance(
             batch.destination_state_indices if replay_slots is None else replay_slots,
-            batch.num_accepted_tokens - 1,
+            batch.num_accepted_tokens,
             batch.is_dummy_request,
+            num_bonus_tokens=1,
         )
 
     @torch.inference_mode()
@@ -903,18 +904,31 @@ class KDAReplayState:
         num_accepted_draft_tokens: torch.Tensor,
         is_dummy_request: torch.Tensor | None,
     ) -> None:
-        """Record accepted drafts in the requests' replay slots, preserving dummy rows.
+        """Record accepted drafts, preserving dummy rows; each input has shape [batch]."""
+        self._record_acceptance(
+            replay_indices, num_accepted_draft_tokens, is_dummy_request, num_bonus_tokens=0
+        )
 
-        Each input has shape ``[batch]``.
-        """
+    def _record_acceptance(
+        self,
+        replay_indices: torch.Tensor,
+        num_accepted: torch.Tensor,
+        is_dummy_request: torch.Tensor | None,
+        *,
+        num_bonus_tokens: int,
+    ) -> None:
+        """Store ``max(num_accepted - num_bonus_tokens, 0)`` per non-dummy slot in one launch."""
+        from ._kda_kernels import record_kda_replay_acceptance
+
         if self.prev_num_accepted_tokens is None:
             raise RuntimeError("KDA replay acceptance requires replay bookkeeping")
-        slots = replay_indices.to(torch.long)
-        accepted = num_accepted_draft_tokens.to(torch.int32).clamp(min=0)
-        if is_dummy_request is not None:
-            current = self.prev_num_accepted_tokens[slots]
-            accepted = torch.where(is_dummy_request, current, accepted)
-        self.prev_num_accepted_tokens[slots] = accepted
+        record_kda_replay_acceptance(
+            self.prev_num_accepted_tokens,
+            replay_indices,
+            num_accepted,
+            is_dummy_request,
+            num_bonus_tokens,
+        )
 
     @staticmethod
     @contextmanager
