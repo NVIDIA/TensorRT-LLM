@@ -278,4 +278,5 @@ def test_k3_drafter_attn_rejects_invalid_page_contents(invalid, normalized) -> N
                 rope_base=THETA,
             )
         with pytest.raises(AssertionError), validating(op):
+            # pyrefly: ignore [missing-argument]
             op(**args)

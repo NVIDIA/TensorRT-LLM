@@ -231,6 +231,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
 
             req = admit(2)
             try:
+                output = None
                 offset = prefix
                 for chunk in chunks:
                     req.context_current_position = offset

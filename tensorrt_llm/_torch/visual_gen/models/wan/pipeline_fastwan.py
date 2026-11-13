@@ -61,6 +61,11 @@ class WanDMDPipeline(WanPipeline):
         """Return FastWan-specific default generation parameters (steps, guidance, frame rate)."""
         return get_fastwan_default_params()
 
+    @property
+    def default_warmup_steps(self):
+        """Use the fixed DMD schedule for pipeline warmup as well as inference."""
+        return len(self.DMD_TIMESTEPS)
+
     @nvtx_range("WanDMDPipeline.forward")
     @torch.no_grad()
     def forward(
