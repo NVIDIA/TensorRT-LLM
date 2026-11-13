@@ -51,34 +51,70 @@ def _isolate_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_detector_fires_after_timeout():
+def test_detector_fires_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = 1000.0
+    now = started
+    timeout = 2
     fired = []
-    hd = HangDetector(timeout=2, on_detected=lambda: fired.append(time.monotonic()))
-    with hd:
-        hd.checkpoint()
-        time.sleep(1.0)
+
+    def on_detected() -> None:
+        fired.append(now)
+        hd.active = False
+
+    hd = HangDetector(timeout=timeout, on_detected=on_detected)
+    ticks = iter([started + timeout / 2, started + timeout])
+
+    async def advance_clock(_delay: float) -> None:
+        nonlocal now
         assert hd.detected() is False
         assert fired == []
-        # Poll up to a generous deadline rather than asserting at the exact
-        # timeout boundary -- the detector thread may wake a bit after the
-        # configured ``timeout`` and a fixed sleep flakes in CI.
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and not hd.detected():
-            time.sleep(0.05)
-        assert hd.detected() is True
-        assert len(fired) == 1
+        now = next(ticks)
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=advance_clock))
+    hd.active = True
+    hd.checkpoint()
+    try:
+        asyncio.run(hd._watch())
+    finally:
+        hd.stop()
+    assert hd.detected() is True
+    assert fired == [started + timeout]
 
 
-def test_checkpoint_resets_timer():
-    """Repeated checkpoints before the timeout keep the detector quiet."""
+def test_checkpoint_resets_timer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A checkpoint keeps the detector quiet past the original deadline."""
+    started = 1000.0
+    now = started
+    timeout = 2
+    renewed_at = started + timeout / 2
     fired = []
-    hd = HangDetector(timeout=2, on_detected=lambda: fired.append(1))
-    with hd:
-        for _ in range(6):
+
+    def on_detected() -> None:
+        fired.append(now)
+        hd.active = False
+
+    hd = HangDetector(timeout=timeout, on_detected=on_detected)
+    ticks = iter([renewed_at, started + timeout, renewed_at + timeout])
+
+    async def advance_clock(_delay: float) -> None:
+        nonlocal now
+        assert fired == []
+        assert hd.detected() is False
+        now = next(ticks)
+        if now == renewed_at:
             hd.checkpoint()
-            time.sleep(0.4)  # < timeout, so the timer keeps resetting
-        assert fired == []
-        assert hd.detected() is False
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=advance_clock))
+    hd.active = True
+    hd.checkpoint()
+    try:
+        asyncio.run(hd._watch())
+    finally:
+        hd.stop()
+    assert hd.detected() is True
+    assert fired == [renewed_at + timeout]
 
 
 def test_checkpoint_schedules_no_work_on_the_detector_loop(
