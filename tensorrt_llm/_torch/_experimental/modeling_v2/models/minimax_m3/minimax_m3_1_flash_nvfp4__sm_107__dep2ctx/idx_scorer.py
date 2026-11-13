@@ -29,8 +29,12 @@ Declines (the proxy runs) under CUDA-graph capture, for non-FP8 operands, for a 
 index-Q that is not contiguous or not 16-byte aligned, for rows whose causal offset is not bottom-right aligned, past
 8192 pages per row, and when the scorer is not the exact K = 32 build. Kill switch:
 ``TRTLLM_M31_DISABLE_DEP2CTX_IDX_SCORER=1`` (``TRTLLM_M31_DISABLE_DEP2CTX_TSEL_ROWS=1`` turns it off too).
-Registration: ``IDX_SCORER_REGISTERED:`` (vs ``IDX_SCORER_OFF:``); engagement (a step taken): ``IDX_SCORER_ON:`` and
-the family's ``MSA_PREFILL_SCORER taken``.
+Registration: ``IDX_SCORER_REGISTERED:`` (vs
+``IDX_SCORER_OFF:``); engagement (a step taken): ``IDX_SCORER_ON:`` and the family's ``MSA_PREFILL_SCORER taken``.
+
+DEP2CTX_IDX_SCORER_K64 (not bitwise, off by default): ``TRTLLM_M31_ENABLE_DEP2CTX_IDX_SCORER_K64=1`` also accepts the
+scorer built with the sm_107 FP8 MMA at K = 64 (``TRTLLM_M31_IDX_SCORER_MMA_K=64``, part of its compile key): page
+maxima may differ by 1-3 ulp, so a top-16 table may differ.
 """
 
 import functools
@@ -46,9 +50,11 @@ from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.logger import logger
 
 from . import tile_select
-from .m31_switches import m31_disabled
+from .m31_switches import m31_disabled, m31_enabled
 
 IDX_SCORER = not m31_disabled("DEP2CTX_IDX_SCORER")
+# Not bitwise: an opt-in (see the header).
+IDX_SCORER_K64 = m31_enabled("DEP2CTX_IDX_SCORER_K64")
 # The vendored scorer's interface module (MSA names the path).
 SCORER_MODULE = (
     "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.msa_kernels."
@@ -84,7 +90,8 @@ def _decline(reason: str) -> None:
 
 
 def _module():
-    """The vendored interface module when it is importable and exact (K = 32 on sm_107), else None. Decided once."""
+    """The vendored interface module when it is importable and exact (K = 32 on sm_107; K = 64 with the opt-in), else
+    None. Decided once."""
     if "module" in _STATE:
         return _STATE["module"]
     mod = None
@@ -98,12 +105,19 @@ def _module():
         mma_k = prefill.mma_inst_k((10, 7))
         exact = not prefill.uses_sm107_fp8_mma((10, 7)) and mma_k == 32
         _STATE["mma_k"] = mma_k
-        if not exact:
+        if not exact and not (IDX_SCORER_K64 and mma_k == 64):
             _log_once(
                 "not_exact",
-                f"[M3.1 dep2ctx] IDX_SCORER_OFF: the scorer is not the exact K=32 build (K={mma_k}) (proxy kept)",
+                f"[M3.1 dep2ctx] IDX_SCORER_OFF: the scorer is not the exact K=32 build (K={mma_k}; K=64 needs "
+                "TRTLLM_M31_ENABLE_DEP2CTX_IDX_SCORER_K64=1) (proxy kept)",
             )
             mod = None
+        elif not exact:
+            _log_once(
+                "k64",
+                "[M3.1 dep2ctx] IDX_SCORER K=64 (DEP2CTX_IDX_SCORER_K64, NOT bitwise: page maxima may differ by "
+                "1-3 ulp)",
+            )
     except (ImportError, AttributeError) as err:
         _log_once(
             "no_module", f"[M3.1 dep2ctx] IDX_SCORER_OFF: {SCORER_MODULE} unavailable ({err})"

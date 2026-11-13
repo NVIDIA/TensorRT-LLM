@@ -1292,6 +1292,8 @@ def _longattn_lc_decode(
         prefetch=m3_attn_lc8.PREFETCH.take(),
         next_kv=m3_attn_lc8.NEXT_KV.take(),
     )
+    if m3_attn_lc8.one_div_applies(total_q):
+        m3_report.taken(ONE_DIV_MERGE_PATH, total_q)
     if mxfp8 is not None:
         m3_prequant.SLOT.publish(
             output.view(total_q, num_heads * head_dim), mxfp8[0][:total_q], mxfp8[1]
@@ -1300,6 +1302,8 @@ def _longattn_lc_decode(
 
 # Engagement path of the identity-selection producers reading their blocks from the kv lengths (IDENTITY).
 DEVICE_IDENTITY_PATH = "sparse_decode_device_identity"
+# Engagement path of the LC's one-division split-K merge (LC8_ONEDIV).
+ONE_DIV_MERGE_PATH = "sparse_decode_lc_one_div_merge"
 
 
 @torch.no_grad()

@@ -148,3 +148,45 @@ def m31_disabled(item_id: str) -> bool:
             f"{item_id!r} is not a switch of the {_TARGET} target (see m31_switches.SWITCHES)"
         )
     return item_id in _DISABLED
+
+
+# Default-off items (opt-ins): ``TRTLLM_M31_ENABLE_<ID>=1`` turns item ``<ID>`` on. Each changes the target's numerics
+# against the default path (not bitwise) or is not faster on every shape, so it stays off unless asked for. Same strict
+# values as the kill switches, read once at import; an opt-in variable naming an id this target does not register is
+# logged once and otherwise ignored.
+_ENABLE_PREFIX = "TRTLLM_M31_ENABLE_"
+
+# Opt-in id -> what TRTLLM_M31_ENABLE_<id>=1 turns on.
+OPT_INS: Dict[str, str] = {
+    "SLOT_IDS_CHANGED": (
+        "the spec sampler's slot-id table uploaded only when it changes (RuntimeHooks spec_slot_ids_changed_only)"
+    ),
+}
+
+
+def _read_enabled() -> FrozenSet[str]:
+    """The registered opt-in ids switched on in this process; logs each unregistered opt-in variable once."""
+    out = set()
+    for name, value in os.environ.items():
+        if not name.startswith(_ENABLE_PREFIX):
+            continue
+        item_id = name[len(_ENABLE_PREFIX) :]
+        if item_id not in OPT_INS:
+            logger.warning(f"{name} is not an opt-in of this MiniMax-M3.1 target; ignored")
+            continue
+        if _is_set(name, value):
+            out.add(item_id)
+    return frozenset(out)
+
+
+# The opt-in ids switched on in this process, read once at import.
+_ENABLED: FrozenSet[str] = _read_enabled()
+
+
+def m31_enabled(item_id: str) -> bool:
+    """Whether ``TRTLLM_M31_ENABLE_<item_id>`` turned the default-off item on for this process."""
+    if item_id not in OPT_INS:
+        raise KeyError(
+            f"{item_id!r} is not a registered opt-in of this target (m31_switches.OPT_INS)"
+        )
+    return item_id in _ENABLED

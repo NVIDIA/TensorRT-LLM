@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import os
 from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
 from typing import Mapping as TMapping
@@ -73,6 +74,7 @@ from tensorrt_llm._torch.distributed import (
     AllReduceFusionOp,
     AllReduceParams,
     MiniMaxAllReduceRMS,
+    allgather,
 )
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -131,8 +133,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, runtime_hooks_compat
 from ..kernels import m31_moe_finalize_out as _m31_finalize_out
+from . import idx_scorer as _idx_scorer
 from . import tile_select as _tsel
-from .m31_switches import m31_disabled
+from .m31_switches import m31_disabled, m31_enabled
 
 # This module's torch namespace (namespace_of): its Python custom ops register there.
 _NS = namespace_of(__name__)
@@ -5164,7 +5167,40 @@ def _strip_language_model_prefix(
 
 # AR-DET: AllReduce AUTO's per-process timing autotuner made SM107 runs differ across server starts. The target turns it
 # off for the whole process at init (AUTO then takes the C++ size / world heuristic, a pure function of the shape). An
-# explicit TLLM_DISABLE_ALLREDUCE_AUTOTUNE is left as given.
+# explicit TLLM_DISABLE_ALLREDUCE_AUTOTUNE is left as given. TRTLLM_M31_ENABLE_AR_AUTOTUNE=1 (opt-in) keeps the
+# autotuner. Read once, at import.
+AR_AUTOTUNE_ENABLED = m31_enabled("AR_AUTOTUNE")
+
+
+# TP2CTX_DRAFT_FC_SPLIT (opt-in, TRTLLM_M31_ENABLE_TP2CTX_DRAFT_FC_SPLIT=1): with TP attention both CTX ranks hold the
+# same tokens, so the DSpark drafter's context fc (bf16 F.linear, [rows, 30720] x [6144, 30720]^T) runs replicated. For
+# a full 16384-row chunk each rank runs fc on its 8192 rows and one all-gather rebuilds the output (the DFlash drafter's
+# _dflash_fc_row_split hook). Exact: cuBLASLt's 8192-row fc gives every row the bits of the 16384-row fc. Other row
+# counts keep the replicated fc (the 580-row half of a 1160-row tail is not bitwise). Off by default: the all-gather
+# takes back what the split saves.
+_DRAFT_FC_SPLIT_ROWS = frozenset({16384})
+
+
+def _enable_draft_fc_split(model: nn.Module, mapping: Mapping) -> None:
+    draft = getattr(model, "draft_model", None)
+    if (
+        not m31_enabled("TP2CTX_DRAFT_FC_SPLIT")
+        or draft is None
+        or not hasattr(draft, "_dflash_fc_row_split")
+        or mapping.tp_size != 2
+        or mapping.enable_attention_dp
+    ):
+        return
+    draft._dflash_fc_row_split = (
+        _DRAFT_FC_SPLIT_ROWS,
+        mapping.tp_rank,
+        mapping.tp_size,
+        functools.partial(allgather, mapping=mapping, dim=0),
+    )
+    logger.info(
+        f"[M3.1 tp2ctx] TP2CTX_DRAFT_FC_SPLIT drafter fc row split over TP{mapping.tp_size} for "
+        f"{sorted(_DRAFT_FC_SPLIT_ROWS)}-row projections (rank {mapping.tp_rank})"
+    )
 
 
 # The GPU architecture this target is written for (SM107).
@@ -5173,7 +5209,8 @@ _SM = (10, 7)
 
 def _pin_allreduce_heuristic(rank: int) -> bool:
     """Default the AllReduce autotune off for this process (see AR-DET); returns whether it is off. Logs one line."""
-    os.environ.setdefault("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "1")
+    if not AR_AUTOTUNE_ENABLED:
+        os.environ.setdefault("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "1")
     off = os.environ.get("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
     if off:
         logger.info(f"[M3.1] rank {rank}: AR_DET engaged (AllReduce autotune off for this process)")
@@ -5221,6 +5258,10 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx(MiniMaxM3ForCausalLM):
         _pin_allreduce_heuristic(model_config.mapping.tp_rank)
         # TP2CTX_TSEL (#20629 TILE_SELECT): the prefill top-16 select as the tile select, on every layer's MSA indexer.
         _tsel.register(self)
+        # TP2CTX_IDX_SCORER (opt-in; exact): the prefill indexer scores from the exact K=32 Q8KV8 scorer, not the proxy.
+        _idx_scorer.register(self)
+        # TP2CTX_DRAFT_FC_SPLIT (opt-in): the 16384-row drafter fc split over the TP pair (bitwise).
+        _enable_draft_fc_split(self, model_config.mapping)
         # One line for the AR1 route's prerequisite: whether this worker has a torch.distributed group.
         _dist = torch.distributed
         _dist_on = _dist.is_available() and _dist.is_initialized()

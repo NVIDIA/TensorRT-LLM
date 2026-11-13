@@ -58,6 +58,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.dspark.
     qk_norm_rope_append,
 )
 from tensorrt_llm._torch.distributed import allgather
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
     external_drafter_config_kwargs,
@@ -79,11 +80,21 @@ from ..ops import flagfree_gather as _ffg  # noqa: E402
 from . import dspark_ctxlen
 from .drafter_mxfp8 import route_gu_swiglu, route_his_layout, route_mx_linears
 from .dspark_markov_worker import MAX_FAST_BATCH, TAILBK_SPEC, S4WorkerMixin
-from .m31_switches import m31_disabled
+from .kernels import m3_mc_allreduce
+from .m31_switches import m31_disabled, m31_enabled
 from .ops.embedding.m3_embedding import m3_embedding
 from .ops.gemm.m31_fc_shard import MAX_ROWS as FC_SHARD_MAX_ROWS
 from .ops.gemm.m31_fc_shard import FcShard
 from .ops.sampling import m31_chain_spec_mc as _chain_spec_mc
+
+# DRAFT_AR_NORM_CLUSTER (opt-in, TRTLLM_M31_ENABLE_DRAFT_AR_NORM_CLUSTER=1): the drafter's fused all-reduces + norms
+# (DRAFT_AR_NORM_FUSED) on the target's multicast all-reduce + norm (its 8-token bucket, the drafter-norm form: the
+# unrounded fp32 sum normalized, opts bit 16) instead of the stock fused all-reduce; not bitwise, as DRAFT_AR_NORM_FUSED
+# (a different summation order). The draft-length-7 batch-1 drafter block (8 rows) takes it; other row counts keep the
+# stock fused path. Off by default. Read at import.
+S9B_MC = m31_enabled("DRAFT_AR_NORM_CLUSTER")
+S9B_MC_MAX_ROWS = 8  # capacity: fixed: the drafter-norm form exists for the 8-token bucket only
+
 
 # DRAFT_APPEND_FUSE: the drafter's per-layer flashinfer
 # append_paged_kv_cache folded into the fused q / k norm + RoPE launch (EX11) (the same K bits, V copied; same pages /
@@ -151,6 +162,35 @@ def _qk_norm_rope_append_logged(*args):
     return out
 
 
+def _s9b_mc_op(mapping):
+    """The fused AR + norm op DRAFT_AR_NORM_CLUSTER installs: (normed, residual + reduced) from the multicast
+    all-reduce + norm, or None (the stock fused all-reduce runs) for operands it does not take. Shapes and the
+    collectively created workspace decide, so every TP rank agrees."""
+
+    def op(partial, residual, norm_weight, eps):
+        if partial.dim() != 2 or not 1 <= partial.shape[0] <= S9B_MC_MAX_ROWS:
+            return None
+        workspace = m3_mc_allreduce.get_workspace(mapping, partial.shape[-1])
+        if workspace is None:
+            return None
+        return m3_mc_allreduce.m3_mc_allreduce_norm(
+            partial.contiguous(),
+            residual.contiguous(),
+            norm_weight,
+            eps,
+            workspace,
+            use_pdl=get_env_enable_pdl(),
+            drafter_norm=True,
+        )
+
+    return op
+
+
+# DRAFT_WINDOW_CAPPED_DECODE (opt-in, TRTLLM_M31_ENABLE_DRAFT_WINDOW_CAPPED_DECODE=1): the largest decode batch the
+# window-capped max_seq_len applies to, by draft length; 0 = off. Per draft length: the largest batch at which the
+# window-capped drafter attention is not slower than the stock call at every batch up to it (400K-token context).
+S5_MAX_BATCH_BY_K = {3: 0, 7: 2}
+
 # Lean drafter glue (DRAFTER_LEAN_GLUE) applies at every draft length: token-identical to the eager glue at draft
 # lengths 3 and 7 with the AllReduce autotune off (as the target sets it). TRTLLM_M31_DISABLE_DRAFTER_LEAN_GLUE=1 turns
 # it off.
@@ -193,6 +233,15 @@ def install_causal_draft(draft_model) -> int:
             f"in-block (no log-sum-exp, no later-key merge)"
         )
     return turned
+
+
+def s5_max_batch_for(num_draft_tokens: int) -> int:
+    """Draft length <= 3 takes the 3 entry, >= 7 the 7 entry, and in between the smaller of the two."""
+    if num_draft_tokens <= 3:
+        return S5_MAX_BATCH_BY_K[3]
+    if num_draft_tokens >= 7:
+        return S5_MAX_BATCH_BY_K[7]
+    return min(S5_MAX_BATCH_BY_K.values())
 
 
 def is_standalone_dspark(spec_config) -> bool:
@@ -317,6 +366,13 @@ A1_MAX_ROWS = 64  # capacity: fixed: allgather_cast.MAX_ROWS (K3 at batch 16, K7
 # A1 at draft lengths other than 3 (switch TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC_ANY_DRAFT_LEN; draft length 3
 # keeps A1).
 A1_K7_DISABLED = m31_disabled("VERIFY_LOGITS_ALLGATHER_MC_ANY_DRAFT_LEN")
+# DRAFT_LOGITS_ALLGATHER_MC (opt-in, TRTLLM_M31_ENABLE_DRAFT_LOGITS_ALLGATHER_MC=1): the rejection sampler's gather of
+# the vocab-sharded fp32 draft logits (stock: the NCCL all-gather + a concat copy) as one launch on the
+# VERIFY_LOGITS_ALLGATHER_MC multicast workspace (allgather_cast.allgather_f32: copied as is, bit for bit). Taken for
+# the B * K draft rows up to the fp32 capacity while that workspace is set up; other shapes keep the stock
+# all-gather. Off by default: with it on, two runs of the same requests sampled different tokens on a few long
+# requests, which the stock all-gather does not. Read at import.
+MCAG = m31_enabled("DRAFT_LOGITS_ALLGATHER_MC")
 _n3a_logged = False
 
 
@@ -395,6 +451,13 @@ _WORKER_HOOKS = (
     "enable_draft_logits_gather_op",
     "enable_fused_kv_rewind",
 )
+# TP8_ANCESTRAL_DRAFT (opt-in, TRTLLM_M31_ENABLE_TP8_ANCESTRAL_DRAFT=1): the in-tree DSpark ancestral draft
+# (DSparkWorker._samples_block_ancestrally: a Markov-head drafter under advanced draft sampling) returns the head's
+# logits from _try_fused_draft_head_and_refine, so _refine_block_logits -- where this target's Markov chain and
+# DRAFT_PROB1 run -- is never called, and the block is drawn by the per-position loop (or an installed ancestral block
+# override). Off by default: the target drafts through the Markov chain / DRAFT_PROB1 route. Read at import.
+TP8_ANCESTRAL = m31_enabled("TP8_ANCESTRAL_DRAFT")
+_TP8_ANCESTRAL_LOGGED: list = []
 
 
 class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
@@ -416,9 +479,17 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
     _f2_tail = None  # FOLD_F2: the M3SpecStepFold whose tail writes this forward's next_new_tokens, or None
 
     def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
-        """Never: the block is drafted through ``_refine_block_logits``, where this target's Markov chain and draft
-        probabilities run, not by the in-tree ancestral draft."""
-        return False
+        """TP8_ANCESTRAL_DRAFT (off by default): the in-tree ancestral draft only when opted in; otherwise the Markov
+        chain / DRAFT_PROB1 route through _refine_block_logits."""
+        if not _TP8_ANCESTRAL_LOGGED:
+            _TP8_ANCESTRAL_LOGGED.append(True)
+            route = (
+                "on (the in-tree ancestral draft)"
+                if TP8_ANCESTRAL
+                else "off (the Markov chain / DRAFT_PROB1 route)"
+            )
+            logger.info(f"M3.1 DSpark TP8_ANCESTRAL_DRAFT: {route}")
+        return TP8_ANCESTRAL and super()._samples_block_ancestrally(draft_model, spec_metadata)
 
     def prepare_1st_drafter_inputs(self, *args, **kwargs):
         """TP8 CTXLEN_FUSE: the in-tree first drafter inputs with the stored-context resume update in one launch
@@ -518,18 +589,33 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         k = getattr(getattr(self, "spec_config", None), "max_draft_len", 0) or 0
         lean = not m31_disabled("DRAFTER_LEAN_GLUE") and s10_applies(k)
         self.enable_lean_glue(draft_model, lean)
-        self.enable_window_capped_decode(draft_model, 0)
+        # DRAFT_WINDOW_CAPPED_DECODE (opt-in): window-capped max_seq_len for the drafter's sliding-window decode (not
+        # bitwise: the TRTLLM-Gen tile / KV split changes, not the keys read).
+        s5_max_batch = s5_max_batch_for(k) if m31_enabled("DRAFT_WINDOW_CAPPED_DECODE") else 0
+        self.enable_window_capped_decode(draft_model, s5_max_batch)
         # The context arena spans every seq slot (CUDA graph metadata narrows max_num_requests to its bucket).
         self.enable_full_slot_arena()
-        s2 = self.enable_fc_tp_split(draft_model, False)
-        # FC_SHARD (bitwise; collective: every rank builds or every rank declines). A row-parallel fc split, when on,
-        # wins.
+        # DRAFT_FC_TP_SPLIT (opt-in): the drafter's replicated fc split row-parallel with one fp32 all-reduce (not
+        # bitwise: the partial-sum order changes). Collective.
+        s2 = self.enable_fc_tp_split(draft_model, m31_enabled("DRAFT_FC_TP_SPLIT"))
+        split = getattr(draft_model, "_dflash_fc_split", None)
+        ar = split[3] if split is not None else None
+        ar_path = (
+            "MNNVL"
+            if getattr(ar, "mnnvl_allreduce", None) is not None
+            else getattr(ar, "strategy", None)
+        )
+        # FC_SHARD (bitwise; collective: every rank builds or every rank declines). DRAFT_FC_TP_SPLIT, when on, wins.
         if hasattr(draft_model, "_dflash_fc_shard"):
             draft_model._dflash_fc_shard = (
                 FcShard.build(draft_model.fc, self.mapping)
                 if FC_SHARD and not s2 and getattr(draft_model, "fc", None) is not None
                 else None
             )
+        logger.info(f"M3.1 DSpark DRAFT_FC_TP_SPLIT: fc TP split {'on' if s2 else 'off'} on rank {rank} (all-reduce "
+                    f"{ar_path})")  # fmt: skip
+        logger.info(f"M3.1 DSpark DRAFT_WINDOW_CAPPED_DECODE: window-capped draft decode for batches <= "
+                    f"{s5_max_batch} on rank {rank}")  # fmt: skip
         logger.info(f"M3.1 DSpark S10: lean drafter glue {'on' if lean else 'off'} on rank {rank}")
         # DRAFT_AR_NORM_FUSED: each drafter layer's all-reduce fused with the add + RMSNorm after it (not bitwise: the
         # sum is not rounded before the add). Kill switch TRTLLM_M31_DISABLE_DRAFT_AR_NORM_FUSED, read at import.
@@ -537,7 +623,15 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         logger.info(
             f"M3.1 DSpark S9b: fused drafter all-reduce + norm {'on' if s9b else 'off'} on rank {rank}"
         )
-        self.enable_fused_ar_norm_op(draft_model, None)
+        # DRAFT_AR_NORM_CLUSTER (opt-in): the multicast workspace is the target's (created collectively at its first
+        # eager boundary, the warmup forward, before any capture); until it exists the op declines on every rank alike.
+        s9b_mc = self.enable_fused_ar_norm_op(
+            draft_model, _s9b_mc_op(self.mapping) if s9b and S9B_MC else None
+        )
+        logger.info(
+            f"M3.1 DSpark DRAFT_AR_NORM_CLUSTER: drafter all-reduce + norm on the multicast kernel "
+            f"(<= {S9B_MC_MAX_ROWS} rows) {'on' if s9b_mc else 'off'} on rank {rank}"
+        )
         # Fused context store: the drafter's context K / V epilogue + accept mask + paged store in one launch after the
         # K / V GEMM (bitwise). Kill switches TRTLLM_M31_DISABLE_DRAFTER_FUSED_GLUE (all fused drafter glue) /
         # TRTLLM_M31_DISABLE_DRAFTER_CTX_KV_STORE_FUSED, read at import.
@@ -685,7 +779,12 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         if not N3A_DISABLED and lm_head is not None:
             _strict_accept.precompile((self.max_draft_len,), lm_head.weight.device)
         self._a1 = self._prebuild_a1(lm_head) if lm_head is not None else None
-        self.enable_draft_logits_gather_op(None)
+        self._mcag_cols = self._prebuild_mcag(lm_head) if self._a1 is not None and MCAG else 0
+        mcag = self.enable_draft_logits_gather_op(self._mcag_gather if self._mcag_cols else None)
+        logger.info(
+            f"M3.1 DRAFT_LOGITS_ALLGATHER_MC: draft-logits all-gather on the multicast kernel "
+            f"{'on' if mcag else 'off'} on rank {rank}"
+        )
         fc_shard = getattr(draft_model, "_dflash_fc_shard", None)
         self._f7_ws = (
             self._prebuild_f7(fc_shard)
@@ -826,6 +925,23 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         )
         return ws
 
+    def _prebuild_mcag(self, lm_head: nn.Module) -> int:
+        """Compile the fp32 draft-logits gather for B * K rows up to its capacity, on every rank (A1's workspace and
+        agreement); its shard columns, or 0 (every rank alike) when a compile fails anywhere."""
+        cols = int(getattr(lm_head, "out_features", 0))
+        k = int(self.max_draft_len)
+        if k <= 0 or cols % 4 != 0:
+            return 0
+        rows = tuple(b * k for b in range(1, _allgather_cast.MAX_ROWS_FP32 // k + 1))
+        if not _allgather_cast.precompile_f32(
+            lm_head.mapping, cols, rows, lm_head.weight.device, agree=self._a1_all_ok
+        ):
+            logger.warning(
+                "M3.1 DRAFT_LOGITS_ALLGATHER_MC: a compile failed on some rank; every rank keeps the NCCL all-gather"
+            )
+            return 0
+        return cols
+
     _f7_ws = None  # FOLD_F7: (fp32 columns per rank, the gather's workspace arguments) once set up
 
     def _prebuild_f7(self, fc_shard):
@@ -876,6 +992,28 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
             "[M3 dispatch sm_107 tp8] FOLD_F7 taken: drafter fc gathered in one multicast launch",
         )
         return out.view(torch.bfloat16)
+
+    def _mcag_gather(self, logits: torch.Tensor):
+        """The draft logits gathered in one launch on the multicast workspace, or None (the stock all-gather) for a
+        shape that is not compiled; the decision depends on the shape only, the same on every rank."""
+        rows = logits.numel() // max(int(logits.shape[-1]), 1)
+        if (
+            logits.dtype != torch.float32
+            or int(logits.shape[-1]) != self._mcag_cols
+            or not _allgather_cast.is_compiled(
+                rows, self._mcag_cols, self._a1["world"], device=logits.device, fp32=True
+            )
+        ):
+            _a1_log_once(
+                ("mcag", rows, logits.dtype),
+                f"[M3 dispatch] DRAFT_LOGITS_ALLGATHER_MC not taken: {rows} rows {logits.dtype}; NCCL all-gather",
+            )
+            return None
+        _a1_log_once(
+            "mcag",
+            "[M3 dispatch] DRAFT_LOGITS_ALLGATHER_MC taken: one launch on the multicast workspace",
+        )
+        return _allgather_cast.gather_last_dim_f32(logits.contiguous(), **self._a1)
 
     def _n3a_eligible(
         self, logits, draft_tokens, num_contexts: int, batch_size: int, spec_metadata
