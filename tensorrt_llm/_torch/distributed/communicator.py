@@ -1266,38 +1266,47 @@ class TorchDist(Distributed):
         """
         staging = self._cuda_obj_staging.get(pg)
         if staging is None:
-            staging = {
-                "size_in":
-                torch.empty(1, dtype=torch.int64, device="cuda"),
-                "size_out":
-                torch.empty(pg.size(), dtype=torch.int64, device="cuda"),
-                "pinned_size":
-                torch.empty(1, dtype=torch.int64, pin_memory=prefer_pinned()),
-                "pinned": {},
-                # Broadcast staging (root side). Separate from the allgather
-                # buffers above: the root's copies out of these are
-                # asynchronous and only fenced by ``bcast_fence``, while the
-                # allgather mirrors are rewritten by the host immediately.
-                "bcast_size":
-                torch.empty(1, dtype=torch.int64, device="cuda"),
-                "bcast_pinned_size":
-                torch.empty(1, dtype=torch.int64, pin_memory=prefer_pinned()),
-                "bcast_pinned":
-                None,
-                "bcast_fence":
-                None,
-            }
+            # The buffers outlive the call and are written in place on later
+            # calls, which may run outside inference mode: never allocate them
+            # as inference tensors (the first call can come from a forward).
+            with torch.inference_mode(False):
+                staging = self._new_cuda_obj_staging(pg)
             self._cuda_obj_staging[pg] = staging
         return staging
+
+    @staticmethod
+    def _new_cuda_obj_staging(pg) -> dict:
+        return {
+            "size_in":
+            torch.empty(1, dtype=torch.int64, device="cuda"),
+            "size_out":
+            torch.empty(pg.size(), dtype=torch.int64, device="cuda"),
+            "pinned_size":
+            torch.empty(1, dtype=torch.int64, pin_memory=prefer_pinned()),
+            "pinned": {},
+            # Broadcast staging (root side). Separate from the allgather
+            # buffers above: the root's copies out of these are
+            # asynchronous and only fenced by ``bcast_fence``, while the
+            # allgather mirrors are rewritten by the host immediately.
+            "bcast_size":
+            torch.empty(1, dtype=torch.int64, device="cuda"),
+            "bcast_pinned_size":
+            torch.empty(1, dtype=torch.int64, pin_memory=prefer_pinned()),
+            "bcast_pinned":
+            None,
+            "bcast_fence":
+            None,
+        }
 
     @staticmethod
     def _cuda_obj_pinned(staging: dict, numel: int,
                          dtype: torch.dtype) -> torch.Tensor:
         buf = staging["pinned"].get(dtype)
         if buf is None or buf.numel() < numel:
-            buf = torch.empty(max(numel, 1),
-                              dtype=dtype,
-                              pin_memory=prefer_pinned())
+            with torch.inference_mode(False):
+                buf = torch.empty(max(numel, 1),
+                                  dtype=dtype,
+                                  pin_memory=prefer_pinned())
             staging["pinned"][dtype] = buf
         return buf[:numel]
 
@@ -1448,9 +1457,12 @@ class TorchDist(Distributed):
                 if nbytes:
                     pinned = staging["bcast_pinned"]
                     if pinned is None or pinned.numel() < nbytes:
-                        pinned = torch.empty(nbytes,
-                                             dtype=torch.uint8,
-                                             pin_memory=prefer_pinned())
+                        # Persistent like the staging buffers: never an
+                        # inference tensor (see _cuda_obj_staging_for).
+                        with torch.inference_mode(False):
+                            pinned = torch.empty(nbytes,
+                                                 dtype=torch.uint8,
+                                                 pin_memory=prefer_pinned())
                         staging["bcast_pinned"] = pinned
                     pinned[:nbytes].numpy()[:] = np.frombuffer(data,
                                                                dtype=np.uint8)
