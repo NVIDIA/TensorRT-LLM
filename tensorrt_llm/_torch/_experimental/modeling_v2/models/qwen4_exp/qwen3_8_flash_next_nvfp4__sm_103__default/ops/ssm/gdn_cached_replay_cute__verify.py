@@ -28,7 +28,10 @@ cores. With `commit`, a row whose history wraps (`p + T > 16`) also writes the a
 checkpoint is read once and written once and the engine's all-layer commit is not needed.
 
 Given the engine's replay work items, each CTA reads its row's (row, slot, pending count, half) in
-one load; otherwise slot, then pending count / half. With PDL the state and history (not written by
+one load (scalar loads when the items carry the replay slot as a fifth field); otherwise slot, then
+pending count / half. The history and its bookkeeping are addressed by a replay slot of their own
+(`replay_indices`, the checkpoint slot when not given) at the slot strides of their buffers, so a
+manager may keep them in pool pages apart from the checkpoint. With PDL the state and history (not written by
 the previous kernel) are read before `griddepcontrol.wait`; without it the step's own small inputs
 are issued first. Small batches (the launch is latency-bound there) bring every state tile in by
 bulk copy as soon as the slot is known (`pf=0`: no tile held in registers through the prologue) and
@@ -62,6 +65,7 @@ GEOMETRIES = ((16, 48), (4, 12))
 TILES = GRP * (V // 16)  # m-tiles of one (request, q/k head)
 PU = 272  # shared row pitch (bytes) of 128-element bf16 rows read by ldmatrix (conflict-free)
 PK = 320  # shared row pitch of the history keys read as permuted 16-byte fragments
+WI_REPLAY_SLOT = 4  # a work item's replay-slot field, when it has one (`REPLAY_WORK_REPLAY_SLOT`)
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
 
@@ -715,6 +719,8 @@ class _Replay:
         spec_hist=False,
         qk_first=True,
         use_wi=False,
+        wi_w=4,
+        rsep=False,
         evict_first=True,
         early_acc=False,
         h=16,
@@ -746,6 +752,10 @@ class _Replay:
         self.qk_first = qk_first
         # (row, slot, pending count, half) per item from the engine's replay work items
         self.use_wi = use_wi
+        # int32 fields per work item: 4 is one 16-byte load, anything else scalar loads
+        self.wi_w = wi_w
+        # the history and its bookkeeping have replay slots of their own (`replay_indices`)
+        self.rsep = rsep
         self.evict_first = evict_first
         nset = 2 if self.spec_hist else 1
         self.nset = nset
@@ -815,6 +825,12 @@ class _Replay:
         ok_ptr: cutlass.Int64,
         og_ptr: cutlass.Int64,
         wi_ptr: cutlass.Int64,
+        ridx_ptr: cutlass.Int64,
+        u_ss: cutlass.Int64,
+        k_ss: cutlass.Int64,
+        g_ss: cutlass.Int64,
+        pnat_ss: cutlass.Int64,
+        buf_ss: cutlass.Int64,
         n_rows: cutlass.Int32,
         scale: cutlass.Float32,
         stream,
@@ -845,6 +861,12 @@ class _Replay:
             ok_ptr,
             og_ptr,
             wi_ptr,
+            ridx_ptr,
+            u_ss,
+            k_ss,
+            g_ss,
+            pnat_ss,
+            buf_ss,
             scale,
         ).launch(
             grid=[n_rows * (self.H * self.S), 1, 1],
@@ -999,6 +1021,15 @@ class _Replay:
     def _b_f32(self, x):
         return x if self.b_f32 else _b16_f32(x)
 
+    def _work_item(self, wi_ptr, item):
+        """Work item `item`'s int32 fields: (row, slot, pending count, half), then the replay
+        slot when the history has slots of its own and the items carry them."""
+        base = wi_ptr + cutlass.Int64(item) * (4 * self.wi_w)
+        if self.wi_w == 4:
+            return _LDG4["plain"](base)
+        fields = WI_REPLAY_SLOT + 1 if self.rsep and self.wi_w > WI_REPLAY_SLOT else 4
+        return [_ldg_i32(base + 4 * f) for f in range(fields)]
+
     def _load_tile(self, addr, pol=None):
         regs = []
         for jj in range(4):
@@ -1037,6 +1068,12 @@ class _Replay:
         ok_ptr: cutlass.Int64,
         og_ptr: cutlass.Int64,
         wi_ptr: cutlass.Int64,
+        ridx_ptr: cutlass.Int64,
+        u_ss: cutlass.Int64,
+        k_ss: cutlass.Int64,
+        g_ss: cutlass.Int64,
+        pnat_ss: cutlass.Int64,
+        buf_ss: cutlass.Int64,
         scale: cutlass.Float32,
     ):
         T: cutlass.Constexpr = self.T
@@ -1062,7 +1099,7 @@ class _Replay:
         nh = bidx // S
         h = nh % H
         if const_expr(self.use_wi):
-            wi = _LDG4["plain"](wi_ptr + cutlass.Int64(nh // H) * 16)
+            wi = self._work_item(wi_ptr, nh // H)
             n = wi[0]
         else:
             n = nh // H
@@ -1154,8 +1191,16 @@ class _Replay:
             slot = wi[1]
         else:
             slot = _ldg_i32(sidx_ptr + n64 * 4)
+        # the history and bookkeeping row: the checkpoint's slot unless it has its own
+        rslot = slot
+        if const_expr(self.rsep):
+            if const_expr(self.use_wi and self.wi_w > WI_REPLAY_SLOT):
+                rslot = wi[WI_REPLAY_SLOT]
+            else:
+                rslot = _ldg_i32(ridx_ptr + n64 * 4)
         if slot >= 0:
             slot64 = cutlass.Int64(slot)
+            rs64 = cutlass.Int64(rslot)
             # ---- 1. the state tiles: bulk copies first, then the register tile -----------------
             pol = _policy_evict_first() if const_expr(self.evict_first) else None
             if const_expr(NSM > 0):
@@ -1191,29 +1236,30 @@ class _Replay:
                 p = wi[2]
                 rb = wi[3]
             else:
-                p = _ldg_i32(pnat_ptr + slot64 * 4)
-                rb = _ldg_i32(buf_ptr + slot64 * 4)
+                p = _ldg_i32(pnat_ptr + rs64 * pnat_ss)
+                rb = _ldg_i32(buf_ptr + rs64 * buf_ss)
             wrap = (p + T) > HIST
             wb = cutlass.Int32(cutlass.select_(wrap, 1 - rb, rb))
             woff = cutlass.Int32(cutlass.select_(wrap, zi, p))
-            rslot = slot64 * 2 + cutlass.Int64(rb)
-            g_rd = og_ptr + rslot * (HV * HIST * 4)
-            wslot = slot64 * 2 + cutlass.Int64(wb)
-            u_rd = ou_ptr + rslot * (HIST * HV * V * 2)
-            k_rd = ok_ptr + rslot * (HIST * H * K * 2)
-            u_wr = ou_ptr + wslot * (HIST * HV * V * 2)
-            k_wr = ok_ptr + wslot * (HIST * H * K * 2)
-            g_wr = og_ptr + wslot * (HV * HIST * 4)
+            # a replay slot's two history halves are packed behind its slot stride
+            u_sl = ou_ptr + rs64 * u_ss
+            k_sl = ok_ptr + rs64 * k_ss
+            g_sl = og_ptr + rs64 * g_ss
+            g_rd = g_sl + cutlass.Int64(rb) * (HV * HIST * 4)
+            u_rd = u_sl + cutlass.Int64(rb) * (HIST * HV * V * 2)
+            k_rd = k_sl + cutlass.Int64(rb) * (HIST * H * K * 2)
+            u_wr = u_sl + cutlass.Int64(wb) * (HIST * HV * V * 2)
+            k_wr = k_sl + cutlass.Int64(wb) * (HIST * H * K * 2)
+            g_wr = g_sl + cutlass.Int64(wb) * (HV * HIST * 4)
 
             n_u: cutlass.Constexpr = NHV * 256
             if const_expr(self.spec_hist):
                 # both halves, every row, before the pending count / half are known; rows j >= p
                 # are masked where they are used
                 for hb in cutlass.range_constexpr(2):
-                    hslot = slot64 * 2 + hb
-                    u_h = ou_ptr + hslot * (HIST * HV * V * 2)
-                    k_h = ok_ptr + hslot * (HIST * H * K * 2)
-                    g_h = og_ptr + hslot * (HV * HIST * 4)
+                    u_h = u_sl + hb * (HIST * HV * V * 2)
+                    k_h = k_sl + hb * (HIST * H * K * 2)
+                    g_h = g_sl + hb * (HV * HIST * 4)
                     for it in cutlass.range_constexpr(-(-n_u // NTHR)):
                         e = tidx + it * NTHR
                         if e < n_u:
@@ -1701,8 +1747,13 @@ def _kernel_kw(
     b_f32: bool,
     work_items: bool,
     config: Optional[dict] = None,
+    work_item_width: int = 4,
+    separate_replay_slots: bool = False,
 ) -> dict:
-    """The kernel's compile-time parameters for a call of `n` requests: its key in `_COMPILED`."""
+    """The kernel's compile-time parameters for a call of `n` requests: its key in `_COMPILED`.
+
+    `work_item_width` is the int32 fields per work item; `separate_replay_slots` says the
+    history is addressed by replay slots of its own (`replay_indices`)."""
     cfg = dict(default_config(n, t, commit))
     if config:
         cfg.update(config)
@@ -1710,6 +1761,8 @@ def _kernel_kw(
     # without it, the step's own small inputs first
     cfg.setdefault("qk_first", not pdl)
     cfg["use_wi"] = bool(cfg.pop("use_wi", True)) and work_items
+    cfg["wi_w"] = work_item_width if cfg["use_wi"] else 4
+    cfg["rsep"] = separate_replay_slots
     return dict(
         T=t,
         h=h,
@@ -1725,7 +1778,15 @@ def _kernel_kw(
 
 
 def precompile(
-    t: int, h: int, hv: int, max_requests: int, *, pdl: bool, partition_from: int
+    t: int,
+    h: int,
+    hv: int,
+    max_requests: int,
+    *,
+    pdl: bool,
+    partition_from: int,
+    work_item_width: int = 4,
+    separate_replay_slots: bool = False,
 ) -> int:
     """Compile every kernel a verify step of 1..`max_requests` requests launches, the way a
     target calls this entry: work items, and with them no in-kernel commit, from
@@ -1748,6 +1809,8 @@ def precompile(
             g_f32=False,
             b_f32=False,
             work_items=partitioned,
+            work_item_width=work_item_width,
+            separate_replay_slots=separate_replay_slots,
         )
         key = tuple(sorted(kw.items()))
         if key not in keys:
@@ -1764,7 +1827,7 @@ def _compile(key, kern):
         fn = cute.compile(
             kern,
             from_dlpack(dummy, assumed_align=4).mark_layout_dynamic(leading_dim=0),
-            *([i64] * 24),
+            *([i64] * 30),
             cutlass.Int32(1),
             cutlass.Float32(1.0),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -1801,9 +1864,15 @@ def cached_replay_update(
     output: Optional[torch.Tensor] = None,
     in_kernel_commit: Optional[bool] = None,
     config: Optional[dict] = None,
+    replay_indices: Optional[torch.Tensor] = None,
     **ignored,
 ) -> torch.Tensor:
     """Same contract as `fused_recurrent_gated_delta_rule_cached_replay_update` (bf16 state).
+
+    `replay_indices` (`state_indices` when None) address the history (`old_u` / `old_k` /
+    `old_G`) and its bookkeeping (`prev_num_accepted_tokens` / `cache_buf_idx`); each
+    replay slot's rows are packed behind a slot stride of 16-byte multiples, and the
+    bookkeeping may have any element stride (a manager keeps both in one row per slot).
 
     Without work items a wrapping row commits its checkpoint in-kernel, as the Triton op does;
     with work items + `use_all_layer_commit` it does not (the caller runs the all-layer commit).
@@ -1812,7 +1881,9 @@ def cached_replay_update(
     Given work items, the kernel reads each row's (row, slot, pending count, half) from them (one
     load instead of two dependent ones), so they must list every one of the N rows, as the engine's
     builder over all decode rows does (`config={"use_wi": False}` falls back to `state_indices`).
-    Work items with `in_kernel_commit=True` need no `use_all_layer_commit` (the caller runs none).
+    Work items with `in_kernel_commit=True` need no `use_all_layer_commit` (the caller runs none);
+    with separate replay slots their fifth field (`REPLAY_WORK_REPLAY_SLOT`) gives each row's
+    replay slot, else `replay_indices` does.
     The Triton launch knobs (`block_v`, `num_warps`, `use_l2_*`, `main_num_stages`) are ignored.
     """
     del old_beta
@@ -1827,8 +1898,32 @@ def cached_replay_update(
     assert ssm_states.stride()[1:] == (V * K, K, 1)
     assert old_u.dtype == torch.bfloat16 and old_k.dtype == torch.bfloat16
     assert old_G.dtype == torch.float32
-    for x in (old_u, old_k, old_G):
-        assert x.is_contiguous()
+    for name, x, rows in (
+        ("old_u", old_u, (2, HIST, HV, V)),
+        ("old_k", old_k, (2, HIST, H, K)),
+        ("old_G", old_G, (2, HV, HIST)),
+    ):
+        assert tuple(x.shape[1:]) == rows and x[0].is_contiguous(), (
+            f"{name} is {tuple(x.shape)} with strides {x.stride()}; the kernel reads packed "
+            f"[slots, {', '.join(map(str, rows))}] rows"
+        )
+        assert x.data_ptr() % 16 == 0 and (x.stride(0) * x.element_size()) % 16 == 0, (
+            f"{name}: the kernel copies 16-byte chunks, so its base and slot stride must be "
+            "16-byte aligned"
+        )
+    for name, x in (
+        ("prev_num_accepted_tokens", prev_num_accepted_tokens),
+        ("cache_buf_idx", cache_buf_idx),
+    ):
+        assert x.dim() == 1 and x.dtype == torch.int32, f"{name}: one int32 per replay slot"
+    rsep = replay_indices is not None and replay_indices.data_ptr() != state_indices.data_ptr()
+    if rsep:
+        assert (
+            replay_indices.dim() == 1
+            and replay_indices.shape[0] >= N
+            and replay_indices.dtype == torch.int32
+            and replay_indices.is_contiguous()
+        ), "replay_indices: one contiguous int32 replay slot per row"
     assert g.shape == (N, T, HV) and beta.shape == (N, T, HV)
     assert g.stride(2) == 1 and beta.stride(2) == 1
     assert g.stride(0) == T * g.stride(1) and beta.stride(0) == T * beta.stride(1)
@@ -1869,6 +1964,13 @@ def cached_replay_update(
         ap, dp = A_log.data_ptr(), dt_bias.data_ptr()
     else:
         ap = dp = 0
+    if replay_work_items is not None:
+        assert (
+            replay_work_items.dim() == 2
+            and replay_work_items.shape[1] >= 4
+            and replay_work_items.dtype == torch.int32
+            and replay_work_items.is_contiguous()
+        ), "replay_work_items: contiguous int32 rows of (row, slot, pending count, half[, ...])"
     kw = _kernel_kw(
         N,
         T,
@@ -1882,6 +1984,8 @@ def cached_replay_update(
         b_f32=beta.dtype == torch.float32,
         work_items=replay_work_items is not None,
         config=config,
+        work_item_width=replay_work_items.shape[1] if replay_work_items is not None else 4,
+        separate_replay_slots=rsep,
     )
     use_wi = kw["use_wi"]
     key = tuple(sorted(kw.items()))
@@ -1915,6 +2019,12 @@ def cached_replay_update(
         old_k.data_ptr(),
         old_G.data_ptr(),
         replay_work_items.data_ptr() if use_wi else 0,
+        replay_indices.data_ptr() if rsep else 0,
+        old_u.stride(0) * old_u.element_size(),
+        old_k.stride(0) * old_k.element_size(),
+        old_G.stride(0) * old_G.element_size(),
+        prev_num_accepted_tokens.stride(0) * prev_num_accepted_tokens.element_size(),
+        cache_buf_idx.stride(0) * cache_buf_idx.element_size(),
         N,
         float(scale),
     )
@@ -2077,7 +2187,9 @@ class GdnCachedReplayCute(OpWrapper):
     (`packed_qkv`; 10240 at 16 / 48), `g` / `beta` the input projection's raw
     a / b columns read through its row stride (no copies), `A_log` / `dt_bias` fp32, the
     layer's view of the stock manager's bf16 state page (slot stride 36 layers' states), the
-    history buffers `[slots, 2, 16, 12|4, 128]` / `[slots, 2, 12, 16]`, and work items +
+    history buffers `[slots, 2, 16, 12|4, 128]` / `[slots, 2, 12, 16]` (addressed by the
+    manager's replay slots, `replay_indices`, when it keeps the history in slots of its own;
+    the work items then carry the replay slot as a fifth field), and work items +
     `use_all_layer_commit` exactly when the Triton entry gets them (N >= 16 with the manager's
     all-layer commit on). `launch_with_pdl=True`: the Triton conv before it signals its
     dependents at its start (`launch_dependent_kernels`), so the kernel streams the checkpoint
@@ -2147,6 +2259,7 @@ class GdnCachedReplayCute(OpWrapper):
         output: Optional[torch.Tensor] = None,
         in_kernel_commit: Optional[bool] = None,
         config: Optional[dict] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return cached_replay_update(
             q=q,
@@ -2175,6 +2288,7 @@ class GdnCachedReplayCute(OpWrapper):
             output=output,
             in_kernel_commit=in_kernel_commit,
             config=config,
+            replay_indices=replay_indices,
         )
 
     def reference(
@@ -2211,6 +2325,7 @@ class GdnCachedReplayCute(OpWrapper):
         output: Optional[torch.Tensor] = None,
         in_kernel_commit: Optional[bool] = None,
         config: Optional[dict] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(out, ssm_states, old_u, old_k, old_G)` as the call leaves them;
         mutates nothing. The state is rebuilt from the checkpoint and history
@@ -2258,15 +2373,16 @@ class GdnCachedReplayCute(OpWrapper):
         if live.numel() == 0:
             return out.to(out_dtype), pool, u_buf, k_buf, G_buf
         slot = state_indices[:N][live].long()
-        p = prev_num_accepted_tokens[slot].long()
-        b = cache_buf_idx[slot].long()
+        rslot = slot if replay_indices is None else replay_indices[:N][live].long()
+        p = prev_num_accepted_tokens[rslot].long()
+        b = cache_buf_idx[rslot].long()
         M, depth = live.numel(), old_u.shape[2]
 
         # 1. the pending state: checkpoint plus the p history entries of half b
         pending = torch.arange(depth, device=dev)[None, :] < p[:, None]  # [M, depth]
-        Gh = torch.where(pending[:, None, :], old_G[slot, b].float(), 0.0)  # [M, HV, depth]
-        Uh = torch.where(pending[:, :, None, None], old_u[slot, b].float(), 0.0)
-        Kh = torch.where(pending[:, :, None, None], old_k[slot, b].float(), 0.0)
+        Gh = torch.where(pending[:, None, :], old_G[rslot, b].float(), 0.0)  # [M, HV, depth]
+        Uh = torch.where(pending[:, :, None, None], old_u[rslot, b].float(), 0.0)
+        Kh = torch.where(pending[:, :, None, None], old_k[rslot, b].float(), 0.0)
         Kh = Kh.repeat_interleave(rep, dim=2)  # [M, depth, HV, K]
         last = (p - 1).clamp(min=0)[:, None, None].expand(M, HV, 1)
         g_start = torch.where(p[:, None] > 0, Gh.gather(2, last).squeeze(2), 0.0)  # [M, HV]
@@ -2296,10 +2412,10 @@ class GdnCachedReplayCute(OpWrapper):
         w_off = torch.where(wrap, 0, p)
         for t in range(T):
             pos = w_off + t
-            u_buf[slot, w_buf, pos] = u_new[t].to(u_buf.dtype)
-            k_buf[slot, w_buf, pos] = kf[live, t].to(k_buf.dtype)
+            u_buf[rslot, w_buf, pos] = u_new[t].to(u_buf.dtype)
+            k_buf[rslot, w_buf, pos] = kf[live, t].to(k_buf.dtype)
             G_store = torch.where(wrap[:, None], G_new[t], g_start + G_new[t])
-            G_buf[slot, w_buf, :, pos] = G_store.to(G_buf.dtype)
+            G_buf[rslot, w_buf, :, pos] = G_store.to(G_buf.dtype)
         commit = replay_work_items is None if in_kernel_commit is None else bool(in_kernel_commit)
         if commit and bool(wrap.any()):
             pool[slot[wrap]] = checkpoint[wrap].to(pool.dtype)
@@ -2339,6 +2455,7 @@ class GdnCachedReplayCute(OpWrapper):
         output: Optional[torch.Tensor] = None,
         in_kernel_commit: Optional[bool] = None,
         config: Optional[dict] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> None:
         N, _, H, K = k.shape
         HV, V = v.shape[2], v.shape[3]
@@ -2347,18 +2464,28 @@ class GdnCachedReplayCute(OpWrapper):
             "kernel reads one slot per sequence with no bound, so a shorter tensor hands the "
             "trailing rows whatever follows it in memory, and they write that slot's history"
         )
-        pool_slots, slots = ssm_states.shape[0], old_u.shape[0]
-        assert slots >= pool_slots, (
-            f"the history buffers have {slots} slots for a {pool_slots}-slot pool -- a slot "
-            "past the history's end is read and written out of bounds"
+        # The history is addressed by the replay slots, the state slots when none are given.
+        if replay_indices is None:
+            history_slots, slot_space = ssm_states.shape[0], "the recurrent pool"
+        else:
+            assert replay_indices.dim() == 1 and replay_indices.shape[0] >= N, (
+                f"replay_indices has shape {tuple(replay_indices.shape)} for {N} sequences -- "
+                "the kernel reads one replay slot per sequence with no bound"
+            )
+            history_slots, slot_space = int(replay_indices[:N].max()) + 1, "the replay slots"
+        slots = old_u.shape[0]
+        assert slots >= history_slots, (
+            f"the history buffers have {slots} slots for {history_slots} of {slot_space} -- a "
+            "slot past the history's end is read and written out of bounds"
         )
         for name, tensor in (
             ("prev_num_accepted_tokens", prev_num_accepted_tokens),
             ("cache_buf_idx", cache_buf_idx),
         ):
-            assert tensor.dim() == 1 and tensor.is_contiguous() and tensor.shape[0] >= pool_slots, (
-                f"{name} has shape {tuple(tensor.shape)} and stride {tensor.stride()}; the kernel "
-                f"reads one element per slot of the {pool_slots}-slot pool, at the slot's index"
+            assert tensor.dim() == 1 and tensor.shape[0] >= history_slots, (
+                f"{name} has shape {tuple(tensor.shape)}; the kernel reads one element per "
+                f"history slot ({history_slots} of {slot_space}), at the slot's index times "
+                "the element stride"
             )
         expected = {
             "old_u": (old_u, (slots, 2, history_size, HV, V)),
