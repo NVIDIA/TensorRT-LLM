@@ -36,7 +36,7 @@ SLOT_PAD = 4096
 OUT_BAND, STATE_BAND = 2e-2, 1e-2
 
 # The prefill steps the shipped target runs, by target directory under `models/`: GLM-5.3-Flash's KDA at TP4
-# (16 of 64 heads), the engine route it forces, the scheduler's planned metadata, --max_num_tokens 32768 and
+# (16 of 64 heads), the auto route it takes, the scheduler's planned metadata, --max_num_tokens 32768 and
 # 13,312-token prompts; the pool bf16 (the default recurrent-state dtype) or fp32.
 CELLS: tuple[Cell, ...] = op.CELLS + (
     Cell(
@@ -47,7 +47,7 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
             slots=(5,),
             fresh=(True,),
             state_dtype=torch.bfloat16,
-            mode="engine",
+            mode="auto",
             planned=True,
             pool=8,
         ),
@@ -60,7 +60,7 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
             slots=(3, 0, 6),
             fresh=(True, True, True),
             state_dtype=torch.bfloat16,
-            mode="engine",
+            mode="auto",
             planned=True,
             pool=8,
         ),
@@ -73,7 +73,7 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
             slots=(6, 1, 4),
             fresh=(False, True, True),
             state_dtype=torch.bfloat16,
-            mode="engine",
+            mode="auto",
             planned=True,
             pool=8,
         ),
@@ -86,7 +86,7 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
             slots=(2, 7),
             fresh=(False, True),
             state_dtype=torch.float32,
-            mode="engine",
+            mode="auto",
             planned=True,
             pool=8,
         ),

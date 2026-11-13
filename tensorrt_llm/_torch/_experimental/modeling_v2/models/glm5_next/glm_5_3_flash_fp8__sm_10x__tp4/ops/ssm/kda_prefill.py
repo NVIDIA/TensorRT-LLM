@@ -53,7 +53,7 @@ class KdaPrefill(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100})
     # GLM-5.3-Flash's KDA at TP4 (16 of 64 heads). The op's own edges; the prefill steps the shipped target runs
-    # (engine route, scheduler-planned metadata) are in this entry's test.
+    # (auto route, scheduler-planned metadata) are in this entry's test.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="auto route without planned metadata: on-device schedule, ragged lengths, empty sequence",

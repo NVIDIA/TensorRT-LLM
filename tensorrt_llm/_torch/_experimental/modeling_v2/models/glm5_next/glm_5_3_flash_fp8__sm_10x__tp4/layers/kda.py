@@ -74,12 +74,6 @@ _GATE_ROWS_ALIGN = 8
 #: Captured generation steps of at most this many rows run the gate projections on the aux
 #: stream beside the ``[q; k; v]`` GEMM.
 _OVERLAP_MAX_ROWS = 128
-#: KDA prefill takes the persistent engine route: the chunk-decomposed route, which the auto
-#: router picks whenever 2 * sequences * heads fits the SMs (16 heads per rank and FP32 state
-#: here), can stall one CTA of ``kernel_chain_dv2`` on its mbarrier pipeline under serving load
-#: (alternating 1- and 8-request 13K-token prefills) and hang every rank at the next collective.
-#: Return to the auto route once that route passes the same alternating serving load.
-_PREFILL_ROUTE = "engine"
 
 
 @dataclass
@@ -313,7 +307,7 @@ class KdaLayer:
             dt_bias=w.dt_bias,
             scale=self.scale,
             lower_bound=self.lower_bound,
-            mode=_PREFILL_ROUTE,
+            mode="auto",
             max_seqlen=hybrid.kda_max_seqlen,
             seq_order=hybrid.kda_seq_order,
             cu_chunks=hybrid.kda_cu_chunks,
