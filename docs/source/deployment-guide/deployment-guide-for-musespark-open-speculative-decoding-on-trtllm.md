@@ -13,7 +13,7 @@ SA drafts by matching the request's own token history: it needs no draft model a
 
 ## Recipe
 
-Start from the recommended configuration in the [deployment guide](deployment-guide-for-musespark-open-on-trtllm.md#recommended-performance-settings) (`examples/musespark_open/serve_config.yaml`) and add:
+Start from the recommended configuration in the [deployment guide](deployment-guide-for-musespark-open-on-trtllm.md#recommended-performance-settings) (`examples/configs/curated/musespark-open.yaml`) and add:
 
 ```yaml
 speculative_config:

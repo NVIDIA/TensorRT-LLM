@@ -74,7 +74,7 @@ If you want to use latest main branch, you can choose to build from source to in
 
 **Treat these as a starting point and tune the parameters for your workload.**
 
-Create a YAML configuration file. The settings below are the validated TP4/EP4 aggregated serving configuration, matching `examples/musespark_open/serve_config.yaml`:
+Create a YAML configuration file. The settings below are the validated TP4/EP4 aggregated serving configuration, matching the curated recipe `examples/configs/curated/musespark-open.yaml`, which the recipe selector on the Model Recipes page also offers:
 
 ```shell
 EXTRA_LLM_API_FILE=/path/to/musespark-open-config.yml
