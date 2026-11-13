@@ -19,7 +19,6 @@ import pytest
 import torch
 from fmha_test_utils import FakeAttention
 
-from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
 )
@@ -123,16 +122,6 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
         if expect_fallback:
             assert "small-batch BF16 context attention" in reason
 
-    # Reject P128 at the fallback boundary even if TRTLLM-Gen rejects for
-    # another reason; generation-only and ordinary context remain usable.
-    fallback = FallbackFmha(attn)
-    for phase in phases:
-        if paged_context and num_contexts and phase != FmhaPhase.GENERATION:
-            with pytest.raises(RuntimeError, match="128-token KV pages"):
-                fallback.is_supported(q, None, None, metadata, forward_args, phase=phase)
-        else:
-            assert fallback.is_supported(q, None, None, metadata, forward_args, phase=phase)
-
 
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize(
@@ -202,7 +191,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
 
         if attention_mask == CustomAttentionMask.CUSTOM:
             assert not supported
-            assert "unsupported attention mask" in reason
+            assert "custom mask" in reason
         else:
             assert supported, reason
             assert reason == ""

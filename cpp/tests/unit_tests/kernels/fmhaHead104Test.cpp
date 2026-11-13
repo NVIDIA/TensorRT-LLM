@@ -29,7 +29,7 @@
 #include <cuda_fp16.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/fmhaDispatcher.h"
+#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 
 namespace
 {
@@ -175,8 +175,9 @@ protected:
         fixed.headSize = kHeadDim;
         fixed.headSizeV = kHeadDim;
         fixed.qScaling = kQScaling;
-        tk::FmhaDispatcher dispatcher(fixed);
-        ASSERT_TRUE(dispatcher.isSupported());
+        // fmha_v2 serves these head-104 configurations on every SM, SM100f included.
+        tk::FusedMHARunnerV2 runner(fixed);
+        ASSERT_TRUE(runner.isFmhaSupported());
 
         auto* output = allocate<T>(outputSize);
         TLLM_CUDA_CHECK(cudaMemset(output, 0xff, outputSize * sizeof(T)));
@@ -195,8 +196,7 @@ protected:
         params.tileCounterPtr = upload<int>({0});
         params.forceFp32Acc = test.forceRuntime;
         params.stream = mStream;
-        // Direct dispatch must launch a fused kernel; there is no unfused implementation in this test.
-        dispatcher.run(params);
+        runner.run(params);
         TLLM_CUDA_CHECK(cudaStreamSynchronize(mStream));
 
         std::vector<T> actual(outputSize);

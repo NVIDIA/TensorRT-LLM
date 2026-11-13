@@ -345,6 +345,83 @@ class PhasedFmha(Fmha):
         params.num_requests = num_seqs
         return params
 
+    def generation_params(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+        total_num_blocks: int,
+        num_gen_tokens: int,
+        params: Optional[FmhaParams] = None,
+    ) -> FmhaParams:
+        """FmhaParams of the generation phase of a call.
+
+        Args:
+            q, k, v: The call's inputs [num_tokens, ...], context tokens first; k / v None with fused QKV.
+            metadata: The generation phase is its num_generations sequences after the num_contexts ones.
+            forward_args: The call's arguments; its output [num_tokens, ...] is written.
+            workspace: The call's attention workspace.
+            total_num_blocks: _get_total_num_blocks(metadata), or 0 without NEEDS_BLOCK_EXTENT.
+            num_gen_tokens: Generation tokens of the call.
+            params: The call's context-phase params to fill in place, or None for new ones.
+        """
+        if params is None:
+            params = self._shared_params(
+                metadata, forward_args, workspace, total_num_blocks, num_gen_tokens
+            )
+        num_tokens = q.shape[0]
+        is_gen_only = forward_args.attention_input_type == AttentionInputType.generation_only
+        fused_epilogue = forward_args.enable_dsv4_epilogue_fusion
+        out_tensor = self._out_tensor(forward_args.output, num_tokens, is_gen_only, fused_epilogue)
+        is_fused_qkv = forward_args.is_fused_qkv
+        seq_offset = metadata.num_contexts
+        token_offset = 0 if is_gen_only else metadata.num_ctx_tokens
+        num_seqs = metadata.num_generations
+
+        max_past_kv_len = int(metadata.kv_lens_runtime[seq_offset : seq_offset + num_seqs].max())
+        input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
+
+        params.use_spec_decoding = metadata.is_spec_decoding_enabled and metadata.use_spec_decoding
+        if params.use_spec_decoding:
+            params.spec_decoding_generation_lengths = metadata.spec_decoding_generation_lengths
+            params.spec_decoding_position_offsets = get_spec_decoding_position_offsets(metadata)
+            params.spec_decoding_packed_mask = metadata.spec_decoding_packed_mask
+            params.spec_decoding_bl_tree_mask_offset = metadata.spec_decoding_bl_tree_mask_offset
+            params.spec_decoding_bl_tree_mask = metadata.spec_decoding_bl_tree_mask
+            params.spec_bl_tree_first_sparse_mask_offset_kv = (
+                metadata.spec_bl_tree_first_sparse_mask_offset_kv
+            )
+
+        phase_input = q[token_offset : token_offset + num_gen_tokens]
+        params.qkv_input = phase_input if is_fused_qkv else None
+        params.query_input = None if is_fused_qkv else phase_input
+        params.key_input = (
+            k[token_offset : token_offset + num_gen_tokens] if k is not None else None
+        )
+        params.value_input = (
+            v[token_offset : token_offset + num_gen_tokens] if v is not None else None
+        )
+        params.output = (
+            out_tensor
+            if fused_epilogue
+            else out_tensor[token_offset : token_offset + num_gen_tokens]
+        )
+        params.sequence_lengths = metadata.kv_lens_cuda_runtime[seq_offset:]
+        params.context_lengths = metadata.prompt_lens_cuda_runtime[
+            seq_offset : seq_offset + num_seqs
+        ]
+        params.max_past_kv_length = max_past_kv_len
+        params.num_tokens = num_gen_tokens
+        params.seq_offset = seq_offset
+        params.token_offset = token_offset
+        params.input_seq_length = input_seq_length
+        params.batch_size = num_seqs
+        params.num_requests = num_seqs // metadata.beam_width
+        return params
+
     def forward(
         self,
         q: torch.Tensor,
@@ -394,7 +471,6 @@ class PhasedFmha(Fmha):
 
         total_num_blocks = self._get_total_num_blocks(metadata) if self.NEEDS_BLOCK_EXTENT else 0
         phase_num_gen_tokens = num_gen_tokens if has_generation else 0
-        sequence_length = metadata.kv_lens_cuda_runtime
         host_past_key_value_lengths = metadata.kv_lens_runtime
 
         params = None
@@ -418,61 +494,17 @@ class PhasedFmha(Fmha):
                 self.run_context(params)
 
         if has_generation:
-            if params is None:
-                params = self._shared_params(
-                    metadata, forward_args, workspace, total_num_blocks, phase_num_gen_tokens
-                )
-            out_tensor = self._out_tensor(output, num_tokens, is_gen_only, fused_epilogue)
-            is_fused_qkv = forward_args.is_fused_qkv
-            seq_offset = num_contexts
-            token_offset = 0 if is_gen_only else num_ctx_tokens
-            num_seqs = num_generations
-
-            max_past_kv_len = int(
-                host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
+            params = self.generation_params(
+                q,
+                k,
+                v,
+                metadata,
+                forward_args,
+                workspace,
+                total_num_blocks,
+                num_gen_tokens,
+                params,
             )
-            input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
-
-            params.use_spec_decoding = (
-                metadata.is_spec_decoding_enabled and metadata.use_spec_decoding
-            )
-            if params.use_spec_decoding:
-                params.spec_decoding_generation_lengths = metadata.spec_decoding_generation_lengths
-                params.spec_decoding_position_offsets = get_spec_decoding_position_offsets(metadata)
-                params.spec_decoding_packed_mask = metadata.spec_decoding_packed_mask
-                params.spec_decoding_bl_tree_mask_offset = (
-                    metadata.spec_decoding_bl_tree_mask_offset
-                )
-                params.spec_decoding_bl_tree_mask = metadata.spec_decoding_bl_tree_mask
-                params.spec_bl_tree_first_sparse_mask_offset_kv = (
-                    metadata.spec_bl_tree_first_sparse_mask_offset_kv
-                )
-
-            phase_input = q[token_offset : token_offset + num_gen_tokens]
-            params.qkv_input = phase_input if is_fused_qkv else None
-            params.query_input = None if is_fused_qkv else phase_input
-            params.key_input = (
-                k[token_offset : token_offset + num_gen_tokens] if k is not None else None
-            )
-            params.value_input = (
-                v[token_offset : token_offset + num_gen_tokens] if v is not None else None
-            )
-            params.output = (
-                out_tensor
-                if fused_epilogue
-                else out_tensor[token_offset : token_offset + num_gen_tokens]
-            )
-            params.sequence_lengths = sequence_length[seq_offset:]
-            params.context_lengths = metadata.prompt_lens_cuda_runtime[
-                seq_offset : seq_offset + num_seqs
-            ]
-            params.max_past_kv_length = max_past_kv_len
-            params.num_tokens = num_gen_tokens
-            params.seq_offset = seq_offset
-            params.token_offset = token_offset
-            params.input_seq_length = input_seq_length
-            params.batch_size = num_seqs
-            params.num_requests = num_seqs // metadata.beam_width
             if attn.is_mla_enable:
                 self.run_mla_generation(params)
             else:

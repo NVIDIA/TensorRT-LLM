@@ -7167,7 +7167,7 @@ def test_encoder_no_kv_cache_boundaries() -> None:
     ctx = env.random_qkv(40)
     _compare(env.call_op(ctx, [40], 1, [0], MASK_CAUSAL), _op_reference(env, ctx, [40], [0]))
     env.check_cache(0)
-    with pytest.raises(RuntimeError, match="unsupported head_size 72"):
+    with pytest.raises(RuntimeError, match="No native FMHA library supports this generation call"):
         env.call_op(env.random_qkv(1), [1], 0, [0], MASK_CAUSAL, record=False)
 
     _compare(

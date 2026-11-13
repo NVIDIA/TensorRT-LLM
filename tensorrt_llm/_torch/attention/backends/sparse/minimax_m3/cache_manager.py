@@ -751,7 +751,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # Native layers run at the target's 128-token pages. trtllm-gen has P128
         # kernels for their dense-GQA shapes but not for every shape, so opt in
         # here rather than in the global allowlist. On SM107 this opt-in is the
-        # only route for these layers: FallbackFmha has no P128 paged-context kernels.
+        # only route for these layers: the native FMHA libraries have no P128 paged-context kernels.
         if self.tokens_per_block == 128:
             # On SM107 the dense layers keep SDPA (see the model's native dense attention
             # setup), so only the shared draft layers need the route there.

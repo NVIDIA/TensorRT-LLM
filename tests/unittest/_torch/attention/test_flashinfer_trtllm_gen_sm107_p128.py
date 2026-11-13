@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """FlashInfer TRTLLM-Gen FMHA at 128-token pages on SM107 (Rubin).
 
-On SM107 the FallbackFmha (thop) has no paged-context kernels for 128-token pages,
+On SM107 the native FMHA libraries (thop) have no paged-context kernels for 128-token pages,
 so the MiniMax-M3 KV managers list 128 as a TRTLLM-Gen extra page size and
 FlashInferTrtllmGenFmha serves those steps (and only those). These tests run the
 real forward at the MiniMax-M3 Eagle3 draft layer shape (16 q : 1 kv head,
 head dim 128, BF16 Q / output) with BF16 and FP8 KV and check, for every step:
 
-- FlashInfer served it (run_context / run_generation) and FallbackFmha did not;
+- FlashInfer served it (run_context / run_generation) and no native library did;
 - the output is within a tolerance of an FP32 reference built from the pool
   contents (FlashInfer is precision-equivalent to the thop P32 kernels, not
   bitwise, so there is no bit-exact oracle);
@@ -28,8 +28,8 @@ import pytest
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention.backends.fmha import fallback
 from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi_mod
+from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
     PredefinedAttentionMask,
@@ -100,7 +100,7 @@ def served(monkeypatch):
     for cls, name, key in (
         (fi_mod.FlashInferTrtllmGenFmha, "run_context", "fi_ctx"),
         (fi_mod.FlashInferTrtllmGenFmha, "run_generation", "fi_gen"),
-        (fallback.FallbackFmha, "forward", "fallback"),
+        *((native_cls, "forward", "fallback") for native_cls in NATIVE_FMHA_LIBS),
     ):
         original = getattr(cls, name)
 

@@ -44,7 +44,11 @@ public:
      * TODO: shouldUse()/prepare() should be templated with KVCacheBuffer.
      * Whether it is beneficial to use this XQA codepath.
      */
-    bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
+    [[nodiscard]] bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
+    //! Whether DecoderXQARunner supports xqaParams.
+    [[nodiscard]] bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
+    //! Whether XQA is expected to outrun MMHA for xqaParams; shouldUse() also requires supportConfig().
+    [[nodiscard]] bool hasPerfGain(XQAParams const& xqaParams) const;
     // Prepares for the kernel running. Must be called before calling run.
     void prepare(XQAParams const& xqaParams);
 
@@ -64,8 +68,6 @@ private:
     //! Whether DecoderXQARunner needs to compile 2 sets (tilesize = 16, 32) kernels for spec-dec
     bool needHMMASpecDec(XQAParams const& xqaParams, bool forConfigurePlugin) const;
 
-    //! Whether DecoderXQARunner supports xqaParams.
-    bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
     //! Whether DecoderXQARunner has perf gain over the default (non-XQA-optimized) implementation.
     bool mayHavePerfGain(XQAParams const& xqaParams) const;
 

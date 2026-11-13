@@ -31,6 +31,7 @@ import torch
 from utils.block_causal_reference import exact_reference as _exact_reference
 from utils.block_causal_reference import reference_attention
 
+from tensorrt_llm._torch.attention.backends.fmha import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
@@ -241,12 +242,12 @@ def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_bloc
 def expected_fmha_library(dtype, num_causal_blocks):
     """The FMHA library the TRTLLM backend should pick for a cached forward. On
     SM100/SM103 FlashInfer's TRTLLM-Gen kernels serve it, except a BF16 context batch
-    of at most 4 requests (one per causal block), which goes to the fallback for LLM
-    time to first token. Elsewhere only the fallback is available."""
+    of at most 4 requests (one per causal block), which goes to the native libraries for
+    LLM time to first token. Elsewhere only the native libraries are available."""
     if get_sm_version() not in (100, 103):
-        return "FallbackFmha"
+        return "native"
     if dtype == torch.bfloat16 and num_causal_blocks <= 4:
-        return "FallbackFmha"
+        return "native"
     return "FlashInferTrtllmGenFmha"
 
 
@@ -257,7 +258,7 @@ def record_fmha_libraries(attn, served):
 
     def recording_select(*args, **kwargs):
         fmha = select(*args, **kwargs)
-        served.add(type(fmha).__name__)
+        served.add("native" if isinstance(fmha, NATIVE_FMHA_LIBS) else type(fmha).__name__)
         return fmha
 
     manager.select = recording_select

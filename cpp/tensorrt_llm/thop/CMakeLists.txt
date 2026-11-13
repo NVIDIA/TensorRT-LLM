@@ -53,6 +53,7 @@ add_th_common_family(
   th_common_attention
   mlaPreprocessOp.cpp
   attentionOp.cpp
+  phasedFmha.cpp
   fmhaPackMaskOp.cpp
   deepseekV4BlockTableOp.cpp
   inverseRopeFp8QuantOp.cpp
