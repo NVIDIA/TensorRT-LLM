@@ -290,7 +290,11 @@ __global__ void __launch_bounds__(1024) s2_moe_tail_kernel(Params params)
         cudaTriggerProgrammaticLaunchCompletion();
     }
     LamportComm<NRanks> comm(params.workspace, params.rank);
-    int const clear_access = comm.clear_size / kElems;
+    // The workspace's clear size is in bytes: every Lamport kernel sharing it (the built-in one-shot all-reduce fusion
+    // included) clears exactly the bytes the previous call wrote, rounded up to whole 16-byte stores, and leaves its
+    // own byte count (comm.update below). Any other unit leaves stale words that a later call on the same sub-buffer
+    // takes as already arrived.
+    int const clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
 
     for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
     {
@@ -357,7 +361,7 @@ __global__ void __launch_bounds__(1024) s2_moe_tail_kernel(Params params)
         reinterpret_cast<uint8_t*>(params.scale_out)[off] = 0;
     }
 
-    comm.update(static_cast<int64_t>(params.size) * NRanks);
+    comm.update(static_cast<int64_t>(params.size) * NRanks * sizeof(__nv_bfloat16));
     if constexpr (TriggerCompletionAtEnd)
     {
         __threadfence();
