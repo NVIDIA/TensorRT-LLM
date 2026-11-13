@@ -860,9 +860,10 @@ class MultimodalConfig(StrictBaseModel):
          "still use the model-owned cache and its capacity is at least one legal "
          "encoder iteration; this value can make that cache larger. String values "
          "such as '512MB' and '1GiB' use binary units. Both inline encoding and "
-         "item scheduling cache individual items; inline caching supports only "
-         "single-modality parameters. "
-         "Compatible with side-stream prefetch."),
+         "item scheduling cache individual items, including those of "
+         "mixed-modality requests. "
+         "Compatible with side-stream prefetch, which requires inline encoding "
+         "(item scheduling rejects it)."),
         status="prototype",
     )
 

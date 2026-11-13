@@ -938,9 +938,9 @@ class MultimodalParams:
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
-    # When set, the consume site in `get_multimodal_embeddings` issues a
-    # `wait_event` and records attached embeddings on the current stream before
-    # reading them.
+    # Input preparation waits on it and records the request's CUDA tensors on
+    # its stream when the chunk reads them; the consume site in
+    # `get_multimodal_embeddings` waits on it again before reading them.
     # Always `None` unless side-stream prefetch is enabled and a prefetch ran.
     encoder_event: Optional[torch.cuda.Event] = field(default=None,
                                                       repr=False,

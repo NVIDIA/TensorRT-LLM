@@ -10821,8 +10821,8 @@ class PyExecutor:
         outstanding-ahead cap in `maybe_prefetch_mm_encoder_for_next_iter`.
         That helper runs the encoder on a side CUDA stream and stashes
         results back into `request.py_multimodal_data`. The next iteration's
-        `_prepare_inputs` then picks up the cached embedding and the mixin
-        consume site waits on the recorded CUDA event.
+        `_prepare_inputs` then waits on the recorded CUDA event and picks
+        up the cached embedding.
 
         Shared between `_executor_loop` (non-overlap) and
         `_executor_loop_overlap`. `self.previous_batch` is always None in
