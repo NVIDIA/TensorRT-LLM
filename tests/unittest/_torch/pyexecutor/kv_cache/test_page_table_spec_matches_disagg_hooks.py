@@ -424,6 +424,17 @@ def test_hybrid_manager_without_recurrent_layers_lays_out_its_kv_alone():
     assert spec.layout_of(str(conv)) is None and spec.layout_of(str(ssm)) is None
 
 
+def test_hybrid_manager_s_replay_state_never_moves():
+    replay_role = DataRole("mamba_test_replay")
+    manager = _hybrid(
+        MambaHybridCacheManagerV2, _replay_layouts={0: {replay_role: (torch.float16, (4, 8, 8))}}
+    )
+
+    spec = assert_spec_matches_disagg_hooks(manager, (*KV_ROLES, *STATE_ROLES, replay_role))
+
+    assert str(replay_role) in spec.untransferred_roles
+
+
 def test_qwen4_exp_side_caches_are_alike_on_every_rank():
     roles = (PLE_CONV_STATE, PLE_NGRAM_CONTEXT, QSA_INDEX_POSITION, QSA_SIDE_PLANES)
 
@@ -438,8 +449,8 @@ def test_qwen4_exp_side_caches_are_alike_on_every_rank():
 @pytest.mark.parametrize("kda_replay", [False, True])
 def test_kda_replay_caches_never_move(manager_cls, kda_replay):
     replay_role = DataRole("kda_test_replay")
-    replay = SimpleNamespace(disagg_ignored_roles=lambda layout: frozenset({replay_role}))
-    manager = _hybrid(manager_cls, _kda_replay=replay if kda_replay else None, _state_layout=None)
+    replay = SimpleNamespace(roles=frozenset({replay_role}))
+    manager = _hybrid(manager_cls, _kda_replay_region=replay if kda_replay else None)
     # Without replay the manager registers no replay cache.
     roles = (*KV_ROLES, *STATE_ROLES, *((replay_role,) if kda_replay else ()))
     if manager_cls is Glm5NextCacheManager:
