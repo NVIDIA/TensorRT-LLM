@@ -519,3 +519,11 @@ That boundary may move as models need more customization. Model-specific
 runtime policy can be split from shared services, but a change to common
 runtime behavior still has to work for every other model. How to specialize
 the runtime further is still being designed.
+
+### Beam diagnostic validation
+
+For Beam, `TRTLLM_MODELING_V2_VALIDATE=1` additionally enables repeated per-layer
+metadata checks and per-step, all-rank routing agreement using device-to-host copies
+and SHA-256 hashes. The serving adapter also enables checkpoint digests in this mode.
+This is expensive diagnostic behavior, not only a first-forward contract check.
+Use the same setting on every rank and leave it disabled for performance measurements.

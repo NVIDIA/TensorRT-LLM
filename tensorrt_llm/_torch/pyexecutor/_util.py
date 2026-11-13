@@ -1331,6 +1331,7 @@ class KvCacheCreator:
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
                 is_disagg=self._is_disagg,
+                disable_overlap_scheduler=self._disable_overlap_scheduler,
                 **extra_kwargs))
         if include_request_cost:
             if cost.bytes_per_request is None:

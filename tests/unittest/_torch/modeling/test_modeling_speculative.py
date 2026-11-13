@@ -865,6 +865,10 @@ def test_dflash_workspace_counts_folded_queries_once(folded: bool) -> None:
         [(2048 * 4, 8), (2048, 8 * 4)] if folded else [(2048 * 4, 8)]
     )
     assert all(call.kwargs["num_tokens"] == call.kwargs["num_gen_tokens"] for call in calls)
+    counter_calls = wrapper._dflash_trtllm_gen_ops.get_multi_ctas_kv_counter_size.call_args_list
+    assert [call.args for call in counter_calls] == (
+        [(8 * 4, 2048, 148)] if folded else [(8, 2048, 148)]
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -904,3 +908,5 @@ def test_dflash_workspace_sizes_the_largest_folded_chunk(
         (3 * block, heads),
         (3, heads * chunk),
     ]
+    counter_calls = wrapper._dflash_trtllm_gen_ops.get_multi_ctas_kv_counter_size.call_args_list
+    assert [call.args for call in counter_calls] == [(heads * chunk, 3, 148)]

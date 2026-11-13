@@ -2579,11 +2579,10 @@ class AutoTuner:
             # Each rank of the tuning group only tunes its share of tactics;
             # _merge_cache_data then keeps the fastest across the group.
             group_size, group_index = self._tuning_group()
-            tactics = [
+            return [
                 tactic for idx, tactic in enumerate(all_valid_tactics)
                 if (offset + idx) % group_size == group_index
             ]
-            return tactics
         else:
             return all_valid_tactics
 

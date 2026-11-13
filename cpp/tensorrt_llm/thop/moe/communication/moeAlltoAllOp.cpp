@@ -74,7 +74,7 @@ static constexpr size_t CACHELINE_ALIGNMENT = 128;
 //
 // The MoE all-to-all workspace setup used tensorrt_llm::mpi::MpiComm directly.
 // mpiUtils.h throws "MPI is disabled, DON'T USE MPI" whenever TLLM_DISABLE_MPI=1,
-// which the Ray executor sets for every worker (executor/ray_executor.py), so the
+// which the Ray executor sets for every worker (tensorrt_llm/executor/ray/executor.py), so the
 // NVLinkOneSided strategy always failed there and silently degraded to
 // NVLinkTwoSided. Route through the Torch process group in that case; the same
 // pattern is already used by cacheTransceiver / allreduceOp via pg_utils.

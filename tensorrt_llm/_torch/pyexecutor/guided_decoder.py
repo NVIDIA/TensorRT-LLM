@@ -581,6 +581,20 @@ class CapturableGuidedDecoder(GuidedDecoder):
         if not torch.cuda.is_current_stream_capturing():
             self.bitmask_event.synchronize()
 
+    def reset_warmup_state(self) -> None:
+        """Discard abandoned dummy batches after an eager warmup failure.
+
+        Only call during warmup, with no live requests or graph capture. Wait
+        on the stream itself: a failed forward may have enqueued callbacks
+        without reaching the bitmask-event record. Once they finish, no
+        callback can consume or overwrite the cleared request snapshots.
+        Warmup dummies have no grammar matchers to roll back.
+        """
+        self.stream.synchronize()
+        self.queue = Queue()
+        self.requests = None
+        self.requests_hostfunc = None
+
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,

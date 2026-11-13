@@ -1219,6 +1219,8 @@ def _make_encoder_fallback_batch_wait_executor():
     executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = None
+    executor.model_engine.encoder_batch_size = 8
+    executor.model_engine.encoder_max_num_tokens = 32
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
@@ -3174,6 +3176,7 @@ class _StubADPExecutor:
         self.expected_num_active_requests = 1
         self.max_num_active_requests = 8
         self.max_total_draft_tokens = 0
+        self.enable_joint_kv_cache_reuse = False
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None

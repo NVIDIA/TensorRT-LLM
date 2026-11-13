@@ -2487,8 +2487,9 @@ class PyExecutor:
         """Stop a profiling phase and detach resources before cache replacement.
 
         Call collectively after consuming profiling responses. Graph destruction
-        precedes workspace release, and transfer registrations precede cache
-        release. Model engines, weights and the execution stream remain valid.
+        precedes workspace release. Transfers drain before cache release, while
+        deferred registrations are released after the pools are unmapped. Model
+        engines, weights and the execution stream remain valid.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")
@@ -2636,6 +2637,16 @@ class PyExecutor:
             # synchronization and allocator teardown can touch DMA-owned memory
             # or hang on a failed device, so retain the whole execution state.
             return False
+        if release_model_owned_graphs:
+            # The C++ MoE runners are cached for the whole process and keep
+            # their GPU workspaces between calls, so a later executor in the
+            # same process would start with them still allocated. Release them
+            # before the graphs below: a workspace captured into a graph's
+            # memory pool must be freed while that pool still exists. They are
+            # re-allocated on next use.
+            from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+                MoERunner
+            MoERunner.clear_all_workspaces()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
@@ -2652,11 +2663,14 @@ class PyExecutor:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         if self.kv_cache_transceiver is not None:
-            self.kv_cache_transceiver.shutdown()
+            self.kv_cache_transceiver.prepare_shutdown()
         if self.resource_manager is not None:
             for manager in self.resource_manager.resource_managers.values():
                 if manager:
                     manager.shutdown()
+        if self.kv_cache_transceiver is not None:
+            # Backends that defer deregistration release it after the pools.
+            self.kv_cache_transceiver.shutdown()
         # Retry a later failure without repeating request publication, graph
         # release, or resource-manager shutdown.
         self._shutdown_runtime_complete = True
@@ -5248,13 +5262,14 @@ class PyExecutor:
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
         self.kv_cache_manager.free_resources(dummy_request)
-        # The V2 scheduler also admits the draft pool's mirror while it
-        # schedules the dummy (KVCacheV2Scheduler._admit_unpaired_draft), so
-        # that pool holds an empty cache under the dummy ID too. Left behind,
-        # it outlives this dummy, and the deferred previous batch -- which
-        # still holds the earlier, finished dummy with the same ID -- resizes
-        # it to that dummy's history in update_resources ("History length
-        # cannot exceed capacity").
+        # The draft pool holds a cache under the dummy ID too: a paired pool
+        # gets it with the dummy (add_dummy_requests), and the V2 scheduler
+        # admits an unpaired pool's mirror while it schedules the dummy
+        # (KVCacheV2Scheduler._admit_unpaired_draft). Left behind, it outlives
+        # this dummy, and the deferred previous batch -- which still holds the
+        # earlier, finished dummy with the same ID -- resizes it to that
+        # dummy's history in update_resources ("History length cannot exceed
+        # capacity").
         draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
         if (getattr(self, "_is_kv_manager_v2", False)
                 and draft_kv_cache_manager is not None):
@@ -8777,7 +8792,14 @@ class PyExecutor:
         decoder-context requests are already coalesced and must not wait for a
         second window. CUDA-graph microbatch admission returns at most one
         supported graph batch so scheduler overfill cannot turn a target-eight
-        batch into an eager batch of nine or more requests.
+        batch into an eager batch of nine or more requests. The encoder step
+        limits are applied afterwards (_fit_encoder_requests_to_encoder_step):
+        when the variable-length encoder inputs of a graph batch exceed
+        encoder_max_num_tokens, the batch is cut to fit, and its encoder step
+        may then run without a captured graph. The token-threshold path also
+        releases the requests once they fill one encoder step
+        (encoder_max_batch_size requests or encoder_max_num_tokens tokens),
+        since waiting cannot make that step larger.
         """
         if not encoder_requests:
             self.encoder_batch_wait_iters_count = 0
@@ -8821,19 +8843,22 @@ class PyExecutor:
                 self.encoder_batch_wait_iters_count += 1
                 return []
 
-        num_scheduled_tokens = sum(request.encoder_output_len
-                                   for request in encoder_requests)
-        num_scheduled_tokens += sum(1 + request.num_draft_tokens
-                                    for request in generation_requests)
+        num_encoder_tokens = sum(request.encoder_output_len
+                                 for request in encoder_requests)
+        num_scheduled_tokens = num_encoder_tokens + sum(
+            1 + request.num_draft_tokens for request in generation_requests)
         has_decoder_work = bool(context_requests or generation_requests)
         if not has_decoder_work:
             has_decoder_work = any(
                 request.request_id in self.inflight_req_ids
                 and request.state != LlmRequestState.ENCODER_INIT
                 for request in self.active_requests)
-        should_wait = (has_decoder_work and self.encoder_batch_wait_iters_count
-                       < self.batch_wait_timeout_iters and num_scheduled_tokens
-                       < self.batch_wait_max_tokens_ratio * self.max_num_tokens)
+        should_wait = (
+            has_decoder_work and self.encoder_batch_wait_iters_count
+            < self.batch_wait_timeout_iters and num_scheduled_tokens
+            < self.batch_wait_max_tokens_ratio * self.max_num_tokens
+            and len(encoder_requests) < self.model_engine.encoder_batch_size
+            and num_encoder_tokens < self.model_engine.encoder_max_num_tokens)
         if should_wait:
             self.encoder_batch_wait_iters_count += 1
             return []
@@ -8937,6 +8962,56 @@ class PyExecutor:
                 return context_requests[:i]
         return context_requests
 
+    def _encoder_requests_in_arrival_order(
+            self, encoder_requests: list[LlmRequest]) -> list[LlmRequest]:
+        """Order scheduled encoder requests as they are in active_requests.
+
+        Encoder batch waiting and the encoder step limits keep a prefix of
+        these requests and defer the rest, so the oldest must come first. The
+        C++ micro-batch scheduler sorts its output with an unstable sort and
+        does not keep this order. The schedulers' grouping by LoRA task id is
+        not kept either: the encoder step has no LoRA path.
+        """
+        if len(encoder_requests) <= 1:
+            return encoder_requests
+        position = {
+            request.py_request_id: index
+            for index, request in enumerate(self.active_requests)
+        }
+        return sorted(encoder_requests,
+                      key=lambda request: position[request.py_request_id])
+
+    def _fit_encoder_requests_to_encoder_step(
+            self, encoder_requests: list[LlmRequest]) -> list[LlmRequest]:
+        """Trim encoder requests to what one encoder step can run.
+
+        The schedulers pack encoder requests against max_num_tokens and
+        max_batch_size, while the encoder step runs at most
+        encoder_max_num_tokens tokens of at most encoder_max_batch_size
+        requests (each falls back to the decoder-side value when unset). Keep
+        the longest prefix within both limits. The first request is always
+        kept: admission rejects an encoder input longer than
+        encoder_max_num_tokens. Deferred requests stay in ENCODER_INIT and are
+        scheduled again next iteration.
+        """
+        if len(encoder_requests) <= 1:
+            return encoder_requests
+        max_requests = self.model_engine.encoder_batch_size
+        max_tokens = self.model_engine.encoder_max_num_tokens
+        num_tokens = encoder_requests[0].encoder_output_len
+        for i in range(1, len(encoder_requests)):
+            num_tokens += encoder_requests[i].encoder_output_len
+            if i == max_requests:
+                limit = f"{max_requests} requests"
+            elif num_tokens > max_tokens:
+                limit = f"{max_tokens} encoder tokens"
+            else:
+                continue
+            logger.debug(f"Deferring {len(encoder_requests) - i} encoder "
+                         f"request(s): one encoder step runs at most {limit}.")
+            return encoder_requests[:i]
+        return encoder_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
@@ -8965,15 +9040,17 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             scheduling_requests, self.inflight_req_ids)
 
-        scheduled_encoder_requests = scheduler_output.encoder_requests
+        scheduled_encoder_requests = self._encoder_requests_in_arrival_order(
+            scheduler_output.encoder_requests)
         should_batch_encoder_requests = (self.is_encoder_decoder
                                          and not self.enable_attention_dp
                                          and self.enable_batch_waiting)
         if should_batch_encoder_requests:
             scheduled_encoder_requests = self._waiting_encoder_requests(
-                scheduler_output.encoder_requests,
-                scheduler_output.context_requests,
+                scheduled_encoder_requests, scheduler_output.context_requests,
                 scheduler_output.generation_requests)
+        scheduled_encoder_requests = self._fit_encoder_requests_to_encoder_step(
+            scheduled_encoder_requests)
 
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
@@ -9587,6 +9664,11 @@ class PyExecutor:
                 key="attention_dp_dummy_insufficient_kv_capacity")
             return
 
+        # A paired draft pool admits every scheduled request together with the
+        # target pool, so the dummy needs a cache in both.
+        draft_kv_cache_manager = (self.draft_kv_cache_manager
+                                  if self.enable_joint_kv_cache_reuse else None)
+
         if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             try:
@@ -9595,6 +9677,7 @@ class PyExecutor:
                     token_nums=token_nums,
                     is_gen=self._adp_dummy_is_gen,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -9613,7 +9696,13 @@ class PyExecutor:
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                try:
+                    spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                except NoFreeSlotsError:
+                    self.kv_cache_manager.free_resources(llm_request)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(llm_request)
+                    return
             self.active_requests.append(llm_request)
             return
 
@@ -9630,6 +9719,7 @@ class PyExecutor:
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -9646,6 +9736,8 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
                 self.kv_cache_manager.free_resources(dummy_request)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(dummy_request)
                 return
 
         assert dummy_request is not None
@@ -9721,6 +9813,11 @@ class PyExecutor:
             return
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        # Allocate the paired draft cache with the dummy, where a shortage
+        # degrades to an empty batch, rather than leaving it to the draft
+        # manager's prepare_resources mirror, which raises on one.
+        draft_kv_cache_manager = (self.draft_kv_cache_manager
+                                  if self.enable_joint_kv_cache_reuse else None)
         try:
             # Degrade to an empty batch rather than propagate: the ranks have
             # yet to agree on can_queue, so a rank-local raise would strand the
@@ -9731,6 +9828,7 @@ class PyExecutor:
                 is_gen=not context_dummy,
                 max_num_draft_tokens=(0 if context_dummy else
                                       self.max_total_draft_tokens),
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -9749,6 +9847,8 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
                 self.kv_cache_manager.free_resources(dummy_request)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(dummy_request)
                 return
 
         dummy_request.is_attention_dp_dummy = True

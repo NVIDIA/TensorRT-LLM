@@ -110,6 +110,22 @@ def _make_case(query_lens: list[int], seed: int, kv_dtype: torch.dtype = torch.b
     )
 
 
+def _kv_lens(positions: torch.Tensor, num_requests: int) -> torch.Tensor:
+    return (positions + 1).view(num_requests, -1)[:, -1].contiguous()
+
+
+def _sparse_gqa(q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs):
+    """Decode rows take per-request KV lengths; prefill rows take per-row metadata."""
+    if kwargs["is_decode"]:
+        seq_lens = _kv_lens(positions, block_table.shape[0])
+        return prims_ts_sparse_gqa(
+            q, k_cache, v_cache, block_table, block_ids, seq_lens=seq_lens, **kwargs
+        )
+    return prims_ts_sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+    )
+
+
 @pytest.mark.parametrize(
     ("query_lens", "is_decode"),
     [
@@ -133,7 +149,7 @@ def test_prims_ts_sparse_gqa_matches_reference(query_lens, is_decode) -> None:
     ) = _make_case(query_lens, seed=1234 + len(query_lens))
     softmax_scale = HEAD_DIM**-0.5
 
-    actual = prims_ts_sparse_gqa(
+    actual = _sparse_gqa(
         q,
         k_cache,
         v_cache,
@@ -375,7 +391,7 @@ def test_prims_ts_sparse_gqa_fp8_kv_matches_reference(is_decode) -> None:
         _make_case(query_lens, seed=4321, kv_dtype=torch.float8_e4m3fn)
     )
     softmax_scale = HEAD_DIM**-0.5
-    actual = prims_ts_sparse_gqa(
+    actual = _sparse_gqa(
         q,
         k_cache,
         v_cache,
@@ -413,13 +429,13 @@ def test_decode_graph_capture_replay(kv_dtype) -> None:
     )
     out = torch.empty_like(q)
     # Eager run prepares the plan; capture must not need the host afterwards.
-    prims_ts_sparse_gqa(
+    _sparse_gqa(
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, out=out, **kwargs
     )
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        prims_ts_sparse_gqa(
+        _sparse_gqa(
             q,
             k_cache,
             v_cache,
@@ -434,7 +450,7 @@ def test_decode_graph_capture_replay(kv_dtype) -> None:
     out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
-    eager = prims_ts_sparse_gqa(
+    eager = _sparse_gqa(
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
     )
     torch.cuda.synchronize()
@@ -451,18 +467,18 @@ def test_decode_rows_get_exact_plans() -> None:
     q, k_cache, v_cache, block_table, block_ids, request_indices, positions, selected, metadata = (
         _make_case([1] * 5, seed=7)
     )
-    prims_ts_sparse_gqa(
+    _sparse_gqa(
         q[:3],
         k_cache,
         v_cache,
-        block_table,
+        block_table[:3],
         block_ids[:3],
         request_indices[:3],
         positions[:3],
         **kwargs,
     )
     plans = len(_CORE._plans)
-    out = prims_ts_sparse_gqa(
+    out = _sparse_gqa(
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
     )
     assert len(_CORE._plans) == plans + 1
@@ -478,3 +494,134 @@ def test_decode_rows_get_exact_plans() -> None:
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_decode_rows_derive_requests_from_seq_lens() -> None:
+    _requires_prims_ts()
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=True
+    )
+    # Speculative verification: two consecutive rows per request.
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, selected, metadata = (
+        _make_case([2] * 4, seed=11)
+    )
+    seq_lens = _kv_lens(positions, 4)
+    out = prims_ts_sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, seq_lens=seq_lens, **kwargs
+    )
+    expected = qsa_sparse_gqa_reference(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+    with pytest.raises(ValueError, match="request-aligned"):
+        prims_ts_sparse_gqa(
+            q[:7], k_cache, v_cache, block_table, block_ids[:7], seq_lens=seq_lens, **kwargs
+        )
+    with pytest.raises(ValueError, match="seq_lens"):
+        prims_ts_sparse_gqa(
+            q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+        )
+
+
+_ARITY_ERROR = (
+    "Mismatched number of arguments when calling: `run_fixed(...)`. Expected {} but got 0 arguments"
+)
+
+
+def _metadata_module_raising(message: str, error_type: type[Exception]):
+    def run_fixed(*args):
+        raise error_type(message)
+
+    return lambda: SimpleNamespace(run_fixed=run_fixed)
+
+
+def test_metadata_module_probe_reports_mismatch(monkeypatch) -> None:
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
+
+    cases = (
+        (_ARITY_ERROR.format(prims_ts_core._METADATA_RUN_FIXED_ARGS), TypeError, None),
+        (_ARITY_ERROR.format(13), TypeError, "does not match the vendored tree"),
+        ("JIT compilation is disabled via FLASHINFER_DISABLE_JIT", RuntimeError, "unavailable"),
+    )
+    try:
+        for message, error_type, expected in cases:
+            monkeypatch.setattr(
+                fi_metadata,
+                "_get_prims_ts_q_token_kv_block_sparse_metadata_module",
+                _metadata_module_raising(message, error_type),
+            )
+            prims_ts_core._metadata_module_reason.cache_clear()
+            reason = prims_ts_core._metadata_module_reason()
+            if expected is None:
+                assert reason is None
+            else:
+                assert expected in reason and message in reason
+    finally:
+        prims_ts_core._metadata_module_reason.cache_clear()
+
+
+def test_metadata_module_build_failure_reports_unavailable(monkeypatch) -> None:
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
+
+    def build_and_load():
+        raise OSError("nvcc not found")
+
+    monkeypatch.setattr(
+        fi_metadata, "_get_prims_ts_q_token_kv_block_sparse_metadata_module", build_and_load
+    )
+    prims_ts_core._metadata_module_reason.cache_clear()
+    try:
+        reason = prims_ts_core._metadata_module_reason()
+        assert "unavailable" in reason and "nvcc not found" in reason
+    finally:
+        prims_ts_core._metadata_module_reason.cache_clear()
+
+
+def test_metadata_module_mismatch_falls_back_to_triton(monkeypatch) -> None:
+    _requires_prims_ts()
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
+
+    warnings = []
+    monkeypatch.setattr(
+        prims_ts_core,
+        "logger",
+        SimpleNamespace(warning_once=lambda *msg, key: warnings.append(key)),
+    )
+    monkeypatch.setattr(
+        fi_metadata,
+        "_get_prims_ts_q_token_kv_block_sparse_metadata_module",
+        _metadata_module_raising(_ARITY_ERROR.format(13), TypeError),
+    )
+    device = torch.device("cuda")
+    q = torch.empty(4, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_cache = torch.empty(1, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device)
+
+    def resolve(backend):
+        return prims_ts_core.resolve_sparse_core_backend(
+            _params(sparse_core_backend=backend),
+            q=q,
+            k_cache=k_cache,
+            page_size=PAGE_SIZE,
+            is_decode=True,
+            num_rows=4,
+        )
+
+    prims_ts_core._metadata_module_reason.cache_clear()
+    try:
+        assert resolve("auto") == "triton"
+        assert resolve("auto") == "triton"
+        assert warnings == ["qsa_prims_ts_unavailable", "qsa_prims_ts_unavailable"]
+        with pytest.raises(RuntimeError, match="does not match the vendored tree"):
+            resolve("prims_ts")
+    finally:
+        prims_ts_core._metadata_module_reason.cache_clear()
