@@ -12,6 +12,7 @@ mxfp8_quantize with the swizzled scale layout, as the MXFP8 linear method stores
 
 import functools
 from types import SimpleNamespace
+from typing import Literal
 
 import torch
 
@@ -187,14 +188,16 @@ def stock_shared(hidden: torch.Tensor) -> torch.Tensor:
     return torch.ops.trtllm.mxfp8_mxfp8_gemm(a2, s2, dn, dn_sf, one, torch.bfloat16)
 
 
-def check_full_output(op, state, m: int, seed: int) -> None:
+def check_full_output(
+    op, state, m: int, seed: int, *, case: Literal["random", "concentrated"] = "random"
+) -> None:
     """Exact: the engine's bf16(shared + routed) is the stock MoE block's shared_output.add_(routed_output) bit for bit
     (stock TRTLLM-Gen routed part on the engine's routing, stock MXFP8 shared expert)."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
         moe_route,
     )
 
-    layer = layer_for(state, "random", shared=True)
+    layer = layer_for(state, case, shared=True)
     hidden = hidden_states(m, seed=seed)
     out = op(hidden, layer)
     ids = state.route_dbg[:, :4].long()

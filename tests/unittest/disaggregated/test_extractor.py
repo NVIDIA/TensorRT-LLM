@@ -53,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     Mapping,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 
 class DummyRankInfo:
@@ -300,7 +301,9 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         pool_group_index=0,
         num_slots=4,
         pools=[
-            SimpleNamespace(pool_index=pi, base_address=base, slot_bytes=sb)
+            SimpleNamespace(
+                pool_index=pi, base_address=base, slot_bytes=sb, storage_medium=CacheTier.GPU_MEM
+            )
             for pi, sb in enumerate(slot_bytes_list)
         ],
         slot_desc=SimpleNamespace(
@@ -309,7 +312,9 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
     )
 
     impl = SimpleNamespace(
-        layer_grouping=((0, 1),),
+        buffer_grouping=(
+            [buffer for coalesced in coalesced_buffers for buffer in coalesced.buffer_ids],
+        ),
         init_config=SimpleNamespace(
             tokens_per_block=16,
             layers=[SimpleNamespace(window_size=None), SimpleNamespace(window_size=None)],
@@ -510,7 +515,7 @@ def test_v2_builder_resolves_mixed_precision_high_layer_heads(virtual_layers: bo
     }
     manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
     manager.layer_specs = None
-    manager.impl.layer_grouping = (high_layers,)
+    manager._layer_ids_by_group = [list(high_layers)]
     manager.impl.init_config.layers.extend(
         [SimpleNamespace(window_size=128), SimpleNamespace(window_size=128)]
     )
@@ -612,6 +617,48 @@ def test_v2_builder_splits_mixed_heads_without_view_partition() -> None:
     views = build_page_table_from_manager(manager).layer_groups[0].pool_views
     assert [view.num_kv_heads for view in views] == [2, 1]
     assert [get_unique_layers(view) for view in views] == [{0}, {1}]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("virtual_layers", [False, True])
+def test_v2_builder_resolves_mixed_precision_high_pool_heads(virtual_layers: bool) -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+        COMPRESSED = 1
+
+    high_layers = (3, 4) if virtual_layers else (2, 3)
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
+        )
+        for index, layer in enumerate(high_layers)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.impl.layer_grouping = (high_layers,)
+    manager.impl.init_config.layers = [
+        SimpleNamespace(window_size=None) for _ in range(high_layers[-1] + 1)
+    ]
+    manager.pp_layers = [20, 21]
+    manager.layer_offsets = {20: 0, 21: 1}
+    manager.num_kv_heads_per_layer = [2, 1]
+    manager.mixed_precision_high_layers = dict(enumerate(high_layers))
+    manager.get_disagg_global_layer_ids = lambda _: [41, 43]
+    if virtual_layers:
+        # Local model layer 1 owns the second high pool, while virtual storage layer 1
+        # belongs to model layer 20. Resolving the high owner through this map is wrong.
+        manager._layer_attn_to_layer_id = {
+            (20, AttentionKind.PRIMARY): 0,
+            (20, AttentionKind.COMPRESSED): 1,
+            (21, AttentionKind.PRIMARY): 2,
+        }
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert [view.num_kv_heads for view in views] == [2, 1]
+    assert [get_unique_layers(view) for view in views] == [{layer} for layer in high_layers]
 
 
 @pytest.mark.cpu_only
@@ -859,8 +906,12 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
         pool_group_index=0,
         num_slots=4,
         pools=[
-            SimpleNamespace(pool_index=0, base_address=0x10000, slot_bytes=256),
-            SimpleNamespace(pool_index=1, base_address=0x20000, slot_bytes=32),
+            SimpleNamespace(
+                pool_index=0, base_address=0x10000, slot_bytes=256, storage_medium=CacheTier.GPU_MEM
+            ),
+            SimpleNamespace(
+                pool_index=1, base_address=0x20000, slot_bytes=32, storage_medium=CacheTier.GPU_MEM
+            ),
         ],
         slot_desc=SimpleNamespace(
             variants=[
@@ -888,7 +939,11 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
     attention_pg = SimpleNamespace(
         pool_group_index=1,
         num_slots=8,
-        pools=[SimpleNamespace(pool_index=0, base_address=0x30000, slot_bytes=128)],
+        pools=[
+            SimpleNamespace(
+                pool_index=0, base_address=0x30000, slot_bytes=128, storage_medium=CacheTier.GPU_MEM
+            )
+        ],
         slot_desc=SimpleNamespace(
             variants=[
                 SimpleNamespace(
@@ -906,7 +961,15 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
 
     manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.impl = SimpleNamespace(
-        layer_grouping=((0, 1), (2,)),
+        buffer_grouping=tuple(
+            [
+                buffer
+                for variant in pg.slot_desc.variants
+                for coalesced in variant.coalesced_buffers
+                for buffer in coalesced.buffer_ids
+            ]
+            for pg in (recurrent_pg, attention_pg)
+        ),
         init_config=SimpleNamespace(
             tokens_per_block=16,
             layers=[SimpleNamespace(window_size=None) for _ in range(3)],

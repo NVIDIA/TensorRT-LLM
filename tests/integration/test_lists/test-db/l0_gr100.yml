@@ -49,6 +49,10 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_dispatch.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_rank_agreement.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
+  - unittest/_torch/attention/test_fp4_mla.py
+  - unittest/_torch/attention/test_fp4_mla_packed.py
+  - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
+  - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py
@@ -57,14 +61,35 @@ l0_gr100:
   - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
   # NVFP4_PLUS (E2M1 with UE5M3 scales per 32 values) runs on SM107 only.
   - unittest/_torch/kernels/parallel/test_nvfp4_plus_quantize_rubin.py
+  # Kimi-K3 MoE front on Rubin: fused routing + moe_sort, the router-logits kernel, the
+  # NVFP4 low-M GEMM output route, and the FC12 sort-table / SM-reserve consumers. The
+  # FC12 cases skip on B200/GB300 (the only lists that otherwise carry them).
+  - unittest/_torch/kernels/parallel/test_fp8_block_scale_low_m_gemm.py
+  - unittest/_torch/kernels/parallel/test_kimi_k3_router_logits.py
+  - unittest/_torch/kernels/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_forward_nvfp4_matches_gemm_then_fp4_quantize
+  - unittest/_torch/moe/test_kimi_k3_route_sort.py
+  - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[1-CUTEDSL_FC12]
+  - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[8-CUTEDSL_FC12]
+  - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[64-CUTEDSL_FC12]
+  - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[200-CUTEDSL_FC12]
+  - unittest/_torch/moe/test_moe_sorted_routing.py::test_shared_expert_runs_beside_fc12_on_reserved_sms[8]
+  - unittest/_torch/moe/test_moe_sorted_routing.py::test_shared_expert_runs_beside_fc12_on_reserved_sms[64]
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_backend.py::test_fc1_prologue_wait_preserves_exhaustion
+  - unittest/_torch/moe/test_moe_backend.py::test_fc1_prologue_wait_keeps_a_longer_stream_open
+  # Single-GPU MEGAMOE_CUTEDSL on SM107.
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e256_k6_h4096_i2048-seq=1-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=DeepSeekV3]
   # The GLM-5.2 target's unit tests, one entry per op directory. Its comm tests
   # run 4 ranks, and CI has no 4-GPU GR100 stage yet.
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/attention
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/dsa
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/embedding
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/gemm
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/moe
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/quantization
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/attention
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/dsa
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/embedding
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/gemm
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/moe
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/quantization
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec
+  - unittest/_torch/visual_gen/kernels/parallel/test_fmha_dense_fp8.py
+  - unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_qk_norm_rope_fp8.py

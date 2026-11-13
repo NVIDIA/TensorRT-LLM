@@ -24,7 +24,7 @@ from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo, validate_protocol_version
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
 from tensorrt_llm._torch.disaggregation.resource.utils import (
@@ -175,7 +175,43 @@ class PeerRegistrar:
                 f"peer={peer_ri.bounded_replay_on_generation})."
             )
 
+    def validate_draft_layers_compatible(self, peer_ri: RankInfo) -> None:
+        """Raise ValueError when the peers' shared draft KV layouts disagree.
+
+        Both sides run it: the sender when it registers a receiver, and the
+        receiver before it registers with a sender, so a mismatch fails the
+        receiver's requests instead of leaving them waiting for KV.
+        """
+        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
+            # The layer-count tolerance in _check_peer_compatible would transfer
+            # only the target layers and leave the drafter's prompt KV unset on
+            # the receiver.
+            raise ValueError(
+                "PeerRegistrar: unified draft KV layer count differs "
+                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
+                "both peers must use the same speculative decoding KV cache layout; "
+                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers, or "
+                "the 'auto' setting resolved differently on the two workers; "
+                "check the shared-draft-KV decision logged at startup."
+            )
+        # Draft layers carry the target's KV heads per rank, so they move with
+        # the target's head mapping only when both sides shard heads alike. A
+        # K-only (MLA) cache keeps the whole latent on every rank.
+        if (
+            self._ri.num_draft_layers
+            and not (self._ri.attention.is_mla and peer_ri.attention.is_mla)
+            and self._ri.tp_size_per_dp_group != peer_ri.tp_size_per_dp_group
+        ):
+            raise ValueError(
+                "PeerRegistrar: a shared draft KV cache needs the same attention TP size "
+                f"(local={self._ri.tp_size_per_dp_group}, peer={peer_ri.tp_size_per_dp_group}); "
+                "unset TRTLLM_DISAGG_SHARED_DRAFT_KV or shard attention alike on both workers."
+            )
+
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
+        # Wire-format gate first: a peer on another protocol version cannot be
+        # trusted on any other field. Raises ValueError naming both versions.
+        validate_protocol_version(peer_ri)
         self.validate_bounded_replay_compatible(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
@@ -193,14 +229,7 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
-        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
-            # The layer-count tolerance below would transfer only the target
-            # layers and leave the drafter's prompt KV unset on the receiver.
-            raise ValueError(
-                "PeerRegistrar: unified draft KV layer count differs "
-                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
-                "both peers must use the same speculative decoding KV cache layout."
-            )
+        self.validate_draft_layers_compatible(peer_ri)
         self.validate_view_head_geometry(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)

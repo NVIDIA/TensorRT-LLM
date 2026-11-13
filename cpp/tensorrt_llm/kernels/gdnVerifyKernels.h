@@ -54,14 +54,20 @@ struct GdnVerifyParams
     void* ssmStates;                      //!< [slots, HV, 128, 128] bf16, updated by the checkpoint commit
     int64_t ssmSlotStride;
     int32_t const* stateIndices;          //!< [N] state slots; negative for a padded request
-    void* oldU;                           //!< [slots, 2, 16, HV, 128] bf16 history values
-    void* oldK;                           //!< [slots, 2, 16, HK, 128] bf16 normalized history keys
-    float* oldG;                          //!< [slots, 2, HV, 16] cumulative log-decay
-    int32_t const* cacheBufIdx;           //!< [slots] history buffer read this step
-    int32_t const* prevNumAcceptedTokens; //!< [slots] history length
+    int32_t const* replayIndices;         //!< [N] replay slots: the rows of the history and bookkeeping below
+    void* oldU;                           //!< [replay slots, 2, 16, HV, 128] bf16 history values
+    void* oldK;                           //!< [replay slots, 2, 16, HK, 128] bf16 normalized history keys
+    float* oldG;                          //!< [replay slots, 2, HV, 16] cumulative log-decay
+    int32_t const* cacheBufIdx;           //!< [replay slots] history buffer read this step
+    int32_t const* prevNumAcceptedTokens; //!< [replay slots] history length
+    int64_t oldUSlotStride;               //!< Replay-slot strides in elements; the other dimensions are packed.
+    int64_t oldKSlotStride;
+    int64_t oldGSlotStride;
+    int64_t cacheBufIdxStride;
+    int64_t prevNumAcceptedTokensStride;
 
-    void* out;                            //!< [N*T, HV*128] gated RMSNorm output (FP8 E4M3 or bf16)
-    int64_t outStride;                    //!< Row stride in elements.
+    void* out;         //!< [N*T, HV*128] gated RMSNorm output (FP8 E4M3 or bf16)
+    int64_t outStride; //!< Row stride in elements.
 
     int numRequests;
     int numTokens;

@@ -60,7 +60,6 @@ from _torch.moe.moe_test_utils import (
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
-    skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
 from _torch.moe.quantize_utils import get_test_quant_params
@@ -334,7 +333,6 @@ def _run_autotune_test(
     backend_type,
     quant_algo,
     run_all_tactics=False,
-    use_flashinfer=False,
 ):
     """Run autotune phase and tactic replay test.
 
@@ -352,9 +350,7 @@ def _run_autotune_test(
         _ = run_forward_fn()
 
     # Check if we should run full tactic replay
-    if not run_all_tactics or not supports_autotuner_capture(
-        backend_type, quant_algo, use_flashinfer
-    ):
+    if not run_all_tactics or not supports_autotuner_capture(backend_type, quant_algo):
         # Simple accuracy check for unsupported backends or when run_all_tactics is False
         with torch.inference_mode():
             output = run_forward_fn()
@@ -747,6 +743,16 @@ def _test_moe_worker_impl(
             ref_fused_moe.load_weights([ref_weights])
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
+            if (
+                mapping.enable_attention_dp
+                and backend_type == MoeBackendType.TRTLLM
+                and quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+            ):
+                # Keep checkpoint weights and scales identical across ranks,
+                # then vary inputs/routes without changing their calibration range.
+                x.copy_(x.roll(mapping.rank, dims=-1))
+                router_logits.copy_(router_logits.roll(mapping.rank, dims=-1))
+
             # Define forward function
             def run_forward():
                 with torch.inference_mode():
@@ -766,9 +772,6 @@ def _test_moe_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
-            use_flashinfer = getattr(fused_moe, "use_flashinfer", False)
-
             # Run tests
             if enable_autotune:
                 _setup_autotuner_for_test(mapping)
@@ -778,7 +781,6 @@ def _test_moe_worker_impl(
                     ref_output,
                     backend_type,
                     quant_algo,
-                    use_flashinfer=use_flashinfer,
                 )
             else:
                 output = run_forward()
@@ -1313,7 +1315,6 @@ def generate_multi_gpu_test_params(
                         quant_algo,
                         model_config,
                         swiglu_gptoss_style=swiglu_gptoss_style,
-                        comm_method=comm_method,
                         moe_tp_size=moe_tp_size,
                         parallel_mode=parallel_mode,
                     ),
@@ -1583,7 +1584,6 @@ def test_configurable_moe_single_gpu(
     """
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
-    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -1763,6 +1763,17 @@ MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     parallel_modes=["DEP"] if IS_CI_MODE else ["DEP", "TEP"],
     comm_methods=["ALLGATHER"],
 )
+MULTI_GPU_TEST_PARAMS += generate_multi_gpu_test_params(
+    parallel_modes=["DEP"],
+    comm_methods=["ALLGATHER"],
+    swiglu_combos=[(1, 0, float("inf"))],
+    model_configs=[MoeModelConfig(8, 1, 512, 512)],
+    seq_lens=[8],
+    dtypes=[torch.bfloat16],
+    backend_types=[MoeBackendType.TRTLLM],
+    quant_algos=[QuantAlgo.W4A8_MXFP4_FP8],
+    routing_methods=[RenormalizeMoeRoutingMethod],
+)
 MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,
     quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
@@ -1802,7 +1813,6 @@ def test_configurable_moe_multi_gpu(
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
-    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -2357,8 +2367,6 @@ def test_configurable_moe_multi_gpu_eplb(
     routing_method_cls,
     moe_multi_gpu_executor,
 ):
-    skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
-
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
         model_config.hidden_size,

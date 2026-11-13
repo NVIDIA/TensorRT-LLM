@@ -37,6 +37,29 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 LOG2E = 1.4426950408889634
+# Largest q_len of a segmented call.
+MAX_Q_LEN = 16
+# Most query rows (q_len x query heads per KV head) a segmented call folds onto one KV head.
+MAX_FOLDED_ROWS = 64
+
+# A segment is a one-token FMHA request: its q_len tokens are folded into the head dimension.
+_SEGMENT_MAX_Q_LEN = 1
+# FlashInfer's trtllm-gen decode with an LSE output (csrc/trtllm_fmha_kernel_launcher.cu) takes its softmax stats off
+# the front of the workspace: a float2 per (request, head) and row, for max_q_len rounded up to a multiple of 256 rows,
+# plus a 1 MiB guard. The multi-CTA scratch gets the rest, unchecked.
+_SOFTMAX_STAT_BYTES = 8  # float2
+_SOFTMAX_STATS_ROW_MULTIPLE = 256
+_SOFTMAX_STATS_GUARD_BYTES = 1 << 20
+
+
+def segment_attention_softmax_bytes(num_fmha_requests: int, num_folded_heads: int) -> int:
+    """Workspace bytes FlashInfer takes for the softmax stats of a segment_attention call of num_fmha_requests
+    segments of num_folded_heads heads, ahead of the multi-CTA scratch."""
+    rows = math.ceil(_SEGMENT_MAX_Q_LEN / _SOFTMAX_STATS_ROW_MULTIPLE) * _SOFTMAX_STATS_ROW_MULTIPLE
+    return (
+        _SOFTMAX_STAT_BYTES * rows * num_fmha_requests * num_folded_heads
+        + _SOFTMAX_STATS_GUARD_BYTES
+    )
 
 
 @triton.jit
@@ -305,6 +328,10 @@ def segment_attention(
     Calls FlashInfer's trtllm-gen decode op directly (the op behind ``trtllm_batch_decode_with_kv_cache``), skipping
     the public wrapper's per-call argument validation. Launched without PDL: the FMHA may read the segment tables /
     lengths, which the kernel right before it writes, before its dependency wait.
+
+    Args:
+        workspace: the trtllm-gen decode's FMHA workspace plus segment_attention_softmax_bytes(*seg_q.shape[:2])
+            bytes: FlashInfer takes the softmax stats of the LSE off its front.
     """
     num_requests, num_heads, _ = seg_q.shape
     sm_count = flashinfer.decode.get_device_sm_count(seg_q.device)
@@ -321,7 +348,7 @@ def segment_attention(
         counter,
         seg_table,
         seg_lens,
-        1,  # max_q_len
+        _SEGMENT_MAX_Q_LEN,  # max_q_len
         max_seg_len,
         _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale,
         bmm2_scale,
@@ -367,9 +394,9 @@ def segmented_decode_supported(
     return (
         num_segments > 1
         and batch * num_segments <= 256
-        and 1 <= q_len <= 16
+        and 1 <= q_len <= MAX_Q_LEN
         and num_heads % num_kv_heads == 0
-        and q_len * (num_heads // num_kv_heads) <= 64
+        and q_len * (num_heads // num_kv_heads) <= MAX_FOLDED_ROWS
         and head_dim in (64, 128, 256)
         and window_left < 0
         and not has_sinks

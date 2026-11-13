@@ -90,7 +90,6 @@ class DeepSeekV4Params(DSAParams):
     algorithm: Literal["deepseek_v4"] = field(init=False, default="deepseek_v4")
     compress_ratios: List[int] = field(default_factory=list)
     window_size: int = 128
-    enable_kv_cache_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,4 +98,3 @@ class DeepSeekV4MetadataParams(DSAMetadataParams):
 
     compress_ratios: List[int] = field(default_factory=list)
     window_size: int = 128
-    enable_kv_cache_offload: bool = False

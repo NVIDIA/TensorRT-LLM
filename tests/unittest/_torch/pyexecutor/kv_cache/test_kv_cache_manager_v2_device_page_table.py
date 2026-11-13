@@ -539,6 +539,50 @@ def test_pageable_inputs_to_the_native_kernel_fail_fast(name):
 
 
 @requires_native_page_table_kernel
+@pytest.mark.parametrize("num_blocks", [4, 1024, 1028, 15584])
+def test_native_kernel_splits_long_rows_over_ctas(num_blocks):
+    """Rows longer than one CTA's 1024 entries are copied by several CTAs."""
+    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+        copy_batch_block_offsets_to_device,
+    )
+
+    generator = torch.Generator().manual_seed(num_blocks)
+    host_table = torch.randint(
+        0, 1 << 20, (_NUM_POOLS, _CAPACITY, 2, num_blocks), dtype=torch.int32, generator=generator
+    )
+    host_table[:, :, 0, num_blocks // 2 :: 7] = BAD_PAGE_INDEX
+    host_table = host_table.pin_memory()
+    copy_idx = torch.tensor([3, 0, 4], dtype=torch.int32).pin_memory()
+    index_scales = torch.tensor([2, 3], dtype=torch.int32).pin_memory()
+    kv_offset = torch.tensor([100, 200], dtype=torch.int32).pin_memory()
+    output = torch.full(
+        (_NUM_POOLS, copy_idx.shape[0] + 1, 2, num_blocks),
+        _UNTOUCHED,
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    copy_batch_block_offsets_to_device(
+        host_table,
+        output,
+        copy_idx,
+        index_scales,
+        kv_offset,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    torch.cuda.synchronize()
+
+    pages = host_table[:, copy_idx.long(), 0, :]
+    bad = pages == BAD_PAGE_INDEX
+    keys = pages * index_scales.view(-1, 1, 1)
+    values = keys + kv_offset.view(-1, 1, 1)
+    expected = torch.stack((keys.masked_fill(bad, 0), values.masked_fill(bad, 0)), dim=2)
+    result = output.cpu()
+    assert torch.equal(result[:, : copy_idx.shape[0]], expected)
+    assert (result[:, copy_idx.shape[0] :] == _UNTOUCHED).all()
+
+
+@requires_native_page_table_kernel
 def test_materializer_matches_the_native_kernel(monkeypatch, scales):
     """The device path must be a drop-in for ``copy_batch_block_offsets_to_device``."""
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (

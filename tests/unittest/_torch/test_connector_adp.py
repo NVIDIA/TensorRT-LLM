@@ -61,6 +61,8 @@ def _request(request_id: int, *, dummy: bool = False) -> MagicMock:
     req.context_current_position = 0
     req.context_remaining_length = 8
     req.context_chunk_size = 8
+    req.py_orig_prompt_len = 8
+    req.total_input_len_cp = 8
     req.get_tokens.return_value = list(range(8))
     req.py_draft_tokens = []
     req.kv_cache_retention_config = None
@@ -103,7 +105,11 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.enable_early_first_token_response = False
     executor.gather_all_responses = False
     executor.kv_connector_manager = None
+    executor._fetch_hint_enabled = False
+    executor._packed_sync_enabled = False
+    executor._stage_timing = False
     executor.kv_cache_transceiver = None
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.dwdp_manager = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
@@ -114,7 +120,9 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.hang_detector = MagicMock()
     executor.hang_detector.detected.return_value = False
     executor._profile_manager = MagicMock()
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.draft_model_engine = None
+    executor.enable_joint_kv_cache_reuse = False
     executor.sampler = None
     executor.worker_thread = MagicMock()
     executor._shutdown_sleep_wakeup_listeners = MagicMock()
@@ -668,6 +676,7 @@ def test_shutdown_drains_save_before_loop_exit(
         executor.virtual_memory_pools = {}
         executor.sampler = None
         executor.dwdp_manager = None
+        executor.dense_dwdp_manager = None
         executor.resource_manager = MagicMock()
         resource = MagicMock()
         executor.resource_manager.resource_managers = {"kv": resource}
@@ -1236,7 +1245,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
-        executor.request_broadcaster.broadcast.return_value = ([], {})
+        executor.request_broadcaster.broadcast.return_value = []
         executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True
@@ -1297,8 +1306,8 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         else:
             # Only the existing routing allgather runs when no transfers exist.
             for executor in executors:
-                executor.dist.tp_allgather_int64.assert_not_called()
-                assert executor.dist.tp_allgather.call_count == 3
+                executor.dist.tp_allgather.assert_not_called()
+                assert executor.dist.tp_allgather_int64.call_count == 3
 
 
 def test_ready_owner_polls_save_during_peer_recovery() -> None:
@@ -1480,6 +1489,7 @@ def test_prefix_load_recovery_lifetime(
     manager.accept_prefix_load(request, 0, 4, [[2, 3]])
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [request]
+    context = generation = None
     if mixed_batch:
         context, generation = _request(8), _request(9)
         generation.state = LlmRequestState.GENERATION_IN_PROGRESS

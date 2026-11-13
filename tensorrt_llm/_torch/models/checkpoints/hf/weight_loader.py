@@ -31,6 +31,7 @@ import torch
 import tqdm
 from mpi4py import MPI as _MPI
 
+from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
@@ -46,6 +47,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
                                  local_mpi_comm, local_mpi_rank, local_mpi_size,
                                  mpi_comm, mpi_disabled)
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -103,10 +105,10 @@ class _CheckpointIOStatus:
     fallback_reason: str | None = None
 
 
-@register_checkpoint_weight_loader("MX")
-@register_checkpoint_weight_loader("mistral")
-@register_checkpoint_weight_loader("mistral_large_3")
-@register_checkpoint_weight_loader("HF")
+@register_checkpoint_weight_loader(CheckpointFormat.MX)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL_LARGE_3)
+@register_checkpoint_weight_loader(CheckpointFormat.HF)
 class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
@@ -434,7 +436,7 @@ class HfWeightLoader(BaseWeightLoader):
         """
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
         if not weight_files:
-            raise RuntimeError(f"No safetensors files in {checkpoint_dir}.")
+            raise ModelLoadError(f"No safetensors files in {checkpoint_dir}.")
         # Same sharded-vs-consolidated selection as the eager path below:
         # when both flavors are present, keep only the requested one.
         filtered_weight_files = [
@@ -997,7 +999,7 @@ class HfWeightLoader(BaseWeightLoader):
                     weight_files, self._load_bin_or_path_file,
                     "Loading bin weights in parallel"))
 
-        raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
+        raise ModelLoadError(f"No weight files found in {checkpoint_dir}.")
 
     def _prefetch_and_load(
             self,

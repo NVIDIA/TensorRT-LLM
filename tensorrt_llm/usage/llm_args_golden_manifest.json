@@ -39,6 +39,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_packed_sync"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_account_for_in_transfer"
     },
     {
@@ -296,9 +301,38 @@
       "path": "dwdp_config.contention_opt"
     },
     {
+      "allowed_values": [
+        "per_slice",
+        "batched",
+        "gather"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.copy_mode"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_dense"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_experts"
+    },
+    {
+      "allowed_values": [
+        "register",
+        "tma"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.gather_kernel"
     },
     {
       "capture_policy": "int",
@@ -573,6 +607,16 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.mixed_precision_first_n"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.mixed_precision_last_n"
     },
     {
       "capture_policy": "bool",
@@ -1461,6 +1505,16 @@
       "path": "scheduler_config.enable_prefix_aware_scheduling"
     },
     {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.target_output_tps"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.tpot_budget"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "scheduler_config.use_python_scheduler"
@@ -1478,6 +1532,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "serve_frontend_affinity_port_stride"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_graceful_shutdown_timeout_s"
     },
     {
       "capture_policy": "bool",
@@ -1593,6 +1652,16 @@
       "capture_policy": "allowlist|none",
       "kind": "categorical",
       "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "sparse_attention_config.kv_cache_offload_config.gpu_cache_factor"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.kv_cache_offload_config.host_history_size"
     },
     {
       "capture_policy": "int|none",
@@ -1845,6 +1914,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "speculative_config.enable_confidence_scheduling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.enable_fused_confidence_scheduler"
     },
     {
       "capture_policy": "bool",
@@ -2111,6 +2185,53 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "use_fine_grained_sync"
+    },
+    {
+      "allowed_values": [
+        "gumbel",
+        "gumbel_dual_key"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.algorithm"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "watermark_config.allow_request_opt_out"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "watermark_config.allow_target_only_watermarking"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "watermark_config.context_width"
+    },
+    {
+      "allowed_values": [
+        "none",
+        "single_turn",
+        "all"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.deduplicate_contexts"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "watermark_config.deduplicate_contexts_max_history"
+    },
+    {
+      "allowed_values": [
+        "philox"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.prf"
     }
   ]
 }

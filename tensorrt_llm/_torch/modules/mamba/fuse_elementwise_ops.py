@@ -48,9 +48,10 @@ def _extract_transpose_prefill_kernel(
         seq_offsets[:, None].to(tl.int64) * src_stride_seq + d_inner + conv_offsets[None, :]
     )
     data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
+    data_t = tl.trans(data)
 
     dst_offsets = conv_offsets[:, None] * num_prefill_tokens + seq_offsets[None, :]
-    tl.store(dst_ptr + dst_offsets, tl.trans(data), mask=conv_mask[:, None] & seq_mask[None, :])
+    tl.store(dst_ptr + dst_offsets, data_t, mask=conv_mask[:, None] & seq_mask[None, :])
 
 
 def extract_transpose_prefill_slice(
@@ -58,20 +59,27 @@ def extract_transpose_prefill_slice(
     num_prefill_tokens: int,
     start_col: int,
     width: int,
+    out: torch.Tensor | None = None,
+    check: bool = True,
 ) -> torch.Tensor:
     """
     Extract and transpose a prefill slice for causal_conv1d_fn.
 
     Input:  src[num_tokens, num_cols], rows contiguous (arbitrary row stride,
             so column-slice views of a wider tensor work in place)
-    Output: [width, num_prefill_tokens]
+    Output: [width, num_prefill_tokens]; written into ``out`` when given (a
+            contiguous [width, num_prefill_tokens] buffer of src's dtype, e.g.
+            a per-iteration scratch shared by the layers).
     """
-    assert src.stride(1) == 1
-    out = torch.empty(width, num_prefill_tokens, dtype=src.dtype, device=src.device)
-
+    if out is None:
+        assert src.stride(1) == 1
+        out = torch.empty(width, num_prefill_tokens, dtype=src.dtype, device=src.device)
+    elif check:
+        assert src.stride(1) == 1
+        assert out.shape == (width, num_prefill_tokens) and out.is_contiguous()
+        assert out.dtype == src.dtype
     BLOCK_SEQ, BLOCK_CONV = 32, 128
     grid = (triton.cdiv(num_prefill_tokens, BLOCK_SEQ), triton.cdiv(width, BLOCK_CONV))
-
     _extract_transpose_prefill_kernel[grid](
         src,
         out,
@@ -232,6 +240,7 @@ def _fused_gdn_post_conv_kernel(
     HEAD_K_DIM: tl.constexpr,
     HEAD_V_DIM: tl.constexpr,
     HAS_DECODE: tl.constexpr,
+    G_LINEAR: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -338,6 +347,10 @@ def _fused_gdn_post_conv_kernel(
             gate_input,
         )
         g_values = -tl.exp(A_log) * softplus
+        if G_LINEAR:
+            # The FlashInfer prefill kernel consumes the decay as alpha =
+            # exp(g): emit it here instead of a torch.exp launch per call.
+            g_values = tl.exp(g_values)
         beta_values = tl.sigmoid(b_values)
         gate_offsets = token_offsets.to(tl.int64) * NUM_V_HEADS + value_head_idx
         tl.store(g_ptr + gate_offsets, g_values, mask=token_mask)
@@ -358,6 +371,9 @@ def fused_gdn_post_conv(
     l2_norm_eps: float = 1e-6,
     softplus_threshold: float = 20.0,
     beta_dtype: torch.dtype = torch.float32,
+    g_linear: bool = False,
+    out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    check: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse GDN post-conv split, Q/K normalization, and gate preparation.
 
@@ -375,8 +391,15 @@ def fused_gdn_post_conv(
         l2_norm_eps: Epsilon added to the Q/K squared norm.
         softplus_threshold: Linear fallback threshold for the decay gate softplus.
         beta_dtype: Output dtype for beta. Target verification uses the input dtype for parity.
+        g_linear: Emit the decay gate in linear space (``alpha = exp(g)``), the
+            convention of the FlashInfer prefill kernel, instead of log space.
+        out: Optional pre-allocated ``(q, k, v, g, beta)`` of the shapes and
+            dtypes below (contiguous), e.g. views of a scratch shared by the
+            layers of one iteration; skips the five allocations per call.
+        check: Verify the shapes / dtypes / contiguity of ``out`` (callers that
+            built ``out`` for these very arguments may pass False).
     Returns:
-        Contiguous Q, K, V, log-space G, and beta tensors with shapes
+        Contiguous Q, K, V, G (log space, or linear space with ``g_linear``), and beta tensors with shapes
         ``[1, num_tokens, num_k_heads, head_k_dim]``,
         ``[1, num_tokens, num_k_heads, head_k_dim]``,
         ``[1, num_tokens, num_v_heads, head_v_dim]``, and twice
@@ -385,16 +408,25 @@ def fused_gdn_post_conv(
     num_prefill_tokens = prefill.shape[1]
     num_decode_tokens = 0 if decode is None else decode.shape[0]
     num_tokens = num_prefill_tokens + num_decode_tokens
-
-    q = torch.empty(
-        (1, num_tokens, num_k_heads, head_k_dim), dtype=prefill.dtype, device=prefill.device
-    )
-    k = torch.empty_like(q)
-    v = torch.empty(
-        (1, num_tokens, num_v_heads, head_v_dim), dtype=prefill.dtype, device=prefill.device
-    )
-    g = torch.empty((1, num_tokens, num_v_heads), dtype=torch.float32, device=prefill.device)
-    beta = torch.empty((1, num_tokens, num_v_heads), dtype=beta_dtype, device=prefill.device)
+    if out is not None:
+        q, k, v, g, beta = out
+        if check:
+            assert q.shape == (1, num_tokens, num_k_heads, head_k_dim) and q.dtype == prefill.dtype
+            assert k.shape == q.shape and k.dtype == prefill.dtype
+            assert v.shape == (1, num_tokens, num_v_heads, head_v_dim) and v.dtype == prefill.dtype
+            assert g.shape == (1, num_tokens, num_v_heads) and g.dtype == torch.float32
+            assert beta.shape == (1, num_tokens, num_v_heads) and beta.dtype == beta_dtype
+            assert all(t.is_contiguous() for t in out)
+    else:
+        q = torch.empty(
+            (1, num_tokens, num_k_heads, head_k_dim), dtype=prefill.dtype, device=prefill.device
+        )
+        k = torch.empty_like(q)
+        v = torch.empty(
+            (1, num_tokens, num_v_heads, head_v_dim), dtype=prefill.dtype, device=prefill.device
+        )
+        g = torch.empty((1, num_tokens, num_v_heads), dtype=torch.float32, device=prefill.device)
+        beta = torch.empty((1, num_tokens, num_v_heads), dtype=beta_dtype, device=prefill.device)
     if num_tokens == 0:
         return q, k, v, g, beta
 
@@ -406,7 +438,8 @@ def fused_gdn_post_conv(
     block_tokens = 16
     block_k = triton.next_power_of_2(head_k_dim)
     block_v = triton.next_power_of_2(head_v_dim)
-    grid = (triton.cdiv(num_tokens, block_tokens), num_k_heads + num_v_heads)
+    num_heads = num_k_heads + num_v_heads
+    grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
     _fused_gdn_post_conv_kernel[grid](
         prefill,
         decode_input,
@@ -436,6 +469,7 @@ def fused_gdn_post_conv(
         head_k_dim,
         head_v_dim,
         has_decode,
+        g_linear,
         block_tokens,
         block_k,
         block_v,

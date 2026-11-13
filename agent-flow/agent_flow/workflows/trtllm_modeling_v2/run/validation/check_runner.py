@@ -121,6 +121,7 @@ class CheckRunner:
                 gpus=want,
                 priority=priority,
                 nodes=nodes,
+                note=lambda said: self.journal.event("waiting", said),
             )
             cache[key] = self._noting_session_loss(shell_runner_for(executor))
         return cache[key]
