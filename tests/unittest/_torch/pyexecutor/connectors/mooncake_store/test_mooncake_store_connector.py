@@ -113,6 +113,8 @@ class FakeStore:
         #: The arguments of every put past the three buffers, as `(args, kwargs)`.
         self.put_options = []
         self.get_calls = []
+        #: The positional arguments of every get past the sizes (Mooncake's grouping flag).
+        self.get_grouped = []
         self.exist_calls = []
         self.closed = False
         self.fail_gets_for = set()
@@ -143,8 +145,9 @@ class FakeStore:
         self.objects.update(keys)
         return [sum(size) for size in sizes]
 
-    def batch_get_into_multi_buffers(self, keys, addresses, sizes):
+    def batch_get_into_multi_buffers(self, keys, addresses, sizes, *grouped):
         self.get_calls.append((list(keys), [list(a) for a in addresses], [list(s) for s in sizes]))
+        self.get_grouped.append(grouped)
         return [
             -1 if (key in self.fail_gets_for or key not in self.objects) else sum(size)
             for key, size in zip(keys, sizes)
@@ -3925,3 +3928,542 @@ def test_scheduler_recomputes_after_failed_load_despite_persistent_store_hit(
     # The fallback belongs to this request, not the pool or other requests.
     healthy = make_request(2, tokens)
     assert scheduler.get_num_new_matched_tokens(healthy, 0) == (2 * TOKENS_PER_BLOCK, async_load)
+
+
+# ---- the store over NVLink with EGM segments ----
+
+
+@pytest.fixture
+def egm_env(monkeypatch):
+    """Turn the EGM store on for this test, from a process with no client yet."""
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    monkeypatch.setenv(shd.STORE_EGM_ENV, "1")
+    for name in (
+        *shd._EGM_ENV_SET,
+        *shd._EGM_ENV_POP,
+        shd.EGM_DIRECT_DISABLE_ENV,
+        shd.EGM_DIRECT_BATCH_ENV,
+        shd.EGM_DIRECT_SAVE_ENV,
+        shd.EGM_LOAD_STREAMS_ENV,
+        shd.EGM_GROUPED_LOADS_ENV,
+        shd.EGM_GROUPED_SAVES_ENV,
+        shd.EGM_PRIVATE_LOOP_STREAM_ENV,
+    ):
+        # setenv first, so teardown restores keys the latch creates.
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    monkeypatch.setitem(shd._EGM_STATE, "clients", 0)
+    # Grouped saves build a put config, which needs the bindings' ReplicateConfig.
+    _fake_mooncake_store(
+        monkeypatch, ReplicateConfig=_ReplicateConfig, SoftPinAction=_SoftPinAction
+    )
+    monkeypatch.setattr(worker_module, "adopt_store_segment", lambda size: size)
+    monkeypatch.setattr(worker_module, "record_segment", lambda *_a, **_kw: None)
+    return shd
+
+
+def _open_over_egm(fake_store, monkeypatch):
+    opened, adopted, budgets, recorded = [], [], [], []
+    monkeypatch.setattr(
+        worker_module, "_open_store", lambda config: opened.append(config) or (fake_store, "h")
+    )
+    monkeypatch.setattr(
+        worker_module, "adopt_store_segment", lambda size: adopted.append(size) or size - (1 << 20)
+    )
+    monkeypatch.setattr(worker_module, "validate_node_budget", budgets.append)
+    monkeypatch.setattr(
+        worker_module, "record_segment", lambda *_a, **kw: recorded.append(kw["segment_size"])
+    )
+    with make_worker(fake_store) as worker:
+        assert worker.config.protocol == "nvlink"
+    assert adopted == [1 << 30]
+    (config,) = opened
+    assert (config.protocol, config.device_name, config.global_segment_size) == ("nvlink", "", 0)
+    assert os.environ["MC_USE_TENT"] == "0"
+    # The ledger records what the donor mounted.
+    assert recorded == [(1 << 30) - (1 << 20)]
+    # The node budget still counts the store bytes this rank stands for.
+    assert budgets[0].global_segment_size == 1 << 30
+    return config, budgets[0]
+
+
+def test_worker_over_egm_moves_its_segment_to_the_donor(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+        DEFAULT_STAGING_BUFFER_BYTES,
+    )
+
+    config, budget = _open_over_egm(fake_store, monkeypatch)
+    # Pages go straight between EGM and the KV pool, so nothing is staged.
+    assert not config.stage_through_host
+    assert config.staging_buffer_bytes == DEFAULT_STAGING_BUFFER_BYTES
+    assert not budget.stage_through_host
+
+
+def test_worker_over_egm_with_direct_off_stages_through_host(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    monkeypatch.setenv(egm_env.EGM_DIRECT_DISABLE_ENV, "1")
+    config, budget = _open_over_egm(fake_store, monkeypatch)
+    assert config.stage_through_host and config.staging_buffer_bytes == 2 << 30
+    assert budget.stage_through_host
+    assert not config.stage_saves_through_host
+
+
+def test_worker_over_egm_with_direct_saves_off_stages_only_saves(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    monkeypatch.setenv(egm_env.EGM_DIRECT_SAVE_ENV, "0")
+    config, budget = _open_over_egm(fake_store, monkeypatch)
+    # Loads stay direct; saves get the EGM staging budget to themselves.
+    assert not config.stage_through_host
+    assert config.stage_saves_through_host and config.staging_buffer_bytes == 2 << 30
+    assert budget.stage_saves_through_host
+
+
+def test_egm_direct_off_wins_over_staged_saves(store_config, fake_store, monkeypatch, egm_env):
+    monkeypatch.setenv(egm_env.EGM_DIRECT_DISABLE_ENV, "1")
+    monkeypatch.setenv(egm_env.EGM_DIRECT_SAVE_ENV, "0")
+    config, _ = _open_over_egm(fake_store, monkeypatch)
+    assert config.stage_through_host and not config.stage_saves_through_host
+
+
+def test_store_transport_without_egm_is_the_same_config(store_config):
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+        MooncakeStoreConnectorConfig,
+    )
+
+    config = MooncakeStoreConnectorConfig.from_file(str(store_config))
+    # The direct knobs mean nothing without the EGM switch.
+    environ = {
+        shd.EGM_DIRECT_DISABLE_ENV: "1",
+        shd.EGM_DIRECT_BATCH_ENV: "3",
+        shd.EGM_DIRECT_SAVE_ENV: "0",
+    }
+    same, store_bytes = config.with_store_transport(0, environ)
+    assert same is config and store_bytes == config.global_segment_size
+
+
+def test_egm_direct_switch_reads_only_on_or_off():
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    egm = {shd.STORE_EGM_ENV: "1"}
+    assert shd.egm_direct_enabled(egm)
+    assert shd.egm_direct_enabled({**egm, shd.EGM_DIRECT_DISABLE_ENV: "0"})
+    assert not shd.egm_direct_enabled({**egm, shd.EGM_DIRECT_DISABLE_ENV: "1"})
+    assert not shd.egm_direct_enabled({})
+    with pytest.raises(ValueError):
+        shd.egm_direct_enabled({**egm, shd.EGM_DIRECT_DISABLE_ENV: "maybe"})
+    assert shd.egm_direct_save_enabled(egm)
+    assert shd.egm_direct_save_enabled({**egm, shd.EGM_DIRECT_SAVE_ENV: "1"})
+    assert not shd.egm_direct_save_enabled({**egm, shd.EGM_DIRECT_SAVE_ENV: "0"})
+    assert not shd.egm_direct_save_enabled({**egm, shd.EGM_DIRECT_DISABLE_ENV: "1"})
+    assert not shd.egm_direct_save_enabled({shd.EGM_DIRECT_SAVE_ENV: "1"})
+    with pytest.raises(ValueError):
+        shd.egm_direct_save_enabled({**egm, shd.EGM_DIRECT_SAVE_ENV: "maybe"})
+    assert shd.egm_direct_batch({}) is None
+    assert shd.egm_direct_batch({shd.EGM_DIRECT_BATCH_ENV: "128"}) == 128
+    for bad in ("0", "1.5", "x"):
+        with pytest.raises(ValueError):
+            shd.egm_direct_batch({shd.EGM_DIRECT_BATCH_ENV: bad})
+
+
+def test_worker_refuses_nvlink_without_the_egm_switch(store_config, fake_store, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    monkeypatch.delenv(shd.STORE_EGM_ENV, raising=False)
+    set_pool_setting(store_config, protocol="nvlink")
+    with pytest.raises(ValueError, match="set both or neither"):
+        with make_worker(fake_store):
+            pass
+
+
+def _put_pages(worker, fake_store, hashes):
+    for block_hash in hashes:
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+
+
+def _load_parked(worker, request_id, hashes):
+    """Park one request's pages on the load threads and report it finished."""
+    pages = [PageTransfer(block_hash, 0, index) for index, block_hash in enumerate(hashes)]
+    queue_async(worker, RequestTransfers(request_id, pages))
+    wait_async_idle(worker)
+    _saving, finished = worker.get_finished([], [request_id])
+    return finished
+
+
+@contextlib.contextmanager
+def make_egm_async_worker(fake_store, store_config, **settings):
+    enable_async_load(store_config)
+    if settings:
+        set_pool_setting(store_config, **settings)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        yield worker
+
+
+def test_egm_direct_loads_into_the_kv_pages_without_registering_them(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    hashes = [bytes([index]) * 16 for index in range(1, 4)]
+    with make_egm_async_worker(fake_store, store_config, transfer_batch_size=2) as worker:
+        assert worker._registered_ranges == []
+        assert worker._async_batch_size == 2
+        assert worker._async_stagings == [] and worker._save_staging is None
+        _put_pages(worker, fake_store, hashes)
+        assert _load_parked(worker, 7, hashes) == [7]
+        assert worker.take_failed_async_load_requests() == set()
+        expected = [worker._addressing.buffers(0, index)[0] for index in range(len(hashes))]
+    assert fake_store.registered == []
+    # Every page lands at its own KV address, a configured batch at a time.
+    assert [len(keys) for keys, _, _ in fake_store.get_calls] == [2, 1]
+    assert [a for _, addresses, _ in fake_store.get_calls for a in addresses] == expected
+
+
+def test_egm_direct_saves_from_the_kv_pages(store_config, fake_store, monkeypatch, egm_env):
+    monkeypatch.setenv(egm_env.EGM_GROUPED_SAVES_ENV, "0")
+    with make_egm_async_worker(fake_store, store_config) as worker:
+        worker._put([RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 3)])])
+        expected = worker._addressing.buffers(0, 3)[0]
+    assert fake_store.registered == []
+    ((_, addresses, _),) = fake_store.put_calls
+    assert addresses == [expected]
+
+
+def test_egm_direct_batch_knob_narrows_only_the_loaders(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    monkeypatch.setenv(egm_env.EGM_DIRECT_BATCH_ENV, "1")
+    hashes = [bytes([index]) * 16 for index in range(1, 4)]
+    with make_egm_async_worker(fake_store, store_config) as worker:
+        assert worker._batch_size == worker.config.transfer_batch_size
+        _put_pages(worker, fake_store, hashes)
+        assert _load_parked(worker, 7, hashes) == [7]
+    assert [len(keys) for keys, _, _ in fake_store.get_calls] == [1, 1, 1]
+
+
+def test_egm_with_direct_off_keeps_the_staging_pools(
+    store_config, fake_store, monkeypatch, egm_env, staged_copies
+):
+    monkeypatch.setenv(egm_env.EGM_DIRECT_DISABLE_ENV, "1")
+    # A budget of its own, so the 2 GiB EGM default is not pinned here.
+    with make_egm_async_worker(fake_store, store_config, staging_buffer_bytes=4096) as worker:
+        assert worker.config.stage_through_host
+        assert worker._async_stagings and worker._save_staging is not None
+
+
+def test_egm_direct_loads_with_staged_saves(
+    store_config, fake_store, monkeypatch, egm_env, staged_copies
+):
+    monkeypatch.setenv(egm_env.EGM_DIRECT_SAVE_ENV, "0")
+    hashes = [bytes([index]) * 16 for index in range(1, 4)]
+    # Two 64 B slots, so the save batch narrows while the loads keep theirs.
+    with make_egm_async_worker(
+        fake_store, store_config, transfer_batch_size=4, staging_buffer_bytes=128
+    ) as worker:
+        # Loads have no staging of their own; saves have the whole budget.
+        assert worker._async_stagings == [] and worker._load_staging is None
+        save_pool = worker._save_staging
+        assert save_pool is not None and save_pool.num_slots == 2
+        assert worker._async_batch_size == worker._batch_size == 4
+        assert worker._save_batch_size == 2
+        # The only registration is the save slots, never a KV range.
+        assert fake_store.registered == [(save_pool.slot_address(0), 128)]
+
+        _put_pages(worker, fake_store, hashes)
+        assert _load_parked(worker, 7, hashes) == [7]
+        assert worker.take_failed_async_load_requests() == set()
+        # Every page lands at its own KV address, with no copy through a slot.
+        expected = [worker._addressing.buffers(0, index)[0] for index in range(len(hashes))]
+        assert [a for _, addresses, _ in fake_store.get_calls for a in addresses] == expected
+        assert staged_copies == []
+
+        saved = [bytes([index]) * 16 for index in range(10, 13)]
+        worker._put([RequestTransfers(1, [PageTransfer(h, 0, i) for i, h in enumerate(saved, 4)])])
+        slots = [save_pool.slot_address(0), save_pool.slot_address(1)]
+        sources = [worker._addressing.buffers(0, index)[0][0] for index in (4, 5, 6)]
+    # Saves go through the slots, a slot-sized batch at a time.
+    assert [len(keys) for keys, _, _ in fake_store.put_calls] == [2, 1]
+    assert [a for _, addresses, _ in fake_store.put_calls for a in addresses] == [
+        [slots[0]],
+        [slots[1]],
+        [slots[0]],
+    ]
+    assert staged_copies == [(slots[0], sources[0], 64), (slots[1], sources[1], 64)] + [
+        (slots[0], sources[2], 64)
+    ]
+    assert fake_store.registered == [(slots[0], 128)]
+
+
+def test_rdma_still_registers_its_pools(store_config, fake_store, mapped_pool, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    # Without the EGM switch the direct knobs change nothing.
+    monkeypatch.delenv(shd.STORE_EGM_ENV, raising=False)
+    monkeypatch.setenv(shd.EGM_DIRECT_BATCH_ENV, "1")
+    mapped_pool()
+    with make_worker(fake_store, layout=make_pool_layout()) as worker:
+        assert worker._registered_ranges
+        assert worker._batch_size == worker._async_batch_size == worker.config.transfer_batch_size
+        assert worker._load_fanout is None and not worker.wants_private_loop_stream
+    assert fake_store.registered
+
+
+def test_fanout_ranges_split_evenly_and_keep_small_loads_whole():
+    assert list(worker_module._fanout_ranges(7, 3, min_pages=1)) == [(0, 3), (3, 5), (5, 7)]
+    assert list(worker_module._fanout_ranges(1024, 4)) == [
+        (0, 256),
+        (256, 512),
+        (512, 768),
+        (768, 1024),
+    ]
+    # Fewer pages than two minimum ranges stay on one stream.
+    assert list(worker_module._fanout_ranges(40, 4)) == [(0, 40)]
+    assert list(worker_module._fanout_ranges(64, 4)) == [(0, 32), (32, 64)]
+    assert list(worker_module._fanout_ranges(5, 1, min_pages=1)) == [(0, 5)]
+
+
+def test_fanout_ranges_read_the_minimum_at_call_time(monkeypatch):
+    monkeypatch.setattr(worker_module, "FANOUT_MIN_PAGES", 1)
+    assert list(worker_module._fanout_ranges(4, 2)) == [(0, 2), (2, 4)]
+
+
+def test_egm_load_streams_knob():
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    egm = {shd.STORE_EGM_ENV: "1"}
+    assert shd.egm_load_streams(egm) == shd.EGM_LOAD_STREAMS_DEFAULT > 1
+    assert shd.egm_load_streams({**egm, shd.EGM_LOAD_STREAMS_ENV: "1"}) == 1
+    assert shd.egm_load_streams({**egm, shd.EGM_LOAD_STREAMS_ENV: "8"}) == 8
+    # Only the direct EGM path splits loads.
+    assert shd.egm_load_streams({shd.EGM_LOAD_STREAMS_ENV: "8"}) == 1
+    assert shd.egm_load_streams({**egm, shd.EGM_DIRECT_DISABLE_ENV: "1"}) == 1
+    for bad in ("0", "2.5", "x"):
+        with pytest.raises(ValueError):
+            shd.egm_load_streams({**egm, shd.EGM_LOAD_STREAMS_ENV: bad})
+
+
+def _record_threads(fake_store, monkeypatch):
+    threads = []
+    original = fake_store.batch_get_into_multi_buffers
+
+    def get(keys, addresses, sizes, *grouped):
+        threads.append(threading.current_thread().name)
+        return original(keys, addresses, sizes, *grouped)
+
+    monkeypatch.setattr(fake_store, "batch_get_into_multi_buffers", get)
+    return threads
+
+
+def test_egm_direct_load_spreads_over_the_fanout_threads(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    monkeypatch.setenv(egm_env.EGM_LOAD_STREAMS_ENV, "3")
+    monkeypatch.setattr(worker_module, "FANOUT_MIN_PAGES", 1)
+    hashes = [bytes([index]) * 16 for index in range(1, 8)]
+    threads = _record_threads(fake_store, monkeypatch)
+    with make_egm_async_worker(fake_store, store_config, transfer_batch_size=2) as worker:
+        assert worker._load_ways == 3 and worker._load_fanout is not None
+        _put_pages(worker, fake_store, hashes)
+        assert _load_parked(worker, 7, hashes) == [7]
+        assert worker.take_failed_async_load_requests() == set()
+        expected = sorted(
+            worker._addressing.buffers(0, index)[0][0] for index in range(len(hashes))
+        )
+        keys = [worker._namespaces[0].key(h) for h in hashes]
+    # Ranges of 3, 2 and 2 pages, each in batches of at most 2, on fan-out threads.
+    calls = sorted(tuple(k) for k, _, _ in fake_store.get_calls)
+    assert calls == sorted([tuple(keys[0:2]), (keys[2],), tuple(keys[3:5]), tuple(keys[5:7])])
+    assert sorted(a[0] for _, addresses, _ in fake_store.get_calls for a in addresses) == expected
+    assert all(name.startswith("mooncake-store-fanout-") for name in threads)
+    # Shutdown retired the pool.
+    assert worker._load_fanout is None
+
+
+def test_egm_direct_fanout_reports_a_missing_page_once_every_range_returned(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    monkeypatch.setenv(egm_env.EGM_LOAD_STREAMS_ENV, "3")
+    monkeypatch.setattr(worker_module, "FANOUT_MIN_PAGES", 1)
+    hashes = [bytes([index]) * 16 for index in range(1, 7)]
+    with make_egm_async_worker(fake_store, store_config, transfer_batch_size=8) as worker:
+        _put_pages(worker, fake_store, hashes)
+        # Present at the probe, then lost: the first range fails its get.
+        fake_store.fail_gets_for.add(worker._namespaces[0].key(hashes[0]))
+        assert _load_parked(worker, 7, hashes) == [7]
+        assert worker.take_failed_async_load_requests() == {7}
+    # Every range was issued and returned.
+    assert sorted(len(keys) for keys, _, _ in fake_store.get_calls) == [2, 2, 2]
+
+
+def test_egm_direct_fanout_retires_every_range_before_raising(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    monkeypatch.setenv(egm_env.EGM_LOAD_STREAMS_ENV, "3")
+    monkeypatch.setattr(worker_module, "FANOUT_MIN_PAGES", 1)
+    hashes = [bytes([index]) * 16 for index in range(1, 7)]
+    calls = []
+    with make_egm_async_worker(fake_store, store_config, transfer_batch_size=8) as worker:
+        _put_pages(worker, fake_store, hashes)
+        broken_key = worker._namespaces[0].key(hashes[0])
+
+        def get(keys, addresses, sizes, *grouped):
+            calls.append(list(keys))
+            if broken_key in keys:
+                raise RuntimeError("transport lost")
+            return [sum(size) for size in sizes]
+
+        fake_store.batch_get_into_multi_buffers = get
+        queue_async(
+            worker, RequestTransfers(7, [PageTransfer(h, 0, i) for i, h in enumerate(hashes)])
+        )
+        wait_async_idle(worker)
+        # Every range was issued and returned before the error surfaced.
+        assert sorted(len(keys) for keys in calls) == [2, 2, 2]
+        with pytest.raises(RuntimeError, match="background load failed"):
+            worker.get_finished([], [7])
+
+
+def test_egm_load_streams_one_keeps_loads_on_the_loader(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    monkeypatch.setenv(egm_env.EGM_LOAD_STREAMS_ENV, "1")
+    monkeypatch.setattr(worker_module, "FANOUT_MIN_PAGES", 1)
+    hashes = [bytes([index]) * 16 for index in range(1, 4)]
+    threads = _record_threads(fake_store, monkeypatch)
+    with make_egm_async_worker(fake_store, store_config, transfer_batch_size=2) as worker:
+        assert worker._load_ways == 1 and worker._load_fanout is None
+        _put_pages(worker, fake_store, hashes)
+        assert _load_parked(worker, 7, hashes) == [7]
+    assert [len(keys) for keys, _, _ in fake_store.get_calls] == [2, 1]
+    assert all(name.startswith("mooncake-store-load-") for name in threads)
+
+
+def test_egm_grouped_loads_knob():
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    egm = {shd.STORE_EGM_ENV: "1"}
+    assert shd.egm_grouped_loads(egm)
+    assert not shd.egm_grouped_loads({**egm, shd.EGM_GROUPED_LOADS_ENV: "0"})
+    assert not shd.egm_grouped_loads({shd.EGM_GROUPED_LOADS_ENV: "1"})
+    assert not shd.egm_grouped_loads({**egm, shd.EGM_DIRECT_DISABLE_ENV: "1"})
+    with pytest.raises(ValueError):
+        shd.egm_grouped_loads({**egm, shd.EGM_GROUPED_LOADS_ENV: "maybe"})
+
+
+@pytest.mark.parametrize("grouped", ["1", "0"])
+def test_egm_direct_loads_ask_mooncake_to_group_by_segment(
+    store_config, fake_store, monkeypatch, egm_env, grouped
+):
+    monkeypatch.setenv(egm_env.EGM_GROUPED_LOADS_ENV, grouped)
+    hashes = [bytes([index]) * 16 for index in range(1, 4)]
+    with make_egm_async_worker(fake_store, store_config, transfer_batch_size=2) as worker:
+        assert worker._grouped_loads is (grouped == "1")
+        _put_pages(worker, fake_store, hashes)
+        assert _load_parked(worker, 7, hashes) == [7]
+    expected = [(True,), (True,)] if grouped == "1" else [(), ()]
+    assert fake_store.get_grouped == expected
+
+
+def test_registered_loads_never_pass_the_grouping_flag(store_config, fake_store):
+    """Off EGM the get call is the one the RDMA path always made."""
+    block_hash = b"\x07" * 16
+    with make_egm_async_worker(fake_store, store_config) as worker:
+        assert worker._grouped_loads is False and worker._load_fanout is None
+        _put_pages(worker, fake_store, [block_hash])
+        assert _load_parked(worker, 7, [block_hash]) == [7]
+    assert fake_store.get_grouped == [()]
+
+
+def test_egm_grouped_saves_knob():
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    egm = {shd.STORE_EGM_ENV: "1"}
+    assert shd.egm_grouped_saves(egm)
+    assert not shd.egm_grouped_saves({**egm, shd.EGM_GROUPED_SAVES_ENV: "0"})
+    assert not shd.egm_grouped_saves({shd.EGM_GROUPED_SAVES_ENV: "1"})
+    assert not shd.egm_grouped_saves({**egm, shd.EGM_DIRECT_DISABLE_ENV: "1"})
+    with pytest.raises(ValueError):
+        shd.egm_grouped_saves({**egm, shd.EGM_GROUPED_SAVES_ENV: "maybe"})
+
+
+def test_replicate_config_asks_for_same_node_placement(monkeypatch):
+    _fake_mooncake_store(
+        monkeypatch, ReplicateConfig=_ReplicateConfig, SoftPinAction=_SoftPinAction
+    )
+    config = worker_module._replicate_config(None, same_node=True)
+    assert isinstance(config, _ReplicateConfig) and config.prefer_alloc_in_same_node is True
+    assert config.soft_pin_action is _SoftPinAction.PRESERVE
+    config = worker_module._replicate_config(86400000, ("a",), same_node=True)
+    assert config.prefer_alloc_in_same_node is True
+    assert config.soft_pin_action is _SoftPinAction.ENABLE and config.group_ids == ["a"]
+    assert not hasattr(worker_module._replicate_config(86400000), "prefer_alloc_in_same_node")
+
+
+@pytest.mark.parametrize("grouped", ["1", "0"])
+def test_egm_direct_saves_ask_mooncake_to_group_by_segment(
+    store_config, fake_store, monkeypatch, egm_env, grouped
+):
+    monkeypatch.setenv(egm_env.EGM_GROUPED_SAVES_ENV, grouped)
+    with make_egm_async_worker(fake_store, store_config) as worker:
+        assert worker._grouped_saves is (grouped == "1")
+        worker._put([RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 3)])])
+        expected_address = worker._addressing.buffers(0, 3)[0]
+    ((_, addresses, _),) = fake_store.put_calls
+    assert addresses == [expected_address]
+    ((args, kwargs),) = fake_store.put_options
+    if grouped == "1":
+        (config,) = args
+        assert config.prefer_alloc_in_same_node is True and kwargs == {}
+    else:
+        assert (args, kwargs) == ((), {})
+
+
+def test_egm_grouped_saves_keep_soft_pin_and_block_groups(
+    store_config, fake_store, monkeypatch, egm_env
+):
+    """Grouping rides on the put config soft pinning and block groups already build."""
+    with make_egm_async_worker(
+        fake_store, store_config, soft_pin_ttl_ms=86400000, group_blocks=True
+    ) as worker:
+        worker._put([RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 3)])])
+    ((args, _kwargs),) = fake_store.put_options
+    (config,) = args
+    assert config.prefer_alloc_in_same_node is True
+    assert config.soft_pin_action is _SoftPinAction.ENABLE and config.group_ids
+
+
+def test_registered_saves_never_pass_a_put_config(store_config, fake_store):
+    with make_egm_async_worker(fake_store, store_config) as worker:
+        assert worker._grouped_saves is False
+        worker._put([RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 3)])])
+    assert fake_store.put_options == [((), {})]
+
+
+def test_egm_private_loop_stream_knob():
+    from tensorrt_llm._torch.pyexecutor import store_host_donor as shd
+
+    egm = {shd.STORE_EGM_ENV: "1"}
+    assert shd.egm_private_loop_stream(egm)
+    assert not shd.egm_private_loop_stream({**egm, shd.EGM_PRIVATE_LOOP_STREAM_ENV: "0"})
+    assert not shd.egm_private_loop_stream({shd.EGM_PRIVATE_LOOP_STREAM_ENV: "1"})
+    assert not shd.egm_private_loop_stream({**egm, shd.EGM_DIRECT_DISABLE_ENV: "1"})
+    with pytest.raises(ValueError):
+        shd.egm_private_loop_stream({**egm, shd.EGM_PRIVATE_LOOP_STREAM_ENV: "maybe"})
+
+
+@pytest.mark.parametrize("knob", ["1", "0"])
+def test_egm_direct_worker_asks_for_a_private_loop_stream(
+    store_config, fake_store, monkeypatch, egm_env, knob
+):
+    monkeypatch.setenv(egm_env.EGM_PRIVATE_LOOP_STREAM_ENV, knob)
+    with make_egm_async_worker(fake_store, store_config) as worker:
+        assert worker.wants_private_loop_stream is (knob == "1")
+
+
+def test_registered_worker_keeps_the_loop_stream(store_config, fake_store):
+    """Off EGM no copy waits on the caller's stream, so the loop stays where it was."""
+    with make_egm_async_worker(fake_store, store_config) as worker:
+        assert worker.wants_private_loop_stream is False

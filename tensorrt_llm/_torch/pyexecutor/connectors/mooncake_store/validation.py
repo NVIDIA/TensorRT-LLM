@@ -234,6 +234,9 @@ def validate_node_budget(
         # warned about when it is allocated, not counted here.
         directions = int(config.role.loads) + int(config.role.saves)
         staging_claim = ranks_on_node * directions * config.staging_buffer_bytes
+    elif getattr(config, "stage_saves_through_host", False) and config.role.saves:
+        # Direct EGM loads with staged saves: one budget, for saves only.
+        staging_claim = ranks_on_node * config.staging_buffer_bytes
 
     claimed = segment_claim + staging_claim
     if claimed <= 0:
@@ -263,6 +266,13 @@ def validate_node_budget(
         )
         return
 
+    # Staged saves under direct EGM loads come from the direct-save switch,
+    # not from stage_through_host, which is already off there.
+    staging_off = (
+        "turn off stage_through_host"
+        if config.stage_through_host
+        else "let saves copy directly (unset TLLM_MOONCAKE_STORE_EGM_DIRECT_SAVE=0)"
+    )
     affordable = (budget - staging_claim) // ranks_on_node
     if affordable > 0:
         remedy = (
@@ -270,17 +280,12 @@ def validate_node_budget(
             "fewer ranks per node"
         )
         # Naming the staging knobs only where staging is pinned at all.
-        remedy += (
-            ", lower staging_buffer_bytes, or turn off stage_through_host."
-            if staging_claim
-            else "."
-        )
+        remedy += f", lower staging_buffer_bytes, or {staging_off}." if staging_claim else "."
     else:
         remedy = (
             f"Lending nothing would not be enough: the {staging_claim / _GIB:.1f} "
             f"GiB of pinned staging buffers alone overruns the budget. Run fewer "
-            f"ranks per node, lower staging_buffer_bytes, or turn off "
-            f"stage_through_host."
+            f"ranks per node, lower staging_buffer_bytes, or {staging_off}."
         )
     raise ValueError(
         f"mooncake-store: this node cannot afford what the pool is configured "

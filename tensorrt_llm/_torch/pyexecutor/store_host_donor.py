@@ -62,6 +62,14 @@ one ``STORE_HOST_DONOR_LATE_AUTO`` line per rank.
 Every registration logs one ``STORE_HOST_DONOR_REGISTERED`` line and every
 release one ``STORE_HOST_DONOR_RETIRED`` line.
 ``TLLM_DISABLE_STORE_HOST_DONOR=1`` turns the feature off.
+
+``TLLM_MOONCAKE_STORE_EGM=1`` runs the whole store over NVLink with EGM
+(host memory the GPUs reach through NVLink-C2C and the NVLink fabric) instead
+of RDMA; see `store_egm_enabled`. Every share, every late lend and the KV
+connector's own segment then becomes a separate Mooncake client that allocates
+its segment as EGM on one NUMA node (``enable_egm_store_pool``), the KV
+connector copies pages between EGM and its KV pool over NVLink, and the sizing
+above is unchanged. Unset (the default), nothing here changes.
 """
 
 import atexit
@@ -84,11 +92,14 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DISABLE_ENV",
+    "EGM_PROTOCOL",
     "MASTER_ENV",
+    "STORE_EGM_ENV",
     "DonorShare",
     "LateAuto",
     "StoreHostDonor",
     "active_donor",
+    "adopt_store_segment",
     "cgroup_memory",
     "close_active_donor",
     "cpu_numa_nodes",
@@ -98,6 +109,12 @@ __all__ = [
     "plan_shares",
     "resolve_master",
     "start_store_host_donor",
+    "store_egm_enabled",
+    "egm_direct_enabled",
+    "egm_direct_save_enabled",
+    "egm_direct_batch",
+    "latch_egm_environment",
+    "egm_wheel_check",
 ]
 
 #: Set to 1 to ignore ``store_host_donor``.
@@ -523,6 +540,365 @@ def node_obtainable_bytes(info: Dict[str, int]) -> Optional[int]:
     return info["MemFree"] + cache + info.get("SReclaimable", 0)
 
 
+#: Smallest physically contiguous block a HOST_NUMA (EGM) allocation is built
+#: from: cuMemGetAllocationGranularity reports 2 MiB for HOST_NUMA memory.
+EGM_HOST_BLOCK = 2 << 20
+
+
+def node_egm_usable_bytes(
+    node: int,
+    buddyinfo_path: str = "/proc/buddyinfo",
+    page_size: Optional[int] = None,
+    block: int = EGM_HOST_BLOCK,
+) -> Optional[int]:
+    """Free memory of a NUMA node in blocks an EGM allocation can use, or None.
+
+    A HOST_NUMA allocation is built from free blocks of at least ``block``
+    bytes, so free memory split into smaller pieces (counted in MemFree) may
+    not back it. This sums the node's free blocks of that order and above
+    from the buddy allocator. It is a hint, not a bound: the kernel can
+    sometimes assemble more blocks while the allocation runs.
+    """
+    if page_size is None:
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, AttributeError):
+            return None
+    if page_size <= 0:
+        return None
+    order = max(0, (max(1, block // page_size) - 1).bit_length())
+    total, found = 0, False
+    try:
+        with open(buddyinfo_path) as handle:
+            for line in handle:
+                # "Node 0, zone   Normal   1180  16528 ..."
+                parts = line.split()
+                if len(parts) < 5 or parts[0] != "Node" or parts[1].rstrip(",") != str(node):
+                    continue
+                found = True
+                for index, count in enumerate(parts[4:]):
+                    if index >= order:
+                        total += int(count) * (page_size << index)
+    except (OSError, ValueError):
+        return None
+    return total if found else None
+
+
+def _env_number(
+    environ: Mapping[str, str], name: str, *, positive: bool = False
+) -> Optional[float]:
+    text = environ.get(name)
+    if text is None or not text.strip():
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{LOG_TAG}: {name}={text!r} is not a number") from None
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        raise ValueError(f"{LOG_TAG}: {name}={text!r} must be a finite nonnegative number")
+    if positive and value == 0:
+        raise ValueError(f"{LOG_TAG}: {name} must be > 0")
+    return value
+
+
+def _env_flag(environ: Mapping[str, str], name: str) -> Optional[bool]:
+    text = environ.get(name)
+    if text is None or not text.strip():
+        return None
+    value = text.strip().lower()
+    if value in ("1", "on", "true", "yes"):
+        return True
+    if value in ("0", "off", "false", "no"):
+        return False
+    raise ValueError(f"{LOG_TAG}: {name}={text!r} must be 1/on or 0/off")
+
+
+# --------------------------------------------------------------------------
+# EGM over NVLink (TLLM_MOONCAKE_STORE_EGM)
+# --------------------------------------------------------------------------
+
+#: 1 runs the store over NVLink with EGM segments; unset or 0 keeps RDMA.
+STORE_EGM_ENV = "TLLM_MOONCAKE_STORE_EGM"
+#: Most EGM clients one process keeps open (each is a transfer engine and a port).
+EGM_MAX_CLIENTS_ENV = "TLLM_MOONCAKE_STORE_EGM_MAX_CLIENTS"
+EGM_MAX_CLIENTS_DEFAULT = 16
+EGM_PROTOCOL = "nvlink"
+EGM_TAG = "STORE_EGM"
+#: 1 passes EGM pages through pinned host staging again. Unset or 0 copies
+#: them between EGM and the KV pool directly over NVLink.
+EGM_DIRECT_DISABLE_ENV = "TLLM_DISABLE_MOONCAKE_STORE_EGM_DIRECT"
+#: Pages per store call on the direct path's asynchronous loaders. Unset keeps
+#: the configured transfer batch.
+EGM_DIRECT_BATCH_ENV = "TLLM_MOONCAKE_STORE_EGM_DIRECT_BATCH"
+#: 0 keeps direct loads but writes pages to EGM through a pinned host slot,
+#: which is faster when the slot sits on the GPU's own NUMA node. Unset or 1
+#: saves directly as well.
+EGM_DIRECT_SAVE_ENV = "TLLM_MOONCAKE_STORE_EGM_DIRECT_SAVE"
+#: Copy streams one asynchronous direct load is spread over. Mooncake issues a
+#: caller's NVLink copies on that thread's own stream, and one stream does not
+#: reach the link's bandwidth; splitting a load across threads reads several
+#: page ranges at once. 1 turns it off.
+EGM_LOAD_STREAMS_ENV = "TLLM_MOONCAKE_STORE_EGM_LOAD_STREAMS"
+EGM_LOAD_STREAMS_DEFAULT = 2
+#: 1 (default) has Mooncake group each direct EGM load call by source segment,
+#: so the NVLink transport submits one copy batch per segment instead of one
+#: per page. Every NVLink submit first waits for the caller's per-thread
+#: default stream, which is ordered behind the executor's legacy default
+#: stream and so behind the forward pass in flight; fewer submits wait less
+#: often. 0 submits page by page.
+EGM_GROUPED_LOADS_ENV = "TLLM_MOONCAKE_STORE_EGM_GROUPED_LOADS"
+#: 1 (default) writes EGM saves with Mooncake's prefer_alloc_in_same_node, the
+#: only put option that groups a call's copies by target segment (one NVLink
+#: submit per segment instead of one per page, as for grouped loads). It also
+#: places new pages on this node's EGM segments first and spills to the other
+#: nodes once those are full. 0 keeps per-page submits and random placement.
+EGM_GROUPED_SAVES_ENV = "TLLM_MOONCAKE_STORE_EGM_GROUPED_SAVES"
+#: 1 (default) has the executor loop run on a private stream rather than the
+#: legacy default stream while direct EGM copies are on. The loop's stream
+#: waits for every forward pass, and Mooncake's NVLink transport host-waits on
+#: its caller's per-thread default stream before each copy submit; that stream
+#: is ordered behind the legacy default stream, so a loop on the legacy stream
+#: makes every EGM load and save wait for the forward pass in flight. 0 keeps
+#: the loop on the legacy default stream.
+EGM_PRIVATE_LOOP_STREAM_ENV = "TLLM_MOONCAKE_STORE_EGM_PRIVATE_LOOP_STREAM"
+#: Every EGM segment is a whole number of these, so the size asked for is the
+#: size mounted under any HOST_NUMA allocation granularity up to it.
+EGM_ALIGN = _GIB
+#: A registration whose job-cgroup growth falls below this share of its size
+#: is not charged as host memory, and accounting that reads the job cgroup
+#: would miss it. The job cgroup is shared with every other rank on the node,
+#: whose own usage can fall while a segment registers, so only a clear
+#: shortfall counts: memory that is not charged at all grows the cgroup by
+#: about nothing.
+EGM_CHARGED_FRACTION = 0.5
+#: Failed setups one late EGM lend accepts per NUMA node before it moves on.
+EGM_LEND_FAILS_PER_NODE = 5
+#: Free large-block memory a retried late EGM lend leaves on its NUMA node.
+EGM_USABLE_MARGIN = 2 * _GIB
+#: A late EGM lend whose cgroup growth exceeds its lent bytes by more than
+#: this is reported: the driver kept memory it did not lend.
+EGM_KEPT_REPORT_BYTES = 2 * _GIB
+#: After a failed EGM setup, the job cgroup and the NUMA node are read every
+#: this many seconds until both hold still (the driver may still be
+#: returning pages), for at most `EGM_SETTLE_SECONDS`, before a retry.
+EGM_SETTLE_INTERVAL = 0.5
+EGM_SETTLE_SECONDS = 10.0
+EGM_SETTLE_STILL_BYTES = 256 << 20
+#: A late EGM share that stays short is retried in the background every this
+#: many seconds, at most `EGM_LATE_RETRY_PASSES` times.
+EGM_LATE_RETRY_SECONDS_ENV = "TLLM_MOONCAKE_STORE_EGM_LATE_RETRY_SECONDS"
+EGM_LATE_RETRY_SECONDS_DEFAULT = 300.0
+EGM_LATE_RETRY_PASSES = 12
+#: 0 keeps every late EGM lend on its own NUMA node. Unset or 1 places the part
+#: that its own node cannot back on the node's other NUMA nodes.
+EGM_LEND_SPILL_ENV = "TLLM_MOONCAKE_STORE_EGM_LEND_SPILL"
+#: Process environment the classic NVLink transport needs. Mooncake reads it
+#: when a client is set up, so it is fixed before the first one.
+_EGM_ENV_SET = {
+    "MC_MS_AUTO_DISC": "0",
+    "MC_USE_TENT": "0",
+    "MC_USE_TEV1": "0",
+    "MC_ENABLE_PARALLEL_REG_MR": "0",
+    "MOONCAKE_STORE_BACKEND": "cpp",
+}
+_EGM_ENV_POP = (
+    "MC_USE_NVLINK_IPC",
+    "MC_FORCE_MNNVL",
+    "MC_INTRANODE_NVLINK",
+    "MC_TE_FILTERS",
+    "MC_ENABLE_DEST_DEVICE_AFFINITY",
+)
+#: Mooncake clients opened in this process under the knob.
+_EGM_STATE = {"clients": 0}
+_EGM_STATE_LOCK = threading.Lock()
+
+
+class EgmSetupError(RuntimeError):
+    """Mooncake could not set up an EGM client (its ``setup`` returned nonzero)."""
+
+
+def store_egm_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the store runs over NVLink with EGM segments.
+
+    The only reader of `STORE_EGM_ENV`; the donor and the KV connector both
+    ask here, so they cannot disagree on the transport. A value that is
+    neither on nor off raises instead of meaning either.
+    """
+    environ = os.environ if environ is None else environ
+    return bool(_env_flag(environ, STORE_EGM_ENV))
+
+
+def egm_direct_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether EGM pages move between the store and the KV pool directly.
+
+    NVLink copies take a local buffer as a raw device pointer, so the KV pool
+    needs neither registration nor a pinned host bounce. On whenever the store
+    runs over EGM, unless `EGM_DIRECT_DISABLE_ENV` is set. Values that are
+    neither on nor off raise.
+    """
+    environ = os.environ if environ is None else environ
+    if not store_egm_enabled(environ):
+        return False
+    return not _env_flag(environ, EGM_DIRECT_DISABLE_ENV)
+
+
+def egm_direct_save_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether saves also skip the host when EGM pages move directly.
+
+    False whenever `egm_direct_enabled` is, and when `EGM_DIRECT_SAVE_ENV` is
+    off: loads then stay direct while saves are gathered into a pinned host
+    slot first. Values that are neither on nor off raise.
+    """
+    environ = os.environ if environ is None else environ
+    if not egm_direct_enabled(environ):
+        return False
+    return _env_flag(environ, EGM_DIRECT_SAVE_ENV) is not False
+
+
+def egm_direct_batch(environ: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """Pages per asynchronous direct load call, or None to keep the configured batch."""
+    environ = os.environ if environ is None else environ
+    value = _env_number(environ, EGM_DIRECT_BATCH_ENV, positive=True)
+    if value is None:
+        return None
+    if value != int(value):
+        raise ValueError(f"{EGM_TAG}: {EGM_DIRECT_BATCH_ENV} must be a whole number")
+    return int(value)
+
+
+def egm_load_streams(environ: Optional[Mapping[str, str]] = None) -> int:
+    """Copy streams per asynchronous direct load; 1 when the direct path is off."""
+    environ = os.environ if environ is None else environ
+    if not egm_direct_enabled(environ):
+        return 1
+    value = _env_number(environ, EGM_LOAD_STREAMS_ENV, positive=True)
+    if value is None:
+        return EGM_LOAD_STREAMS_DEFAULT
+    if value != int(value):
+        raise ValueError(f"{EGM_TAG}: {EGM_LOAD_STREAMS_ENV} must be a whole number")
+    return int(value)
+
+
+def egm_grouped_loads(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether direct EGM loads ask Mooncake to group each call by source segment."""
+    environ = os.environ if environ is None else environ
+    if not egm_direct_enabled(environ):
+        return False
+    return _env_flag(environ, EGM_GROUPED_LOADS_ENV) is not False
+
+
+def egm_grouped_saves(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether direct-path EGM saves are grouped by segment (and placed node-local first)."""
+    environ = os.environ if environ is None else environ
+    if not egm_direct_enabled(environ):
+        return False
+    return _env_flag(environ, EGM_GROUPED_SAVES_ENV) is not False
+
+
+def egm_private_loop_stream(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether direct EGM copies ask the executor loop to leave the legacy default stream."""
+    environ = os.environ if environ is None else environ
+    if not egm_direct_enabled(environ):
+        return False
+    return _env_flag(environ, EGM_PRIVATE_LOOP_STREAM_ENV) is not False
+
+
+def egm_max_clients(environ: Optional[Mapping[str, str]] = None) -> int:
+    environ = os.environ if environ is None else environ
+    value = _env_number(environ, EGM_MAX_CLIENTS_ENV, positive=True)
+    if value is None:
+        return EGM_MAX_CLIENTS_DEFAULT
+    if value != int(value):
+        raise ValueError(f"{EGM_TAG}: {EGM_MAX_CLIENTS_ENV} must be a whole number")
+    return int(value)
+
+
+def egm_lend_spill(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether a late EGM lend may place what its NUMA node cannot back on the
+    node's other NUMA nodes (on unless `EGM_LEND_SPILL_ENV` is off)."""
+    environ = os.environ if environ is None else environ
+    return _env_flag(environ, EGM_LEND_SPILL_ENV) is not False
+
+
+def latch_egm_environment(environ: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Fix the process environment the NVLink transport needs. Idempotent.
+
+    Returns what it changed. Raises when a change is needed after this
+    process already opened a client under the knob, since that client was set
+    up with the old values.
+    """
+    environ = os.environ if environ is None else environ
+    changed = {
+        name: [environ.get(name), value]
+        for name, value in _EGM_ENV_SET.items()
+        if environ.get(name) != value
+    }
+    popped = [name for name in _EGM_ENV_POP if name in environ]
+    with _EGM_STATE_LOCK:
+        if (changed or popped) and _EGM_STATE["clients"] > 0:
+            raise RuntimeError(
+                f"{EGM_TAG}: the environment changed ({sorted(changed) + popped}) after a "
+                "Mooncake client was set up; set it before the first client"
+            )
+        for name, value in _EGM_ENV_SET.items():
+            environ[name] = value
+        for name in popped:
+            environ.pop(name, None)
+    return {"set": changed, "popped": popped}
+
+
+def _note_egm_client() -> None:
+    with _EGM_STATE_LOCK:
+        _EGM_STATE["clients"] += 1
+
+
+def egm_wheel_check(store_type: Any = None) -> None:
+    """Raise unless the Mooncake binding can allocate EGM segments.
+
+    The dictionary ``setup`` ignores keys it does not know, so only its
+    documentation tells a wheel with the EGM store pool from one without.
+    """
+    if store_type is None:
+        try:
+            from mooncake.store import MooncakeDistributedStore as store_type
+        except ImportError as error:
+            logger.error(f"{EGM_TAG}_UNSUPPORTED reason=import: {error}")
+            raise RuntimeError(
+                f"{EGM_TAG}: {STORE_EGM_ENV}=1 needs the Mooncake Python bindings"
+            ) from error
+    doc = getattr(getattr(store_type, "setup", None), "__doc__", None) or ""
+    missing = [key for key in ("enable_egm_store_pool", "egm_numa_nodes") if key not in doc]
+    if missing:
+        logger.error(f"{EGM_TAG}_UNSUPPORTED reason=wheel missing={missing}")
+        raise RuntimeError(
+            f"{EGM_TAG}: {STORE_EGM_ENV}=1 but this Mooncake wheel cannot allocate EGM "
+            f"segments (setup lacks {missing}); there is no RDMA fallback"
+        )
+
+
+def _egm_kind(phase: str) -> str:
+    return phase if phase in ("startup", "startup_adopted") else "late"
+
+
+def egm_setup_config(*, hostname: str, master: str, size: int, numa_node: int) -> Dict[str, str]:
+    """The dictionary ``setup`` of a client that provides one EGM segment.
+
+    ``egm_numa_nodes`` names the socket: Mooncake's ``auto`` would follow the
+    visible GPUs instead of the share's NUMA node.
+    """
+    return {
+        "local_hostname": hostname,
+        "metadata_server": METADATA_SERVER,
+        "master_server_addr": master,
+        "protocol": EGM_PROTOCOL,
+        "rdma_devices": "",
+        "global_segment_size": str(size),
+        "local_buffer_size": "0",
+        "enable_egm_store_pool": "true",
+        "egm_numa_nodes": str(numa_node),
+    }
+
+
 # --------------------------------------------------------------------------
 # The donor
 # --------------------------------------------------------------------------
@@ -587,9 +963,20 @@ class StoreHostDonor:
         store_factory: Callable[[], Any] = _default_store_factory,
         bind_thread: Callable[[int], None] = _bind_current_thread,
         meminfo: Callable[[int], Dict[str, int]] = node_meminfo,
+        egm: bool = False,
+        egm_max_clients: int = EGM_MAX_CLIENTS_DEFAULT,
+        egm_spill: bool = True,
+        egm_usable: Callable[[int], Optional[int]] = node_egm_usable_bytes,
     ) -> None:
         if late_mode not in ("auto", "same_client", "new_client"):
             raise ValueError(f"{LOG_TAG}: unknown late_mode {late_mode!r}")
+        self.egm = bool(egm)
+        if self.egm:
+            # Each EGM segment is its own client: a segment mounted on an
+            # existing client is plain host memory peers cannot reach over
+            # NVLink, and a provider needs no transfer buffer.
+            protocol, device_name, local_buffer_size = EGM_PROTOCOL, "", 0
+            late_mode = "new_client"
         if late_delay_seconds < 0:
             raise ValueError(f"{LOG_TAG}: late_delay_seconds must be nonnegative")
         self.master = master
@@ -625,6 +1012,39 @@ class StoreHostDonor:
         self._late_done = False
         self._closed = False
         self._stop = threading.Event()
+        self._egm_max_clients = egm_max_clients
+        #: EGM bytes of retired clients, held until the process exits.
+        self._egm_retired_held = 0
+        #: Why EGM lending stopped for good, or None.
+        self._egm_stop: Optional[str] = None
+        self._egm_spill = bool(egm_spill)
+        self._egm_usable = egm_usable
+        #: Per NUMA node: bytes failed EGM setups left charged to the job, which
+        #: the driver hands to this process's next allocation on that node.
+        self._egm_kept: Dict[int, int] = {}
+        #: Static late shares that stayed short: [phase, home, short bytes,
+        #: {node: bytes failed setups left kept}], retried in the background.
+        self._egm_late_short: List[List[Any]] = []
+        self._egm_late_retry_thread: Optional[threading.Thread] = None
+        if self.egm:
+            egm_wheel_check(None if store_factory is _default_store_factory else store_factory)
+            latched = latch_egm_environment()
+            record = {
+                "role": "donor",
+                "rank": rank,
+                "local_rank": local_rank,
+                "memory": "egm",
+                "protocol": EGM_PROTOCOL,
+                "numa": self.numa_nodes,
+                "owned": [s.numa_node for s in self.shares],
+                "wheel_has_egm": True,
+                "align": EGM_ALIGN,
+                "max_clients": egm_max_clients,
+                "late_spill": self._egm_spill,
+                "late_mode": self.late_mode,
+                "env": latched,
+            }
+            logger.info(f"{EGM_TAG}_ENGAGED {json.dumps(record, sort_keys=True)}")
 
     # -- helpers ----------------------------------------------------------
 
@@ -671,12 +1091,20 @@ class StoreHostDonor:
             if handle is not None:
                 handle.close()  # closing releases the flock
 
-    def _check_headroom(self, node: int, size: int, client: bool = False) -> Dict[str, int]:
-        """Refuse an allocation the NUMA node or the job cgroup cannot take."""
+    def _check_headroom(
+        self, node: int, size: int, client: bool = False, kept: int = 0
+    ) -> Dict[str, int]:
+        """Refuse an allocation the NUMA node or the job cgroup cannot take.
+
+        ``kept`` is memory a failed EGM setup took from the node that this
+        allocation reuses, so the NUMA node needs that much less free memory.
+        It is an estimate, so the cgroup check below does not count on it.
+        """
         info = self._meminfo(node)
         obtainable = node_obtainable_bytes(info)
         # Opening a client also allocates its transfer buffer under the binding.
-        need = size + (self.local_buffer_size if client else 0)
+        full = size + (self.local_buffer_size if client else 0)
+        need = max(0, full - max(0, kept))
         if obtainable is not None and obtainable < need + NODE_HEADROOM_BYTES:
             raise RuntimeError(
                 f"{LOG_TAG}: NUMA node {node} has {obtainable / _GIB:.1f} GiB free or "
@@ -688,16 +1116,22 @@ class StoreHostDonor:
         # can be far smaller than the node: refuse what cannot fit under it.
         job = self._job_memory()
         limit, nonfile = job.get("limit"), job.get("nonfile")
-        if limit is not None and (nonfile is None or need > limit - nonfile):
+        if limit is not None and (nonfile is None or full > limit - nonfile):
             held = "unknown" if nonfile is None else f"{nonfile / _GIB:.1f} GiB"
             raise RuntimeError(
-                f"{LOG_TAG}: {need / _GIB:.1f} GiB does not fit the memory cgroup "
+                f"{LOG_TAG}: {full / _GIB:.1f} GiB does not fit the memory cgroup "
                 f"{job.get('path')} ({limit / _GIB:.1f} GiB limit, {held} held); refusing an "
                 "allocation that could be OOM-killed"
             )
         return info
 
-    def _log_registered(self, reg: _Registration, seconds: float, before: Dict[str, int]) -> None:
+    def _log_registered(
+        self,
+        reg: _Registration,
+        seconds: float,
+        before: Dict[str, int],
+        egm: Optional[Dict[str, Any]] = None,
+    ) -> None:
         after = self._meminfo(reg.share.numa_node)
         drop = (
             (before.get("MemFree", 0) - after.get("MemFree", 0)) / _GIB
@@ -726,6 +1160,17 @@ class StoreHostDonor:
             "host": socket.gethostname(),
             "pid": os.getpid(),
         }
+        if egm is not None:
+            free_was, free_now = before.get("MemFree"), after.get("MemFree")
+            record.update(
+                memory="egm",
+                kind=_egm_kind(reg.phase),
+                egm_numa=reg.share.numa_node,
+                numa_free_delta=(
+                    None if free_was is None or free_now is None else free_was - free_now
+                ),
+                **egm,
+            )
         logger.info(f"{LOG_TAG}_REGISTERED {json.dumps(record, sort_keys=True)}")
 
     def _run_bound(self, node: int, work: Callable[[], Any], name: str) -> Any:
@@ -805,6 +1250,9 @@ class StoreHostDonor:
             self._open_client_locked(reg)
 
     def _open_client_locked(self, reg: _Registration) -> None:
+        if self.egm:
+            self._open_egm_client_locked(reg)
+            return
         node = reg.share.numa_node
         before = self._check_headroom(node, reg.bytes, client=True)
         hostname = self._hostname()
@@ -841,6 +1289,123 @@ class StoreHostDonor:
             self._registrations.append(reg)
         self._log_registered(reg, time.monotonic() - started, before)
 
+    def _egm_live_clients(self) -> int:
+        with self._lock:
+            return sum(1 for r in self._registrations if r.own_client)
+
+    def _open_egm_client_locked(self, reg: _Registration, kept: int = 0) -> None:
+        """Open one client whose segment Mooncake allocates as EGM on the share's
+        NUMA node. Call with the node lock held.
+
+        ``kept`` is memory an earlier failed setup on this node left charged to
+        the job; the driver backs this segment from it first, so the job cgroup
+        grows by that much less.
+        """
+        node = reg.share.numa_node
+        reg.bytes = reg.bytes // EGM_ALIGN * EGM_ALIGN
+        if reg.bytes <= 0:
+            return
+        if self._egm_stop == "egm_uncharged" and _egm_kind(reg.phase) == "late":
+            # The planned store (startup shares, the connector's segment) is
+            # in the static budget already; nothing beyond it is lent.
+            raise RuntimeError(
+                f"{EGM_TAG}: an earlier EGM segment was not charged to the job cgroup; "
+                f"refusing the {reg.phase} segment of {reg.bytes} bytes"
+            )
+        if self._egm_live_clients() >= self._egm_max_clients:
+            raise RuntimeError(
+                f"{EGM_TAG}: {self._egm_max_clients} EGM clients already open on rank "
+                f"{self.rank} ({EGM_MAX_CLIENTS_ENV})"
+            )
+        before = self._check_headroom(node, reg.bytes, client=True, kept=kept)
+        job_before = self._job_memory().get("nonfile")
+        hostname = self._hostname()
+        config = egm_setup_config(
+            hostname=hostname, master=self.master, size=reg.bytes, numa_node=node
+        )
+        started = time.monotonic()
+
+        def work():
+            store = self._store_factory()
+            _note_egm_client()
+            try:
+                status = store.setup(config)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    store.close()
+                raise
+            if status != 0:
+                with contextlib.suppress(Exception):
+                    store.close()
+                free = before.get("MemFree")
+                raise EgmSetupError(
+                    f"{EGM_TAG}: EGM setup failed with status {status} (master={self.master}, "
+                    f"requested={reg.bytes}, numa_node={node}, numa_memfree="
+                    f"{'unknown' if free is None else free}); no RDMA fallback"
+                )
+            return store
+
+        reg.store = self._run_bound(node, work, f"store-host-donor-{reg.phase}-n{node}")
+        reg.segment_name = _segment_name(reg.store, hostname)
+        with self._lock:
+            self._registrations.append(reg)
+        job_after = self._job_memory().get("nonfile")
+        cgroup_delta = None if job_before is None or job_after is None else job_after - job_before
+        # Memory the driver pooled earlier (a failed setup, a closed client, of
+        # this or another process of the job) was charged when it left the
+        # node; reusing it grows neither the cgroup nor the node's usage. Only
+        # memory that leaves the node uncharged is a shortfall.
+        was = node_obtainable_bytes(before)
+        now = node_obtainable_bytes(self._meminfo(node))
+        node_taken = None if was is None or now is None else was - now
+        egm = {"cgroup_delta": cgroup_delta, "node_taken": node_taken}
+        if kept:
+            egm["kept_reused"] = kept
+        self._log_registered(reg, time.monotonic() - started, before, egm=egm)
+        threshold = EGM_CHARGED_FRACTION * reg.bytes
+        if (
+            cgroup_delta is not None
+            and cgroup_delta + max(0, kept) < threshold
+            and (node_taken is None or node_taken - max(0, kept) >= threshold)
+        ):
+            # Host-memory accounting that reads the job cgroup would miss
+            # this memory: stop lending rather than lend into it twice.
+            self._egm_stop = "egm_uncharged"
+            record = {
+                "rank": self.rank,
+                "phase": reg.phase,
+                "numa_node": node,
+                "bytes": reg.bytes,
+                "cgroup_delta": cgroup_delta,
+                "node_taken": node_taken,
+                "kept": kept,
+            }
+            logger.error(f"{EGM_TAG}_UNCHARGED {json.dumps(record, sort_keys=True)}")
+
+    def adopt_store_segment(self, size: int) -> int:
+        """Provide this rank's KV connector segment as an EGM client on the rank's
+        own NUMA node. Returns the bytes provided.
+
+        Over NVLink the connector's own segment would be plain host memory its
+        peers cannot reach, so the connector opens with none and the donor
+        provides the same bytes instead, at the moment the connector would
+        have mounted them.
+        """
+        if not self.egm:
+            raise RuntimeError(f"{EGM_TAG}: segment adoption needs {STORE_EGM_ENV}=1")
+        if not self.numa_nodes:
+            raise RuntimeError(f"{EGM_TAG}: segment adoption needs the NUMA node list")
+        # The inverse of `plan_shares`: ranks fill the sockets in order.
+        node = self.numa_nodes[self.local_rank * len(self.numa_nodes) // self.local_size]
+        reg = _Registration("startup_adopted", DonorShare(node, size, 0), size)
+        self._open_client(reg)
+        if reg not in self._registrations:
+            raise RuntimeError(
+                f"{EGM_TAG}: store segment of {size} bytes rounds to nothing at "
+                f"{EGM_ALIGN} bytes per segment"
+            )
+        return reg.bytes
+
     def _mount_on(self, base: _Registration, reg: _Registration, fit: bool = False) -> None:
         with self._node_serialized():
             if fit and not self._fit_late_auto(reg, client=False):
@@ -848,6 +1413,11 @@ class StoreHostDonor:
             self._mount_on_locked(base, reg)
 
     def _mount_on_locked(self, base: _Registration, reg: _Registration) -> None:
+        if self.egm:
+            raise RuntimeError(
+                f"{EGM_TAG}: allocate_and_mount_segment mounts plain host memory that peers "
+                "cannot reach over NVLink; every EGM segment needs its own client"
+            )
         node = reg.share.numa_node
         before = self._check_headroom(node, reg.bytes)
         started = time.monotonic()
@@ -906,6 +1476,17 @@ class StoreHostDonor:
             "status": str(status),
             "ok": ok,
         }
+        if self.egm:
+            # Closing does not hand EGM back to the job promptly: count it as
+            # held until the process exits, so nothing is lent into it.
+            self._egm_retired_held += reg.bytes
+            record.update(
+                memory="egm",
+                kind=_egm_kind(reg.phase),
+                egm_numa=reg.share.numa_node,
+                held_until_exit=True,
+                egm_retired_held=self._egm_retired_held,
+            )
         if ok:
             logger.info(f"{LOG_TAG}_RETIRED {json.dumps(record, sort_keys=True)}")
             with self._lock:
@@ -969,7 +1550,7 @@ class StoreHostDonor:
 
     def _late_base(self, node: int) -> Optional[_Registration]:
         """The client a late segment on ``node`` mounts on, or None for a new client."""
-        if self.late_mode == "new_client":
+        if self.egm or self.late_mode == "new_client":
             return None
         base = self._base_for(node)
         if self.late_mode == "same_client":
@@ -1086,6 +1667,8 @@ class StoreHostDonor:
                 (auto.store_per_gpu + peak + startup_per_gpu + total / self.local_size) / _GIB, 3
             ),
         }
+        if self.egm:
+            self.late_auto_record["memory"] = "egm"
         logger.info(f"{LOG_TAG}_LATE_AUTO {json.dumps(self.late_auto_record, sort_keys=True)}")
 
     def _register_late_now(self) -> None:
@@ -1099,9 +1682,343 @@ class StoreHostDonor:
             fit = self.late_auto is not None
             if base is not None:
                 self._mount_on(base, reg, fit=fit)
+            elif self.egm:
+                if not self._open_egm_late(reg, fit=fit):
+                    break
             else:
                 self._open_client(reg, fit=fit)
         self._late_done = True
+        if self.egm:
+            self._egm_start_late_retry()
+
+    def _open_egm_late(self, reg: _Registration, fit: bool) -> bool:
+        """Lend a planned late share as EGM. Returns False once lending on this
+        rank has stopped for good (client cap, uncharged memory).
+
+        See `_lend_egm_locked` for how a share that Mooncake cannot set up in
+        one piece is still lent in full. Startup shares and the adopted
+        connector segment stay fatal.
+        """
+        if self._egm_stop == "egm_uncharged":
+            # The planned store is in the static budget already; nothing
+            # beyond it is lent.
+            raise RuntimeError(
+                f"{EGM_TAG}: an earlier EGM segment was not charged to the job cgroup; "
+                f"refusing the {reg.phase} segment of {reg.bytes} bytes"
+            )
+        with self._node_serialized():
+            if fit and not self._fit_late_auto(reg, client=True):
+                return True
+            summary = self._lend_egm_locked(reg.phase, reg.share.numa_node, reg.bytes, EGM_ALIGN)
+        if summary["short"] >= EGM_ALIGN and self._egm_stop is None:
+            kept = {int(n): b for n, b in summary["kept"].items()}
+            self._egm_late_short.append([reg.phase, reg.share.numa_node, summary["short"], kept])
+        return self._egm_stop is None
+
+    def _egm_late_retry_loop(self, interval: float, passes: int) -> None:
+        """Retry the static late EGM shares that stayed short, every
+        ``interval`` seconds, at most ``passes`` times.
+
+        Each retry asks only for the bytes still unlent. Memory the earlier
+        failures left kept counts as growth already made, so the share never
+        grows the job beyond its plan; it is also the first memory a retry on
+        that node reuses.
+        """
+        for attempt in range(1, passes + 1):
+            if self._stop.wait(interval) or self._egm_stop is not None:
+                return
+            with self._node_serialized():
+                for entry in self._egm_late_short:
+                    phase, home, short, kept = entry
+                    if short < EGM_ALIGN or self._stop.is_set():
+                        continue
+                    summary = self._lend_egm_locked(
+                        f"{phase}_retry{attempt}", home, short, EGM_ALIGN, carried=kept
+                    )
+                    entry[2] = short - summary["lent"]
+                    entry[3] = {int(n): b for n, b in summary["kept"].items()}
+            left = sum(entry[2] for entry in self._egm_late_short)
+            if left < EGM_ALIGN or self._egm_stop is not None:
+                break
+        left = sum(entry[2] for entry in self._egm_late_short)
+        record = {
+            "rank": self.rank,
+            "short": left,
+            "kept": sum(sum(entry[3].values()) for entry in self._egm_late_short),
+            "egm_stop": self._egm_stop,
+        }
+        if left >= EGM_ALIGN:
+            logger.error(f"{EGM_TAG}_LATE_INCOMPLETE {json.dumps(record, sort_keys=True)}")
+        else:
+            logger.info(f"{EGM_TAG}_LATE_COMPLETE {json.dumps(record, sort_keys=True)}")
+
+    def _egm_start_late_retry(self) -> None:
+        if not any(entry[2] >= EGM_ALIGN for entry in self._egm_late_short):
+            return
+        interval = _env_number(os.environ, EGM_LATE_RETRY_SECONDS_ENV)
+        interval = EGM_LATE_RETRY_SECONDS_DEFAULT if interval is None else interval
+
+        def target():
+            try:
+                self._egm_late_retry_loop(interval, EGM_LATE_RETRY_PASSES)
+            except BaseException as error:  # noqa: BLE001 - nobody to raise to
+                logger.error(f"{LOG_TAG}_FAILED phase=late_retry rank={self.rank}: {error}")
+
+        with self._lock:
+            # No retry once close has begun: close joins only a thread it sees.
+            if self._stop.is_set():
+                return
+            self._egm_late_retry_thread = threading.Thread(
+                target=target, name="store-host-donor-late-retry", daemon=True
+            )
+            self._egm_late_retry_thread.start()
+
+    def _egm_settle(self, node: int) -> float:
+        """Wait until the job cgroup and NUMA node ``node`` hold still after a
+        failed EGM setup (at most `EGM_SETTLE_SECONDS`). Returns the seconds
+        waited. A retry sized while the driver is still returning pages could
+        take new memory instead of reusing the kept memory."""
+        if EGM_SETTLE_INTERVAL <= 0:
+            return 0.0
+        start = time.monotonic()
+
+        def read():
+            return (
+                self._job_memory().get("nonfile"),
+                self._meminfo(node).get("MemFree"),
+            )
+
+        last = read()
+        while time.monotonic() - start < EGM_SETTLE_SECONDS:
+            if self._stop.wait(EGM_SETTLE_INTERVAL):
+                break
+            now = read()
+            if all(
+                a is None or b is None or abs(a - b) < EGM_SETTLE_STILL_BYTES
+                for a, b in zip(last, now)
+            ):
+                break
+            last = now
+        return round(time.monotonic() - start, 3)
+
+    def _egm_next_size(
+        self,
+        remaining: int,
+        kept: int,
+        usable: Optional[int],
+        last_failed: Optional[int],
+        failed_kept: int = 0,
+    ) -> int:
+        """Bytes the next EGM setup on one NUMA node asks for (before clamps)."""
+        if last_failed is None:
+            return remaining
+        if kept > 0 or usable is not None:
+            size = kept + max(0, (usable or 0) - EGM_USABLE_MARGIN)
+            # Segments are whole EGM_ALIGN units: round up, so the kept memory
+            # is reused in full rather than leaving a stranded part.
+            size = -(-size // EGM_ALIGN) * EGM_ALIGN
+        else:
+            size = last_failed // 2
+        if size < last_failed:
+            return size
+        if size == last_failed and kept >= failed_kept + EGM_ALIGN:
+            # The size failed before the failure left this memory kept: now
+            # only the last partial unit is new, so it is worth one more try.
+            return size
+        # Never repeat a size that already failed with no more memory known:
+        # the kept memory alone is the likeliest to back a segment.
+        return kept if 0 < kept < last_failed else last_failed // 2
+
+    def _lend_egm_locked(
+        self,
+        phase: str,
+        home: int,
+        planned: int,
+        min_segment: int,
+        carried: Optional[Mapping[int, int]] = None,
+    ) -> Dict[str, Any]:
+        """Lend ``planned`` bytes of EGM, starting on NUMA node ``home``, as one
+        or more segments. Call with the node lock held.
+
+        An EGM segment is one HOST_NUMA allocation, built from free blocks of
+        `EGM_HOST_BLOCK` and more; MemFree also counts smaller free pieces, so
+        a lend sized from it can fail on a fragmented node. A failed setup leaves what
+        it took charged to the job, and the driver hands that memory to this
+        process's next allocation on the node. So after a failure the lend is
+        retried on the same node at once, sized from that kept memory plus the
+        node's free large blocks, and the part the node cannot back moves to
+        the node's other NUMA nodes (unless `EGM_LEND_SPILL_ENV` is off).
+
+        The job grows by at most ``planned``: each setup asks for no more than
+        the plan less what the job has grown by since the call started (lent
+        segments and memory failed setups kept, measured from the job cgroup
+        when it can be read), plus the memory kept on the node it is placed
+        on, which it reuses first. Kept memory is known only from this call's
+        failures and is re-measured after each one, so nothing stale from an
+        earlier call or another process is counted. Memory that stays kept is
+        charged to the job, and the next setup on that node reuses it first. A lend that stays
+        short holds only for this call; later calls try again. ``carried`` is
+        memory an earlier call for the same plan left kept, per node: it counts
+        as growth already made and may be reused on its node, but it is never
+        trusted to relax the NUMA headroom check.
+
+        The bound is on EGM bytes (lent segments plus memory failed setups
+        kept, re-measured from the job cgroup after each failure); the small
+        process-side cost of each setup (tens of MiB) is outside it and is
+        covered by the host memory budget. The last segment may be smaller than
+        ``min_segment`` (down to `EGM_ALIGN`) when it completes the plan.
+
+        Returns the summary that is also logged.
+        """
+        align = EGM_ALIGN
+        planned = max(0, planned) // align * align
+        min_segment = max(align, min_segment // align * align)
+        nodes = [home]
+        if self._egm_spill:
+            nodes += [n for n in self.numa_nodes if n != home]
+        job_start = self._job_memory().get("nonfile")
+        lent, failures = 0, 0
+        # Kept memory from earlier calls may have been reused by another
+        # process since: only this call's failures count.
+        self._egm_kept = {}
+        carry: Dict[int, int] = {int(n): max(0, int(b)) for n, b in (carried or {}).items()}
+
+        def grown() -> int:
+            # EGM bytes this plan has taken: lent segments, memory this call's
+            # failures kept (re-measured after each), and memory carried.
+            return lent + sum(self._egm_kept.values()) + sum(carry.values())
+
+        def completes(left: int) -> bool:
+            return left >= min_segment or (lent > 0 and left >= align)
+
+        segments: List[Dict[str, Any]] = []
+        refused: List[Dict[str, Any]] = []
+        for node in nodes:
+            last_failed: Optional[int] = None
+            failed_kept = 0
+            fails = 0
+            while completes(planned - lent) and not self._stop.is_set():
+                if self._egm_stop is None and self._egm_live_clients() >= self._egm_max_clients:
+                    self._egm_stop = "egm_client_cap"
+                if self._egm_stop is not None:
+                    break
+                remaining = planned - lent
+                kept = self._egm_kept.get(node, 0)
+                pooled = kept + carry.get(node, 0)
+                # The setup reuses this node's kept memory first, so it grows
+                # the job by at most size - kept.
+                budget = planned - grown() + pooled
+                usable = self._egm_usable(node)
+                size = self._egm_next_size(remaining, pooled, usable, last_failed, failed_kept)
+                obtainable = node_obtainable_bytes(self._meminfo(node))
+                if obtainable is not None:
+                    size = min(size, obtainable + kept - NODE_HEADROOM_BYTES)
+                size = max(0, min(size, remaining, budget)) // align * align
+                if size < (min_segment if size < remaining else align):
+                    break
+                reg = _Registration(phase, DonorShare(node, 0, size), size)
+                free_before = self._meminfo(node).get("MemFree")
+                job_before = self._job_memory().get("nonfile")
+                try:
+                    self._open_egm_client_locked(reg, kept=min(kept, size))
+                except EgmSetupError as error:
+                    failures, fails, last_failed, failed_kept = (
+                        failures + 1,
+                        fails + 1,
+                        size,
+                        pooled,
+                    )
+                    settled = self._egm_settle(node)
+                    free_after = self._meminfo(node).get("MemFree")
+                    job_after = self._job_memory().get("nonfile")
+                    if job_before is not None and job_after is not None:
+                        taken, basis = job_after - job_before, "job_cgroup"
+                    elif free_before is not None and free_after is not None:
+                        taken, basis = free_before - free_after, "numa_memfree"
+                    else:
+                        taken, basis = 0, "unknown"
+                    kept = kept + max(0, min(size, taken))
+                    if job_start is not None and job_after is not None:
+                        # Re-measure: all kept memory is job growth not lent.
+                        others = sum(b for n, b in self._egm_kept.items() if n != node)
+                        unlent = job_after - job_start - lent
+                        kept = max(0, min(kept, unlent - others))
+                    self._egm_kept[node] = kept
+                    record = {
+                        "rank": self.rank,
+                        "phase": phase,
+                        "numa_node": node,
+                        "home": home,
+                        "requested": size,
+                        "failure": fails,
+                        "kept": self._egm_kept[node],
+                        "kept_basis": basis,
+                        "settle_seconds": settled,
+                        "usable_before": usable,
+                        "usable_after": self._egm_usable(node),
+                        "numa_memfree_after": free_after,
+                        "lent_so_far": lent,
+                        "planned": planned,
+                        "error": str(error),
+                    }
+                    logger.warning(f"{EGM_TAG}_LEND_RETRY {json.dumps(record, sort_keys=True)}")
+                    if fails >= EGM_LEND_FAILS_PER_NODE:
+                        break
+                    continue
+                except RuntimeError as error:
+                    # Headroom, cgroup or stop refusals: this node takes no more now.
+                    refused.append({"numa_node": node, "bytes": size, "error": str(error)})
+                    break
+                if reg not in self._registrations:
+                    break
+                lent += reg.bytes
+                reused = min(carry.get(node, 0), reg.bytes)
+                if reused:
+                    carry[node] -= reused
+                self._egm_kept[node] = max(0, kept - (reg.bytes - reused))
+                segments.append(
+                    {
+                        "numa_node": node,
+                        "bytes": reg.bytes,
+                        "segment": reg.segment_name,
+                        "kept_reused": min(kept, reg.bytes),
+                    }
+                )
+            if self._egm_stop is not None or not completes(planned - lent):
+                break
+        job_end = self._job_memory().get("nonfile")
+        growth = None if job_start is None or job_end is None else job_end - job_start
+        summary = {
+            "rank": self.rank,
+            "phase": phase,
+            "home": home,
+            "planned": planned,
+            "lent": lent,
+            "short": planned - lent,
+            "failures": failures,
+            "segments": segments,
+            "refused": refused,
+            "kept": {
+                str(n): self._egm_kept.get(n, 0) + carry.get(n, 0)
+                for n in set(self._egm_kept) | set(carry)
+                if self._egm_kept.get(n, 0) + carry.get(n, 0)
+            },
+            "cgroup_growth": growth,
+            "max_growth": planned,
+            "spill": self._egm_spill,
+            "egm_stop": self._egm_stop,
+        }
+        if failures or refused or summary["short"] >= min_segment:
+            logger.warning(f"{EGM_TAG}_LATE_LEND {json.dumps(summary, sort_keys=True)}")
+        else:
+            logger.info(f"{EGM_TAG}_LATE_LEND {json.dumps(summary, sort_keys=True)}")
+        if sum(int(b) for b in summary["kept"].values()) > EGM_KEPT_REPORT_BYTES or (
+            growth is not None and growth > lent + EGM_KEPT_REPORT_BYTES
+        ):
+            # Charged to the job (so accounting that reads the job cgroup sees
+            # it) but not lent: the next lend on that node reuses it first.
+            logger.warning(f"{EGM_TAG}_KEPT {json.dumps(summary, sort_keys=True)}")
+        return summary
 
     @property
     def has_late(self) -> bool:
@@ -1145,7 +2062,10 @@ class StoreHostDonor:
         if self._closed:
             return True
         self._stop.set()
-        for name in ("_late_thread", "_startup_thread"):
+        # The late thread may start the static retry thread, so it is joined
+        # first; a retry setup in flight registers before its thread ends, so
+        # what it lent is released below rather than left behind.
+        for name in ("_late_thread", "_startup_thread", "_egm_late_retry_thread"):
             with self._lock:
                 thread = getattr(self, name)
             if thread is not None and thread is not threading.current_thread():
@@ -1205,6 +2125,21 @@ _RESERVED = object()
 def active_donor() -> Optional[StoreHostDonor]:
     donor = _ACTIVE
     return None if donor is _RESERVED else donor
+
+
+def adopt_store_segment(size: int) -> int:
+    """Have this process's donor provide the KV connector's segment over EGM.
+
+    Returns the bytes provided. The connector calls this under
+    ``TLLM_MOONCAKE_STORE_EGM=1`` in place of mounting the segment itself.
+    """
+    donor = active_donor()
+    if donor is None:
+        raise RuntimeError(
+            f"{EGM_TAG}: {STORE_EGM_ENV}=1 moves the KV connector's {size}-byte segment to "
+            "the store host donor, but this server runs none; set store_host_donor"
+        )
+    return donor.adopt_store_segment(size)
 
 
 def close_active_donor() -> bool:
@@ -1316,9 +2251,17 @@ def _build_donor(config, rank, local_rank, local_size, environ, numa_nodes, dono
     auto, late = _late_sizing(config, environ)
     shares = plan_shares(startup, late, nodes, local_rank, local_size)
     master = resolve_master(config.master, environ)
+    egm = store_egm_enabled(environ)
+    if egm:
+        donor_kwargs = {
+            "egm": True,
+            "egm_max_clients": egm_max_clients(environ),
+            "egm_spill": egm_lend_spill(environ),
+            **donor_kwargs,
+        }
     device_name = config.device_name
     if device_name is None:
-        device_name = _default_device_name(config.protocol) if shares else ""
+        device_name = _default_device_name(config.protocol) if shares and not egm else ""
     donor = StoreHostDonor(
         master=master,
         shares=shares,
@@ -1352,6 +2295,8 @@ def _build_donor(config, rank, local_rank, local_size, environ, numa_nodes, dono
         "late_mode": config.late_mode,
         "late_delay_seconds": config.late_delay_seconds,
     }
+    if egm:
+        plan.update(memory="egm", protocol=EGM_PROTOCOL, late_mode=donor.late_mode)
     logger.info(f"{LOG_TAG}_PLAN {json.dumps(plan, sort_keys=True)}")
     return donor
 

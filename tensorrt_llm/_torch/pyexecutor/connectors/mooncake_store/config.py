@@ -23,6 +23,7 @@ server is the traffic it drives and the memory it lends. `master.provision_pool`
 merges the two into the file this reads back.
 """
 
+import dataclasses
 import json
 import math
 import os
@@ -30,7 +31,7 @@ import re
 import socket
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Mapping, Optional, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
@@ -71,6 +72,8 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
 #: equal `parse_size` of the `MooncakeStoreConfig.staging_buffer_bytes` default,
 #: so a client config without the key stages exactly what an unset field asks.
 DEFAULT_STAGING_BUFFER_BYTES = 1 << 30
+#: The same over EGM, where a staged transfer passes through staging.
+EGM_STAGING_BUFFER_BYTES = 2 * (1 << 30)
 DEFAULT_NAMESPACE = "trtllm"
 #: Mooncake's peer-to-peer handshake, which keeps a separate metadata process
 #: out of the deployment. An empty connstring is not a form `store.setup`
@@ -328,6 +331,10 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
+    #: Pass only saved pages through a pinned host buffer, while loads reach
+    #: the KV pool directly. Set by `with_store_transport` under EGM, never
+    #: read from the client config.
+    stage_saves_through_host: bool = False
     #: Pinned host memory per transfer direction under `stage_through_host`.
     #: It bounds how many pages one store call stages, not how large a page may
     #: be. With `async_load` the load direction's share is split evenly across
@@ -452,6 +459,86 @@ class MooncakeStoreConnectorConfig:
                 "since it cannot inherit the path."
             )
         return MooncakeStoreConnectorConfig.from_file(path)
+
+    def with_store_transport(
+        self, rank: int, environ: Optional[Mapping[str, str]] = None
+    ) -> Tuple["MooncakeStoreConnectorConfig", int]:
+        """This config as the store's transport needs it, and the store bytes
+        this rank stands for.
+
+        Under ``TLLM_MOONCAKE_STORE_EGM=1`` the store runs over NVLink with EGM
+        segments: the connector speaks ``nvlink`` and mounts no segment of its
+        own (the store host donor provides those bytes as EGM, see
+        `store_host_donor.adopt_store_segment`). Pages move between EGM and the
+        KV pool by NVLink copy: the pool is a local endpoint and needs no
+        registration. ``TLLM_DISABLE_MOONCAKE_STORE_EGM_DIRECT=1`` passes them
+        through pinned host staging instead, and
+        ``TLLM_MOONCAKE_STORE_EGM_DIRECT_SAVE=0`` does so for saves only. Every
+        key it changes is logged. Without the knob the config comes back
+        unchanged, and one that asks for ``nvlink`` is a deployment switched
+        only halfway, which is refused.
+        """
+        from tensorrt_llm.logger import logger
+
+        from ...store_host_donor import (
+            EGM_PROTOCOL,
+            EGM_TAG,
+            STORE_EGM_ENV,
+            egm_direct_enabled,
+            egm_direct_save_enabled,
+            latch_egm_environment,
+            store_egm_enabled,
+        )
+
+        if not store_egm_enabled(environ):
+            if self.protocol == EGM_PROTOCOL:
+                raise ValueError(
+                    f"The Mooncake config asks for protocol={EGM_PROTOCOL!r} but "
+                    f"{STORE_EGM_ENV} is off; set both or neither, since a store "
+                    "with mixed protocols places pages where readers cannot reach them"
+                )
+            return self, self.global_segment_size
+        direct = egm_direct_enabled(environ)
+        staged_saves = direct and not egm_direct_save_enabled(environ)
+        latched = latch_egm_environment(None if environ is None else dict(environ))
+        overrides = {
+            "protocol": EGM_PROTOCOL,
+            "device_name": "",
+            # Zero keeps Mooncake off its CPU memcpy path, which a GPU page
+            # cannot take.
+            "global_segment_size": 0,
+            "stage_through_host": not direct,
+            "stage_saves_through_host": staged_saves,
+        }
+        stages = not direct or staged_saves
+        if stages and self.staging_buffer_bytes == DEFAULT_STAGING_BUFFER_BYTES:
+            overrides["staging_buffer_bytes"] = EGM_STAGING_BUFFER_BYTES
+        changed = {
+            key: [getattr(self, key), value]
+            for key, value in overrides.items()
+            if getattr(self, key) != value
+        }
+        for key, (old, new) in changed.items():
+            logger.warning(
+                f"{EGM_TAG}_OVERRIDE "
+                + json.dumps({"rank": rank, "key": key, "from": old, "to": new}, sort_keys=True)
+            )
+        config = dataclasses.replace(self, **overrides)
+        record = {
+            "role": "connector",
+            "rank": rank,
+            "memory": "egm",
+            "protocol": EGM_PROTOCOL,
+            "global_segment_size": 0,
+            "store_bytes": self.global_segment_size,
+            "stage_through_host": config.stage_through_host,
+            "staging_bytes": config.staging_buffer_bytes if stages else 0,
+            "direct": direct,
+            "save_path": "staged" if stages else "direct",
+            "env": latched,
+        }
+        logger.warning(f"{EGM_TAG}_ENGAGED {json.dumps(record, sort_keys=True)}")
+        return config, self.global_segment_size
 
     def resolve_model_key(self, model: Any) -> str:
         """The model identity to namespace keys by.

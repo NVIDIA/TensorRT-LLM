@@ -6359,7 +6359,8 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step, self.hang_detector:
+        with self._profiler() as profile_step, self.hang_detector, \
+                self._private_loop_stream_scope():
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
@@ -7356,14 +7357,16 @@ class PyExecutor:
 
         Not taken with a two-model drafter, a guided decoder, a KV connector,
         an encoder-decoder model or multimodal encoder item scheduling, whose
-        side streams synchronize with the current stream.
+        side streams synchronize with the current stream. The loop may then
+        still leave the legacy default stream; see _private_loop_stream_scope.
         """
         if not (self._execution_stream_loop_armed and self.drafter is None and
                 self.draft_model_engine is None and self.guided_decoder is None
                 and self.kv_connector_manager is None
                 and not self.is_encoder_decoder
                 and not self._mm_encoder_item_scheduling_enabled):
-            yield
+            with self._private_loop_stream_scope():
+                yield
             return
         with torch.cuda.stream(self.execution_stream):
             self._loop_on_execution_stream = True
@@ -7371,6 +7374,36 @@ class PyExecutor:
                 yield
             finally:
                 self._loop_on_execution_stream = False
+
+    @contextmanager
+    def _private_loop_stream_scope(self):
+        """Run the executor loop on a private stream instead of the legacy default stream.
+
+        Taken only when the KV connector worker asks for it (its
+        ``wants_private_loop_stream``). After every forward _forward_step makes
+        the current stream wait for the execution stream. On the legacy default
+        stream that wait also holds back every other thread's per-thread
+        default stream, which is implicitly ordered behind the legacy one: a
+        transfer engine that host-waits on its caller's per-thread stream
+        before each copy then waits for the forward in flight. A private
+        stream carries the same work and the same explicit waits in the same
+        order, so nothing this loop orders changes; the legacy default stream
+        just stays idle. A no-op when the loop already runs on the execution
+        stream.
+        """
+        worker = getattr(getattr(self, "kv_connector_manager", None), "worker",
+                         None)
+        if getattr(worker, "wants_private_loop_stream", False) is not True:
+            yield
+            return
+        outer = torch.cuda.current_stream()
+        loop_stream = torch.cuda.Stream()
+        loop_stream.wait_stream(outer)
+        try:
+            with torch.cuda.stream(loop_stream):
+                yield
+        finally:
+            outer.wait_stream(loop_stream)
 
     def _executor_loop_overlap(self) -> None:
         torch.cuda.set_device(self.device_id)

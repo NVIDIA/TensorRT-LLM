@@ -1242,19 +1242,21 @@ def test_start_vote_fails_every_rank_before_model_load(monkeypatch):
     detect = SimpleNamespace(numa_nodes=None)
     assert creator._start_store_host_donor(None, FakeDist(0, ["unused"]), 0) is None
     assert started == []
-    ok = ScriptedDist([[None, (host, None, False)], [None, None]])
+    ok = ScriptedDist([[None, (host, None, False, False)], [None, None]])
     assert creator._start_store_host_donor(fixed, ok, 0) == "donor"
     # Another rank failed to start: this rank fails too instead of loading the model.
-    other = ScriptedDist([[None, (host, None, False)], [None, "rank 3: no NUMA node"]])
+    other = ScriptedDist([[None, (host, None, False, False)], [None, "rank 3: no NUMA node"]])
     with pytest.raises(RuntimeError, match="other ranks"):
         creator._start_store_host_donor(fixed, other, 0)
 
     # Detected sockets: ranks on one host must agree before any rank plans.
     started.clear()
-    agree = ScriptedDist([[None, (host, [0, 1], False), ("other", [0], False)], [None, None, None]])
+    agree = ScriptedDist(
+        [[None, (host, [0, 1], False, False), ("other", [0], False, False)], [None, None, None]]
+    )
     assert creator._start_store_host_donor(detect, agree, 0) == "donor"
     assert started[0]["numa_nodes"] == [0, 1]
-    split = ScriptedDist([[None, (host, [1], False)], [None, None]])
+    split = ScriptedDist([[None, (host, [1], False, False)], [None, None]])
     with pytest.raises(ValueError, match="different CPU NUMA nodes"):
         creator._start_store_host_donor(detect, split, 0)
 
@@ -1265,12 +1267,12 @@ def test_kill_switch_must_agree_across_ranks(monkeypatch):
     fixed = SimpleNamespace(numa_nodes=[0, 1])
     host = creator.platform.node()
     # This rank is enabled, another is disabled: every rank fails, none starts.
-    mixed = ScriptedDist([[None, (host, None, True)], [None, None]])
+    mixed = ScriptedDist([[None, (host, None, True, False)], [None, None]])
     with pytest.raises(ValueError, match="differs across ranks"):
         creator._start_store_host_donor(fixed, mixed, 0)
     # Disabled everywhere: every rank skips the donor, with no vote.
     monkeypatch.setenv(shd.DISABLE_ENV, "1")
-    off = ScriptedDist([[None, (host, None, True)]])
+    off = ScriptedDist([[None, (host, None, True, False)]])
     assert creator._start_store_host_donor(fixed, off, 0) is None
     assert off.answers == []
 

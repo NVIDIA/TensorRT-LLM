@@ -65,9 +65,10 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
-from .store_host_donor import (DISABLE_ENV, StoreHostDonor, active_donor,
-                               close_active_donor, cpu_numa_nodes,
-                               node_numa_disagreement, start_store_host_donor)
+from .store_host_donor import (DISABLE_ENV, STORE_EGM_ENV, StoreHostDonor,
+                               active_donor, close_active_donor, cpu_numa_nodes,
+                               node_numa_disagreement, start_store_host_donor,
+                               store_egm_enabled)
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -1534,18 +1535,30 @@ def _start_store_host_donor(config, dist: Distributed,
     if config is None:
         return None
     disabled = os.environ.get(DISABLE_ENV, "0") == "1"
+    egm, egm_error = False, None
+    try:
+        egm = store_egm_enabled()
+    except ValueError as exc:
+        egm_error = exc
     numa_nodes, detect_error = None, None
     if not disabled and not config.numa_nodes:
         try:
             numa_nodes = cpu_numa_nodes()
         except Exception as exc:  # noqa: BLE001 - raised inside the vote
             detect_error = exc
-    # Every rank gathers, before anything that can fail: the kill switch and
-    # the detected socket lists must agree, or ranks would take different
-    # collective paths.
-    peers = dist.allgather((platform.node(), numa_nodes, disabled))
+    # Every rank gathers, before anything that can fail: the kill switch, the
+    # store transport and the detected socket lists must agree, or ranks would
+    # take different collective paths.
+    peers = dist.allgather((platform.node(), numa_nodes, disabled, egm))
     switch = {peer[2] for peer in peers}
+    transports = {bool(peer[3]) for peer in peers}
     if switch == {True}:
+        if True in transports:
+            # Over EGM the KV connectors lend nothing themselves, so the
+            # store would have no capacity at all.
+            raise ValueError(
+                f"store_host_donor: {DISABLE_ENV}=1 with {STORE_EGM_ENV}=1 leaves "
+                "the store without memory; turn one of them off")
         logger.warning(
             f"{DISABLE_ENV}=1 on every rank: store_host_donor is off")
         return None
@@ -1556,6 +1569,12 @@ def _start_store_host_donor(config, dist: Distributed,
             raise ValueError(
                 f"store_host_donor: {DISABLE_ENV} differs across ranks; set it "
                 "on all ranks or none")
+        if len(transports) > 1:
+            raise ValueError(
+                f"store_host_donor: {STORE_EGM_ENV} differs across ranks; set it "
+                "on all ranks or none")
+        if egm_error is not None:
+            raise egm_error
         if detect_error is not None:
             raise detect_error
         reason = node_numa_disagreement([peer[:2] for peer in peers],

@@ -65,12 +65,23 @@ pool without an HCA that can pin GPU pages.
 With `stats_interval` set, a role that reads the pool logs two info-level lines
 per interval: lookups that stopped at a hole the pool evicted from a prefix it
 otherwise still holds, and the time each phase of a load took.
+
+Under ``TLLM_MOONCAKE_STORE_EGM=1`` the store runs over NVLink with EGM
+segments that the store host donor provides (see
+`MooncakeStoreConnectorConfig.with_store_transport`). Pages then move between
+EGM and the KV pool by NVLink copy, with no registration and no pinned host
+bounce: loads are grouped by source segment and an asynchronous load is
+spread over several copy streams, saves are grouped by target segment, and the
+executor loop is asked to leave the legacy default stream.
 """
 
+import dataclasses
+import json
 import threading
 import time
 import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from queue import Queue
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -81,6 +92,17 @@ from tensorrt_llm._utils import mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 
+from ...store_host_donor import (
+    EGM_PROTOCOL,
+    EGM_TAG,
+    adopt_store_segment,
+    egm_direct_batch,
+    egm_grouped_loads,
+    egm_grouped_saves,
+    egm_load_streams,
+    egm_private_loop_stream,
+    egm_wheel_check,
+)
 from ..kv_cache_connector import AllocationFence, KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
@@ -181,6 +203,9 @@ def _open_store(config: MooncakeStoreConnectorConfig):
             "and does not provide MooncakeDistributedStore."
         ) from exc
 
+    if config.protocol == EGM_PROTOCOL:
+        # Fail before connecting rather than run a store without EGM.
+        egm_wheel_check(MooncakeDistributedStore)
     store = MooncakeDistributedStore()
     hostname = config.local_hostname or local_address(config.master_server_address)
     setup_kwargs = {}
@@ -215,6 +240,25 @@ def _batched(items: Sequence, size: int):
         yield items[start : start + size]
 
 
+#: Fewest pages a load range gets when one load is split over several streams.
+#: Smaller loads stay on one stream, where the extra handoffs cost more than
+#: the parallel reads save.
+FANOUT_MIN_PAGES = 32
+
+
+def _fanout_ranges(count: int, ways: int, min_pages: Optional[int] = None):
+    """Split `count` pages into at most `ways` contiguous ranges of near-equal size."""
+    if min_pages is None:
+        min_pages = FANOUT_MIN_PAGES
+    parts = max(1, min(ways, count // max(1, min_pages)))
+    base, extra = divmod(count, parts)
+    start = 0
+    for index in range(parts):
+        stop = start + base + (1 if index < extra else 0)
+        yield start, stop
+        start = stop
+
+
 def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
     """The raw CUDA stream handle behind a torch stream.
 
@@ -226,21 +270,29 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
     return int(stream.cuda_stream)
 
 
-def _replicate_config(soft_pin_ttl_ms: Optional[int], group_ids: Optional[Sequence[str]] = None):
+def _replicate_config(
+    soft_pin_ttl_ms: Optional[int],
+    group_ids: Optional[Sequence[str]] = None,
+    same_node: bool = False,
+):
     """The Mooncake `ReplicateConfig` for one put call, or None for the store's defaults.
 
     Args:
         soft_pin_ttl_ms: Soft-pin every page of the call for this long, if set.
         group_ids: One eviction group per key of the call, if set.
+        same_node: Set ``prefer_alloc_in_same_node``, the only put option that
+            makes Mooncake submit one transfer per target segment instead of
+            one per page; it also places new pages on the writer's own node
+            first. Used for direct EGM saves.
 
     Returns:
-        A `mooncake.store.ReplicateConfig`, or None when neither option is set,
-        in which case the put keeps its three-argument form.
+        A `mooncake.store.ReplicateConfig`, or None when no option is set, in
+        which case the put keeps its three-argument form.
 
     Raises:
         ImportError: When the installed bindings predate either option.
     """
-    if soft_pin_ttl_ms is None and group_ids is None:
+    if soft_pin_ttl_ms is None and group_ids is None and not same_node:
         return None
     try:
         import mooncake.store as mooncake_store
@@ -251,6 +303,8 @@ def _replicate_config(soft_pin_ttl_ms: Optional[int], group_ids: Optional[Sequen
             config.soft_pin_ttl_ms = soft_pin_ttl_ms
         if group_ids is not None:
             config.group_ids = list(group_ids)
+        if same_node:
+            config.prefer_alloc_in_same_node = True
     except (ImportError, AttributeError) as exc:
         raise ImportError(
             "mooncake_store.soft_pin_ttl_ms and group_blocks need "
@@ -506,6 +560,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     #: chosen only after the final batch, so on a disaggregated server the
     #: pages each admitted request needs to finish have to stay free.
     requires_completion_reservation = True
+    #: Read by the executor when its loop starts: True keeps the loop off the
+    #: legacy default stream (direct EGM copies; see `_open_egm_direct`).
+    wants_private_loop_stream = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
@@ -534,6 +591,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._run_dir = pool.run_dir if pool is not None else None
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
+        # Over EGM the store host donor provides this rank's segment; the
+        # store bytes it stands for are unchanged.
+        self._config, store_bytes = self._config.with_store_transport(self._rank)
         enable_attention_dp = getattr(llm_args, "enable_attention_dp", False) is True
         # A stored page is one attention shard's KV. Every attention-DP owner
         # holds all heads, so all owners key shard 0 of 1 on the shared pool;
@@ -636,6 +696,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._batch_size = self._config.transfer_batch_size
         # Pages per store call on a load thread; its own staging narrows it.
         self._async_batch_size = self._batch_size
+        # Pages per store call on the save thread; its staging narrows it.
+        self._save_batch_size = self._batch_size
+        # Threads one direct asynchronous load is spread over (one copy stream
+        # each); 1 keeps a load on its load thread.
+        self._load_ways = 1
+        self._load_fanout: Optional[ThreadPoolExecutor] = None
+        # Whether direct EGM gets are grouped by source segment in Mooncake.
+        self._grouped_loads = False
+        # Whether direct EGM puts are grouped by target segment in Mooncake.
+        self._grouped_saves = False
         # Save submissions still in flight, per request.
         self._outstanding_saves: Dict[int, int] = defaultdict(int)
         # Requests the runtime has told us are done producing KV. Their pages
@@ -654,7 +724,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Checked before the segment is mounted, since the kernel answers an
         # unaffordable total by killing the process rather than by failing the
         # allocation.
-        validate_node_budget(self._config)
+        validate_node_budget(
+            self._config
+            if store_bytes == self._config.global_segment_size
+            else dataclasses.replace(self._config, global_segment_size=store_bytes)
+        )
 
         # Write options exist only for a role that writes, so consumer and
         # capacity roles build nothing and need no particular binding.
@@ -669,12 +743,14 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             self._soft_pin_ttl_ms, ["probe"] if self._group_blocks else None
         )
 
+        if self._config.protocol == EGM_PROTOCOL and store_bytes > 0:
+            store_bytes = adopt_store_segment(store_bytes)
         self._store, self._segment_host = _open_store(self._config)
         record_segment(
             self._run_dir,
             host=self._segment_host,
             rank=self._rank,
-            segment_size=self._config.global_segment_size,
+            segment_size=store_bytes,
             role=self._config.role.value,
             model_key=self._model_key,
         )
@@ -760,6 +836,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if self._config.stage_through_host:
             addressing = PageAddressing(layout)
             self._open_staging(addressing)
+        elif self._config.protocol == EGM_PROTOCOL:
+            # NVLink copies take the KV pages as raw local pointers, so there
+            # is nothing to register: exporting pool memory that was not
+            # allocated as fabric memory would fail, and is never needed.
+            addressing = PageAddressing(layout)
+            self._open_egm_direct(addressing)
         else:
             addressing = PageAddressing(layout, allocation_lookup=allocation_range)
             self._register_pools(addressing)
@@ -964,6 +1046,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             )
         # Saves, and synchronous loads where they have a pool.
         self._batch_size = min(batch, num_slots)
+        self._save_batch_size = self._batch_size
         if self._batch_size < batch and (saves or self._load_staging is not None):
             logger.warning(
                 f"mooncake-store rank {self._rank} reduced its transfer batch from "
@@ -971,6 +1054,87 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 f"pages within staging_buffer_bytes={budget} does not fit more. Raise "
                 "staging_buffer_bytes or lower transfer_batch_size."
             )
+
+    def _open_egm_direct(self, addressing: PageAddressing) -> None:
+        """Arm the direct EGM path: no registration, no load staging, one log line.
+
+        Loads always copy straight into the KV pages. Saves do too, unless the
+        config asks to stage them, in which case they alone get a pinned pool.
+        """
+        batch = egm_direct_batch()
+        if batch is not None and self._async_load:
+            self._async_batch_size = batch
+        self._grouped_loads = egm_grouped_loads()
+        # Every NVLink copy submit host-waits on the calling thread's
+        # per-thread default stream, which is ordered behind the legacy
+        # default stream; ask the executor to keep its loop off the latter.
+        self.wants_private_loop_stream = egm_private_loop_stream()
+        if egm_grouped_saves() and self._config.role.saves:
+            self._grouped_saves = True
+            if not self._group_blocks:
+                # The shared put config; with block groups `_put` builds one per call.
+                self._put_config = _replicate_config(self._soft_pin_ttl_ms, same_node=True)
+        ways = egm_load_streams()
+        if self._async_load and ways > 1:
+            self._load_ways = ways
+            self._load_fanout = ThreadPoolExecutor(
+                max_workers=ways * self._async_workers,
+                thread_name_prefix=f"mooncake-store-fanout-{self._rank}",
+                initializer=self._bind_device,
+            )
+        staging_bytes = 0
+        if self._config.stage_saves_through_host and self._config.role.saves:
+            staging_bytes = self._open_save_staging(addressing)
+        record = {
+            "rank": self._rank,
+            "device": self._device_index,
+            "role": self._config.role.value,
+            "layer_groups": list(addressing.layer_group_ids),
+            "bytes_per_page": {
+                str(layer_group_id): addressing.bytes_per_page(layer_group_id)
+                for layer_group_id in addressing.layer_group_ids
+            },
+            "batch_size": self._batch_size,
+            "async_load": self._async_load,
+            "async_batch_size": self._async_batch_size if self._async_load else 0,
+            "async_workers": self._async_workers,
+            "load_streams": self._load_ways,
+            "grouped_loads": self._grouped_loads,
+            "grouped_saves": self._grouped_saves,
+            "registered_ranges": 0,
+            "staging_bytes": staging_bytes,
+            "save_path": "staged" if self._save_staging is not None else "direct",
+            "save_batch_size": self._save_batch_size,
+        }
+        logger.warning(f"{EGM_TAG}_DIRECT {json.dumps(record, sort_keys=True)}")
+
+    def _bind_device(self) -> None:
+        """Adopt this rank's device on a helper thread (new threads start on device 0)."""
+        if self._device_index is not None:
+            torch.cuda.set_device(self._device_index)
+
+    def _open_save_staging(self, addressing: PageAddressing) -> int:
+        """Allocate the pinned slots saves alone pass through; returns their bytes.
+
+        Sized from the whole staging budget, since no load pool shares it.
+        """
+        max_bytes_per_page = max(
+            addressing.bytes_per_page(layer_group_id)
+            for layer_group_id in addressing.layer_group_ids
+        )
+        budget = self._config.staging_buffer_bytes
+        slot_bytes, num_slots = plan_slot_geometry(
+            max_bytes_per_page, self._config.transfer_batch_size, budget
+        )
+        self._warn_raised_to_one_page(["save"], budget, max_bytes_per_page)
+        self._save_staging = HostStagingPool(
+            slot_bytes=slot_bytes,
+            num_slots=num_slots,
+            store=self._store,
+            label="save",
+        )
+        self._save_batch_size = min(self._config.transfer_batch_size, num_slots)
+        return slot_bytes * num_slots
 
     def _warn_raised_to_one_page(
         self, labels: List[str], budget: int, page_bytes: int, *, split: bool = False
@@ -1313,9 +1477,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 else:
                     target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
             with _timed_phase(phases, "get"):
-                results = self._store.batch_get_into_multi_buffers(
-                    batch_keys, target_addresses, target_sizes
-                )
+                if staging is None:
+                    results = self._get_into(batch_keys, target_addresses, target_sizes)
+                else:
+                    results = self._store.batch_get_into_multi_buffers(
+                        batch_keys, target_addresses, target_sizes
+                    )
             if len(results) != len(batch_keys):
                 # Which pages landed is unknowable, so none of them counts.
                 results = [-1] * len(batch_keys)
@@ -1354,6 +1521,60 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # these pages, so the scatter has to complete before either.
                 with _timed_phase(phases, "sync"):
                     _sync_stream(handle)
+        return failed_requests, num_failed_pages, first_failure, loaded_bytes
+
+    def _get_into(self, keys: List[str], addresses: List[List[int]], sizes: List[List[int]]):
+        """One store get straight into `addresses`, grouped by source segment when armed."""
+        if self._grouped_loads:
+            # Mooncake's flag for "group the transfers by target segment"; a
+            # get places nothing, so it changes only how copies are submitted.
+            return self._store.batch_get_into_multi_buffers(keys, addresses, sizes, True)
+        return self._store.batch_get_into_multi_buffers(keys, addresses, sizes)
+
+    def _fanout_load_pages(
+        self,
+        keys: List[str],
+        addresses: List[List[int]],
+        sizes: List[List[int]],
+        owners: List[int],
+        batch_size: int,
+    ) -> Tuple[Set[int], int, Optional[str], int]:
+        """`_load_pages` without staging, spread over the fan-out threads.
+
+        Each range runs on its own thread and so on its own copy stream. Waits
+        for every range, failed or not, before it reports: a range that raised
+        must not hide another one still writing KV pages.
+        """
+        futures = [
+            self._load_fanout.submit(
+                self._load_pages,
+                keys[start:stop],
+                addresses[start:stop],
+                sizes[start:stop],
+                owners[start:stop],
+                None,
+                0,
+                batch_size,
+                recover=True,
+            )
+            for start, stop in _fanout_ranges(len(keys), self._load_ways)
+        ]
+        failed_requests: Set[int] = set()
+        num_failed_pages = loaded_bytes = 0
+        first_failure: Optional[str] = None
+        error: Optional[BaseException] = None
+        for future in futures:
+            try:
+                failed, count, first, loaded = future.result()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below once all ranges retired
+                error = error or exc
+                continue
+            failed_requests |= failed
+            num_failed_pages += count
+            first_failure = first_failure or first
+            loaded_bytes += loaded
+        if error is not None:
+            raise error
         return failed_requests, num_failed_pages, first_failure, loaded_bytes
 
     # ---- asynchronous load path ----
@@ -1518,17 +1739,29 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             batches = -(-len(keys) // self._async_batch_size)
             # Recovered here whatever the rank: `get_finished` decides whether
             # a failed request is fatal.
-            failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(
-                keys,
-                addresses,
-                sizes,
-                [request_id] * len(keys),
-                staging,
-                handle,
-                self._async_batch_size,
-                recover=True,
-                phases=phases,
-            )
+            if staging is None and self._load_fanout is not None:
+                with _timed_phase(phases, "get"):
+                    failed_requests, num_failed_pages, first_failure, loaded_bytes = (
+                        self._fanout_load_pages(
+                            keys,
+                            addresses,
+                            sizes,
+                            [request_id] * len(keys),
+                            self._async_batch_size,
+                        )
+                    )
+            else:
+                failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(
+                    keys,
+                    addresses,
+                    sizes,
+                    [request_id] * len(keys),
+                    staging,
+                    handle,
+                    self._async_batch_size,
+                    recover=True,
+                    phases=phases,
+                )
             failed = bool(failed_requests)
             if failed:
                 logger.warning(
@@ -1842,10 +2075,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         groups = self._block_groups(transfers) if self._group_blocks else [None] * len(keys)
 
         for batch in zip(
-            _batched(keys, self._batch_size),
-            _batched(addresses, self._batch_size),
-            _batched(sizes, self._batch_size),
-            _batched(groups, self._batch_size),
+            _batched(keys, self._save_batch_size),
+            _batched(addresses, self._save_batch_size),
+            _batched(sizes, self._save_batch_size),
+            _batched(groups, self._save_batch_size),
         ):
             batch_keys, batch_addresses, batch_sizes, batch_groups = batch
             # Skip pages another rank or another instance already wrote. The
@@ -1872,9 +2105,13 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             put_args = ([batch_keys[i] for i in pending], source_addresses, source_sizes)
             if self._group_blocks:
                 # One group per key that survived the existence filter.
-                put_args += (
-                    _replicate_config(self._soft_pin_ttl_ms, [batch_groups[i] for i in pending]),
-                )
+                page_groups = [batch_groups[i] for i in pending]
+                if self._grouped_saves:
+                    put_args += (
+                        _replicate_config(self._soft_pin_ttl_ms, page_groups, same_node=True),
+                    )
+                else:
+                    put_args += (_replicate_config(self._soft_pin_ttl_ms, page_groups),)
             elif self._put_config is not None:
                 put_args += (self._put_config,)
             # With neither option set this is the plain three-argument put.
@@ -1974,6 +2211,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             return
         self._save_thread = None
         self._load_threads = []
+        fanout, self._load_fanout = self._load_fanout, None
+        if fanout is not None:
+            # Its tasks only run inside a load thread's load, and every load
+            # thread has returned, so this does not wait on a transfer.
+            fanout.shutdown(wait=True)
         if self._store is not None:
             # Before the store closes and the cache manager frees the pools,
             # so the fabric holds no registration over memory handed out again.
