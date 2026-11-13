@@ -32,6 +32,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention import (
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ds_mla_sparse_decode import (  # noqa: E501
     GLOBAL_SPLITS,
     SPLITS,
+    CompiledDsMlaSparseDecode,
     build,
     splits_for,
 )
@@ -464,7 +465,7 @@ def _small_poisoned_global_inputs(
 
 
 @pytest.mark.parametrize("heads", [8, 16])
-@pytest.mark.parametrize("rows", [4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 16])
 @pytest.mark.parametrize("nope", [False, True])
 def test_global_split_boundaries_and_dynamic_graph(heads: int, rows: int, nope: bool) -> None:
     """Global partials preserve owner, hole, offset and dynamic graph output contracts."""
@@ -590,8 +591,23 @@ def test_global_split_at_1m_large_address(heads: int, nope: bool) -> None:
         torch.cuda.empty_cache()
 
 
+@pytest.mark.parametrize(
+    "num_sms,global_fns,global_rows",
+    [(212, (None, None), range(1, 9)), (100, (None, None), range(1, 7)), (212, None, ())],
+)
+def test_global_split_row_gate(num_sms, global_fns, global_rows) -> None:
+    """Rows up to GLOBAL_MAX_ROWS run global16 while their CTAs fit in one wave of the SMs;
+    every other call keeps the cluster split."""
+    compiled = CompiledDsMlaSparseDecode(
+        device_index=0, num_heads=8, num_sms=num_sms, fns={}, global_fns=global_fns
+    )
+    for rows in range(33):
+        expected = GLOBAL_SPLITS[0] if rows in global_rows else kernel.pick_splits(rows, num_sms)
+        assert splits_for(rows, compiled) == expected
+
+
 @pytest.mark.parametrize("heads", [8, 16])
-@pytest.mark.parametrize("rows", [4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9, 16])
 def test_low_row_wrapper_padded_query_and_graph(heads: int, rows: int) -> None:
     """The actual dispatch reads only real heads of a 64-head query and owns graph scratch."""
     q, kv, idx, out, parent, legal, gen = _small_poisoned_global_inputs(rows, heads, False, 2026)
@@ -612,7 +628,7 @@ def test_low_row_wrapper_padded_query_and_graph(heads: int, rows: int) -> None:
         assert bool(torch.isfinite(out).all())
         assert bool(torch.isnan(q64[:, heads:]).all())
     assert bool(torch.isnan(parent[:3]).all())
-    if rows == 16:
+    if splits_for(rows, compiled) in SPLITS:
         expected = kernel.launch(
             compiled.fns[kernel.pick_splits(rows, compiled.num_sms)],
             q64,

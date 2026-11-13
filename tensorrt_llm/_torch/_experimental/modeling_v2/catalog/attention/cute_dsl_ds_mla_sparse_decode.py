@@ -24,6 +24,9 @@ HEADS = _kernel.SUPPORTED_HEADS
 SPLITS = _kernel.SUPPORTED_SPLITS
 #: Global-workspace variants, separate from the cluster functions in `compiled.fns`.
 GLOBAL_SPLITS = (16,)
+#: The most rows the global variant runs. A CTA holds a whole SM, so a call also needs its
+#: rows x GLOBAL_SPLITS CTAs to fit in one wave; past it the cluster split is faster.
+GLOBAL_MAX_ROWS = 8
 
 #: The tp4 / tep4 (16 heads) and tp8 / tep8 (8 heads) targets at their 1M config (max_seq_len
 #: 1048576, chunked prefill, 16 sequences): top-2048 selections over keys up to 1048576 in the
@@ -57,17 +60,26 @@ def build(device_id: int, *, num_heads: int) -> CompiledDsMlaSparseDecode:
         fns = {ns: _kernel.compile_variant(num_heads, ns, device_id) for ns in SPLITS}
         num_sms = torch.cuda.get_device_properties(device_id).multi_processor_count
         global_fns = None
-        if torch.cuda.get_device_capability(device_id) == (10, 7) and num_sms == 212:
-            global_fns = _kernel._compile_global_variant(num_heads, 16, device_id)
+        if torch.cuda.get_device_capability(device_id) == (10, 7):
+            global_fns = _kernel._compile_global_variant(num_heads, GLOBAL_SPLITS[0], device_id)
     return CompiledDsMlaSparseDecode(
         device_index=device_id, num_heads=num_heads, num_sms=num_sms, fns=fns, global_fns=global_fns
     )
 
 
+def _runs_global(rows: int, compiled: CompiledDsMlaSparseDecode) -> bool:
+    """Whether a call with `rows` rows runs the global variant."""
+    return (
+        compiled.global_fns is not None
+        and 1 <= rows <= GLOBAL_MAX_ROWS
+        and rows * GLOBAL_SPLITS[0] <= compiled.num_sms
+    )
+
+
 def splits_for(rows: int, compiled: CompiledDsMlaSparseDecode) -> int:
     """The split-K count a call with `rows` rows runs."""
-    if compiled.global_fns is not None and rows in (4, 8):
-        return 16
+    if _runs_global(rows, compiled):
+        return GLOBAL_SPLITS[0]
     return _kernel.pick_splits(rows, compiled.num_sms)
 
 
@@ -455,11 +467,12 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
     Call sites: the mistral_large4 NVFP4 tp4 and tep4 targets (also run at world 8 as tp8
     and tep8), the generation rows of every layer, decode and mixed steps. Kernel (sm_103):
     `_ds_mla_sparse_decode_kernel`, one launch, split-K partials merged in the cluster.
-    On SM107 with 212 SMs, rows 4 and 8 instead run 16 independent split CTAs per
-    row and one combine launch. The FP32 partial workspace has 516 elements per
-    (row, split, head), including the 512-wide normalized output and LSE. Each
-    invocation allocates its own workspace through PyTorch, preserving stream and
-    graph-pool lifetimes; other shapes and devices use the original cluster path.
+    On SM107, rows 1 to 8 whose 16 CTAs per row fit in one wave of the SMs instead
+    run 16 independent split CTAs per row and one combine launch. The FP32 partial
+    workspace has 516 elements per (row, split, head), including the 512-wide
+    normalized output and LSE. Each invocation allocates its own workspace through
+    PyTorch, preserving stream and graph-pool lifetimes; other shapes and devices use
+    the original cluster path.
     It replaces flash_mla_sparse_decode's head64 kernel on these targets, which needs the
     query padded to 64 heads, a scheduler kernel and a combine kernel.
 
@@ -544,9 +557,11 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
         *,
         compiled: CompiledDsMlaSparseDecode,
     ) -> torch.Tensor:
-        if compiled.global_fns is not None and q.shape[0] in (4, 8):
+        if _runs_global(q.shape[0], compiled):
             workspace = torch.empty(
-                (q.shape[0], 16, compiled.num_heads, 516), dtype=torch.float32, device=q.device
+                (q.shape[0], GLOBAL_SPLITS[0], compiled.num_heads, 516),
+                dtype=torch.float32,
+                device=q.device,
             )
             return _kernel._launch_global(
                 compiled.global_fns, q, kv_cache, indices, out, softmax_scale, workspace
