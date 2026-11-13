@@ -21,6 +21,7 @@ import pytest
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.benchmark.utils.asynchronous import LlmManager
+from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 
@@ -477,3 +478,47 @@ async def test_async_benchmark_duration():
     # and finish before the deadline, which is why the CLI rejects that
     # combination.
     assert 1 <= len(stats.requests) < 3
+
+
+def test_generate_warmup_dataset_salts_copies():
+    requests = [InferenceRequest(task_id=i, input_ids=[i], output_tokens=i + 1) for i in range(3)]
+    originals = {request.task_id: request.model_dump() for request in requests}
+
+    warmup = generate_warmup_dataset(requests, 4)
+
+    assert len(warmup) == 4
+    assert {request.task_id: request.model_dump() for request in requests} == originals
+    for request in warmup:
+        assert request.model_dump() == {**originals[request.task_id], "cache_salt": "warmup"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cache_salt", [None, "warmup", "other"], ids=["unsalted", "warmup", "other"]
+)
+@pytest.mark.parametrize("turns", [None, ["q1", "q2"]], ids=["single_turn", "multi_turn"])
+async def test_llm_manager_forwards_cache_salt(turns, cache_salt):
+    mock_llm = MagicMock(spec=LLM)
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4])]
+
+    async def mock_aresult():
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = [1, 2, 3]
+    tokenizer.decode.return_value = "answer"
+
+    manager = LlmManager(llm=mock_llm, outbox=asyncio.Queue(), streaming=False, tokenizer=tokenizer)
+    request = InferenceRequest(
+        task_id=0, input_ids=[1, 2, 3], output_tokens=1, turns=turns, cache_salt=cache_salt
+    )
+    await manager.process_request(request, SamplingParams(), PostprocParams())
+
+    calls = mock_llm.generate_async.call_args_list
+    assert len(calls) == len(turns or [None])
+    assert all(call.kwargs["cache_salt"] == cache_salt for call in calls)
