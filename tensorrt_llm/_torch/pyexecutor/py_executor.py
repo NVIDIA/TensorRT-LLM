@@ -141,6 +141,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.bindings import MpiProgressThread
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .store_host_donor import StoreHostDonor
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -691,6 +692,9 @@ class PyExecutor:
     _executor_events: Optional[ExecutorEvents] = None
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
+    # Host memory this process lends to a Mooncake store pool; set by the executor
+    # creator when llm_args.store_host_donor is on and released in shutdown().
+    store_host_donor: Optional["StoreHostDonor"] = None
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -2608,6 +2612,18 @@ class PyExecutor:
             self.worker_thread.join()
         if self.kv_connector_manager is not None and not self._kv_connector_failed:
             self.kv_connector_manager.shutdown()
+        if self.store_host_donor is not None:
+            # The worker loop has exited; nothing in this process uses the
+            # lent memory, so its registrations can be retired now.
+            from .store_host_donor import close_active_donor
+            if close_active_donor():
+                self.store_host_donor = None
+            else:
+                # The memory is still lent: keep the reference, and the
+                # process-wide donor, so close_active_donor() can retry.
+                logger.error(
+                    "store_host_donor: retiring the lent host memory failed; it "
+                    "stays registered with the store")
         if self.dist.pp_size > 1 and self.worker_started:
             # The worker thread has exited, so no PP traffic needs progress.
             self._pp_mpi_progress_stop.set()

@@ -31,6 +31,7 @@ exporting `MOONCAKE_CONFIG_PATH` for the ranks the LLM constructor spawns.
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess  # nosec B404
@@ -87,6 +88,14 @@ LOG_TAIL_LINES = 20
 DEFAULT_MASTER_PORT = 50051
 DEFAULT_MASTER_METRICS_PORT = 9004
 DEFAULT_MASTER_EVICTION_RATIO = 0.05
+#: Extra `mooncake_master` flags, split like a shell command line, for the
+#: settings this launcher does not spell out: the eviction watermarks, the KV
+#: lease TTL, the allocation strategy. Flags given to the launcher directly are
+#: passed after these, so they win where both set the same one.
+MASTER_ARGS_ENV = "TRTLLM_MOONCAKE_MASTER_ARGS"
+#: Flags the launcher owns: the manifest it publishes states them, so a pass-
+#: through that changed them would send every server to the wrong place.
+_RESERVED_MASTER_FLAGS = ("port", "rpc_port", "metrics_port")
 
 
 def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
@@ -454,6 +463,42 @@ class LaunchedMaster:
             self.process.wait()
 
 
+def master_extra_args(extra_args: Sequence[str] = ()) -> List[str]:
+    """The pass-through flags for `mooncake_master`: `$TRTLLM_MOONCAKE_MASTER_ARGS`, then `extra_args`.
+
+    gflags keeps the last value of a repeated flag, so `extra_args` override the
+    environment. Raises `ValueError` for a flag that is not `--name[=value]` or
+    that names a port the published manifest has to state.
+    """
+    args = shlex.split(os.environ.get(MASTER_ARGS_ENV, "")) + list(extra_args)
+    for arg in args:
+        if not arg.startswith("-"):
+            raise ValueError(
+                f"mooncake_master flag {arg!r} is not of the form --name=value; "
+                f"check {MASTER_ARGS_ENV} and the launcher's extra arguments"
+            )
+        name = arg.lstrip("-").split("=", 1)[0]
+        if name in _RESERVED_MASTER_FLAGS:
+            raise ValueError(
+                f"mooncake_master flag {arg!r} sets a port the pool manifest "
+                "publishes; use the launcher's own --rpc_port/--metrics_port"
+            )
+    return args
+
+
+def effective_eviction_ratio(eviction_ratio: float, args: Sequence[str]) -> float:
+    """The ratio a master started with `args` after `--eviction_ratio` runs with.
+
+    The master takes the last value a flag is given, so a pass-through
+    `--eviction_ratio` overrides the launcher's.
+    """
+    for arg in args:
+        name, sep, value = arg.lstrip("-").partition("=")
+        if name == "eviction_ratio" and sep:
+            eviction_ratio = float(value)
+    return eviction_ratio
+
+
 def _launch_master(
     run_dir: str,
     *,
@@ -462,8 +507,14 @@ def _launch_master(
     eviction_ratio: float = DEFAULT_MASTER_EVICTION_RATIO,
     binary: str = DEFAULT_MASTER_BINARY,
     timeout: float = DEFAULT_MASTER_TIMEOUT,
+    extra_args: Sequence[str] = (),
 ) -> LaunchedMaster:
-    """Start a master on this host and wait for it to answer."""
+    """Start a master on this host and wait for it to answer.
+
+    `extra_args` and `$TRTLLM_MOONCAKE_MASTER_ARGS` are appended to the
+    master's command line; see `master_extra_args`.
+    """
+    passed = master_extra_args(extra_args)
     resolved = shutil.which(binary)
     if resolved is None:
         raise FileNotFoundError(
@@ -489,6 +540,7 @@ def _launch_master(
         f"--rpc_port={rpc_port}",
         f"--metrics_port={metrics_port}",
         f"--eviction_ratio={eviction_ratio}",
+        *passed,
     ]
 
     logger.warning(f"mooncake-store: starting {' '.join(command)} on {host}")
@@ -568,6 +620,7 @@ def running_master(
     namespace: str = DEFAULT_NAMESPACE,
     binary: str = DEFAULT_MASTER_BINARY,
     timeout: float = DEFAULT_MASTER_TIMEOUT,
+    extra_args: Sequence[str] = (),
 ) -> Iterator[LaunchedMaster]:
     """Run a master, and publish the manifest describing the pool it owns.
 
@@ -583,6 +636,7 @@ def running_master(
         eviction_ratio=eviction_ratio,
         binary=binary,
         timeout=timeout,
+        extra_args=extra_args,
     )
     manifest = PoolManifest(
         master_server_address=master.address,
@@ -590,7 +644,7 @@ def running_master(
         protocol=protocol,
         namespace=namespace,
         metrics_port=metrics_port,
-        eviction_ratio=eviction_ratio,
+        eviction_ratio=effective_eviction_ratio(eviction_ratio, master_extra_args(extra_args)),
     )
     try:
         with _published_manifest(manifest, _manifest_paths(run_dir, pool_file)):

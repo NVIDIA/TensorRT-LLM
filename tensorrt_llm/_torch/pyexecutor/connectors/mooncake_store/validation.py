@@ -180,6 +180,12 @@ def _available_host_memory() -> Optional[int]:
         return None
 
 
+def _gpus_on_node() -> Optional[int]:
+    """GPUs Slurm allocated to the job on this node, or `None` outside Slurm."""
+    value = os.environ.get("SLURM_GPUS_ON_NODE", "").strip()
+    return int(value) if value.isdigit() and int(value) > 0 else None
+
+
 def validate_node_budget(
     config: "MooncakeStoreConnectorConfig",
     *,
@@ -196,10 +202,15 @@ def validate_node_budget(
 
     Args:
         config: The resolved connector configuration.
-        ranks_on_node: Ranks of this server sharing this physical node.
-            Defaults to the local MPI communicator's size.
+        ranks_on_node: Ranks that claim a segment on this physical node.
+            Defaults to the larger of the local MPI communicator's size and
+            the GPUs Slurm gave the job on this node: servers placed on one
+            node start together, so each checks before any of them has
+            allocated, and only counting every GPU's rank keeps them from
+            all passing.
         available_bytes: Host memory to measure against. Defaults to the
-            kernel's own figure.
+            kernel's own figure, capped by the room under any cgroup memory
+            limit of the job.
     """
     from tensorrt_llm._utils import local_mpi_size
 
@@ -208,6 +219,7 @@ def validate_node_budget(
             ranks_on_node = max(1, local_mpi_size())
         except Exception:  # noqa: BLE001 - a missing communicator must not block startup
             ranks_on_node = 1
+        ranks_on_node = max(ranks_on_node, _gpus_on_node() or 0)
 
     segment_claim = ranks_on_node * max(0, config.global_segment_size)
     # Staging is pinned for the process's lifetime and comes out of the same
@@ -229,6 +241,10 @@ def validate_node_budget(
 
     if available_bytes is None:
         available_bytes = _available_host_memory()
+        # A job's memory limit can be far below what the host has available.
+        room = _cgroup_room()
+        if room is not None:
+            available_bytes = room if available_bytes is None else min(available_bytes, room)
     if available_bytes is None:
         logger.warning(
             "mooncake-store: cannot read this node's available memory, so the "
@@ -277,6 +293,99 @@ def validate_node_budget(
         f"weights and the runtime's own host buffers. {remedy} "
         f"Contribution is per rank, so a server's demand on its node grows "
         f"with its parallelism."
+    )
+
+
+def _cgroup_room(
+    proc_cgroup: str = "/proc/self/cgroup", root: str = "/sys/fs/cgroup"
+) -> Optional[int]:
+    """Least room left under any cgroup v2 memory limit above this process.
+
+    Room is the limit less what reclaim cannot free: usage less the page
+    cache that reclaim can drop, which leaves out shared memory and
+    unevictable (mlocked) pages. `None` when no limit applies or one is
+    unreadable.
+    """
+    try:
+        with open(proc_cgroup) as handle:
+            path = next(
+                (line.strip().split("::", 1)[1] for line in handle if line.startswith("0::")), None
+            )
+    except OSError:
+        return None
+    if path is None:
+        return None
+    rooms = []
+    parts = [part for part in path.split("/") if part]
+    for depth in range(len(parts), -1, -1):
+        directory = os.path.join(root, *parts[:depth])
+        try:
+            with open(os.path.join(directory, "memory.max")) as handle:
+                limit = handle.read().strip()
+        except OSError:
+            continue
+        if not limit.isdigit():
+            continue
+        # A known finite limit always counts, however little else is readable.
+        try:
+            with open(os.path.join(directory, "memory.current")) as handle:
+                current = int(handle.read().strip())
+        except (OSError, ValueError):
+            rooms.append(0)  # usage unknown: assume no room rather than drop the limit
+            continue
+        try:
+            with open(os.path.join(directory, "memory.stat")) as handle:
+                stat = dict(line.split() for line in handle if len(line.split()) == 2)
+            reclaimable = max(
+                0, int(stat["file"]) - int(stat["shmem"]) - int(stat.get("unevictable", 0))
+            )
+        except (OSError, KeyError, ValueError):
+            reclaimable = 0  # no page-cache allowance without the statistics
+        rooms.append(int(limit) - (current - reclaimable))
+    return min(rooms) if rooms else None
+
+
+def validate_donation_budget(
+    segment_size: int, local_buffer_size: int, *, available_bytes: Optional[int] = None
+) -> None:
+    """Reject a donation this node cannot back, before any of it is allocated.
+
+    A donor runs beside the node's servers, so a segment larger than what is
+    left surfaces as the OOM killer once Mooncake touches it rather than as a
+    failed start. The same measure and reserve as `validate_node_budget`.
+
+    The host's figure is capped by the room under any container (cgroup)
+    memory limit.
+
+    Args:
+        segment_size: Bytes the donor lends.
+        local_buffer_size: Mooncake's per-process transfer buffer, also host memory.
+        available_bytes: Host memory to measure against. Defaults to the
+            kernel's own figure.
+    """
+    claimed = segment_size + local_buffer_size
+    if available_bytes is None:
+        available_bytes = _available_host_memory()
+        # A container's memory limit can be far below what the host has free.
+        room = _cgroup_room()
+        if room is not None:
+            available_bytes = room if available_bytes is None else min(available_bytes, room)
+    if available_bytes is None:
+        logger.warning(
+            "mooncake-store: cannot read this node's available memory, so the "
+            f"{claimed / _GIB:.1f} GiB donation is not checked against it."
+        )
+        return
+    budget = available_bytes - NODE_BUDGET_RESERVE_BYTES
+    if claimed <= budget:
+        return
+    affordable = max(0, budget - local_buffer_size)
+    raise ValueError(
+        f"mooncake-store: this node cannot back a {segment_size / _GIB:.1f} GiB donation "
+        f"(plus a {local_buffer_size / _GIB:.2f} GiB transfer buffer): only "
+        f"{available_bytes / _GIB:.1f} GiB is available and "
+        f"{NODE_BUDGET_RESERVE_BYTES / _GIB:.0f} GiB of that is reserved for the "
+        f"node's servers. Lower --segment_size to at most {affordable / _GIB:.1f} GiB."
     )
 
 

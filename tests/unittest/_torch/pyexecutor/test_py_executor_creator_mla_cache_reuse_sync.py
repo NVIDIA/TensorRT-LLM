@@ -252,6 +252,7 @@ def _make_llm_args():
         sleep_config=None,
         cache_transceiver_config=None,
         dwdp_config=None,
+        store_host_donor=None,
         layer_wise_benchmarks_config=SimpleNamespace(
             calibration_mode=None,
             calibration_file_path=None,
