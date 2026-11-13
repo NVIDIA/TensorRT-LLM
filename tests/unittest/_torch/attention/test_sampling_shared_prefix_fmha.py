@@ -43,7 +43,9 @@ def _fa4_available():
     return fa4_supported(128, torch.bfloat16)
 
 
-needs_fa4 = pytest.mark.skipif(not _fa4_available(), reason="needs SM90 or SM100 and FlashAttention-4")
+needs_fa4 = pytest.mark.skipif(
+    not _fa4_available(), reason="needs SM90 or SM100 and FlashAttention-4"
+)
 
 
 @pytest.fixture(autouse=True)
