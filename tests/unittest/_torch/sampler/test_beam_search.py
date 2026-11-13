@@ -1811,8 +1811,9 @@ def test_beam_search_cba_reorders_stop_window():
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("speculative_d2h", [False, True])
+@pytest.mark.parametrize("early_eos", [False, True], ids=["length", "eos"])
 def test_beam_search_handoff_keeps_receiving_rank_in_step(
-        speculative_d2h: bool) -> None:
+        speculative_d2h: bool, early_eos: bool) -> None:
     """A pipeline-parallel rank that does not sample keeps beam search in step.
 
     Only the last pipeline-parallel rank samples; every other rank updates its
@@ -1825,6 +1826,8 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step(
     beam_width = 3
     max_tokens = 6
     vocab_size = 32
+    end_id = vocab_size - 1 if early_eos else -1
+    num_steps = 2 if early_eos else max_tokens
     prompts = [[1, 2, 3], [4, 5, 6, 7]]
     sampling_params = SamplingParams(n=beam_width,
                                      best_of=beam_width,
@@ -1850,7 +1853,7 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step(
                 seq_slot=slot,
                 input_tokens=prompt,
                 max_new_tokens=max_tokens,
-                end_id=-1,
+                end_id=end_id,
                 sampling_config=SamplingConfig(
                     sampling_params._get_sampling_config()),
                 return_log_probs=True,
@@ -1865,8 +1868,20 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step(
             (len(prompts) * (1 if step == 0 else beam_width), vocab_size),
             device="cuda",
             generator=generator,
-        ) for step in range(max_tokens)
+        ) for step in range(num_steps)
     ]
+    if early_eos:
+        # Start distinct live beams, then fill the completed pool before the
+        # length limit, with no finished beam in the predictor's previous step.
+        logits[0].fill_(-100.0)
+        logits[0][:, :beam_width] = torch.arange(beam_width,
+                                                 0,
+                                                 -1,
+                                                 device="cuda")
+        logits[1].fill_(-100.0)
+        logits[1][:, end_id] = 100.0
+        context_log_probs = logits[0][0].log_softmax(-1)[:beam_width].tolist()
+        eos_log_prob = logits[1][0].log_softmax(-1)[end_id].item()
     sampling_rank, receiving_rank = make_sampler(), make_sampler()
     sampled_requests, received_requests = make_requests(), make_requests()
     sampled_store = sampling_rank.store.beam_search_store
@@ -1905,6 +1920,7 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step(
                 received.get_tokens(beam) for beam in range(beam_width)
             ] == [sampled.get_tokens(beam) for beam in range(beam_width)]
             assert received.is_finished == sampled.is_finished
+            assert sampled.is_finished == (step == num_steps - 1)
             # The next forward attends over every position the request holds.
             num_positions = sampled.max_beam_num_tokens
             slot = sampled.py_seq_slot
@@ -1920,6 +1936,18 @@ def test_beam_search_handoff_keeps_receiving_rank_in_step(
         assert sampled.is_finished
         assert received.py_result.log_probs == sampled.py_result.log_probs
         assert received.py_result.cum_log_probs == sampled.py_result.cum_log_probs
+        if early_eos:
+            prompt = prompts[sampled.py_seq_slot]
+            for beam in range(beam_width):
+                assert sampled.get_tokens(beam) == prompt + [beam, end_id]
+                log_probs = sampled.py_result.log_probs[beam]
+                assert len(log_probs) == num_steps
+                expected = [context_log_probs[beam], eos_log_prob]
+                assert [
+                    log_probs[0][beam].logprob, log_probs[1][end_id].logprob
+                ] == pytest.approx(expected)
+                assert sampled.py_result.cum_log_probs[beam] == pytest.approx(
+                    sum(expected))
 
 
 @pytest.mark.threadleak(enabled=False)
