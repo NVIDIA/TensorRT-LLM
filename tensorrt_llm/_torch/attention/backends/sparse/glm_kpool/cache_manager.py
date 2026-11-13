@@ -45,7 +45,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     _host_slots_to_device,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
@@ -167,12 +166,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     def page_table_spec(self) -> PageTableSpec:
         """The KDA replay caches are generation-local and never move."""
         spec = super().page_table_spec()
-        if self._kda_replay is None:
+        if self._kda_replay_region is None:
             return spec
         return replace(
-            spec,
-            untransferred_roles=spec.untransferred_roles
-            | self._kda_replay.disagg_ignored_roles(self._state_layout),
+            spec, untransferred_roles=spec.untransferred_roles | self._kda_replay_region.roles
         )
 
     @override

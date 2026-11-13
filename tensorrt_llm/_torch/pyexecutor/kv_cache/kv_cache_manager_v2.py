@@ -139,7 +139,6 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
-from .page_table import ByHead, PageTableSpec, kv_dtype_name, layer_groups
 from .page_table import ByHead, PageTableSpec, Replicated, kv_dtype_name, layer_groups
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (

@@ -1109,12 +1109,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     def page_table_spec(self) -> PageTableSpec:
         """The KDA replay caches are generation-local and never move."""
         spec = super().page_table_spec()
-        if self._kda_replay is None:
+        if self._kda_replay_region is None:
             return spec
         return replace(
-            spec,
-            untransferred_roles=spec.untransferred_roles
-            | self._kda_replay.disagg_ignored_roles(self._state_layout),
+            spec, untransferred_roles=spec.untransferred_roles | self._kda_replay_region.roles
         )
 
     @override

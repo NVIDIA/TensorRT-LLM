@@ -617,8 +617,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
         each split by byte over the ranks recurrent state splits over. SSM
         state is split by head. Both name their element types, which their
-        dtypes configure apart from the KV cache's. With the FP4 MLA cache
-        layout, the policy lays its attention roles over them
+        dtypes configure apart from the KV cache's. The managed replay state's
+        roles never move: the generation worker starts it afresh. With the FP4
+        MLA cache layout, the policy lays its attention roles over them
         (``_fp4_mla_disagg_page_table_spec``) and names the layers
         (``_disagg_layer_names``).
         """
@@ -633,6 +634,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     MambaRole.SSM_STATE: ByHead(head_bytes=head_bytes, dtype=self.ssm_state_dtype),
                 },
             )
+        replay_roles = frozenset(
+            role for layout in self._replay_layouts.values() for role in layout
+        )
+        if replay_roles:
+            spec = replace(spec, untransferred_roles=spec.untransferred_roles | replay_roles)
         if self._attention_cache_layout_policy is not None:
             spec = self._fp4_mla_disagg_page_table_spec(spec)
         return spec
