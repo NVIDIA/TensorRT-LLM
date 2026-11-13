@@ -486,38 +486,70 @@ class DisaggTransferCoordinator:
                     for request in deferred_requests:
                         disagg_diagnostics.emit_kv_rollback(request, dist=self._dist, reason=reason)
 
+    def _align_gen_requests(self, requests: List[LlmRequest]) -> List[LlmRequest]:
+        """Intersect request IDs over the ranks sharing a generation batch."""
+        if not self._enable_attention_dp and self._dist.tp_size > 1:
+            gather = (
+                self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
+            )
+        elif self._dist.cp_size > 1:
+            gather = self._dist.cp_allgather
+        else:
+            return requests
+        local_ids = [request.py_request_id for request in requests]
+        common_ids = set(local_ids)
+        for peer_ids in gather(local_ids, small_payload=True):
+            common_ids.intersection_update(peer_ids)
+        return [request for request in requests if request.py_request_id in common_ids]
+
     @nvtx_range("align_gen_admission_across_cp")
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
-        """Keep only the gen-init requests that every CP rank of the group admitted.
+        """Align GEN admission over CP and, without attention DP, TP as well.
 
-        In async-transfer mode ``receive_gen_init`` ends with the gen transfer
-        status collective, entered only on ranks that admitted something, and in
-        sync mode with the failure gather (``_align_sync_receive_failures_across_cp``),
-        so the CP ranks must admit the same requests in the same iteration. Equal
-        KV capacity does not guarantee that: KV cache manager V1 deals helix
-        blocks round-robin from CP rank 0, so that rank can hold one more block
-        per request, and a client cancel or a transfer timeout retires a request
-        rank-locally, so one CP rank can have room before its peer. The pp=1
-        loops call this on every rank every iteration; the dropped requests give
-        back their V2 KV and are retried on a later iteration. Under
-        attention-DP, a request passes the intersection only if every CP rank
-        routed it to the same DP rank. ``ADPRouter.gather_all_rank_states``
-        gives the CP ranks the same loads. ``ADPRouter.create`` does not build
-        ``KVCacheAwareADPRouter`` under helix CP, because each CP rank probes
-        its own prefix matches and they can differ.
+        Every scheduling rank must enter, including ranks admitting nothing:
+        receive_gen_init enters transfer-status consensus only with admissions.
+        Cancellation or unequal KV capacity can leave local candidates different.
+        Deferred V2 candidates return their speculative KV allocation.
         """
-        if self._dist.cp_size == 1:
-            return admitted
-        local_ids = [request.py_request_id for request in admitted]
-        common_ids = set(local_ids)
-        # small_payload: at most one iteration's gen-init request ids.
-        for peer_ids in self._dist.cp_allgather(local_ids, small_payload=True):
-            common_ids.intersection_update(peer_ids)
-        if len(common_ids) == len(local_ids):
-            return admitted
-        aligned = [request for request in admitted if request.py_request_id in common_ids]
-        self.revert_deferred_gen_init(admitted, aligned, reason="cp_reconciliation")
+        aligned = self._align_gen_requests(admitted)
+        reason = (
+            "tp_reconciliation"
+            if not self._enable_attention_dp and self._dist.tp_size > 1
+            else "cp_reconciliation"
+        )
+        self.revert_deferred_gen_init(admitted, aligned, reason=reason)
         return aligned
+
+    @property
+    def requires_gen_cancellation_consensus(self) -> bool:
+        """Whether legacy async GEN cancellation must retire a replicated batch together."""
+        return (
+            not self._enable_attention_dp
+            and self._dist.pp_size == 1
+            and self._dist.world_size > 1
+            and self._transceiver.consumes_transfer_buffer is False
+            and uses_async_gen_transfer()
+            and self._transceiver.supports_idle_request_cancellation() is not True
+        )
+
+    def align_gen_cancellation(self, ready: List[LlmRequest]) -> List[LlmRequest]:
+        """Keep GEN cancellations only after every batch rank can retire them.
+
+        Call at a shared cancellation boundary, even when this rank has no
+        locally ready request. Physical cancellation may finish before peers;
+        retaining the request and cancel ID keeps idle retries reachable.
+        """
+        if not self.requires_gen_cancellation_consensus:
+            return ready
+        gen_ready = self._align_gen_requests(
+            [request for request in ready if request.is_generation_only_request]
+        )
+        ready_ids = {request.py_request_id for request in gen_ready}
+        return [
+            request
+            for request in ready
+            if not request.is_generation_only_request or request.py_request_id in ready_ids
+        ]
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
@@ -1295,6 +1327,13 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
         return admitted
+
+    @property
+    def requires_gen_cancellation_consensus(self) -> bool:
+        return False
+
+    def align_gen_cancellation(self, ready: List[LlmRequest]) -> List[LlmRequest]:
+        return ready
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         return None

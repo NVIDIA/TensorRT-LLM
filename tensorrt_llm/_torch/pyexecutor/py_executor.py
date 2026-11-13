@@ -5548,8 +5548,8 @@ class PyExecutor:
             admitted_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(scheduler_fitting_disagg_gen_init_requests))
             # receive_gen_init enters the gen transfer status collective only
-            # on ranks that admitted something, so every CP rank must start
-            # the same receives.
+            # on ranks that admitted something. All CP peers, and TP peers
+            # without attention DP, must start the same receives.
             admitted_disagg_gen_init_requests = (
                 self.disagg.align_gen_admission_across_cp(
                     admitted_disagg_gen_init_requests))
@@ -11138,10 +11138,13 @@ class PyExecutor:
         new_ids = {req.py_request_id for req in new_requests}
         cancelled_model_ids = self._cancelled_disagg_model_request_ids()
         previous_batch = getattr(self, "previous_batch", None)
-        if previous_batch is not None:
-            cancelled_model_ids.difference_update(
-                req.py_request_id
-                for req in previous_batch.scheduled_requests.all_requests())
+        previous_ids = ({
+            req.py_request_id
+            for req in previous_batch.scheduled_requests.all_requests()
+        } if previous_batch is not None else set())
+        cancelled_model_ids.difference_update(previous_ids)
+        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        ready_to_cancel = []
         retired_ids = set()
         failed_ids = set()
         handled_cancel_ids = set()
@@ -11162,8 +11165,12 @@ class PyExecutor:
                     LlmRequestState.DISAGG_TRANS_ERROR,
                 ))
             model_cancelled = request.py_request_id in cancelled_model_ids
+            legacy_gen_waiting = replicated_gen_cancel and generation_waiting
+            if legacy_gen_waiting and request.py_request_id in previous_ids:
+                continue
             if (not (context_waiting or generation_waiting or model_cancelled)
-                    or supports_idle_cancel(request) is not True):
+                    or (supports_idle_cancel(request) is not True
+                        and not legacy_gen_waiting)):
                 continue
             if model_cancelled and not self._try_cancel_request(request):
                 continue
@@ -11180,6 +11187,11 @@ class PyExecutor:
             if not logically_cancelled and not self.disagg.request_cancellation(
                     request):
                 continue
+            ready_to_cancel.append(request)
+
+        for request in self.disagg.align_gen_cancellation(ready_to_cancel):
+            cancel_id = (request.parent_request_id
+                         if request.is_child else request.py_request_id)
             handled_cancel_ids.add(cancel_id)
             if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
                 # Keep the failure outcome. The pending cancel must no longer
@@ -11286,6 +11298,7 @@ class PyExecutor:
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
         still_pending_canceled_ids = []
+        ready_to_cancel = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
@@ -11293,28 +11306,37 @@ class PyExecutor:
 
             is_cancelled = self._try_cancel_request(request)
             if is_cancelled:
-                if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
-                        and request.is_generation_only_request
-                        and self.kv_cache_transceiver is not None
-                        and getattr(self, "kv_connector_manager", None) is None
-                        and self.kv_cache_transceiver.
-                        supports_idle_request_cancellation(request) is True):
-                    # Drop the pending cancel so synchronized error cleanup
-                    # can report the committed failure without rewriting it.
-                    continue
-                # Mark requests as finished, then, we reuse all existing code
-                # to clean up the KV cache resources.
-                request.py_kv_transfer_timed_out = False
-                request.finish_by_reason(FinishReason.CANCELLED)
-                request.decoding_iter = request.py_decoding_iter
-                if self._kv_connector_moves_kv:
-                    # A request cancelled mid-prefill can have a connector save
-                    # outstanding against the blocks it has filled so far, and
-                    # the response pass below frees them as soon as it sees this
-                    # request finished.
-                    self._start_connector_async_save(request)
+                ready_to_cancel.append(request)
             else:
                 still_pending_canceled_ids.append(req_id)
+
+        aligned = self.disagg.align_gen_cancellation(ready_to_cancel)
+        aligned_ids = {request.py_request_id for request in aligned}
+        still_pending_canceled_ids.extend(
+            request.parent_request_id if request.is_child else request.
+            py_request_id for request in ready_to_cancel
+            if request.py_request_id not in aligned_ids)
+        for request in aligned:
+            if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
+                    and request.is_generation_only_request
+                    and self.kv_cache_transceiver is not None
+                    and getattr(self, "kv_connector_manager", None) is None
+                    and self.kv_cache_transceiver.
+                    supports_idle_request_cancellation(request) is True):
+                # Drop the pending cancel so synchronized error cleanup
+                # can report the committed failure without rewriting it.
+                continue
+            # Mark requests as finished, then, we reuse all existing code
+            # to clean up the KV cache resources.
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            if self._kv_connector_moves_kv:
+                # A request cancelled mid-prefill can have a connector save
+                # outstanding against the blocks it has filled so far, and
+                # the response pass below frees them as soon as it sees this
+                # request finished.
+                self._start_connector_async_save(request)
 
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.canceled_req_ids.clear()

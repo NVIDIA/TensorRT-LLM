@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
+from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
@@ -383,3 +384,96 @@ def test_admission_gate_matches_select(seed) -> None:
     # Only the candidate that closed the gate is allocated and then deferred.
     assert gated.deferred_request_count == min(reference.deferred_request_count, 1)
     assert len(candidates) - len(observed) == max(reference.deferred_request_count - 1, 0)
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("peer_admits", [False, True])
+def test_tp_admission_waits_for_every_non_adp_rank(tp_size: int, peer_admits: bool) -> None:
+    """A TP peer with no candidate must still join the admission vote."""
+    group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
+    ranks = [
+        CoordinatorHarness(dist=group.rank(rank), is_kv_manager_v2=True) for rank in range(tp_size)
+    ]
+    candidates = [[_candidate(1), _candidate(2)] for _ in ranks]
+    candidates[-1] = [_candidate(1)] if peer_admits else []
+
+    aligned = group.run(
+        lambda rank: ranks[rank].coordinator.align_gen_admission_across_cp(candidates[rank])
+    )
+
+    expected = [1] if peer_admits else []
+    assert [[request.py_request_id for request in requests] for requests in aligned] == [
+        expected for _ in ranks
+    ]
+    for rank, h in enumerate(ranks):
+        assert h.dist.calls == [("tp_allgather", [r.py_request_id for r in candidates[rank]])]
+        dropped = [r for r in candidates[rank] if r.py_request_id not in expected]
+        assert h.effects.reverted == ([dropped] if dropped else [])
+
+
+def test_non_adp_admission_spans_both_tp_and_cp() -> None:
+    """A TP peer outside the local CP group can veto a receive."""
+    gathered = []
+
+    def tp_cp_allgather(ids, *, small_payload=False):
+        assert small_payload
+        gathered.append(ids)
+        return [ids, ids, ids, [1]]
+
+    dist = SimpleNamespace(
+        rank=0,
+        tp_size=2,
+        cp_size=2,
+        pp_size=1,
+        world_size=4,
+        tp_cp_allgather=tp_cp_allgather,
+    )
+    h = CoordinatorHarness(dist=dist, is_kv_manager_v2=True)
+    first, second = _candidate(1), _candidate(2)
+
+    assert h.coordinator.align_gen_admission_across_cp([first, second]) == [first]
+    assert h.effects.reverted == [[second]]
+    assert gathered == [[1, 2]]
+
+
+def test_attention_dp_does_not_intersect_independent_tp_owners() -> None:
+    """Different ADP owners must remain free to admit different requests."""
+    dist = SimpleNamespace(rank=0, tp_size=8, cp_size=1, pp_size=1, world_size=8)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True, is_kv_manager_v2=True)
+    candidate = _candidate(1)
+
+    assert h.coordinator.align_gen_admission_across_cp([candidate]) == [candidate]
+    assert h.effects.reverted == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "bridge", "expected"),
+    [
+        ({}, False, True),
+        ({"enable_attention_dp": True}, False, False),
+        ({"pp_size": 2}, False, False),
+        ({"consumes_transfer_buffer": True}, False, False),
+        ({}, True, False),
+        ({"world_size": 1, "tp_size": 1}, False, False),
+    ],
+)
+def test_gen_cancellation_consensus_preserves_runtime_capability_gates(
+    overrides: dict,
+    bridge: bool,
+    expected: bool,
+) -> None:
+    """C++ transfers, ADP, PP and the ownership bridge retain their cancellation paths."""
+    options = dict(world_size=2, tp_size=2, consumes_transfer_buffer=False)
+    options.update(overrides)
+    h = CoordinatorHarness(**options)
+    h.transceiver.supports_idle_request_cancellation = lambda req=None: bridge
+
+    assert h.coordinator.requires_gen_cancellation_consensus is expected
+
+
+def test_gen_cancellation_consensus_is_disabled_for_sync_receives(monkeypatch) -> None:
+    """A rank-local blocking receive must not acquire the async cancellation vote."""
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    h = CoordinatorHarness(world_size=2, tp_size=2, consumes_transfer_buffer=False)
+
+    assert not h.coordinator.requires_gen_cancellation_consensus

@@ -619,10 +619,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The PP loop does not, so _check_compatible rejects attention-DP
             # with both helix CP and pp_size > 1.
             #
-            # Non-DP tp x cp gathers over the world behind the same predicate and
-            # goes through the same step, which lines up its CP ranks but not its
-            # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP.
+            # Non-DP TP x CP gathers over the world. Its scheduling loop aligns
+            # admission over both TP and CP before entering receive_gen_init.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:

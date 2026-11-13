@@ -1962,3 +1962,85 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
     assert executor.active_requests == [healthy]
     assert not healthy.is_finished
     _assert_released_once(executor, cancelled)
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
+    executor: PyExecutor,
+    tp_size: int,
+) -> None:
+    """One drained receive cannot remove a replicated request ahead of its peers."""
+    group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
+    ready = [True] * tp_size
+    ready[-1] = False
+    engines = []
+    requests = []
+    for rank in range(tp_size):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        request = _request(1)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1]
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        engine.disagg.request_cancellation = Mock(side_effect=lambda req, r=rank: ready[r])
+        engine._try_cancel_request = Mock(side_effect=lambda req, r=rank: ready[r])
+        engines.append(engine)
+        requests.append(request)
+
+    # A receive still referenced by a prior model batch cannot be closed by
+    # the loop-head retry, even when local transport retirement reports ready.
+    for rank, engine in enumerate(engines):
+        engine.previous_batch = SimpleNamespace(
+            scheduled_requests=ScheduledRequests(generation_requests=[requests[rank]])
+        )
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(not request.is_finished for request in requests)
+    for engine in engines:
+        engine.disagg.request_cancellation.assert_not_called()
+        engine.previous_batch = None
+
+    group.run(lambda rank: engines[rank]._handle_canceled_requests())
+
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    assert all(engine.active_requests == [requests[rank]] for rank, engine in enumerate(engines))
+
+    # No model batch follows. The loop-head path must keep retrying without
+    # releasing the rank whose physical receive already drained.
+    remaining = group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert remaining == [[] for _ in engines]
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    assert all(engine._pending_response_terminations == [] for engine in engines)
+
+    ready[-1] = True
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+
+    assert all(request.is_finished_due_to_cancellation for request in requests)
+    assert all(engine.active_requests == [] for engine in engines)
+    assert all(engine.canceled_req_ids == [] for engine in engines)
+    assert all(
+        engine._pending_response_terminations == [requests[rank]]
+        for rank, engine in enumerate(engines)
+    )
+    assert all(
+        [name for name, _ in engine.dist.calls] == ["tp_allgather"] * 4 for engine in engines
+    )
