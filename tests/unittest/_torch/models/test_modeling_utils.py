@@ -250,3 +250,35 @@ def test_quantization_passes_match_declared_fused_checkpoint_names(
         assert projection.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
     else:
         assert projection.quant_config is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the module walk pins the CUDA device")
+def test_load_weights_impl_v2_reloads_keep_one_skip_list(monkeypatch) -> None:
+    """An in-flight weight update loads each bucket through the engine's one mapper.
+
+    Every load adds the model's skip list to the mapper; the list must not grow
+    with the number of loads, and each load must still land its weights.
+    """
+
+    class _Stub(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model_config = ModelConfig(
+                pretrained_config=PretrainedConfig(tie_word_embeddings=False), mapping=Mapping()
+            )
+            self.config = self.model_config.pretrained_config
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([nn.Linear(4, 4)])
+            self.lm_head = nn.Linear(4, 2, bias=False)
+
+    stub = _Stub()
+    monkeypatch.setenv("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
+    mapper = HfWeightMapper()
+    mapper.init_model_and_config(stub, stub.model_config)
+    for value in (5.0, 7.0, 9.0):
+        bucket = {"lm_head.weight": torch.full((2, 4), value)}
+        modeling_utils._load_weights_impl_v2(
+            stub, bucket, mapper, skip_modules=["draft_model"], allow_partial_loading=True
+        )
+        torch.testing.assert_close(stub.lm_head.weight.detach(), bucket["lm_head.weight"])
+    assert mapper.skip_modules == ["draft_model"]
