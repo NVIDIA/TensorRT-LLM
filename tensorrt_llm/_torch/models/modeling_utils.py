@@ -18,6 +18,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._errors import (ConfigInputError, ModelLoadError,
+                                  UnsupportedError)
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.checkpoint_format import CheckpointFormat
@@ -435,6 +437,22 @@ def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
     return None
 
 
+def fused_checkpoint_names(module: nn.Module, name: str) -> list[str]:
+    """Checkpoint names of the projections fused into ``module``.
+
+    A fused ``Linear`` whose parts are not spelled ``gate_proj``/``up_proj`` or
+    ``q_proj``/``k_proj``/``v_proj`` declares their leaf names in a
+    ``fused_checkpoint_names`` attribute, e.g. ``("index_q_proj",
+    "index_k_proj")``. Both quantization passes match those names instead of
+    the fused module's own name. Returns an empty list when none are declared.
+    """
+    leaves = getattr(module, "fused_checkpoint_names", None)
+    if not leaves:
+        return []
+    prefix = name.rsplit('.', 1)[0]
+    return [f"{prefix}.{leaf}" for leaf in leaves]
+
+
 def apply_layerwise_quant_config(
         model_config: ModelConfig,
         named_modules: Iterator[tuple[str, nn.Module]]) -> None:
@@ -450,7 +468,20 @@ def apply_layerwise_quant_config(
             elif isinstance(module, Linear):
                 weight_mode = module.weights_loading_config.weight_mode
                 prefix_name = '.'.join(name.split('.')[:-1])
-                if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                fused_names = fused_checkpoint_names(module, name)
+                if fused_names:
+                    # The parts load into one weight, so they must agree.
+                    configs = [quant_config_dict.get(n) for n in fused_names]
+                    if any(q is not None for q in configs):
+                        if any(q is None
+                               for q in configs) or any(q != configs[0]
+                                                        for q in configs[1:]):
+                            raise ValueError(
+                                f"{', '.join(fused_names)} load into one fused "
+                                f"projection and need the same quantization, "
+                                f"got {configs}.")
+                        module.quant_config = configs[0]
+                elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
                     for n, q in quant_config_dict.items():
                         # gate_proj and up_proj share the same quant config
                         if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
@@ -519,9 +550,19 @@ def apply_quant_config_exclude_modules(
                             name.replace('qkv_proj', 'k_proj'),
                             name.replace('qkv_proj', 'v_proj')
                         ]
+                fused_names = fused_checkpoint_names(module, name)
+                fused_excluded = [
+                    quant_config.is_module_excluded_from_quantization(n)
+                    for n in fused_names
+                ]
+                if any(fused_excluded) and not all(fused_excluded):
+                    raise ValueError(
+                        f"{', '.join(fused_names)} load into one fused "
+                        f"projection, but exclude_modules excludes only some "
+                        f"of them.")
                 is_excluded = any(
                     quant_config.is_module_excluded_from_quantization(n)
-                    for n in candidates)
+                    for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
                     module.quant_config = new_config
@@ -1204,6 +1245,21 @@ def register_external_model_modules(arch_to_module: Dict[str, str]) -> None:
     _rebuild_arch_registries(declared)
 
 
+def _model_arch_provider(model_arch: str) -> Optional[str]:
+    """The module to import for ``model_arch``, or ``None`` if no source lists it.
+
+    External declarations take precedence over the static index of built-in
+    architectures. Imports nothing; ``_ensure_model_registered`` and
+    ``is_model_arch_known`` both resolve providers through this function.
+    """
+    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    if full_name is None:
+        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+        if module_name is not None:
+            full_name = f"tensorrt_llm._torch.models.{module_name}"
+    return full_name
+
+
 def _ensure_model_registered(model_arch: str) -> None:
     """Import the module that provides ``model_arch``, if it isn't loaded yet.
 
@@ -1224,12 +1280,9 @@ def _ensure_model_registered(model_arch: str) -> None:
     registration decorator; the import itself is idempotent via
     ``sys.modules``.
     """
-    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    full_name = _model_arch_provider(model_arch)
     if full_name is None:
-        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
-        if module_name is None:
-            return
-        full_name = f"tensorrt_llm._torch.models.{module_name}"
+        return
     try:
         importlib.import_module(full_name)
     except ModuleNotFoundError as e:
@@ -1254,6 +1307,18 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def is_model_arch_known(model_arch: str) -> bool:
+    """Whether ``get_registered_model_class`` has a source for ``model_arch``.
+
+    Checks the registry and then ``_model_arch_provider``, the same steps as
+    the lookup, but imports nothing, so it is cheap enough for checks that run
+    before the model is built. A provider whose module later fails to import
+    still counts as known; that error surfaces where the model is built.
+    """
+    return (model_arch in MODEL_CLASS_MAPPING
+            or _model_arch_provider(model_arch) is not None)
 
 
 def _is_builtin_draft_model_builder(builder) -> bool:
@@ -1498,16 +1563,17 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = get_registered_model_class(model_config.architectures[0])
     else:
-        raise RuntimeError("Model architecture is not provided.")
+        raise ModelLoadError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]
         if arch in _GEMMA4_ARCHITECTURES:
-            raise RuntimeError(
+            raise ConfigInputError(
                 f"Gemma4 model support requires transformers>=5.5.0, "
                 f"please upgrade: pip install 'transformers>=5.5.0' "
-                f"(architecture: {arch}).")
-        raise RuntimeError(f"Unknown model architecture: {arch}")
+                f"(architecture: {arch}).",
+                reason="import")
+        raise UnsupportedError(f"Unknown model architecture: {arch}")
     return cls, model_config.architectures[0]
 
 

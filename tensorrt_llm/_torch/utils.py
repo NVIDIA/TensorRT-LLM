@@ -461,8 +461,8 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
 
     DeepGemm picks its tile layout from a heuristic over M and compiles one
     kernel per selected layout. A layout no bucket selects gets compiled
-    mid-inference instead, and DeepGemm forks nvcc while holding the GIL, so
-    that compile stalls every rank of the attention-DP group.
+    mid-inference instead, inside that rank's forward, so that compile stalls
+    every rank of the attention-DP group.
 
     Step 16 is exactly the right spacing, and it is needed over the whole
     range. In ``deepgemm/csrc/jit_kernels/heuristics/sm100.hpp`` the selection

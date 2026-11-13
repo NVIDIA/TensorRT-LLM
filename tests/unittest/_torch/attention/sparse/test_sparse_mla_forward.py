@@ -1819,6 +1819,10 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
+    freqs_cis = None
+    rope_cos_sin = None
+    ref_compressor = None
+    ref_indexer_compressor = None
     # Create RoPE config
     if sparse_attn_algo == "dsa":
         rope_config = RopeConfig(
@@ -1872,7 +1876,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             qk_rope_head_dim=qk_rope_head_dim,
             model_type="deepseek_v4",
         )
-        freqs_cis = None  # Will be set after MLA modules are created
 
     # Calculate scaling factors (aligned with vLLM)
     def yarn_get_mscale(scale=1, mscale=1):

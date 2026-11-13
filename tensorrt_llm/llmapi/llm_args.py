@@ -49,6 +49,7 @@ from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
+from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
 
@@ -75,6 +76,7 @@ from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
 from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
+from ..watermark.config import WatermarkConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
@@ -927,6 +929,46 @@ class GuidedDecodingConfig(StrictBaseModel):
         description="The stop token ids for guided decoding config.")
 
 
+class SparseKvCacheOffloadConfig(StrictBaseModel):
+    """Memory sizing for sparse attention KV cache offload.
+
+    With offload, the KV history a sparse attention layer selects from lives in
+    host memory, and each request keeps a GPU cache of the units its selections
+    name.
+    """
+    gpu_cache_factor: float = Field(
+        default=2.0,
+        ge=1.0,
+        status="prototype",
+        description=
+        "Size of each request's GPU cache for offloaded attention history, in "
+        "selections: the cache holds this many times the units one decode step "
+        "selects, plus the unit being written, rounded up to whole pages. A "
+        "larger cache keeps more history on the GPU between decode steps, so "
+        "fewer units are fetched from host memory, at the cost of GPU memory per "
+        "request.")
+    host_history_size: Optional[NonNegativeInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Pinned host memory in bytes, per rank, for offloaded attention history "
+        "and the staging buffers that publish it to the GPU. The KV cache "
+        "manager holds the history pools within it, beside the GPU KV cache "
+        "quota, which it does not lower; a size too small for the batches the "
+        "manager must always hold, such as one max_seq_len request, is "
+        "rejected. It is separate from kv_cache_config.host_cache_size, the "
+        "host tier that evicted KV cache pages move to, and the two together "
+        "must fit this rank's share of available host memory and the "
+        "pinned-memory limit. When unset, the history pools come first: they "
+        "may take the host memory automatic sizing may pin, beside the staging "
+        "buffers and, unless kv_cache_config.host_cache_size or a disk tier is "
+        "set, room in the host tier for one max_seq_len request. Either way it "
+        "is an upper bound: the history pools share their slot count with the "
+        "GPU KV cache pools, so they pin only what the GPU quota's slots pair "
+        "with. When unset, the automatic host tier takes the host memory they "
+        "leave, up to the GPU KV cache quota.")
+
+
 class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
@@ -936,6 +978,14 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        """Return the KV cache offload sizing, or None without offload.
+
+        Override in algorithms that can offload attention history to host memory.
+        """
+        return None
 
     def to_sparse_params(self, **kwargs):
         """Lower user-facing config into SparseParams."""
@@ -1416,6 +1466,42 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
         "it each step. Defaults to the model's HF config value.")
+    enable_kv_cache_offload: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Offload the KV history sparse attention selects from to host memory "
+        "with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 "
+        "the ratio-4 compressed cache. Each decode step fetches the units the "
+        "indexer selects into a per-request GPU cache; the indexer and "
+        "sliding-window caches remain on GPU. Only a decode-only worker, such "
+        "as the generation worker of a disaggregated deployment, can offload.")
+    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
+        default_factory=SparseKvCacheOffloadConfig,
+        status="prototype",
+        description="Memory sizing for KV cache offload. Applies only with "
+        "enable_kv_cache_offload.")
+
+    @model_validator(mode="after")
+    def _validate_kv_cache_offload(self):
+        """Reject offload sizing without offload and a non-positive top-k.
+
+        ``index_topk`` may still be None here; the checkpoint fills it later.
+        """
+        if self.enable_kv_cache_offload:
+            if self.index_topk is not None and self.index_topk <= 0:
+                raise ValueError(
+                    "KV cache offload requires a positive index_topk.")
+        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
+            raise ValueError("kv_cache_offload_config requires "
+                             "enable_kv_cache_offload=True.")
+        return self
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        if not self.enable_kv_cache_offload:
+            return None
+        return self.kv_cache_offload_config
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1549,6 +1635,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 pretrained_config, kwargs.get("layer_idx")),
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1585,6 +1672,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             has_shared_indexer_layers=has_shared_indexer_layers,
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
 
@@ -1617,14 +1705,6 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description="The sliding window size in tokens for SWA layers.")
     index_topk: Optional[int] = Field(default=512,
                                       description="The top-k for the indexer.")
-    enable_kv_cache_offload: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "Offload ratio-4 compressed attention KV history to host memory with "
-        "KV cache manager v2. The indexer and sliding-window caches remain on "
-        "GPU. This feature is under development and currently cannot be "
-        "enabled for inference.")
 
     @field_validator("index_head_dim")
     @classmethod
@@ -1644,7 +1724,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return [1 if ratio == 0 else ratio for ratio in compress_ratios]
 
     @model_validator(mode="after")
-    def validate_kv_cache_offload(self) -> "DeepSeekV4SparseAttentionConfig":
+    def _validate_deepseek_v4_kv_cache_offload(
+            self) -> "DeepSeekV4SparseAttentionConfig":
         if self.enable_kv_cache_offload:
             if 4 not in self.compress_ratios:
                 raise ValueError(
@@ -4823,6 +4904,30 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         description=
         "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
         "K/V global scales. Omit it to use identity global scales.")
+    mixed_precision_first_n: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Number of leading tokens per sequence kept unquantized in the cold tiers, "
+        "in whole cache pages. Applies to full-attention layers; sliding-window "
+        "layers are stored as ordinary cold pages.")
+    mixed_precision_last_n: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Number of most recent tokens per sequence kept unquantized in the cold "
+        "tiers, in whole cache pages. Applies to full-attention layers; "
+        "sliding-window layers are stored as ordinary cold pages. Rejected when a "
+        "sliding-window layer keeps the same tokens (its window is this value plus "
+        "one, with the same sink pages): the high layers would share that layer's "
+        "page group, which the cold-page codec cannot split.")
+
+    @property
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` kept at the active precision, else None."""
+        if self.mixed_precision_first_n or self.mixed_precision_last_n:
+            return (self.mixed_precision_first_n, self.mixed_precision_last_n)
+        return None
 
     def supports_block_reuse(self) -> bool:
         """Block reuse is unchanged because token identity is preserved."""
@@ -6657,7 +6762,7 @@ class BaseLlmArgs(StrictBaseModel):
         if config_dict is None:
             config_dict = {}
         elif not isinstance(config_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         return cls(**config_dict)
 
     @field_validator("gpus_per_node", mode='before')
@@ -7141,6 +7246,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    watermark_config: Optional[WatermarkConfig] = Field(
+        default=None,
+        description=
+        "Enables statistical text watermarking of generated tokens (Gumbel-max). "
+        "Requests may opt out with SamplingParams.watermarking=False unless "
+        "allow_request_opt_out is False. Greedy and beam-search requests cannot "
+        "carry a watermark and are generated normally. The key is a secret and "
+        "must match at detection time (see tensorrt_llm.watermark).",
+        status="prototype")
+
     lm_head_output_dtype: Literal["auto", "float32"] = Field(
         default="auto",
         description=
@@ -7172,7 +7287,8 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         ("Maximum number of top-level encoder inputs processed in one "
          "iteration. For encoder-decoder models, each encoder request counts "
-         "as one input. For multimodal models, each atomic image, video, or "
+         "as one input, and encoder requests beyond it wait for later "
+         "iterations. For multimodal models, each atomic image, video, or "
          "other encoder item counts as one input, even if it expands into "
          "multiple internal attention sequences. For encoder-decoder models, "
          "it also limits encoder CUDA graph batch sizes. Falls back to "
@@ -7181,14 +7297,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     encoder_max_num_tokens: Optional[int] = Field(
         default=None,
-        description=(
-            "Maximum number of encoder tokens. For encoder-decoder models, this "
-            "limits encoder CUDA graph total-token buckets. For multimodal "
-            "models, it limits encoder attention tokens scheduled in one "
-            "iteration and is shared across all encoded modalities. It falls "
-            "back to `max_num_tokens` when unset. Because an atomic multimodal "
-            "item cannot be split, the effective budget is raised to the "
-            "model's largest atomic item when necessary."),
+        description=
+        ("Maximum number of encoder tokens. For encoder-decoder models, this "
+         "limits the total encoder tokens of the requests encoded in one "
+         "iteration: encoder requests beyond it wait for later iterations, "
+         "and a request whose encoder tokens alone exceed it is rejected. It "
+         "also limits encoder CUDA graph total-token buckets. For multimodal "
+         "models, it limits encoder attention tokens scheduled in one "
+         "iteration and is shared across all encoded modalities. It falls "
+         "back to `max_num_tokens` when unset. Because an atomic multimodal "
+         "item cannot be split, the effective budget is raised to the "
+         "model's largest atomic item when necessary."),
         status="prototype")
 
     @model_validator(mode="before")
@@ -7229,6 +7348,18 @@ class TorchLlmArgs(BaseLlmArgs):
         # tensor derives both from the model, and only the engine knows which
         # kind of encoder the model has. It still raises for the token encoders
         # that require them.
+        return self
+
+    @model_validator(mode="after")
+    def validate_watermark_config(self) -> 'TorchLlmArgs':
+        spec = self.speculative_config
+        if (self.watermark_config is not None and spec is not None
+                and spec.spec_dec_mode.is_dspark()):
+            raise ValueError(
+                "watermark_config is not supported with DSpark speculative "
+                "decoding: its ragged verification windows cannot be "
+                "watermarked. Use another speculation mode or drop "
+                "watermark_config.")
         return self
 
     attn_backend: str = Field(
@@ -7675,7 +7806,7 @@ class TorchLlmArgs(BaseLlmArgs):
         self._quant_config = value
 
     modeling_v2: Literal["off", "auto", "require"] = Field(
-        default="off",
+        default="auto",
         status="prototype",
         description=
         "Whether to build the model from a modeling_v2 target (experimental) "
@@ -7758,42 +7889,58 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
-        """Reject runtime features the mixed-precision KV cache does not support."""
-        if self.kv_cache_config.mixed_precision_kv is None:
+        """Reject what the mixed-precision KV cache and the cold-page window do not support."""
+        hot = self.kv_cache_config.mixed_precision_kv is not None
+        cold = getattr(self.kv_cache_compression_config,
+                       "mixed_precision_high_window", None) is not None
+        if not hot and not cold:
             return self
+        feature = "Mixed-precision KV" if hot else "Mixed-precision cold pages"
+        if cold and self.kv_cache_config.dtype == "fp8_ds_mla":
+            # The sparse backends return that layout's indices before the redirect.
+            raise ValueError(
+                f"{feature} do not support kv_cache_config.dtype='fp8_ds_mla'.")
         if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
             raise ValueError(
-                "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
+                f"{feature} requires kv_cache_config.use_kv_cache_manager_v2=True."
             )
-        # get_attention_backend matches the name case-insensitively.
-        if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
+        # Case-insensitive like get_attention_backend; FlashInfer indexes whole pages.
+        backends = "TRTLLM" if cold else "TRTLLM and FLASHINFER"
+        if self.attn_backend.upper() not in backends.split(" and "):
             raise ValueError(
-                "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
-                f"backends; got attn_backend={self.attn_backend!r}.")
+                f"{feature} supports the {backends} attention backend"
+                f"{'' if cold else 's'}; got attn_backend={self.attn_backend!r}."
+            )
         # The connector layout maps every cache layer to one model layer; the
         # mixed-precision high layers break that mapping.
         if self.kv_connector_config is not None:
             raise ValueError(
-                "Mixed-precision KV is not supported together with a KV connector."
-            )
+                f"{feature} is not supported together with a KV connector.")
         if self.sleep_config is not None:
             raise ValueError(
-                "Mixed-precision KV requires KVCacheManagerV2, which does not support "
+                f"{feature} requires KVCacheManagerV2, which does not support "
                 "sleep_config.")
         sparse = self.sparse_attention_config
         if sparse is not None and sparse.algorithm not in ("dsa",
                                                            "deepseek_v4"):
             raise ValueError(
-                "Mixed-precision KV supports the dsa and deepseek_v4 sparse "
+                f"{feature} supports the dsa and deepseek_v4 sparse "
                 f"attention algorithms; got {sparse.algorithm!r}.")
-        if (self.kv_cache_compression_config is not None
-                or self.max_beam_width != 1):
+        if cold and sparse is not None and sparse.enable_kv_cache_offload:
+            # Sparse KV cache offload reads the selected rows from its own
+            # arena, which the redirect to the high layer does not cover.
             raise ValueError(
-                "Mixed-precision KV currently requires single-beam execution "
-                "without cold-page compression.")
+                f"{feature} is not supported together with sparse KV cache "
+                "offload (enable_kv_cache_offload).")
+        if hot and self.kv_cache_compression_config is not None:
+            raise ValueError(
+                "Mixed-precision KV (kv_cache_config.dtype=mixed_*) cannot be "
+                "combined with kv_cache_compression_config.")
+        if self.max_beam_width != 1:
+            raise ValueError(f"{feature} requires single-beam execution.")
         if getattr(self.speculative_config, "use_dynamic_tree", False):
             raise ValueError(
-                "Mixed-precision KV does not support dynamic-tree speculative "
+                f"{feature} does not support dynamic-tree speculative "
                 "decoding, which moves accepted KV rows inside the cache pools."
             )
         return self
@@ -8928,7 +9075,7 @@ def update_llm_args_with_extra_options(
         if llm_args_dict is None:
             llm_args_dict = {}
         elif not isinstance(llm_args_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         llm_args = update_llm_args_with_extra_dict(
             llm_args,
             llm_args_dict,

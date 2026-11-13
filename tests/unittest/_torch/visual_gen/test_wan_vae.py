@@ -6,6 +6,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -118,6 +119,8 @@ def test_wan_warmup_encodes_each_fp4_ti2v_resolution_once():
     pipeline = object.__new__(WanPipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.is_wan22_5b = True
+    pipeline.is_wan22_14b = False
+    pipeline.config = SimpleNamespace()
     pipeline._fp4_vae_encoder_warmup_resolutions = set()
     pipeline.vae = _FakeVAE()
     pipeline._device = torch.device("cpu")
@@ -130,6 +133,7 @@ def test_wan_warmup_encodes_each_fp4_ti2v_resolution_once():
 
     assert pipeline.vae.encoded_shapes == [(1, 3, 1, 64, 96), (1, 3, 1, 96, 128)]
     assert len(forward_calls) == 3
+    assert all(call["guidance_scale"] == 5.0 for call in forward_calls)
 
 
 def test_fp4_conv_composes_with_parallel_vae_halo():

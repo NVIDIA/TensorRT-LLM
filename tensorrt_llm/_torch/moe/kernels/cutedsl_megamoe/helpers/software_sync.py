@@ -113,7 +113,9 @@ class NvlinkBarrier(SoftwareGridSync):
         workspace: DeviceWorkspace,
         peer_rank_ptr_mapper,
     ) -> None:
-        super().assign_device_members(workspace)
+        # Explicit base call: inside a @cute.jit method a zero-argument super() resolves from the
+        # runtime type, so a subclass of NvlinkBarrier would recurse into this method instead.
+        SoftwareGridSync.assign_device_members(self, workspace)
         self._phase_counter = workspace.ptr(self.phase_counter_region)
         self._signal = workspace.ptr(self.signal_region)
         self._peer_rank_ptr_mapper = peer_rank_ptr_mapper
