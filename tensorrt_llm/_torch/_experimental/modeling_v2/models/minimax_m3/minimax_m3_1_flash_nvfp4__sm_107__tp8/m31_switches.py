@@ -130,6 +130,7 @@ ITEMS: Dict[str, str] = {
     "REJ_V3": "the rejection sampler's v2 kernel on every device",
     "TOPP_V6": "the top-p renorm's staged summation loop on every device",
     "AR2_ORDER_FIX": "the boundary all-reduce's legacy parity rotation after thread 0's poll",
+    "LC8_EXTRACT": "the long-context sparse decode's per-byte NVFP4 dequant",
 }
 
 

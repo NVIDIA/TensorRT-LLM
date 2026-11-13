@@ -18,8 +18,8 @@
 # minimax_m3 native code; see the modeling_v2 README.
 #
 # m3/: the family's copies of the MiniMax-M3 multicast all-reduce + RMSNorm,
-# low-M MXFP8 GEMM, MSA KV-length update and SM107 TP2 sparse decode kernels,
-# with their fixes. m31/: kernels the MiniMax-M3.1-Flash targets share.
+# low-M MXFP8 GEMM, MSA KV-length update and SM107 TP2 / TP8 sparse decode
+# kernels, with their fixes. m31/: kernels the MiniMax-M3.1-Flash targets share.
 # msa_vllm_topk/: the MSA top-k selection headers. Each target keeps its own
 # code in <target>/csrc/.
 add_modeling_v2_family(minimax_m3)

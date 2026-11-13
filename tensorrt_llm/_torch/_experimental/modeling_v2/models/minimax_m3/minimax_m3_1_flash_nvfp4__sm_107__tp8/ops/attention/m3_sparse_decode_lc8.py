@@ -15,6 +15,9 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
+
+from ...m31_switches import m31_disabled
 
 #: The TP8 geometry the kernel is compiled for: 8 query heads on one KV head.
 NUM_HEADS = 8
@@ -26,6 +29,9 @@ SF_VEC = 16
 #: MXFP8 elements per UE8M0 scale, and the o_proj width the hand-off is laid out for.
 MX_BLOCK = 32
 WIDTH = NUM_HEADS * HEAD_DIM
+#: LC8_EXTRACT: the merge-once op dequantizes each K / V byte with fewer moves (one unpack per word, one byte permute
+#: per scale pair), the same values. Kill switch TRTLLM_M31_DISABLE_LC8_EXTRACT=1, passed as the op's extract argument.
+LC8_EXTRACT = not m31_disabled("LC8_EXTRACT")
 
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
@@ -292,10 +298,10 @@ class M3SparseDecodeLc8(OpWrapper):
         identity_step: bool = False,
         one_div: bool = False,
     ) -> torch.Tensor:
-        # merge_once: this target's copy of the op (minimaxM3Sm107Tp8/sparseDecodeLc8m.cu), whose split-K merge forms
-        # the 16 weights once per CTA (same values, same order: bitwise the image op's output).
+        # merge_once: the family's copy of the op (csrc/m3/sm107Tp8SparseDecodeLc8m.cu), whose split-K merge forms the
+        # 16 weights once per CTA (same values, same order: bitwise the image op's output), with LC8_EXTRACT.
         lc8 = (
-            torch.ops.trtllm.minimax_m3_sm107_tp8_sparse_decode_lc8
+            family_ops().minimax_m3_sm107_tp8_sparse_decode_lc8
             if merge_once
             else torch.ops.trtllm.minimax_m3_tp8_sparse_decode_lc8
         )
@@ -330,6 +336,7 @@ class M3SparseDecodeLc8(OpWrapper):
             **({"identity": True} if identity else {}),
             **({"identity_step": True} if identity_step else {}),
             **({"one_div": True} if one_div else {}),
+            **({"extract": LC8_EXTRACT} if merge_once else {}),
         )
         return out
 

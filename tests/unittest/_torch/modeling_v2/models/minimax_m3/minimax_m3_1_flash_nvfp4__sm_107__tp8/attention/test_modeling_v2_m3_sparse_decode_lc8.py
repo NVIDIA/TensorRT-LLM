@@ -7,11 +7,14 @@ Every cell is held to the float64 reference within the derived band, its MXFP8 h
 the two ``prewait`` variants (staging before or after the grid wait) to each other bit for bit.
 """
 
+import re
 import zlib
 
 import pytest
 import torch
+from torch.profiler import ProfilerActivity, profile
 
+import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 as lc8_entry  # noqa: E501
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 import (  # noqa: E501
     NUM_HEADS,
     WIDTH,
@@ -359,3 +362,37 @@ def test_one_div_merge_is_deterministic_and_in_band(
     assert torch.isfinite(a.float()).all()
     assert_within_ulp(a, ref, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
     assert_within_ulp(a, per, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
+
+
+def _lc8_extract_rows(monkeypatch, extract, case):
+    """The merge-once op's rows and hand-offs at both softmax recurrences and both staging variants with LC8_EXTRACT
+    set to ``extract``, and the EXTRACT template argument of every LC8 kernel those calls launched."""
+    monkeypatch.setattr(lc8_entry, "LC8_EXTRACT", extract)
+    rows = {}
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for linear in (False, True):
+            for prewait in (False, True):
+                out, q8, sf = _buffers(case.q.shape[0], True)
+                op(*_args(case, out, q8, sf, linear, prewait), merge_once=True)
+                rows[(linear, prewait)] = (out.view(torch.int16).clone(), q8.clone(), sf.clone())
+        torch.cuda.synchronize()
+    kernels = [e.name for e in prof.events() if "m3_tp8_lc8_attn_kernel<" in e.name]
+    templates = sorted(
+        {re.search(r"m3_tp8_lc8_attn_kernel<(?:\w+, ){4}(\w+)>", n).group(1) for n in kernels}
+    )
+    return rows, templates, len(kernels)
+
+
+def test_the_extract_switch_keeps_the_bits(monkeypatch) -> None:
+    """The dequant's fewer-move byte extraction (LC8_EXTRACT, on by default) and the instance its kill switch selects
+    (the op's extract=False) write the same rows and hand-offs at both softmax recurrences and both staging variants,
+    and each setting launches the instance it names."""
+    case = build_step((165521,), 4, identity=False, seed=20261031)
+    on, on_templates, on_launches = _lc8_extract_rows(monkeypatch, True, case)
+    off, off_templates, off_launches = _lc8_extract_rows(monkeypatch, False, case)
+    assert on_templates == ["true"] and on_launches == 4, (on_templates, on_launches)
+    assert off_templates == ["false"] and off_launches == 4, (off_templates, off_launches)
+    for key, (out, q8, sf) in on.items():
+        b_out, b_q8, b_sf = off[key]
+        assert torch.equal(out, b_out), key
+        assert torch.equal(q8, b_q8) and torch.equal(sf, b_sf), key

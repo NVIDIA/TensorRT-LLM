@@ -647,6 +647,7 @@ torch.library.register_fake(f"{_NS}::minimax_m3_sm107_tp2_mc_allreduce_norm")(
     _sm107_mc_allreduce_norm_fake
 )
 _in_place("minimax_m3_sm107_tp2_sparse_decode_lc")
+_in_place("minimax_m3_sm107_tp8_sparse_decode_lc8")
 torch.library.register_fake(f"{_NS}::minimax_m3_sm107_tp2_sparse_decode_lc_prepare")(
     _sparse_decode_lc_prepare_fake
 )
