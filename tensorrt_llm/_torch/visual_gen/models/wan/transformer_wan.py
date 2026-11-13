@@ -394,6 +394,10 @@ class WanBlock(nn.Module):
         self._fused_ln_supported = hidden_size == 5120
         # Static-FP8 block fusions, decided by plan_fp8_fusions() after weights are loaded.
         self._fp8_block = False
+        self._tp_size = tp_size
+        # expand_timesteps (e.g. TI2V-5B) always hands blocks a per-token [B, S, 6, H] temb,
+        # which the fused path does not take.
+        self._expand_timesteps = bool(getattr(config, "expand_timesteps", False))
 
         self._pertoken_adaln = WanPerTokenAdaLN(
             hidden_size,
@@ -535,6 +539,10 @@ class WanBlock(nn.Module):
         ]
         if not_fp8:
             reasons.append(f"not static FP8 on the cuBLAS path: {', '.join(not_fp8)}")
+        if self._tp_size > 1:
+            reasons.append(f"tensor parallelism (tp_size={self._tp_size})")
+        if self._expand_timesteps:
+            reasons.append("expand_timesteps (per-token temb)")
         if self._use_async_ulysses:
             reasons.append("async Ulysses")
         if self.add_k_proj is not None:
