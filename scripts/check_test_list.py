@@ -15,7 +15,7 @@ For AST-based validation (no pytest or model weights needed):
 
 Options:
 --l0:       Check only the L0 tests located in $LLM_ROOT/tests/integration/test_list/test_db/*.yml.
---qa:       Check QA text lists and YAML case lists under tests/integration/test_lists/qa/.
+--qa:       Check QA lists under tests/integration/test_lists/qa/, including functional/*.yml.
 --waive:    Check only the tests in $LLM_ROOT/tests/integration/test_list/waives.txt.
 --validate: Run AST-based validation of test list entries against source files.
 --report-unverifiable [PATH]: With --validate, write the list of active entries
@@ -1058,7 +1058,9 @@ def verify_qa_test_lists(llm_src):
     # Remove dynamically generated perf tests
     subprocess.run(f"rm -f {test_qa_path}/*perf*", shell=True, check=True)
     test_def_files = sorted(
-        glob.glob(f"{test_qa_path}/*.txt") + glob.glob(f"{test_qa_path}/*.yml"))
+        glob.glob(f"{test_qa_path}/*.txt") +
+        glob.glob(f"{test_qa_path}/*.yml") +
+        glob.glob(f"{test_qa_path}/functional/*.yml"))
     with tempfile.TemporaryDirectory(
             prefix="trtllm-qa-lists-") as text_lists_dir:
         for test_def_file in test_def_files:
