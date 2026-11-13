@@ -1081,53 +1081,47 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "cp_size,gather,attention_dp,spec_mode,max_rows",
-    [
-        (1, "tp_allgather", False, None, 8),
-        (2, "tp_cp_allgather", True, None, 16),
-        (1, "tp_allgather", False, "DSPARK", None),
-        (1, "tp_allgather", False, "NGRAM", 8),
-        (1, "tp_allgather", False, "USER_PROVIDED", None),
-    ],
-)
-@pytest.mark.parametrize("fails", [False, True])
-def test_lowm_row_bucket_prewarm_always_meets_its_peers(
-    cp_size: int,
-    gather: str,
-    attention_dp: bool,
-    spec_mode: str | None,
-    max_rows: int | None,
-    fails: bool,
-) -> None:
-    """Without speculation, or with NGram's prefix-lookup drafts, a rank prewarms the buckets up to
-    a step's most rows (its tokens, gathered over the TP group under attention DP). With any other
-    drafter, a user-provided one included, every bucket, since it can run more rows than its target
-    verifies. The rank meets its TP (TP x CP) peers whether its prewarm compiled nothing or failed;
-    a failure is a warning, since it only defers the compiles to their first calls."""
-    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-
-    spec_config = (
-        None
-        if spec_mode is None
-        else SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode[spec_mode])
+def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_sparse_mla
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
     )
+
+    events = []
+    metadata = object()
     owner = SimpleNamespace(
         _config=SimpleNamespace(
-            max_num_tokens=8, spec_config=spec_config, is_spec_decode=spec_config is not None
+            attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
+            spec_config=None,
         ),
-        mapping=SimpleNamespace(cp_size=cp_size, tp_size=2, enable_attention_dp=attention_dp),
-        dist=Mock(),
+        _metadata=SimpleNamespace(
+            setup_attention=Mock(side_effect=lambda *args: events.append("metadata") or metadata)
+        ),
+        model=object(),
+        mapping=SimpleNamespace(cp_size=1, tp_size=4),
+        dist=SimpleNamespace(tp_allgather=Mock(side_effect=lambda *args: events.append("barrier"))),
     )
-    prewarm = Mock(side_effect=RuntimeError("no compiler")) if fails else Mock(return_value=(0, 0))
+    resources, manager = object(), SimpleNamespace(context_swa_layer_limit=None)
     with (
-        patch("tensorrt_llm._torch.modules.low_m_gemm.prewarm_mma_row_buckets", prewarm),
-        patch.object(decoder_warmup_module.logger, "warning") as warning,
+        patch.object(decoder_warmup_module, "get_draft_kv_cache_manager", return_value=None),
+        patch.object(
+            prims_ts_sparse_mla,
+            "warmup_prims_ts_sparse_mla",
+            side_effect=lambda *args: events.append("kernels"),
+        ) as warm,
+        patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync")),
     ):
-        DecoderWarmup._prewarm_lowm_mma_row_buckets(owner)
-    prewarm.assert_called_once_with(max_rows)
-    getattr(owner.dist, gather).assert_called_once_with(1)
-    assert warning.call_count == int(fails)
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        assert events == ["metadata", "kernels", "sync", "barrier"]
+        warm.assert_called_once_with(owner.model, metadata)
+        owner._metadata.setup_attention.assert_called_once_with(manager, None)
+        events.clear()
+        manager.context_swa_layer_limit = 1
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        owner._config.attention_backend.Metadata = TrtllmAttentionMetadata
+        manager.context_swa_layer_limit = None
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        assert events == []  # Context-only workers and other backends do not precompile.
 
 
 class TestWarmupCleanup(unittest.TestCase):

@@ -2,24 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parallel precompilation of PrimTS sparse MLA kernel variants.
 
-``PrimsTSSparseMlaFmha._warm_kernel_variants`` plans every kernel variant a
-deployment can select. Each variant is one ``cute.compile`` (tens of seconds),
-and FlashInfer's on-disk CuTe DSL cache serializes the builds of one op family
-behind a file lock, so N ranks warming the same variants finish no sooner than
-one rank compiling them all in sequence. This module fans the variants out to
-worker subprocesses that compile through ``_compile_cache.precompile_only()``
-(``cute.compile`` outside the lock, the artifact committed under it); the
-serving process then loads every variant from disk.
+The decoder's explicit warmup collects the kernel variants of every enabled
+layer profile. This module fans their combined payloads out to one group of
+worker subprocesses that call the public wrapper's ``plan()`` method. FlashInfer
+compiles different kernels concurrently and serializes artifact publication;
+the serving process loads every variant from disk before its first forward.
+The workers serve all profiles and exit before model execution and graph capture.
 
 Workers are plain interpreter subprocesses rather than ``multiprocessing``
 children: importing ``tensorrt_llm`` initializes MPI, so a worker must not
 inherit the launcher's MPI environment, and a subprocess gets a fully
-controlled one. Worker ``i`` of ``N`` starts with payload slots ``i, i+N, ...``
-and then goes through the rest of the list, deferring kernels another process
-is compiling (per-kernel lock) and finishing with a blocking pass, so every
-worker ends with every variant on disk whether the workspace is private to the
-rank (TRT-LLM's default) or shared between ranks. Failures are best-effort:
-the caller falls back to compiling in-process.
+controlled one. Worker ``i`` of ``N`` handles only payload slots ``i, i+N, ...``.
+The parent waits for all workers, so their combined shards populate the cache.
+FlashInfer's per-kernel lock handles overlapping compile signatures or other
+ranks sharing the workspace. Failures are best-effort: the caller falls back
+to compiling missing kernels in-process.
 
 Host load. Every worker is an interpreter that imports torch and the CuTe DSL,
 opens a CUDA context on its rank's GPU and runs ``cute.compile`` (one to a few
@@ -73,8 +70,7 @@ def local_rank_count(mapping) -> int:
 
     From the model's ``Mapping`` (``min(world_size, gpus_per_node)``) when the
     caller has one, else from the launcher's environment, else 1. No
-    communicator query: this runs inside the first forward, where a collective
-    would hang if the ranks reached it at different points.
+    communicator query: worker creation does not need a collective.
     """
     if mapping is not None:
         world = int(getattr(mapping, "world_size", 0) or 0)
@@ -137,10 +133,31 @@ def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) 
     return {"device_index": device_index, "rows": rows, "heads": heads, "plan_kwargs": kwargs}
 
 
-def shard_order(payloads: Sequence[Any], slot: int, slots: int) -> list:
-    """Own shard first (``payloads[slot::slots]``), then the rest in list order."""
-    mine = list(payloads[slot::slots])
-    return mine + [p for p in payloads if not any(p is m for m in mine)]
+def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int = 1) -> None:
+    """Populate all profiles with one worker group through normal build/load calls.
+
+    The caller subsequently loads every plan in-process, also compiling any
+    artifacts missing after worker failure or when workers are disabled.
+    """
+    workers = worker_count(len(payloads), local_ranks=local_ranks)
+    if workers <= 1:
+        return
+    start = time.perf_counter()
+    try:
+        ok = run_precompile_workers(payloads, workers)
+    except Exception as error:  # noqa: BLE001 -- helper failures fall back to local planning
+        if strict():
+            raise
+        logger.warning(f"PrimTS sparse MLA parallel precompile skipped: {error!r}")
+        return
+    if not ok and strict():
+        raise RuntimeError(
+            "PrimTS sparse MLA precompile workers failed (TLLM_PRIMTS_WARM_STRICT=1)"
+        )
+    logger.info(
+        f"PrimTS sparse MLA precompiled {len(payloads)} kernel variants with {workers} workers "
+        f"in {time.perf_counter() - start:.0f} s{'' if ok else ' (some workers failed)'}"
+    )
 
 
 def _worker_env() -> dict[str, str]:
@@ -204,23 +221,7 @@ def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> 
                     f"the serving process compiles what is missing.\n{tail}"
                 )
                 continue
-            meta_line = next(
-                (
-                    line
-                    for line in text.splitlines()
-                    if line.startswith("[prims-ts precompile] meta=")
-                ),
-                "",
-            )
-            expected = str(_expected_cache_meta())
-            if meta_line and meta_line[len("[prims-ts precompile] meta=") :] != expected:
-                ok = False
-                logger.warning(
-                    f"PrimTS precompile worker (slot {slot}) wrote a different cache key than this "
-                    f"process expects; its kernels will be recompiled.\n worker: {meta_line}\n parent: {expected}"
-                )
-            else:
-                logger.debug(f"PrimTS precompile worker (slot {slot}) finished")
+            logger.debug(f"PrimTS precompile worker (slot {slot}) finished")
     finally:
         for _, proc, out in procs:
             if proc.poll() is None:
@@ -228,12 +229,6 @@ def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> 
                 proc.wait()
             out.close()
     return ok
-
-
-def _expected_cache_meta() -> dict:
-    from tensorrt_llm._torch.attention.backends.prims_ts import _compile_cache
-
-    return _compile_cache.expected_cache_meta()
 
 
 def _plan(mla_decode, payload: dict[str, Any], torch) -> None:
@@ -247,33 +242,19 @@ def _plan(mla_decode, payload: dict[str, Any], torch) -> None:
 
 
 def _main(argv: list[str]) -> int:
-    """Worker entry: compile ``payloads[slot::slots]`` first, then everything else."""
+    """Worker entry: compile only ``payloads[slot::slots]``."""
     payloads = json.loads(argv[1])
     slot, slots = (int(argv[2]), int(argv[3])) if len(argv) > 3 else (0, 1)
     import torch
 
-    from tensorrt_llm._torch.attention.backends.prims_ts import _compile_cache, mla_decode
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
-    deferred = []
-    for payload in shard_order(payloads, slot, slots):
-        try:
-            with _compile_cache.precompile_only(skip_busy=True):
-                _plan(mla_decode, payload, torch)
-        except _compile_cache.KernelBusy:
-            deferred.append(payload)
-            continue
+    for payload in payloads[slot::slots]:
+        _plan(mla_decode, payload, torch)
         print(
             f"[prims-ts precompile] rows={payload['rows']} extra={payload['plan_kwargs'].get('max_extra_topk')} done",
             flush=True,
         )
-    for payload in deferred:
-        with _compile_cache.precompile_only():
-            _plan(mla_decode, payload, torch)
-        extra = payload["plan_kwargs"].get("max_extra_topk")
-        print(
-            f"[prims-ts precompile] rows={payload['rows']} extra={extra} done (waited)", flush=True
-        )
-    print(f"[prims-ts precompile] meta={_compile_cache.expected_cache_meta()}", flush=True)
     return 0
 
 
