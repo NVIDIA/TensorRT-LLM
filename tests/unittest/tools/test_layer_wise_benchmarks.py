@@ -301,6 +301,10 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
     check_call(
         [
             "./mpi_launch.sh",
+            # The TRTLLM MoE routes inside its kernel without attention DP, so the
+            # default --balance-method needs the top-k computed outside it.
+            "-x",
+            "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1",
             "./run.sh",
             "config_gen.yaml",
             "--model",
@@ -350,10 +354,9 @@ def test_kimi_k3_gen_dep(llm_root, world_size):
             model_root / "Kimi-K3",
             *layer_args,
             "--tokens-per-block=64",
-            # SiTU routed experts support no other backend, and GEN also builds
-            # a prefill runner.
+            # SiTU routed experts support no other backend. The prefill runner
+            # that GEN builds stays on its AUTO default, which resolves to TRTLLM.
             "--moe-backend=TRTLLM",
-            "--moe-backend-for-prefill=TRTLLM",
             # 1 golden + 3 draft tokens per generation step.
             "--batch-size=32",
             "--seq-len-q=4",

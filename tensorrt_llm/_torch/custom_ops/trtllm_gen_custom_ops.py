@@ -26,8 +26,9 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                         OptimizationProfile, TunableRunner, TuningConfig)
+from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
+                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                         TuningConfig)
 
 _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
     "TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION")
@@ -55,7 +56,8 @@ _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
 # = per-rank tokens when use_dp=False) and must map it to one of the
 # m_values profile buckets. The mapping:
 #
-#   1. Round to last power of 2.
+#   1. Round to last power of 2 (FP4 block-scale with decode_tuning: keep counts
+#      below 8, round counts up to 128 down to a multiple of 8).
 #   2. If use_dp=True, deflate by ep_size to assume the avg-case
 #      perfectly-distributed per-rank load `runtime_max_tokens_per_rank`.
 #   3. If the result still exceeds MAX_PROFILE_BUCKET (8192) and the
@@ -359,18 +361,16 @@ def prepare_dummy_topk_and_hook(
         assert topk_weights_for_tuner is None
         assert topk_ids_for_tuner is None
 
-    # Define hook to recreate dummy tensors when shape changes during profiling
+    # Define hook to recreate dummy tensors for every profiled bucket
     def recreate_dummy_topk_if_needed(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Recreate dummy topk tensors if token count changed during profiling."""
+        """Give every profiled bucket its own dummy routing: the AutoTuner fills a
+        bucket's int top-k by repeating the tuned call's rows."""
         current_num_tokens = inputs[hidden_states_index].shape[0]
 
         # Only recreate if we originally created dummies
         if need_dummy_topk:
-            # Check if shape changed
-            if inputs[-1] is not None and inputs[-1].shape[
-                    0] != current_num_tokens:
-                # Recreate with new shape
+            if inputs[-1] is not None:
                 topk_weights_for_tuner, topk_ids_for_tuner = make_selected_dummy_topk(
                     current_num_tokens, inputs[hidden_states_index].device,
                     None)
@@ -461,7 +461,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False):
+                 use_dp: bool = False,
+                 decode_tuning: bool = False):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -478,7 +479,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
-            use_dp=use_dp)
+            use_dp=use_dp,
+            decode_tuning=decode_tuning)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
@@ -499,11 +501,31 @@ class FP4BlockScaleMoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
         output: Optional[torch.Tensor] = None,
+        prerouted: Optional[Tuple[List[torch.Tensor], torch.Tensor,
+                                  torch.Tensor]] = None,
     ) -> torch.Tensor:
+        """``prerouted``: (routing tables for ``tactic``'s tile, top-k ids, BF16
+        top-k weights); the tables number this rank's experts from 0 (-1:
+        another rank), so the kernels run an all-local problem and skip the
+        routing kernel."""
         assert isinstance(tactic, list)
 
         args = FP4BlockScaleMoEInputs(*inputs)
         kernel_runner = self.get_runner()
+
+        if prerouted is not None:
+            tables, topk_ids, topk_weights = prerouted
+            return kernel_runner.run_moe_prerouted(
+                None, None, args.hidden_states, args.hidden_states_scale,
+                args.gemm1_weights, args.gemm1_weights_scale, args.gemm1_bias,
+                args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+                args.gemm2_weights, args.gemm2_weights_scale, args.gemm2_bias,
+                args.output1_scale_scalar, args.output1_scale_gate_scalar,
+                args.output2_scale_scalar, self.local_num_experts, self.top_k,
+                self.n_group, self.topk_group, self.intermediate_size, 0,
+                self.local_num_experts, self.routed_scaling_factor,
+                self.routing_method_type, self.do_finalize, tactic,
+                topk_weights, topk_ids, output, *tables, tactic[0])
 
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
@@ -547,12 +569,19 @@ class FP4BlockScaleMoERunner(TunableRunner):
             cls,
             ep_size: int,
             tune_max_num_tokens: int = 8192,
-            use_dp: bool = False) -> Tuple[DynamicTensorSpec, ...]:
+            use_dp: bool = False,
+            decode_tuning: bool = False) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
         MAX_PROFILE_BUCKET = 8192
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        if decode_tuning:
+            # Decode steps run multiples of (1 + draft length) tokens: an exact
+            # bucket below 8 and one per multiple of 8 up to 128.
+            m_values = tuple(
+                sorted(
+                    set(m_values) | set(range(1, 8)) | set(range(8, 129, 8))))
         if tune_max_num_tokens > MAX_PROFILE_BUCKET:
             m_values = tuple(m_values) + (tune_max_num_tokens, )
 
@@ -563,6 +592,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
             if (deflated > MAX_PROFILE_BUCKET
                     and tune_max_num_tokens > MAX_PROFILE_BUCKET):
                 return tune_max_num_tokens
+            if decode_tuning and deflated < 8:
+                return max(1, deflated)
+            if decode_tuning and deflated <= 128:
+                return deflated // 8 * 8
             value = last_positive_power_of_2(deflated)
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
@@ -633,53 +666,91 @@ class FP4BlockScaleMoERunner(TunableRunner):
     def get_tuning_config(cls,
                           ep_size: int,
                           tune_max_num_tokens: int = 8192,
-                          use_dp: bool = False) -> TuningConfig:
+                          use_dp: bool = False,
+                          decode_tuning: bool = False) -> TuningConfig:
+        """``decode_tuning`` (declared by the model): exact buckets for the decode
+        steps' token counts, and every rank runs rank 0's tactic, as ranks that
+        time a decode shape differently would run different tactics and the
+        slowest rank sets every layer's pace."""
 
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs(
-            ep_size, tune_max_num_tokens, use_dp)
+            ep_size, tune_max_num_tokens, use_dp, decode_tuning)
         constraint_specs = cls.get_constraint_specs()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs,
-                                     tune_max_num_tokens=max(
-                                         8192, tune_max_num_tokens))
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            tune_max_num_tokens=max(8192, tune_max_num_tokens),
+            distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST
+            if decode_tuning else DistributedTuningStrategy.INDEPENDENT)
 
         return tuning_config
 
+    def lookup_tactic(
+            self, inputs: List[Optional[torch.Tensor]]) -> Optional[List[int]]:
+        """The [tile, config] the op runs for ``inputs`` (its tensor arguments
+        in ``FP4BlockScaleMoEInputs`` order; activations may be meta tensors):
+        the tuned choice, or None (not tuned yet). A caller that routes the
+        tokens itself builds its tables for this tile and passes the tactic as
+        ``prerouted_tactic``."""
+        shapes = tuple(
+            t.size() if isinstance(t, torch.Tensor) else torch.Size((0, ))
+            for t in inputs)
+        hit, _, tactic, _ = AutoTuner.get().profiling_cache.search_cache(
+            "trtllm::fp4_block_scale_moe_runner", [self], shapes,
+            self.tuning_config)
+        if not hit or tactic == -1:
+            return None
+        return [int(tactic[0]), int(tactic[1])]
+
 
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
-def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
-                               routing_bias: Optional[torch.Tensor],
-                               hidden_states: torch.Tensor,
-                               hidden_states_scale: torch.Tensor,
-                               gemm1_weights: torch.Tensor,
-                               gemm1_weights_scale: torch.Tensor,
-                               gemm1_bias: torch.Tensor,
-                               gemm1_alpha: torch.Tensor,
-                               gemm1_beta: torch.Tensor,
-                               gemm1_clamp_limit: torch.Tensor,
-                               gemm2_weights: torch.Tensor,
-                               gemm2_weights_scale: torch.Tensor,
-                               gemm2_bias: torch.Tensor,
-                               output1_scale_scalar: torch.Tensor,
-                               output1_scale_gate_scalar: torch.Tensor,
-                               output2_scale_scalar: torch.Tensor,
-                               num_experts: int,
-                               top_k: int,
-                               n_group: Optional[int],
-                               topk_group: Optional[int],
-                               intermediate_size: int,
-                               local_expert_offset: int,
-                               local_num_experts: int,
-                               routed_scaling_factor: Optional[float],
-                               routing_method_type: int,
-                               do_finalize: bool,
-                               act_type: int = ActType_TrtllmGen.SwiGlu.value,
-                               topk_weights: Optional[torch.Tensor] = None,
-                               topk_ids: Optional[torch.Tensor] = None,
-                               output: Optional[torch.Tensor] = None,
-                               tune_max_num_tokens: int = 8192,
-                               use_dp: bool = False) -> List[torch.Tensor]:
+def fp4_block_scale_moe_runner(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm1_beta: torch.Tensor,
+        gemm1_clamp_limit: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        gemm2_bias: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        do_finalize: bool,
+        act_type: int = ActType_TrtllmGen.SwiGlu.value,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
+        prerouted_tables: Optional[torch.Tensor] = None,
+        prerouted_ids: Optional[torch.Tensor] = None,
+        prerouted_weights: Optional[torch.Tensor] = None,
+        prerouted_tactic: Optional[List[int]] = None,
+        decode_tuning: bool = False) -> List[torch.Tensor]:
+    """``decode_tuning``: see ``FP4BlockScaleMoERunner.get_tuning_config``.
+
+    ``prerouted_tables`` (flat int32 routing tables), ``prerouted_ids`` /
+    ``prerouted_weights`` (top-k ids, BF16 top-k weights), built for
+    ``prerouted_tactic``'s tile (``lookup_tactic``): the op
+    runs that tactic and skips its routing kernel; with ``do_finalize=False``
+    it then returns the FC2 rows only (the top-k weights and the expanded ->
+    permuted index are the caller's tensors)."""
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -696,6 +767,7 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         act_type,
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
+        decode_tuning=decode_tuning,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -740,22 +812,36 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         topk_ids_for_tuner,  # Dummy if need_dummy_topk, else actual value
     ]
 
-    kernel_runner, best_tactic = tuner.choose_one(
-        "trtllm::fp4_block_scale_moe_runner",
-        [kernel_runner],
-        tuning_config_with_hook,
-        input_tensors_for_tuner,
-    )
-
-    input_tensors = input_tensors_for_tuner
+    # A copy: the tuner below must still see the dummy routing tensors.
+    input_tensors = list(input_tensors_for_tuner)
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    result = kernel_runner(
-        input_tensors,
-        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-        output=output)
+    if prerouted_tables is not None:
+        from ..moe.fused_moe.trtllm_gen.decode_front import \
+            prerouted_table_views
+        result = kernel_runner(input_tensors,
+                               tactic=list(prerouted_tactic),
+                               output=output,
+                               prerouted=(prerouted_table_views(
+                                   prerouted_tables, hidden_states.shape[0],
+                                   top_k, local_num_experts,
+                                   prerouted_tactic[0]), prerouted_ids,
+                                          prerouted_weights))
+        if not do_finalize:
+            return [result[0]]
+    else:
+        kernel_runner, best_tactic = tuner.choose_one(
+            "trtllm::fp4_block_scale_moe_runner",
+            [kernel_runner],
+            tuning_config_with_hook,
+            input_tensors_for_tuner,
+        )
+        result = kernel_runner(
+            input_tensors,
+            tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+            output=output)
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
@@ -823,7 +909,12 @@ def _(routing_logits,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
-      use_dp: bool = False) -> List[torch.Tensor]:
+      use_dp: bool = False,
+      prerouted_tables: Optional[torch.Tensor] = None,
+      prerouted_ids: Optional[torch.Tensor] = None,
+      prerouted_weights: Optional[torch.Tensor] = None,
+      prerouted_tactic: Optional[List[int]] = None,
+      decode_tuning: bool = False) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2
@@ -832,12 +923,13 @@ def _(routing_logits,
                                     dtype=torch.bfloat16)
         ]
 
-    return fp4_block_scale_fake_output_without_finalize(
+    outputs = fp4_block_scale_fake_output_without_finalize(
         hidden_states,
         num_experts,
         top_k,
         routing_bias,
     )
+    return outputs[:1] if prerouted_tables is not None else outputs
 
 
 @dataclass(frozen=True)
@@ -2181,6 +2273,285 @@ def bf16_mxe2m1_block_scale_moe_runner(
     if output is not None:
         return torch.empty(0, device=result.device, dtype=result.dtype)
     return result
+
+
+@dataclass(frozen=True)
+class Bf16MoEInputs:
+    routing_logits: Optional[torch.Tensor]
+    routing_bias: Optional[torch.Tensor]
+    hidden_states: torch.Tensor
+    gemm1_weights: torch.Tensor
+    gemm2_weights: torch.Tensor
+    topk_weights: Optional[torch.Tensor] = None
+    topk_ids: Optional[torch.Tensor] = None
+
+
+class Bf16MoERunner(TunableRunner):
+    """Unquantized BF16 x BF16 TRTLLM-Gen MoE.
+
+    The weights are in the shuffled BlockMajorK layout
+    ``BF16TRTLLMGenFusedMoEMethod`` produces: ``[experts, K / 64, M, 64]``.
+    """
+
+    runner_dict = dict()
+
+    def __init__(self,
+                 num_experts: int,
+                 top_k: int,
+                 n_group: Optional[int],
+                 topk_group: Optional[int],
+                 intermediate_size: int,
+                 local_expert_offset: int,
+                 local_num_experts: int,
+                 routed_scaling_factor: Optional[float],
+                 routing_method_type: int,
+                 do_finalize: bool,
+                 act_type: int,
+                 tune_max_num_tokens: int = 8192,
+                 use_dp: bool = False) -> None:
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.intermediate_size = intermediate_size
+        self.local_expert_offset = local_expert_offset
+        self.local_num_experts = local_num_experts
+        self.routed_scaling_factor = routed_scaling_factor
+        self.routing_method_type = routing_method_type
+        self.do_finalize = do_finalize
+        self.act_type = act_type
+
+        self.tuning_config = Bf16MoERunner.get_tuning_config(
+            self.num_experts // self.local_num_experts,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_dp=use_dp)
+
+    def unique_id(self) -> Tuple[int, int, int, int]:
+        return (self.top_k, self.intermediate_size, self.local_num_experts,
+                self.act_type)
+
+    def get_runner(self) -> torch.ScriptObject:
+        instance_key = (self.act_type, )
+        if instance_key not in Bf16MoERunner.runner_dict:
+            Bf16MoERunner.runner_dict[
+                instance_key] = torch.classes.trtllm.Bf16MoERunner(
+                    self.act_type)
+        return Bf16MoERunner.runner_dict[instance_key]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: List[int] = [-1, -1],
+        output: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        assert isinstance(tactic, list)
+        args = Bf16MoEInputs(*inputs)
+        return self.get_runner().run_moe(
+            args.routing_logits, args.routing_bias, args.hidden_states,
+            args.gemm1_weights, args.gemm2_weights, self.num_experts,
+            self.top_k, self.n_group, self.topk_group, self.intermediate_size,
+            self.local_expert_offset, self.local_num_experts,
+            self.routed_scaling_factor, self.routing_method_type,
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
+        args = Bf16MoEInputs(*inputs)
+        num_tokens, hidden_size = args.hidden_states.shape
+        return self.get_runner().get_valid_configs(self.top_k, hidden_size,
+                                                   self.intermediate_size,
+                                                   self.local_num_experts,
+                                                   num_tokens)
+
+    @classmethod
+    def get_dynamic_tensor_specs(
+            cls,
+            ep_size: int,
+            tune_max_num_tokens: int = 8192,
+            use_dp: bool = False) -> Tuple[DynamicTensorSpec, ...]:
+        HIDDEN_STATES_IDX = 2
+        TUNED_DIM = 0
+        MAX_PROFILE_BUCKET = 8192
+
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        if tune_max_num_tokens > MAX_PROFILE_BUCKET:
+            m_values = tuple(m_values) + (tune_max_num_tokens, )
+
+        def round_rule(x: int) -> int:
+            # See the module-level distribution comment for the use_dp
+            # / ep_size deflation and tune_max_num_tokens fall-through.
+            deflated = x // ep_size if use_dp else x
+            if (deflated > MAX_PROFILE_BUCKET
+                    and tune_max_num_tokens > MAX_PROFILE_BUCKET):
+                return tune_max_num_tokens
+            value = last_positive_power_of_2(deflated)
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        return (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                  TUNED_DIM,
+                                  m_values,
+                                  map_to_tuning_buckets=round_rule), )
+
+    @classmethod
+    def get_constraint_specs(cls) -> Tuple[ConstraintSpec, ...]:
+
+        def _constrain_to_num_tokens(shapes: Tuple[torch.Size]) -> int:
+            return shapes[2][0]
+
+        ROUTER_LOGITS_IDX = 0
+        TOPK_WEIGHTS_IDX = 5
+        TOPK_IDS_IDX = 6
+        CONSTRAINED_DIM = 0
+        return tuple(
+            ConstraintSpec(idx, CONSTRAINED_DIM, _constrain_to_num_tokens)
+            for idx in (ROUTER_LOGITS_IDX, TOPK_WEIGHTS_IDX, TOPK_IDS_IDX))
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_tuning_config(cls,
+                          ep_size: int,
+                          tune_max_num_tokens: int = 8192,
+                          use_dp: bool = False) -> TuningConfig:
+        return TuningConfig(dynamic_tensor_specs=cls.get_dynamic_tensor_specs(
+            ep_size, tune_max_num_tokens, use_dp),
+                            constraint_specs=cls.get_constraint_specs(),
+                            tune_max_num_tokens=max(8192, tune_max_num_tokens))
+
+
+@torch.library.custom_op("trtllm::bf16_moe_runner", mutates_args=())
+def bf16_moe_runner(routing_logits: Optional[torch.Tensor],
+                    routing_bias: Optional[torch.Tensor],
+                    hidden_states: torch.Tensor,
+                    gemm1_weights: torch.Tensor,
+                    gemm2_weights: torch.Tensor,
+                    num_experts: int,
+                    top_k: int,
+                    n_group: Optional[int],
+                    topk_group: Optional[int],
+                    intermediate_size: int,
+                    local_expert_offset: int,
+                    local_num_experts: int,
+                    routed_scaling_factor: Optional[float],
+                    routing_method_type: int,
+                    do_finalize: bool,
+                    act_type: int = ActType_TrtllmGen.SwiGlu.value,
+                    topk_weights: Optional[torch.Tensor] = None,
+                    topk_ids: Optional[torch.Tensor] = None,
+                    output: Optional[torch.Tensor] = None,
+                    tune_max_num_tokens: int = 8192,
+                    use_dp: bool = False) -> List[torch.Tensor]:
+    """``[output]`` with ``do_finalize``, else the unfinalized
+    ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``."""
+    tuner = AutoTuner.get()
+    kernel_runner = Bf16MoERunner(
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        do_finalize,
+        act_type,
+        tune_max_num_tokens=tune_max_num_tokens,
+        use_dp=use_dp,
+    )
+
+    # Prepare dummy topk tensors and hook for AutoTuner profiling
+    routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook = \
+        prepare_dummy_topk_and_hook(
+            routing_method_type=routing_method_type,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            hidden_states=hidden_states,
+            routing_logits=routing_logits,
+            base_tuning_config=kernel_runner.tuning_config,
+            top_k=top_k,
+            num_experts=num_experts,
+            local_num_experts=local_num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            hidden_states_index=2,
+            local_expert_offset=local_expert_offset,
+            use_dp=use_dp,
+        )
+
+    input_tensors_for_tuner = [
+        routing_logits_for_tuner,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        topk_weights_for_tuner,
+        topk_ids_for_tuner,
+    ]
+
+    kernel_runner, best_tactic = tuner.choose_one(
+        "trtllm::bf16_moe_runner",
+        [kernel_runner],
+        tuning_config_with_hook,
+        input_tensors_for_tuner,
+    )
+
+    # The tuner profiled with the dummy routing tensors; swap the real ones
+    # into a copy, since AutoTuner.capture() keeps a reference to its list.
+    input_tensors = list(input_tensors_for_tuner)
+    input_tensors[0] = routing_logits
+    input_tensors[-2] = topk_weights
+    input_tensors[-1] = topk_ids
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output)
+    # When output is provided and do_finalize=True, the result is written in-place to output.
+    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use output directly when they provide it.
+    if output is not None and do_finalize:
+        return [torch.empty(0, device=output.device, dtype=output.dtype)]
+    return result
+
+
+@bf16_moe_runner.register_fake
+def _(routing_logits: Optional[torch.Tensor],
+      routing_bias: Optional[torch.Tensor],
+      hidden_states: torch.Tensor,
+      gemm1_weights: torch.Tensor,
+      gemm2_weights: torch.Tensor,
+      num_experts: int,
+      top_k: int,
+      n_group: Optional[int],
+      topk_group: Optional[int],
+      intermediate_size: int,
+      local_expert_offset: int,
+      local_num_experts: int,
+      routed_scaling_factor: Optional[float],
+      routing_method_type: int,
+      do_finalize: bool,
+      act_type: int = ActType_TrtllmGen.SwiGlu.value,
+      topk_weights: Optional[torch.Tensor] = None,
+      topk_ids: Optional[torch.Tensor] = None,
+      output: Optional[torch.Tensor] = None,
+      tune_max_num_tokens: int = 8192,
+      use_dp: bool = False) -> List[torch.Tensor]:
+    if do_finalize:
+        # With ``output`` the op writes into it and returns an empty placeholder.
+        if output is not None:
+            return [hidden_states.new_empty((0, ), dtype=torch.bfloat16)]
+        return [
+            hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)
+        ]
+    # gemm2_output's row count depends on the tile the tactic picks, so this is
+    # the bound for the largest tile. The op returns its top-k weights in bf16
+    # whatever the routing bias dtype.
+    return fp4_block_scale_fake_output_without_finalize(hidden_states,
+                                                        num_experts,
+                                                        top_k,
+                                                        routing_bias=None)
 
 
 @dataclass(frozen=True)

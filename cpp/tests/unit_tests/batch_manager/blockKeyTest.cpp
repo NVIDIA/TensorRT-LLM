@@ -190,8 +190,7 @@ TEST_F(BlockKeyTest, GenerateExtraKeysUsesExactMultimodalRuns)
     Request executorRequest({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
         OutputConfig(), /*endId=*/std::nullopt,
         /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
-        /*embeddingBias=*/std::nullopt,
-        /*pTuningConfig=*/std::nullopt, multimodalInput);
+        /*embeddingBias=*/std::nullopt, multimodalInput);
     LlmRequest llmRequest(/*requestId=*/0, executorRequest);
 
     auto firstRunKeys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
@@ -232,13 +231,11 @@ TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForIncompleteRunMetadata)
     Request executorRequestA({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
         OutputConfig(),
         /*endId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
-        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt,
-        /*pTuningConfig=*/std::nullopt, multimodalInputA);
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, multimodalInputA);
     Request executorRequestB({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
         OutputConfig(),
         /*endId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
-        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt,
-        /*pTuningConfig=*/std::nullopt, multimodalInputB);
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, multimodalInputB);
     LlmRequest llmRequestA(/*requestId=*/0, executorRequestA);
     LlmRequest llmRequestB(/*requestId=*/1, executorRequestB);
 
@@ -270,8 +267,7 @@ TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForInvalidRunRange)
     Request executorRequest({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
         OutputConfig(), /*endId=*/std::nullopt,
         /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
-        /*embeddingBias=*/std::nullopt,
-        /*pTuningConfig=*/std::nullopt, multimodalInput);
+        /*embeddingBias=*/std::nullopt, multimodalInput);
     LlmRequest llmRequest(/*requestId=*/0, executorRequest);
 
     auto keys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/0, /*endTokenIdx=*/4);

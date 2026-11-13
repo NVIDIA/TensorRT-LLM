@@ -13,7 +13,7 @@ class K3EmbedNorm(OpWrapper):
     """Write ``table[ids]`` into ``raw`` (zero rows for ids outside ``[0, V)``) and return
     ``raw * rsqrt(mean(raw^2) + eps) * weight`` as a new bf16 tensor, in one k3_embed_norm call."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

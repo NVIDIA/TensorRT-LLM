@@ -755,6 +755,7 @@ class MockPadDummyExecutor:
         self.num_fetch_requests = num_fetch_requests
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.max_total_draft_tokens = 0
+        self.enable_joint_kv_cache_reuse = False
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
         self._enable_adp_dummy_fixes = True
@@ -905,6 +906,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
         ex.active_requests = []
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1317,6 +1319,7 @@ class TestFailFastDuringBenchmarkFill:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1700,6 +1703,7 @@ class TestFillPhaseEndToEnd:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None

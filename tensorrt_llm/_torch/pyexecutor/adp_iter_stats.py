@@ -7,10 +7,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
-from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, RequestStats
+from tensorrt_llm.bindings.executor import (
+    InflightBatchingStats,
+    IterationStats,
+    KvCacheStats,
+    RequestStats,
+    SpecDecodingStats,
+)
 from tensorrt_llm.logger import logger
 
 from .scheduler.adp_router import RankIterStatsPayload, RankState
+from .scheduler.rank_state import RankKvCacheStats, RankSpecDecodingStats
 
 _ITERATION_STATS_SCALAR_FIELDS = (
     "timestamp",
@@ -27,12 +34,91 @@ _ITERATION_STATS_SCALAR_FIELDS = (
     "pinned_mem_usage",
 )
 
-_ITERATION_STATS_OPTIONAL_FIELDS = (
-    "kv_cache_stats",
-    "cross_kv_cache_stats",
-    "static_batching_stats",
-    "specdec_stats",
-)
+_ITERATION_STATS_OPTIONAL_FIELDS = ("static_batching_stats",)
+
+
+def _snapshot_kv_cache_stats(stats: KvCacheStats | None) -> RankKvCacheStats | None:
+    """Capture a rank's KV counters independently of the mutable native object.
+
+    Args:
+        stats: Local KV snapshot, or None when this iteration has no measurement.
+
+    Returns:
+        Immutable scalar snapshot, or None when unavailable.
+    """
+    if stats is None:
+        return None
+    return RankKvCacheStats(
+        max_num_blocks=stats.max_num_blocks,
+        free_num_blocks=stats.free_num_blocks,
+        used_num_blocks=stats.used_num_blocks,
+        tokens_per_block=stats.tokens_per_block,
+        alloc_total_blocks=stats.alloc_total_blocks,
+        alloc_new_blocks=stats.alloc_new_blocks,
+        reused_blocks=stats.reused_blocks,
+        missed_blocks=stats.missed_blocks,
+        cache_hit_rate=stats.cache_hit_rate,
+    )
+
+
+def _restore_kv_cache_stats(snapshot: RankKvCacheStats) -> KvCacheStats:
+    """Create a native KV stats object from one rank's captured values.
+
+    Args:
+        snapshot: Immutable counters captured with the rank's iteration payload.
+
+    Returns:
+        A fresh native stats object.
+    """
+    stats = KvCacheStats()
+    for name, value in zip(snapshot._fields, snapshot):
+        setattr(stats, name, value)
+    return stats
+
+
+def _snapshot_specdec_stats(stats: SpecDecodingStats | None) -> RankSpecDecodingStats | None:
+    """Capture a rank's speculative-decoding counters.
+
+    Args:
+        stats: Local speculative-decoding stats, or None when they are unavailable.
+
+    Returns:
+        Immutable counter snapshot, or None when unavailable.
+    """
+    if stats is None:
+        return None
+    return RankSpecDecodingStats(
+        num_draft_tokens=stats.num_draft_tokens,
+        num_accepted_tokens=stats.num_accepted_tokens,
+        num_requests_with_draft_tokens=stats.num_requests_with_draft_tokens,
+    )
+
+
+def _restore_specdec_stats(
+    snapshot: RankSpecDecodingStats, rank0_stats: SpecDecodingStats | None
+) -> SpecDecodingStats:
+    """Create a native speculative-decoding stats object for one rank's row.
+
+    The counters and the acceptance length derived from them are the rank's
+    own. The draft timings keep rank 0's values, like the row's other timings.
+
+    Args:
+        snapshot: Counters captured with the rank's iteration payload.
+        rank0_stats: Rank 0's speculative-decoding stats for the same iteration.
+
+    Returns:
+        A fresh native stats object.
+    """
+    stats = SpecDecodingStats()
+    for name, value in zip(snapshot._fields, snapshot):
+        setattr(stats, name, value)
+    num_requests = snapshot.num_requests_with_draft_tokens
+    stats.acceptance_length = (
+        (snapshot.num_accepted_tokens + num_requests) / num_requests if num_requests else 0.0
+    )
+    stats.iter_latency_ms = rank0_stats.iter_latency_ms if rank0_stats is not None else 0.0
+    stats.draft_overhead = rank0_stats.draft_overhead if rank0_stats is not None else 0.0
+    return stats
 
 
 @dataclass
@@ -96,6 +182,9 @@ class ADPIterStatsBuffer:
             num_gen_kv_tokens=ifb.num_gen_kv_tokens,
             num_paused_requests=ifb.num_paused_requests,
             num_paused_kv_tokens=ifb.num_paused_kv_tokens,
+            kv_cache_stats=_snapshot_kv_cache_stats(stats.kv_cache_stats),
+            cross_kv_cache_stats=_snapshot_kv_cache_stats(stats.cross_kv_cache_stats),
+            specdec_stats=_snapshot_specdec_stats(stats.specdec_stats),
         )
 
     def queue(
@@ -144,9 +233,12 @@ class ADPIterStatsBuffer:
         self._oldest_iter = min(self._payloads) if self._payloads else None
 
     def _ensure_zero_payload(self, iter_id: int) -> None:
-        """Add a zero payload when this rank had no work for an iteration."""
+        """Add a zero-work payload for a missing iteration."""
         if iter_id in self._payloads:
             return
+        # This placeholder may precede an already queued measured iteration.
+        # Reading the live cache manager here could put newer KV values before
+        # that queued snapshot. Leave KV statistics absent for this iteration.
         self._payloads[iter_id] = RankIterStatsPayload(
             has_iter_stats=1,
             iter_stats_iter=iter_id,
@@ -206,13 +298,22 @@ class ADPIterStatsBuffer:
         for attr in _ITERATION_STATS_SCALAR_FIELDS:
             setattr(stats, attr, getattr(rank0_stats, attr))
 
-        # Optional nested stats are copied when present. KV iteration deltas
-        # are attached separately and remain rank-0-only to avoid double-logging
-        # global KV-cache deltas.
+        # KV snapshots belong to this rank and iteration. Separate KV iteration
+        # deltas retain their existing rank-0-only export ownership.
+        # Native setters reject None; default-constructed fields are already absent.
+        if payload.kv_cache_stats is not None:
+            stats.kv_cache_stats = _restore_kv_cache_stats(payload.kv_cache_stats)
+        if payload.cross_kv_cache_stats is not None:
+            stats.cross_kv_cache_stats = _restore_kv_cache_stats(payload.cross_kv_cache_stats)
         for attr in _ITERATION_STATS_OPTIONAL_FIELDS:
             nested_stats = getattr(rank0_stats, attr)
             if nested_stats is not None:
                 setattr(stats, attr, nested_stats)
+
+        if payload.specdec_stats is not None:
+            stats.specdec_stats = _restore_specdec_stats(
+                payload.specdec_stats, rank0_stats.specdec_stats
+            )
 
         ifb = InflightBatchingStats()
         ifb.num_context_requests = payload.num_context_requests

@@ -832,6 +832,7 @@ def _collect_signals_inproc(
     device = torch.device("cuda")
     sig = Signals(case_id=case.case_id, arch=sm_arch(), phase=case.phase, shape=case.shape_tag())
 
+    metadata = None
     if case.is_dsa:
         mla, metadata, fwd, kv_mgr = _build_dsa_ctx(case, device)
     else:

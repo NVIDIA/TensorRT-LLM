@@ -1,0 +1,385 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Modeling-v2 preflight behavior and regression checks."""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import subprocess
+import sys
+import warnings
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
+from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
+from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
+    PROBE_SOURCE,
+    RECEIPT_PASSED,
+    format_surface,
+    parse_inventory,
+)
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import datasets, preflight
+from agent_flow.workflows.trtllm_modeling_v2.run.startup.preflight import PreflightError
+
+
+def _smi_rows(*rows: str) -> str:
+    return "\n".join(rows) + "\n"
+
+
+def _healthy_row(index: int, cap: str = "10.3") -> str:
+    return f"{index}, 180000, 183359, 0, {cap}"
+
+
+def make_runner(*, smi: str, probe_ok=lambda index: True):
+    """Build a runner that answers nvidia-smi, the lone probe, and torchrun."""
+
+    def runner(argv, env=None, timeout=0):
+        joined = " ".join(argv)
+        if argv and argv[0] == "nvidia-smi":
+            return CommandResult(returncode=0, stdout=smi)
+        if argv and argv[0] == "torchrun":
+            return CommandResult(returncode=0, stdout="[preflight] OK\n")
+        if "torch.cuda.set_device" in joined:
+            index = int((env or {}).get("CUDA_VISIBLE_DEVICES", "0"))
+            if probe_ok(index):
+                return CommandResult(returncode=0, stdout="ok\n")
+            return CommandResult(returncode=1, stderr="cudaErrorDevicesUnavailable")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    return runner
+
+
+_SCRATCH = "/scratch/mv2flow-run-tmp"
+
+
+def _task(tmp_path, **overrides):
+    checkpoint = tmp_path / "ckpt"
+    checkpoint.mkdir(exist_ok=True)
+    (checkpoint / "config.json").write_text(json.dumps({"architectures": ["Qwen3MoeForCausalLM"]}))
+    task = {
+        "checkpoint_path": str(checkpoint),
+        "arch": "sm_103",
+        "parallel": "tp1",
+        "trtllm_repo_path": str(tmp_path),
+        "environment": {
+            "kind": "local",
+            "python": "/opt/venv/bin/python",
+            "env": {"TMPDIR": _SCRATCH, "CLAUDE_CODE_TMPDIR": _SCRATCH},
+        },
+    }
+    task.update(overrides)
+    return task
+
+
+def test_run_preflight_resolves_identity(tmp_path):
+    task = _task(tmp_path, parallel="dep4")
+    (tmp_path / "ckpt").rename(tmp_path / "Qwen3-30B-A3B")
+    task["checkpoint_path"] = str(tmp_path / "Qwen3-30B-A3B")
+    runner = make_runner(smi=_smi_rows(*[_healthy_row(i) for i in range(4)]))
+    result = preflight.run_preflight(task, runner=runner)
+    assert result.slug == "qwen3-30b-a3b-sm_103-dep4"
+    assert result.branch == "trtllm-modeling-v2/qwen3-30b-a3b-sm_103-dep4"
+    assert result.devices == (0, 1, 2, 3)
+    assert result.world_size == 4
+    assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
+
+
+def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_path):
+    fp8 = {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}, "members": ["dep4"]}
+    task = _task(
+        tmp_path,
+        parallel="unified",
+        members=["tp4", "dep4"],
+        accuracy={"benchmark": "gsm8k", "reference_yaml": "x.yaml", "benchmark_members": "tp4"},
+        variants={"kv_fp8": {**fp8, "gates": ["accuracy"]}},
+    )
+    with pytest.raises(PreflightError, match="`core`'s benchmark at none of dep4"):
+        preflight.check_variant_anchors(task, 4)
+    del task["accuracy"]["benchmark_members"]
+    assert "relative, core's own score at dep4" in preflight.check_variant_anchors(task, 4)[0]
+    task["features"] = ["disagg"]
+    task["environment"]["gpus_per_node"] = 4
+    task["accuracy"]["disagg"] = {"test": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}
+    with pytest.raises(PreflightError, match="more than the 4 devices one node holds"):
+        preflight.check_disagg_placement(task)
+
+
+def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_ever():
+    task = {
+        "environment": {
+            "kind": "session_spool",
+            "sessions": [
+                {"name": "gates", "spool": "/g", "role": "gates", "time_limit": "02:00:00"},
+                {"name": "work", "spool": "/w", "role": "work", "time_limit": "08:00:00"},
+            ],
+        },
+        "accuracy": {},
+    }
+    with pytest.raises(preflight.PreflightError, match="accuracy.timeout is 14400s"):
+        preflight.check_gate_budgets(task)
+    task["accuracy"]["timeout"] = 5400
+    (note,) = preflight.check_gate_budgets(task)
+    assert "accuracy.timeout 5400s" in note and "7200s" in note
+    # A slow load gets a longer boot or acceptance leg; the longest one declared counts.
+    task["accuracy"]["boot"] = {"timeout": 3600, "core": {"timeout": 9000}}
+    with pytest.raises(preflight.PreflightError, match="accuracy.boot.timeout is 9000s"):
+        preflight.check_gate_budgets(task)
+    assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
+
+
+def _fake_boot(fails: dict[str, str], booted: list):
+    """A boot gate that fails the members named in ``fails`` with their detail."""
+
+    def run_boot_gate(environment, *, member=None, **_):
+        booted.append(member)
+        detail = fails.get(member)
+        return GateResult(
+            name="boot[off]", member=member, passed=detail is None, detail=detail or "generated"
+        )
+
+    return run_boot_gate
+
+
+def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves(
+    tmp_path, monkeypatch
+):
+    task = _task(tmp_path, parallel="unified", members=["tp4", "tep4", "dep4"])
+    environment = SimpleNamespace(world_size=4)
+    booted, notes = [], []
+    misaligned = {"tp4": "AssertionError: M % 128 == 0"}
+    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(misaligned, booted))
+    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
+    assert booted == ["tp4", "tep4"]
+    assert "at `tep4`" in notes[0]
+    assert "could not serve `tp4` (AssertionError: M % 128 == 0)" in notes[1]
+
+    # Every member failing is still a stop, and names what each member said.
+    booted.clear()
+    every = {member: f"{member} broke" for member in ("tp4", "tep4", "dep4")}
+    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(every, booted))
+    with pytest.raises(PreflightError, match="every member failed:\n  tp4: tp4 broke\n  tep4"):
+        preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path)
+    assert booted == ["tp4", "tep4", "dep4"]
+
+    # A concrete segment is booted once, as itself.
+    booted.clear()
+    task["parallel"] = "dep4"
+    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot({}, booted))
+    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
+    assert booted == [None]
+
+
+def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environment(tmp_path):
+    """Sessions and spools are where jobs queue; every other environment field is the boot's."""
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
+        resolve_environment,
+    )
+    from agent_flow.workflows.trtllm_modeling_v2.run.startup.bootstrap import (
+        substrate_inputs,
+        substrate_reuse,
+    )
+
+    def inputs(perf=None, **environment):
+        task = _task(tmp_path, environment=environment, perf=perf or {})
+        return substrate_inputs(task, resolve_environment(task, world_size=4))
+
+    gates = {"name": "gates", "spool": "/s/gates", "env": {"A": "1"}, "setup": ["source /e.sh"]}
+    block = {
+        "kind": "session_spool",
+        "python": "/venv/bin/python",
+        "container_image": "/images/trtllm.sqsh",
+        "mounts": ["/data:/data"],
+        "env": {"TMPDIR": _SCRATCH},
+        "sessions": [gates],
+    }
+    record = {"at": 0.0, "inputs": inputs(**block)}
+    perf = [
+        {**gates, "name": f"perf{n}", "spool": f"/s/perf{n}", "time_limit": "4h"} for n in (1, 2)
+    ]
+    resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
+    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
+    assert substrate_reuse(record, inputs({"dev_spools": ["/s/perf2"]}, **grown), now=60.0)[0]
+    for changed in (
+        {"container_image": "/images/other.sqsh"},
+        {"mounts": ["/data:/data", "/models:/models"]},
+        {"env": {"TMPDIR": _SCRATCH, "NCCL_DEBUG": "INFO"}},
+        {"python": "/other/bin/python"},
+        {"sessions": [gates, {**gates, "name": "perf1", "setup": ["source /other.sh"]}]},
+        # A field no list names counts too.
+        {"gpu_memory_gib": 80},
+    ):
+        reusable, why = substrate_reuse(record, inputs(**{**block, **changed}), now=60.0)
+        assert not reusable and "environment" in why, changed
+
+
+def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+
+    seen = []
+
+    def runner(argv, env, timeout):
+        seen.append((argv, env))
+        return CommandResult(0, "[preflight] OK")
+
+    preflight.check_multirank_substrate(
+        2, RunEnvironment("local", "/venv/bin/python", devices=(3, 5)), runner=runner
+    )
+    argv, env = seen[0]
+    assert argv[3:6] == ["--no-python", "/venv/bin/python", "-c"]
+    assert env["CUDA_VISIBLE_DEVICES"] == "3,5"
+
+
+def _files(path: Path) -> Path:
+    (path / "main").mkdir(parents=True, exist_ok=True)
+    (path / "main" / "test-00000-of-00001.parquet").write_text("rows")
+    return path
+
+
+def test_a_missing_dataset_is_downloaded_into_the_workspace(tmp_path):
+    asked = []
+
+    def run(argv, **kwargs):
+        asked.append(argv[-2:])
+        _files(Path(argv[-1]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    entry = datasets.stage({"accuracy": {}}, tmp_path / "ws", "gsm8k", python="/py", run=run)
+    assert entry["state"] == "ready" and entry["source"] == "downloaded openai/gsm8k"
+    assert asked == [["openai/gsm8k", str(tmp_path / "ws/datasets/openai/gsm8k")]]
+
+
+def test_the_tree_tests_read_a_models_root_that_holds_the_staged_copy(tmp_path):
+    root = tmp_path / "models"
+    (root / "stepfun").mkdir(parents=True)
+    (root / "datasets" / "mmlu").mkdir(parents=True)
+    staged = _files(tmp_path / "ws" / "datasets" / "openai" / "gsm8k")
+    overlay = Path(datasets.models_root(tmp_path / "ws", str(root), "gsm8k", str(staged)))
+    assert overlay != root
+    assert (overlay / "stepfun").resolve() == (root / "stepfun").resolve()
+    assert (overlay / "datasets" / "mmlu").resolve() == (root / "datasets" / "mmlu").resolve()
+    assert (overlay / "datasets/openai/gsm8k/main").is_dir()
+    # A root that holds it already is used as it is.
+    assert datasets.models_root(tmp_path / "ws", str(overlay), "gsm8k", str(staged)) == str(overlay)
+
+
+def _entry_source(impl, archs):
+    arch_set = ", ".join(f"Arch.{a}" for a in archs)
+    cell_list = "".join(f"Cell(why='c{i}', spec={{}}), " for i in range(2))
+    return (
+        "from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
+        "class Entry(OpWrapper):\n"
+        '    """Mentions torch.ops.trtllm.neighbour in prose, which is not the op."""\n\n'
+        f"    ARCHS = frozenset({{{arch_set}}})\n"
+        f"    CELLS = ({cell_list})\n\n"
+        "    def __call__(self, x):\n"
+        f"        return {impl}(x)\n\n"
+        "    def reference(self, x):\n"
+        "        return x\n"
+    )
+
+
+def _fake_repo(tmp_path, entries, model_ops=()):
+    """A repo tree with catalog entries, and nothing else.
+
+    ``entries`` are ``(category/name.py, impl, archs)`` written under
+    ``catalog/``; ``model_ops`` are ``(family/target, category/name.py, impl,
+    archs)`` kept in a target's ``ops/``.
+    """
+    catalog = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
+    catalog.mkdir(parents=True)
+    (catalog / "_op.py").write_text("class OpWrapper:\n    pass\n", encoding="utf-8")
+    for path, impl, archs in entries:
+        py = catalog / path
+        py.parent.mkdir(parents=True, exist_ok=True)
+        (py.parent / "__init__.py").write_text("", encoding="utf-8")
+        py.write_text(_entry_source(impl, archs), encoding="utf-8")
+    models = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+    for scope, path, impl, archs in model_ops:
+        py = models / scope / "ops" / path
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.write_text(_entry_source(impl, archs), encoding="utf-8")
+        (py.parent / "__init__.py").write_text("", encoding="utf-8")
+    return tmp_path
+
+
+def _run_probe(repo, arch="sm_103", prelude=""):
+    proc = subprocess.run(
+        [sys.executable, "-c", prelude + PROBE_SOURCE, str(repo), arch],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return parse_inventory(proc.stdout + proc.stderr, arch=arch)
+
+
+_INLINE_PASS = ("SM_103",)
+
+
+def test_another_targets_ops_are_listed_not_spendable(tmp_path):
+    repo = _fake_repo(
+        tmp_path,
+        [("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS)],
+        model_ops=[
+            ("fam/ckpt__sm_103__tp1", "moe/router.py", "torch.ops.trtllm.router", _INLINE_PASS)
+        ],
+    )
+    inventory = _run_probe(repo)
+    (op,) = inventory.other_targets
+    assert (op.scope, op.path, op.impl) == (
+        "fam/ckpt__sm_103__tp1",
+        "moe/router.py",
+        "torch.ops.trtllm.router",
+    )
+    assert op.receipt == RECEIPT_PASSED
+    assert op not in inventory.spendable and op not in inventory.uncertified
+    assert "router" not in inventory.unwrapped_ops
+    assert "`fam/ckpt__sm_103__tp1/ops/moe/router`" in format_surface(inventory)
+
+
+def test_family_shared_ops_are_discovered_alongside_target_ops(tmp_path):
+    repo = _fake_repo(
+        tmp_path,
+        [],
+        model_ops=[
+            ("fam", "norm/shared.py", "torch.ops.trtllm.shared", _INLINE_PASS),
+        ],
+    )
+    inventory = _run_probe(repo)
+    assert any(
+        entry.scope == "fam" and entry.path == "norm/shared.py" for entry in inventory.other_targets
+    )
+
+
+ANCHORS = tree_anchors.ANCHORS
+
+
+def test_every_anchor_is_found_by_what_identifies_it_in_this_checkout():
+    """Inside a TensorRT-LLM checkout, a search that ignores each hint finds what the hint points at.
+
+    The search is what a run relies on once the tree moves, so it is what this
+    holds. A hint this tree lacks (an older or newer layout) only warns.
+    """
+    root = Path(__file__).resolve().parents[4]
+    if not (root / "tensorrt_llm").is_dir():
+        pytest.skip("not inside a TensorRT-LLM checkout")
+    unfindable = []
+    for key, anchor in ANCHORS.items():
+        here = tree_anchors.resolve(root, anchor)
+        if here.via != "hint":
+            where = f"found at {list(here.paths[:3])}" if here.found else "missing"
+            warnings.warn(f"anchor {key}: no {anchor.hint} in this tree, {where}", stacklevel=1)
+            continue
+        moved = dataclasses.replace(anchor, hint=f"{anchor.hint}.moved")
+        found = tree_anchors.resolve(root, moved).paths
+        hint = anchor.hint
+        if not any(
+            p == hint or p.startswith(hint + "/") or hint.startswith(p + "/") for p in found
+        ):
+            unfindable.append(f"{key}: a search found {list(found[:3])}")
+    assert not unfindable, f"anchors a search cannot find by what identifies them: {unfindable}"

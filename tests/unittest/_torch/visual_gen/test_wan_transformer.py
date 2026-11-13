@@ -256,6 +256,99 @@ class TestWanUnit:
             )
         assert out.shape == hs.shape
 
+    @staticmethod
+    def _morton_model(device, *, dense_layers, expand_timesteps=False, tau=2.0):
+        """2-layer Wan with token_order=morton; layers in ``dense_layers`` run dense FMHA."""
+        from tensorrt_llm.visual_gen.args import AttentionConfig, SolAttentionConfig
+
+        cfg = {
+            **WAN_1_3B_CONFIG,
+            "num_layers": 2,
+            "hidden_size": WAN_1_3B_CONFIG["num_attention_heads"]
+            * WAN_1_3B_CONFIG["attention_head_dim"],
+            "expand_timesteps": expand_timesteps,
+        }
+        model_config = _make_model_config(cfg)
+        model_config.attention = AttentionConfig(
+            backend="CUTEDSL",
+            sparse_attention_config=SolAttentionConfig(
+                tau=tau, token_order="morton", dense_layers=dense_layers
+            ),
+        )
+        model = (
+            WanTransformer3DModel(model_config=model_config).to(device, dtype=torch.bfloat16).eval()
+        )
+        assert model._token_reorder.active
+        # Parameters are allocated uninitialized; give them finite values.
+        torch.manual_seed(0)
+        for param in model.parameters():
+            param.normal_(0.0, 0.02)
+        return model
+
+    @staticmethod
+    def _morton_inputs(device, *, expand_timesteps):
+        """T=4 latent frames so the permutation and RoPE see the frame axis: grid (4, 16, 16)."""
+        hs = torch.randn(1, 16, 4, 32, 32, dtype=torch.bfloat16, device=device)
+        enc = torch.randn(1, 128, 4096, dtype=torch.bfloat16, device=device)
+        ts = _normalize_wan_timestep(torch.tensor([500.0], device=device))
+        if expand_timesteps:
+            # Wan2.2 TI2V-5B style per-patch timestep: [B, S] with a distinct
+            # value on the first latent frame so the permutation is exercised.
+            frame_tokens = (hs.shape[3] // 2) * (hs.shape[4] // 2)
+            ts = ts.reshape(1, 1).expand(1, hs.shape[2] * frame_tokens).clone()
+            ts[:, :frame_tokens] = 0.0
+        return hs, ts, enc
+
+    @torch.no_grad()
+    @pytest.mark.parametrize("expand_timesteps", [False, True])
+    def test_morton_token_order_matches_native(self, expand_timesteps):
+        """Dense attention is permutation-equivariant, so token_order=morton
+        must reproduce the native-order output (2 layers, random weights).
+        Both layers are forced dense so the check is backend-exact, not routing-dependent."""
+        from tensorrt_llm._torch.visual_gen.token_order import TokenReorder
+
+        model = self._morton_model(
+            self.DEVICE, dense_layers=[0, 1], expand_timesteps=expand_timesteps
+        )
+        hs, ts, enc = self._morton_inputs(self.DEVICE, expand_timesteps=expand_timesteps)
+
+        with torch.inference_mode():
+            morton_out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+            model._token_reorder = TokenReorder("native")
+            native_out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+
+        assert _cosine_similarity(morton_out, native_out) > 0.999
+        torch.testing.assert_close(morton_out.float(), native_out.float(), atol=0.1, rtol=0.05)
+
+    @torch.no_grad()
+    def test_morton_token_order_rejects_mismatched_per_token_timesteps(self):
+        """A per-token timestep with fewer entries than tokens cannot be permuted
+        consistently with the tokens, so the forward must raise, not skip the permutation."""
+        model = self._morton_model(self.DEVICE, dense_layers=[0, 1], expand_timesteps=True)
+        hs, ts, enc = self._morton_inputs(self.DEVICE, expand_timesteps=True)
+        with pytest.raises(ValueError, match="one timestep per token"), torch.inference_mode():
+            model(hidden_states=hs, timestep=ts[:, :-1], encoder_hidden_states=enc)
+
+    @torch.no_grad()
+    def test_morton_token_order_runs_sparse_sol_layer(self):
+        """Morton order through a routed Sol-Attn layer: layer 0 dense, layer 1 sparse.
+        The CuTe kernel must actually run (kernel census) and produce finite output."""
+        from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import sol_attn_backend
+
+        probe = torch.empty(1, 64, 1, 128, device=self.DEVICE, dtype=torch.bfloat16)
+        if not sol_attn_backend.sol_attn_supported(probe):
+            pytest.skip(sol_attn_backend.sol_attn_ineligible_reason(probe))
+
+        model = self._morton_model(self.DEVICE, dense_layers=[0])
+        hs, ts, enc = self._morton_inputs(self.DEVICE, expand_timesteps=False)
+        before = sol_attn_backend.get_sol_attn_stats()["kernel_calls"]
+        with torch.inference_mode():
+            out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+        torch.cuda.synchronize()
+        assert sol_attn_backend.get_sol_attn_stats()["kernel_calls"] > before
+        assert out.shape == hs.shape
+        assert torch.isfinite(out.float()).all()
+
     @torch.no_grad()
     def test_allclose_to_hf(self):
         """TRT-LLM output matches HuggingFace when weights are shared (2 layers, random init)."""

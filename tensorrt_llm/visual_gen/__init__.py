@@ -49,6 +49,7 @@ if TYPE_CHECKING:
         ParallelConfig,
         QuantAttentionConfig,
         RuntimeLoRAConfig,
+        SeaCacheConfig,
         SkipSoftmaxAttentionConfig,
         SolAttentionConfig,
         SparseAttentionConfig,
@@ -78,6 +79,7 @@ _LAZY_ATTRS = {
     "ParallelConfig": "tensorrt_llm.visual_gen.args",
     "QuantAttentionConfig": "tensorrt_llm.visual_gen.args",
     "RuntimeLoRAConfig": "tensorrt_llm.visual_gen.args",
+    "SeaCacheConfig": "tensorrt_llm.visual_gen.args",
     "SkipSoftmaxAttentionConfig": "tensorrt_llm.visual_gen.args",
     "SolAttentionConfig": "tensorrt_llm.visual_gen.args",
     "SparseAttentionConfig": "tensorrt_llm.visual_gen.args",
@@ -161,6 +163,7 @@ __all__ = [
     "CacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",
+    "SeaCacheConfig",
     # Re-exported for convenience
     "QuantConfig",
 ]

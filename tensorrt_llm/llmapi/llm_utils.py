@@ -8,10 +8,11 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import transformers
 
+from .._errors import ConfigInputError, ModelLoadError, UnsupportedError
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
-from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, KvCacheRetentionConfig)
+from ..bindings.executor import (CapacitySchedulerPolicy, ContextChunkingPolicy,
+                                 KvCacheRetentionConfig)
 # yapf: enable
 from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
@@ -19,6 +20,7 @@ from ..models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             read_modelopt_quant_config,
+                                            reject_checkpoint_nvfp4_plus,
                                             warn_if_inline_diverges)
 # yapf: disable
 from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
@@ -73,16 +75,20 @@ class ModelLoader:
         quant_config = self.llm_args.quant_config
         hf_quant_algo = hf_quant_config.pop("quant_algo", None)
         if hf_quant_algo is None:
-            raise ValueError("Pre-quantized checkpoint must have quant_algo.")
+            raise ModelLoadError(
+                "Pre-quantized checkpoint must have quant_algo.")
+        reject_checkpoint_nvfp4_plus(hf_quant_algo,
+                                     "The checkpoint quantization config")
         hf_quant_algo = QuantAlgo(hf_quant_algo)
         if quant_config.quant_algo is None:
             logger.info(
                 f"Setting quant_algo={hf_quant_algo} from HF quant config.")
             quant_config.quant_algo = hf_quant_algo
         elif quant_config.quant_algo != hf_quant_algo:
-            raise ValueError(
-                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
-            )
+            raise ConfigInputError(
+                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config.",
+                hint="Remove quant_config.quant_algo; the quantization of a "
+                "pre-quantized checkpoint is read from the checkpoint.")
 
         hf_kv_cache_quant_algo = hf_quant_config.pop("kv_cache_quant_algo",
                                                      None)
@@ -100,14 +106,15 @@ class ModelLoader:
                 )
                 quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
             elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                raise ValueError(
-                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                )
+                raise ConfigInputError(
+                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config.",
+                    hint="Set the KV cache format with kv_cache_config.dtype, "
+                    "which overrides the checkpoint's.")
         else:
             if quant_config.kv_cache_quant_algo not in [
                     None, QuantAlgo.FP8, QuantAlgo.NVFP4
             ]:
-                raise ValueError(
+                raise UnsupportedError(
                     f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                 )
 
@@ -170,7 +177,7 @@ class ModelLoader:
                         "falling back to config.json or model_kwargs for global "
                         "quantization.")
                 else:
-                    raise ValueError(
+                    raise ModelLoadError(
                         "Pre-quantized checkpoint must have quant_algo.")
             else:
                 self._apply_modelopt_quant_config(normalized,
@@ -198,7 +205,7 @@ class ModelLoader:
             )
 
         if requires_global_quant_config_fallback and hf_quant_config is None:
-            raise ValueError(
+            raise ModelLoadError(
                 "hf_quant_config.json does not set a global quant_algo and no "
                 "quantization_config fallback was found.")
 
@@ -465,7 +472,6 @@ __all__ = [
     'ModelLoader',
     '_ParallelConfig',
     '_ModelWrapper',
-    'BatchingType',
     'SchedulerConfig',
     'KvCacheRetentionConfig',
     'MTPDecodingConfig',
@@ -532,6 +538,9 @@ def apply_model_defaults_to_llm_args(
     user_overrides = llm_args.model_dump(exclude_unset=True)
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
+    # Model defaults cannot change this config; retain its private launcher state,
+    # which is intentionally excluded from model_dump().
+    merged_state["cache_transceiver_config"] = llm_args.cache_transceiver_config
 
     new_args = llm_args.__class__(**merged_state)
 

@@ -17,6 +17,7 @@ import math
 import platform
 import sys
 import types
+from typing import Optional
 
 from ..logger import logger
 
@@ -38,10 +39,8 @@ def _skip_legacy_cutlass_mlir_helpers() -> None:
 
 IS_CUTLASS_DSL_AVAILABLE = False
 
-# Whether the public CuTe DSL package provides the SM107/Rubin helper module.
-# Rubin kernels stay disabled when it is absent and callers retain their
-# existing fallback paths.
-# TODO: flips to True once a Rubin-capable CuTe DSL package ships in the image.
+# Whether the installed CuTe DSL provides ``cutlass.utils.rubin_helpers``; set
+# by the import probe below. Rubin kernels stay disabled when it is absent.
 IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 
 if platform.system() != "Windows":
@@ -60,6 +59,45 @@ if platform.system() != "Windows":
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
     except ImportError:
         pass
+
+
+class _GraphSafeDlpack:
+    """DLPack export without a stream synchronization (safe under CUDA-graph capture)."""
+
+    def __init__(self, tensor):
+        self._tensor = tensor.detach()
+
+    def __dlpack__(self, stream=None):
+        return self._tensor.__dlpack__(stream=-1)
+
+    def __dlpack_device__(self):
+        return self._tensor.__dlpack_device__()
+
+
+def graph_safe_cute_tensor(tensor,
+                           assumed_align: int = 16,
+                           dynamic_leading_dim: Optional[int] = None):
+    """CuTe DSL view of a torch tensor whose export does not synchronize streams.
+
+    ``dynamic_leading_dim``: the shape and the strides other than that (unit-stride) dimension's are runtime
+    values, so one compiled kernel serves every size.
+    """
+    from cutlass.cute.runtime import from_dlpack
+
+    view = from_dlpack(_GraphSafeDlpack(tensor), assumed_align=assumed_align)
+    if dynamic_leading_dim is not None:
+        view = view.mark_layout_dynamic(leading_dim=dynamic_leading_dim)
+    return view
+
+
+def gmem_ptr(tensor, dtype, assumed_align: int):
+    """CuTe global-memory pointer of ``dtype`` to ``tensor``'s data (keeps no reference to the tensor)."""
+    import cutlass.cute as cute
+
+    return cute.runtime.make_ptr(dtype,
+                                 tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=assumed_align)
 
 
 def install_cutlass_dsl_compatibility() -> None:

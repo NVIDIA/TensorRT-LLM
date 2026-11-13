@@ -7,11 +7,13 @@ from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm.functional import AllReduceFusionOp
 
 from .mnnvl_workspace import MnnvlWorkspace
+
+native_ops = load_family_ops(__name__)
 
 __all__ = ["MnnvlWorkspace", "mnnvl_fusion_allreduce", "required_buffer_bytes"]
 
@@ -36,7 +38,7 @@ class MnnvlFusionAllreduce(OpWrapper):
     must hold the call (:func:`required_buffer_bytes`). Advances ``workspace`` by one call: every rank of the group
     makes the same MNNVL calls on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=(
@@ -199,7 +201,7 @@ class MnnvlFusionAllreduce(OpWrapper):
                 f"not {workspace.buffer_bytes}"
             )
         fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM if fused else AllReduceFusionOp.NONE
-        outputs = torch.ops.trtllm.k3_mnnvl_fusion_allreduce(
+        outputs = native_ops.k3_mnnvl_fusion_allreduce(
             input,
             norm_weight,
             residual,

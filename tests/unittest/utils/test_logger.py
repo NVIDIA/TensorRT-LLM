@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for the modular logger (auto module detection, per-module filtering)."""
 
+import importlib
 import logging
 from io import StringIO
 
@@ -239,6 +240,26 @@ class TestModuleLevelFiltering:
         # Cleanup
         singleton._module_levels = {}
 
+    def test_filtered_message_skips_caller_lookup(self, monkeypatch):
+        # The package re-exports the Logger singleton as ``tensorrt_llm.logger``,
+        # shadowing the submodule, so fetch the module object explicitly.
+        logger_module = importlib.import_module("tensorrt_llm.logger")
+
+        singleton = Logger()
+        monkeypatch.setattr(singleton, "_min_severity", "warning")
+        monkeypatch.setattr(singleton, "_module_levels", {})
+
+        def fail():
+            raise AssertionError("caller module looked up for a filtered message")
+
+        monkeypatch.setattr(logger_module, "_get_caller_module", fail)
+        singleton.info("filtered")
+        assert singleton.is_debug_enabled() is False
+        # A per-module override still needs the caller's module.
+        monkeypatch.setattr(singleton, "_module_levels", {"runtime": 10})
+        with pytest.raises(AssertionError, match="caller module"):
+            singleton.info("module filtered")
+
 
 class TestIsDebugEnabled:
     """Tests for is_debug_enabled, the guard for expensive debug arguments.
@@ -343,3 +364,42 @@ class TestLoggerAPI:
 
         # Cleanup
         singleton._appeared_keys.discard("test_key_unique_12345")
+
+
+def test_no_exc_info_passed_to_trtllm_logger():
+    """The TRT-LLM logger takes no exc_info and has no exception(): either raises inside the except block."""
+    import ast
+    import pathlib
+    import re
+
+    import tensorrt_llm
+
+    root = pathlib.Path(tensorrt_llm.__file__).parent
+    methods = {"debug", "info", "warning", "error", "critical"}
+    offenders = []
+    for path in root.rglob("*.py"):
+        source = path.read_text(encoding="utf-8", errors="replace")
+        if "logger" not in source or (
+            "exc_info" not in source and "logger.exception" not in source
+        ):
+            continue
+        # A module that binds `logger` to a stdlib logger at top level (not as an import fallback) may use
+        # exc_info and exception() with it.
+        if re.search(r"^logger\s*=\s*logging\.getLogger", source, re.MULTILINE):
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+                and (
+                    node.func.attr == "exception"
+                    or (
+                        node.func.attr in methods
+                        and any(kw.arg == "exc_info" for kw in node.keywords)
+                    )
+                )
+            ):
+                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert not offenders, f"stdlib-only logging call on the TRT-LLM logger: {offenders}"

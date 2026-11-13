@@ -3,8 +3,11 @@
 
 from typing import Dict, Optional, Tuple
 
+import pytest
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, CUDAGraphRunnerConfig)
@@ -98,6 +101,8 @@ def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
         bits_in_type = 8
     elif weight_dtype == torch.quint4x2:
         bits_in_type = 4
+    else:
+        raise ValueError(f"Unsupported weight dtype: {weight_dtype}")
     quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
     max_val = torch.max(abs(x)).item()
     atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
@@ -306,3 +311,53 @@ def dspark_markov_chain_logits_reference(base_logits: torch.Tensor,
                                        next_token_fn=argmax_fn,
                                        cast_bias_to_logits=True)
     return corrected
+
+
+@triton.jit
+def _gumbel_scores_kernel(logits_ptr, temp_ptr, seed_ptr, out_ptr, vocab,
+                          BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    ok = cols < vocab
+    x = tl.load(logits_ptr + row * vocab + cols, mask=ok,
+                other=0.0).to(tl.float32)
+    u = tl.rand(tl.load(seed_ptr), row * vocab + cols)
+    u = tl.minimum(tl.maximum(u, 1e-12), 0.99999994)
+    x = x / tl.load(temp_ptr + row) - tl.log(-tl.log(u))
+    tl.store(out_ptr + row * vocab + cols, x, mask=ok)
+
+
+def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
+                         seed: torch.Tensor,
+                         greedy_threshold: float) -> torch.Tensor:
+    """Temperature samples (int32 [rows]) of ``logits`` [rows, vocab] by
+    Gumbel-max with the noise ``TPKeyExchange.argmax_logits`` draws:
+    ``tl.rand(seed, row * vocab + token)`` for ``seed`` (int64 [1]). Rows below
+    ``greedy_threshold`` take the argmax."""
+    rows, vocab = logits.shape
+    scores = torch.empty((rows, vocab),
+                         dtype=torch.float32,
+                         device=logits.device)
+    block = 1024
+    grid = (rows, triton.cdiv(vocab, block))
+    _gumbel_scores_kernel[grid](logits.contiguous(),
+                                temperatures,
+                                seed,
+                                scores,
+                                vocab,
+                                BLOCK=block)
+    sampled = temperatures >= greedy_threshold
+    return torch.where(sampled, scores.argmax(-1),
+                       logits.float().argmax(-1)).to(torch.int32)
+
+
+def triton_num_compiled(kernel) -> int:
+    """Specializations of a ``triton.jit`` kernel compiled in this process.
+
+    A launch that raises the count compiled a new variant of the kernel. Skips
+    the calling test when this Triton does not expose the per-device caches.
+    """
+    caches = getattr(kernel, "device_caches", None)
+    if caches is None:
+        pytest.skip("this Triton has no JITFunction.device_caches")
+    return sum(len(cache[0]) for cache in caches.values())

@@ -40,7 +40,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.params import MediaRole
 
-from .cache import CacheDiTAccelerator, TeaCacheAccelerator
+from .cache import CacheDiTAccelerator, SeaCacheAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .mapping import _VisualGenAutotuneDist
@@ -144,7 +144,7 @@ class BasePipeline(nn.Module):
         self._warmed_up_shapes: Set[tuple] = set()
         self._runtime_lora_applications: List[Any] = []
 
-        # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
+        # Unified cache acceleration (TeaCache, Cache-DiT, SeaCache); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
 
         # Components
@@ -191,10 +191,31 @@ class BasePipeline(nn.Module):
 
             for i, t in self._profile_denoise_steps(timesteps):
                 ...
+
+        It also publishes each step as ``(step, num_steps)`` under
+        ``denoise_step`` in every transformer component's attention metadata
+        state, for the attention recipes that follow the step schedule, and
+        clears it when the loop ends.
         """
-        if self._is_warmup:
-            return enumerate(timesteps)
-        return self._profiler.steps(timesteps)
+        steps = enumerate(timesteps) if self._is_warmup else self._profiler.steps(timesteps)
+        num_steps = len(timesteps) if hasattr(timesteps, "__len__") else None
+        try:
+            for i, t in steps:
+                self._publish_denoise_step(None if num_steps is None else (i, num_steps))
+                yield i, t
+        finally:
+            self._publish_denoise_step(None)
+
+    def _publish_denoise_step(self, denoise_step: Optional[Tuple[int, int]]) -> None:
+        """Record the current denoising step in each transformer component's attention state."""
+        # Partially built pipelines, as the unit tests construct them, may not resolve
+        # their component list yet; they have no attention state to publish into.
+        for name in getattr(self, "transformer_components", None) or ():
+            model = getattr(self, name, None)
+            model_config = getattr(model, "model_config", None)
+            state = getattr(model_config, "attention_metadata_state", None)
+            if state is not None:
+                state["denoise_step"] = denoise_step
 
     def _get_or_create_cuda_graph_shared_pool(self) -> SharedGraphPool:
         """Return the pipeline-owned pool shared by non-concurrent graph runners."""
@@ -455,7 +476,11 @@ class BasePipeline(nn.Module):
         raise NotImplementedError
 
     def _sleep_loading_context(
-        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+        self,
+        restore_mode: "SleepRestoreMode",
+        *,
+        device: torch.device,
+        release_host_backup: bool = False,
     ) -> contextlib.AbstractContextManager[None]:
         """Capture persistent allocations for pipelines that explicitly support sleep.
 
@@ -733,7 +758,7 @@ class BasePipeline(nn.Module):
             )
 
     def _setup_cache_acceleration(self) -> None:
-        """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
+        """Enable TeaCache, Cache-DiT or SeaCache from model_config.cache_backend."""
 
         if getattr(self, "cache_accelerator", None) is not None:
             self.cache_accelerator.unwrap()
@@ -743,6 +768,12 @@ class BasePipeline(nn.Module):
 
         if cfg.cache_backend == "cache_dit":
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
+            acc.wrap()
+            self.cache_accelerator = acc
+            return
+
+        if cfg.cache_backend == "seacache":
+            acc = SeaCacheAccelerator(self, cfg.seacache)
             acc.wrap()
             self.cache_accelerator = acc
             return
@@ -1355,7 +1386,7 @@ class BasePipeline(nn.Module):
         scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
         extra_stream_timesteps: dict[str, torch.Tensor] | None = None,
     ):
-        """Execute denoising loop with optional CFG parallel and TeaCache support.
+        """Execute denoising loop with optional CFG parallel and step-caching support.
 
         Args:
             latents: Initial noise latents (primary stream, e.g., video)
@@ -1413,7 +1444,7 @@ class BasePipeline(nn.Module):
             if stream_timesteps.ndim != 1 or len(stream_timesteps) != total_steps:
                 raise ValueError(f"Timestep schedule for {name} must have {total_steps} entries.")
 
-        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
+        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT / SeaCache)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             self.cache_accelerator.refresh(total_steps)
 
@@ -1529,7 +1560,7 @@ class BasePipeline(nn.Module):
             logger.info("=" * 80)
             logger.info(f"Denoising done: {total_time:.2f}s ({total_time / total_steps:.2f}s/step)")
 
-            # Single logging site for TeaCache and Cache-DiT.
+            # Single logging site for TeaCache, Cache-DiT and SeaCache.
             if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
                 stats = self.cache_accelerator.get_stats()
                 if stats:
@@ -1549,6 +1580,12 @@ class BasePipeline(nn.Module):
                                 f"TeaCache: {stats['hit_rate']:.1%} hit rate "
                                 f"({stats['cached']}/{stats['total']} steps)"
                             )
+                    elif self.pipeline_config.cache_backend == "seacache":
+                        logger.info(
+                            f"SeaCache: {stats['hit_rate']:.1%} hit rate "
+                            f"({stats['cached']}/{stats['total']} steps, "
+                            f"cached steps {stats['cached_step_indices']})"
+                        )
                     else:
                         logger.info("Cache acceleration stats: %s", stats)
 

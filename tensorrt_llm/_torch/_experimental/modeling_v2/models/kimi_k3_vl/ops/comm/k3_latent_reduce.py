@@ -23,7 +23,7 @@ class K3LatentReduce(OpWrapper):
     every rank pushed into it since the previous reduce. Empties the words it read and advances ``exchange`` by one
     call: every rank pushes, then reduces, the same token count on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"{tokens} decode tokens, {kind} partials: {reason}",
@@ -100,7 +100,7 @@ class K3LatentReduce(OpWrapper):
     M is runtime. TRTLLM_ENABLE_PDL is read each call (default 1), affecting
     scheduling, not results; each key needs an eager call before capture.
     The wrapper fixes ctas_per_token=0: four CTAs through W=8, fourteen at
-    W=16. Explicit 4/14/28 choices belong to the kernel test, not this entry.
+    W=16. The kernel test runs explicit 14 and 28 over fabric handles.
 
     The matrix emulates pushes with copies, including negative zero; actual
     push-only routed-expert producers and their device-side half selection

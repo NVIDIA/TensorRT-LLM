@@ -195,10 +195,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_packed_mask = None
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone()
-            self._saved_position_offsets_cpp = attn_metadata.spec_decoding_position_offsets_cpp
+            self._saved_spec_decoding_query_len = attn_metadata.spec_decoding_query_len
         else:
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[
                 :batch_size
@@ -225,9 +225,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_packed_mask = None
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(self._saved_position_offsets)
-            attn_metadata.spec_decoding_position_offsets_cpp = self._saved_position_offsets_cpp
+            attn_metadata.spec_decoding_query_len = self._saved_spec_decoding_query_len
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
@@ -253,9 +253,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
-        """Set spec-dec gen lengths and refresh the C++ position-offset view."""
+        """Set the current speculative query lengths and position-offset layout."""
         attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
-        attn_metadata.update_position_offsets_for_cpp(query_len)
+        attn_metadata.spec_decoding_query_len = query_len
 
     def _refresh_blackwell_tree_mask_metadata(self, attn_metadata):
         if not getattr(attn_metadata, "use_spec_decoding", False):

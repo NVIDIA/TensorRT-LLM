@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <cmath>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -130,8 +131,25 @@ inline std::optional<size_t> cacheTierMaxQuota(CacheTierConfig const& cfg)
     return host != nullptr ? host->maxQuota : std::nullopt;
 }
 
+//! Controls whether a lifecycle participates in prefix matching and page reuse.
+enum class ReusePolicy
+{
+    //! Commit reusable pages and require live-window coverage when matching a prefix.
+    REQUIRED = 0,
+    //! Keep request-local working pages; never publish or reuse them through the radix tree.
+    PRIVATE = 1,
+    //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
+    //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
+    //! These pages may be evicted independently without removing the REQUIRED prefix.
+    OPTIONAL = 2,
+    //! REQUIRED for sink blocks, OPTIONAL for the sliding window: sinks constrain the prefix match and are
+    //! claimed with it; the window is selected at resume, and ReuseGroupStatus::complete describes it.
+    //! Attention layers only.
+    SINK_REQUIRED_ONLY = 3,
+};
+
 // ---------------------------------------------------------------------------
-// Buffer configuration (one KV buffer inside an attention layer).
+// Buffer configuration (one buffer inside an attention or SSM layer).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -193,6 +211,15 @@ struct BufferConfig
     //! densely packed, so a padded page is not expressible.
     int sparseUnitChunks = 1;
 
+    //! Reuse policy of this buffer; nullopt inherits the layer's policy. Overrides can
+    //! place buffers of one attention or SSM layer in different lifecycle groups.
+    std::optional<ReusePolicy> reusePolicy;
+
+    [[nodiscard]] ReusePolicy effectiveReusePolicy(ReusePolicy layerPolicy) const noexcept
+    {
+        return reusePolicy.value_or(layerPolicy);
+    }
+
     void validate() const;
 
     //! Where this buffer's selection units sit inside a page, given how many the layer
@@ -219,6 +246,13 @@ struct BufferConfig
 // ---------------------------------------------------------------------------
 struct SparseCacheConfig
 {
+    //! The 32-bit probe word packs a cache slot beside a unit ordinal. Both fields
+    //! reserve their all-ones value, so the largest ordinal is two below 2^18.
+    static constexpr uint32_t kProbeSlotBits = 14;
+    static constexpr int32_t kMaxUnitOrdinal = static_cast<int32_t>((1U << (32 - kProbeSlotBits)) - 2U);
+    //! Maximum cache entries per selection supported by the sparse resolve probe.
+    static constexpr int32_t kMaxCacheEntries = static_cast<int32_t>((1U << kProbeSlotBits) - 2U);
+
     //! Selection width: units a sparse-attention step selects for this layer.
     int numSelectedBlocks;
 
@@ -292,19 +326,6 @@ inline void validateNoDuplicateBufferRoles(std::vector<BufferConfig> const& buff
 
 } // namespace detail
 
-//! Controls whether an attention lifecycle participates in prefix matching and page reuse.
-enum class AttentionReusePolicy
-{
-    //! Commit reusable pages and require live-window coverage when matching a prefix.
-    REQUIRED = 0,
-    //! Keep request-local working pages; never publish or reuse them through the radix tree.
-    PRIVATE = 1,
-    //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
-    //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
-    //! These pages may be evicted independently without removing the REQUIRED prefix.
-    OPTIONAL = 2,
-};
-
 struct AttentionLayerConfig
 {
     static constexpr LayerType type = LayerType::ATTENTION;
@@ -319,7 +340,8 @@ struct AttentionLayerConfig
     std::optional<int> numSinkTokens;
 
     // Private working pages never constrain prefix matching or enter the tree.
-    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+    // Every buffer of an attention layer uses this policy.
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
     //! The sparse fetch path for this layer's sparse buffers, if it has one.
     std::optional<SparseCacheConfig> sparseCache;
 
@@ -341,6 +363,8 @@ struct SsmLayerConfig
 
     LayerId layerId = 0;
     std::vector<BufferConfig> buffers;
+    // Default policy of the layer's buffers; BufferConfig::reusePolicy may override it per buffer.
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
     void validate() const
     {
@@ -355,12 +379,64 @@ struct SsmLayerConfig
             {
                 throw std::invalid_argument("Sparse buffers are only supported for attention layers");
             }
+            if (buf.effectiveReusePolicy(reusePolicy) == ReusePolicy::SINK_REQUIRED_ONLY)
+            {
+                throw std::invalid_argument("SINK_REQUIRED_ONLY is only supported for attention layers");
+            }
             buf.validate();
         }
     }
 };
 
 using LayerConfig = std::variant<AttentionLayerConfig, SsmLayerConfig>;
+
+inline std::vector<BufferConfig> const& layerBuffers(LayerConfig const& layer)
+{
+    return std::visit([](auto const& cfg) -> std::vector<BufferConfig> const& { return cfg.buffers; }, layer);
+}
+
+// ---------------------------------------------------------------------------
+// Regions — buffers whose life cycle is declared rather than derived from a layer config.
+// ---------------------------------------------------------------------------
+
+//! What one unit of a region's allocation covers.
+enum class RegionAllocationUnit : std::uint8_t
+{
+    kRequest,    //!< One slot per KV cache and beam, held for the cache's lifetime.
+    kTokenBlock, //!< One page per token block. Not supported yet.
+};
+
+//! One buffer of a region. The layer id places the buffer in the per-layer address
+//! space; the buffer's life cycle comes from its region.
+struct RegionBuffer
+{
+    LayerId layerId = 0;
+    BufferConfig buffer;
+};
+
+//! Buffers that share a life cycle of the region's own. The life cycle is never merged
+//! with another one, even one whose parameters are equal.
+//!
+//! Only request regions with the PRIVATE reuse policy are supported: one slot per living
+//! KV cache and beam, never published for reuse, returned when the cache closes. Each
+//! buffer sits on a layer that has an SsmLayerConfig.
+struct RegionConfig
+{
+    std::string name;
+    RegionAllocationUnit allocationUnit = RegionAllocationUnit::kRequest;
+    ReusePolicy reusePolicy = ReusePolicy::PRIVATE;
+    std::vector<RegionBuffer> buffers;
+
+    //! GPU slot count of the region's pool group. When set, the region's life cycle gets a
+    //! pool group of its own with exactly this many hot-tier slots; ratio-based sizing at
+    //! construction, in resize() and adjust(), and in tuner targets leaves that group at
+    //! this size. A GPU quota too small to hold it is raised, as for the constraint floors.
+    //! When unset, the region is sized by ratio like any other life cycle.
+    std::optional<std::int64_t> fixedSlotCount;
+
+    //! Checks of the region alone; KVCacheManagerConfig::validate() checks it against the layers.
+    void validate() const;
+};
 
 // ---------------------------------------------------------------------------
 // KVCacheDesc — describes one KV cache request's capacity and history length.
@@ -511,6 +587,11 @@ struct KVCacheManagerConfig
     // Layer configs (attention or SSM). Layer IDs must be unique.
     std::vector<LayerConfig> layers;
 
+    // Regions, each with a life cycle of its own. A (layer, role) pair belongs to one layer
+    // config or one region. Region life cycles are numbered after every layer life cycle,
+    // in declaration order, so declaring a region never renumbers the layer groups.
+    std::vector<RegionConfig> regions;
+
     // Suspend/resume threshold: if utilization > this, resuming will fail.
     float maxUtilForResume = 0.97f;
 
@@ -531,7 +612,8 @@ struct KVCacheManagerConfig
     std::vector<BatchDesc> constraints;   // batches that must always be supportable
     std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
     // One normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
-    // layer-group slot-count proportions while accounting for cold page sizes.
+    // layer-group slot-count proportions while accounting for cold page sizes. The group of a region with a
+    // fixed slot count keeps its entry, which the hot tier ignores.
     std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
 
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.

@@ -247,15 +247,30 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // their page sizes. Nothing may read a cold level before then.
     TLLM_CHECK(appendLevelSlotDescList(config.slotDescList) == kHotLevel);
 
-    // Compute layer attributes and slot utilization fractions for scratch support.
-    mLayerAttributes = config.layerAttributes();
+    // A scratch slot serves one layer at a time. Reserve the largest layer share
+    // across the coalesced pools of each lifecycle, retaining exact fractions.
     mSlotUtilFracMax.resize(lifeCycles.size(), Rational{0, 1});
-    for (auto const& [layerId, layerAttr] : mLayerAttributes)
+    for (auto const& slotDesc : config.slotDescList)
     {
-        LifeCycleId const lcIdx = layerAttr.lifeCycleId;
-        if (layerAttr.slotUtilFracMax > mSlotUtilFracMax[lcIdx])
+        for (auto const& variant : slotDesc.variants)
         {
-            mSlotUtilFracMax[lcIdx] = layerAttr.slotUtilFracMax;
+            for (auto const& buffers : variant.coalescedBuffers)
+            {
+                std::unordered_map<LayerId, int> counts;
+                for (auto const& buffer : buffers.bufferIds)
+                {
+                    ++counts[buffer.layerId];
+                }
+                for (auto const& [layer, count] : counts)
+                {
+                    Rational const fraction{count, buffers.numBuffers()};
+                    auto& maximum = mSlotUtilFracMax[variant.lifeCycleId];
+                    if (fraction > maximum)
+                    {
+                        maximum = fraction;
+                    }
+                }
+            }
         }
     }
 
@@ -317,6 +332,22 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mHotMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
+    // A fixed-capacity group's floor is its fixed size, so every quota check reserves it. Like the
+    // elastic floors, it raises a GPU quota that is too small to hold all floors.
+    mFixedSlots = config.fixedSlotCounts;
+    if (mFixedSlots.empty())
+    {
+        mFixedSlots = FixedSlotCounts(numPoolGroups(), std::nullopt);
+    }
+    TLLM_CHECK_WITH_INFO(mFixedSlots.size() == numPoolGroups(), "Fixed slot counts must cover every pool group");
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
+    {
+        if (auto const fixed = mFixedSlots[pgIdx])
+        {
+            mHotMinSlots[pgIdx] = *fixed;
+        }
+    }
+
     // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
     // those weights while accounting for the cold representation's page sizes.
     TypedVec<LifeCycleId, float> lifeCycleRatio;
@@ -371,9 +402,19 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
                                                                   : defaultHostSparsePoolQuota(config.cacheTiers);
     // From the descriptors: the level's storage does not exist yet.
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
-        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota));
+        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota), mFixedSlots);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
+    {
+        if (mFixedSlots[pgIdx])
+        {
+            TLLM_LOG_INFO(
+                "KVCacheManagerV2: GPU pool group %d (region layer group %d) has a fixed capacity of %lld slots",
+                pgIdx.value(), mHotPoolGroupMapping.lifeCycles(pgIdx)[0].value(),
+                static_cast<long long>(gpuSlotCounts[pgIdx]));
+        }
+    }
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -432,12 +473,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     TypedVec<LifeCycleId, PoolGroupIndex> coldGrouping(numLifeCycles());
     TypedVec<PoolGroupIndex, SlotDesc> coldSlotDescList;
-    std::map<std::pair<AttentionReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
+    std::map<std::pair<ReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
         size_t const coldPageBytes = coldPageBytesByLifeCycle[lifeCycle];
-        auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[lifeCycle]);
-        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        auto const policy = effectivePoolReusePolicy(mLifeCycles[lifeCycle]);
         auto [it, inserted] = coldGroupByPageBytes.emplace(
             std::make_pair(policy, coldPageBytes), PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
         PoolGroupIndex const coldPgIdx = it->second;
@@ -1630,14 +1670,6 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
     return result;
 }
 
-LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const
-{
-    auto it = mLayerAttributes.find(layerId);
-    if (it == mLayerAttributes.end())
-        throw std::out_of_range("Unknown LayerId for LayerAttr");
-    return it->second;
-}
-
 SlotCount StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const
 {
     return mLevels.at(level).storage->numSlots(pgIdx);
@@ -1837,7 +1869,12 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota) + " exceeds the reserved maximum of "
             + std::to_string(*maxQuota) + " for this cache level (raise the tier's max_quota)");
     }
+    // Fixed hot-tier groups keep their size; only elastic groups are resized.
     auto newNumSlots = slotCountsForLevel(level, quota, ratioList);
+    for (PoolGroupIndex pgIdx{0}; level == kHotLevel && pgIdx < newNumSlots.size(); ++pgIdx)
+    {
+        TLLM_CHECK_DEBUG(!mFixedSlots[pgIdx] || newNumSlots[pgIdx] == oldNumSlots[pgIdx]);
+    }
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
@@ -1885,14 +1922,13 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
     // same boundary KvCache::_appendBeams() uses.
     HalfOpenRange<BlockOrdinal> const sharedRange{0, std::min(std::max(promptLength, 0) / tokensPerBlock, numBlocks)};
     TypedVec<LifeCycleId, size_t> numBytes(numLifeCycles(), 0);
-    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
     auto const& lifeCycles = mLifeCycles.getAll();
     for (LifeCycleId lifeCycle{0}; lifeCycle < lifeCycles.size(); ++lifeCycle)
     {
         auto const poolSizes = slotSize(level, getPoolGroupIndex(level, lifeCycle));
         size_t const slotBytes = std::accumulate(poolSizes.begin(), poolSizes.end(), size_t{0});
         int numRequiredBlocks;
-        if (ssmLcId.has_value() && lifeCycle == *ssmLcId)
+        if (mLifeCycles.isSsm(lifeCycle))
         {
             // One recurrent-state block per beam.
             numRequiredBlocks = effBeamWidth;
@@ -1953,9 +1989,9 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     // A soft preference, not a feasibility floor: keep one optional endpoint
     // per typical request in addition to its private working pages.
-    for (auto const& [lc, attention] : mLifeCycles.attentionLifeCycles())
+    for (auto const& [lc, lifeCycle] : mLifeCycles)
     {
-        if (attention->allowsCheckpoint())
+        if (reusePolicy(lifeCycle) == ReusePolicy::OPTIONAL)
         {
             numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
         }
@@ -2052,12 +2088,11 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
     BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
     TypedVec<LifeCycleId, SlotCount> numSlots(numLifeCycles(), 0);
-    auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     int sysBlocks = batch.systemPromptLength / tokensPerBlock;
 
     for (auto const& [lcIdx, lc] : mLifeCycles)
     {
-        if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+        if (mLifeCycles.isSsm(lcIdx))
         {
             // SSM: one dedicated block per request per beam, never shared.
             // _appendBeams() gives every beam its own recurrent-state slot.
@@ -2167,12 +2202,13 @@ TypedVec<LifeCycleId, size_t> StorageManager::slotsToBytes(TypedVec<LifeCycleId,
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
     TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-    size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget)
+    size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget, FixedSlotCounts const& fixedSlots)
 {
     size_t quota = cacheTierQuota(tierConfig);
     size_t const granularity = tierCommitUnit(tierConfig, gpuPhysMemSize);
     quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots, secondBudget), roundUp(quota, granularity));
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, secondBudget);
+    return CacheLevelStorage::ratioToSlotCountList(
+        quota, slotSizeLists, ratio, granularity, minSlots, secondBudget, fixedSlots);
 }
 
 //! Host-backed pools round to HostMem::sizeGranularity(), not to the device granularity, so the
@@ -2248,7 +2284,8 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::slotCountsForLevel(
 {
     auto const& storage = *mLevels.at(level).storage;
     return CacheLevelStorage::ratioToSlotCountList(quota, storage.slotSizeLists(), ratio,
-        storage.poolSizeGranularity(storage.cacheTier()), _minSlotsFor(level), _secondaryBudget(storage));
+        storage.poolSizeGranularity(storage.cacheTier()), _minSlotsFor(level), _secondaryBudget(storage),
+        level == kHotLevel ? mFixedSlots : FixedSlotCounts{});
 }
 
 size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
@@ -2277,6 +2314,8 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     auto& gpuStorage = *mLevels[kHotLevel].storage;
+    // Fixed groups enter at their fixed slot count, so their target matches their current share and never
+    // requests an adjustment.
     auto slotCountList = slotCountsForLevel(kHotLevel, gpuStorage.roundedNumBytes(gpuStorage.cacheTier()), ratio);
     // All-bytes, each medium in its own grain -- the same measure ratioList() reports, so
     // the target this derives and the layout a rebalance then achieves are comparable. They

@@ -3,16 +3,18 @@
 
 """Process attachment shared by HTTP and OpenEngine serving."""
 
+import contextlib
 import json
 import os
 import selectors
+import socket
 
 # Re-exec the serving CLI with sys.executable and an argument list, without a shell.
 import subprocess  # nosec B404
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
 from tensorrt_llm.llmapi.mpi_session import split_mpi_env
@@ -70,6 +72,7 @@ def _spawn_attached_frontends(
     extra_env: dict[str, str] | None = None,
     cancelled: threading.Event | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
+    affinity_sockets: dict[int, socket.socket] | None = None,
 ) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
@@ -84,6 +87,10 @@ def _spawn_attached_frontends(
     failure (or a missed deadline) fails the whole group, terminating
     the children already started, so num_serve_frontends=K never
     silently degrades to fewer frontends.
+
+    affinity_sockets maps a frontend id to the affinity socket the launcher
+    bound for it (_frontend_affinity_sockets). Each child inherits its own
+    socket; the launcher closes its copy and removes it from the dict.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -113,12 +120,19 @@ def _spawn_attached_frontends(
             read_fd, write_fd = os.pipe()
             ready_fds.append(read_fd)
             env["TLLM_FRONTEND_READY_FD"] = str(write_fd)
+            pass_fds = [write_fd]
+            affinity_sock = (affinity_sockets or {}).pop(frontend_id, None)
+            if affinity_sock is not None:
+                env["TLLM_FRONTEND_AFFINITY_FD"] = str(affinity_sock.fileno())
+                pass_fds.append(affinity_sock.fileno())
             try:
-                child = subprocess.Popen([sys.executable] + sys.argv, env=env, pass_fds=(write_fd,))  # nosec B603
+                child = subprocess.Popen([sys.executable] + sys.argv, env=env, pass_fds=pass_fds)  # nosec B603
             finally:
                 # The child now holds the only write end; its exit before
                 # READY surfaces as EOF on read_fd.
                 os.close(write_fd)
+                if affinity_sock is not None:
+                    affinity_sock.close()
             children.append(child)
             logger.info(f"Launched attached serving frontend {frontend_id} (pid {child.pid})")
         _wait_attached_frontends_ready(children, ready_fds, cancelled, report_failure)
@@ -194,6 +208,117 @@ def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
     fd = int(ready_fd)
     os.write(fd, b"R")
     os.close(fd)
+
+
+def _ephemeral_port_range() -> tuple[int, int] | None:
+    """The kernel's range for automatically assigned local ports, if known."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            low, high = (int(v) for v in f.read().split())
+    except (OSError, ValueError):
+        return None
+    return low, high
+
+
+def _frontend_affinity_ports(port: int, num_frontends: int, stride: int | None) -> list[int]:
+    """Per-frontend affinity ports, empty when affinity is off.
+
+    With serve_frontend_affinity_port_stride=S and num_serve_frontends=K > 1, frontend i
+    (the launcher is 0) also listens on port + S * (i + 1), so a disagg orchestrator can
+    pin a conversation to one frontend and reuse its per-process state.
+    """
+    if stride is None or num_frontends <= 1:
+        return []
+    return [port + stride * (i + 1) for i in range(num_frontends)]
+
+
+def _warn_if_ephemeral(port: int, ports: list[int]) -> None:
+    ephemeral = _ephemeral_port_range()
+    if ephemeral is None or not any(ephemeral[0] <= p <= ephemeral[1] for p in ports):
+        return
+    max_stride = (ephemeral[0] - 1 - port) // len(ports)
+    hint = f"; a stride of at most {max_stride} keeps them below it" if max_stride > 0 else ""
+    logger.warning(
+        f"Frontend affinity ports {ports[0]}-{ports[-1]} overlap the ephemeral "
+        f"port range {ephemeral[0]}-{ephemeral[1]} (net.ipv4.ip_local_port_range). "
+        f"They are bound before the executor starts, but another process on this "
+        f"node can still hold one{hint} (change serve_frontend_affinity_port_stride of the "
+        f"workers and of the disaggregated server's context_servers together)."
+    )
+
+
+def _bind_affinity_port(
+    host: str,
+    affinity_port: int,
+    address_family: int,
+    frontend_id: int,
+    describe_port_holder: Callable[[int], str],
+) -> socket.socket:
+    sock = socket.socket(address_family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, affinity_port))
+    except OSError as e:
+        sock.close()
+        raise RuntimeError(
+            f"Failed to bind the affinity socket of frontend {frontend_id} to "
+            f"{host}:{affinity_port}: {e}. Port holder(s): "
+            f"{describe_port_holder(affinity_port)}"
+        ) from e
+    return sock
+
+
+@contextlib.contextmanager
+def _frontend_affinity_sockets(
+    host: str,
+    port: int,
+    address_family: int,
+    multi_frontend: MultiFrontendMode,
+    port_stride: int | None,
+    describe_port_holder: Callable[[int], str],
+) -> Iterator[tuple[socket.socket | None, dict[int, socket.socket]]]:
+    """Bound affinity sockets for this frontend group, closed on exit.
+
+    Yields this frontend's affinity socket (None when affinity is off) and, in
+    the launcher, the sockets reserved for the attached frontends by frontend id.
+    The launcher binds all K ports before the executor's outgoing connections can
+    take one; an attached frontend adopts the one in TLLM_FRONTEND_AFFINITY_FD.
+    """
+    ports = _frontend_affinity_ports(port, multi_frontend.num_frontends, port_stride)
+    own: socket.socket | None = None
+    reserved: dict[int, socket.socket] = {}
+    try:
+        if ports and multi_frontend.is_attached_frontend:
+            frontend_id = int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"])
+            inherited_fd = os.environ.pop("TLLM_FRONTEND_AFFINITY_FD", None)
+            if inherited_fd is not None:
+                own = socket.socket(fileno=int(inherited_fd))
+                own.set_inheritable(False)
+            else:
+                own = _bind_affinity_port(
+                    host, ports[frontend_id], address_family, frontend_id, describe_port_holder
+                )
+            logger.info(
+                f"Serving frontend {frontend_id} also listens on its own port "
+                f"{own.getsockname()[1]}"
+            )
+        elif ports:
+            _warn_if_ephemeral(port, ports)
+            for frontend_id, affinity_port in enumerate(ports):
+                reserved[frontend_id] = _bind_affinity_port(
+                    host, affinity_port, address_family, frontend_id, describe_port_holder
+                )
+            own = reserved.pop(0)
+            logger.info(
+                f"Serving frontend 0 also listens on its own port {ports[0]}; ports "
+                f"{ports[1]}-{ports[-1]} are reserved for the attached frontends"
+            )
+        yield own, reserved
+    finally:
+        if own is not None:
+            own.close()
+        for sock in reserved.values():
+            sock.close()
 
 
 def _watch_attached_frontends(children: list, interval_s: float = 1.0) -> threading.Event:

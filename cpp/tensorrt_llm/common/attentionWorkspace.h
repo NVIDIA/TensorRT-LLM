@@ -67,7 +67,6 @@ struct AttentionContextWorkspaceSizes
     size_t sageVScale{};
     size_t sageKMean{};
     size_t sageKMeanSum{};
-    size_t cpWorkspace{};
     size_t fmhaMultiCtasKvScratch{};
 };
 
@@ -100,7 +99,6 @@ struct AttentionContextWorkspaceLayout
     WorkspaceSlice sageVScale{};
     WorkspaceSlice sageKMean{};
     WorkspaceSlice sageKMeanSum{};
-    WorkspaceSlice cpWorkspace{};
     WorkspaceSlice fmhaMultiCtasKvScratch{};
     size_t totalSize{};
 };
@@ -135,15 +133,11 @@ struct AttentionContextWorkspaceViews
     float* sageVScale{};
     float* sageKMean{};
     int64_t* sageKMeanSum{};
-    T* gatherInBuffer{};
-    T* gatherOutBuffer{};
-    int* cuCpPartialSeqlens{};
     void* fmhaMultiCtasKvScratch{};
 };
 
 struct AttentionGenerationWorkspaceSizes
 {
-    size_t cpWorkspace{};
     size_t partialOut{};
     size_t partialSum{};
     size_t partialMax{};
@@ -158,7 +152,6 @@ struct AttentionGenerationWorkspaceSizes
 
 struct AttentionGenerationWorkspaceLayout
 {
-    WorkspaceSlice cpWorkspace{};
     WorkspaceSlice partialOut{};
     WorkspaceSlice partialSum{};
     WorkspaceSlice partialMax{};
@@ -172,8 +165,6 @@ struct AttentionGenerationWorkspaceLayout
 template <typename T>
 struct AttentionGenerationWorkspaceViews
 {
-    T* mhaOutput{};
-    T* mhaInput{};
     T* partialOut{};
     float* partialSum{};
     float* partialMax{};
@@ -262,16 +253,14 @@ public:
         layout.sageVScale = nextSlice(offset, sizes.sageVScale, alignment);
         layout.sageKMean = nextSlice(offset, sizes.sageKMean, alignment);
         layout.sageKMeanSum = nextSlice(offset, sizes.sageKMeanSum, alignment);
-        layout.cpWorkspace = nextSlice(offset, sizes.cpWorkspace, alignment);
         layout.fmhaMultiCtasKvScratch = nextSlice(offset, sizes.fmhaMultiCtasKvScratch, alignment);
         layout.totalSize = offset;
         return layout;
     }
 
     template <typename T>
-    static AttentionContextWorkspaceViews<T> materializeContext(void* workspace,
-        AttentionContextWorkspaceLayout const& layout, size_t cpMaxPaddedSequenceLength, int headSize, int numHeads,
-        int numKvHeads)
+    static AttentionContextWorkspaceViews<T> materializeContext(
+        void* workspace, AttentionContextWorkspaceLayout const& layout)
     {
         AttentionContextWorkspaceViews<T> views{};
         views.cublasWorkspace = ptr<void>(workspace, layout.cublasWorkspace);
@@ -301,15 +290,6 @@ public:
         views.sageVScale = ptr<float>(workspace, layout.sageVScale);
         views.sageKMean = ptr<float>(workspace, layout.sageKMean);
         views.sageKMeanSum = ptr<int64_t>(workspace, layout.sageKMeanSum);
-
-        views.gatherInBuffer = ptr<T>(workspace, layout.cpWorkspace);
-        if (views.gatherInBuffer != nullptr)
-        {
-            auto const cpBufferElements
-                = cpMaxPaddedSequenceLength * static_cast<size_t>(headSize) * (numHeads + 2 * numKvHeads);
-            views.gatherOutBuffer = views.gatherInBuffer + cpBufferElements;
-            views.cuCpPartialSeqlens = reinterpret_cast<int*>(views.gatherOutBuffer + cpBufferElements);
-        }
         views.fmhaMultiCtasKvScratch = ptr<void>(workspace, layout.fmhaMultiCtasKvScratch);
         return views;
     }
@@ -319,7 +299,6 @@ public:
     {
         AttentionGenerationWorkspaceLayout layout{};
         size_t offset = 0;
-        layout.cpWorkspace = nextSlice(offset, sizes.cpWorkspace, alignment);
         layout.partialOut = nextSlice(offset, sizes.partialOut, alignment);
         layout.partialSum = nextSlice(offset, sizes.partialSum, alignment);
         layout.partialMax = nextSlice(offset, sizes.partialMax, alignment);
@@ -332,18 +311,10 @@ public:
     }
 
     template <typename T>
-    static AttentionGenerationWorkspaceViews<T> materializeGeneration(void* workspace,
-        AttentionGenerationWorkspaceLayout const& layout, size_t cpMaxPaddedSequenceLength, int numHeads,
-        int numKvHeads, int headSize)
+    static AttentionGenerationWorkspaceViews<T> materializeGeneration(
+        void* workspace, AttentionGenerationWorkspaceLayout const& layout)
     {
         AttentionGenerationWorkspaceViews<T> views{};
-        views.mhaOutput = ptr<T>(workspace, layout.cpWorkspace);
-        if (views.mhaOutput != nullptr)
-        {
-            auto const cpBufferElements
-                = cpMaxPaddedSequenceLength * (numHeads + 2 * numKvHeads) * static_cast<size_t>(headSize);
-            views.mhaInput = views.mhaOutput + cpBufferElements;
-        }
         views.partialOut = ptr<T>(workspace, layout.partialOut);
         views.partialSum = ptr<float>(workspace, layout.partialSum);
         views.partialMax = ptr<float>(workspace, layout.partialMax);

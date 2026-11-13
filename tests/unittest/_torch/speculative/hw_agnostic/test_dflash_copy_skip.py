@@ -23,10 +23,10 @@ def _worker(req_to_slot):
         _graph_dummy_id_floor=1 << 30,
         _dummy_slot=DUMMY_SLOT,
         _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long)),
-        _write_ctx_len=lambda updates: None,
+        _write_ctx_len=lambda updates, base_updates=None: None,
     )
     # Generation requests are already assigned in these tests; prepare assigns nothing.
-    worker._assign_slot = lambda rid: worker._req_to_slot.get(rid)
+    worker._assign_slot = lambda rid, **kwargs: worker._req_to_slot.get(rid)
     return worker
 
 
@@ -103,3 +103,15 @@ def test_an_unchanged_step_enqueues_no_copy(monkeypatch):
     monkeypatch.undo()
     assert copies == []
     assert worker._batch_to_slot_buffer.tensor[:2].tolist() == [1, 2]
+
+
+def test_a_fresh_generation_slot_without_host_positions_raises() -> None:
+    # Request 7 is a generation row with no slot yet, so prepare seeds one at
+    # the row's position; without the host positions it has nothing to seed.
+    worker = _worker({})
+    worker._assign_slot = lambda rid, **kwargs: worker._req_to_slot.setdefault(rid, 3)
+    metadata = _metadata(worker, [7], num_generations=1)
+    metadata.host_position_ids = None
+    metadata.seq_lens = None
+    with pytest.raises(RuntimeError, match="no host positions"):
+        _prepare(metadata, [7], num_generations=1)

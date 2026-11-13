@@ -50,12 +50,7 @@ from ..impl_identity import MOE_IMPL_REGISTRY
 from ..interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode
 from ..moe_op_backend import MoEOpBackend, get_op_backend
 from ..routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod, MiniMaxM2MoeRoutingMethod
-from .identity import (
-    PROVIDER_FLASHINFER,
-    TECHNIQUE_TRTLLM_GEN,
-    TRTLLM_GEN_CAPABILITIES,
-    TRTLLM_GEN_INPUT_REQUIREMENT,
-)
+from .identity import TECHNIQUE_TRTLLM_GEN, TRTLLM_GEN_CAPABILITIES, TRTLLM_GEN_INPUT_REQUIREMENT
 
 
 class TrtllmGenFusedMoEBase(MoEImplBase):
@@ -67,12 +62,12 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     - ``quant`` decides which kernel ``run_moe`` calls, how weights and inputs
       are prepared, and which activation ABI applies. Held by a per-quant class
       in the module named for that kernel ABI -- :mod:`.fp4_block_scale` or
-      :mod:`.fp8_block_scale` -- one per format that two providers share. A
-      format only one provider serves has no such class.
-    - ``provider`` decides which op backend executes, which configurations are
-      eligible, and whether the kernel writes into the caller's workspace. Read
-      off the leaf's own descriptor by ``__init_subclass__`` below, so a leaf
-      is just an identity and a ``can_implement``.
+      :mod:`.fp8_block_scale` -- for the formats that share a runner op. A
+      format on a runner op of its own has no such class.
+    - ``provider`` decides which op backend executes. Every format runs on the
+      native ``trtllm`` provider. Read off the leaf's own descriptor by
+      ``__init_subclass__`` below, so a leaf is just an identity and a
+      ``can_implement``.
 
     One kernel call per forward: routing (unless a leaf routes
     outside it), scatter, gemm1, the fused activation, gemm2, and the combine
@@ -97,17 +92,13 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     #: ``__init__`` builds the op backend from. Derived in
     #: ``__init_subclass__``, not declared per leaf.
     provider: ClassVar[str]
-    #: ``provider == PROVIDER_FLASHINFER``, read from outside as a plain
-    #: attribute by ``ConfigurableMoE`` and the backend tests. Derived with
-    #: ``provider``.
-    use_flashinfer: ClassVar[bool]
     #: Whether this format has a fused cubin for the gpt-oss SwiGLU package
     #: (expert bias plus alpha/beta). Read off the *class* at resolution time,
     #: where there is no instance to ask.
     supports_gptoss_style: ClassVar[bool] = False
     #: Whether this leaf can run SiTu. Per-leaf and not per-format: the format
-    #: needs a fused SiTu FC1 cubin *and* the provider has to call it, so a
-    #: FlashInfer sibling of a supported format may still be False.
+    #: needs a fused SiTu FC1 cubin *and* the provider has to call it, and only
+    #: the native op backend does.
     supports_situ: ClassVar[bool] = False
     #: Whether this format's cubins always read an FC bias, so a model without
     #: one still needs a zeroed buffer. Declarative rather than an override
@@ -129,8 +120,7 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         one source.
 
         Plain class attributes and not properties, because both are read off
-        the *class* -- at resolution, and by ``fused_shared_expert_count``
-        through ``type(self)`` -- where a property yields the descriptor
+        the *class* at resolution, where a property yields the descriptor
         object rather than its value.
 
         Intermediate bases publish no descriptor of their own, having no one
@@ -141,7 +131,6 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         if "descriptor" not in cls.__dict__:
             return
         cls.provider = cls.descriptor.identity.provider
-        cls.use_flashinfer = cls.provider == PROVIDER_FLASHINFER
 
     @staticmethod
     def situ_supported_quant_algos() -> frozenset[QuantAlgo]:
@@ -222,6 +211,9 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
+        # Declared by the model: the FP4 block-scale op tunes for its decode steps
+        # (FP4BlockScaleMoERunner.get_tuning_config).
+        self.decode_tuning = bool(model_config.extra_attrs.get("moe_decode_tuning", False))
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 
@@ -321,10 +313,10 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
             )
 
     def _requires_separated_routing(self) -> bool:
-        """Whether this leaf's kernel takes top-k from the host, not the logits.
+        """Whether this leaf takes top-k from the host, not the logits.
 
         False by default: these cubins route internally from the logits. A
-        leaf whose kernel has no internal routing overrides this.
+        leaf overrides this when it has to route on the host.
         """
         return False
 
@@ -403,10 +395,9 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
         """Whether ``run_moe`` fills a caller-supplied output buffer.
 
-        Only the native provider's runners take an output tensor. A leaf that
-        diverges from its provider overrides this.
+        Every leaf's runner takes an output tensor.
         """
-        return not self.use_flashinfer
+        return True
 
     def _unfinalized(self, outputs: list[torch.Tensor]) -> list[torch.Tensor]:
         """Hand back per-expert outputs for the caller to combine."""

@@ -23,6 +23,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
+from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._frontend_processes import (
     FrontendStartupCancelled,
@@ -101,6 +102,8 @@ class OpenEngineServer:
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        max_media_preparations: Concurrent media preparation requests. Defaults to
+            TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT, or four when unset.
     """
 
     def __init__(
@@ -113,8 +116,15 @@ class OpenEngineServer:
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
         subagent_affinity_auth_key: str | None = None,
+        max_media_preparations: int | None = None,
         metrics: OpenEngineMetrics | None = None,
     ) -> None:
+        if max_media_preparations is None:
+            max_media_preparations = int(
+                os.getenv("TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT", "4")
+            )
+        if type(max_media_preparations) is not int or max_media_preparations < 1:
+            raise ValueError("max_media_preparations must be a positive integer")
         self.host = host
         self.port = port
         self._llm = llm
@@ -148,6 +158,7 @@ class OpenEngineServer:
             metrics=metrics,
             input_executor=self._input_executor,
             media_executor=self._media_executor,
+            max_media_preparations=max_media_preparations,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
@@ -287,14 +298,17 @@ class OpenEngineServer:
                 if self._metrics is not None:
                     await self._metrics.stop()
             finally:
-                await asyncio.gather(
-                    asyncio.to_thread(
-                        self._input_executor.shutdown, wait=True, cancel_futures=True
-                    ),
-                    asyncio.to_thread(
-                        self._media_executor.shutdown, wait=True, cancel_futures=True
-                    ),
-                )
+                try:
+                    await _close_aiohttp_session()
+                finally:
+                    await asyncio.gather(
+                        asyncio.to_thread(
+                            self._input_executor.shutdown, wait=True, cancel_futures=True
+                        ),
+                        asyncio.to_thread(
+                            self._media_executor.shutdown, wait=True, cancel_futures=True
+                        ),
+                    )
         logger.info("OpenEngine server stopped")
 
     async def wait_for_termination(self) -> None:

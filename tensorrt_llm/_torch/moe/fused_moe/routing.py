@@ -5,7 +5,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, Dict, Optional, Type
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
 import torch.nn.functional as F
@@ -13,8 +13,16 @@ from torch import nn
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+if TYPE_CHECKING:
+    from .impl_contract import MoESortTables
+
 # Global cache for perfect router logits shared across MoE modules
 _PERFECT_ROUTER_LOGITS_CACHE = {}
+# Global cache for perfect router expert-id tables shared across MoE modules,
+# keyed by expert geometry, sender rank, token bound and device
+_PERFECT_ROUTER_EXPERT_IDS_CACHE = {}
 
 
 def _get_perfect_router_cache_signature(routing_method):
@@ -234,6 +242,73 @@ def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
         return logits
 
 
+def get_cached_perfect_router_expert_ids(num_tokens: int, num_experts: int,
+                                         experts_per_token: int,
+                                         moe_ep_size: int, ep_rank: int,
+                                         max_num_tokens: int,
+                                         device: torch.device) -> torch.Tensor:
+    """
+    Return perfectly balanced expert ids for ``num_tokens`` local tokens.
+
+    This is the ``ENABLE_PERFECT_ROUTER=expert_ids`` counterpart of
+    ``get_cached_perfect_router_logits``: instead of synthesizing logits for
+    the routing method to consume, it replaces the routed expert ids after
+    routing. It therefore also covers routers whose ids do not come from the
+    logits (DeepSeek-V4 hash layers) and needs no per-token-count planning.
+
+    The ids follow ``FlatTopKPerfectRouterPlanner._get_balanced_expert_indices``:
+    slot ``t * experts_per_token + j``, rotated by ``ep_rank``, goes to EP rank
+    ``slot % moe_ep_size`` and to expert ``(slot // moe_ep_size) %
+    (num_experts // moe_ep_size)`` on it. A slot's expert depends only on its
+    own index, so the ids for ``n`` tokens are the leading ``n`` rows of a
+    longer table. One table of ``max_num_tokens`` rows per geometry, bound and
+    device is built on the first call and never replaced, so CUDA graphs
+    captured later keep reading valid memory. Every call returns a view of its
+    leading rows, with no kernel launch.
+
+    Args:
+        num_tokens: Number of local tokens on the current EP rank.
+        num_experts: Total number of experts across all EP ranks.
+        experts_per_token: Number of experts selected for each token.
+        moe_ep_size: Number of EP ranks.
+        ep_rank: Sender EP rank used to rotate the assignment stream.
+        max_num_tokens: Upper bound on ``num_tokens`` in every call; it sizes
+            the table.
+        device: Device of the routed expert ids.
+
+    Returns:
+        torch.Tensor: Contiguous int32 expert ids of shape
+        ``[num_tokens, experts_per_token]``.
+
+    Raises:
+        ValueError: If ``num_tokens`` exceeds ``max_num_tokens``.
+        RuntimeError: If the table would be built while a CUDA graph is being
+            captured.
+    """
+    if num_tokens > max_num_tokens:
+        raise ValueError(
+            f"ENABLE_PERFECT_ROUTER=expert_ids got {num_tokens} tokens in one "
+            f"MoE call, more than max_num_tokens ({max_num_tokens}), which "
+            "sizes its expert-id table")
+    cache_key = (num_experts, experts_per_token, moe_ep_size, ep_rank,
+                 max_num_tokens, device)
+    table = _PERFECT_ROUTER_EXPERT_IDS_CACHE.get(cache_key)
+    if table is None:
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "ENABLE_PERFECT_ROUTER=expert_ids builds its expert-id table on "
+                "the first MoE call, which must run before CUDA graph capture")
+        table = FlatTopKPerfectRouterPlanner._get_balanced_expert_indices(
+            max_num_tokens, num_experts, experts_per_token, moe_ep_size,
+            ep_rank, device).to(torch.int32)
+        if table.is_cuda:
+            # Other streams, such as the MoE chunking aux stream, read the
+            # table without waiting for the stream that built it.
+            torch.cuda.current_stream(table.device).synchronize()
+        _PERFECT_ROUTER_EXPERT_IDS_CACHE[cache_key] = table
+    return table[:num_tokens]
+
+
 # The type of method in top-K routing, for use in torch custom op
 # Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/moe/trtllmGen/runner.h
 class RoutingMethodType(IntEnum):
@@ -288,6 +363,38 @@ class BaseMoeRoutingMethod(nn.Module):
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support auxiliary routing data")
+
+    def apply_with_sort(
+        self,
+        router_logits: torch.Tensor,
+        local_expert_offset: int,
+        local_num_experts: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, "MoESortTables"]]:
+        """Route with a kernel that also writes ``moe_sort``'s tables.
+
+        Returns ``apply``'s ``(token_selected_experts, token_final_scales)``
+        and the ``moe_sort`` outputs of experts ``[local_expert_offset,
+        local_expert_offset + local_num_experts)``, or ``None`` when no such
+        kernel serves this routing and these logits.
+        """
+        return None
+
+    def serves_with_sort(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        device: torch.device,
+    ) -> bool:
+        """Whether :meth:`apply_with_sort` routes ``num_tokens`` tokens of
+        ``num_experts`` contiguous FP32 router logits on ``device`` for experts
+        ``[local_expert_offset, local_expert_offset + local_num_experts)``.
+
+        Describes eager forwards only: :meth:`apply_with_sort` declines under
+        ``torch.compiler.is_compiling()``, so a compiled graph re-routes
+        through :meth:`apply` and never sees the sorting kernel."""
+        return False
 
     def get_experts_per_token(self) -> int:
         return self.top_k
@@ -509,6 +616,12 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         # Pass a callable to fetch the tensor from DeepseekV3Gate at runtime, ensuring it is on the correct device
         assert callable(callable_e_score_correction_bias)
         self.callable_e_score_correction_bias = callable_e_score_correction_bias
+        # Ungrouped fused top-16 routing has a kernel that also sorts
+        # (``apply_with_sort``).
+        self._sort_kernel_applies = False
+        if IS_CUTLASS_DSL_AVAILABLE and is_fused and n_group == 1 and topk_group == 1:
+            from ..kernels.blackwell import kimi_k3_routing
+            self._sort_kernel_applies = top_k == kimi_k3_routing.TOP_K
 
     def apply(
         self,
@@ -516,6 +629,52 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         input_ids: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.routing_impl.apply(logits, self.e_score_correction_bias)
+
+    def apply_with_sort(
+        self,
+        router_logits: torch.Tensor,
+        local_expert_offset: int,
+        local_num_experts: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, "MoESortTables"]]:
+        """Ungrouped fused top-16 routing of decode batches: the
+        ``noaux_tc_route_sort`` kernel (``kimi_k3_routing.py``), bitwise
+        ``noaux_tc_op`` + ``moe_sort``."""
+        if not self._sort_kernel_applies or torch.compiler.is_compiling():
+            return None
+        from ..kernels.blackwell import kimi_k3_routing
+        from .impl_contract import MoESortTables
+
+        # Decline out-of-scope shapes before the op (the op validates tensors
+        # and raises rather than declining); dtype/alignment still fall to the op.
+        if not kimi_k3_routing.serves(
+                router_logits.shape[0],
+                router_logits.shape[1],
+                local_expert_offset,
+                local_num_experts,
+                router_logits.device,
+        ):
+            return None
+        bias = self.e_score_correction_bias
+        topk_ids, topk_weights, *sort_outputs = torch.ops.trtllm.noaux_tc_route_sort(
+            router_logits, bias, float(self.routing_impl.routed_scaling_factor),
+            local_expert_offset, local_num_experts)
+        return topk_ids, topk_weights, MoESortTables(kimi_k3_routing.TILE_SIZE,
+                                                     tuple(sort_outputs))
+
+    def serves_with_sort(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        device: torch.device,
+    ) -> bool:
+        if not self._sort_kernel_applies:
+            return False
+        from ..kernels.blackwell import kimi_k3_routing
+        return kimi_k3_routing.serves(num_tokens, num_experts,
+                                      local_expert_offset, local_num_experts,
+                                      device)
 
     @property
     def e_score_correction_bias(self) -> torch.Tensor:
@@ -881,6 +1040,11 @@ class SigmoidRenormMoeRoutingMethod(BaseMoeRoutingMethod):
             topk_weights = topk_weights / (
                 topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
         return topk_idx.to(torch.int32), topk_weights.to(self.output_dtype)
+
+    @property
+    def requires_separated_routing(self) -> bool:
+        # The C++ SigmoidRenorm routing always renormalizes the top-k weights.
+        return not self.renormalize
 
     @property
     def routing_method_type(self):

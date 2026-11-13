@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from dataclasses import dataclass, field
 from unittest import TestCase
@@ -66,6 +69,44 @@ def test_python_agent_accepts_topology_without_forwarding_it_to_nixl():
 
     agent_config.assert_called_once_with(enable_prog_thread=False, backends=["UCX"], num_threads=3)
     nixl_agent.assert_called_once_with("testAgent", agent_config.return_value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("outcome", [True, False, RuntimeError("metadata lookup failed")])
+def test_python_check_remote_descs(
+    outcome: bool | RuntimeError,
+) -> None:
+    agent_py = pytest.importorskip(_AGENT_PY_MODULE, exc_type=ImportError)
+    with patch.object(agent_py, "nixl_agent_config"), patch.object(agent_py, "nixl_agent"):
+        agent = agent_py.NixlTransferAgent("testAgent")
+    backend = agent.agent
+    memory_descs = Mock(descs=[(1024, 64, 0)], type="VRAM")
+    converted = backend.get_xfer_descs.return_value
+    if isinstance(outcome, Exception):
+        backend.check_remote_metadata.side_effect = outcome
+    else:
+        backend.check_remote_metadata.return_value = outcome
+
+    if isinstance(outcome, Exception):
+        with pytest.raises(RuntimeError):
+            agent.check_remote_descs("peer", memory_descs)
+    else:
+        assert agent.check_remote_descs("peer", memory_descs) is outcome
+    backend.get_xfer_descs.assert_called_once_with(memory_descs.descs, "VRAM")
+    backend.check_remote_metadata.assert_called_once_with("peer", converted)
+    backend.initialize_xfer.assert_not_called()
+    backend.transfer.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_python_check_remote_descs_rejects_failed_conversion() -> None:
+    agent_py = pytest.importorskip(_AGENT_PY_MODULE, exc_type=ImportError)
+    with patch.object(agent_py, "nixl_agent_config"), patch.object(agent_py, "nixl_agent"):
+        agent = agent_py.NixlTransferAgent("testAgent")
+    agent.agent.get_xfer_descs.return_value = None
+    with pytest.raises(RuntimeError, match="returned None"):
+        agent.check_remote_descs("peer", Mock(descs=[(1024, 64, 0)], type="VRAM"))
+    agent.agent.check_remote_metadata.assert_not_called()
 
 
 def _convert_to_memory_descs(reg_descs: RegMemoryDescs) -> MemoryDescs:
@@ -259,10 +300,47 @@ class TestBindingsNixlTransferStatus(TestCase):
 
     def test_last_status_unavailable_fallback(self):
         # cpp_status without get_last_status*/-> graceful sentinels, no raise.
-        cpp = Mock(spec=[])
+        cpp = Mock(spec=["release"])
         status = BindingsNixlTransferStatus(cpp)
         self.assertEqual(status.last_status(), -1)
         self.assertEqual(status.last_status_str(), "<unavailable>")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _HAS_CPP_NIXL_BINDING, reason="nixl C++ transfer-agent binding unavailable")
+class TestBindingsNixlTransferStatusRelease(TestCase):
+    """Dropping a status releases its request handle through the binding's release().
+
+    The binding releases the GIL in release(); the C++ destructor that runs
+    afterwards does not, so the handle must already be released by then.
+    """
+
+    def test_binding_exposes_release(self):
+        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
+            TransferStatus as CppTransferStatus,
+        )
+
+        self.assertTrue(callable(getattr(CppTransferStatus, "release", None)))
+
+    def test_release_passthrough(self):
+        cpp = Mock()
+        cpp.release.return_value = True
+        status = BindingsNixlTransferStatus(cpp)
+        self.assertTrue(status.release())
+        cpp.release.assert_called_once_with()
+
+    def test_dropping_status_releases_handle(self):
+        cpp = Mock()
+        status = BindingsNixlTransferStatus(cpp)
+        cpp.release.assert_not_called()
+        del status
+        cpp.release.assert_called_once_with()
+
+    def test_dropping_status_without_cpp_status_is_quiet(self):
+        status = BindingsNixlTransferStatus.__new__(BindingsNixlTransferStatus)
+        with patch("sys.unraisablehook") as unraisable:
+            del status
+        unraisable.assert_not_called()
 
 
 @pytest.mark.skipif(not _HAS_CPP_NIXL_BINDING, reason="nixl C++ transfer-agent binding unavailable")

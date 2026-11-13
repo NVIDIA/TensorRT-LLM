@@ -46,6 +46,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
+    DeepseekV4MoE,
     DeepseekV4MTP,
     DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
@@ -606,7 +607,7 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     monkeypatch.setattr(
         DeepseekV4TrtllmAttention,
         "_prepare_sparse_forward_args",
-        lambda self, metadata, forward_args: None,
+        lambda self, metadata, forward_args: forward_args,
     )
     attn = object.__new__(DeepseekV4TrtllmAttention)
     sink = torch.ones(4, dtype=torch.float32)
@@ -676,6 +677,124 @@ def test_deepseek_v4_nvfp4_mixed_precision_config():
         normalized_config.quant_config_dict["model.layers.0.mlp.experts"].quant_algo
         == QuantAlgo.NVFP4
     )
+
+
+@pytest.mark.parametrize(
+    ("quant_config_dict", "exclude_modules", "expected"),
+    [
+        (None, None, True),
+        (
+            {"model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None)},
+            None,
+            False,
+        ),
+        (
+            {"model.layers.4.mlp.shared_experts.down_proj": QuantConfig(quant_algo=None)},
+            None,
+            False,
+        ),
+        (None, ["*shared_experts.gate_up_proj"], False),
+        (None, ["*shared_experts.down_proj"], False),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+                "model.layers.4.mlp.shared_experts.up_proj": QuantConfig(quant_algo=None),
+            },
+            None,
+            True,
+        ),
+        # The actual shared gate/up module is one fused Linear: its first
+        # gate_proj/gate_up_proj override wins and up-only overrides are ignored.
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None),
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+            },
+            None,
+            False,
+        ),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None),
+            },
+            None,
+            True,
+        ),
+        (None, ["*shared_experts.gate_proj"], False),
+        (None, ["*shared_experts.up_proj"], False),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=64
+                ),
+                "model.layers.4.mlp.shared_experts.down_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=64
+                ),
+            },
+            None,
+            False,
+        ),
+    ],
+)
+def test_deepseek_v4_shared_fc12_uses_final_projection_quantization(
+    quant_config_dict, exclude_modules, expected
+):
+    model_config = ModelConfig(
+        pretrained_config=DeepseekV4Config(),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+            group_size=128,
+            exclude_modules=exclude_modules,
+        ),
+        quant_config_dict=quant_config_dict,
+    )
+
+    gate_up_quant, down_quant = DeepseekV4MoE._get_shared_expert_projection_quant_configs(
+        model_config, layer_idx=4
+    )
+
+    assert DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant) is expected
+
+
+@pytest.mark.parametrize(("supported", "expected"), [(False, False), (True, True)])
+def test_deepseek_v4_shared_fc12_uses_backend_capability(supported, expected):
+    backend = SimpleNamespace(
+        capabilities=SimpleNamespace(supports_per_layer_dynamic_eplb=supported)
+    )
+
+    assert DeepseekV4MoE._shared_fc12_backend_supported(backend) is expected
+
+
+def test_deepseek_v4_shared_fc12_rejects_backend_without_capabilities():
+    assert not DeepseekV4MoE._shared_fc12_backend_supported(SimpleNamespace())
+
+
+def test_deepseek_v4_shared_fc12_ignores_up_only_layerwise_override():
+    global_quant_config = QuantConfig(quant_algo=None)
+    fp8_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+    model_config = ModelConfig(
+        pretrained_config=DeepseekV4Config(),
+        quant_config=global_quant_config,
+        quant_config_dict={
+            "model.layers.4.mlp.shared_experts.up_proj": fp8_quant_config,
+            "model.layers.4.mlp.shared_experts.down_proj": fp8_quant_config,
+        },
+    )
+
+    gate_up_quant, down_quant = DeepseekV4MoE._get_shared_expert_projection_quant_configs(
+        model_config, layer_idx=4
+    )
+
+    assert gate_up_quant is global_quant_config
+    assert down_quant is fp8_quant_config
+    assert not DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant)
 
 
 def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):
@@ -1144,6 +1263,40 @@ def test_deepseek_v4_model_config_defaults_to_fp4_indexer(tmp_path, monkeypatch)
     )
 
     assert model_config.sparse_attention_config.indexer_k_dtype == "fp4"
+
+
+@pytest.mark.parametrize("enable_offload", [False, True])
+def test_deepseek_v4_model_config_preserves_sparse_offload(tmp_path, monkeypatch, enable_offload):
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=8,
+        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 128],
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+    offload_options = (
+        {"gpu_cache_factor": 3.0, "host_history_size": 2 * 1024**3} if enable_offload else {}
+    )
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=enable_offload,
+        kv_cache_offload_config=offload_options,
+    )
+
+    resolved = ModelConfig.from_pretrained(
+        str(tmp_path),
+        sparse_attention_config=sparse_config,
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    ).sparse_attention_config
+
+    assert resolved.enable_kv_cache_offload is enable_offload
+    assert resolved.kv_cache_offload_config == sparse_config.kv_cache_offload_config
+    # The checkpoint's eight-layer list overrides the shorter seven-layer default;
+    # its 0 ratios (uncompressed/SWA-only layers) are normalized to 1.
+    assert resolved.compress_ratios == [1, 1, 4, 128, 4, 128, 4, 128]
+    # Resolution creates a new config, leaving the input's seven-layer default unchanged.
+    assert sparse_config.compress_ratios == [1, 1, 4, 128, 4, 128, 4]
 
 
 def test_deepseek_v4_model_config_defaults_to_fp8_before_blackwell(tmp_path, monkeypatch):

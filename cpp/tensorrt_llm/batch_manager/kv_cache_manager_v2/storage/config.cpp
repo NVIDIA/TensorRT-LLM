@@ -22,10 +22,12 @@
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -69,6 +71,11 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
             for (PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
             {
                 auto const& cb = variant.coalescedBuffers[poolIndex];
+                std::unordered_map<LayerId, int> buffersPerLayer;
+                for (auto const& bufId : cb.bufferIds)
+                {
+                    ++buffersPerLayer[bufId.layerId];
+                }
                 size_t offset = 0;
                 for (auto const& bufId : cb.bufferIds)
                 {
@@ -77,7 +84,8 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
                     if (it != expansion.end())
                         exp = it->second;
 
-                    ret[bufId] = BufferAttr{lcId, poolIndex, offset, cb.singleBufferSize, exp};
+                    ret[bufId] = BufferAttr{
+                        lcId, poolIndex, offset, cb.singleBufferSize, exp, buffersPerLayer.at(bufId.layerId)};
                     offset += cb.singleBufferSize;
                 }
             }
@@ -86,63 +94,22 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
     return ret;
 }
 
-std::unordered_map<LayerId, LifeCycleId> StorageConfig::layerToLifeCycleIds() const
+std::unordered_map<LayerId, std::vector<LifeCycleId>> StorageConfig::layerToLifeCycleIds() const
 {
-    std::unordered_map<LayerId, LifeCycleId> map;
+    std::unordered_map<LayerId, std::vector<LifeCycleId>> map;
     for (auto const& [bufId, attr] : bufferAttributes())
     {
-        auto [it, inserted] = map.emplace(bufId.layerId, attr.lifeCycleId);
-        if (!inserted)
+        auto& ids = map[bufId.layerId];
+        if (std::find(ids.begin(), ids.end(), attr.lifeCycleId) == ids.end())
         {
-            TLLM_CHECK_DEBUG(it->second == attr.lifeCycleId);
+            ids.push_back(attr.lifeCycleId);
         }
+    }
+    for (auto& [layerId, ids] : map)
+    {
+        std::sort(ids.begin(), ids.end());
     }
     return map;
-}
-
-std::map<LayerId, LayerAttr> StorageConfig::layerAttributes() const
-{
-    std::map<LayerId, LayerAttr> ret;
-    for (auto const& pg : slotDescList)
-    {
-        for (auto const& variant : pg.variants)
-        {
-            LifeCycleId lcId = variant.lifeCycleId;
-            for (PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
-            {
-                auto const& cb = variant.coalescedBuffers[poolIndex];
-                // Count how many buffers per layer in this coalesced buffer.
-                std::unordered_map<LayerId, int> slotUtilPerLayer;
-                for (auto const& bufId : cb.bufferIds)
-                {
-                    slotUtilPerLayer[bufId.layerId] += 1;
-                }
-                int buffersPerSlot = cb.numBuffers();
-
-                for (auto const& [layerId, count] : slotUtilPerLayer)
-                {
-                    auto it = ret.find(layerId);
-                    if (it == ret.end())
-                    {
-                        LayerAttr attr;
-                        attr.lifeCycleId = lcId;
-                        attr.slotUtil.resize(variant.coalescedBuffers.size(), 0);
-                        attr.slotUtilFracMax = Rational{0, 1};
-                        it = ret.emplace(layerId, std::move(attr)).first;
-                    }
-                    auto& attr = it->second;
-                    TLLM_CHECK_DEBUG(attr.lifeCycleId == lcId);
-                    attr.slotUtil[poolIndex] = count;
-                    Rational frac{count, buffersPerSlot};
-                    if (frac > attr.slotUtilFracMax)
-                    {
-                        attr.slotUtilFracMax = frac;
-                    }
-                }
-            }
-        }
-    }
-    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,24 +134,30 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
     for (auto const& layer : config.layers)
     {
-        LifeCycle lc = makeLifeCycle(layer, tokensPerBlock);
-        LifeCycleId lcId = registry.getId(lc);
+        LayerId const layerId = std::visit([](auto const& cfg) { return cfg.layerId; }, layer);
+        for (auto const& buf : layerBuffers(layer))
+        {
+            LifeCycleId const lcId = registry.getId(makeLifeCycle(layer, buf, tokensPerBlock));
+            int tpbo = buf.tokensPerBlockOverride.value_or(tokensPerBlock);
+            int exp = exactDiv(tokensPerBlock, tpbo);
+            size_t expandedSize = buf.size * static_cast<size_t>(exp);
 
-        std::visit(
-            [&](auto const& cfg)
-            {
-                for (auto const& buf : cfg.buffers)
-                {
-                    int tpbo = buf.tokensPerBlockOverride.value_or(tokensPerBlock);
-                    int exp = exactDiv(tokensPerBlock, tpbo);
-                    size_t expandedSize = buf.size * static_cast<size_t>(exp);
-
-                    BufferId bid{cfg.layerId, buf.role};
-                    expansionMap[bid] = exp;
-                    bufferGroups[lcId][{buf.coalescingGroup, expandedSize, buf.isSparse}].push_back(bid);
-                }
-            },
-            layer);
+            BufferId bid{layerId, buf.role};
+            expansionMap[bid] = exp;
+            bufferGroups[lcId][{buf.coalescingGroup, expandedSize, buf.isSparse}].push_back(bid);
+        }
+    }
+    // Region buffers join their region's lifecycle. Regions admit no tokensPerBlockOverride
+    // and no sparse buffer, so the expansion is 1 and the pool dense.
+    for (int regionIndex = 0; regionIndex < registry.numRegions(); ++regionIndex)
+    {
+        LifeCycleId const lcId = registry.regionLifeCycleId(regionIndex);
+        for (auto const& [layerId, buf] : config.regions[static_cast<size_t>(regionIndex)].buffers)
+        {
+            BufferId bid{layerId, buf.role};
+            expansionMap[bid] = 1;
+            bufferGroups[lcId][{buf.coalescingGroup, buf.size, false}].push_back(bid);
+        }
     }
 
     // Build one SlotDescVariant per life cycle.
@@ -212,35 +185,48 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Distinct reuse policies need separate GPU pools and eviction queues. Keying on
-    // per-pool sparsity too keeps a shared pool uniformly host-backed or device-backed.
+    // Distinct reuse policies need separate GPU pools and eviction queues, except that SINK_REQUIRED_ONLY shares the
+    // REQUIRED ones (effectivePoolReusePolicy explains why). Keying on per-pool sparsity too keeps a shared pool
+    // uniformly host-backed or device-backed. A region with a fixed slot count gets a pool group of its own:
+    // KvCache::resume() gates on each pool group's utilization, so a count that leaves resume headroom for the
+    // region's owners holds only while no other lifecycle shares its slots.
     struct PoolGroupKey
     {
-        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+        ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         std::vector<bool> sparsity;
+        std::optional<int> fixedRegionIndex;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(reusePolicy, slotSizes, sparsity)
-                < std::tie(other.reusePolicy, other.slotSizes, other.sparsity);
+            return std::tie(reusePolicy, slotSizes, sparsity, fixedRegionIndex)
+                < std::tie(other.reusePolicy, other.slotSizes, other.sparsity, other.fixedRegionIndex);
         }
     };
 
     std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroups;
     for (auto& sg : slotGroups)
     {
+        auto const& lifeCycle = registry.getLifeCycle(sg.lifeCycleId);
         auto const sizes = sg.slotSizeList();
-        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
-        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        auto const policy = effectivePoolReusePolicy(lifeCycle);
         TypedVec<PoolIndex, bool> sparsity;
         sparsity.reserve(sizes.size());
         for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
         {
             sparsity.push_back(sg.isSparse(pool));
         }
-        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .sparsity = sparsity.raw()}].push_back(
-            std::move(sg));
+        std::optional<int> fixedRegionIndex;
+        if (auto const* ssm = std::get_if<SsmLifeCycle>(&lifeCycle); ssm != nullptr && ssm->regionIndex.has_value()
+            && config.regions[static_cast<size_t>(*ssm->regionIndex)].fixedSlotCount.has_value())
+        {
+            fixedRegionIndex = ssm->regionIndex;
+        }
+        poolGroups[{.reusePolicy = policy,
+                       .slotSizes = sizes.raw(),
+                       .sparsity = sparsity.raw(),
+                       .fixedRegionIndex = fixedRegionIndex}]
+            .push_back(std::move(sg));
     }
 
     StorageConfig out;
@@ -253,6 +239,9 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         SlotDesc sd;
         sd.variants = std::move(variants);
         out.slotDescList.push_back(std::move(sd));
+        out.fixedSlotCounts.push_back(key.fixedRegionIndex.has_value()
+                ? config.regions[static_cast<size_t>(*key.fixedRegionIndex)].fixedSlotCount
+                : std::nullopt);
     }
 
     // A21: Assert all life_cycle_ids across all SlotDescVariants are unique.

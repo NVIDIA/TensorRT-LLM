@@ -56,12 +56,10 @@ from .test_list_parser import (TestCorrectionMode, apply_waives,
 from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
                                    makedirs, print_info, print_warning,
                                    wsl_to_win_path)
-from .utils.periodic_junit import PeriodicJUnitXML
+from .utils.periodic_junit import (PeriodicJUnitXML,
+                                   register_pytest_timeout_evidence)
 
-try:
-    from llm import trt_environment
-except ImportError:
-    trt_environment = None
+ALL_PYTEST_ITEMS: list[pytest.Item] | None = None
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -180,17 +178,9 @@ def cached_in_llm_models_root(path_relative_to_llm_models_root,
     return wrapper
 
 
-# Fixture about whether the current pipeline is running in TRT environment.
-@pytest.fixture(scope="session")
-def is_trt_environment():
-    return trt_environment is not None
-
-
 # Helper function to get llm_root. Do not define it as a fixture so that this
 # function can be used during test collection phase.
-def get_llm_root(trt_config=None, gitlab_token=None):
-    if trt_environment:
-        return trt_environment.setup_tensorrt_llm_repo(trt_config, gitlab_token)
+def get_llm_root():
     llm_repo_root = os.environ.get("LLM_ROOT", None)
     if llm_repo_root is None:
         llm_repo_root = os.path.dirname(
@@ -301,6 +291,7 @@ def medusa_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="function")
 def deepseek_v3_model_root(request):
     models_root = llm_models_root()
+    deepseek_v3_model_root = ""
     if request.param == "DeepSeek-V3":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3")
     elif request.param == "DeepSeek-V3-Lite-bf16":
@@ -320,6 +311,7 @@ def deepseek_v3_model_root(request):
 @pytest.fixture(scope="function")
 def gpt_oss_model_root(request):
     models_root = os.path.join(llm_models_root(), "gpt_oss")
+    gpt_oss_model_root = ""
     if request.param == "gpt-oss-20b":
         gpt_oss_model_root = os.path.join(models_root, "gpt-oss-20b")
     assert exists(gpt_oss_model_root), f"{gpt_oss_model_root} does not exist!"
@@ -1130,6 +1122,10 @@ def pytest_configure(config):
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
         os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
+    periodic = config.getoption("--periodic-junit", default=False)
+    if periodic:
+        register_pytest_timeout_evidence(config)
+
     # xdist worker processes must not register PeriodicJUnitXML: all worker
     # reports are forwarded to the controller via xdist and processed there,
     # so registering on workers causes concurrent writers to the same
@@ -1138,7 +1134,6 @@ def pytest_configure(config):
         return
 
     # Initialize PeriodicJUnitXML reporter if enabled
-    periodic = config.getoption("--periodic-junit", default=False)
     output_dir = config.getoption("--output-dir", default=None)
     periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
                                               default=None)
@@ -1506,8 +1501,19 @@ def collect_status(item: pytest.Item):
     except Exception:
         gpu_memory = get_gpu_memory_wo_pynvml()
 
-    print("\nCurrent memory status:")
-    print(gpu_memory)
+    # Keep command-line payloads (e.g. python -c scripts) out of routine CI logs.
+    summary = ", ".join(f"GPU{idx}={info['total_used']}/{info['total']}"
+                        for idx, info in sorted(gpu_memory.items()))
+    lines = [f"\nGPU memory after {item.name} (used/total MiB): {summary}"]
+    if any(info["process"] for info in gpu_memory.values()):
+        lines.append("GPU  PID      Program       GPU MiB  Host USS MiB")
+    for idx, info in sorted(gpu_memory.items()):
+        for pid, values in sorted(info["process"].items()):
+            gpu_mib, host_mib, cmdline = values
+            program = os.path.basename(cmdline[0]) if cmdline else "<unknown>"
+            lines.append(f"{idx:<4} {pid:<8} {program:<13} "
+                         f"{gpu_mib:>7}  {host_mib:>12}")
+    print("\n".join(lines))
 
 
 @pytest.hookimpl(wrapper=True)

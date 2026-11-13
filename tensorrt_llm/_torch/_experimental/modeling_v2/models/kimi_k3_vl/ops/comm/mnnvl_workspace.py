@@ -4,7 +4,7 @@
 
 A state type, not an entry: it launches nothing per call. Its constructor is collective and eager, the
 target builds one in ``post_load_weights`` (before any CUDA-graph capture) and passes it to every MNNVL
-one-shot op of that group (``comm/mnnvl_allreduce_attn_res``, and ``trtllm::k3_mnnvl_fusion_allreduce`` given
+one-shot op of that group (``comm/mnnvl_allreduce_attn_res``, and ``mv2_kimi_k3_vl::k3_mnnvl_fusion_allreduce`` given
 the same ``comm_buffer`` / ``buffer_flags``).
 """
 
