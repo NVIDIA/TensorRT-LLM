@@ -7350,6 +7350,10 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
             def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+            // TEMP fault injection for PR validation -- drop before merge.
+            if (stageName == "CPU-Generic-x86-1" && attempt == 1) {
+                attemptPodSpec = attemptPodSpec + [yaml: attemptPodSpec.yaml.replaceFirst(/(?m)^(\s*image:\s*)(\S+)/, '$1$2-faultinject')]
+            }
             trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
