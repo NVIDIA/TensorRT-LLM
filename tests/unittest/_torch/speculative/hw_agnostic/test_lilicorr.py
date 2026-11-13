@@ -7,11 +7,16 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig, Qwen3Config
+from transformers import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_dflash as dflash
 from tensorrt_llm._torch.models import modeling_lilicorr as lili
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+from tensorrt_llm._torch.models.modeling_laguna import LagunaDecoderLayer, LagunaForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.speculative.dflash import (
@@ -285,6 +290,91 @@ def test_laguna_lilicorr_is_rejected() -> None:
             None,
             None,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_laguna_for_causal_lm_forward() -> None:
+    # Dense, ungated full attention has the same mathematics as Qwen3.
+    settings = dict(
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        max_position_embeddings=32,
+        rms_norm_eps=1e-6,
+        rope_scaling=None,
+        rope_theta=10000.0,
+        attention_bias=False,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+    )
+    config = PretrainedConfig(
+        architectures=["LagunaForCausalLM"],
+        num_experts=0,
+        gating=False,
+        layer_types=["full_attention", "full_attention"],
+        **settings,
+    )
+    model_class = get_registered_model_class("LagunaForCausalLM")
+    assert model_class is LagunaForCausalLM
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        reference = (
+            HFQwen3ForCausalLM(Qwen3Config(**settings))
+            .to(device="cuda", dtype=torch.bfloat16)
+            .eval()
+        )
+        model = (
+            model_class(
+                ModelConfig(
+                    pretrained_config=config,
+                    attn_backend="TRTLLM",
+                    max_seq_len=32,
+                    max_num_tokens=8,
+                )
+            )
+            .cuda()
+            .eval()
+        )
+        model.load_weights(reference.state_dict())
+
+    assert isinstance(model, LagunaForCausalLM)
+    assert len(model.model.layers) == 2
+    assert all(isinstance(layer, LagunaDecoderLayer) for layer in model.model.layers)
+
+    input_ids = torch.tensor([[1, 7, 11, 13], [1, 17, 19, 23]], device="cuda", dtype=torch.long)
+    position_ids = torch.arange(4, device="cuda").repeat(2)
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=2,
+        max_num_tokens=8,
+        num_contexts=2,
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        request_ids=[0, 1],
+        position_ids=position_ids,
+    )
+    metadata.max_seq_len = 32
+    metadata.prepare()
+
+    actual_logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids.flatten(),
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    reference_logits = reference(input_ids=input_ids, use_cache=False).logits.reshape(8, 64)
+
+    assert actual_logits.shape == (8, 64)
+    assert actual_logits.dtype == torch.float32
+    assert torch.isfinite(actual_logits).all()
+    torch.testing.assert_close(actual_logits, reference_logits.float(), atol=1e-2, rtol=2e-3)
 
 
 @pytest.mark.usefixtures("lightweight_backbone")
