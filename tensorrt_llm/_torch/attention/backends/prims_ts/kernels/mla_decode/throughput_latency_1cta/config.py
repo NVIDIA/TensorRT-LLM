@@ -34,6 +34,7 @@ from ....split_kv_mode_policy import select_split_kv_modes
 from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.nvfp4_kv import (
     Nvfp4KVConfig,
+    cache_record_size,
     is_sm107_target,
     nvfp4_row_bytes,
 )
@@ -237,6 +238,12 @@ class MlaConfig(Nvfp4KVConfig):
     # whole grid; an early release only moves their launch and prologue onto
     # SMs this grid leaves idle, which crowds them once the grid is large.
     pdl_entry_trigger_max_ctas: int = 0
+    # With use_pdl, a persistent grid whose scales are launch scalars and
+    # whose loaders bind sparse sources without reading them waits after its
+    # prologue (TMA descriptor prefetch, shared-memory carve-out and barrier
+    # initialization, TMEM allocation) instead of at entry, so that prologue
+    # overlaps the preceding grid. Other grids keep the entry wait.
+    pdl_wait_after_prologue: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects
@@ -318,13 +325,42 @@ class MlaConfig(Nvfp4KVConfig):
         """Use independent gather/transform warps with two retained tiles."""
         return self.has_nvfp4_kv and self.whole_kv_tile
 
+    @property
+    def tma_fp8_primary_tiles(self) -> bool:
+        """Gather an FP8 primary pool's tiles straight into the retained whole tile.
+
+        A per-tensor FP8 primary row is already the E4M3 operand, so the loader
+        warps TMA-gather its four 128-byte panels into the retained SW128 tile
+        instead of copying a raw 512-byte record. The raw record ring then holds
+        the NVFP4 extra pool's records only, whose 288-byte stride admits two
+        buffers.
+        """
+        return (
+            self.async_nvfp4_kv_gather
+            and self.kv_cache_format == "fp8"
+            and self.extra_kv_cache_format == "nvfp4"
+            and not self.rope_dim
+        )
+
+    @property
+    def raw_record_stride(self) -> int:
+        """Return the raw SMEM row pitch in bytes, aligned for four-row TMA gathers.
+
+        FP8 primary tiles bypass the raw ring (tma_fp8_primary_tiles), so the
+        extra pool's NVFP4 records size it.
+        """
+        if self.tma_fp8_primary_tiles:
+            return (cache_record_size(self.extra_kv_cache_format, self.rope_dim) + 31) // 32 * 32
+        return Nvfp4KVConfig.raw_record_stride.fget(self)
+
     def raw_record_ring_fits(self) -> bool:
         """Return whether a second 128-row raw record buffer fits in SMEM.
 
-        D512 pure-NVFP4 records (288 B, 36 KiB per buffer) leave room beside
-        the two retained whole tiles. D576 records (352 B, 44 KiB per buffer)
-        take the H64 whole-tile schedule to 264 KB, which fits only SM107's
-        327 KiB. Mixed FP8 sources (512 B records) keep one raw buffer.
+        D512 NVFP4 records (288 B, 36 KiB per buffer) leave room beside the two
+        retained whole tiles, also beside FP8 primary tiles that bypass the raw
+        ring. D576 records (352 B, 44 KiB per buffer) take the H64 whole-tile
+        schedule to 264 KB, which fits only SM107's 327 KiB. Raw 512-byte FP8
+        records keep one raw buffer.
         """
         if self.rope_dim:
             return is_sm107_target() and self.raw_record_stride <= 352
@@ -347,14 +383,15 @@ class MlaConfig(Nvfp4KVConfig):
     def early_raw_snapshot(self) -> bool:
         """Snapshot raw NVFP4 records into registers before acquiring the KV tile.
 
-        Enabled with the two-slot raw ring (pure NVFP4 D512 sources only), so
-        the converter's raw-slot release no longer waits for PV to free a
-        retained whole-tile stage and two gathers stay in flight.
+        Enabled with the two-slot raw ring (D512 NVFP4 records, with FP8 primary
+        tiles gathered straight into the retained tile), so the converter's
+        raw-slot release no longer waits for PV to free a retained whole-tile
+        stage and two gathers stay in flight.
         """
         return (
             self.async_nvfp4_kv_gather
             and self.raw_record_stages == 2
-            and self.kv_cache_format != "fp8"
+            and (self.kv_cache_format != "fp8" or self.tma_fp8_primary_tiles)
         )
 
     @property
@@ -2161,12 +2198,19 @@ def configure_sparse_mla(
     # ~0.3 us (H128 B1-B4: 13.3 -> 13.6 us) and gains nothing. D576 records
     # need SM107's SMEM (raw_record_ring_fits); there the ring makes
     # persistent top-k 2048 decode 5-9% faster (VR200 H12 832 rows: 125.8 ->
-    # 115.6 us; H64: 145.9 -> 132.5 us).
+    # 115.6 us; H64: 145.9 -> 132.5 us). An FP8 primary with an NVFP4 extra
+    # pool gathers its primary tiles straight into the retained tile
+    # (tma_fp8_primary_tiles), so its 288-byte NVFP4 records take the ring too.
+    fp8_primary_tiles = (
+        retained_nvfp4_kv
+        and cfg.kv_cache_format == "fp8"
+        and cfg.extra_kv_cache_format == "nvfp4"
+        and not cfg.rope_dim
+    )
     raw_record_ring = (
         2
         if retained_nvfp4_kv
-        and cfg.raw_record_ring_fits()
-        and cfg.kv_cache_format != "fp8"
+        and (fp8_primary_tiles or (cfg.raw_record_ring_fits() and cfg.kv_cache_format != "fp8"))
         and cfg.use_persistent_scheduler
         else 1
     )

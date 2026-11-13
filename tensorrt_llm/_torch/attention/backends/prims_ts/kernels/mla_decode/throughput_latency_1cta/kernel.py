@@ -100,6 +100,7 @@ from ..helpers.gather import make_sparse_rope_map
 from ..helpers.nvfp4_kv import (
     validate_nvfp4_kv_formats,
     Nvfp4KVConfig,
+    make_fp8_panel_map,
     make_nvfp4_kv_maps,
 )
 from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
@@ -1872,6 +1873,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.coalesce_keeps_output = False
         self.use_pdl = False
         self.pdl_entry_trigger_max_ctas = 0
+        self.pdl_wait_after_prologue = False
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -2070,6 +2072,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cfg,
                 use_pdl=True,
                 pdl_entry_trigger_max_ctas=self.pdl_entry_trigger_max_ctas,
+                pdl_wait_after_prologue=self.pdl_wait_after_prologue,
             )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
@@ -2480,6 +2483,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     primary_format=cfg.kv_cache_format,
                     extra_format=cfg.extra_kv_cache_format,
                 )
+                if cutlass.const_expr(cfg.tma_fp8_primary_tiles):
+                    # Whole-record loaders read no primary scale map. Its slot carries
+                    # the FP8 primary's 128-byte panel map for the loaders' gathers.
+                    tma_desc_v = make_fp8_panel_map(c_latent)
 
         # The WS TMA output stores one correction warp's 32 rows x 64 channels
         # per box. Rows run over heads, then queries, of the public
@@ -2784,7 +2791,21 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
-        if cutlass.const_expr(cfg.use_pdl or acc_o is not None):
+        # A persistent grid binds its sparse sources without reading them, has
+        # no per-CTA activity guard, and takes launch-scalar scales, so nothing
+        # before its task graph reads memory the preceding grid may write.
+        wait_after_prologue = cutlass.const_expr(
+            cfg.use_pdl
+            and cfg.pdl_wait_after_prologue
+            and acc_o is None
+            and tile_sched_params is not None
+            and cfg.use_persistent_scheduler == 1
+            and self.kv_producer is None
+            and not isinstance(softmax_scale_operand, cute.Tensor)
+            and not isinstance(output_scale, cute.Tensor)
+            and not (cfg.sparse_direct and isinstance(sparse_inputs[5], cute.Tensor))
+        )
+        if cutlass.const_expr((cfg.use_pdl or acc_o is not None) and not wait_after_prologue):
             # A PDL launch can start before the preceding grid completes, so
             # every input read below (metadata, Q, KV, sinks) waits for it.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -3068,6 +3089,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
                 thread_count=cfg.threads_per_cta,
             )
+        if cutlass.const_expr(wait_after_prologue):
+            # The prologue above (descriptor and sink prefetches, barrier
+            # initialization, TMEM allocation) overlapped the preceding grid;
+            # every task reads and writes global memory only after this wait.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         task_manager.run()
         if cutlass.const_expr(has_runtime_activity_guard):
             if not run_task_graph and query_tile_is_active:

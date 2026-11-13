@@ -1099,6 +1099,238 @@ def test_prims_ts_mxfp8_output_matches_inverse_rope_mxfp8(
     assert torch.equal(scales, expected_scales)
 
 
+def _run_nvfp4_case(packed, case: dict, *, valid_prefix: bool, groups: int | None = None) -> tuple:
+    """Plan ``swa_fp8`` SWA with NVFP4 MAIN records and run the case once.
+
+    Returns the plan, its BF16 output (or, with ``groups``, its MXFP8 data and scales and
+    the RoPE inputs) and its LSE.
+    """
+    rows, _, heads, _ = case["q"].shape
+    device = case["q"].device
+    max_extra_topk = case["extra_sparse_indices"].shape[1]
+    size = packed.get_packed_sparse_mla_workspace_size(
+        device, rows, heads, max_topk=128, max_extra_topk=max_extra_topk
+    )
+    wrapper = packed.PackedSparseMLA(torch.empty(size, device=device, dtype=torch.uint8))
+    wrapper.plan(
+        device,
+        rows,
+        heads,
+        max_topk=128,
+        max_extra_topk=max_extra_topk,
+        has_sinks=case["sinks"] is not None,
+        swa_cache_format="swa_fp8",
+        main_cache_format="main",
+        valid_prefix=valid_prefix,
+        output_groups=groups,
+    )
+    inputs = {key: value for key, value in case.items() if key != "q"}
+    if groups is None:
+        out = torch.full_like(case["q"], torch.nan)
+        wrapper.run(case["q"], **inputs, softmax_scale=512**-0.5, out=out, validate=True)
+        return wrapper, out, wrapper._state.buffers["lse"].clone()
+    depth = heads * 512 // groups
+    data = torch.full((groups, rows, depth), 0x7F, device=device, dtype=torch.uint8)
+    scales = torch.full(
+        ((groups * ((rows + 127) // 128 * 128) * depth) // 32,),
+        0xAB,
+        device=device,
+        dtype=torch.uint8,
+    )
+    positions = torch.randint(0, 1000, (rows,), device=device, dtype=torch.int32)
+    cos_sin = _rope_table(device, 1000)
+    wrapper.run(
+        case["q"],
+        **inputs,
+        softmax_scale=512**-0.5,
+        out=None,
+        validate=True,
+        output_quant=(data.view(torch.float8_e4m3fn), scales, positions, cos_sin),
+    )
+    return wrapper, (data, scales, positions, cos_sin), wrapper._state.buffers["lse"].clone()
+
+
+@pytest.mark.parametrize("band", ["small", "one_wave", "persistent", "multi_tile"])
+@pytest.mark.parametrize("has_sinks", [True, False])
+@torch.inference_mode()
+def test_prims_ts_nvfp4_main_matches_packed_producer(band: str, has_sinks: bool) -> None:
+    """The native NVFP4 MAIN kernel decodes each selected MAIN record exactly as the producer.
+
+    It serves valid-prefix 64-head plans over E4M3 SWA rows and NVFP4 MAIN records, below
+    half a wave of rows on the half-wave schedule of one CTA per row. The producer divides
+    such grids across KV splits, so those rows are checked against the leading rows of a
+    one-wave producer plan, whose rows each take one CTA.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    one_wave = 140
+    rows = {
+        "small": 8,
+        "one_wave": one_wave,
+        "persistent": sm_count + 1,
+        "multi_tile": 4 * sm_count + 3,
+    }[band]
+    # Every E2M1 payload nibble and E4M3 group scale, saturating products included.
+    main = _pool("main", 288, 200)
+    case = _gather_case(max(rows, one_wave), 64, True, has_sinks, _pool("swa_fp8", 512, 300), main)
+    produced, expected, expected_lse = _run_nvfp4_case(packed, case, valid_prefix=False)
+    if rows < one_wave:
+        per_row = ("q", "swa_indices", "swa_lengths", "extra_sparse_indices", "extra_sparse_lens")
+        case = {key: value[:rows] if key in per_row else value for key, value in case.items()}
+        expected, expected_lse = expected[:rows], expected_lse[:rows]
+    fused, out, lse = _run_nvfp4_case(packed, case, valid_prefix=True)
+    assert fused._state.nvfp4 is not None and produced._state.nvfp4 is None
+    assert produced._state.split_kv == 1
+    assert fused._state.compiled is None
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+    assert fused._state.nvfp4.split_kv == 1
+
+
+@pytest.mark.parametrize("band", ["one_wave", "persistent"])
+@torch.inference_mode()
+def test_prims_ts_nvfp4_main_mxfp8_output_matches_inverse_rope_mxfp8(band: str) -> None:
+    """The NVFP4 MAIN kernel's fused MXFP8 output equals inverse_rope_mxfp8 of its BF16 output."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import inverse_rope_mxfp8
+
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    rows = {"one_wave": 140, "persistent": 2 * sm_count + 37}[band]
+    case = _gather_case(rows, 64, True, True, _pool("swa_fp8", 512, 300), _pool("main", 288, 200))
+    _, bf16, _ = _run_nvfp4_case(packed, case, valid_prefix=True)
+    wrapper, (data, scales, positions, cos_sin), _ = _run_nvfp4_case(
+        packed, case, valid_prefix=True, groups=8
+    )
+    assert wrapper._state.nvfp4 is not None
+    assert torch.isfinite(bf16).all()
+    expected, expected_scales = inverse_rope_mxfp8(bf16.view(rows, 64 * 512), positions, cos_sin, 8)
+    assert torch.equal(data, expected.view(torch.uint8))
+    assert torch.equal(scales, expected_scales)
+
+
+@pytest.mark.parametrize(("swa_stride", "main_stride"), [(1024, 288), (512, 304)])
+@torch.inference_mode()
+def test_prims_ts_nvfp4_main_plan_reads_padded_pools_with_producer(
+    swa_stride: int, main_stride: int
+) -> None:
+    """Pools that are not dense records of their format take the producer kernel."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    case = _gather_case(
+        140, 64, True, True, _pool("swa_fp8", swa_stride, 300), _pool("main", main_stride, 200)
+    )
+    fused, out, _ = _run_nvfp4_case(packed, case, valid_prefix=True)
+    _, expected, _ = _run_nvfp4_case(packed, case, valid_prefix=False)
+    assert fused._state.nvfp4 is not None and set(fused._packed) == {True}
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_prims_ts_nvfp4_main_admission() -> None:
+    """64-head plans with MAIN rows decode MAIN records in the kernel on the native one-CTA
+    Keep-AB schedule of a single split and V owner, which also fuses the MXFP8 output;
+    grids below half a wave take the half-wave schedule instead of a divided one."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    device = torch.device("cuda", 0)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    capability = packed._compute_capability(device)
+    for rows in (1, 8, 32, sm_count // 2 - 1, sm_count // 2 + 1, 140, sm_count + 1, 1252, 8064):
+        assert packed.decodes_nvfp4_main(device, rows, 64, 128, 512), rows
+        assert packed.decodes_nvfp4_main(device, rows, 64, 128, 512, quantized_output=True), rows
+        profile = packed._select_nvfp4_profile(rows, 64, 640, sm_count, capability)
+        assert (profile.family, profile.split_kv, profile.head_dim_ctas) == ("keep", 1, 1), rows
+    assert not packed.decodes_nvfp4_main(device, 1252, 16, 128, 512)
+    assert not packed.decodes_nvfp4_main(device, 1252, 64, 128, 0)
+
+
+@pytest.mark.parametrize("route", ["nvfp4", "gather"])
+@torch.inference_mode()
+def test_prims_ts_dependent_launch_reads_after_preceding_writer(
+    route: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A programmatic dependent attention launch reads its inputs only after the kernel before it.
+
+    Persistent NVFP4 MAIN and WS gather grids prepare their barriers and TMEM while that kernel
+    still runs. In a CUDA graph, one large copy whose last bytes are the MAIN selections directly
+    precedes the attention, which matches the same attention launched without PDL bit for bit.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows = torch.cuda.get_device_properties(device).multi_processor_count + 1
+    main_format = "main" if route == "nvfp4" else "main_fp8"
+    main = _pool(main_format, 288 if route == "nvfp4" else 512, 200)
+    case = _gather_case(rows, 64, True, True, _pool("swa_fp8", 512, 300), main)
+    stale = case["extra_sparse_indices"]
+    width = stale.shape[1]
+    fresh = torch.where(stale >= 0, (stale + 7) % main.shape[0], stale)
+
+    def plan(enabled: bool):
+        monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1" if enabled else "0")
+        launch = packed._resolve_launch(
+            device,
+            rows,
+            64,
+            128,
+            width,
+            "swa_fp8",
+            main_cache_format=main_format,
+            valid_prefix=True,
+        )
+        kernel = (launch.nvfp4 if route == "nvfp4" else launch.gather).spec.kernel
+        assert kernel.use_pdl == enabled and kernel.pdl_wait_after_prologue == enabled
+        size = packed.get_packed_sparse_mla_workspace_size(
+            device, rows, 64, max_topk=128, max_extra_topk=width
+        )
+        wrapper = packed.PackedSparseMLA(torch.empty(size, device=device, dtype=torch.uint8))
+        wrapper.plan(
+            device,
+            rows,
+            64,
+            max_topk=128,
+            max_extra_topk=width,
+            has_sinks=True,
+            swa_cache_format="swa_fp8",
+            main_cache_format=main_format,
+            valid_prefix=True,
+        )
+        assert getattr(wrapper._state, route) is not None
+        return wrapper
+
+    def run(wrapper, indices, out):
+        inputs = {key: value for key, value in case.items() if key != "q"}
+        inputs["extra_sparse_indices"] = indices
+        wrapper.run(case["q"], **inputs, softmax_scale=512**-0.5, out=out, validate=False)
+
+    reference = plan(False)
+    expected = torch.full_like(case["q"], torch.nan)
+    run(reference, fresh, expected)
+    expected_lse = reference._state.buffers["lse"].clone()
+
+    dependent = plan(True)
+    # The selections are the last bytes a 256 MiB copy writes.
+    filler = 1 << 26
+    storage = torch.empty(filler + fresh.numel(), device=device, dtype=fresh.dtype)
+    source = torch.cat((torch.zeros(filler, device=device, dtype=fresh.dtype), fresh.flatten()))
+    indices = storage[filler:].view(fresh.shape)
+    out = torch.full_like(case["q"], torch.nan)
+    indices.copy_(stale)
+    run(dependent, indices, out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        storage.copy_(source)
+        run(dependent, indices, out)
+    for _ in range(3):
+        indices.copy_(stale)
+        out.fill_(torch.nan)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        torch.testing.assert_close(dependent._state.buffers["lse"], expected_lse, atol=0, rtol=0)
+
+
 @torch.inference_mode()
 def test_prims_ts_mxfp8_output_plan_contract() -> None:
     """Only single-split, single-V-CTA plans store MXFP8, and their run takes no BF16 output.
@@ -1479,7 +1711,10 @@ def test_prims_ts_selection_bank_attention_matches_packed(rows: int) -> None:
             has_sinks=True,
             swa_cache_format="swa_fp8",
             main_cache_format=main_format,
-            valid_prefix=True,
+            # Valid-prefix NVFP4 plans of 64 heads take the native NVFP4 kernel
+            # (test_prims_ts_nvfp4_main_matches_packed_producer); without the promise
+            # the producer decodes the MAIN records.
+            valid_prefix=main_format == "main_fp8",
         )
         plans[main_format] = packed
     q = (torch.randn((rows, 1, heads, 512), device=device) * 0.125).bfloat16()

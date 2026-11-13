@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -28,6 +30,11 @@ def _compact_kernel() -> type:
     import cutlass
     import cutlass.cute as cute
     from cutlass import Int32, Int64, Uint32, Uint64
+
+    from tensorrt_llm._torch.kernels.blackwell.utils import (
+        griddepcontrol_launch_dependents,
+        griddepcontrol_wait,
+    )
 
     def _min(a, b):
         return cutlass.select_(a < b, a, b)
@@ -77,6 +84,8 @@ def _compact_kernel() -> type:
         bank decode, as ``_prims_ts_bank.dedup_main_records`` claims: the slot keeps the
         largest ``tag | (2^31 - 1 - f)``, so the smallest flat selection ``f`` of this
         call reading the row, where ``tag`` is the epoch after the device's current one.
+        Without ``writes_main`` only the SWA list is written; the MAIN list and its
+        lengths keep their contents.
         """
 
         def __init__(
@@ -86,22 +95,28 @@ def _compact_kernel() -> type:
             main_width: int,
             main_capacity: int,
             has_main: bool,
+            writes_main: bool,
             mapped: bool,
             bank: bool,
             page_size: int,
             marks: bool,
             claim: bool,
+            use_pdl: bool,
         ) -> None:
+            if has_main and not writes_main:
+                raise ValueError("CSA2 PrimTS compaction reads MAIN selections only to write them")
             self.swa_width = swa_width
             self.swa_capacity = swa_capacity
             self.main_width = main_width
             self.main_capacity = main_capacity
             self.has_main = has_main
+            self.writes_main = writes_main
             self.mapped = mapped
             self.bank = bank
             self.page_size = page_size
             self.marks = marks
             self.claim = claim
+            self.use_pdl = use_pdl
 
         @cute.jit
         def _claim(self, owners, tag, row, column, record):
@@ -152,6 +167,12 @@ def _compact_kernel() -> type:
         ) -> None:
             lane = cute.arch.lane_idx()
             row = cute.arch.block_idx()[0] * Int32(_WARPS) + cute.arch.warp_idx()
+            if cutlass.const_expr(self.use_pdl):
+                # Selections, tables and owner slots may still be written by the
+                # preceding kernel; the attention that reads these lists waits for
+                # this whole grid, so it may launch now.
+                griddepcontrol_wait()
+                griddepcontrol_launch_dependents()
             if row < num_rows:
                 below = cute.arch.lanemask_lt()
                 swa_chunks = (self.swa_width + 31) // 32
@@ -271,7 +292,8 @@ def _compact_kernel() -> type:
                                 if cutlass.const_expr(self.claim):
                                     self._claim(owners, tag, row, column, value)
                             extra = extra + cute.arch.popc(ballot)
-                self._finish(extra_compact, extra_lengths, row, lane, extra, self.main_capacity)
+                if cutlass.const_expr(self.writes_main):
+                    self._finish(extra_compact, extra_lengths, row, lane, extra, self.main_capacity)
 
         @cute.jit
         def __call__(
@@ -329,6 +351,7 @@ def _compact_kernel() -> type:
                 grid=((num_rows + Int32(_WARPS - 1)) // Int32(_WARPS), 1, 1),
                 block=(32 * _WARPS, 1, 1),
                 stream=stream,
+                use_pdl=self.use_pdl,
             )
 
     return _Compact
@@ -346,11 +369,13 @@ def _compiled(key: tuple) -> "Callable[..., object]":
         main_width,
         main_capacity,
         has_main,
+        writes_main,
         mapped,
         bank,
         page_size,
         marks,
         claim,
+        use_pdl,
     ) = key
     element = {torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}
 
@@ -388,11 +413,13 @@ def _compiled(key: tuple) -> "Callable[..., object]":
             main_width,
             main_capacity,
             has_main,
+            writes_main,
             mapped,
             bank,
             page_size,
             marks,
             claim,
+            use_pdl,
         ),
         matrix(swa),
         matrix(main),
@@ -444,6 +471,7 @@ def prepare_prims_ts_metadata(
     main_bank: "CSA2PrimsTSMainBank | None" = None,
     marks: torch.Tensor | None = None,
     claims: tuple[torch.Tensor, torch.Tensor] | None = None,
+    swa_only: bool = False,
 ) -> None:
     """Refresh two compact lists without allocations or host tensor reads.
 
@@ -462,6 +490,10 @@ def prepare_prims_ts_metadata(
     every kept MAIN pool row claim its owner slot for the next
     ``dedup_main_records(..., claimed=True)`` over ``prepared.extra_indices``, which must
     then be contiguous: flat selection ``r * width + c`` is its entry ``[r, c]``.
+
+    With ``swa_only``, only the SWA list and its lengths are refreshed: the MAIN list keeps
+    what the last compaction into ``prepared`` wrote, for a layer whose MAIN selections,
+    pool and page table are that compaction's. It takes no bank, marks or claims.
     """
     rows, swa_capacity = prepared.indices.shape
     main_capacity = prepared.extra_indices.shape[1]
@@ -471,12 +503,14 @@ def prepare_prims_ts_metadata(
     if inputs.swa_pool is None or inputs.swa_pool.device != device:
         raise ValueError("CSA2 SWA pool must be on the compact metadata device")
     _validate_indices(inputs.swa_indices, rows, swa_capacity, device, "SWA")
-    has_main = inputs.topk_indices is not None
+    if swa_only and (main_bank is not None or marks is not None or claims is not None):
+        raise ValueError("CSA2 PrimTS SWA-only compaction takes no MAIN bank, marks or claims")
+    has_main = inputs.topk_indices is not None and not swa_only
     if has_main:
         if inputs.main_pool is None or inputs.main_pool.device != device:
             raise ValueError("CSA2 MAIN selections require a pool on the compact metadata device")
         _validate_indices(inputs.topk_indices, rows, main_capacity, device, "MAIN")
-    mapping = inputs.main_mapping
+    mapping = None if swa_only else inputs.main_mapping
     if mapping is not None:
         if not has_main:
             raise ValueError("CSA2 MAIN mapping requires logical MAIN selections")
@@ -586,11 +620,13 @@ def prepare_prims_ts_metadata(
         main.shape[1] if reads_main else 0,
         main_capacity,
         reads_main,
+        not swa_only,
         mapped,
         mapped and main_bank is not None,
         page_size if mapped else 1,
         marked,
         claimed,
+        get_env_enable_pdl(),
     )
     _compiled(key)(
         inputs.swa_indices,

@@ -365,6 +365,25 @@ def make_whole_record_map(pool, record_bytes: cutlass.Constexpr[int]):
 
 
 @cute.jit
+def make_fp8_panel_map(pool):
+    """Describe a per-tensor FP8 pool's rows as 128-byte SW128 panel boxes for gather4.
+
+    ``pool`` is the internal [1, 512, physical_rows] byte view. One box is one
+    row's 128 consecutive channels, landing in the MMA's K-major swizzle."""
+    data = cute.make_tensor(
+        pool.iterator,
+        cute.make_layout((512, pool.shape[2]), stride=(1, pool.stride[2])),
+    )
+    return create_tensor_map_tiled_from_view(
+        data,
+        box_dims=(128, 1),
+        stride_order=(0, 1),
+        swizzle=cuda.TensorMapSwizzle.s128b,
+        l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+    )
+
+
+@cute.jit
 def make_nvfp4_kv_maps(
     primary,
     extra,
@@ -869,6 +888,28 @@ def convert_nvfp4_record(
         stage_bytes=stage_bytes,
         rope_dim=rope_dim,
     )
+
+
+@cute.jit
+def gather_fp8_tile(dst, panel_map, barrier, cached, base, warp, *, rows: cutlass.Constexpr[int]):
+    """TMA-gather this warp's rows of unchanged FP8 primary bytes into four retained panels.
+
+    Warp ``warp`` owns rows ``[warp * rows, (warp + 1) * rows)`` of the tile, whose
+    register-cached quads ``cached[base:base + 4]`` its first ``rows // 4`` lanes
+    hold. Panel ``p`` (16 KiB) takes channels ``[128 p, 128 p + 128)``. The
+    gathers complete ``rows * 512`` bytes on ``barrier``, the tile's full barrier."""
+    for panel in cutlass.range_constexpr(4):
+        gather_cached(
+            dst + Int32(panel * 16384) + warp * Int32(rows * 128),
+            panel_map,
+            panel_map,
+            Int32(panel * 128),
+            barrier,
+            cached,
+            base,
+            rows=rows,
+            width=128,
+        )
 
 
 @cute.jit

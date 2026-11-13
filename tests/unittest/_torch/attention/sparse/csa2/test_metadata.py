@@ -760,6 +760,23 @@ def test_prims_ts_metadata_plan_cache_reuse_and_workspace(
             )
             torch.testing.assert_close(indices.cpu(), expected, atol=0, rtol=0)
             assert lengths.tolist() == [len(values) for values in selected]
+        # A SWA-only refresh rewrites the SWA list alone; the MAIN list keeps its contents.
+        main_list = (compact.extra_indices.clone(), compact.extra_lengths.clone())
+        selection.fill_(-1)
+        selection[:, 3] = torch.arange(rows, device="cuda")
+        prepare_prims_ts_metadata(inputs, compact, swa_only=True)
+        assert compact.lengths.tolist() == [1] * rows
+        assert compact.indices[:, 0].tolist() == list(range(rows))
+        assert bool((compact.indices[:, 1:] == -1).all())
+        torch.testing.assert_close(compact.extra_indices, main_list[0], atol=0, rtol=0)
+        torch.testing.assert_close(compact.extra_lengths, main_list[1], atol=0, rtol=0)
+        with pytest.raises(ValueError, match="SWA-only"):
+            prepare_prims_ts_metadata(
+                inputs,
+                compact,
+                marks=torch.zeros(1, device="cuda", dtype=torch.uint8),
+                swa_only=True,
+            )
         selection.fill_(-1)
         inputs.main_pool = inputs.topk_indices = inputs.main_mapping = None
         prepare_prims_ts_metadata(inputs, compact)

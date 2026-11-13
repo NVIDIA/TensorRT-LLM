@@ -491,14 +491,16 @@ def test_prims_ts_selection_bank_claims_in_compaction(
 
     The bank decode launches no claim kernel of its own, and the attention matches the
     selection bank without deduplication bit for bit. With final selections, both
-    decodes run on the compaction's side stream.
+    decodes run on the compaction's side stream. The native NVFP4 MAIN kernel, which
+    needs no bank, is held off.
     """
     from dataclasses import replace
 
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_bank
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_bank, _prims_ts_packed
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _forbid_prims_ts_staging(monkeypatch)
+    monkeypatch.setattr(_prims_ts_packed, "decodes_nvfp4_main", lambda *args, **kwargs: False)
     decodes = []
     dedup, plain_decode = _prims_ts_bank.dedup_main_records, _prims_ts_bank.decode_main_records
 
@@ -544,6 +546,243 @@ def test_prims_ts_selection_bank_claims_in_compaction(
     torch.testing.assert_close(deduplicated, plain, atol=0, rtol=0)
     assert [(kind, claimed) for kind, claimed, _ in decodes] == [("dedup", True), ("plain", False)]
     assert all((stream != model_stream) == early for _, _, stream in decodes)
+
+
+@skip_prims_ts_unsupported
+@pytest.mark.parametrize(
+    ("early", "band"),
+    [(False, "below"), (True, "below"), (True, "limit")],
+    ids=["serial", "early-selection", "early-selection-limit"],
+)
+@torch.inference_mode()
+def test_prims_ts_generation_decodes_nvfp4_main_in_kernel(
+    early: bool, band: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 64-head generation tile over E4M3 SWA rows reads its NVFP4 MAIN records in the kernel.
+
+    No selection bank is decoded, except for a tile of fewer than
+    ``_EARLY_SELECTION_BANK_ROWS`` rows whose selections are final before its projections,
+    which keeps it. Either way the attention matches the selection bank's bit for bit.
+    """
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import (
+        _prims_ts_bank,
+        _prims_ts_packed,
+        prims_ts,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _forbid_prims_ts_staging(monkeypatch)
+    decodes = []
+    for name in ("dedup_main_records", "decode_main_records"):
+        original = getattr(_prims_ts_bank, name)
+
+        def record(*args, _original=original, _name=name, **kwargs):
+            decodes.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(_prims_ts_bank, name, record)
+    torch.manual_seed(509)
+    count = {"below": 192, "limit": prims_ts._EARLY_SELECTION_BANK_ROWS}[band]
+    heads = 64
+    attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype="fp8")
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+    main = torch.randn(count, 512, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
+    main_valid = torch.ones(count, 512, device="cuda", dtype=torch.bool)
+    swa_valid[:, 1::7] = False
+    main_valid[:, 2::13] = False
+    sink = torch.linspace(-1.0, 1.0, heads, device="cuda")
+    args = _inputs(
+        q, swa, main, swa_valid, main_valid, sink, swa_cache_format=attn.swa_cache_format
+    )
+    if early:
+        ready = torch.cuda.Event()
+        ready.record()
+        args = replace(
+            args, sparse_backend_args=replace(args.sparse_backend_args, selection_ready=ready)
+        )
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 512, kv_input_mode="packed")
+    routed = _helper_forward(attn, q.flatten(1), metadata, args).clone()
+    keeps_bank = early and band == "below"
+    assert decodes == (["dedup_main_records"] if keeps_bank else [])
+    monkeypatch.setattr(_prims_ts_packed, "decodes_nvfp4_main", lambda *args, **kwargs: False)
+    banked = _helper_forward(attn, q.flatten(1), metadata, args)
+    assert decodes == ["dedup_main_records"] * (2 if keeps_bank else 1)
+    torch.testing.assert_close(routed, banked, atol=0, rtol=0)
+
+
+@skip_prims_ts_unsupported
+@pytest.mark.parametrize("route", ["nvfp4", "bank", "hybrid"])
+@torch.inference_mode()
+def test_prims_ts_group_layers_share_main_compaction(
+    route: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Layers of one staging group compact their MAIN selections and decode their bank once.
+
+    Three layers read one MAIN pool through the same selections, each with its own SWA
+    rows. After the group's first compaction (and selection bank decode, where the layers
+    read one), the others of the forward compact only their SWA rows, on either stream,
+    and match their own full compaction bit for bit. ``nvfp4``: every tile decodes NVFP4
+    MAIN in the kernel, the later two from final selections on the side stream. ``bank``:
+    every tile reads one selection bank on the model stream, also replayed from a CUDA
+    Graph over changed inputs. ``hybrid``: the index source decodes NVFP4 MAIN and its
+    Reuse layers keep the selection bank, so the first of them still decodes it. A new
+    forward, or another group's compaction in between, compacts again.
+    """
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import (
+        _prims_ts_bank,
+        _prims_ts_metadata,
+        _prims_ts_packed,
+        prims_ts,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
+
+    _forbid_prims_ts_staging(monkeypatch)
+    compactions, decodes = [], []
+    compact = _prims_ts_metadata.prepare_prims_ts_metadata
+
+    def record_compaction(*args, **kwargs):
+        compactions.append(kwargs.get("swa_only", False))
+        return compact(*args, **kwargs)
+
+    monkeypatch.setattr(_prims_ts_metadata, "prepare_prims_ts_metadata", record_compaction)
+    for name in ("dedup_main_records", "decode_main_records"):
+        original = getattr(_prims_ts_bank, name)
+
+        def record_decode(*args, _original=original, **kwargs):
+            decodes.append(torch.cuda.current_stream())
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(_prims_ts_bank, name, record_decode)
+    if route == "nvfp4":
+        monkeypatch.setattr(prims_ts, "_EARLY_SELECTION_BANK_ROWS", 1)
+    elif route == "bank":
+        monkeypatch.setattr(_prims_ts_packed, "decodes_nvfp4_main", lambda *args, **kwargs: False)
+    torch.manual_seed(521)
+    count, heads, layers = 192, 64, 3
+    attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype="fp8")
+    swa_format = attn.swa_cache_format
+    sink = torch.linspace(-1.0, 1.0, heads, device="cuda")
+    main_ids = torch.arange(count * 512, device="cuda").view(count, 512)
+
+    def main_selections(seed: int) -> torch.Tensor:
+        valid = torch.ones(count, 512, device="cuda", dtype=torch.bool)
+        valid[:, seed % 13 :: 13] = False
+        return torch.where(valid, main_ids, -1)
+
+    main_pool = pack_rows(torch.randn(count * 512, 512, device="cuda").bfloat16(), "main")
+    topk = main_selections(2)
+    queries = [torch.randn(count, heads * 512, device="cuda").bfloat16() for _ in range(layers)]
+    swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
+    layer_args = []
+    for layer in range(layers):
+        swa_valid[:, layer + 1 :: 7] = False
+        swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+        args = _inputs(
+            queries[layer].view(count, heads, 512),
+            swa,
+            None,
+            swa_valid.clone(),
+            None,
+            sink,
+            swa_cache_format=swa_format,
+        )
+        args.sparse_backend_args = replace(
+            args.sparse_backend_args, main_pool=main_pool, topk_indices=topk
+        )
+        args.output = torch.empty(count, heads * 512, device="cuda", dtype=torch.bfloat16)
+        layer_args.append(args)
+    # Later layers of the nvfp4 and hybrid groups have final selections before their projections.
+    early = [False] + [route != "bank"] * (layers - 1)
+    source = SimpleNamespace(csa2_indices={}, _csa2_stage_epoch=1)
+    group = [(1, 1, 0)]
+    prepare = attn.prepare_sparse_inputs
+
+    def grouped_inputs(q, metadata, forward_args):
+        # The module resolves each layer's staging group and forward state.
+        return replace(
+            prepare(q, metadata, forward_args),
+            stage_group=group[0],
+            state=None if group[0] is None else SimpleNamespace(metadata=source),
+        )
+
+    monkeypatch.setattr(attn, "prepare_sparse_inputs", grouped_inputs)
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        queries[0].view(count, heads, 512), 512, kv_input_mode="packed"
+    )
+
+    def run(layer: int) -> torch.Tensor:
+        args = layer_args[layer]
+        if early[layer]:
+            ready = torch.cuda.Event()
+            ready.record()
+            args = replace(
+                args, sparse_backend_args=replace(args.sparse_backend_args, selection_ready=ready)
+            )
+        return _helper_forward(attn, queries[layer], metadata, args)
+
+    def references() -> list[torch.Tensor]:
+        group[0] = None
+        try:
+            return [run(layer).clone() for layer in range(layers)]
+        finally:
+            group[0] = (1, 1, 0)
+
+    def new_forward() -> None:
+        source.csa2_indices = {}
+        source._csa2_stage_epoch += 1
+
+    expected = references()
+    compactions.clear()
+    decodes.clear()
+    for layer in range(layers):
+        torch.testing.assert_close(run(layer), expected[layer], atol=0, rtol=0)
+    first_reuse = 2 if route == "hybrid" else 1
+    assert compactions == [layer >= first_reuse for layer in range(layers)]
+    if route == "nvfp4":
+        assert decodes == []
+    else:
+        # One decode per group: on the model stream, or beside a Reuse layer's projections.
+        assert len(decodes) == 1
+        assert (decodes[0] == torch.cuda.current_stream()) == (route == "bank")
+
+    # A new forward compacts again; so does a layer after another group's compaction.
+    new_forward()
+    compactions.clear()
+    torch.testing.assert_close(run(layers - 1), expected[-1], atol=0, rtol=0)
+    group[0] = (2, 1, 0)
+    run(0)
+    group[0] = (1, 1, 0)
+    torch.testing.assert_close(run(layers - 1), expected[-1], atol=0, rtol=0)
+    assert compactions == [False, False, False]
+
+    if route != "bank":
+        return
+    # Graph replay follows live selections, pool rows and SWA rows of every layer.
+    new_forward()
+    compactions.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = [run(layer) for layer in range(layers)]
+    assert compactions == [False, True, True]
+    topk.copy_(main_selections(5))
+    main_pool.copy_(pack_rows(torch.randn(count * 512, 512, device="cuda").bfloat16(), "main"))
+    for args in layer_args:
+        rows = torch.randn(count * 128, 512, device="cuda").bfloat16()
+        args.sparse_backend_args.swa_pool.copy_(pack_rows(rows, swa_format))
+    for output in captured:
+        output.fill_(torch.nan)
+    graph.replay()
+    replayed = [output.clone() for output in captured]
+    for actual, reference in zip(replayed, references()):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 @skip_prims_ts_unsupported

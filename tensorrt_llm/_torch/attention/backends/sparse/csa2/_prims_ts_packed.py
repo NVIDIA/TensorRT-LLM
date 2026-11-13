@@ -25,6 +25,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+
 from ...prims_ts._compile_cache import build_and_load_attention_kernel
 from ...prims_ts.decode import (
     _append_workspace_section,
@@ -33,7 +35,8 @@ from ...prims_ts.decode import (
     _workspace_section_view,
     _WorkspaceSection,
 )
-from ...prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
+from ...prims_ts.kernels.mla_decode.helpers.nvfp4_kv import is_sm107_target
+from ...prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile, select_sparse_mla_profile
 from ...prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
     MlaProfile,
     compute_workspace_size,
@@ -57,6 +60,7 @@ from .quantization import row_bytes
 
 __all__ = [
     "PackedSparseMLA",
+    "decodes_nvfp4_main",
     "fuses_mxfp8_output",
     "get_packed_sparse_mla_workspace_size",
     "precompile_packed_sparse_mla",
@@ -87,7 +91,8 @@ class _CompileSpec:
 
 @dataclass(frozen=True)
 class _GatherLaunch:
-    """Native TMA gather4 kernel over unit-scale E4M3 rows of both sources."""
+    """A native kernel without the packed producer: TMA gather4 over unit-scale E4M3 rows
+    of both sources, or, for NVFP4 MAIN records, the native NVFP4 loader schedule."""
 
     profile: SparseMlaProfile
     spec: _MLADecodeCompileSpec
@@ -101,9 +106,10 @@ class _Launch:
     kernel: ThroughputLatencyMlaDecodeTs
     sections: dict[str, _WorkspaceSection]
     workspace_bytes: int
-    # Split-KV scratch of the packed producer kernel; "core" also fits the gather's.
+    # Split-KV scratch of the packed producer kernel; "core" also fits the native kernels'.
     core_bytes: int
     gather: _GatherLaunch | None = None
+    nvfp4: _GatherLaunch | None = None
 
 
 @dataclass(frozen=True)
@@ -127,10 +133,11 @@ class _Plan:
     valid_prefix: bool
     output_groups: int | None
     spec: _CompileSpec
-    # The packed producer kernel; a gather plan compiles it only for a pool
-    # whose rows are not 512 contiguous bytes.
+    # The packed producer kernel; a gather or NVFP4 plan compiles it only for a
+    # pool whose rows are not dense records of their format.
     compiled: Callable[..., object] | None
     gather: _GatherPlan | None
+    nvfp4: _GatherPlan | None
     query: UnitScaleQuery
     buffers: dict[str, torch.Tensor]
     core: torch.Tensor | None
@@ -200,6 +207,18 @@ def _quantizes_output(profile: SparseMlaProfile) -> bool:
     Split-KV schedules finalize in their reduction kernel instead.
     """
     return profile.split_kv == 1 and profile.head_dim_ctas == 1
+
+
+def _launch_dependent(kernel: ThroughputLatencyMlaDecodeTs) -> None:
+    """Make ``kernel`` a programmatic dependent launch (unless TRTLLM_ENABLE_PDL=0).
+
+    It may start while the preceding kernel of its stream still runs. A persistent
+    grid then prepares its barriers and TMEM before waiting for that kernel, and
+    every grid reads and writes global memory only after the wait.
+    """
+    if get_env_enable_pdl():
+        kernel.use_pdl = True
+        kernel.pdl_wait_after_prologue = True
 
 
 @cache
@@ -357,6 +376,7 @@ def _gather_launch(
     kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
     kernel.assume_valid_prefix = True
     kernel.output_quant = output_quant
+    _launch_dependent(kernel)
     spec = _make_mla_decode_compile_spec(
         _MLADecodeLaunchSpec(kernel, (), core_bytes, profile.split_kv),
         device_index=device.index,
@@ -372,14 +392,164 @@ def _gather_launch(
     return _GatherLaunch(profile, spec, core_bytes)
 
 
-def _dense_rows(pool: torch.Tensor) -> bool:
-    """Whether a UINT8[N,512] pool is the dense E4M3 row storage gather4 maps address."""
-    return pool.shape[0] > 0 and pool.shape[1] == _HEAD_DIM and pool.stride(0) == _HEAD_DIM
+@cache
+def _select_nvfp4_profile(
+    rows: int, heads: int, capacity: int, sm_count: int, compute_capability: tuple[int, int] | None
+) -> SparseMlaProfile | None:
+    """The native schedule that decodes NVFP4 MAIN records in the kernel, or None.
+
+    With unit-scale E4M3 SWA rows (``swa_fp8``) and NVFP4 MAIN records, the native
+    sparse plan of an FP8 primary pool with an NVFP4 extra pool reads both formats as
+    stored: its loader decodes each selected MAIN record into the E4M3 operand stage,
+    so no selection bank is decoded or read back. Outputs are bitwise equal to the
+    selection bank's wherever that also runs one KV split. GB300, 64 heads, SWA 128 +
+    512 MAIN, CUDA-graph replays, us (bank = compaction, MAIN decode and gather
+    attention; native fused decode in parentheses), independent selections: 150 rows 31.9 -> 23.2 (24.5), 252 rows
+    52.1 -> 35.4 (39.0), 504 rows 90.7 -> 63.0 (81.7), 1252 rows 197.9 -> 126.4
+    (163.0); query rows of a request sharing 80% of their selections: 150 rows
+    28.8 -> 22.5, 1252 rows 130.8 -> 122.7.
+
+    Only the native one-CTA Keep-AB family is taken, for 64 heads, whose single-split
+    plans also fuse the grouped MXFP8 output. Below half a wave of rows the native
+    policy divides each row across CTAs (V over two or four CTAs, or five KV splits,
+    with four issuers), which is slower here than one CTA per row: those grids take
+    the schedule the policy picks for half a wave (GB300, 64 rows: 44.4 us divided,
+    native fused decode 24.7 us; 76 rows on the one-CTA schedule 22.4 us).
+    """
+    if heads != _QUERY_TILE:
+        return None
+    profile = select_sparse_mla_profile(
+        rows=max(rows, (sm_count + 1) // 2),
+        heads=heads,
+        query_length=1,
+        capacity=capacity,
+        dtype="fp8",
+        sm_count=sm_count,
+        rope_dim=0,
+        kv_cache_format="fp8",
+        compute_capability=compute_capability,
+    )
+    return profile if profile.family == "keep" else None
+
+
+def _compute_capability(device: torch.device) -> tuple[int, int] | None:
+    """The device's capability as the native sparse policy keys it."""
+    capability = torch.cuda.get_device_capability(device)
+    # SM107 schedules assume SM107 kernel resources, which only an SM107 target compiles.
+    return None if capability == (10, 7) and not is_sm107_target() else capability
+
+
+def decodes_nvfp4_main(
+    device: torch.device | str | int,
+    rows: int,
+    heads: int,
+    max_topk: int,
+    max_extra_topk: int,
+    quantized_output: bool = False,
+) -> bool:
+    """Whether a valid-prefix plan over ``swa_fp8`` SWA and NVFP4 MAIN of this geometry
+    decodes the MAIN records in the attention kernel (see :func:`_select_nvfp4_profile`).
+
+    ``quantized_output`` asks it of a plan that stores the grouped MXFP8 output.
+    """
+    if not max_extra_topk:
+        return False
+    capacity = _validate_geometry(rows, heads, max_topk, max_extra_topk)
+    device, _ = _resolve_cuda_device(device)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    profile = _select_nvfp4_profile(rows, heads, capacity, sm_count, _compute_capability(device))
+    return profile is not None and (not quantized_output or _quantizes_output(profile))
+
+
+def _nvfp4_launch(
+    device: torch.device,
+    rows: int,
+    heads: int,
+    capacity: int,
+    sm_count: int,
+    max_topk: int,
+    max_extra_topk: int,
+    output_quant: MXFP8OutputQuant | None = None,
+) -> _GatherLaunch | None:
+    """Build the native kernel over E4M3 SWA rows and NVFP4 MAIN records.
+
+    Both pools are read as dense records: UINT8[rows, 512] SWA and UINT8[rows, 288]
+    MAIN. Like the gather kernel, it trusts every entry before a live length to be a
+    valid row of its pool. With ``output_quant`` it stores the grouped MXFP8 O-A
+    input instead of BF16; a plan whose profile cannot store it gets no kernel.
+    """
+    profile = _select_nvfp4_profile(rows, heads, capacity, sm_count, _compute_capability(device))
+    if profile is None or (output_quant is not None and not _quantizes_output(profile)):
+        return None
+    kernel = ThroughputLatencyMlaDecodeTs(
+        batch_size=rows,
+        num_heads=profile.tile_size_q,
+        seq_len_q=(heads + profile.tile_size_q - 1) // profile.tile_size_q,
+        seq_len_k=capacity,
+        rope_dim=0,
+        page_size=1,
+        max_active_clusters=sm_count,
+        qkv_dtype="e4m3",
+        out_dtype="bf16",
+        profile=MlaProfile(
+            name="csa2_nvfp4_main_keep_v1",
+            kernel_variant="keeps_mma_ab",
+            tile_size_q=profile.tile_size_q,
+            num_ctas_per_head_dim=profile.head_dim_ctas,
+            num_ctas_per_seq_kv=profile.split_kv,
+            use_multi_ctas_kv=int(profile.split_kv > 1),
+            use_cluster_reduction=int(profile.reduction == "cluster"),
+            use_persistent_scheduler=int(profile.scheduler != "nonpersistent"),
+            use_clc_dynamic_persistent_scheduler=int(profile.scheduler == "clc"),
+        ),
+        reduction_mode=profile.reduction,
+        logical_num_heads=heads,
+        logical_seq_len_q=1,
+        tile_size_q=profile.tile_size_q,
+        mask_type="dense",
+        sparse_profile=profile,
+        kv_cache_format="fp8",
+        extra_kv_cache_format="nvfp4",
+    )
+    core_bytes = compute_workspace_size(
+        cfg=kernel._make_config(),
+        partial_o_dtype=cutlass.BFloat16,
+        lse_dtype=cutlass.Float32,
+    )
+    kernel.finalize_output = True
+    kernel.direct_sparse = True
+    kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
+    kernel.assume_valid_prefix = True
+    kernel.output_quant = output_quant
+    _launch_dependent(kernel)
+    spec = _make_mla_decode_compile_spec(
+        _MLADecodeLaunchSpec(kernel, (), core_bytes, profile.split_kv),
+        device_index=device.index,
+        num_qo_heads=heads,
+        kv_lora_rank=_HEAD_DIM,
+        qk_rope_head_dim=0,
+        page_size=1,
+        q_dtype_key="float8_e4m3fn",
+        out_dtype_key="bfloat16" if output_quant is None else "float8_e4m3fn",
+        max_q_len=1,
+        packed_query=False,
+    )
+    return _GatherLaunch(profile, spec, core_bytes)
+
+
+def _dense_rows(pool: torch.Tensor, width: int = _HEAD_DIM) -> bool:
+    """Whether a UINT8[N,width] pool is the dense record storage the native kernels address."""
+    return pool.shape[0] > 0 and pool.shape[1] == width and pool.stride(0) == width
 
 
 def _gather_pool(pool: torch.Tensor) -> torch.Tensor:
     """Dense E4M3 rows as the native one-token-page [1, 512, rows] cache view."""
     return pool.view(torch.float8_e4m3fn).unsqueeze(1).permute(1, 2, 0)
+
+
+def _record_pool(pool: torch.Tensor) -> torch.Tensor:
+    """Dense UINT8 records as the native one-token-page [1, width, rows] cache view."""
+    return pool.unsqueeze(1).permute(1, 2, 0)
 
 
 def _resolve_launch(
@@ -452,16 +622,25 @@ def _resolve_launch(
         partial_o_dtype=cutlass.BFloat16,
         lse_dtype=cutlass.Float32,
     )
-    # Size the arena for both kernels whatever the formats, so one arena serves
+    # Size the arena for every kernel whatever the formats, so one arena serves
     # every format, prefix promise and output of the geometry.
     gather = _gather_launch(
         device, rows, heads, capacity, sm_count, max_topk, max_extra_topk, output_quant
     )
-    gather_core = 0 if gather is None else gather.core_bytes
+    nvfp4 = (
+        _nvfp4_launch(
+            device, rows, heads, capacity, sm_count, max_topk, max_extra_topk, output_quant
+        )
+        if max_extra_topk
+        else None
+    )
+    native_core = max(
+        (launch.core_bytes for launch in (gather, nvfp4) if launch is not None), default=0
+    )
     sections = {}
     byte_end = 0
     for name, shape, dtype in (
-        ("core", (max(core_bytes, gather_core),), torch.int8),
+        ("core", (max(core_bytes, native_core),), torch.int8),
         ("lse", (rows, 1, heads), torch.float32),
         ("q8", (rows, 1, heads, _HEAD_DIM), torch.uint8),
         # One record wide enough for either MAIN format, so both share an arena.
@@ -476,7 +655,9 @@ def _resolve_launch(
         valid_prefix and gathers_plain_rows(swa_cache_format, main_cache_format, max_extra_topk)
     ):
         gather = None
-    return _Launch(device, profile, kernel, sections, byte_end, core_bytes, gather)
+    if not (valid_prefix and swa_cache_format == "swa_fp8" and main_cache_format == "main"):
+        nvfp4 = None
+    return _Launch(device, profile, kernel, sections, byte_end, core_bytes, gather, nvfp4)
 
 
 def get_packed_sparse_mla_workspace_size(
@@ -492,7 +673,8 @@ def get_packed_sparse_mla_workspace_size(
     """Return bytes for the exact packed profile, without allocating or compiling.
 
     Includes native split-KV BF16 partial outputs/FP32 statistics for the packed
-    producer kernel and, where the geometry has one, the TMA gather kernel; FP32
+    producer kernel and, where the geometry has them, the TMA gather and NVFP4 MAIN
+    kernels; FP32
     LSE and unit-scale E4M3 Q; one dummy record, as wide as either MAIN format,
     for launches without a MAIN pool; and the gather kernel's empty extra lists
     and -inf sinks. The size depends on neither the formats nor a prefix promise.
@@ -551,13 +733,14 @@ def precompile_packed_sparse_mla(
     """Compile every kernel that plans of 1 to ``max_rows`` rows select for these pools.
 
     The row count picks the split-KV partition count and its reduction
-    topology, both compile-time kernel parameters, and, for plain E4M3 rows
-    under a valid-prefix promise, the TMA gather or packed producer kernel, so
-    a plan for a row count first seen while serving would otherwise compile on
-    the request path. Only 512-byte gather rows and 16-byte-aligned producer
-    rows are compiled. With ``output_groups``, compiles instead the MXFP8 output
-    kernels of the row counts whose plans can store it (see
-    :func:`fuses_mxfp8_output`). Returns the number of distinct kernels.
+    topology, both compile-time kernel parameters, and, under a valid-prefix
+    promise, the TMA gather kernel for plain E4M3 rows or the NVFP4 MAIN kernel
+    for ``swa_fp8`` SWA with NVFP4 MAIN records instead of the packed producer
+    kernel, so a plan for a row count first seen while serving would otherwise
+    compile on the request path. Only dense records for the native kernels and
+    16-byte-aligned producer rows are compiled. With ``output_groups``, compiles
+    instead the MXFP8 output kernels of the row counts whose plans can store it
+    (see :func:`fuses_mxfp8_output`). Returns the number of distinct kernels.
     """
     if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows <= 0:
         raise ValueError("max_rows must be a positive integer")
@@ -566,23 +749,37 @@ def precompile_packed_sparse_mla(
     capacity = _validate_geometry(max_rows, heads, max_topk, max_extra_topk)
     device, _ = _resolve_cuda_device(device)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    capability = _compute_capability(device)
     gathers = valid_prefix and gathers_plain_rows(
         swa_cache_format, main_cache_format, max_extra_topk
     )
+    nvfp4s = (
+        valid_prefix
+        and swa_cache_format == "swa_fp8"
+        and main_cache_format == "main"
+        and max_extra_topk > 0
+    )
     # Specs compare without their kernel object, so equal kernels collapse.
     specs = {}
-    gather_specs = {}
+    native_specs = {}
     previous = None
     for rows in range(1, max_rows + 1):
+        packed = _select_packed_profile(rows, heads, capacity, sm_count)
         gather = _select_gather_profile(rows, heads, capacity, sm_count) if gathers else None
-        profile = gather or _select_packed_profile(rows, heads, capacity, sm_count)
-        if output_groups is not None and not _quantizes_output(profile):
+        if output_groups is not None and not _quantizes_output(gather or packed):
             continue
+        nvfp4 = (
+            _select_nvfp4_profile(rows, heads, capacity, sm_count, capability) if nvfp4s else None
+        )
+        if nvfp4 is not None and output_groups is not None and not _quantizes_output(nvfp4):
+            nvfp4 = None
+        kind = "nvfp4" if nvfp4 is not None else "gather" if gather is not None else "packed"
+        profile = nvfp4 or gather or packed
         # Beyond its profile, a kernel depends on the row count only through
         # the split-KV reduction topology. A single split has no reduction.
-        if (gather is not None, profile) == previous and profile.split_kv == 1:
+        if (kind, profile) == previous and profile.split_kv == 1:
             continue
-        previous = (gather is not None, profile)
+        previous = (kind, profile)
         launch = _resolve_launch(
             device,
             rows,
@@ -594,8 +791,9 @@ def precompile_packed_sparse_mla(
             valid_prefix=valid_prefix,
             output_groups=output_groups,
         )
-        if launch.gather is not None:
-            gather_specs.setdefault(launch.gather.spec)
+        native = launch.nvfp4 or launch.gather
+        if native is not None:
+            native_specs.setdefault(native.spec)
             continue
         specs.setdefault(
             _compile_spec(
@@ -610,9 +808,9 @@ def precompile_packed_sparse_mla(
         )
     for spec in specs:
         _compile_packed(spec)
-    for spec in gather_specs:
+    for spec in native_specs:
         _get_compiled_mla_decode(spec)
-    return len(specs) + len(gather_specs)
+    return len(specs) + len(native_specs)
 
 
 @cache
@@ -742,10 +940,12 @@ class PackedSparseMLA:
     Graph replays as captured. No cache tensor or pointer is retained by the
     plan; callers keep graph-bound inputs alive. Different
     concurrent streams require separate workspace arenas. Planning compiles the
-    plan's kernel: the TMA gather kernel for dense 512-byte plain E4M3 rows of a
-    ``valid_prefix`` plan whose schedule favors it, otherwise the packed
-    producer's asynchronous-copy kernel for 16-byte-aligned pool row strides.
-    The first eager run with other strides compiles the producer kernel they need.
+    plan's kernel: for a ``valid_prefix`` plan, the TMA gather kernel for dense
+    512-byte plain E4M3 rows whose schedule favors it, or the NVFP4 MAIN kernel
+    for dense ``swa_fp8`` SWA rows and NVFP4 MAIN records where
+    :func:`decodes_nvfp4_main` admits it; otherwise the packed producer's
+    asynchronous-copy kernel for 16-byte-aligned pool row strides. The first
+    eager run with other strides compiles the producer kernel they need.
     """
 
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
@@ -786,7 +986,10 @@ class PackedSparseMLA:
         is a valid row of its pool. When both sources then hold plain unit-scale
         E4M3 rows (``swa_fp8`` SWA and, if planned, ``main_fp8`` MAIN), launches
         whose schedule favors it read the rows with native TMA gather4 copies
-        rather than the packed producer's issuer-warp copies.
+        rather than the packed producer's issuer-warp copies. With ``swa_fp8``
+        SWA and NVFP4 MAIN records (``main``), launches that
+        :func:`decodes_nvfp4_main` admits run the native NVFP4 loader schedule,
+        which decodes the selected MAIN records in the kernel.
 
         ``output_groups`` plans kernels that store, instead of the BF16 output, the
         grouped MXFP8 O-A input of that many groups (see ``run``'s ``output_quant``).
@@ -828,16 +1031,19 @@ class PackedSparseMLA:
             swa_cache_format,
             main_cache_format,
         )
-        gather = None
-        compiled = None
-        if launch.gather is None:
-            compiled = _compile_packed(spec)
-        else:
-            gather = _GatherPlan(
-                compiled=_get_compiled_mla_decode(launch.gather.spec),
-                split_kv=launch.gather.profile.split_kv,
-                core=buffers["core"] if launch.gather.core_bytes > 0 else None,
+
+        def native_plan(native: _GatherLaunch | None) -> _GatherPlan | None:
+            if native is None:
+                return None
+            return _GatherPlan(
+                compiled=_get_compiled_mla_decode(native.spec),
+                split_kv=native.profile.split_kv,
+                core=buffers["core"] if native.core_bytes > 0 else None,
             )
+
+        gather = native_plan(launch.gather)
+        nvfp4 = native_plan(launch.nvfp4)
+        compiled = _compile_packed(spec) if gather is None and nvfp4 is None else None
         self._state = _Plan(
             device=launch.device,
             rows=rows,
@@ -853,6 +1059,7 @@ class PackedSparseMLA:
             spec=spec,
             compiled=compiled,
             gather=gather,
+            nvfp4=nvfp4,
             query=UnitScaleQuery.plan(launch.device, rows, heads, buffers["q8"]),
             buffers=buffers,
             core=buffers["core"] if spec.has_workspace else None,
@@ -1046,8 +1253,9 @@ class PackedSparseMLA:
         INT32[rows] live lengths. Row zero is valid; -1 and out-of-pool indices
         are masked before payload/scale reads. Lengths must be in [0,capacity].
         A ``valid_prefix`` plan requires instead that every entry before a live
-        length is a valid row of its pool; its TMA gather kernel reads pools whose
-        rows are dense 512-byte records, and other pools use the packed producer.
+        length is a valid row of its pool; its TMA gather or NVFP4 MAIN kernel reads
+        pools whose rows are dense records of their format, and other pools use the
+        packed producer.
         Both lists share one softmax and optional FP32[H] sinks are applied once.
 
         All operands use unit tensor scales: BF16 Q is rounded RN/satfinite to
@@ -1137,11 +1345,44 @@ class PackedSparseMLA:
             sinks,
             None,
         )
+        sinks_or_none = state.buffers["no_sinks"] if sinks is None else sinks
+        nvfp4 = state.nvfp4
+        # An empty or omitted MAIN pool has no live rows under the prefix promise;
+        # the native kernels still need a descriptor over one real record.
+        main_bytes = main_row_bytes(state.main_cache_format)
+        native_main = (
+            main if main.shape[0] else state.buffers["dummy_main"].view(-1)[:main_bytes].view(1, -1)
+        )
+        if nvfp4 is not None and _dense_rows(swa_cache) and _dense_rows(native_main, main_bytes):
+            # The native sparse ABI, as the gather kernel takes it, over UINT8 record views.
+            nvfp4.compiled(
+                query,
+                query,
+                _record_pool(swa_cache),
+                _record_pool(native_main),
+                swa_indices.transpose(0, 1),
+                output,
+                state.lse_kernel,
+                nvfp4.core,
+                nvfp4.split_kv,
+                swa_lengths,
+                None,
+                (
+                    swa_indices,
+                    extra_sparse_indices,
+                    swa_lengths,
+                    extra_sparse_lens,
+                    sinks_or_none,
+                    1.0,
+                ),
+                softmax_scale,
+                output_scale,
+                quant_args,
+                1,
+            )
+            return out
         gather = state.gather
-        # An empty or omitted MAIN pool has no live rows under the prefix
-        # promise; gather4 still needs a descriptor over one real row.
-        gather_main = main if main.shape[0] else state.buffers["dummy_main"]
-        if gather is not None and _dense_rows(swa_cache) and _dense_rows(gather_main):
+        if gather is not None and _dense_rows(swa_cache) and _dense_rows(native_main):
             extra_indices, extra_lengths = extra_sparse_indices, extra_sparse_lens
             if not state.max_extra_topk:
                 extra_indices = state.buffers["dummy_extra"][0].view(state.rows, 1)
@@ -1153,7 +1394,7 @@ class PackedSparseMLA:
                 query,
                 query,
                 _gather_pool(swa_cache),
-                _gather_pool(gather_main),
+                _gather_pool(native_main),
                 swa_indices.transpose(0, 1),
                 output,
                 state.lse_kernel,
@@ -1166,7 +1407,7 @@ class PackedSparseMLA:
                     extra_indices,
                     swa_lengths,
                     extra_lengths,
-                    state.buffers["no_sinks"] if sinks is None else sinks,
+                    sinks_or_none,
                     1.0,
                 ),
                 softmax_scale,

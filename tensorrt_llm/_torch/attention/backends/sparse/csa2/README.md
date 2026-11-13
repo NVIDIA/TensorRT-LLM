@@ -71,9 +71,20 @@ four rows at a time before converting them. The bank is decoded on the model
 stream after the layer's MAIN publication; its storage and marks are retained,
 grow by powers of two up to 64 MiB of bank and are part of the PrimTS workspace
 reservation. Larger phases keep decoding selections in the kernel.
-Generation tiles with FP8 SWA whose gather schedule applies decode their
-selections into a selection bank instead, one unit-scale E4M3 `uint8[512]` row per
-compacted selection. Query rows of one request may select the same MAIN row: the
+With FP8 SWA rows, a tile without a MAIN bank that the native NVFP4 MAIN schedule
+serves (64 heads under the native one-CTA Keep-AB profile of an FP8 primary pool
+with an NVFP4 extra pool, see `decodes_nvfp4_main` in `_prims_ts_packed.py`) reads
+the NVFP4 MAIN records as stored: the native loader decodes each selected record
+into the E4M3 operand stage, so nothing is decoded into or read back from a bank,
+and on one KV split its outputs are bitwise equal to the selection bank's. Below
+half a wave of rows it keeps one CTA per row, the schedule the native policy picks
+for half a wave, where the selection bank's schedule splits KV. A generation tile
+whose selections are final before its projections keeps the selection bank below
+1024 rows (`_EARLY_SELECTION_BANK_ROWS` in `prims_ts.py`): its decode runs on the
+side stream beside the projections (below), and the gather kernel is faster than
+the NVFP4 MAIN kernel. Other tiles with FP8
+SWA whose gather schedule applies decode their selections into a selection bank
+instead, one unit-scale E4M3 `uint8[512]` row per compacted selection. Query rows of one request may select the same MAIN row: the
 compaction then also claims an epoch-tagged INT64 owner slot per kept pool row
 (never cleared, since each call claims with the next epoch), and
 `dedup_main_records` decodes each selected row once, into the bank row of its
@@ -81,7 +92,12 @@ smallest selection, which all of that row's selections read. A layer whose
 selections and MAIN rows are final before its projections (a Reuse layer of a
 generation-only forward) compacts and decodes its selection bank on a side stream
 beside its projections and KV write; other layers do both on the model stream
-after their MAIN publication.
+after their MAIN publication. Layers of one staging group (KV owner, index source
+and query start) select the same MAIN rows in a forward, and all of a device's
+tiles of one geometry share one compact metadata buffer and one selection bank:
+a layer whose group last wrote the MAIN list (and the selection bank, where it
+reads one) compacts only its own SWA rows and decodes nothing
+(`_main_selection_group` in `prims_ts.py`).
 External BF16 Q is converted at unit scale into preallocated E4M3 Q scratch,
 except in eager context phases of at least 1024 tokens on the fused MXFP8 prefill
 Q projection: its Q-B GEMM applies RoPE and rounds the BF16 Q RN/satfinite to E4M3

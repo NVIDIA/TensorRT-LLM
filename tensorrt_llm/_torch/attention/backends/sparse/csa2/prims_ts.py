@@ -26,6 +26,13 @@ _PACKED_ABI = "packed_e4m3_unit_scale_v4"
 _MAX_SOFTMAX_SCALE = torch.finfo(torch.float32).max / math.log2(math.e)
 # CSA2 side stream that prepares selection metadata beside a layer's projections.
 _SELECTION_STREAM = 2
+# Generation tiles whose selections are final before their projections keep the
+# selection bank below this many rows (CSA2PrimsTS._uses_selection_bank).
+_EARLY_SELECTION_BANK_ROWS = 1024
+# Arena entries naming the selections the shared MAIN list and selection bank last held
+# (CSA2PrimsTS._main_selection_group).
+_MAIN_HOLDER_KEY = "main_holder"
+_SELECTION_BANK_HOLDER_KEY = "csa2_prims_ts_selection_bank_holder"
 
 
 def _validate_softmax_scale(scale: float) -> None:
@@ -304,12 +311,18 @@ class CSA2PrimsTS:
         # row, not per selection: all of its requests' rows, or only the selected
         # ones when its queries select fewer rows than the requests own.
         bank = metadata.prims_ts_main_bank
-        # A tile without a MAIN bank can still gather unit-scale E4M3 rows: one bank row
-        # per selection, decoded after compaction (_uses_selection_bank).
-        selection_bank = bank is None and self._uses_selection_bank(q, metadata, swa_cache_format)
-        main_cache_format = "main" if bank is None and not selection_bank else "main_fp8"
         mxfp8 = self._mxfp8_output(q, metadata, forward_args)
         output_groups = None if mxfp8 is None else mxfp8[0].shape[0]
+        # A tile without a MAIN bank can still gather unit-scale E4M3 rows: one bank row
+        # per selection, decoded after compaction (_uses_selection_bank).
+        selection_bank = bank is None and self._uses_selection_bank(
+            q,
+            metadata,
+            swa_cache_format,
+            quantized_output=mxfp8 is not None,
+            early_selection=raw.selection_ready is not None,
+        )
+        main_cache_format = "main" if bank is None and not selection_bank else "main_fp8"
         with torch.cuda.device(q.device):
             # Reject cold capture before cache writes or indexer side effects.
             record = self._get_plan(q, metadata, swa_cache_format, main_cache_format, output_groups)
@@ -321,10 +334,10 @@ class CSA2PrimsTS:
             has_extra = prepared.extra_indices.shape[1] > 0
             main_source = inputs.main_pool
             marks = None
+            arenas = metadata.fmha_plan_caches.setdefault(_ARENA_CACHE_KEY, {})
             if bank is not None:
                 if not has_extra or inputs.main_pool is None or inputs.main_mapping is None:
                     raise ValueError("CSA2 PrimTS MAIN banks need logical MAIN selections")
-                arenas = metadata.fmha_plan_caches.setdefault(_ARENA_CACHE_KEY, {})
                 main_source = main_bank_storage(arenas, q.device, bank.rows)
                 if bank.selected_only:
                     marks = main_bank_marks(arenas, q.device, bank.rows)
@@ -332,11 +345,12 @@ class CSA2PrimsTS:
                     # After this layer's MAIN publication, on the stream that wrote it.
                     decode_main_bank(inputs.main_pool, bank, main_source)
             extra_indices = prepared.extra_indices
-            dedup, claims = False, None
+            arena = record["arena"]
+            group = None if bank is not None else self._main_selection_group(inputs, q.shape[0])
+            dedup, claims, bank_holder = False, None, None
             if selection_bank:
                 if not has_extra or inputs.main_pool is None:
                     raise ValueError("CSA2 PrimTS selection banks need MAIN selections")
-                arenas = metadata.fmha_plan_caches.setdefault(_ARENA_CACHE_KEY, {})
                 # Sized once for the largest tile this metadata plans, before capture.
                 max_queries = getattr(
                     metadata, "_csa2_prims_ts_max_queries", metadata.max_num_tokens
@@ -357,9 +371,17 @@ class CSA2PrimsTS:
                 # Selection c of query r reads bank row r * width + c, or with dedup the bank
                 # row of the first selection of its MAIN row, the only selections decoded.
                 extra_indices = record["selection_rows" if dedup else "selection_indices"]
-                if dedup:
-                    # The compaction claims each kept MAIN row's owner slot for the decode.
-                    claims = main_record_owners(arenas, q.device, int(inputs.main_pool.shape[0]))
+                bank_holder = (group, dedup, main_source.data_ptr(), extra_indices.data_ptr())
+            # The group's MAIN list, and the selection bank this tile reads, may hold this
+            # layer's selections already; the layer then compacts only its own SWA rows.
+            swa_only = (
+                group is not None
+                and arena.get(_MAIN_HOLDER_KEY) == group
+                and (not selection_bank or arenas.get(_SELECTION_BANK_HOLDER_KEY) == bank_holder)
+            )
+            if dedup and not swa_only:
+                # The compaction claims each kept MAIN row's owner slot for the decode.
+                claims = main_record_owners(arenas, q.device, int(inputs.main_pool.shape[0]))
             sources = dict(
                 swa_cache=inputs.swa_pool,
                 swa_indices=prepared.indices,
@@ -368,6 +390,13 @@ class CSA2PrimsTS:
                 extra_sparse_indices=extra_indices if has_extra else None,
                 extra_sparse_lens=prepared.extra_lengths if has_extra else None,
             )
+
+            def compact() -> None:
+                if swa_only:
+                    prepare_prims_ts_metadata(inputs, prepared, swa_only=True)
+                    return
+                prepare_prims_ts_metadata(inputs, prepared, bank, marks, claims)
+                arena[_MAIN_HOLDER_KEY] = group
 
             def decode_selection_bank() -> None:
                 if dedup:
@@ -383,12 +412,14 @@ class CSA2PrimsTS:
                     decode_main_records(
                         inputs.main_pool, prepared.extra_indices, main_source, arenas
                     )
+                arenas[_SELECTION_BANK_HOLDER_KEY] = bank_holder
 
+            decodes = selection_bank and not swa_only
             early = raw.selection_ready is not None and marks is None
             if not early:
                 # Every layer's bank shares the device's marks, so a selected-row
                 # bank marks and decodes them in this stream's order.
-                prepare_prims_ts_metadata(inputs, prepared, bank, marks, claims)
+                compact()
             else:
                 # The selections and the MAIN rows they address were final before this
                 # layer's projections, so compact them and decode their selection bank
@@ -401,15 +432,15 @@ class CSA2PrimsTS:
                     self._selection_done = torch.cuda.Event()
                 with torch.cuda.stream(side):
                     side.wait_event(raw.selection_ready)
-                    prepare_prims_ts_metadata(inputs, prepared, bank, claims=claims)
-                    if selection_bank:
+                    compact()
+                    if decodes:
                         decode_selection_bank()
                     self._selection_done.record()
                 self._selection_done.wait()
             if marks is not None:
                 # The rows the compaction kept, after this layer's MAIN publication.
                 decode_main_bank(inputs.main_pool, bank, main_source, marks)
-            if selection_bank and not early:
+            if decodes and not early:
                 # The compacted MAIN records, after this layer's MAIN publication.
                 decode_selection_bank()
             output = forward_args.output
@@ -434,6 +465,38 @@ class CSA2PrimsTS:
             return output
 
     @staticmethod
+    def _main_selection_group(inputs: CSA2BackendForwardArgs, rows: int) -> tuple | None:
+        """Key of the MAIN list a compaction of this tile writes, or None if no layer shares it.
+
+        Layers of one staging group (KV owner, index source and query start) read one MAIN
+        pool through the same selections, page table and visible prefixes in a forward, so
+        their compactions write the same MAIN list and the same selection bank. The key
+        names the forward (its request metadata, index publication and staging epoch) and
+        whether the stream captures, so a CUDA Graph records its own compaction.
+        """
+        source = None if inputs.state is None else inputs.state.metadata
+        if (
+            inputs.stage_group is None
+            or source is None
+            or inputs.topk_indices is None
+            or inputs.main_pool is None
+        ):
+            return None
+        mapping = inputs.main_mapping
+        return (
+            inputs.stage_group,
+            id(source),
+            id(getattr(source, "csa2_indices", None)),
+            getattr(source, "_csa2_stage_epoch", 0),
+            rows,
+            torch.cuda.is_current_stream_capturing(),
+            inputs.main_pool.data_ptr(),
+            inputs.main_pool.shape[0],
+            inputs.topk_indices.data_ptr(),
+            None if mapping is None else mapping[0].data_ptr(),
+        )
+
+    @staticmethod
     def _shares_main_rows(raw: CSA2BackendForwardArgs, rows: int) -> bool:
         """Whether a generation tile's query rows can select the same MAIN rows.
 
@@ -447,24 +510,47 @@ class CSA2PrimsTS:
         return requests <= 0 or rows > requests
 
     def _uses_selection_bank(
-        self, q: torch.Tensor, metadata: CSA2TrtllmMetadata, swa_cache_format: SwaCacheFormat
+        self,
+        q: torch.Tensor,
+        metadata: CSA2TrtllmMetadata,
+        swa_cache_format: SwaCacheFormat,
+        quantized_output: bool = False,
+        early_selection: bool = False,
     ) -> bool:
         """Whether a tile without a MAIN bank decodes its MAIN selections into a selection bank.
 
-        In-kernel decoding converts each selected NVFP4 MAIN row inside the attention
-        kernel's producer warps. A bank row per selection, decoded by its own kernel,
-        lets the tile take the TMA gather schedule over unit-scale E4M3 rows instead,
-        when its SWA rows are E4M3 and its selections fit the bank's reserved rows.
+        With E4M3 SWA rows, the native NVFP4 MAIN kernel decodes each selected NVFP4
+        MAIN record into its operand stage and needs no bank where it applies
+        (``decodes_nvfp4_main``). Elsewhere in-kernel decoding converts each selected
+        record inside the packed producer's warps, and a bank row per selection,
+        decoded by its own kernel, lets the tile take the TMA gather schedule over
+        unit-scale E4M3 rows instead, when its selections fit the bank's reserved rows.
+        ``quantized_output`` is whether the tile stores the grouped MXFP8 output.
+
+        A tile with ``early_selection`` (selections final before its projections)
+        compacts and decodes its selection bank on the side stream beside them, so
+        below ``_EARLY_SELECTION_BANK_ROWS`` rows it keeps the bank wherever the
+        gather schedule applies: the decode overlaps the projections, and the gather
+        kernel is faster than the NVFP4 MAIN kernel (GB300, 64 heads, SWA 128 + 512
+        MAIN: 252 rows 24.0 against 29.0 us, 504 rows 45.9 against 55.9 us). AgentX
+        DEP generation, NVFP4 MAIN kernel on every tile against the selection bank on
+        every tile: 252 rows -2.2% and 504 rows -1.2% output throughput per GPU, but
+        1252 rows +0.9%, where the decode beside the projections competes with them
+        for the GPU (1252 rows: 91 us gather after an 87 us decode, against 119 us).
         """
-        from ._prims_ts_packed import _select_gather_profile, _validate_geometry
+        from ._prims_ts_packed import _select_gather_profile, _validate_geometry, decodes_nvfp4_main
 
         width = metadata.num_sparse_topk
         rows = metadata.num_tokens
         if swa_cache_format != "swa_fp8" or width <= _SWA_TILE or rows <= 0:
             return False
+        heads = self.attention.num_heads
+        if not (early_selection and rows < _EARLY_SELECTION_BANK_ROWS) and decodes_nvfp4_main(
+            q.device, rows, heads, _SWA_TILE, width - _SWA_TILE, quantized_output=quantized_output
+        ):
+            return False
         if rows * (width - _SWA_TILE) > main_records_rows_limit():
             return False
-        heads = self.attention.num_heads
         capacity = _validate_geometry(rows, heads, _SWA_TILE, width - _SWA_TILE)
         sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
         return _select_gather_profile(rows, heads, capacity, sm_count) is not None
