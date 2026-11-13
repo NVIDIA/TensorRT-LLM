@@ -58,6 +58,11 @@ struct CtxBoundaryNormQuantParams
     int rows = 0;
     int hidden = 0;
     float eps = 0.f;
+    // Launch choice (the defaults are the served launch; each form writes the same bits):
+    bool p2 = true;     //!< CBNQ_P2: try the two-chunk, two-CTAs-per-SM kernel first (sm_107); false: one chunk
+    bool twoCta = true; //!< CBNQ_2CTA: false forces the three-stage one-chunk ring without a carveout attribute
+    int stages = 3;     //!< requested one-chunk ring depth (3, 4, 6 or 8; other values: 3), stepped down to fit
+    int p2Stages = 3;   //!< requested P2 ring depth (3 or 4; other values: 3), 3 when 4 does not fit
 };
 
 //! Whether the kernel serves this hidden size (hidden % 256 == 0, 256 <= hidden <= 6144: hidden / 8 threads within
@@ -96,6 +101,7 @@ struct CtxBoundaryTopkNormQuantParams
     int rows = 0;
     int hidden = 0;
     float eps = 0.f;
+    bool dual = true; //!< CBNQ_TOPK_DUAL: two row groups per CTA where the thread limit allows (sm_107); false: one
 };
 
 //! Launches the fold on stream. Returns cudaErrorNotSupported unless topk == 4, the hidden size is supported, the

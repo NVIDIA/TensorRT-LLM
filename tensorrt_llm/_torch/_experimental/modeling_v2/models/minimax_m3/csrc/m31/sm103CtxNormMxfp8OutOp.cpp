@@ -56,7 +56,7 @@ void checkOut(torch::Tensor const& t, int64_t bytes, char const* what)
 void minimaxM31CtxResidualRmsNormMxfp8Out(torch::Tensor& inter, torch::Tensor const& residual,
     torch::Tensor const& weight, double eps, std::optional<torch::Tensor> normOut, torch::Tensor qOut,
     torch::Tensor sfOut, std::optional<torch::Tensor> fp4Out, std::optional<torch::Tensor> fp4SfOut,
-    std::optional<torch::Tensor> const& fp4GlobalScale, std::optional<torch::Tensor> f32Out, bool enablePdl)
+    std::optional<torch::Tensor> const& fp4GlobalScale, std::optional<torch::Tensor> f32Out, bool enablePdl, bool lb2)
 {
     TORCH_CHECK(inter.is_cuda() && inter.is_contiguous() && inter.scalar_type() == at::kBFloat16 && inter.dim() >= 2);
     TORCH_CHECK(
@@ -97,7 +97,7 @@ void minimaxM31CtxResidualRmsNormMxfp8Out(torch::Tensor& inter, torch::Tensor co
         fp4 ? reinterpret_cast<uint32_t*>(fp4Out->data_ptr()) : nullptr,
         fp4 ? reinterpret_cast<uint32_t*>(fp4SfOut->data_ptr()) : nullptr,
         fp4 ? fp4GlobalScale->data_ptr<float>() : nullptr, f32Out.has_value() ? f32Out->data_ptr<float>() : nullptr,
-        static_cast<int>(rows), static_cast<int>(hidden), static_cast<float>(eps), enablePdl,
+        static_cast<int>(rows), static_cast<int>(hidden), static_cast<float>(eps), enablePdl, lb2,
         at::cuda::getCurrentCUDAStream(inter.get_device()));
 }
 
@@ -111,7 +111,7 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "minimax_m31_ctx_residual_rmsnorm_mxfp8_out(Tensor(a!) inter, Tensor residual, Tensor weight, float eps, "
         "Tensor(b!)? norm_out, Tensor(c!) q_out, Tensor(d!) sf_out, Tensor(e!)? fp4_out=None, "
         "Tensor(f!)? fp4_sf_out=None, Tensor? fp4_global_scale=None, Tensor(g!)? f32_out=None, "
-        "bool enable_pdl=False) -> ()");
+        "bool enable_pdl=False, bool lb2=True) -> ()");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

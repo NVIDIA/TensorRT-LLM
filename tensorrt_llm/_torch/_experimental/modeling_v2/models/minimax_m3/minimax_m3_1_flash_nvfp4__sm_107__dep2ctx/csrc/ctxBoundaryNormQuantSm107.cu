@@ -78,10 +78,19 @@ struct CbnqLaunchChoice
     int p2Stages;  // its requested ring depth (3 or 4)
 };
 
-//! The serving launch: the three-stage one-chunk ring (no carveout) behind the P2 launch at three stages.
-CbnqLaunchChoice cbnqLaunchChoice()
+//! The launch the params ask for. The defaults are the serving launch: the three-stage one-chunk ring (no carveout)
+//! behind the P2 launch at three stages. twoCta = false forces the previous launch (three stages, no carveout)
+//! whatever depth is asked; the carveout only serves a ring deeper than the previous launch's.
+CbnqLaunchChoice cbnqLaunchChoice(CtxBoundaryNormQuantParams const& p)
 {
-    return CbnqLaunchChoice{kCbnqL6DefaultStages, false, true, kCbnqP2DefaultStages};
+    int const p2Stages = (p.p2Stages == 3 || p.p2Stages == 4) ? p.p2Stages : kCbnqP2DefaultStages;
+    if (!p.twoCta)
+    {
+        return CbnqLaunchChoice{kCbnqStages, false, p.p2, p2Stages};
+    }
+    int const stages
+        = (p.stages == 3 || p.stages == 4 || p.stages == 6 || p.stages == 8) ? p.stages : kCbnqL6DefaultStages;
+    return CbnqLaunchChoice{stages, stages > kCbnqStages, p.p2, p2Stages};
 }
 
 //! Whether the P2 kernel serves this hidden size: whole warps per half and a virtual warp count of at most 32.
@@ -503,13 +512,10 @@ bool aligned16(void const* p)
 // per SM where the boundary kernels run two (CBNQ_P2). Where the thread limit also holds the one-chunk kernel to one
 // CTA per SM (sm_107) and the hidden size splits into whole 32-chunk warps per half (cbnqP2Supported), the fold runs
 // ctxBoundaryTopkNormQuantDualKernel (ctxBoundaryTopkNormQuantDualSm107.cuh): the same CTA, grid and ring, two
-// hidden / 16-thread row groups with two chunks per thread, every output bit for bit the one-group fold's.
-bool cbnqTopkDualEnabled()
-{
-    return true;
-}
+// hidden / 16-thread row groups with two chunks per thread, every output bit for bit the one-group fold's. The params'
+// dual = false (the CBNQ_TOPK_DUAL kill switch) keeps the one-group fold.
 
-//! Whether the fold takes the dual-group form on this device and hidden size (with `enabled` the switch's value).
+//! Whether the fold takes the dual-group form on this device and hidden size (with `enabled` the params' dual).
 bool cbnqTopkDualForm(bool enabled, int hidden, int threadsPerSm)
 {
     return enabled && cbnqP2Supported(hidden) && threadsPerSm / (hidden / kCbnqPacked) < kCbnqMinBlocks;
@@ -657,39 +663,38 @@ bool ctxBoundaryNormQuantSupported(int hidden)
 
 cudaError_t invokeCtxBoundaryNormQuant(CtxBoundaryNormQuantParams const& params, bool enablePdl, cudaStream_t stream)
 {
-    return dispatch(params, cbnqLaunchChoice(), enablePdl, stream, /*launch=*/true, nullptr, nullptr, nullptr);
+    return dispatch(params, cbnqLaunchChoice(params), enablePdl, stream, /*launch=*/true, nullptr, nullptr, nullptr);
 }
 
 cudaError_t ctxBoundaryNormQuantLaunchShape(
     CtxBoundaryNormQuantParams const& params, int* ctasPerSm, int* grid, int* smemBytes)
 {
-    return dispatch(params, cbnqLaunchChoice(), false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes);
+    return dispatch(params, cbnqLaunchChoice(params), false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes);
 }
 
 cudaError_t ctxBoundaryNormQuantLaunchForm(CtxBoundaryNormQuantParams const& params, int* chunksPerThread,
     int* ctasPerSm, int* grid, int* smemBytes, int* stages)
 {
-    return dispatch(params, cbnqLaunchChoice(), false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes,
+    return dispatch(params, cbnqLaunchChoice(params), false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes,
         chunksPerThread, stages);
 }
 
 cudaError_t invokeCtxBoundaryTopkNormQuant(
     CtxBoundaryTopkNormQuantParams const& params, bool enablePdl, cudaStream_t stream)
 {
-    return dispatchTopk(params, cbnqTopkDualEnabled(), enablePdl, stream, /*launch=*/true, nullptr, nullptr, nullptr);
+    return dispatchTopk(params, params.dual, enablePdl, stream, /*launch=*/true, nullptr, nullptr, nullptr);
 }
 
 cudaError_t ctxBoundaryTopkNormQuantLaunchShape(
     CtxBoundaryTopkNormQuantParams const& params, int* ctasPerSm, int* grid, int* smemBytes)
 {
-    return dispatchTopk(params, cbnqTopkDualEnabled(), false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes);
+    return dispatchTopk(params, params.dual, false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes);
 }
 
 cudaError_t ctxBoundaryTopkNormQuantLaunchForm(
     CtxBoundaryTopkNormQuantParams const& params, int* dual, int* ctasPerSm, int* grid, int* smemBytes)
 {
-    return dispatchTopk(
-        params, cbnqTopkDualEnabled(), false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes, dual);
+    return dispatchTopk(params, params.dual, false, nullptr, /*launch=*/false, ctasPerSm, grid, smemBytes, dual);
 }
 
 } // namespace kernels::minimaxM31

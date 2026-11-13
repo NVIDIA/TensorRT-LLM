@@ -34,7 +34,7 @@ def _host_query(name: str) -> None:
 
 
 def _ctx_residual_rmsnorm_mxfp8_fake(
-    inter, residual, weight, eps, write_norm, fp4_global_scale=None, enable_pdl=False
+    inter, residual, weight, eps, write_norm, fp4_global_scale=None, enable_pdl=False, lb2=True
 ):
     """sm103CtxNormMxfp8Op.cpp: (norm_out, MXFP8 rows, swizzled scale bytes, NVFP4 rows, linear NVFP4 scale
     bytes); inter is updated in place. Outputs that are off are empty 1-D tensors of inter's dtype."""
@@ -54,7 +54,7 @@ def _ctx_residual_rmsnorm_mxfp8_fake(
 
 
 def _ctx_residual_rmsnorm_mxfp8_f32_fake(
-    inter, residual, weight, eps, fp4_global_scale=None, enable_pdl=False
+    inter, residual, weight, eps, fp4_global_scale=None, enable_pdl=False, lb2=True
 ):
     """The _f32 variant (TP2CTX_NORMQ_F32 / TP2AGG_ROUTER_F32): the base op's outputs with write_norm, plus the norm
     widened to float32."""
@@ -64,12 +64,14 @@ def _ctx_residual_rmsnorm_mxfp8_f32_fake(
     return (*outs, torch.empty_like(inter, dtype=torch.float32))
 
 
-def _select_prefill_tile_fake(scores, n_valid_blocks, out, init_blocks, local_blocks):
+def _select_prefill_tile_fake(scores, n_valid_blocks, out, init_blocks, local_blocks, narrow=True):
     """sm103SelectPrefillTileOp.cpp: writes the block table into out; returns nothing."""
     return None
 
 
-def _select_prefill_tile_rows_fake(scores, n_valid_blocks, out, init_blocks, local_blocks):
+def _select_prefill_tile_rows_fake(
+    scores, n_valid_blocks, out, init_blocks, local_blocks, narrow=True
+):
     """sm103SelectPrefillTileOp.cpp (row-major scores, DEP2CTX_TSEL_ROWS): writes the block table into out;
     returns nothing."""
     return None
@@ -97,6 +99,7 @@ def _topp_renorm_det_v3_fake(
     list_path=True,
     wide_hist=True,
     keep_all_ge1=True,
+    chain_prefetch=True,
 ):
     """m31_topp_det v3: as minimax_m31_topp_renorm_det (in place into out, workspace updated); returns nothing.
     minimax_m31_topp_renorm_det_v3_ws_bytes takes no tensor and needs no fake."""
@@ -292,7 +295,7 @@ def _expand_block_sampling_fake(
 
 
 def _chain_spec_sampling_mc_fake(
-    draft_probs, draft_token_ids, target_probs, seed, offset, workspace, ctas_per_row
+    draft_probs, draft_token_ids, target_probs, seed, offset, workspace, ctas_per_row, v3=True
 ):
     """m31_chain_spec_mc (ST-01-REJ): (output_token_ids [batch, numDraft + 1], num_tokens [batch]), int32 as
     trtllm::chain_speculative_sampling; updates the persistent workspace in place.
@@ -314,6 +317,7 @@ def _chain_spec_sampling_mc_slots_fake(
     offset,
     workspace,
     ctas_per_row,
+    v3=True,
 ):
     """m31_chain_spec_mc REJ_SLOTS: as minimax_m31_chain_speculative_sampling_mc, draft rows read by slot."""
     batch_size = draft_token_ids.shape[0]
@@ -363,7 +367,7 @@ def _qkv_indexer_producer_rows_fake(
     )
 
 
-def _swiglu_oai_mxfp8_fake(x, q, sf, h):
+def _swiglu_oai_mxfp8_fake(x, q, sf, h, rows_form=True, k_rows=4):
     """minimax_m31_swiglu_oai_mxfp8 (TP2CTX_SWIGLU_MXFP8): writes the E4M3 activation, its swizzled UE8M0 scales and
     (optionally) the bf16 activation into the caller's buffers; returns nothing."""
     return None
@@ -515,6 +519,7 @@ def _mc_allreduce_norm_fake(
     quant,
     prepushed,
     opts,
+    ar2_order_fix=True,
 ):
     """[normed, updated residual] (+ [E4M3 rows, swizzled scale bytes] with quant)."""
     outputs = [torch.empty_like(residual), torch.empty_like(residual)]
@@ -554,6 +559,7 @@ def _sm107_mc_allreduce_norm_fake(
     cap_out=None,
     cap_w=None,
     cap_eps=0.0,
+    ar2_order_fix=True,
 ):
     """As minimax_m3_mc_allreduce_norm; cap_out is written in place."""
     return _mc_allreduce_norm_fake(
@@ -590,6 +596,7 @@ def _chain_spec_sampling_mc_win_fake(
     add,
     window,
     base_row,
+    v3=True,
 ):
     """As minimax_m31_chain_speculative_sampling_mc; the window is written in place."""
     return _chain_spec_sampling_mc_fake(
@@ -611,6 +618,7 @@ def _chain_spec_sampling_mc_slots_win_fake(
     add,
     window,
     base_row,
+    v3=True,
 ):
     """As minimax_m31_chain_speculative_sampling_mc_slots; the window is written in place."""
     return _chain_spec_sampling_mc_slots_fake(

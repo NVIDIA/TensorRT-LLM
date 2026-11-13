@@ -49,6 +49,8 @@ namespace
 {
 
 constexpr int kEmpty = static_cast<int>(0x80000000u);
+// Bit 8 of the kernel's prepushed argument: the legacy (pre AR2_ORDER_FIX) early parity rotation.
+constexpr int kAr2LegacyRotateBit = 256;
 constexpr int kFinMaxTopk = 8; // MoE finalize: top-k rows loaded together up to this k
 
 __device__ __forceinline__ uint32_t canon_bf16x2(uint32_t w)
@@ -130,6 +132,10 @@ __global__ void __launch_bounds__(THREADS) mc_allreduce_norm_kernel(__nv_bfloat1
     bool const active = t < M && threadIdx.x * 8 < cols;
     int64_t const half_words = static_cast<int64_t>(MAXT) * world * (H / 2);
 
+    // Bit 8 of prepushed (set by the op when its ar2_order_fix argument is false, the AR2_ORDER_FIX kill switch): the
+    // legacy early parity rotation.
+    bool const legacyRotate = (prepushed & kAr2LegacyRotateBit) != 0;
+    prepushed &= ~kAr2LegacyRotateBit;
     // prepushed 1: the producer (m3_mx_gemv) already pushed this rank's rows into the exchange slots; 2: and it
     // launched this grid only after its pushes (its grid wait passed), so the slots are polled without a grid wait;
     // 3: as 2, with x in set A and x2 in set B.
@@ -351,6 +357,12 @@ __global__ void __launch_bounds__(THREADS) mc_allreduce_norm_kernel(__nv_bfloat1
         *reinterpret_cast<uint4*>(out_residual + static_cast<int64_t>(t) * H + c0)
             = make_uint4(upd[0], upd[1], upd[2], upd[3]);
     }
+    if constexpr ((OPTS & 4) != 0)
+    {
+        // Legacy order (the AR2_ORDER_FIX kill switch): rotate once thread 0's own poll is done.
+        if (legacyRotate && threadIdx.x == 0)
+            flags[blockIdx.x] = parity ^ 1;
+    }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         sq += __shfl_xor_sync(0xffffffffu, sq, off);
@@ -359,11 +371,11 @@ __global__ void __launch_bounds__(THREADS) mc_allreduce_norm_kernel(__nv_bfloat1
     __syncthreads();
     if constexpr ((OPTS & 4) != 0)
     {
-        // Every CTA (active or not) rotates its call parity (read only by later grids) only after every thread's poll
-        // of this slot is done (the barrier above). A producer that releases this grid before all of its pushes reads
-        // the parity before each push; rotating after thread 0's own poll alone let a lagging producer CTA read the
-        // next call's parity and push into the half nobody polls.
-        if (threadIdx.x == 0)
+        // AR2_ORDER_FIX: every CTA (active or not) rotates its call parity (read only by later grids) only after every
+        // thread's poll of this slot is done (the barrier above). A producer that releases this grid before all of its
+        // pushes reads the parity before each push; rotating after thread 0's own poll alone let a lagging producer CTA
+        // read the next call's parity and push into the half nobody polls.
+        if (!legacyRotate && threadIdx.x == 0)
             flags[blockIdx.x] = parity ^ 1;
     }
     if constexpr ((OPTS & 2) != 0)

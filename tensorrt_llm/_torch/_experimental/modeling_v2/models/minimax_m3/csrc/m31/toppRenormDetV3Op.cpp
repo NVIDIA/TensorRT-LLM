@@ -62,7 +62,7 @@ static void checkV3Operands(torch::Tensor const& probs, torch::Tensor const& top
 
 static void launchV3(torch::Tensor const& probs, torch::Tensor const& topP, torch::Tensor& workspace,
     torch::Tensor& out, int64_t ctasPerRow, bool pdl, bool candidateList, bool listPath, bool wideHist, bool keepAllGe1,
-    TRTLLM_MV2_NS::kernels::minimaxM31::ToppRowStore const& rowStore)
+    TRTLLM_MV2_NS::kernels::minimaxM31::ToppRowStore const& rowStore, bool chainPrefetch)
 {
     int64_t const rows = probs.size(0);
     int64_t const d = probs.size(1);
@@ -78,10 +78,10 @@ static void launchV3(torch::Tensor const& probs, torch::Tensor const& topP, torc
     auto const err = rowStore.dst == nullptr
         ? TRTLLM_MV2_NS::kernels::minimaxM31::invokeToppRenormDetV3(probs.data_ptr<float>(), out.data_ptr<float>(),
             topP.data_ptr<float>(), static_cast<int>(rows), static_cast<int>(d), static_cast<int>(ctasPerRow),
-            workspace.data_ptr(), nullptr, pdl, candidateList, listPath, wideHist, keepAllGe1, stream)
+            workspace.data_ptr(), nullptr, pdl, candidateList, listPath, wideHist, keepAllGe1, stream, chainPrefetch)
         : TRTLLM_MV2_NS::kernels::minimaxM31::invokeToppRenormDetV3(probs.data_ptr<float>(), out.data_ptr<float>(),
             topP.data_ptr<float>(), static_cast<int>(rows), static_cast<int>(d), static_cast<int>(ctasPerRow),
-            workspace.data_ptr(), nullptr, pdl, candidateList, listPath, wideHist, stream, rowStore);
+            workspace.data_ptr(), nullptr, pdl, candidateList, listPath, wideHist, stream, rowStore, chainPrefetch);
     TORCH_CHECK(err == cudaSuccess, "minimax_m31_topp_renorm_det_v3 launch failed: ", cudaGetErrorString(err));
 }
 
@@ -91,14 +91,16 @@ static void launchV3(torch::Tensor const& probs, torch::Tensor const& topP, torc
 //! ctas_per_row divides 1024 and rows x ctas_per_row must not exceed the SM count when ctas_per_row > 1.
 //! list_path (V4) / wide_hist (K8): the one-sync list path and 8 privatized pass histograms; both bitwise the same.
 //! Both default to off, so a caller that does not pass them runs the v3 kernel unchanged.
+//! chain_prefetch (TOPP_V6, default on): the sm_107 chain-prefetch summation; off, the staged loop (the same bits).
 //! keep_all_ge1 (default on): rows with top_p >= 1 keep every element; off, they take FlashInfer's radix passes too, so
 //! every row is bitwise FlashInfer's deterministic top_p_renorm_probs.
 void minimaxM31ToppRenormDetV3(torch::Tensor const& probs, torch::Tensor const& topP, torch::Tensor& workspace,
-    torch::Tensor& out, int64_t ctasPerRow, bool pdl, bool candidateList, bool listPath, bool wideHist, bool keepAllGe1)
+    torch::Tensor& out, int64_t ctasPerRow, bool pdl, bool candidateList, bool listPath, bool wideHist, bool keepAllGe1,
+    bool chainPrefetch)
 {
     checkV3Operands(probs, topP, workspace, out, ctasPerRow);
     launchV3(probs, topP, workspace, out, ctasPerRow, pdl, candidateList, listPath, wideHist, keepAllGe1,
-        TRTLLM_MV2_NS::kernels::minimaxM31::ToppRowStore{});
+        TRTLLM_MV2_NS::kernels::minimaxM31::ToppRowStore{}, chainPrefetch);
 }
 
 //! FOLD_F1: minimax_m31_topp_renorm_det_v3 that also writes output row r, value for value, to
@@ -107,7 +109,7 @@ void minimaxM31ToppRenormDetV3(torch::Tensor const& probs, torch::Tensor const& 
 //! last-dim stride and 16-byte aligned rows; slot_ids: contiguous int64 [rows / k] (not bounds-checked).
 void minimaxM31ToppRenormDetV3Rows(torch::Tensor const& probs, torch::Tensor const& topP, torch::Tensor& workspace,
     torch::Tensor& out, int64_t ctasPerRow, bool pdl, bool candidateList, bool listPath, bool wideHist,
-    torch::Tensor& dst, torch::Tensor const& slotIds, int64_t k)
+    torch::Tensor& dst, torch::Tensor const& slotIds, int64_t k, bool chainPrefetch)
 {
     checkV3Operands(probs, topP, workspace, out, ctasPerRow);
     int64_t const rows = probs.size(0);
@@ -127,8 +129,8 @@ void minimaxM31ToppRenormDetV3Rows(torch::Tensor const& probs, torch::Tensor con
     rowStore.k = static_cast<int32_t>(k);
     rowStore.slotStride = dst.stride(0);
     rowStore.rowStride = dst.stride(1);
-    launchV3(
-        probs, topP, workspace, out, ctasPerRow, pdl, candidateList, listPath, wideHist, /*keepAllGe1=*/true, rowStore);
+    launchV3(probs, topP, workspace, out, ctasPerRow, pdl, candidateList, listPath, wideHist, /*keepAllGe1=*/true,
+        rowStore, chainPrefetch);
 }
 
 //! Workspace bytes per row of minimax_m31_topp_renorm_det_v3.
@@ -146,11 +148,11 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
     m.def(
         "minimax_m31_topp_renorm_det_v3(Tensor probs, Tensor top_p, Tensor(a!) workspace, Tensor(b!) out, "
         "int ctas_per_row, bool pdl, bool candidate_list, bool list_path=False, bool wide_hist=False, "
-        "bool keep_all_ge1=True) -> ()");
+        "bool keep_all_ge1=True, bool chain_prefetch=True) -> ()");
     m.def(
         "minimax_m31_topp_renorm_det_v3_rows(Tensor probs, Tensor top_p, Tensor(a!) workspace, Tensor(b!) out, "
         "int ctas_per_row, bool pdl, bool candidate_list, bool list_path, bool wide_hist, Tensor(c!) dst, "
-        "Tensor slot_ids, int k) -> ()");
+        "Tensor slot_ids, int k, bool chain_prefetch=True) -> ()");
     // No tensor arguments: a catch-all kernel (as moe_a2a_get_timeout), callable without a device.
     m.def("minimax_m31_topp_renorm_det_v3_ws_bytes() -> int");
 }

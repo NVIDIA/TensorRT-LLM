@@ -43,6 +43,10 @@ from ...m31_switches import m31_disabled
 # The largest CTA count per row (the persistent grid is rows x ctas_per_row 1024-thread CTAs, all co-resident).
 MAX_CTAS_PER_ROW = 16
 
+# TOPP_V6: on sm_107 the v3 renorm sums each chain straight from global memory (the same adds in the same order). Kill
+# switch TRTLLM_M31_DISABLE_TOPP_V6=1 (the staged loop on every device), passed as the op's chain_prefetch argument.
+TOPP_V6 = not m31_disabled("TOPP_V6")
+
 # The rows the workspace holds and the override takes with v3 / V4K8: up to the aggregated TP2 K = 3 calls at 64
 # requests (256 rows) and the K = 7 calls at 56 requests (448 rows). v3 and V4K8 are bitwise FlashInfer's det mode on
 # every row count 9..448 (peaked / randn / near_uniform logits). Past 106 rows each row runs on one CTA (no
@@ -252,9 +256,19 @@ class M31ToppDet(OpWrapper):
                     _STATE["cand_list"],
                     _STATE["list_path"],
                     _STATE["wide_hist"],
+                    chain_prefetch=TOPP_V6,
                 )
             else:
-                op(probs, top_p, workspace, out, int(ctas_per_row), True, _STATE["cand_list"])
+                op(
+                    probs,
+                    top_p,
+                    workspace,
+                    out,
+                    int(ctas_per_row),
+                    True,
+                    _STATE["cand_list"],
+                    chain_prefetch=TOPP_V6,
+                )
         else:
             op(probs, top_p, workspace, out, int(ctas_per_row))
         return out

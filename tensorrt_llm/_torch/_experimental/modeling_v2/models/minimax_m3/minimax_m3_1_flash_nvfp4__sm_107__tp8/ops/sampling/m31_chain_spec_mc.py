@@ -27,6 +27,12 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
+from ...m31_switches import m31_disabled
+
+# REJ_V3: on sm_107 the op launches the v3 kernel (staged chains, the same adds in the same order). Kill switch
+# TRTLLM_M31_DISABLE_REJ_V3=1 (the v2 kernel on every device), passed as the op's v3 argument.
+REJ_V3 = not m31_disabled("REJ_V3")
+
 # The largest CTA count per request (the grid is batch x ctas_per_row 1024-thread CTAs, all co-resident; ctas_per_row
 # is sized from the device's own SM count, so the same entry holds on SM103 and SM107); bitwise at every count.
 MAX_CTAS_PER_ROW = 64
@@ -147,7 +153,7 @@ def kernel_version() -> int:
             version = getattr(
                 family_ops(), "minimax_m31_chain_speculative_sampling_mc_version", None
             )
-            _STATE["kernel"] = int(version()) if version is not None else 2
+            _STATE["kernel"] = int(version(REJ_V3)) if version is not None else 2
     return _STATE["kernel"]
 
 
@@ -276,9 +282,17 @@ class M31ChainSpecMc(OpWrapper):
             return family_ops().minimax_m31_chain_speculative_sampling_mc_win(
                 draft_probs, draft_token_ids, target_probs, seed, offset, workspace,
                 int(ctas_per_row), base, add, win, win.numel() - 1,
+                v3=REJ_V3,
             )  # fmt: skip
         tokens, num_tokens = op(
-            draft_probs, draft_token_ids, target_probs, seed, offset, workspace, int(ctas_per_row)
+            draft_probs,
+            draft_token_ids,
+            target_probs,
+            seed,
+            offset,
+            workspace,
+            int(ctas_per_row),
+            v3=REJ_V3,
         )
         return tokens, num_tokens
 
@@ -455,6 +469,7 @@ def chain_spec_mc_slots(
         return family_ops().minimax_m31_chain_speculative_sampling_mc_slots_win(
             draft_buf, slot_ids, int(num_draft), draft_token_ids, target_probs, seed, offset,
             workspace, int(g), base, add, win, win.numel() - 1,
+            v3=REJ_V3,
         )  # fmt: skip
     if window is not None:
         return None  # chain_spec_mc, which the sampler calls next, writes the window
@@ -469,4 +484,5 @@ def chain_spec_mc_slots(
         offset,
         workspace,
         int(g),
+        v3=REJ_V3,
     )

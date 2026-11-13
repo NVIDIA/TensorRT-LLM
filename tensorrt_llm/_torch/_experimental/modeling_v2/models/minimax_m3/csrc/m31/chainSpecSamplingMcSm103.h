@@ -98,14 +98,15 @@ struct ChainSpecMcRngWindow
 cudaError_t invokeChainSpecSamplingMc(
     tensorrt_llm::kernels::speculative_decoding::ChainSpeculativeSamplingParams const& params, int ctasPerRow,
     void* workspace, cudaStream_t stream, ChainSpecMcDraftRows const& rows = ChainSpecMcDraftRows{},
-    ChainSpecMcRngWindow const& rng = ChainSpecMcRngWindow{});
+    ChainSpecMcRngWindow const& rng = ChainSpecMcRngWindow{}, bool allowV3 = true);
 
 //! Workspace bytes per request of invokeChainSpecSamplingMc.
 size_t chainSpecSamplingMcWorkspaceBytesPerRow();
 
 //! The kernel invokeChainSpecSamplingMc launches: 3 (REJ v3 on sm_107: staged chains, both tile variants before one
-//! row barrier, the same adds and order) or 2 (the v2 kernel, other devices).
-int chainSpecSamplingMcKernelVersion();
+//! row barrier, the same adds and order) or 2 (the v2 kernel, other devices). allowV3 = false (the REJ_V3 kill switch)
+//! keeps the v2 kernel on every device.
+int chainSpecSamplingMcKernelVersion(bool allowV3 = true);
 
 } // namespace minimaxM31
 } // namespace kernels

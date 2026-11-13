@@ -262,7 +262,8 @@ int residentCtas(void const* kernel, int block)
 
 void invokeCtxResidualRmsNormMxfp8(__nv_bfloat16* inter, __nv_bfloat16 const* residual, __nv_bfloat16 const* weight,
     __nv_bfloat16* normOut, uint64_t* qOut, uint32_t* sfOut, uint32_t* fp4Out, uint32_t* fp4SfOut,
-    float const* fp4GlobalScale, float* f32Out, int rows, int hidden, float eps, bool enablePdl, cudaStream_t stream)
+    float const* fp4GlobalScale, float* f32Out, int rows, int hidden, float eps, bool enablePdl, bool lb2,
+    cudaStream_t stream)
 {
     static int const multiProcessorCount = []
     {
@@ -283,11 +284,11 @@ void invokeCtxResidualRmsNormMxfp8(__nv_bfloat16* inter, __nv_bfloat16 const* re
     attribute[0].val.programmaticStreamSerializationAllowed = enablePdl;
     config.attrs = attribute;
     config.numAttrs = 1;
-    bool const lb2 = block <= 768;
+    bool const twoPerSm = lb2 && block <= 768;
     // kernel: the one-CTA-per-SM form; kernelLb2: the CTXNORM_LB2 form of the same flavor.
     auto launch = [&](auto kernel, auto kernelLb2)
     {
-        int const ctas = lb2 ? residentCtas(reinterpret_cast<void const*>(kernelLb2), block) : 0;
+        int const ctas = twoPerSm ? residentCtas(reinterpret_cast<void const*>(kernelLb2), block) : 0;
         if (ctas >= 2)
         {
             config.gridDim = std::max(1, std::min(rows, ctas * multiProcessorCount));

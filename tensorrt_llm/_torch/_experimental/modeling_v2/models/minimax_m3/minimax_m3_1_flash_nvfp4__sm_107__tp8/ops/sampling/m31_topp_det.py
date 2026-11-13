@@ -42,6 +42,10 @@ from ...m31_switches import m31_disabled
 # The largest CTA count per row (the persistent grid is rows x ctas_per_row 1024-thread CTAs, all co-resident).
 MAX_CTAS_PER_ROW = 16
 
+# TOPP_V6: on sm_107 the v3 renorm sums each chain straight from global memory (the same adds in the same order). Kill
+# switch TRTLLM_M31_DISABLE_TOPP_V6=1 (the staged loop on every device), passed as the op's chain_prefetch argument.
+TOPP_V6 = not m31_disabled("TOPP_V6")
+
 # The rows the workspace holds and the override takes: one request at draft length 7 (the draft's 7 rows and the
 # verify's 8). Larger calls keep the stock kernel.
 MAX_ROWS = 8
@@ -286,6 +290,7 @@ class M31ToppDet(OpWrapper):
                 dst,
                 slot_ids,
                 k,
+                chain_prefetch=TOPP_V6,
             )
             stored = out.view(slot_ids.numel(), k, probs.shape[1])
             _ROWS_STORED[0] = _row_store_key(dst, slot_ids, stored)
@@ -308,9 +313,19 @@ class M31ToppDet(OpWrapper):
                     _STATE["cand_list"],
                     _STATE["list_path"],
                     _STATE["wide_hist"],
+                    chain_prefetch=TOPP_V6,
                 )
             else:
-                op(probs, top_p, workspace, out, int(ctas_per_row), True, _STATE["cand_list"])
+                op(
+                    probs,
+                    top_p,
+                    workspace,
+                    out,
+                    int(ctas_per_row),
+                    True,
+                    _STATE["cand_list"],
+                    chain_prefetch=TOPP_V6,
+                )
         else:
             op(probs, top_p, workspace, out, int(ctas_per_row))
         return out

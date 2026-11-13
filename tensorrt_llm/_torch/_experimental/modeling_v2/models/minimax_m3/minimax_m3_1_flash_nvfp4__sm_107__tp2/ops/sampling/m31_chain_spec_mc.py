@@ -44,6 +44,9 @@ WIDE = not m31_disabled("REJ_MC_WIDE")
 # Slot-indexed calls avoid the caller's draft-probability gather. The compound path
 # is exact at K = 3 up to 112 requests and K = 7 up to 56.
 SLOTS_WIDE = not m31_disabled("REJ_SLOTS_WIDE")
+# REJ_V3: on sm_107 the op launches the v3 kernel (staged chains, the same adds in the same order). Kill switch
+# TRTLLM_M31_DISABLE_REJ_V3=1 (the v2 kernel on every device), passed as the op's v3 argument.
+REJ_V3 = not m31_disabled("REJ_V3")
 WORKSPACE_MAX_BATCH = 112
 
 # The widest vocab the kernel takes (64 tiles of 4096; kChainSpecMcMaxVocab).
@@ -216,7 +219,14 @@ class M31ChainSpecMc(OpWrapper):
         if op is None or workspace.numel() * workspace.element_size() < batch * ws_bytes_per_row():
             return None
         tokens, num_tokens = op(
-            draft_probs, draft_token_ids, target_probs, seed, offset, workspace, int(ctas_per_row)
+            draft_probs,
+            draft_token_ids,
+            target_probs,
+            seed,
+            offset,
+            workspace,
+            int(ctas_per_row),
+            v3=REJ_V3,
         )
         return tokens, num_tokens
 
@@ -374,6 +384,7 @@ def chain_spec_mc_slots(
         offset,
         workspace,
         int(g),
+        v3=REJ_V3,
     )
     m3_report.work("REJ_SLOTS", f"batch {batch}")
     return out

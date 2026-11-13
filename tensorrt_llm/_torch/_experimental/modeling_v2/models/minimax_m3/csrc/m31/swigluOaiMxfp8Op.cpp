@@ -34,8 +34,8 @@ namespace torch_ext
 //! SWIGLU_MXFP8 (see csrc/m31/swigluOaiMxfp8Sm103.h): x bf16 [rows, 2d] -> q E4M3 [rows, d] and sf uint8
 //! [pad128(rows) * d / 32] (swizzled K32 UE8M0), bitwise mxfp8_quantize(swiglu_oai(x), True); `h` (bf16 [rows, d]),
 //! when given, also receives the activation. PDL as quantize_with_block_size (TRTLLM_ENABLE_PDL).
-void minimaxM31SwigluOaiMxfp8(
-    torch::Tensor const& x, torch::Tensor& q, torch::Tensor& sf, std::optional<torch::Tensor> const& h)
+void minimaxM31SwigluOaiMxfp8(torch::Tensor const& x, torch::Tensor& q, torch::Tensor& sf,
+    std::optional<torch::Tensor> const& h, bool rowsForm, int64_t kRows)
 {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
         "minimax_m31_swiglu_oai_mxfp8: x must be a contiguous 2-D bfloat16 CUDA tensor");
@@ -62,11 +62,11 @@ void minimaxM31SwigluOaiMxfp8(
     }
     c10::cuda::CUDAGuard const deviceGuard{x.device()};
     thread_local int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-    auto const err
-        = TRTLLM_MV2_NS::kernels::minimaxM31::invokeSwigluOaiMxfp8(reinterpret_cast<uint4 const*>(x.data_ptr()),
-            reinterpret_cast<uint64_t*>(q.data_ptr()), reinterpret_cast<uint32_t*>(sf.data_ptr()),
-            h.has_value() ? reinterpret_cast<uint4*>(h->data_ptr()) : nullptr, rows, d, multiProcessorCount,
-            tensorrt_llm::common::getEnvEnablePDL(), at::cuda::getCurrentCUDAStream(x.get_device()));
+    auto const err = TRTLLM_MV2_NS::kernels::minimaxM31::invokeSwigluOaiMxfp8(
+        reinterpret_cast<uint4 const*>(x.data_ptr()), reinterpret_cast<uint64_t*>(q.data_ptr()),
+        reinterpret_cast<uint32_t*>(sf.data_ptr()), h.has_value() ? reinterpret_cast<uint4*>(h->data_ptr()) : nullptr,
+        rows, d, multiProcessorCount, tensorrt_llm::common::getEnvEnablePDL(),
+        at::cuda::getCurrentCUDAStream(x.get_device()), rowsForm, static_cast<int>(kRows));
     TORCH_CHECK(err == cudaSuccess, "minimax_m31_swiglu_oai_mxfp8 launch failed: ", cudaGetErrorString(err));
 }
 
@@ -118,7 +118,9 @@ TRTLLM_MV2_NAMESPACE_END
 
 TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
-    m.def("minimax_m31_swiglu_oai_mxfp8(Tensor x, Tensor(a!) q, Tensor(b!) sf, Tensor(c!)? h) -> ()");
+    m.def(
+        "minimax_m31_swiglu_oai_mxfp8(Tensor x, Tensor(a!) q, Tensor(b!) sf, Tensor(c!)? h, bool rows_form=True, "
+        "int k_rows=4) -> ()");
     m.def("minimax_m31_swiglu_oai_mxfp8_decode(Tensor x, Tensor(a!) q, Tensor(b!) sf, bool finite_code0=True) -> ()");
 }
 

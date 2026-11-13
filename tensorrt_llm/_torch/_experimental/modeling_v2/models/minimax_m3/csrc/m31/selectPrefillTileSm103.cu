@@ -903,7 +903,7 @@ __global__ void __launch_bounds__(kNarrowThreads)
 template <bool kRowMajor>
 cudaError_t launchSelectPrefillTile(float const* scores, int64_t headStride, int64_t blockStride, int64_t queryStride,
     int32_t const* nValidBlocks, int32_t* out, int64_t outQueryStride, int64_t outHeadStride, int32_t numKvHeads,
-    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream)
+    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream, bool narrowAllowed)
 {
     if (totalQ == 0 || numKvHeads == 0)
     {
@@ -913,11 +913,13 @@ cudaError_t launchSelectPrefillTile(float const* scores, int64_t headStride, int
     {
         return cudaErrorInvalidValue;
     }
-    // The narrow-row kernel is measured on sm_107 only.
-    static bool const narrow = common::getSMVersion() == 107;
+    // The narrow-row kernel is measured on sm_107 only; narrowAllowed = false (the TSEL_NARROW kill switch) turns it
+    // off.
+    static bool const narrowArch = common::getSMVersion() == 107;
+    bool const narrow = narrowAllowed && narrowArch;
     static std::once_flag logged;
     std::call_once(logged,
-        []
+        [narrow, narrowAllowed]
         {
             char const* const layout = kRowMajor ? " (row-major scores)" : "";
             TLLM_LOG_INFO(
@@ -931,7 +933,8 @@ cudaError_t launchSelectPrefillTile(float const* scores, int64_t headStride, int
             }
             else
             {
-                TLLM_LOG_INFO("minimaxM3SelectPrefillTile%s: narrow rows NOT ENGAGED (not sm_107)", layout);
+                TLLM_LOG_INFO("minimaxM3SelectPrefillTile%s: narrow rows NOT ENGAGED (%s)", layout,
+                    narrowAllowed ? "not sm_107" : "TRTLLM_M31_DISABLE_TSEL_NARROW=1");
             }
         });
     if (narrow && numBlocks <= kNarrowMaxBlocks)
@@ -965,18 +968,18 @@ cudaError_t launchSelectPrefillTile(float const* scores, int64_t headStride, int
 
 cudaError_t invokeMinimaxM3SelectPrefillTile(float const* scores, int64_t headStride, int64_t blockStride,
     int32_t const* nValidBlocks, int32_t* out, int64_t outQueryStride, int64_t outHeadStride, int32_t numKvHeads,
-    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream)
+    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream, bool narrow)
 {
     return launchSelectPrefillTile<false>(scores, headStride, blockStride, /*queryStride=*/1, nValidBlocks, out,
-        outQueryStride, outHeadStride, numKvHeads, numBlocks, totalQ, initBlocks, localBlocks, stream);
+        outQueryStride, outHeadStride, numKvHeads, numBlocks, totalQ, initBlocks, localBlocks, stream, narrow);
 }
 
 cudaError_t invokeMinimaxM3SelectPrefillTileRows(float const* scores, int64_t headStride, int64_t queryStride,
     int32_t const* nValidBlocks, int32_t* out, int64_t outQueryStride, int64_t outHeadStride, int32_t numKvHeads,
-    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream)
+    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream, bool narrow)
 {
     return launchSelectPrefillTile<true>(scores, headStride, /*blockStride=*/1, queryStride, nValidBlocks, out,
-        outQueryStride, outHeadStride, numKvHeads, numBlocks, totalQ, initBlocks, localBlocks, stream);
+        outQueryStride, outHeadStride, numKvHeads, numBlocks, totalQ, initBlocks, localBlocks, stream, narrow);
 }
 
 } // namespace kernels::minimaxM31Sm103

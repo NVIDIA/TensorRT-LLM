@@ -52,11 +52,13 @@ struct NoAuxTcFp4QuantStage
 // launch. Token t goes to stage0 row t when t < stage0.numRows and to stage1 row t - stage0.numRows otherwise; both
 // stages' tails are reset in the same launch. A nonzero padMask[t] (padMask may be null; numTokens bytes otherwise)
 // gives token t's stage row the tail's ids and weights instead of its routing. Each other written value has the bits
-// trtllm::noaux_tc_op and trtllm::fp4_quantize produce.
+// trtllm::noaux_tc_op and trtllm::fp4_quantize produce. fp32Weight (NOAUX_TC_FP32, default on) computes the routing
+// weights in the FP32 form (the FP64 expression's values without FP64 instructions on the common path); false (its
+// kill switch) evaluates the FP64 expression for every weight.
 void invokeNoAuxTcFp4QuantStage(float const* scores, float const* bias, __nv_bfloat16 const* hiddenStates,
     float const* globalScale, uint8_t const* padMask, NoAuxTcFp4QuantStage const& stage0,
     NoAuxTcFp4QuantStage const& stage1, int64_t numTokens, int64_t numExperts, int64_t topk, int64_t hiddenSize,
-    double routedScalingFactor, cudaStream_t stream);
+    double routedScalingFactor, cudaStream_t stream, bool fp32Weight = true);
 
 // The routing half of invokeNoAuxTcFp4QuantStage for one stage, in one launch: token t < stage.numRows goes to stage
 // row t (a nonzero padMask[t] gives it the tail's ids and weights), and the tail rows past stage.numRows are reset.
@@ -64,7 +66,7 @@ void invokeNoAuxTcFp4QuantStage(float const* scores, float const* bias, __nv_bfl
 // writes for the same stage.
 void invokeNoAuxTcRouteStage(float const* scores, float const* bias, uint8_t const* padMask,
     NoAuxTcFp4QuantStage const& stage, int64_t numExperts, int64_t topk, double routedScalingFactor,
-    cudaStream_t stream);
+    cudaStream_t stream, bool fp32Weight = true);
 
 } // namespace kernels::minimaxM31
 

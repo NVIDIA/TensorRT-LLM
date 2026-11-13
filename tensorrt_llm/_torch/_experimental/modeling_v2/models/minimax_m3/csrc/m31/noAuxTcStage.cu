@@ -113,7 +113,7 @@ __device__ __forceinline__ float noAuxTcRoutingWeight(float s, float S, double c
 // One token's single-group routing (deepseek_v3_topk_block's ungrouped path at MaxNumTopExperts = 32): the sigmoid
 // scores plus bias in shared memory, warp 0's iterated top-k over them, then the normalized, scaled weights of the
 // selected experts. scores, topkValues and topkIndices point at the token's row.
-template <int MaxNumExperts>
+template <int MaxNumExperts, bool kFp32Weight>
 __device__ __forceinline__ void routeRow(float const* scores, float* topkValues, int32_t* topkIndices,
     float const* routingBias, int64_t const topk, int64_t const numExperts, double const routedScalingFactor)
 {
@@ -163,7 +163,8 @@ __device__ __forceinline__ void routeRow(float const* scores, float* topkValues,
         // Only the lanes that store a weight form one: a zero score would take the FP64 path.
         if (laneIdx < topk)
         {
-            topkValues[laneIdx] = noAuxTcRoutingWeight(scoreNorm, redNorm, routedScalingFactor);
+            topkValues[laneIdx] = kFp32Weight ? noAuxTcRoutingWeight(scoreNorm, redNorm, routedScalingFactor)
+                                              : noAuxTcRoutingWeightFp64(scoreNorm, redNorm, routedScalingFactor);
             topkIndices[laneIdx] = expertIdx;
         }
     }
@@ -193,7 +194,7 @@ __device__ __forceinline__ void resetNoAuxTcFp4QuantStageTail(NoAuxTcFp4QuantSta
     }
 }
 
-template <int MaxNumExperts>
+template <int MaxNumExperts, bool kFp32Weight>
 __global__ __launch_bounds__(NoAuxTcFp4QuantStageThreads) void noaux_tc_fp4_quant_stage_kernel(float const* scores,
     float const* routingBias, __nv_bfloat16 const* hiddenStates, float const* globalScale, uint8_t const* padMask,
     NoAuxTcFp4QuantStage stage0, NoAuxTcFp4QuantStage stage1, int numTokens, int topk, int numExperts, int hiddenSize,
@@ -220,7 +221,7 @@ __global__ __launch_bounds__(NoAuxTcFp4QuantStageThreads) void noaux_tc_fp4_quan
         }
         else if (ctaIdx < numTokens)
         {
-            routeRow<MaxNumExperts>(scores + static_cast<int64_t>(tokenIdx) * numExperts,
+            routeRow<MaxNumExperts, kFp32Weight>(scores + static_cast<int64_t>(tokenIdx) * numExperts,
                 stage.topkWeights + stageRow * stage.weightStride, stage.topkIndices + stageRow * stage.indexStride,
                 routingBias, topk, numExperts, routedScalingFactor);
         }
@@ -266,7 +267,7 @@ __global__ __launch_bounds__(NoAuxTcFp4QuantStageThreads) void noaux_tc_fp4_quan
 constexpr int64_t NoAuxTcRouteStageTailCellsPerCta = 1024;
 constexpr int64_t NoAuxTcRouteStageMaxTailCtas = 64;
 
-template <int MaxNumExperts>
+template <int MaxNumExperts, bool kFp32Weight>
 __global__ __launch_bounds__(NoAuxTcFp4QuantStageThreads) void noaux_tc_route_stage_kernel(float const* scores,
     float const* routingBias, uint8_t const* padMask, NoAuxTcFp4QuantStage stage, int topk, int numExperts,
     double routedScalingFactor)
@@ -288,8 +289,9 @@ __global__ __launch_bounds__(NoAuxTcFp4QuantStageThreads) void noaux_tc_route_st
         }
         else
         {
-            routeRow<MaxNumExperts>(scores + row * numExperts, stage.topkWeights + row * stage.weightStride,
-                stage.topkIndices + row * stage.indexStride, routingBias, topk, numExperts, routedScalingFactor);
+            routeRow<MaxNumExperts, kFp32Weight>(scores + row * numExperts,
+                stage.topkWeights + row * stage.weightStride, stage.topkIndices + row * stage.indexStride, routingBias,
+                topk, numExperts, routedScalingFactor);
         }
     }
     else
@@ -319,7 +321,7 @@ __global__ __launch_bounds__(NoAuxTcFp4QuantStageThreads) void noaux_tc_route_st
 void invokeNoAuxTcFp4QuantStage(float const* scores, float const* bias, __nv_bfloat16 const* hiddenStates,
     float const* globalScale, uint8_t const* padMask, NoAuxTcFp4QuantStage const& stage0,
     NoAuxTcFp4QuantStage const& stage1, int64_t numTokens, int64_t numExperts, int64_t topk, int64_t hiddenSize,
-    double routedScalingFactor, cudaStream_t stream)
+    double routedScalingFactor, cudaStream_t stream, bool fp32Weight)
 {
     TLLM_CHECK_WITH_INFO(numExperts >= 1 && numExperts <= NumDeepseekExperts && topk >= 1 && topk <= numExperts
             && topk <= MaxSupportedTopExperts,
@@ -336,8 +338,10 @@ void invokeNoAuxTcFp4QuantStage(float const* scores, float const* bias, __nv_bfl
         TLLM_CHECK_WITH_INFO(stage->numRows <= stage->indexCapRows && stage->numRows <= stage->weightCapRows,
             "invokeNoAuxTcFp4QuantStage: a stage holds fewer rows than it receives");
     }
-    auto* kernelInstance = numExperts <= 128 ? &noaux_tc_fp4_quant_stage_kernel<128>
-                                             : &noaux_tc_fp4_quant_stage_kernel<NumDeepseekExperts>;
+    auto* kernelInstance = numExperts <= 128
+        ? (fp32Weight ? &noaux_tc_fp4_quant_stage_kernel<128, true> : &noaux_tc_fp4_quant_stage_kernel<128, false>)
+        : (fp32Weight ? &noaux_tc_fp4_quant_stage_kernel<NumDeepseekExperts, true>
+                      : &noaux_tc_fp4_quant_stage_kernel<NumDeepseekExperts, false>);
     cudaLaunchConfig_t config;
     config.gridDim = static_cast<unsigned int>(2 * numTokens + 1);
     config.blockDim = NoAuxTcFp4QuantStageThreads;
@@ -356,7 +360,7 @@ void invokeNoAuxTcFp4QuantStage(float const* scores, float const* bias, __nv_bfl
 
 void invokeNoAuxTcRouteStage(float const* scores, float const* bias, uint8_t const* padMask,
     NoAuxTcFp4QuantStage const& stage, int64_t numExperts, int64_t topk, double routedScalingFactor,
-    cudaStream_t stream)
+    cudaStream_t stream, bool fp32Weight)
 {
     TLLM_CHECK_WITH_INFO(numExperts >= 1 && numExperts <= NumDeepseekExperts && topk >= 1 && topk <= numExperts
             && topk <= MaxSupportedTopExperts,
@@ -369,8 +373,10 @@ void invokeNoAuxTcRouteStage(float const* scores, float const* bias, uint8_t con
     int64_t const numTailCtas = std::min(
         std::max((tailCells + NoAuxTcRouteStageTailCellsPerCta - 1) / NoAuxTcRouteStageTailCellsPerCta, int64_t{1}),
         NoAuxTcRouteStageMaxTailCtas);
-    auto* kernelInstance
-        = numExperts <= 128 ? &noaux_tc_route_stage_kernel<128> : &noaux_tc_route_stage_kernel<NumDeepseekExperts>;
+    auto* kernelInstance = numExperts <= 128
+        ? (fp32Weight ? &noaux_tc_route_stage_kernel<128, true> : &noaux_tc_route_stage_kernel<128, false>)
+        : (fp32Weight ? &noaux_tc_route_stage_kernel<NumDeepseekExperts, true>
+                      : &noaux_tc_route_stage_kernel<NumDeepseekExperts, false>);
     cudaLaunchConfig_t config;
     config.gridDim = static_cast<unsigned int>(stage.numRows + numTailCtas);
     config.blockDim = NoAuxTcFp4QuantStageThreads;

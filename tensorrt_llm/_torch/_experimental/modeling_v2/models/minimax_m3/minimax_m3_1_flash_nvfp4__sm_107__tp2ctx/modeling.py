@@ -133,6 +133,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, runtime_hooks_compat
 from ..kernels import m31_moe_finalize_out as _m31_finalize_out
+from ..ops import swiglu_rows_plan
 from . import idx_scorer as _idx_scorer
 from . import tile_select as _tsel
 from .m31_switches import m31_disabled, m31_enabled
@@ -1283,7 +1284,7 @@ def _sp_boundary(
             addnorm(local_ptr, peer_ptr, owned, *outs_args, 1, False)
             _addnorm_note(rows, moe is not None)
         else:
-            normq_out(owned, *outs_args, False)
+            normq_out(owned, *outs_args, False, lb2=_CTXNORM_LB2)
         xq, xsf = gq.view(torch.float8_e4m3fn), gsf
         if fp4_scale is not None:
             fp4, fp4_sf = g4, g4sf.reshape(-1)
@@ -1302,11 +1303,28 @@ def _sp_boundary(
     else:
         f32_op = _normq_f32_op() if moe is not None else None
         if f32_op is not None:
-            outs = f32_op(owned, res.contiguous(), norm.weight, norm.variance_epsilon, fp4_scale)
+            outs = f32_op(
+                owned,
+                res.contiguous(),
+                norm.weight,
+                norm.variance_epsilon,
+                fp4_scale,
+                lb2=_CTXNORM_LB2,
+            )
         elif fp4_scale is None:
-            outs = op(owned, res.contiguous(), norm.weight, norm.variance_epsilon, True)
+            outs = op(
+                owned, res.contiguous(), norm.weight, norm.variance_epsilon, True, lb2=_CTXNORM_LB2
+            )
         else:
-            outs = op(owned, res.contiguous(), norm.weight, norm.variance_epsilon, True, fp4_scale)
+            outs = op(
+                owned,
+                res.contiguous(),
+                norm.weight,
+                norm.variance_epsilon,
+                True,
+                fp4_scale,
+                lb2=_CTXNORM_LB2,
+            )
         xq = _sp_put(ws, "mxfp8", rows, outs[1]).view(outs[1].dtype)
         xsf = _sp_put(ws, "mxfp8_sf", rows, outs[2]).view(outs[2].dtype)
         if fp4_scale is not None:
@@ -2319,6 +2337,12 @@ _combine_mxfp8_sink.min_rows = _C1_MIN_ROWS
 _combine_mxfp8_sink.drop_bf16 = _combine_mxfp8_drop_bf16
 
 
+# CTXNORM_LB2: the CTX residual add + RMSNorm + MXFP8 kernel launches at two CTAs per SM (a two-CTA launch bound) where
+# hidden / 8 <= 768, the same outputs bit for bit. Default ON; kill switch TRTLLM_M31_DISABLE_CTXNORM_LB2=1 (one CTA per
+# SM), passed to the op as its lb2 argument.
+_CTXNORM_LB2 = not m31_disabled("CTXNORM_LB2")
+
+
 def _normq_op():
     """family_ops().minimax_m31_ctx_residual_rmsnorm_mxfp8, or None when the build lacks it. Decided once."""
     if "op" not in _NORMQ_STATE:
@@ -2398,13 +2422,33 @@ def _normq_boundary(
     )
     f32_op = _normq_f32_op() if moe is not None else None
     if f32_op is not None:
-        outs = f32_op(reduced, residual.contiguous(), norm.weight, norm.variance_epsilon, fp4_scale)
+        outs = f32_op(
+            reduced,
+            residual.contiguous(),
+            norm.weight,
+            norm.variance_epsilon,
+            fp4_scale,
+            lb2=_CTXNORM_LB2,
+        )
         moe._router_input_f32 = (outs[0], outs[5])
     elif fp4_scale is None:
-        outs = op(reduced, residual.contiguous(), norm.weight, norm.variance_epsilon, True)
+        outs = op(
+            reduced,
+            residual.contiguous(),
+            norm.weight,
+            norm.variance_epsilon,
+            True,
+            lb2=_CTXNORM_LB2,
+        )
     else:
         outs = op(
-            reduced, residual.contiguous(), norm.weight, norm.variance_epsilon, True, fp4_scale
+            reduced,
+            residual.contiguous(),
+            norm.weight,
+            norm.variance_epsilon,
+            True,
+            fp4_scale,
+            lb2=_CTXNORM_LB2,
         )
     normed, xq, xsf = outs[0], outs[1], outs[2]
     if fp4_scale is not None:
@@ -2622,6 +2666,14 @@ _SWIGLU_MXFP8 = not m31_disabled("TP2CTX_SWIGLU_MXFP8")
 _SWIGLU_MXFP8_STATE: Dict[str, Any] = {}
 
 
+# SWIGLU_MXFP8_ROWS: from ops/swiglu_rows_plan.ROWS_MIN rows the op keeps K_ROWS_DEFAULT rows in flight per CTA on an
+# occupancy-true grid, every output byte the one-row launch's. Default ON; kill switch
+# TRTLLM_M31_DISABLE_SWIGLU_MXFP8_ROWS=1 (the one-row launch at every row count), passed as the op's rows_form argument.
+_SWIGLU_ROWS: Dict[str, Any] = dict(
+    rows_form=not m31_disabled("SWIGLU_MXFP8_ROWS"), k_rows=swiglu_rows_plan.K_ROWS_DEFAULT
+)
+
+
 def _swiglu_mxfp8_op():
     """family_ops().minimax_m31_swiglu_oai_mxfp8 from the build; None when it is not built. Decided once."""
     if "op" not in _SWIGLU_MXFP8_STATE:
@@ -2712,7 +2764,7 @@ class _SwigluMxfp8GatedMLP(GatedMLP):
                 ((rows + 127) // 128 * 128 * d // 32,), dtype=torch.uint8, device=h1.device
             )
             _bcg_note("SWIGLU_MXFP8", h1)
-            _swiglu_mxfp8_op()(h1, q, sf, None if _swiglu_noh(self) else h2)
+            _swiglu_mxfp8_op()(h1, q, sf, None if _swiglu_noh(self) else h2, **_SWIGLU_ROWS)
             _NORMQ_SLOT.publish(h2, q, sf)
         return self.down_proj(
             h2, all_reduce_params=final_all_reduce_params, layer_idx=self.layer_idx

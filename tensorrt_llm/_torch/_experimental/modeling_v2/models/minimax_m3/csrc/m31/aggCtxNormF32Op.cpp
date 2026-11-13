@@ -40,7 +40,7 @@ namespace torch_ext
 //! (norm_out, mxfp8, sf, fp4, fp4_sf, norm_f32), the first five exactly the base op's with write_norm = true.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 minimaxM31CtxResidualRmsNormMxfp8F32(torch::Tensor& inter, torch::Tensor const& residual, torch::Tensor const& weight,
-    double eps, std::optional<torch::Tensor> const& fp4GlobalScale, bool enablePdl)
+    double eps, std::optional<torch::Tensor> const& fp4GlobalScale, bool enablePdl, bool lb2)
 {
     TORCH_CHECK(inter.is_cuda() && inter.is_contiguous() && inter.scalar_type() == at::kBFloat16 && inter.dim() >= 2);
     TORCH_CHECK(
@@ -74,7 +74,7 @@ minimaxM31CtxResidualRmsNormMxfp8F32(torch::Tensor& inter, torch::Tensor const& 
         fp4 ? reinterpret_cast<uint32_t*>(fp4Out.data_ptr()) : nullptr,
         fp4 ? reinterpret_cast<uint32_t*>(fp4SfOut.data_ptr()) : nullptr,
         fp4 ? fp4GlobalScale->data_ptr<float>() : nullptr, f32Out.data_ptr<float>(), static_cast<int>(rows),
-        static_cast<int>(hidden), static_cast<float>(eps), enablePdl,
+        static_cast<int>(hidden), static_cast<float>(eps), enablePdl, lb2,
         at::cuda::getCurrentCUDAStream(inter.get_device()));
     return {normOut, qOut, sfOut, fp4Out, fp4SfOut, f32Out};
 }
@@ -87,7 +87,8 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "minimax_m31_ctx_residual_rmsnorm_mxfp8_f32(Tensor(a!) inter, Tensor residual, Tensor weight, float eps, "
-        "Tensor? fp4_global_scale=None, bool enable_pdl=False) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor? fp4_global_scale=None, bool enable_pdl=False, bool lb2=True) -> (Tensor, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor)");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

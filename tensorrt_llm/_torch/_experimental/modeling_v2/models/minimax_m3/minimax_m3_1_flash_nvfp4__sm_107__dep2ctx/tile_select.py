@@ -33,6 +33,9 @@ from .m31_switches import m31_disabled
 
 TSEL = not m31_disabled("DEP2CTX_TSEL")
 TSEL_ROWS = TSEL and not m31_disabled("DEP2CTX_TSEL_ROWS")
+# TSEL_NARROW: on sm_107 the op runs tiles of few blocks on its narrow-row kernel (the same table). Kill switch
+# TRTLLM_M31_DISABLE_TSEL_NARROW=1 (the tile kernel for every tile), passed as the op's narrow argument.
+TSEL_NARROW = not m31_disabled("TSEL_NARROW")
 TSEL_MIN_ROWS = 256  # #20629's bound: below it the built-in one-CTA-per-row grid serves the select
 TSEL_MAX_BLOCKS = 5856  # the op's shared-memory bound (kMinimaxM3SelectPrefillTileMaxBlocks)
 
@@ -113,7 +116,7 @@ def _run(op, max_score_kv, n_valid_blocks, init_blocks, local_blocks):
         (num_kv_heads, total_q, MSA_REQUIRED_TOPK), dtype=torch.int32, device=max_score_kv.device
     ).permute(1, 0, 2)
     nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
-    op(max_score_kv, nvb, out, init_blocks, local_blocks)
+    op(max_score_kv, nvb, out, init_blocks, local_blocks, narrow=TSEL_NARROW)
     return out
 
 

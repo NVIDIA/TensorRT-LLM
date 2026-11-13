@@ -2550,6 +2550,12 @@ _CTXNORMQ_F32 = m3_prequant.PrequantSlot()
 _SP_LOGITS = m3_prequant.PrequantSlot()
 
 
+# CTXNORM_LB2: the CTX residual add + RMSNorm + MXFP8 kernel launches at two CTAs per SM (a two-CTA launch bound) where
+# hidden / 8 <= 768, the same outputs bit for bit. Default ON; kill switch TRTLLM_M31_DISABLE_CTXNORM_LB2=1 (one CTA per
+# SM), passed to the op as its lb2 argument.
+_CTXNORM_LB2 = not m31_disabled("CTXNORM_LB2")
+
+
 def _ctxnormq_op():
     """``family_ops().minimax_m31_ctx_residual_rmsnorm_mxfp8``, or None; without it the boundary keeps the fused
     all-reduce. Decided once per process."""
@@ -2828,7 +2834,7 @@ def _sp_boundary(core, ws, op, x, residual, norm_w, fp4_scale, allreduce, router
                 f"[M3.1 agg] TP2AGG_SP_ADDNORM taken: {'pre-MoE' if pre_moe else 'boundary'} rows {rows}",
             )
         else:
-            normq_out(owned, *outs_args, False)
+            normq_out(owned, *outs_args, False, lb2=_CTXNORM_LB2)
         xq, xsf = gq.view(torch.float8_e4m3fn), gsf
         if pre_moe:
             fp4, fp4_sf = g4, g4sf.reshape(-1)
@@ -2843,9 +2849,9 @@ def _sp_boundary(core, ws, op, x, residual, norm_w, fp4_scale, allreduce, router
         f32_op = _ctxnormq_f32_op() if pre_moe else None
         pdl = get_env_enable_pdl()
         if f32_op is not None:
-            outs = f32_op(owned, res, norm_w, core.rms_eps, fp4_scale, pdl)
+            outs = f32_op(owned, res, norm_w, core.rms_eps, fp4_scale, pdl, lb2=_CTXNORM_LB2)
         else:
-            outs = op(owned, res, norm_w, core.rms_eps, True, fp4_scale, pdl)
+            outs = op(owned, res, norm_w, core.rms_eps, True, fp4_scale, pdl, lb2=_CTXNORM_LB2)
         xq = _sp_put(ws, "mxfp8", rows, outs[1]).view(outs[1].dtype)
         xsf = _sp_put(ws, "mxfp8_sf", rows, outs[2]).view(outs[2].dtype)
         if pre_moe:
@@ -2934,7 +2940,13 @@ def _ctxnormq_allreduce_norm(
     f32_op = _ctxnormq_f32_op() if fp4_scale is not None else None
     if f32_op is not None:
         normed, xq, xsf, xfp4, xfp4_sf, normed_f32 = f32_op(
-            reduced, residual.contiguous(), norm_w, core.rms_eps, fp4_scale, get_env_enable_pdl()
+            reduced,
+            residual.contiguous(),
+            norm_w,
+            core.rms_eps,
+            fp4_scale,
+            get_env_enable_pdl(),
+            lb2=_CTXNORM_LB2,
         )
         _CTXNORMQ_F32.publish(normed, normed_f32, None)
     else:
@@ -2946,6 +2958,7 @@ def _ctxnormq_allreduce_norm(
             True,
             fp4_scale,
             get_env_enable_pdl(),
+            lb2=_CTXNORM_LB2,
         )
         _CTXNORMQ_F32.clear()
     _CTXNORMQ_MX.publish(normed, xq, xsf)
@@ -3063,6 +3076,11 @@ def _gqamix_decode(*args, **kwargs) -> None:
 _TSEL_STATE: dict = {}
 
 
+# TSEL_NARROW: on sm_107 the tile select runs tiles of few blocks on its narrow-row kernel (the same table). Kill
+# switch TRTLLM_M31_DISABLE_TSEL_NARROW=1 (the tile kernel for every tile), passed as the op's narrow argument.
+_TSEL_NARROW = not m31_disabled("TSEL_NARROW")
+
+
 def _tsel_op():
     """``family_ops().minimax_m31_select_prefill_tile`` on sm_107, or None. Decided once per process."""
     if "op" not in _TSEL_STATE:
@@ -3100,7 +3118,7 @@ def _tsel_select(max_score_kv, n_valid_blocks, init_blocks, local_blocks):
         (num_kv_heads, total_q, MSA_REQUIRED_TOPK), dtype=torch.int32, device=max_score_kv.device
     ).permute(1, 0, 2)
     nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
-    op(max_score_kv, nvb, out, init_blocks, local_blocks)
+    op(max_score_kv, nvb, out, init_blocks, local_blocks, narrow=_TSEL_NARROW)
     if not _TSEL_STATE.get("taken"):
         _TSEL_STATE["taken"] = True
         print(

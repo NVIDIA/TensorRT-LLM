@@ -904,8 +904,12 @@ namespace
 {
 // TOPP_V6: the chain-prefetch summation on sm_107 devices; other devices run the staged loop. The compute capability
 // is read once per device.
-bool chainPrefetchOn()
+bool chainPrefetchOn(bool allowed)
 {
+    if (!allowed)
+    {
+        return false;
+    }
     static std::once_flag smOnce[64];
     static bool sm107[64] = {};
     int device = 0;
@@ -942,9 +946,9 @@ cudaError_t launchV3Kernel(cudaLaunchConfig_t& cfg, float const* probs, float* o
 
 template <bool kPdl, bool kCandList, bool kList, int kCopies>
 cudaError_t launchV3(cudaLaunchConfig_t& cfg, float const* probs, float* out, float const* topP, int d,
-    toppv3::RowWorkspace* ws, int* keptOut, float keepAllFrom, ToppRowStore const& rs)
+    toppv3::RowWorkspace* ws, int* keptOut, float keepAllFrom, ToppRowStore const& rs, bool chainPf)
 {
-    return chainPrefetchOn()
+    return chainPrefetchOn(chainPf)
         ? launchV3Kernel<kPdl, kCandList, kList, kCopies, true>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs)
         : launchV3Kernel<kPdl, kCandList, kList, kCopies, false>(
             cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs);
@@ -952,15 +956,18 @@ cudaError_t launchV3(cudaLaunchConfig_t& cfg, float const* probs, float* out, fl
 
 template <bool kPdl, bool kCandList>
 cudaError_t launchV3Copies(cudaLaunchConfig_t& cfg, bool listPath, bool wideHist, float const* probs, float* out,
-    float const* topP, int d, toppv3::RowWorkspace* ws, int* keptOut, float keepAllFrom, ToppRowStore const& rs)
+    float const* topP, int d, toppv3::RowWorkspace* ws, int* keptOut, float keepAllFrom, ToppRowStore const& rs,
+    bool chainPf)
 {
     if (listPath)
     {
-        return wideHist ? launchV3<kPdl, kCandList, true, 8>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs)
-                        : launchV3<kPdl, kCandList, true, 4>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs);
+        return wideHist
+            ? launchV3<kPdl, kCandList, true, 8>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs, chainPf)
+            : launchV3<kPdl, kCandList, true, 4>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs, chainPf);
     }
-    return wideHist ? launchV3<kPdl, kCandList, false, 8>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs)
-                    : launchV3<kPdl, kCandList, false, 4>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs);
+    return wideHist
+        ? launchV3<kPdl, kCandList, false, 8>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs, chainPf)
+        : launchV3<kPdl, kCandList, false, 4>(cfg, probs, out, topP, d, ws, keptOut, keepAllFrom, rs, chainPf);
 }
 } // namespace
 
@@ -971,7 +978,7 @@ namespace
 // this one launcher.
 cudaError_t invokeToppRenormDetV3Impl(float const* probs, float* out, float const* topP, int rows, int d,
     int ctasPerRow, void* workspace, int* keptOut, bool pdl, bool candidateList, bool listPath, bool wideHist,
-    bool keepAllGe1, cudaStream_t stream, ToppRowStore const& rowStore)
+    bool keepAllGe1, cudaStream_t stream, ToppRowStore const& rowStore, bool chainPf)
 {
     using namespace toppv3;
     if (rows <= 0 || d <= 0)
@@ -996,33 +1003,33 @@ cudaError_t invokeToppRenormDetV3Impl(float const* probs, float* out, float cons
     if (pdl)
     {
         return candidateList ? launchV3Copies<true, true>(
-                   cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut, keepAllFrom, rowStore)
-                             : launchV3Copies<true, false>(
-                                 cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut, keepAllFrom, rowStore);
+                   cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut, keepAllFrom, rowStore, chainPf)
+                             : launchV3Copies<true, false>(cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut,
+                                 keepAllFrom, rowStore, chainPf);
     }
-    return candidateList
-        ? launchV3Copies<false, true>(cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut, keepAllFrom, rowStore)
-        : launchV3Copies<false, false>(
-            cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut, keepAllFrom, rowStore);
+    return candidateList ? launchV3Copies<false, true>(
+               cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut, keepAllFrom, rowStore, chainPf)
+                         : launchV3Copies<false, false>(
+                             cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut, keepAllFrom, rowStore, chainPf);
 }
 
 } // namespace
 
 cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* topP, int rows, int d, int ctasPerRow,
     void* workspace, int* keptOut, bool pdl, bool candidateList, bool listPath, bool wideHist, bool keepAllGe1,
-    cudaStream_t stream)
+    cudaStream_t stream, bool chainPrefetch)
 {
     return invokeToppRenormDetV3Impl(probs, out, topP, rows, d, ctasPerRow, workspace, keptOut, pdl, candidateList,
-        listPath, wideHist, keepAllGe1, stream, ToppRowStore{});
+        listPath, wideHist, keepAllGe1, stream, ToppRowStore{}, chainPrefetch);
 }
 
 cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* topP, int rows, int d, int ctasPerRow,
     void* workspace, int* keptOut, bool pdl, bool candidateList, bool listPath, bool wideHist, cudaStream_t stream,
-    ToppRowStore const& rowStore)
+    ToppRowStore const& rowStore, bool chainPrefetch)
 {
     // FOLD_F1 callers (the TP8 3.1 fused verify) run the keep-all rule, the behaviour they were measured with.
     return invokeToppRenormDetV3Impl(probs, out, topP, rows, d, ctasPerRow, workspace, keptOut, pdl, candidateList,
-        listPath, wideHist, /*keepAllGe1=*/true, stream, rowStore);
+        listPath, wideHist, /*keepAllGe1=*/true, stream, rowStore, chainPrefetch);
 }
 
 size_t toppRenormDetV3WorkspaceBytesPerRow()

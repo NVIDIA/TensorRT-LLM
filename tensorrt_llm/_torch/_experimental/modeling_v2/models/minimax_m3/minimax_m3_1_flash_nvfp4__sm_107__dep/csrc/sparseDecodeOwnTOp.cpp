@@ -129,11 +129,13 @@ int32_t mainGrid()
 //! @param out BF16 [T, H * 2048] with unit last-dim stride and 16-byte aligned rows, written.
 //! @param q8, sf When given, receive out's MXFP8 copy: E4M3 rows [T, numSfKTiles * 128] and their UE8M0 scales in the
 //! 128x4 swizzled layout of trtllm::mxfp8_quantize(out, true), bitwise that quantize (LC2's hand-off).
+//! @param fastPlan DEP_OWNT_FASTPLAN: derive the union's fixed block weights in the plan (false: load them; same
+//! split).
 void minimaxM3Sm107SparseDecodeOwnT(torch::Tensor const& q, torch::Tensor const& k, torch::Tensor const& v,
     torch::Tensor const& kBlockScale, torch::Tensor const& vBlockScale, torch::Tensor const& kGlobalScale,
     torch::Tensor const& vGlobalScale, torch::Tensor const& topk, torch::Tensor const& blockTable,
     torch::Tensor const& seqLens, torch::Tensor& out, std::optional<torch::Tensor> q8, std::optional<torch::Tensor> sf,
-    int64_t numSfKTiles, int64_t decodeQueryLen, double smScale, bool usePdl)
+    int64_t numSfKTiles, int64_t decodeQueryLen, double smScale, bool usePdl, bool fastPlan)
 {
     TORCH_CHECK(q.is_cuda(), "minimax_m3_sm107_sparse_decode_own_t: q must be a CUDA tensor");
     c10::cuda::CUDAGuard const deviceGuard{q.device()};
@@ -251,7 +253,7 @@ void minimaxM3Sm107SparseDecodeOwnT(torch::Tensor const& q, torch::Tensor const&
         TRTLLM_MV2_NS::kernels::minimaxM3Sm107SparseDecodeOwnTWorkspaceBytes(static_cast<int32_t>(items), grid), &bytes,
         stream);
     cudaError_t const err
-        = TRTLLM_MV2_NS::kernels::invokeMinimaxM3Sm107SparseDecodeOwnT(prm, ws, bytes, grid, usePdl, stream);
+        = TRTLLM_MV2_NS::kernels::invokeMinimaxM3Sm107SparseDecodeOwnT(prm, ws, bytes, grid, usePdl, stream, fastPlan);
     TORCH_CHECK(err == cudaSuccess, "minimax_m3_sm107_sparse_decode_own_t launch failed: ", cudaGetErrorString(err));
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true))
@@ -293,7 +295,7 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "minimax_m3_sm107_sparse_decode_own_t(Tensor q, Tensor k, Tensor v, Tensor k_block_scale, "
         "Tensor v_block_scale, Tensor k_global_scale, Tensor v_global_scale, Tensor topk, Tensor block_table, "
         "Tensor seq_lens, Tensor(a!) out, Tensor(b!)? q8, Tensor(c!)? sf, int num_sf_k_tiles, int decode_query_len, "
-        "float sm_scale, bool use_pdl) -> ()");
+        "float sm_scale, bool use_pdl, bool fast_plan=True) -> ()");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

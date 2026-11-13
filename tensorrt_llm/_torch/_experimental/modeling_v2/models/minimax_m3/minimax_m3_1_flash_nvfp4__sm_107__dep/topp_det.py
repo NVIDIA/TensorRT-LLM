@@ -41,6 +41,9 @@ from .m31_switches import m31_disabled
 
 TOPP_DET = not m31_disabled("TOPP_DET")
 TOPP_SPLIT = not m31_disabled("TOPP_SPLIT")
+# TOPP_V6: on sm_107 the v3 renorm sums each chain straight from global memory (the same adds in the same order). Kill
+# switch TRTLLM_M31_DISABLE_TOPP_V6=1 (the staged loop on every device), passed as the op's chain_prefetch argument.
+TOPP_V6 = not m31_disabled("TOPP_V6")
 
 #: The widest call the workspace holds: the verify with 7 draft tokens at 48 requests is 384 rows, the draft 48.
 MAX_ROWS = 448  # capacity: fixed: TOPP_DET's widest supported call
@@ -153,7 +156,7 @@ def _launch(
 ) -> torch.Tensor:
     """One renorm launch: PDL, the candidate list, the list path and 8 pass histograms on, keep_all_ge1 off."""
     out = torch.empty_like(probs) if out is None else out
-    op(probs, top_p, workspace, out, ctas, True, True, True, True, False)
+    op(probs, top_p, workspace, out, ctas, True, True, True, True, False, chain_prefetch=TOPP_V6)
     return out
 
 

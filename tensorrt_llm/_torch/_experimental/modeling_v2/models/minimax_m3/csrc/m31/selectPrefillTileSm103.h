@@ -42,10 +42,12 @@ constexpr int32_t kMinimaxM3SelectPrefillTileMaxBlocks = 5856;
 //! initBlocks to 1e30, local winning; ranked by the descending ordered key of the float bits (NaN above +inf, +0 above
 //! -0, negative NaN below -inf), ties to the smaller block; picks whose forced score is -inf or a negative NaN
 //! emitted as -1; ascending ids with -1 tail padding.
-//! Writes out[query * outQueryStride + head * outHeadStride + 0..15].
+//! Writes out[query * outQueryStride + head * outHeadStride + 0..15]. On sm_107, tiles of few blocks take a narrow-row
+//! kernel (the same table); narrow = false (the TSEL_NARROW kill switch) keeps the tile kernel for them.
 cudaError_t invokeMinimaxM3SelectPrefillTile(float const* scores, int64_t headStride, int64_t blockStride,
     int32_t const* nValidBlocks, int32_t* out, int64_t outQueryStride, int64_t outHeadStride, int32_t numKvHeads,
-    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream);
+    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream,
+    bool narrow = true);
 
 //! The same select and contract as invokeMinimaxM3SelectPrefillTile, for row-major scores whose blocks are contiguous
 //! per (head, query) row: element (head, block, query) at scores[head * headStride + block + query * queryStride]
@@ -54,7 +56,8 @@ cudaError_t invokeMinimaxM3SelectPrefillTile(float const* scores, int64_t headSt
 //! and it leaves the same keys and stride-class minima for the unchanged select phase.
 cudaError_t invokeMinimaxM3SelectPrefillTileRows(float const* scores, int64_t headStride, int64_t queryStride,
     int32_t const* nValidBlocks, int32_t* out, int64_t outQueryStride, int64_t outHeadStride, int32_t numKvHeads,
-    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream);
+    int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream,
+    bool narrow = true);
 
 } // namespace kernels::minimaxM31Sm103
 

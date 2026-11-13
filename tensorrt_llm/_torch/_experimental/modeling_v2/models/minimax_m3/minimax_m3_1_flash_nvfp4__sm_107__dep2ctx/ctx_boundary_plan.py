@@ -51,10 +51,18 @@ def smem_bytes(stages: int, add: bool, hidden: int) -> int:
     )
 
 
-def launch_choice() -> Tuple[int, bool]:
-    """``cbnqLaunchChoice``: (requested ring depth, max shared-memory carveout): L6_STAGES = 3; the carveout is set
-    only for a ring deeper than STAGES, so this is the previous launch (3, no carveout)."""
-    return L6_STAGES, L6_STAGES > STAGES
+#: Ring depths the one-chunk launch takes on request (``stages``), and the P2 launch (``p2_stages``).
+STAGE_CHOICES = (3, 4, 6, 8)
+
+
+def launch_choice(two_cta: bool = True, stages: int = L6_STAGES) -> Tuple[int, bool]:
+    """``cbnqLaunchChoice``: (requested ring depth, max shared-memory carveout). ``stages`` picks 3 / 4 / 6 / 8 (else
+    L6_STAGES = 3); the carveout is set only for a ring deeper than STAGES, so the default is the previous launch
+    (3, no carveout). ``two_cta`` False (the CBNQ_2CTA kill switch) forces the previous launch whatever it asks."""
+    if not two_cta:
+        return STAGES, False
+    requested = stages if stages in STAGE_CHOICES else L6_STAGES
+    return requested, requested > STAGES
 
 
 def launch_stages(
@@ -92,6 +100,7 @@ P2_CHUNKS = 2
 P2_MAX_THREADS = 384
 P2_MIN_BLOCKS = 2
 P2_STAGES = 3  # kCbnqP2DefaultStages
+P2_STAGE_CHOICES = (3, 4)
 WARP = 32
 
 
@@ -124,9 +133,10 @@ def p2_virtual_warps(hidden: int) -> int:
     return P2_CHUNKS * p2_block(hidden) // WARP
 
 
-def p2_choice() -> Tuple[bool, int]:
-    """``cbnqLaunchChoice``'s P2 part: (enabled, requested depth) = (True, P2_STAGES)."""
-    return True, P2_STAGES
+def p2_choice(p2: bool = True, p2_stages: int = P2_STAGES) -> Tuple[bool, int]:
+    """``cbnqLaunchChoice``'s P2 part: (enabled, requested depth). ``p2`` False (the CBNQ_P2 kill switch) turns it
+    off; ``p2_stages`` picks 3 / 4 (else P2_STAGES)."""
+    return p2, (p2_stages if p2_stages in P2_STAGE_CHOICES else P2_STAGES)
 
 
 def p2_ctas_per_sm(
@@ -150,12 +160,16 @@ def launch_form(
     max_threads_per_sm: int,
     smem_optin: int,
     smem_per_sm: int,
+    p2: bool = True,
+    two_cta: bool = True,
+    stages: int = L6_STAGES,
+    p2_stages: int = P2_STAGES,
 ) -> Tuple[int, int, int]:
     """``dispatch``: (chunks per thread, CTAs per SM, ring depth) of the launch. P2 at its requested depth, then at 3,
     when it is enabled, serves the hidden size, the thread limit holds the one-chunk kernel below two CTAs per SM
     (sm_107), the ring fits the opt-in and two P2 CTAs fit an SM; else the one-chunk kernel at :func:`launch_stages`'s
-    depth."""
-    enabled, requested_p2 = p2_choice()
+    depth. The keyword arguments are the op's launch-choice arguments (:func:`launch_choice`, :func:`p2_choice`)."""
+    enabled, requested_p2 = p2_choice(p2, p2_stages)
     thread_limited = max_threads_per_sm // (hidden // PACKED) < MIN_BLOCKS
     if enabled and p2_supported(hidden) and thread_limited:
         for s in dict.fromkeys((requested_p2, STAGES)):  # 3 is tried once
@@ -164,7 +178,7 @@ def launch_form(
             ctas = p2_ctas_per_sm(s, add, hidden, max_threads_per_sm, smem_per_sm)
             if ctas >= P2_MIN_BLOCKS:
                 return P2_CHUNKS, ctas, s
-    requested, _ = launch_choice()
+    requested, _ = launch_choice(two_cta, stages)
     return (
         1,
         ctas_per_sm(max_threads_per_sm, hidden),
@@ -203,9 +217,9 @@ def topk_fits(topk: int, hidden: int, smem_optin: int) -> bool:
 TOPK_DUAL_GROUPS = 2
 
 
-def topk_dual_choice() -> bool:
-    """``cbnqTopkDualEnabled``: the dual fold is on."""
-    return True
+def topk_dual_choice(dual: bool = True) -> bool:
+    """The fold's ``dual`` launch argument: on unless the CBNQ_TOPK_DUAL kill switch passes False."""
+    return dual
 
 
 def topk_dual_form(enabled: bool, hidden: int, max_threads_per_sm: int) -> bool:

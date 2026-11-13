@@ -12,7 +12,14 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
+from ...m31_switches import m31_disabled
+
 _E4M3_MAX = 448.0
+
+# AR2_ORDER_FIX: every CTA rotates its call parity only after every thread's poll of its slot (a producer that releases
+# the grid early cannot push into the half nobody polls). Kill switch TRTLLM_M31_DISABLE_AR2_ORDER_FIX=1 (the legacy
+# rotation after thread 0's poll), passed to the op as its ar2_order_fix argument.
+AR2_ORDER_FIX = not m31_disabled("AR2_ORDER_FIX")
 
 
 def mxfp8_rows(normed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -248,6 +255,7 @@ class M3McAllreduceNorm(OpWrapper):
             prepushed,
             opts,
             *((cap_out, cap_w, cap_eps) if cap_out is not None else ()),
+            ar2_order_fix=AR2_ORDER_FIX,
         )
 
     def reference(

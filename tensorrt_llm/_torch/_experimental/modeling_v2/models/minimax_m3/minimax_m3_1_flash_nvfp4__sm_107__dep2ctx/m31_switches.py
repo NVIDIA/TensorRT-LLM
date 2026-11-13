@@ -65,6 +65,13 @@ SWITCHES: Dict[str, str] = {
     "DEP2CTX_DSPARK_STORE": "the stock drafter prefill store (every store item off)",
     "DEP2CTX_DSPARK_STORE_FOLD": "the drafter's k_norm weight unfolded",
     "DRAFTER_LEAN_GLUE": "the drafter's stock strided-view glue",
+    "CTXNORM_LB2": "the CTX norm + MXFP8 boundary kernel at one CTA per SM",
+    "CBNQ_P2": "the CTX boundary ring kernel's one-chunk launch (no two-chunk P2 kernel)",
+    "CBNQ_2CTA": "the CTX boundary ring at three stages without a shared-memory carveout",
+    "CBNQ_TOPK_DUAL": "the top-k fold boundary at one row group per CTA",
+    "SWIGLU_MXFP8_ROWS": "the SwiGLU + MXFP8 op's one-row launch at every row count",
+    "TSEL_NARROW": "the prefill tile select's tile kernel for every tile (no narrow-row kernel)",
+    "NOAUX_TC_FP32": "the routing weights' FP64 expression for every weight",
 }
 
 
