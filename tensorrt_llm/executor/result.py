@@ -29,7 +29,8 @@ from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
-from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
+from .postprocessor_hook import (PostProcessorHook, apply_post_processor_hook,
+                                 end_post_processor_hook)
 from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
                     is_llm_response)
 
@@ -1064,10 +1065,20 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self._post_processor_hook = post_processor_hook
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
-        GenerationResultBase._handle_response(self, response)
+        try:
+            GenerationResultBase._handle_response(self, response)
+        finally:
+            # An executor error ends this owner's request without a final chunk,
+            # whether its background error handler returns or raises.
+            if (not isinstance(response, PostprocWorker.Output)
+                    and self._error_msg is not None):
+                end_post_processor_hook(self._post_processor_hook, self.id,
+                                        "error")
 
         # The postprocess has been performed, return directly
         if isinstance(response, PostprocWorker.Output):
+            return
+        if self._error_msg is not None:
             return
 
         kwargs = {

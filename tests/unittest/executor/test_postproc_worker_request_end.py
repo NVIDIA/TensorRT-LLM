@@ -21,19 +21,29 @@ lives. These tests drive the worker's own loop over both paths.
 """
 
 import asyncio
+from collections.abc import Callable, Sequence
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.postproc_worker import PostprocWorker
-from tensorrt_llm.executor.postprocessor_hook import apply_post_processor_hook
+from tensorrt_llm.executor.postprocessor_hook import (
+    PostProcessorHookChunk,
+    PostProcessorHookVerdict,
+    apply_post_processor_hook,
+    emit,
+)
 from tensorrt_llm.executor.result import (
     CompletionOutput,
     DetokenizedGenerationResultBase,
     GenerationResult,
 )
 from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -271,4 +281,160 @@ def test_hook_failure_is_terminal_for_repeated_reads(read_method, abort_raises):
     assert result._aborted
     result.abort.assert_called_once_with()
     assert hook.ended == [(8, "postprocessing_error")]
+    assert hook.state == {}
+
+
+class _InlineHook(_Hook):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chunks: list[PostProcessorHookChunk] = []
+        self.state: dict[int, str] = {}
+
+    def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict:
+        self.chunks.append(chunk)
+        self.state[chunk.request_id] = chunk.text
+        if chunk.is_final:
+            self.state.pop(chunk.request_id, None)
+        return emit(chunk.text_diff)
+
+    def on_request_end(self, request_id: int, reason: str) -> None:
+        super().on_request_end(request_id, reason)
+        self.state.pop(request_id, None)
+
+
+def _inline_result(
+    request_id: int = 7,
+    handler: Callable[[str | None], None] | None = None,
+    streaming: bool = True,
+) -> tuple[DetokenizedGenerationResultBase, _InlineHook, SimpleNamespace]:
+    hook = _InlineHook()
+    tokenizer = SimpleNamespace(decode=Mock(side_effect=lambda tokens, **_: "x" * len(tokens)))
+    result = DetokenizedGenerationResultBase(
+        request_id,
+        SamplingParams(),
+        tokenizer=tokenizer,
+        streaming=streaming,
+        background_error_handler=handler,
+        post_processor_hook=hook,
+    )
+    return result, hook, tokenizer
+
+
+def _inline_response(
+    request_id: int = 7, token_ids: Sequence[int] = (1, 2), is_final: bool = False
+) -> LlmResponse:
+    return LlmResponse(
+        request_id=request_id,
+        client_id=request_id,
+        result=SimpleNamespace(
+            is_final=is_final,
+            context_phase_params=None,
+            decoding_iter=1,
+            avg_decoded_tokens_per_iter=None,
+            finish_reasons=[FinishReason.LENGTH if is_final else FinishReason.NOT_FINISHED],
+            output_token_ids=[list(token_ids)],
+            sequence_index=0,
+            cum_log_probs=None,
+            log_probs=None,
+            generation_logits=None,
+            per_pos_drafted=None,
+            per_pos_accepted=None,
+            spec_dec_totals=None,
+            time_breakdown_metrics=None,
+            request_perf_metrics=None,
+            additional_context_outputs=None,
+            additional_generation_outputs=None,
+            context_logits=None,
+        ),
+    )
+
+
+class _InlineErrorHandler:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.messages: list[str] = []
+
+    def handle(self, error_msg: str | None = None) -> None:
+        if error_msg is not None:
+            self.messages.append(error_msg)
+            if self.error is not None:
+                raise self.error
+
+
+@pytest.mark.parametrize("response_type", [ErrorResponse, LlmResponse])
+@pytest.mark.parametrize("handler_mode", ["absent", "returning", "raising"])
+@pytest.mark.parametrize("prior_output", [False, True])
+@pytest.mark.parametrize("message", ["boom", ""])
+def test_an_inline_executor_error_ends_without_a_normal_hook_chunk(
+    response_type: type[ErrorResponse] | type[LlmResponse],
+    handler_mode: Literal["absent", "returning", "raising"],
+    prior_output: bool,
+    message: str,
+) -> None:
+    error = RuntimeError("handler failure") if handler_mode == "raising" else None
+    owner = _InlineErrorHandler(error)
+    result, hook, tokenizer = _inline_result(
+        handler=None if handler_mode == "absent" else owner.handle
+    )
+    if prior_output:
+        result._handle_response(_inline_response())
+    chunks_before = list(hook.chunks)
+    text_before = result.outputs[0].text
+    decode_calls_before = tokenizer.decode.call_count
+    response = response_type(client_id=7, error_msg=message, request_id=7)
+
+    if error is not None:
+        with pytest.raises(RuntimeError) as raised:
+            result._handle_response(response)
+        assert raised.value is error
+    else:
+        result._handle_response(response)
+
+    assert result.error == message
+    assert result._done
+    assert hook.chunks == chunks_before
+    assert tokenizer.decode.call_count == decode_calls_before
+    assert result.outputs[0].text == text_before
+    assert hook.ended == [(7, "error")]
+    assert hook.state == {}
+    assert owner.messages == ([] if handler_mode == "absent" else [message])
+
+
+@pytest.mark.parametrize("is_final", [False, True])
+@pytest.mark.parametrize("prior_error", [False, True])
+def test_worker_outputs_keep_their_postprocessing_owner(is_final: bool, prior_error: bool) -> None:
+    result, hook, tokenizer = _inline_result()
+    if prior_error:
+        result._handle_response(ErrorResponse(7, "boom", 7))
+    ends_before = list(hook.ended)
+    processed = CompletionOutput(index=0, text="already processed")
+
+    result._handle_response(PostprocWorker.Output(client_id=7, res=processed, is_final=is_final))
+
+    assert result.outputs[0] is processed
+    assert result._done is is_final
+    assert result.error == ("boom" if prior_error else None)
+    assert hook.chunks == []
+    assert hook.ended == ends_before
+    tokenizer.decode.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("prior_output", [False, True])
+def test_normal_inline_final_output_still_runs_its_hook(
+    streaming: bool, prior_output: bool
+) -> None:
+    result, hook, tokenizer = _inline_result(streaming=streaming)
+    if prior_output:
+        result._handle_response(_inline_response())
+
+    result._handle_response(_inline_response(token_ids=(3,), is_final=True))
+
+    assert result._done
+    assert result.error is None
+    assert hook.chunks[-1].is_final
+    assert hook.chunks[-1].text == result.outputs[0].text
+    assert result.outputs[0].text == "x" * (3 if prior_output else 1)
+    assert tokenizer.decode.call_count == (2 if prior_output else 1)
+    assert hook.ended == []
     assert hook.state == {}
