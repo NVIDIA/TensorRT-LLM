@@ -86,14 +86,13 @@ The config folder can be overridden with:
 
 VisualGen family YAMLs use model-based names. Hardware-specific recipes may
 include a hardware suffix; supported GPUs are listed in
-`metadata.supported_gpus`. The B200 LTX recipes use `ltx2_blackwell.yaml` and
-`ltx2_single_stage_blackwell.yaml`; `ltx2.yaml` retains the VR200 recipes.
+`metadata.supported_gpus`.
 
 Examples:
 
 - `wan22_i2v_a14b_blackwell.yaml`
 - `flux2_blackwell.yaml`
-- `ltx2.yaml`
+- `ltx2_blackwell.yaml`
 
 ### YAML Structure
 
@@ -101,46 +100,27 @@ Each file can hold one or more named `server_configs`. This mirrors the LLM
 aggregated perf sanity layout and allows one family YAML to contain multiple
 stable server recipes.
 
+A minimal layout is shown below. See the [family YAMLs](../../../scripts/perf-sanity/visual_gen/)
+for complete recipes.
+
 ```yaml
 metadata:
   model_name: FLUX.2-dev
-  supported_gpus:
-    - B200
+  supported_gpus: [B200]
 hardware:
   gpus_per_node: 4
-environment:
-  server_env_var: TLLM_LOG_LEVEL=info
-  client_env_var: ""
 server_configs:
-  - name: flux2_bf16_cfg1_ulysses4_teacache_cg_on
+  - name: t2i
     server_config:
-      attention_config:
-        backend: VANILLA
       parallel_config:
         cfg_size: 1
         ulysses_size: 4
-        async_ulysses: false
-        parallel_vae_size: 1
-      cache_config:
-        cache_backend: teacache
-      compilation_config:
-        resolutions:
-        - - 1024
-          - 1024
-        num_frames:
-        - 1
-      cuda_graph_config:
-        enable: true
     client_configs:
-      - name: 1024x1024_1f_50s_con1
+      - name: 1024x1024
         prompt: A cat holding a sign that says hello world
         backend: openai-images
         generation_mode: t2i
         size: 1024x1024
-        num_inference_steps: 50
-        seed: 42
-        max_concurrency: 1
-        num_prompts: 1
 ```
 
 ### Schema Notes
@@ -326,58 +306,3 @@ export LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models
 | Family YAMLs | `tests/scripts/perf-sanity/visual_gen/` |
 | B200 post-merge test-db | `tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml` |
 | Jenkins stage wiring | `jenkins/L0_Test.groovy` |
-
-## B200 sweep-derived recipes
-
-The refreshed FLUX.2-dev, Wan2.2 I2V and LTX2 recipes are selected from the
-October 26 sweep at source `dddb74c217dadabd6e9ba04ef22d48da53a73e01`, within
-each existing model/mode and logical GPU budget. These are observed minima
-from one measured request per point, not universal optima for every workload.
-
-| Sanity workload | GPUs | Transformer / attention | Other settings | Sweep KPI (s) |
-|---|---:|---|---|---:|
-| FLUX.2-dev T2I | 4 | BF16 / Vanilla | TeaCache, CUDA graph | 1.18 |
-| Wan2.2 A14B I2V | 8 | Dynamic NVFP4 / TRTLLM INT8-QK + FP8-V | Async Ulysses, parallel VAE 8, CUDA graph | 41.21 |
-| LTX2 two-stage I2V | 8 | BF16 / FA4 | Async Ulysses, parallel VAE 8, CUDA graph, compile | 2.74 |
-| LTX2 two-stage T2V | 8 | Dynamic FP8 blockwise / FA4 | Async Ulysses, parallel VAE 8, CUDA graph, compile | 2.30 |
-| LTX2 one-stage I2V | 8 | Dynamic FP8 blockwise / FA4 | Async Ulysses, parallel VAE 8, CUDA graph, compile | 6.20 |
-
-The one-stage LTX selection is restricted to recipes supported by the currently
-staged BF16 checkpoint. The overall one-stage minimum (5.25 s) used a separate
-ModelOpt static NVFP4 checkpoint. A native `ltx-2-19b-dev-fp4.safetensors` file
-is staged, but its `_quantization_metadata` declares `nvfp4`, which the current
-metadata converter does not recognize. Do not substitute it or on-load NVFP4
-and claim equivalence to the measured static recipe. LTX NVFP4 here concerns
-transformer linear layers, not VAE quantization.
-
-All LTX recipes select the explicit BF16 file, rather than a directory that
-contains several precision variants. One-stage uses a separate family YAML with
-`TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE=1`. Two-stage recipes explicitly set that
-flag to `0` and supply both auxiliary paths. The model directory contains an
-upscaler and a distilled LoRA, so omitting those paths alone would still allow
-automatic two-stage selection. Keep the stage override isolated to each
-server environment rather than changing the global test-runner environment.
-
-Wan attention uses Q/K INT8, V FP8 and Q/K/V block sizes 1/16/1. Its VAE stays
-native; NVFP4 in its recipe name describes transformer GEMM. Warmup shapes and
-LTX compile options match the measured serve configurations. Existing GPU
-allocations and client workloads/counts are retained; FLUX uses four logical
-GPUs within the eight-GPU stage. The B200 test list contains five scheduled
-cases: FLUX.2, Wan2.2 and three LTX2 cases. Wan2.1 is not included.
-
-The sweep-derived LTX2 settings are restricted to B200 in
-`ltx2_blackwell.yaml` and `ltx2_single_stage_blackwell.yaml`. The generic
-`ltx2.yaml` retains its existing recipes for VR200; no VR200 recipe or
-regression threshold is refreshed here.
-
-When refreshing recipes, select within a fixed model, modality, stage, shape
-and GPU budget, rename the pytest selector, and update its scheduled test-list
-entry. Changed optimization settings require separate CI baselines; do not
-overwrite old timings or accept a known regression by installing a slower
-baseline. Retain investigations and fixed controls for important non-winning
-recipes: fastest-recipe KPI cases alone cannot cover every regression.
-
-The values above are sweep observations rather than CI baseline values or
-proof of runtime compatibility in the current CI environment. Client prompts
-and reference images remain the existing sanity workloads, so exact CI
-latency can differ from the sweep.
