@@ -185,3 +185,25 @@ def ctx_store_launch(
 def view_key(t: torch.Tensor) -> Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype]:
     """Identity of a tensor view: (data pointer, shape, strides, dtype)."""
     return (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+
+
+def copy_captures(buf: torch.Tensor, rows: int, hidden: int, layers: int, kept) -> bool:
+    """Write the kept captures ``kept`` = [(capture index, [rows, hidden] tensor), ...] into ``buf``'s columns, the
+    bytes DFlash's maybe_capture_hidden_states copies. When every layer is kept and ``buf[:rows]`` is the whole
+    contiguous [rows, layers x hidden] block, one concatenation writes all of it; otherwise one slice copy per layer
+    (the stock op). Returns whether the single concatenation ran."""
+    if (
+        len(kept) == layers
+        and sorted(i for i, _ in kept) == list(range(layers))
+        and buf.shape[1] == layers * hidden
+        and buf[:rows].is_contiguous()
+        and all(t.shape == (rows, hidden) and t.dtype == buf.dtype for _, t in kept)
+    ):
+        parts = [t for _, t in sorted(kept, key=lambda e: e[0])]
+        torch.cat(parts, dim=1, out=buf[:rows])
+        return True
+    from tensorrt_llm._torch.custom_ops import inplace_slice_copy
+
+    for i, t in kept:
+        inplace_slice_copy(buf, t, i * hidden, (i + 1) * hidden)
+    return False

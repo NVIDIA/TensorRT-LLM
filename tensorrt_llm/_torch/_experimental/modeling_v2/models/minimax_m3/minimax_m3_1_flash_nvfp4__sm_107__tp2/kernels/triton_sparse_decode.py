@@ -55,7 +55,7 @@ from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm.logger import logger
 
-from ..m31_switches import m31_disabled
+from ..m31_switches import m31_disabled, m31_enabled
 from . import m3_attn_lc, m3_prequant, m3_report
 
 # One sparse block is exactly one KV page.
@@ -1247,8 +1247,12 @@ MQ_NUM_WARPS = 8
 # The long-context decode (``_longattn_lc_decode``) in its engagement line (modeling's SPARSE_DECODE_LC path; the
 # rows it takes are LC_MIN_ROWS..LC_MAX_ROWS, see TP2WIDE_LC2).
 LC_PATH = "m3_sparse_decode_lc"
-# The engagement path of the Triton route for an LC-shaped step (packed NVFP4 pages, FP8 q, one top-k chunk) that the
-# long-context decode does not take (``m3_report.taken``, one line per rank and row count).
+# LC_TP2 (opt-in, ``TRTLLM_M31_ENABLE_LC_TP2=1``): the Triton route does not log its engagement line for the rows of
+# an LC-shaped step that the long-context decode (TP2WIDE_LC2 below) does not take. The dispatch itself is
+# TP2WIDE_LC2's either way; LC_TP2 changes the log only. Read at import.
+LC_TP2 = m31_enabled("LC_TP2")
+# The engagement path of the LC_TP2-off route: an LC-shaped step (packed NVFP4 pages, FP8 q, one top-k chunk) that runs
+# the Triton decode (``m3_report.taken``, one line per rank and row count).
 LC_TRITON_PATH = "m3_sparse_decode_lc_tp2_triton"
 # TP2WIDE_LC2 (TP2 WIDE rule, ported from the M3 sm_107 TP2 target): pure generation steps with a selected top-16 table
 # (not the identity selection) at LC_MIN_ROWS..LC_MAX_ROWS query rows run LC2
@@ -1284,11 +1288,12 @@ LC_MAX_ROWS = (  # capacity: fixed: LC2's widest step
     MergeMxfp8.TRITON_MAX_ROWS if m31_disabled("TP2WIDE_LC2_448") else MergeMxfp8.MAX_ROWS
 )
 
-# A step of 8 query rows per request (draft length 7) uses LC2 from 9 rows (not bitwise).
-# TRTLLM_M31_DISABLE_TP2_LC2_SMALL=1 restores the 33-row lower bound. Other query lengths keep the 33-row lower bound.
-# Read once at import.
+# A step of 8 query rows per request (draft length 7) uses LC2 from 9 rows (not bitwise). Draft length 3 (4 query rows
+# per request) does too with the opt-in TRTLLM_M31_ENABLE_TP2_LC2_SMALL_DRAFT_LEN_3=1.
+# TRTLLM_M31_DISABLE_TP2_LC2_SMALL=1 restores the 33-row lower bound for both. Other query lengths keep the 33-row lower
+# bound. Read once at import.
 TP2_LC2_SMALL = not m31_disabled("TP2_LC2_SMALL")
-LC2_SMALL_QLENS = frozenset({8})
+LC2_SMALL_QLENS = frozenset({4, 8} if m31_enabled("TP2_LC2_SMALL_DRAFT_LEN_3") else {8})
 LC2_SMALL_MIN_ROWS = 9  # capacity: fixed: measured crossover (12 rows, the first K3 step past 8)
 
 
@@ -1512,8 +1517,8 @@ def minimax_m3_sparse_attn_decode(
         m3_report.taken(LC_PATH, total_q)
         _log_tp2wide_lc2(total_q)
         return
-    if lc_shaped:
-        m3_report.taken(LC_TRITON_PATH, total_q, "LC rows on the Triton sparse decode")
+    if not LC_TP2 and lc_shaped:
+        m3_report.taken(LC_TRITON_PATH, total_q, "LC rows on the Triton sparse decode (LC_TP2 off)")
 
     query_group_size = (
         _sm100f_nvfp4_query_group_size(
