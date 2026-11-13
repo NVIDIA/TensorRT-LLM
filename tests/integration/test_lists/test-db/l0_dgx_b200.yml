@@ -248,6 +248,7 @@ l0_dgx_b200:
   # ------------- VisualGen multi-GPU tests ---------------
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_cosmos3_transformer_parallel.py
+  - unittest/_torch/visual_gen/multi_gpu/test_parallel_wino_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_ulysses.py

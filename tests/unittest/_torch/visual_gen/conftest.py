@@ -23,3 +23,20 @@ def disable_cosmos3_guardrails() -> Iterator[None]:
     patcher.setattr(pipe_mod, "TRTLLM_DISABLE_COSMOS3_GUARDRAILS", True)
     yield
     patcher.undo()
+
+
+@pytest.fixture(autouse=True)
+def isolated_cudnn_plans(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator[None]:
+    """An empty, private cuDNN plan cache for every test, so each process runs the plan
+    search itself (no stale plan restored from the user's cache without the finite-output
+    check) and the user's on-disk cache is left alone."""
+    from tensorrt_llm._torch.visual_gen.models.wan import cudnn_conv
+
+    def reset() -> None:
+        cudnn_conv._plan_choices = None
+        cudnn_conv._convs.clear()
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    reset()
+    yield
+    reset()
