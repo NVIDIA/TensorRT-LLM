@@ -657,12 +657,28 @@ def test_fat_sqsh_builder_reads_the_package_through_fetch_helper() -> None:
     assert "trap removeNetrc EXIT" in body
     assert "trap removeUnusedNetrc EXIT" in prepare
 
-    # Every hash of the fat sqsh cache key is on the artifact path, not a location URL.
-    key = """printf '%s' "${FAT_LLM_TAR_ARTIFACT_PATH}|${FAT_LLM_DOCKER_IMAGE}|"""
-    assert key in body
-    assert key in prepare
-    l0_key = "printf '%s' '${llmTarArtifactPath}|${LLM_DOCKER_IMAGE}|${scriptHash}'"
-    assert l0_key in L0_TEST.read_text(encoding="utf-8")
+    # The fat sqsh is named once on the controller; the builder and Prepare Container use that
+    # path as given, so the reader and the writer can never disagree on it.
+    for script in (body, prepare):
+        assert script.count("fatSqshPath=") == 1
+        assert 'fatSqshPath="${FAT_SQSH_PATH}"' in script
+        assert "sha256sum" not in script.split('fatSqshPath="${FAT_SQSH_PATH}"', 1)[1]
+    l0_lines = _l0_test_code_lines()
+    compute = _groovy_function_body(l0_lines, "computeFatSqshPath")
+    # Keyed by commit rather than by the per-pipeline artifact path, so pipelines that test the
+    # same commit share one fat sqsh.
+    assert "def commit = env.artifactCommit ?: env.gitlabCommit" in compute
+    # Without a commit, the artifact path, unique per pipeline, keeps the name from being shared.
+    assert "def commitTag = commit ? commit.take(8) : shortHash(llmTarArtifactPath)" in compute
+    # Each flow names the fat sqsh once and hands that one path to every consumer.
+    l0_text = "\n".join(l0_lines)
+    for flow in ("runLLMTestlistWithAgent", "runLLMTestlistWithSbatch"):
+        assert _groovy_function_body(l0_lines, flow).count("computeFatSqshPath(") == 1
+    assert l0_text.count("fatSqshPath: fatSqshPath,") == 4
+    assert (
+        'def name = "fat-commit-${commitTag}-image-${imageTag}-${packageTag}-script-${scriptHash}"'
+        in compute
+    )
 
 
 def test_l0_slurm_job_gets_the_read_helper_and_its_netrc() -> None:

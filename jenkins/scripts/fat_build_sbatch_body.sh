@@ -7,9 +7,8 @@
 #
 #   FAT_CONTAINER_DIR       - scratch path for enroot base .sqsh files
 #   FAT_CONTAINER           - docker URI of the base image, in enroot's host#path form
-#   FAT_SQSH_DIR            - scratch path where fat .sqsh files are stored
+#   FAT_SQSH_PATH           - fat .sqsh path to write, named by computeFatSqshPath() in L0_Test.groovy
 #   FAT_LLM_TAR_ARTIFACT_PATH - artifact path of the TRT-LLM tarball, read with FAT_FETCH_HELPER_PATH
-#   FAT_LLM_DOCKER_IMAGE    - full docker image tag (used for cache-key hashing)
 #   FAT_BUILD_SCRIPT_PATH   - path to fat_build_inline.sh on the SLURM node
 #   FAT_TAR_NAME            - tarball filename (e.g. TensorRT-LLM.tar.gz)
 #   FAT_FETCH_HELPER_PATH   - path to fetch_build_artifact.sh on the SLURM node
@@ -72,14 +71,8 @@ importContainerWithRetries() {
 importContainerWithRetries "${FAT_CONTAINER}" "$baseSqshPath"
 
 # Build fat sqsh from cached base sqsh.
-mkdir -p "${FAT_SQSH_DIR}"
-# Include hash of the build script itself so changing fat_build_inline.sh
-# invalidates the cached sqsh automatically.
-# Only writer of the cache; the formula is mirrored in prepare_container.sh and
-# computeFatSqshPath() in L0_Test.groovy. Change all three together.
-fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
-fatHash=$(printf '%s' "${FAT_LLM_TAR_ARTIFACT_PATH}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
-fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
+fatSqshPath="${FAT_SQSH_PATH}"
+mkdir -p "$(dirname "$fatSqshPath")"
 if [ -f "$fatSqshPath" ]; then
     echo "[fat_build_sbatch] Fat sqsh already exists: $fatSqshPath"
     exit 0

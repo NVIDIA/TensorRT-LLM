@@ -100,11 +100,14 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
 
     def parse_test_name(s):
         if s.startswith("full:"):
-            s = s.lstrip("full:")
+            s = s[len("full:"):]
             if test_prefix:
+                # Only the leading "<platform>/" component is rewritten, so the
+                # platform string may also appear inside the test name itself.
+                platform, sep, rest = s.partition("/")
                 # Check for SM version pattern (e.g., sm90, sm89, sm100)
-                sm_match = re.match(r'sm(\d+)/', s)
-                if sm_match:
+                sm_match = re.fullmatch(r'sm(\d+)', platform)
+                if sep and sm_match:
                     sm_version = int(sm_match.group(1))
                     # Get current SM version
                     try:
@@ -112,12 +115,12 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
                         current_sm = get_sm_version()
                         # If SM versions match, replace with test_prefix
                         if sm_version == current_sm:
-                            s = s.replace(f'sm{sm_version}', test_prefix)
+                            s = f"{test_prefix}/{rest}"
                     except Exception:
                         # If can't get SM version, skip SM-based filtering
                         pass
-                elif test_prefix.split('-')[0] in s:
-                    s = s.replace(test_prefix.split('-')[0], test_prefix)
+                elif sep and platform == test_prefix.split('-')[0]:
+                    s = f"{test_prefix}/{rest}"
             return s
         elif test_prefix:
             return "/".join([test_prefix, s])

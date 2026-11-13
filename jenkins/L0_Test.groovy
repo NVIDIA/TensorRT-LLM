@@ -1099,13 +1099,25 @@ def isValidSlurmJobId(def slurmJobID) {
     return slurmJobID && slurmJobID.toString() ==~ /\d+/
 }
 
-// Cache key formula is mirrored in fat_build_sbatch_body.sh (the only writer) and
-// prepare_container.sh; a divergent key misses the cache silently forever.
-// Hashed on the Jenkins controller so no $()/\${} has to survive SSH quoting.
+// Named after what the fat sqsh bakes in: the commit, the base image, the package
+// (which also tells x86 from SBSA) and the builder script.
+// Every pipeline that tests the same commit therefore reuses one file.
+// Computed only here; the builder and prepare_container.sh receive it as FAT_SQSH_PATH.
 def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatBuildScriptLocalPath) {
-    def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -d' ' -f1 | head -c 8").trim()
-    def hash = sh(returnStdout: true, script: "printf '%s' '${llmTarArtifactPath}|${LLM_DOCKER_IMAGE}|${scriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
-    return [scriptHash: scriptHash, hash: hash, path: "${fatSqshDir}/fat-${hash}.sqsh"]
+    def shortHash = { String text -> sh(returnStdout: true, script: "printf '%s' '${text}' | sha256sum | cut -c1-8").trim() }
+    // The commit the package was built from: L0_MergeRequest passes gitlabCommit with the artifactPath
+    // it built, and artifactCommit overrides it when testing another commit's artifacts (as linuxPkgName).
+    def commit = env.artifactCommit ?: env.gitlabCommit
+    // Without a commit, fall back to the artifact path, which is unique per pipeline.
+    def commitTag = commit ? commit.take(8) : shortHash(llmTarArtifactPath)
+    def imageTag = LLM_DOCKER_IMAGE.contains("@sha256:") ? LLM_DOCKER_IMAGE.split("@sha256:")[1].take(8) : shortHash(LLM_DOCKER_IMAGE)
+    // Pre-merge tests the canonical package and post-merge tests bolted-<package>; both
+    // are the commit's build for that arch, so the BOLT prefix is not part of the name.
+    def packageTag = llmTarArtifactPath.tokenize('/')[-1]
+        .replaceAll(/^bolted-/, '').replaceAll(/\.tar\.gz$/, '').replaceAll(/[^A-Za-z0-9._-]/, '_')
+    def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -c1-8").trim()
+    def name = "fat-commit-${commitTag}-image-${imageTag}-${packageTag}-script-${scriptHash}"
+    return [name: name, path: "${fatSqshDir}/${name}.sqsh"]
 }
 
 // Shared by the SLURM agent and sbatch flows.
@@ -1116,9 +1128,8 @@ def generateFatBuildSbatchScript(Map args) {
 #SBATCH ${args.fatBuilderArgs}
 export FAT_CONTAINER_DIR="${args.containerDir}"
 export FAT_CONTAINER="${args.container}"
-export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_SQSH_PATH="${args.fatSqshPath}"
 export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
-export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
 export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
 export FAT_TAR_NAME="${args.tarName}"
 export FAT_FETCH_HELPER_PATH="${args.fetchHelperPathNode}"
@@ -1132,10 +1143,7 @@ bash "${args.fatBuildBodyPathNode}"
 def generateFatPrepareScript(Map args) {
     return """\
 #!/bin/bash
-export FAT_SQSH_DIR="${args.fatSqshDir}"
-export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
-export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
-export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_SQSH_PATH="${args.fatSqshPath}"
 export FAT_BUILD_SBATCH_PATH="${args.fatBuildSbatchPathNode}"
 export FAT_BUILD_LOG_TEMPLATE="${args.fatBuildLogPath}"
 export FAT_ARTIFACTORY_NETRC="${args.artifactoryNetrcPathNode}"
@@ -1198,13 +1206,14 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            // Fat sqsh files are shared across jobs (keyed by package, image and builder script),
-            // so age-prune rather than delete per job; reused ones keep a refreshed mtime.
-            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            // Fat sqsh files are shared across jobs (keyed by commit, image, package and builder
+            // script), so age-prune rather than delete per job; reused ones keep a refreshed mtime.
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +2 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
             // Keep the job workspace (job-output.log etc.) for debugging; the
-            // PruneSlurmOutputs job removes it after the retention period. Drop the
-            // S3 spool and anything holding credentials right away: the launch
+            // PruneSlurmOutputs job in trt-llm-automation-tools (prune-slurm-outputs/)
+            // removes it after the retention period and reads these paths, so keep both
+            // in sync. Drop the S3 spool and anything holding credentials right away: the launch
             // script embeds HF/GitHub tokens and OpenSearch credentials, and the
             // netrc files hold the Artifactory credentials.
             "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
@@ -1261,7 +1270,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +2 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
         ].join(" ; ")
         Utils.exec(
@@ -1503,6 +1512,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             def scriptPrepareBodyPathNode = "${agentJobWorkspace}/${nodeName}-prepare_container_body.sh"
             def scriptFetchHelperPathNode = "${agentJobWorkspace}/${nodeName}-fetch_build_artifact.sh"
             def fatArtifactoryNetrcPathNode = "${agentJobWorkspace}/fat-artifactory-netrc"
+            // Named once the package is unpacked, since the name hashes its builder script.
+            def fatSqshPath = null
 
             stage("Initialize Test") {
                 println("Selected Cluster: ${cluster.name}")
@@ -1513,6 +1524,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
                     }
                     sh "cd ${llmPath} && tar -zxf ${tarName}"
+                    fatSqshPath = computeFatSqshPath("${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh", llmTarArtifactPath, scriptFatBuildLocalPath).path
 
                     Utils.exec(pipeline, script: "echo 'Script to build fat sqsh inline:' && cat ${scriptFatBuildLocalPath}")
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildLocalPath, scriptFatBuildPathNode, true)
@@ -1524,7 +1536,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         container = LLM_DOCKER_IMAGE
                             .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                     }
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${nodeName}-fat_build")
 
@@ -1538,9 +1549,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         fatBuilderArgs: cluster.fatBuilderArgs,
                         containerDir: containerDir,
                         container: container,
-                        fatSqshDir: fatSqshDir,
+                        fatSqshPath: fatSqshPath,
                         llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
                         fatBuildScriptPathNode: scriptFatBuildPathNode,
                         tarName: tarName,
                         fetchHelperPathNode: scriptFetchHelperPathNode,
@@ -1552,10 +1562,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildSbatchPathLocal, scriptFatBuildSbatchPathNode, true)
 
                     def scriptPrepareContent = generateFatPrepareScript(
-                        fatSqshDir: fatSqshDir,
-                        llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
-                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatSqshPath: fatSqshPath,
                         fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
                         fatBuildLogPath: fatBuildLogPath,
                         artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
@@ -1645,11 +1652,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // Run the agent inside the pre-built fat sqsh (TRT-LLM + pip deps baked in).
                 // ENROOT only: a .sqsh path is not a valid image for a Docker runtime.
                 if (cluster.fatBuilderArgs != null && cluster.containerRuntime.toString() == "ENROOT") {
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
-                    def fatHash = fatSqsh.hash
-                    def fatSqshPath = fatSqsh.path
-                    echo "Fat sqsh check: hash=${fatHash} path=${fatSqshPath}"
+                    echo "Fat sqsh check: ${fatSqshPath}"
                     // Simple SSH check: just test the pre-computed literal path.
                     def fatCheckResult = Utils.exec(
                         pipeline,
@@ -2565,6 +2568,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
+                // One name for the builder, Prepare Container and the srun prologue.
+                def fatSqshPath = null
+                if (cluster.fatBuilderArgs != null || cluster.containerRuntime.toString() == "ENROOT") {
+                    fatSqshPath = computeFatSqshPath("${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh", llmTarArtifactPath, scriptFatBuildLocalPath).path
+                }
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm profiler environment: \" && cat ${scriptProfilerEnvLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -2607,7 +2615,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         scriptFatBuildPathNode,
                         true
                     )
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
 
@@ -2619,9 +2626,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         fatBuilderArgs: cluster.fatBuilderArgs,
                         containerDir: containerDir,
                         container: container,
-                        fatSqshDir: fatSqshDir,
+                        fatSqshPath: fatSqshPath,
                         llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
                         fatBuildScriptPathNode: scriptFatBuildPathNode,
                         tarName: tarName,
                         fetchHelperPathNode: scriptFetchHelperPathNode,
@@ -2852,17 +2858,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     // base sqsh (fallback). Base sqsh is shared across jobs by image digest.
                     containerImageArg = "\${enrootImagePath}"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
-                    def fatBuildScriptHash = fatSqsh.scriptHash
-                    def fatHash = fatSqsh.hash
-                    def fatSqshPath = fatSqsh.path
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
                     # Fat sqsh: pre-built on CPU node; if present, skip all pip installs.
-                    # Path pre-computed on Jenkins controller (hash=${fatBuildScriptHash}, fatHash=${fatHash}).
+                    # Path pre-computed on Jenkins controller.
                     if [ -f "${fatSqshPath}" ]; then
                         echo "Reusing fat sqsh: ${fatSqshPath} (SKIP_INSTALL=1)"
                         export enrootImagePath="${fatSqshPath}"
@@ -3130,15 +3131,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // (if needed) and polls until it completes. Run Pytest starts only after
                 // this stage returns, so the fat sqsh is already on disk when the GPU job
                 // starts and the srunPrologue can reuse it (SKIP_INSTALL=1).
-                def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                 def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
                 if (cluster.fatBuilderArgs != null) {
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
                     scriptPrepareContent = generateFatPrepareScript(
-                        fatSqshDir: fatSqshDir,
-                        llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
-                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatSqshPath: fatSqshPath,
                         fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
                         fatBuildLogPath: fatBuildLogPath,
                         artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
