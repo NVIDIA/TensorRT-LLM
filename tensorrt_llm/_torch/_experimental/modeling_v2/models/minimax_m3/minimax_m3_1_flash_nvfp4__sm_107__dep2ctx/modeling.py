@@ -5452,6 +5452,8 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx(MiniMaxM3ForCausalLM):
         dict(
             sparse_attention=_msa_engine.sparse_attention_classes(),
             disagg_draft_kv=True,
+            ctx_batch_wait_skip=True,
+            gpu_timestamps=True,
             # The windowed draft pool's sizing and resize fixes.
             draft_pool_fixes=True,
             late_compile_detect=True,

@@ -209,6 +209,8 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
         defer_gen_reuse_commit=step and not m31_disabled("DEP_DEFER_REUSE_COMMIT"),
         context_token_array=True,
         token_array_all_requests=True,
+        ctx_batch_wait_skip=True,
+        gpu_timestamps=True,
         persist_flashinfer_mxfp8_tactics=persist_tactics,
     )
     msa_policy = dict(

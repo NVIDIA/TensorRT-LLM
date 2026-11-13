@@ -63,8 +63,10 @@ MAIN_DEFAULT: FrozenSet[str] = frozenset(
 PERF_ONLY: FrozenSet[str] = frozenset(
     {
         "context_onehot_index_fill",
+        "ctx_batch_wait_skip",
         "defer_gen_reuse_commit",
         "dflash_host_ctx_alloc",
+        "gpu_timestamps",
         "install_tactic_pins",
         "kv_gpu_prefetch",
         "msa_prefill_fork",

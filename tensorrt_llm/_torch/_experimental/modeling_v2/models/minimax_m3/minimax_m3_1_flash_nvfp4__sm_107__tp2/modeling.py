@@ -9077,6 +9077,8 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
         dict(
             sparse_attention=_msa_engine.sparse_attention_classes(),
             fp8_saturating_casts=True,
+            ctx_batch_wait_skip=True,
+            gpu_timestamps=True,
             msa_kv_cache_fixes=True,
             draft_pool_fixes=True,
             persist_flashinfer_mxfp8_tactics=True,

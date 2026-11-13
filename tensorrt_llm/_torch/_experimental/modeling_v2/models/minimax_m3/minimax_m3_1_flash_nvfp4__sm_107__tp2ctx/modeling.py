@@ -5298,6 +5298,8 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx(MiniMaxM3ForCausalLM):
             sparse_attention=_msa_engine.sparse_attention_classes(),
             disagg_draft_kv=True,
             late_compile_detect=True,
+            ctx_batch_wait_skip=True,
+            gpu_timestamps=True,
         ),
         msa=dict(
             prefill_proxy_qo_tile=None if m31_disabled("TP2CTX_PROXY_Q128") else 128,
