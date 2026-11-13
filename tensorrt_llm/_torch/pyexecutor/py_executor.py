@@ -5480,6 +5480,12 @@ class PyExecutor:
         new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
+        supports_gen_cancel = getattr(self.kv_cache_transceiver,
+                                      "supports_logical_gen_cancellation", None)
+        if callable(supports_gen_cancel) and supports_gen_cancel() is True:
+            # The symmetric receive poll commits TP-wide logical decisions.
+            # Apply them before GEN_INIT can enter this iteration's scheduler.
+            new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
         # After the polls so a transfer that completed this iteration releases
@@ -11307,7 +11313,7 @@ class PyExecutor:
             if (generation_waiting
                     and id(request) in self._held_transfer_failures()):
                 # Progress retirement without replacing the earlier executor error.
-                if self.disagg.request_cancellation(request):
+                if self.disagg.request_cancellation(request, failed=True):
                     request.state = LlmRequestState.DISAGG_TRANS_ERROR
                 continue
             logically_cancelled = (generation_waiting and
@@ -11457,7 +11463,7 @@ class PyExecutor:
                 and id(request) in self._held_transfer_failures()
                 and self.kv_cache_transceiver.
                 supports_idle_request_cancellation(request) is True):
-            if self.disagg.request_cancellation(request):
+            if self.disagg.request_cancellation(request, failed=True):
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
 
@@ -11466,6 +11472,10 @@ class PyExecutor:
         if (not self._kv_connector_moves_kv
                 and self.disagg.cancel_gen_logically(request)):
             return True
+        if self.disagg.owns_gen_cancellation(request):
+            # The local destination may already be safe while a TP peer is
+            # still deciding its outcome or retaining an accessor.
+            return self.disagg.request_cancellation(request)
         if (connector is None
                 and self.disagg.supports_logical_context_cancellation(request)):
             if request.py_request_id in getattr(self, "inflight_req_ids", ()):

@@ -111,6 +111,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
             "request_logical_context_cancellation",
             "has_retiring_gen_receives",
             "cancel_gen_logically",
+            "owns_gen_cancellation",
             "defer_gen_termination",
             "request_cancellation",
             "inflight_cancel_active",
@@ -120,6 +121,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine.disagg.request_logical_context_cancellation.return_value = True
     engine.disagg.has_retiring_gen_receives = False
     engine.disagg.cancel_gen_logically.return_value = False
+    engine.disagg.owns_gen_cancellation.return_value = False
     engine.disagg.defer_gen_termination.return_value = False
     engine.disagg.request_cancellation.return_value = False
     engine.disagg.inflight_cancel_active.return_value = False

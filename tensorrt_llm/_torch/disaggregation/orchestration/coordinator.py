@@ -1038,20 +1038,38 @@ class DisaggTransferCoordinator:
             return False
         pending = self._unpublished_gen_receives.get(request.py_request_id)
         try:
-            if cancel(request, pending[1] if pending else None) is not True:
-                return False
+            accepted = cancel(request, pending[1] if pending else None) is True
         except RuntimeError as error:
             logger.error(
                 f"Logical GEN cancellation failed for request {request.py_request_id}; "
                 f"falling back to transfer cancellation: {error}\n{traceback.format_exc()}"
             )
             return False
+        if not accepted and not self.owns_gen_cancellation(request):
+            return False
         # The transceiver now owns any unpublished fence. Remove the only
         # publication path before the executor makes the result terminal.
         self._unpublished_gen_receives.pop(request.py_request_id, None)
+        if not accepted:
+            # Publication is closed, but the logical result is not committed
+            # until every TP rank votes at the receive progress boundary.
+            return False
         if not self.request_cancellation(request):
             self._retiring_gen_receives[request.py_request_id] = request
         return True
+
+    def owns_gen_cancellation(self, request: LlmRequest) -> bool:
+        """Whether receive cancellation owns this request's terminal decision.
+
+        Args:
+            request: Destination request reaching an executor cancellation boundary.
+
+        Returns:
+            Whether group cancellation owns admission and outcome, including
+            after physical retirement. Use request_cancellation for release.
+        """
+        owns = getattr(self._transceiver, "owns_gen_cancellation", None)
+        return callable(owns) and owns(request) is True
 
     def defer_gen_termination(self, request: LlmRequest) -> bool:
         """Retain a cancelled destination after its terminal response is published.
@@ -1078,27 +1096,39 @@ class DisaggTransferCoordinator:
             self._gen_termination_requested.remove(request_id)
             self._effects.terminate_request(request)
 
-    def request_cancellation(self, request: LlmRequest) -> bool:
+    def request_cancellation(self, request: LlmRequest, *, failed: bool = False) -> bool:
         """Cancel transfers, retaining unpublished fences and resources until safe.
 
         Transfer a qualified unpublished CUDA fence to the transceiver before
         cancelling. False retains ownership for later progress; True permits
         retirement. An earlier failure remains the request's logical outcome.
+
+        Args:
+            request: The exact request whose transfer admission must close.
+            failed: Whether the executor already holds an earlier failure.
+
+        Returns:
+            Whether physical retirement permits ordinary request termination.
         """
+        supports = getattr(self._transceiver, "supports_logical_gen_cancellation", None)
+        if failed and callable(supports) and supports(request) is True:
+            # Executor-held errors are not necessarily reflected in the
+            # request or native session yet. Include them in the TP vote.
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
         try:
             pending = self._unpublished_gen_receives.get(request.py_request_id)
             if (
                 pending is not None
-                and pending[1] is not None
                 and self._transceiver.supports_idle_request_cancellation(request) is True
             ):
                 cancel = getattr(self._transceiver, "cancel_gen_logically", None)
-                if callable(cancel) and cancel(request, pending[1]) is True:
+                accepted = callable(cancel) and cancel(request, pending[1]) is True
+                if accepted or self.owns_gen_cancellation(request):
                     # A parked failure still owns its result. Transfer only the
                     # unpublished fence so cancellation closes admission and
                     # starts bounded retirement without replacing that result.
                     self._unpublished_gen_receives.pop(request.py_request_id, None)
-                elif not pending[1].query():
+                elif pending[1] is not None and not pending[1].query():
                     return False
         except RuntimeError as error:
             logger.error(

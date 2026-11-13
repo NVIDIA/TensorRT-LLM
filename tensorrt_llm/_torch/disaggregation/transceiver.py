@@ -18,6 +18,7 @@ import time
 import traceback
 import uuid
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
 
@@ -91,7 +92,7 @@ def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
     """Emit best-effort fatal diagnostics on a dedicated thread.
 
     Args:
-        event: The sticky expiry event retained by the watchdog.
+        event: The sticky physical-retirement failure retained by the watchdog.
     """
     try:
         logger.critical(
@@ -99,7 +100,9 @@ def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
             "other executors in the same job. Retaining KV "
             f"and transport roots until process teardown. request_id={event.request_id}, "
             f"direction={event.direction}, reason={event.reason}, "
-            "deadline_owner=retirement_grace progress_at_observation=unproven_quiescence, "
+            f"failure_kind={event.failure_kind}, "
+            f"deadline_owner={'retirement_grace' if event.failure_kind == 'deadline' else 'none'} "
+            "progress_at_observation=unproven_quiescence, "
             f"deadline={event.deadline}, expired_at={event.expired_at}"
         )
     except Exception:  # noqa: BLE001 - diagnostics cannot alter containment
@@ -111,7 +114,7 @@ def _fail_unproven_kv_transfer(
 ) -> None:
     """Terminate the executor world without running ordinary resource cleanup.
 
-    Called by the independent retirement watchdog after fatal expiry is sticky
+    Called by the retirement watchdog after physical-retirement failure is sticky
     and transfer admission is closed. The existing MPI/launcher crash path
     makes the endpoint unhealthy; request failure is not memory-release proof.
     The communicator identifies the executor, not an isolated failure domain:
@@ -121,7 +124,7 @@ def _fail_unproven_kv_transfer(
     not merely after this function requests termination.
 
     Args:
-        event: The first unproven physical owner whose drain deadline expired.
+        event: The first deadline or ownership-handoff failure; never release proof.
         communicator: Validated executor world captured before the watchdog starts.
     """
     try:
@@ -358,6 +361,16 @@ def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
     return paged_bytes, state_bytes
 
 
+@dataclass
+class _CancelledGenReceive:
+    """Keep a destination's logical vote separate from group retirement."""
+
+    request: LlmRequest
+    failed_before_cancel: bool
+    failed: bool | None = None
+    unhanded_ready: Optional[torch.cuda.Event] = None
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     # GEN idle-poll skip state; _init_gen_idle_poll sets the instance values.
     _gen_idle_poll_skip: bool = False
@@ -476,6 +489,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs = {}
         self._recv_reqs = {}
         self._cancelled_receive_fences: Dict[int, tuple[torch.cuda.Event, RetirementDeadline]] = {}
+        self._cancelled_gen_receives: dict[int, _CancelledGenReceive] = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         try:
@@ -532,7 +546,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         termination call raises or unexpectedly returns.
 
         Args:
-            event: The sticky physical-retirement deadline expiry.
+            event: The sticky physical-retirement failure decision.
         """
         _fail_unproven_kv_transfer(event, self._retirement_mpi_comm)
 
@@ -708,6 +722,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Preflight may refuse closure while DMA remains active. Start the
         # bounded drain before that refusal, not only in worker.shutdown().
         self._transfer_worker.request_shutdown()
+        if getattr(self, "_cancelled_gen_receives", {}):
+            raise RuntimeError("Cancelled GEN receives still await group retirement")
         for rid in list(getattr(self, "_cancelled_receive_fences", {})):
             if not self._retire_cancelled_receive_fence(rid):
                 raise RuntimeError(f"Unpublished receive {rid} still owns destination memory")
@@ -898,6 +914,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
+        if getattr(self, "_context_first_ownership", False) is True:
+            # Cancellation joins the normal receive-progress rendezvous. Keep
+            # both the collective count and the agreed-idle fast path intact.
+            local = (local_ids, self._cancelled_gen_receive_snapshot())
+            packed = list(self._gen_allgather(local)) if self._gen_need_sync else [local]
+            self._progress_cancelled_gen_receives([snapshot for _, snapshot in packed])
+            all_ranks = [ids for ids, _ in packed]
+            return _find_consensus_request_ids(all_ranks, len(all_ranks))
         if not self._gen_need_sync:
             return list(local_ids)
         all_ranks = self._gen_allgather(local_ids)
@@ -1002,7 +1026,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._gen_need_sync,
             locally_retirable,
             locally_verified,
-            local_session_count=len(self._recv_sessions) + deferred if idle_skip else None,
+            local_session_count=(
+                len(self._recv_sessions)
+                + len(getattr(self, "_cancelled_gen_receives", {}))
+                + deferred
+                if idle_skip
+                else None
+            ),
         )
         new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
         if idle_skip:
@@ -1308,6 +1338,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             rid in self._send_sessions
             or rid in self._recv_sessions
             or rid in getattr(self, "_cancelled_receive_fences", {})
+            or rid in getattr(self, "_cancelled_gen_receives", {})
         )
 
     def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
@@ -1551,8 +1582,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req: The generation request whose KV cache blocks to receive
                 into.
         """
-        # Before anything that can return or raise: every rank requests the
-        # same receives, so they all resume status polling together.
+        if self.owns_gen_cancellation(req):
+            return
+        # Every rank admits the same new receives, so resume status polling
+        # before validation can reject one shard or raise.
         self._gen_idle_agreed = False
         if not self._validate_bridge_req(req):
             return
@@ -1765,9 +1798,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if need_progress:
             self._poll_gen_sessions_for_poll_interval(wait_num)
 
-        local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        cancelled_receives = getattr(self, "_cancelled_gen_receives", {})
+        sessions = self._recv_sessions
+        if cancelled_receives:
+            sessions = {
+                rid: session for rid, session in sessions.items() if rid not in cancelled_receives
+            }
+        local_completed, local_failed = self._collect_done(sessions, self._recv_reqs)
         to_process = self._build_to_process(
-            self._recv_sessions,
+            sessions,
             self._gen_consensus(local_completed + local_failed),
             0 if need_progress else wait_num,
             block_all,
@@ -1919,7 +1958,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             time.sleep(min(0.001, remaining_s))
 
     def check_gen_transfer_complete(self):
-        return not self._recv_sessions and not getattr(self, "_cancelled_receive_fences", {})
+        return (
+            not self._recv_sessions
+            and not getattr(self, "_cancelled_receive_fences", {})
+            and not getattr(self, "_cancelled_gen_receives", {})
+        )
 
     def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
         """Verify the V2 scheduler pre-declared prompt_len as history.
@@ -1955,12 +1998,36 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Allow bridge cancellation or a session-free generation-first CTX wait."""
         if getattr(self, "_fp4_mla_bridge_enabled", False) is True:
             return True
+        if self.supports_logical_gen_cancellation(req):
+            return True
         return (
             req is not None
             and req.is_context_only_request
             and req.py_disaggregated_params is not None
             and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
             and not self.has_inflight_transfer(req)
+        )
+
+    def supports_logical_gen_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
+        """Check the protected context-first destination cancellation capability.
+
+        Args:
+            req: The request to check, or None for the runtime capability.
+
+        Returns:
+            Whether the request uses the protected immutable-ID GEN profile.
+        """
+        if getattr(self, "_context_first_ownership", False) is not True:
+            return False
+        if req is None:
+            return True
+        params = req.py_disaggregated_params
+        return (
+            req.is_generation_only_request
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            and type(params.disagg_request_id) is int
+            and params.disagg_request_id >= 0
         )
 
     def cancel_gen_logically(
@@ -1978,9 +2045,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             With the bridge enabled, a passed ready fence remains retained until
             cancel_request returns True, even when this method returns False.
         """
-        if not getattr(self, "_fp4_mla_bridge_enabled", False):
+        group_cancel = self.supports_logical_gen_cancellation(req)
+        if not getattr(self, "_fp4_mla_bridge_enabled", False) and not group_cancel:
             return False
+        if group_cancel and getattr(req, "py_kv_receive_cancellation_retired", False):
+            return not req.py_kv_receive_cancel_failed
         rid = get_unique_rid(req)
+        if group_cancel:
+            records = getattr(self, "_cancelled_gen_receives", None)
+            if records is None:
+                records = self._cancelled_gen_receives = {}
+            if rid not in records:
+                session = self._recv_sessions.get(rid)
+                records[rid] = _CancelledGenReceive(
+                    req,
+                    req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                    or (session is not None and session.status == SessionStatus.ERROR),
+                )
+                self._recv_reqs[rid] = req
+                self._ever_had_recv_session = True
+                self._gen_idle_agreed = False
+            record = records[rid]
+            if ready is not None:
+                record.unhanded_ready = ready
+            else:
+                ready = record.unhanded_ready
         if ready is not None:
             fences = getattr(self, "_cancelled_receive_fences", None)
             if fences is None:
@@ -1988,16 +2077,123 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if rid not in fences:
                 # Register before querying: a CUDA error must not drop the only
                 # root or leave an unobservable accessor without a grace clock.
-                owner = self._transfer_worker.create_receive_retirement(req.py_request_id)
+                try:
+                    owner = self._transfer_worker.create_receive_retirement(req.py_request_id)
+                except RuntimeError:
+                    if group_cancel:
+                        self._transfer_worker.fail_receive_retirement(
+                            req.py_request_id, "unpublished CUDA ownership handoff refused"
+                        )
+                    raise
                 self._recv_reqs[rid] = req
                 fences[rid] = (ready, owner)
                 owner.retain_unproven(req, "cancelled receive admission")
+            if group_cancel:
+                record.unhanded_ready = None
         session = self._recv_sessions.get(rid)
         if session is not None:
             session.cancel_local()
+            if group_cancel and records[rid].failed is None:
+                # Native cancellation serializes with result callbacks. Read
+                # its winner after that boundary, not before a failure can race.
+                records[rid].failed_before_cancel |= session.status == SessionStatus.ERROR
+        if group_cancel:
+            return records[rid].failed is False
         return req.state != LlmRequestState.DISAGG_TRANS_ERROR and (
             session is None or session.status != SessionStatus.ERROR
         )
+
+    def owns_gen_cancellation(self, req: LlmRequest) -> bool:
+        """Whether cancellation already closed this destination's publication.
+
+        Args:
+            req: The exact destination request.
+
+        Returns:
+            Whether a pending or committed group cancellation owns the result;
+            this is not a physical-resource retention or release predicate.
+        """
+        return (
+            get_unique_rid(req) in getattr(self, "_cancelled_gen_receives", {})
+            or getattr(req, "py_kv_receive_cancellation_retired", False) is True
+        )
+
+    def _cancelled_gen_receive_snapshot(self) -> dict[int, tuple[bool, bool]]:
+        """Snapshot the immutable local outcome and current physical-safety evidence.
+
+        Returns:
+            Per-request prior-failure and local-safe votes for the GEN rendezvous.
+        """
+        records = getattr(self, "_cancelled_gen_receives", {})
+        local = {}
+        for rid, record in records.items():
+            session = self._recv_sessions.get(rid)
+            if session is not None:
+                try:
+                    session.notify_cancel()
+                except RuntimeError as error:
+                    logger.warning(f"Receive {rid} cancellation notification will retry: {error}")
+            # If watchdog admission closed during hand-off, keep the original
+            # CUDA fence rooted. Missing registration is not evidence of safety.
+            safe = record.unhanded_ready is None and (
+                session is None or not self._retirement_blocked(session)
+            )
+            fence = getattr(self, "_cancelled_receive_fences", {}).get(rid)
+            if fence is not None:
+                ready, owner = fence
+                try:
+                    safe = ready.query() and owner.settle(record.request) and safe
+                except RuntimeError as error:
+                    # Unknown CUDA progress is not a safe vote. Retain the
+                    # original owner and grace clock while peers keep polling.
+                    logger.warning(f"Receive {rid} CUDA readiness is unproven: {error}")
+                    safe = False
+            local[rid] = (record.failed_before_cancel, safe)
+        return local
+
+    def _progress_cancelled_gen_receives(
+        self, gathered: list[dict[int, tuple[bool, bool]]]
+    ) -> None:
+        """Commit cancellation decisions at the symmetric receive-progress boundary.
+
+        Args:
+            gathered: Every participant's logical-outcome and physical-safety votes.
+        """
+        records = getattr(self, "_cancelled_gen_receives", {})
+        if any(gathered):
+            # Keep the ordinary status collectives symmetric even when one
+            # rank has only a cancelled, never-published destination.
+            self._gen_idle_agreed = False
+        for rid, record in list(records.items()):
+            if not all(rid in snapshot for snapshot in gathered):
+                continue
+            if record.failed is None:
+                record.failed = any(snapshot[rid][0] for snapshot in gathered)
+                if record.failed:
+                    record.request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            if not all(snapshot[rid][1] for snapshot in gathered):
+                continue
+            session = self._recv_sessions.get(rid)
+            if session is not None:
+                self._close_session_or_raise(session, rid, "cancelled")
+                del self._recv_sessions[rid]
+            if not self._retire_cancelled_receive_fence(rid):
+                raise RuntimeError(f"Cancelled receive {rid} lost safe retirement evidence")
+            self._recv_reqs.pop(rid, None)
+            # Keep the terminal decision on the exact request object, not in
+            # a live receive table. Duplicate cancellation cannot reopen a
+            # retired vote or retain an otherwise completed request forever.
+            record.request.py_kv_receive_cancel_failed = record.failed
+            record.request.py_kv_receive_cancellation_retired = True
+            del records[rid]
+            if session is not None and disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                self._emit_transfer_settled(
+                    "gen",
+                    rid,
+                    record.request,
+                    session,
+                    "failed" if record.failed else "cancelled",
+                )
 
     def supports_logical_context_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
         """Whether this request has independently retained context-transfer ownership.
@@ -2078,6 +2274,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # Keep the session until the normal send reaper agrees across ranks.
             accepted = self.request_logical_context_cancellation(req)
             return accepted and rid not in self._send_sessions
+
+        if self.supports_logical_gen_cancellation(req):
+            self.cancel_gen_logically(req)
+            return getattr(req, "py_kv_receive_cancellation_retired", False) is True
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
