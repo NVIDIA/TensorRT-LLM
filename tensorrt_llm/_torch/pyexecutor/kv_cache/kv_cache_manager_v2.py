@@ -103,6 +103,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
+    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
@@ -486,10 +487,25 @@ def _request_conversation_id(request: LlmRequest) -> Optional[str]:
     return conversation_id or None
 
 
+def _request_conversation_key(request: LlmRequest) -> tuple[str, int | None, str | None] | None:
+    conversation_id = _request_conversation_id(request)
+    if conversation_id is None:
+        return None
+    # Retention plans must use the same namespace as prefix reuse.
+    return conversation_id, request.lora_task_id, request.cache_salt
+
+
+def _conversation_prefix_hash(kv_cache: _KVCache, tokens: Sequence[TokenIdExt]) -> bytes:
+    keys = sequence_to_blockchain_keys(kv_cache.tokens_per_block, kv_cache.reuse_scope, tokens)
+    return deque(keys, maxlen=1)[0][1]
+
+
 @dataclass(slots=True)
 class _ConversationState:
     current_request_id: Optional[int] = None
     planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
+    prefix_length: int = 0
+    prefix_hash: bytes | None = None
 
 
 class ConversationManager:
@@ -497,26 +513,40 @@ class ConversationManager:
 
     def __init__(self, max_num_turns: int) -> None:
         self._max_num_turns = max_num_turns
-        self._conversation_states: Dict[str, _ConversationState] = {}
+        self._conversation_states: Dict[tuple[str, int | None, str | None], _ConversationState] = {}
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
         """Save a completed context's drop plan and apply the preceding plan on success."""
         request_id = request.py_request_id
-        conversation_id = _request_conversation_id(request)
-        if conversation_id is None:
+        conversation_key = _request_conversation_key(request)
+        if conversation_key is None:
             return
 
-        state = self._conversation_states[conversation_id]
-        if state.current_request_id != request_id:
+        # An overlapping request can outlive the conversation's registered
+        # request, whose completion may remove the state entirely.
+        state = self._conversation_states.get(conversation_key)
+        if state is None or state.current_request_id != request_id:
+            return
+
+        tokens = kv_cache.committed_tokens
+        if state.prefix_hash is not None and (
+            len(tokens) < state.prefix_length
+            or _conversation_prefix_hash(kv_cache, tokens[: state.prefix_length])
+            != state.prefix_hash
+        ):
+            # An ID collision or a fork does not advance another history's retention plans.
+            self.finish_request(request)
             return
 
         drop_handle = kv_cache.plan_committed_block_drop()
         if drop_handle is None:
             logger.warning(
                 f"Committed blocks for request {request_id} in conversation "
-                f"{conversation_id} have been dropped."
+                f"{conversation_key[0]} have been dropped."
             )
         else:
+            state.prefix_length = len(tokens)
+            state.prefix_hash = _conversation_prefix_hash(kv_cache, tokens)
             state.planned_drop_handles.append(drop_handle)
             if len(state.planned_drop_handles) > self._max_num_turns:
                 state.planned_drop_handles.popleft().drop()
@@ -525,15 +555,15 @@ class ConversationManager:
 
     def prepare_request(self, request: LlmRequest) -> None:
         """Register a context request unless its conversation has another active one."""
-        conversation_id = _request_conversation_id(request)
-        if conversation_id is None:
+        conversation_key = _request_conversation_key(request)
+        if conversation_key is None:
             return
         request_id = request.py_request_id
-        state = self._conversation_states.setdefault(conversation_id, _ConversationState())
+        state = self._conversation_states.setdefault(conversation_key, _ConversationState())
         current_request_id = state.current_request_id
         if current_request_id is not None and current_request_id != request_id:
             logger.warning(
-                f"Conversation {conversation_id} already has current request "
+                f"Conversation {conversation_key[0]} already has current request "
                 f"{current_request_id}. Request {request_id} will ignore "
                 "conversation params."
             )
@@ -543,16 +573,16 @@ class ConversationManager:
 
     def finish_request(self, request: LlmRequest) -> None:
         """Clear a request as active while preserving any saved drop plan."""
-        conversation_id = _request_conversation_id(request)
-        if conversation_id is None:
+        conversation_key = _request_conversation_key(request)
+        if conversation_key is None:
             return
-        state = self._conversation_states.get(conversation_id)
+        state = self._conversation_states.get(conversation_key)
         if state is None or state.current_request_id != request.py_request_id:
             return
 
         state.current_request_id = None
         if not state.planned_drop_handles:
-            self._conversation_states.pop(conversation_id)
+            self._conversation_states.pop(conversation_key)
 
     def clear(self) -> None:
         """Clear state after reusable KV-cache blocks have been cleared."""
