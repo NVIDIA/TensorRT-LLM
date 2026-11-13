@@ -69,7 +69,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 39);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 40);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -261,6 +261,14 @@ public:
     void syncTransferManagerWithBufferManager() override
     {
         NB_OVERRIDE_PURE(syncTransferManagerWithBufferManager);
+    }
+
+    tbk::KvCacheTransferLease prepareBlocksForTransfer(
+        std::unordered_map<SizeType32, std::vector<tbk::KVCacheBlock::IdType>> const&,
+        tensorrt_llm::executor::KvCacheTransferMode = tensorrt_llm::executor::KvCacheTransferMode::DRAM,
+        std::string const& = "") override
+    {
+        TLLM_THROW("prepareBlocksForTransfer is not supported by Python KV cache manager overrides.");
     }
 
     void refreshBlocks() override
