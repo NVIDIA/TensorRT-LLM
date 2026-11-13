@@ -95,6 +95,7 @@ class _Tokenizer:
 class _Generation:
     """A finished generation, as far as the routes read one before post-processing."""
 
+    request_id = 1
     prompt_token_ids = [1, 2, 3]
     finished = True
     error = None
