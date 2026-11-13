@@ -5858,25 +5858,26 @@ def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
     assert mgr.use_kda_replay_update
 
 
+@skip_no_cuda
 def test_v2_kda_replay_policy_records_acceptance_and_skips_dummy_rows():
     mgr = object.__new__(KimiK3HybridCacheManager)
     mgr.local_num_mamba_layers = 1
     policy = KDAReplayState(
         num_speculative_tokens=2,
     )
-    policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
-    policy.intermediate_indices = torch.arange(3, dtype=torch.int32)
-    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, False, True]))
+    policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32, device="cuda")
+    policy.intermediate_indices = torch.arange(3, dtype=torch.int32, device="cuda")
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(
+        torch.tensor([False, False, True], device="cuda")
+    )
     mgr._kda_replay = policy
     mgr._speculative_state = policy
 
-    mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
-    if not hasattr(mgr, "_dummy_request_mask"):
-        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
+    mgr._generation_state_indices = torch.arange(64, dtype=torch.int32, device="cuda")
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=3, num_contexts=1),
-        torch.tensor([1, 3, 2], dtype=torch.int32),
-        state_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+        torch.tensor([1, 3, 2], dtype=torch.int32, device="cuda"),
+        state_indices=torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
     )
 
     assert policy.prev_num_accepted_tokens.tolist() == [7, 2, 9]
@@ -5906,6 +5907,7 @@ def test_v2_kda_replay_policy_resets_context_slots():
     assert policy.prev_num_accepted_tokens.tolist() == [5, 6, 0]
 
 
+@skip_no_cuda
 def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     mgr = object.__new__(KimiK3HybridCacheManager)
     mgr.local_num_mamba_layers = 1
@@ -5915,7 +5917,7 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     policy = KDAReplayState(
         num_speculative_tokens=2,
     )
-    policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
+    policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32, device="cuda")
     mgr._kda_replay = policy
     mgr._speculative_state = policy
     policy.acceptance_pending = {101, 202, 404}
@@ -6060,6 +6062,12 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
     its update_resources raises. Once update_resources has recorded it, or the batch is reverted without running, the
     request suspends."""
     mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
+    if recorded_by == "update_resources":
+        # update_resources records the acceptance with the CUDA kernel.
+        if not torch.cuda.is_available():
+            pytest.skip("the acceptance record needs CUDA")
+        replay = mgr._kda_replay
+        replay.prev_num_accepted_tokens = replay.prev_num_accepted_tokens.cuda()
     mgr.spec_config = SimpleNamespace(decoding_type="NGram")
     for method in ("prepare_resources", "update_resources", "revert_allocate_generation"):
         monkeypatch.setattr(KVCacheManagerV2, method, MagicMock())
@@ -7907,6 +7915,7 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
     policy._conv_section_dims = tuple(mgr.conv_section_dims)
     policy._committed_window = window
 
+    previous_mode = None
     if device == "cuda":
         torch.cuda.synchronize()
         previous_mode = torch.cuda.get_sync_debug_mode()
@@ -7917,7 +7926,7 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
         policy.relocate_slots([1], [6])
         mgr.seed_kda_replay_caches_for_disagg_gen([10, 11])
     finally:
-        if device == "cuda":
+        if previous_mode is not None:
             torch.cuda.set_sync_debug_mode(previous_mode)
 
     # Reset 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2; 7 untouched.

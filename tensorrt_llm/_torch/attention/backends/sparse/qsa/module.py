@@ -721,18 +721,18 @@ class QSASparseHooks(AttentionSparseHooks):
             )
             fuse_output_gate = False
             if use_prims_ts:
+                num_seqs = attn_metadata.num_seqs
                 output = prims_ts_sparse_gqa(
                     q,
                     k_cache,
                     v_cache,
-                    attn_metadata.qsa_block_table,
+                    attn_metadata.qsa_block_table[:num_seqs],
                     selected,
-                    req_idx,
-                    logical,
                     page_size=tokens_per_block,
                     max_seq_len_kv=max_seq_len_kv,
                     softmax_scale=softmax_scale,
                     is_decode=True,
+                    seq_lens=attn_metadata.kv_lens_cuda_runtime[:num_seqs],
                 )
             else:
                 if output_gate is not None:

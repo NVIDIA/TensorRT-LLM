@@ -1691,6 +1691,7 @@ def test_prims_ts_cache_free_fp8_recipes(
     plans: list[dict] = []
     runs: list[dict] = []
     forward_calls: list[tuple] = []
+    forward = None
     if cuda_graph:
         from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 

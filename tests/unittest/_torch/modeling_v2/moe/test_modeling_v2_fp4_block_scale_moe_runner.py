@@ -174,6 +174,7 @@ def test_deepseek_geometry():
     without chunking. Token counts are appended in ascending order, so every
     count below the top draws exactly the values it drew before.
     """
+    top = None
     args, ref = _dsv3()
     gen = ref["gen"]
     worst = (0.0, 0.0)
@@ -575,6 +576,9 @@ def test_ep_window_18_of_72():
     unchunked. Counts are appended in ascending order, so every count below
     the top draws exactly the values it drew before.
     """
+    top_win = None
+    top_sum = None
+    top_drop = None
     args, ref = _dsv3()
     num_experts, hidden, top_k, shard = 72, 2560, 6, 18
     windows = [(r * shard, shard) for r in range(4)]
@@ -829,6 +833,7 @@ def test_r1_geometry():
     Token counts are swept in ascending order, so every count below the top
     draws exactly the values it drew before.
     """
+    top = None
     args, ref = _dsr1()
     gen = ref["gen"]
     num_experts, hidden, top_k = 256, 7168, 8
@@ -876,6 +881,9 @@ def test_ep_window_64_of_256():
     four bf16 outputs sum back to the 256-expert result (the value the dep4
     all-reduce adds up).
     """
+    top_win = None
+    top_sum = None
+    top_drop = None
     args, ref = _dsr1()
     num_experts, hidden, top_k, shard = 256, 7168, 8, 64
     windows = [(r * shard, shard) for r in range(4)]
@@ -1099,6 +1107,7 @@ def test_many_experts_top10_geometry(many_expert_layer):  # noqa: F811
     identical calls are bitwise equal, and the wrong computations land far
     outside the gate at this geometry too.
     """
+    top = None
     args, ref = many_expert_layer()
     num_experts, hidden, inter, top_k = 512, 2560, 640, 10
     gen = torch.Generator(device=DEV).manual_seed(51264)
