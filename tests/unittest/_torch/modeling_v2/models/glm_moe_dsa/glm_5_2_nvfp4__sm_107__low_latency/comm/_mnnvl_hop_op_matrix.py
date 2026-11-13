@@ -330,12 +330,20 @@ def check_cuda_graph_replays() -> None:
         torch.cuda.synchronize()
         norm1, res1, norm2, res2, norm3, res3 = state["outputs"]
         ref = entry.mnnvl_hop.reference(per_rank, state["residual"], gamma, EPS)
-        _compare(norm1, res1, *ref, f"replay {replay} production publish rows={rows}")
+        call_ref_norm, call_ref_residual = ref
+        _compare(
+            norm1,
+            res1,
+            call_ref_norm,
+            call_ref_residual,
+            f"replay {replay} production publish rows={rows}",
+        )
         assert torch.all(state["layout"] == 71.0), "o_proj_publish wrote its layout-only output"
         gathered = [torch.empty_like(norm1) for _ in range(WORLD)]
         dist.all_gather(gathered, norm1)
         ref = entry.mnnvl_hop.reference(gathered, res1, gamma, EPS)
-        _compare(norm2, res2, *ref, f"replay {replay} hop")
+        call_ref_norm, call_ref_residual = ref
+        _compare(norm2, res2, call_ref_norm, call_ref_residual, f"replay {replay} hop")
         local_draft = o_proj_publish.reference(
             state["draft_x"], state["weight"], state["draft_layout"], None, None, WORLD, RANK
         )
@@ -343,7 +351,14 @@ def check_cuda_graph_replays() -> None:
         dist.all_gather(per_rank_draft, local_draft)
         assert torch.all(state["draft_layout"] == 73.0)
         ref = entry.mnnvl_hop.reference(per_rank_draft, res2[:draft_rows], gamma, EPS)
-        _compare(norm3, res3, *ref, f"replay {replay} draft rows={draft_rows}")
+        call_ref_norm, call_ref_residual = ref
+        _compare(
+            norm3,
+            res3,
+            call_ref_norm,
+            call_ref_residual,
+            f"replay {replay} draft rows={draft_rows}",
+        )
         ranks.assert_same_on_every_rank(norm3, f"replay {replay} draft hop")
         assert ranks.workspace_addresses(MAPPING, HIDDEN) == addresses
         dist.barrier()

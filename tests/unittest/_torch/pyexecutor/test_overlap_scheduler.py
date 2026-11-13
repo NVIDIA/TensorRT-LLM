@@ -141,4 +141,5 @@ def test_overlap_scheduler_block_reuse_cache_hit(model_path, test_case):
 
 
 if __name__ == "__main__":
-    test_overlap_scheduler_consistency()
+    raise SystemExit(
+        pytest.main([__file__, "-k", "test_overlap_scheduler_consistency"]))

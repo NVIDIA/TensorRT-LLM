@@ -168,8 +168,11 @@ def test_fused_dspark_rmsnorm_rope_matches_reference(
         apply_rmsnorm,
         inverse_rope,
     )
+    call_x, call_weight, call_freqs = inputs
     expected = _reference(
-        *inputs,
+        call_x,
+        call_weight,
+        call_freqs,
         num_heads,
         rope_dim,
         eps,

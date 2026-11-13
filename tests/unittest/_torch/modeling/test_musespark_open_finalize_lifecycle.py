@@ -402,14 +402,14 @@ def _drop_after_enqueue(rank, mapping):
                 torch.cuda._sleep(20_000_000)
             actual = workspace.finalize(gemm, indices, weights, norm, 1e-8, tokens)
             if rank == lagging:
-                del workspace
+                workspace = None
                 gc.collect()
             torch.cuda.synchronize()
             actual, expected = actual.float(), expected.float()
             ok &= bool(torch.allclose(actual, expected, rtol=0.04, atol=0.02))
             MPI.COMM_WORLD.Barrier()
             if rank != lagging:
-                del workspace
+                workspace = None
                 gc.collect()
             MPI.COMM_WORLD.Barrier()
             ok &= _check_call(other, nccl, rank, 24, 500 + repeat)

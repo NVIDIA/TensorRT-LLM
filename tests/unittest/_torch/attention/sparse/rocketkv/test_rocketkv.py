@@ -774,8 +774,10 @@ def test_rocket_add_dummy_requests_forwards_capture_sampling_params(mocker):
 if __name__ == "__main__":
     # RocketKV e2e tests
     print("=== Testing RocketKV E2E tests ===")
-    test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "VANILLA")
-    test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "TRTLLM")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "VANILLA", monkeypatch)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "TRTLLM", monkeypatch)
 
     # Unit tests for sparse_kv_predict
     print("\n=== Testing sparse_kv_predict ===")

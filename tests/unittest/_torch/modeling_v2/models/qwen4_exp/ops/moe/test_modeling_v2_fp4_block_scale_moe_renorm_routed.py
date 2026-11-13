@@ -47,6 +47,7 @@ G1 = 137.0  # activation global scale, as the pre-routed entry's test draws it
 
 
 def _routed(args, data, sf, logits, scalars, spec, top_k=None):
+    call_output1_scale_scalar, call_output1_scale_gate_scalar, call_output2_scale_scalar = scalars
     return op(
         logits,
         data,
@@ -55,7 +56,9 @@ def _routed(args, data, sf, logits, scalars, spec, top_k=None):
         args["gemm1_weights_scale"],
         args["gemm2_weights"],
         args["gemm2_weights_scale"],
-        *scalars,
+        call_output1_scale_scalar,
+        call_output1_scale_gate_scalar,
+        call_output2_scale_scalar,
         spec["num_experts"],
         spec["top_k"] if top_k is None else top_k,
         spec["intermediate"],

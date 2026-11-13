@@ -585,7 +585,10 @@ def test_qwen3_5_vl_source_identity_binds_runtime_max_num_tokens(tmp_path: Path)
             )
         )
 
-    decision = check_weight_sharing_compatibility(*identities, IdentityCheckPolicy.WARN_FALLBACK)
+    call_local, call_source = identities
+    decision = check_weight_sharing_compatibility(
+        call_local, call_source, IdentityCheckPolicy.WARN_FALLBACK
+    )
 
     assert not decision.should_share
     assert decision.match_result.mismatched_fields == ["shard_fingerprint"]

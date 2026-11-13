@@ -124,6 +124,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
                 },
             )
             config._attn_implementation = "eager"
+            # pyrefly: ignore [missing-argument]
             reference = Qwen3VLTextModel(config).to(device=device, dtype=torch.bfloat16).eval()
             mapping = _MiniMaxH3TextEncoderMapping(
                 world_size=2, rank=rank, tp_size=2, gpus_per_node=2, tp_group_pg=group

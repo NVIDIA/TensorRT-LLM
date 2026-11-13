@@ -215,7 +215,8 @@ def _projection(nk, push):
 def test_gemvs_after_prebuild_never_compile(monkeypatch, nk, push) -> None:
     use_pdl = True
     module = _projection(nk, push)
-    variants = modeling._gemv_variants(*nk, push, 4)
+    call_n, call_k = nk
+    variants = modeling._gemv_variants(call_n, call_k, push, 4)
     pushes = [v for v in variants if v[2] is not None]
     if push is None:
         assert not pushes

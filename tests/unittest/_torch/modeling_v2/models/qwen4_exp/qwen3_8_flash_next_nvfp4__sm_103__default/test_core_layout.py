@@ -771,7 +771,8 @@ def test_every_rank_completes_its_draft_rows_through_the_round_trip(counts, monk
             state["partial"], _expert_out(gathered, ids, wts, 128 * rank, 128)
         )
         assert tuple(out.shape) == (counts[rank], HIDDEN)
-        torch.testing.assert_close(out, _expert_out(xs[rank], *route(xs[rank]), 0, NUM_EXPERTS))
+        call_ids, call_wts = route(xs[rank])
+        torch.testing.assert_close(out, _expert_out(xs[rank], call_ids, call_wts, 0, NUM_EXPERTS))
         per_rank.append(state["collectives"])
     assert all(c == per_rank[0] for c in per_rank), per_rank
     assert per_rank[0] == [

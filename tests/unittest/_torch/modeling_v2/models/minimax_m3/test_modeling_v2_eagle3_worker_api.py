@@ -58,7 +58,6 @@ def _load_dispatch(path: Path, fused: bool):
                 keywords=[],
                 body=[parent],
                 decorator_list=[],
-                type_params=[],
             ),
             ast.ClassDef(
                 name="Worker",
@@ -66,7 +65,6 @@ def _load_dispatch(path: Path, fused: bool):
                 keywords=[],
                 body=[method],
                 decorator_list=[],
-                type_params=[],
             ),
         ],
         type_ignores=[],

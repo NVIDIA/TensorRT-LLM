@@ -30,10 +30,10 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.activation import (
-    ACTIVATION_PAYLOAD,
     MoEActivation,
     SimpleActivation,
     SiTuActivation,
+    SwigluActivation,
     SwigluBiasActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEEnvFlag, collect_moe_environment
@@ -162,13 +162,11 @@ def _situ_kwargs(
 
 
 def _plain_activation(kind: ActivationType) -> MoEActivation:
-    """The spec's ``activation_type`` as a carrier, for the no-constants case.
-
-    Reads ``ACTIVATION_PAYLOAD`` rather than naming the two kinds ``specs.py``
-    currently allows, so a third one added there needs no change here.
-    """
-    payload = ACTIVATION_PAYLOAD[ActivationType(kind)]
-    return SimpleActivation(kind) if payload is SimpleActivation else payload()
+    """Build an activation that requires no model-specific constants."""
+    kind = ActivationType(kind)
+    if kind == ActivationType.Swiglu:
+        return SwigluActivation()
+    return SimpleActivation(kind)
 
 
 def _create_moe_for_benchmark(**kwargs):

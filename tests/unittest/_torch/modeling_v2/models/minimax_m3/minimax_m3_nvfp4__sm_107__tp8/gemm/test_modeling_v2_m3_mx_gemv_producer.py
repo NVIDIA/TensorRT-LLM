@@ -77,10 +77,28 @@ def _fused(case, caches):
     q = torch.zeros(tokens, HEADS_Q, 128, dtype=torch.float8_e4m3fn, device="cuda")
     iq = torch.zeros(tokens, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
     kv_data, kv_scale, index_k = caches
+    call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = norms
     ok = gemv.m3_mx_gemv_producer(
-        xq, xsf, wq, wsf, q, iq, kv_data, kv_scale, index_k, slots, quant, EPS, *norms, rotary, positions,
+        xq,
+        xsf,
+        wq,
+        wsf,
+        q,
+        iq,
+        kv_data,
+        kv_scale,
+        index_k,
+        slots,
+        quant,
+        EPS,
+        call_q_weight,
+        call_k_weight,
+        call_index_q_weight,
+        call_index_k_weight,
+        rotary,
+        positions,
         use_pdl=True,
-    )  # fmt: skip
+    )
     assert ok, "the producer GEMV must serve the sparse QKV shape at <= 8 tokens"
     torch.cuda.synchronize()
     return q, iq
@@ -139,9 +157,29 @@ def test_producer_gemv_is_deterministic_and_graph_replays() -> None:
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        call_kv_data, call_kv_scale, call_index_k = caches
+        call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = norms
         gemv.m3_mx_gemv_producer(
-            xq, xsf, wq, wsf, q, iq, *caches, slots, quant, EPS, *norms, rotary, positions, use_pdl=True
-        )  # fmt: skip
+            xq,
+            xsf,
+            wq,
+            wsf,
+            q,
+            iq,
+            call_kv_data,
+            call_kv_scale,
+            call_index_k,
+            slots,
+            quant,
+            EPS,
+            call_q_weight,
+            call_k_weight,
+            call_index_q_weight,
+            call_index_k_weight,
+            rotary,
+            positions,
+            use_pdl=True,
+        )
     graph.replay()
     torch.cuda.synchronize()
     outs.append([t.contiguous().view(torch.uint8).clone() for t in (q, iq, *caches)])
@@ -161,6 +199,25 @@ def test_declines_outside_its_shape() -> None:
         torch.zeros(16, K, dtype=torch.bfloat16, device="cuda"), True
     )[1]
     caches = _caches()
+    call_kv_data, call_kv_scale, call_index_k = caches
+    call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = norms
     assert not gemv.m3_mx_gemv_producer(
-        wide, xsf16, wq, wsf, q, iq, *caches, slots, quant, EPS, *norms, rotary, positions
-    )  # fmt: skip
+        wide,
+        xsf16,
+        wq,
+        wsf,
+        q,
+        iq,
+        call_kv_data,
+        call_kv_scale,
+        call_index_k,
+        slots,
+        quant,
+        EPS,
+        call_q_weight,
+        call_k_weight,
+        call_index_q_weight,
+        call_index_k_weight,
+        rotary,
+        positions,
+    )

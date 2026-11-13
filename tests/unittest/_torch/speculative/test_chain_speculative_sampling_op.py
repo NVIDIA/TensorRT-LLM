@@ -125,8 +125,16 @@ def test_offset_moves_the_stream() -> None:
 def test_same_rng_state_reproduces() -> None:
     num_draft, vocab, rows = 4, 1000, 16
     inputs = _repeat(rows, *_request(num_draft, vocab))
-    first = rejection_sampling_one_model(*inputs, *_independent_trials(rows))
-    second = rejection_sampling_one_model(*inputs, *_independent_trials(rows))
+    call_draft_probs, call_draft_token_ids, call_target_probs = inputs
+    call_seed, call_offset = _independent_trials(rows)
+    first = rejection_sampling_one_model(
+        call_draft_probs, call_draft_token_ids, call_target_probs, call_seed, call_offset
+    )
+    call_draft_probs, call_draft_token_ids, call_target_probs = inputs
+    call_seed, call_offset = _independent_trials(rows)
+    second = rejection_sampling_one_model(
+        call_draft_probs, call_draft_token_ids, call_target_probs, call_seed, call_offset
+    )
     assert torch.equal(first[0], second[0]) and torch.equal(first[1], second[1])
 
 
@@ -202,7 +210,11 @@ def test_long_drafts_run() -> None:
     draft_probs = target_probs[:num_draft].clone()
     draft_tokens = torch.multinomial(draft_probs, 1).squeeze(-1).int()
     inputs = _repeat(rows, draft_probs, draft_tokens, target_probs)
-    tokens, num_tokens = rejection_sampling_one_model(*inputs, *_independent_trials(rows))
+    call_draft_probs, call_draft_token_ids, call_target_probs = inputs
+    call_seed, call_offset = _independent_trials(rows)
+    tokens, num_tokens = rejection_sampling_one_model(
+        call_draft_probs, call_draft_token_ids, call_target_probs, call_seed, call_offset
+    )
     assert (num_tokens == num_draft + 1).all()
     assert torch.equal(tokens[:, :num_draft], inputs[1])
 
