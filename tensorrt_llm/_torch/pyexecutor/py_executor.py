@@ -2487,8 +2487,9 @@ class PyExecutor:
         """Stop a profiling phase and detach resources before cache replacement.
 
         Call collectively after consuming profiling responses. Graph destruction
-        precedes workspace release, and transfer registrations precede cache
-        release. Model engines, weights and the execution stream remain valid.
+        precedes workspace release. Transfers drain before cache release, while
+        deferred registrations are released after the pools are unmapped. Model
+        engines, weights and the execution stream remain valid.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")
@@ -2636,6 +2637,16 @@ class PyExecutor:
             # synchronization and allocator teardown can touch DMA-owned memory
             # or hang on a failed device, so retain the whole execution state.
             return False
+        if release_model_owned_graphs:
+            # The C++ MoE runners are cached for the whole process and keep
+            # their GPU workspaces between calls, so a later executor in the
+            # same process would start with them still allocated. Release them
+            # before the graphs below: a workspace captured into a graph's
+            # memory pool must be freed while that pool still exists. They are
+            # re-allocated on next use.
+            from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+                MoERunner
+            MoERunner.clear_all_workspaces()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
@@ -2652,11 +2663,14 @@ class PyExecutor:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         if self.kv_cache_transceiver is not None:
-            self.kv_cache_transceiver.shutdown()
+            self.kv_cache_transceiver.prepare_shutdown()
         if self.resource_manager is not None:
             for manager in self.resource_manager.resource_managers.values():
                 if manager:
                     manager.shutdown()
+        if self.kv_cache_transceiver is not None:
+            # Backends that defer deregistration release it after the pools.
+            self.kv_cache_transceiver.shutdown()
         # Retry a later failure without repeating request publication, graph
         # release, or resource-manager shutdown.
         self._shutdown_runtime_complete = True

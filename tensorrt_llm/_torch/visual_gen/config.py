@@ -39,6 +39,7 @@ from tensorrt_llm.visual_gen.args import (
     CudaGraphConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
+    SeaCacheConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
@@ -157,6 +158,10 @@ class DiffusionModelConfig(_VisualGenConfigBase):
         return self.cache if isinstance(self.cache, CacheDiTConfig) else None
 
     @property
+    def seacache(self) -> Optional[SeaCacheConfig]:
+        return self.cache if isinstance(self.cache, SeaCacheConfig) else None
+
+    @property
     def torch_dtype(self) -> "torch.dtype":
         """Get the torch dtype of the model (default: bfloat16)."""
         return torch.bfloat16
@@ -238,6 +243,10 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     @property
     def cache_dit(self) -> Optional[CacheDiTConfig]:
         return self.cache if isinstance(self.cache, CacheDiTConfig) else None
+
+    @property
+    def seacache(self) -> Optional[SeaCacheConfig]:
+        return self.cache if isinstance(self.cache, SeaCacheConfig) else None
 
     @property
     def torch_dtype(self) -> "torch.dtype":

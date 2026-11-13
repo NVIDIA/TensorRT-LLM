@@ -80,15 +80,19 @@ def registered_routes() -> Dict[str, Callable[..., type]]:
 #: construction, and a check that can only ever hold is a check whose failure
 #: mode is its own bug taking down a working deployment.
 #:
-#: An environment variable rather than an LLM arg while modeling_v2 is
-#: experimental; it has to reach the ranks, so a test passes it through
+#: Beam additionally enables checkpoint digests, per-layer metadata rechecks and per-step
+#: routing agreement (device-to-host copies, hashing and collectives). Keep it off for
+#: performance measurements; all Beam ranks must use the same setting.
+#:
+#: An environment variable while modeling_v2 is experimental. It must reach all ranks,
+#: so a test passes it through
 #: ``env_overrides``. When this stops being experimental it belongs in the
 #: LLM args, where a caller can set it per engine rather than per process.
 MODELING_V2_VALIDATE_ENV = "TRTLLM_MODELING_V2_VALIDATE"
 
 
 def step_contract_enabled() -> bool:
-    """Whether targets should check their step contract on the first forward.
+    """Whether contract diagnostics are enabled (Beam also checks every step).
 
     Read once per model instance at construction rather than per forward: the
     answer cannot change within a process, and the forward is the hot path.
