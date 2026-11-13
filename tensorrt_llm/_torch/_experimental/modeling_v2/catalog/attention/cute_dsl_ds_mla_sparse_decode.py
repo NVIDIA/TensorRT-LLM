@@ -22,6 +22,8 @@ TILE = 128
 HEADS = _kernel.SUPPORTED_HEADS
 #: The split-K counts (CTAs per row) a batch can select.
 SPLITS = _kernel.SUPPORTED_SPLITS
+#: Global-workspace variants, separate from the cluster functions in `compiled.fns`.
+GLOBAL_SPLITS = (16,)
 
 #: The tp4 / tep4 (16 heads) and tp8 / tep8 (8 heads) targets at their 1M config (max_seq_len
 #: 1048576, chunked prefill, 16 sequences): top-2048 selections over keys up to 1048576 in the
@@ -42,21 +44,30 @@ class CompiledDsMlaSparseDecode:
     num_heads: int
     num_sms: int
     fns: Mapping[int, Callable]
+    global_fns: tuple[Callable, Callable] | None = None
 
 
 def build(device_id: int, *, num_heads: int) -> CompiledDsMlaSparseDecode:
-    """Compile the four split variants for `num_heads` (8 or 16) real heads: about a second
-    each, cached per process by the kernel module; allocates nothing."""
+    """Compile the cluster variants and the supported low-row global variant.
+
+    The compiled object owns code only; invocation scratch belongs to PyTorch's
+    allocator and CUDA graph pools.
+    """
     with torch.cuda.device(device_id):
         fns = {ns: _kernel.compile_variant(num_heads, ns, device_id) for ns in SPLITS}
         num_sms = torch.cuda.get_device_properties(device_id).multi_processor_count
+        global_fns = None
+        if torch.cuda.get_device_capability(device_id) == (10, 7) and num_sms == 212:
+            global_fns = _kernel._compile_global_variant(num_heads, 16, device_id)
     return CompiledDsMlaSparseDecode(
-        device_index=device_id, num_heads=num_heads, num_sms=num_sms, fns=fns
+        device_index=device_id, num_heads=num_heads, num_sms=num_sms, fns=fns, global_fns=global_fns
     )
 
 
 def splits_for(rows: int, compiled: CompiledDsMlaSparseDecode) -> int:
     """The split-K count a call with `rows` rows runs."""
+    if compiled.global_fns is not None and rows in (4, 8):
+        return 16
     return _kernel.pick_splits(rows, compiled.num_sms)
 
 
@@ -444,6 +455,11 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
     Call sites: the mistral_large4 NVFP4 tp4 and tep4 targets (also run at world 8 as tp8
     and tep8), the generation rows of every layer, decode and mixed steps. Kernel (sm_103):
     `_ds_mla_sparse_decode_kernel`, one launch, split-K partials merged in the cluster.
+    On SM107 with 212 SMs, rows 4 and 8 instead run 16 independent split CTAs per
+    row and one combine launch. The FP32 partial workspace has 516 elements per
+    (row, split, head), including the 512-wide normalized output and LSE. Each
+    invocation allocates its own workspace through PyTorch, preserving stream and
+    graph-pool lifetimes; other shapes and devices use the original cluster path.
     It replaces flash_mla_sparse_decode's head64 kernel on these targets, which needs the
     query padded to 64 heads, a scheduler kernel and a combine kernel.
 
@@ -528,6 +544,13 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
         *,
         compiled: CompiledDsMlaSparseDecode,
     ) -> torch.Tensor:
+        if compiled.global_fns is not None and q.shape[0] in (4, 8):
+            workspace = torch.empty(
+                (q.shape[0], 16, compiled.num_heads, 516), dtype=torch.float32, device=q.device
+            )
+            return _kernel._launch_global(
+                compiled.global_fns, q, kv_cache, indices, out, softmax_scale, workspace
+            )
         fn = compiled.fns[_kernel.pick_splits(q.shape[0], compiled.num_sms)]
         return _kernel.launch(fn, q, kv_cache, indices, out, softmax_scale)
 

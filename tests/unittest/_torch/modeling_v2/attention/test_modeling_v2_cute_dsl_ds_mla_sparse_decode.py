@@ -30,6 +30,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention import (
     _ds_mla_sparse_decode_kernel as kernel,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ds_mla_sparse_decode import (  # noqa: E501
+    GLOBAL_SPLITS,
     SPLITS,
     build,
     splits_for,
@@ -401,7 +402,7 @@ def test_matches_flash_mla_at_the_dispatched_split(rows, heads) -> None:
     compiled = _compiled(heads)
     op(q, kv, idx, SCALE, out, compiled=compiled)
     ref_out, _ = _flash_mla(q, kv, idx, heads)
-    assert splits_for(rows, compiled) in SPLITS
+    assert splits_for(rows, compiled) in (*SPLITS, *GLOBAL_SPLITS)
     ref = op.reference(q, kv, idx, SCALE, out)
     _gate(out, ref)
     _gate(ref_out, ref)
@@ -419,3 +420,205 @@ def test_is_valid_refuses_padded_heads_and_strided_queries() -> None:
         op.is_valid(q64, kv, idx, SCALE, out64, compiled=compiled)
     with pytest.raises(ValueError, match="contiguous"):
         op.is_valid(q64[:, :16], kv, idx, SCALE, out, compiled=compiled)
+
+
+def _small_poisoned_global_inputs(
+    rows: int, heads: int, nope: bool, seed: int
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[torch.Tensor],
+    torch.Generator,
+]:
+    """Two legal page owners; every other owner's FP8/scale/BF16 bytes are NaN."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    blocks, owners, page = 67, 63, 32
+    pool = torch.full((blocks, owners, page, 656), 255, dtype=torch.uint8, device="cuda")
+    legal = []
+    for owner in (35 if nope else 62, 49):
+        slots = (
+            (torch.arange(blocks, device="cuda")[:, None] * owners + owner) * page
+            + torch.arange(page, device="cuda")[None]
+        ).flatten()
+        pool.view(-1, 656)[slots] = _draw_rows(slots.numel(), gen, nope)
+        legal.append(slots)
+    q_parent = torch.randn(rows + 3, heads, 576, device="cuda", generator=gen).bfloat16()
+    if nope:
+        q_parent[..., 512:] = 0
+    out_parent = torch.full(
+        (rows + 3, heads, 512), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    indices = torch.full((rows, 2048), -1, device="cuda", dtype=torch.int32)
+    return (
+        q_parent[3:],
+        pool.view(-1, page, 1, 656),
+        indices,
+        out_parent[3:],
+        out_parent,
+        legal,
+        gen,
+    )
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("rows", [4, 8, 16])
+@pytest.mark.parametrize("nope", [False, True])
+def test_global_split_boundaries_and_dynamic_graph(heads: int, rows: int, nope: bool) -> None:
+    """Global partials preserve owner, hole, offset and dynamic graph output contracts."""
+    q, kv, idx, out, parent, legal, gen = _small_poisoned_global_inputs(rows, heads, nope, 7241)
+    fns = kernel._compile_global_variant(heads, 16, torch.cuda.current_device())
+    workspace = torch.full((rows, 16, heads, 516), float("nan"), device="cuda", dtype=torch.float32)
+    counts = (0, 1, 31, 32, 33, 2047, 2048)
+    for start in (0, 4):
+        idx.fill_(-1)
+        for row in range(rows):
+            count = counts[(start + row) % len(counts)]
+            columns = torch.randperm(2048, generator=gen, device="cuda")[:count]
+            slots = legal[row % 2]
+            picks = torch.randperm(slots.numel() - 1, generator=gen, device="cuda")[:count]
+            if count:
+                picks[-1] = slots.numel() - 1
+            idx[row, columns] = slots[picks].int()
+        kernel._launch_global(fns, q, kv, idx, out, SCALE, workspace)
+        _gate(out, op.reference(q, kv, idx, SCALE, out))
+        assert bool(torch.isfinite(out).all())
+        assert bool(torch.isnan(parent[:3]).all())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernel._launch_global(fns, q, kv, idx, out, SCALE, workspace)
+    for replay in range(100):
+        q.copy_(torch.randn(q.shape, generator=gen, device="cuda", dtype=q.dtype))
+        if nope:
+            q[..., 512:] = 0
+        idx.copy_(idx.roll(1, dims=-1))
+        slots = legal[replay % 2][:32]
+        kv.view(-1, 656)[slots] = _draw_rows(slots.numel(), gen, nope)
+        out.fill_(float("nan"))
+        workspace.fill_(float("nan"))
+        graph.replay()
+        _gate(out, op.reference(q, kv, idx, SCALE, out))
+        assert bool(torch.isfinite(out).all())
+    assert bool(torch.isnan(parent[:3]).all())
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("use_wrapper", [False, True])
+def test_global_split_concurrent_graph_workspaces(heads: int, use_wrapper: bool) -> None:
+    """A shared compiled variant runs independent stream/graph workspaces without cross-talk."""
+    rows = 4
+    fns = kernel._compile_global_variant(heads, 16, torch.cuda.current_device())
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    inputs = [_small_poisoned_global_inputs(rows, heads, False, seed) for seed in (42, 314)]
+    workspaces = [
+        torch.empty(rows, 16, heads, 516, device="cuda", dtype=torch.float32) for _ in streams
+    ]
+    for data in inputs:
+        q, kv, idx, out, _, legal, _ = data
+        idx.copy_(legal[0][:2048].int()[None].expand(rows, -1))
+    for stream, graph, data, scratch in zip(streams, graphs, inputs, workspaces):
+        q, kv, idx, out, *_ = data
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            if use_wrapper:
+                op(q, kv, idx, SCALE, out, compiled=_compiled(heads))
+            else:
+                kernel._launch_global(fns, q, kv, idx, out, SCALE, scratch)
+        with torch.cuda.graph(graph, stream=stream):
+            if use_wrapper:
+                op(q, kv, idx, SCALE, out, compiled=_compiled(heads))
+            else:
+                kernel._launch_global(fns, q, kv, idx, out, SCALE, scratch)
+    for replay in range(100):
+        for stream, graph, data, scratch in zip(streams, graphs, inputs, workspaces):
+            q, _, idx, out, _, _, gen = data
+            with torch.cuda.stream(stream):
+                q.copy_(torch.randn(q.shape, generator=gen, device="cuda", dtype=q.dtype))
+                idx.copy_(idx.roll(1, dims=-1))
+                out.fill_(float("nan"))
+                scratch.fill_(float("nan"))
+                graph.replay()
+        torch.cuda.synchronize()
+        for q, kv, idx, out, parent, *_ in inputs:
+            _gate(out, op.reference(q, kv, idx, SCALE, out))
+            assert bool(torch.isfinite(out).all())
+            assert bool(torch.isnan(parent[:3]).all())
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("nope", [False, True])
+def test_global_split_at_1m_large_address(heads: int, nope: bool) -> None:
+    """The candidate reads a real 1M pool's far owner slots beyond 32-bit byte addresses."""
+    rows = 4 if heads == 8 else 16
+    spec = dict(
+        op.CELLS[0].spec,
+        topk=2048,
+        kv_len=1048576,
+        page_size=32,
+        owners=63,
+        blocks=74183,
+        far=True,
+        heads=heads,
+        h_q=heads,
+        nope=nope,
+    )
+    gen = torch.Generator(device="cuda").manual_seed(heads * 131 + int(nope))
+    try:
+        pool = _pool_1m(spec, gen)
+        indices = _selections_1m(spec, pool, rows, gen)
+        assert int(indices.max()) * 656 > 2**32
+        q = _queries_1m(rows, spec, gen)
+        out = torch.empty(rows, heads, 512, device="cuda", dtype=torch.bfloat16)
+        scratch = torch.empty(rows, 16, heads, 516, device="cuda", dtype=torch.float32)
+        fns = kernel._compile_global_variant(heads, 16, torch.cuda.current_device())
+        kernel._launch_global(fns, q, pool.kv, indices, out, SCALE, scratch)
+        _check_1m(q, pool.kv, indices, out)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            kernel._launch_global(fns, q, pool.kv, indices, out, SCALE, scratch)
+        q.copy_(_queries_1m(rows, spec, gen))
+        indices.copy_(_selections_1m(spec, pool, rows, gen))
+        out.fill_(float("nan"))
+        scratch.fill_(float("nan"))
+        graph.replay()
+        _check_1m(q, pool.kv, indices, out)
+    finally:
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("rows", [4, 8, 16])
+def test_low_row_wrapper_padded_query_and_graph(heads: int, rows: int) -> None:
+    """The actual dispatch reads only real heads of a 64-head query and owns graph scratch."""
+    q, kv, idx, out, parent, legal, gen = _small_poisoned_global_inputs(rows, heads, False, 2026)
+    q64 = torch.full((rows + 3, 64, 576), float("nan"), device="cuda", dtype=torch.bfloat16)[3:]
+    q64[:, :heads] = q
+    idx.copy_(legal[0][:2048].int()[None].expand(rows, -1))
+    compiled = _compiled(heads)
+    graph = torch.cuda.CUDAGraph()
+    op(q64, kv, idx, SCALE, out, compiled=compiled)
+    with torch.cuda.graph(graph):
+        op(q64, kv, idx, SCALE, out, compiled=compiled)
+    for replay in range(100):
+        q64[:, :heads] = torch.randn(q.shape, device="cuda", generator=gen, dtype=q.dtype)
+        idx.copy_(idx.roll(1, dims=-1))
+        out.fill_(float("nan"))
+        graph.replay()
+        _gate(out, op.reference(q64, kv, idx, SCALE, out))
+        assert bool(torch.isfinite(out).all())
+        assert bool(torch.isnan(q64[:, heads:]).all())
+    assert bool(torch.isnan(parent[:3]).all())
+    if rows == 16:
+        expected = kernel.launch(
+            compiled.fns[kernel.pick_splits(rows, compiled.num_sms)],
+            q64,
+            kv,
+            idx,
+            torch.empty_like(out),
+            SCALE,
+        )
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
