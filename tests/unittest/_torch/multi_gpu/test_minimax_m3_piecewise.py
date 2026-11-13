@@ -37,6 +37,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 @torch.inference_mode()
 def _run_empty_adp_rank(world_size: int) -> int:
+    capture_output = None
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     torch.manual_seed(42 + rank)

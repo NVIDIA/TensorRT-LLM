@@ -1,1 +1,0 @@
-"""Rubin kernel implementations."""
