@@ -1965,9 +1965,19 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
 
 
 @pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize(
+    ("state", "encoder_decoder"),
+    [
+        (LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS, False),
+        (LlmRequestState.GENERATION_IN_PROGRESS, False),
+        (LlmRequestState.GENERATION_IN_PROGRESS, True),
+    ],
+)
 def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     executor: PyExecutor,
     tp_size: int,
+    state: LlmRequestState,
+    encoder_decoder: bool,
 ) -> None:
     """One drained receive cannot remove a replicated request ahead of its peers."""
     group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
@@ -1980,7 +1990,8 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         request = _request(1)
-        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        request.state = state
+        engine.is_encoder_decoder = encoder_decoder
         engine.active_requests = [request]
         engine.canceled_req_ids = [1]
         engine.waiting_queue = FCFSWaitingQueue()
@@ -2047,8 +2058,9 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
 
 
 @pytest.mark.parametrize("peer_owns_receive", [False, True])
+@pytest.mark.parametrize("cancel_rank", [0, 1])
 def test_legacy_tp_cancel_with_request_missing_on_peer(
-    executor: PyExecutor, peer_owns_receive: bool
+    executor: PyExecutor, peer_owns_receive: bool, cancel_rank: int
 ) -> None:
     """A peer with no active copy must still participate in cancellation."""
     group = FakeDistGroup(world_size=2, tp_size=2, timeout_s=1)
@@ -2060,7 +2072,7 @@ def test_legacy_tp_cancel_with_request_missing_on_peer(
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         engine.active_requests = [request] if rank == 0 else []
-        engine.canceled_req_ids = [1]
+        engine.canceled_req_ids = [1] if rank == cancel_rank else []
         engine.waiting_queue = FCFSWaitingQueue()
         engine._pending_transfer_responses = []
         engine._pending_response_terminations = []
@@ -2090,6 +2102,7 @@ def test_legacy_tp_cancel_with_request_missing_on_peer(
     if peer_owns_receive:
         assert not request.is_finished
         engines[1].kv_cache_transceiver._recv_reqs.clear()
+    if not request.is_finished:
         group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
     assert request.is_finished_due_to_cancellation
     assert all(not engine.canceled_req_ids for engine in engines)

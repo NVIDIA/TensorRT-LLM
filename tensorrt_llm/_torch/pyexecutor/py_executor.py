@@ -11087,17 +11087,21 @@ class PyExecutor:
         if (not getattr(self, "canceled_req_ids", None)
                 or self.kv_cache_transceiver is None
                 or getattr(self, "kv_connector_manager", None) is not None
-                or self.dist.pp_size != 1
-                or getattr(self, "is_encoder_decoder", False)
-                or getattr(self, "_mm_encoder_item_scheduling_enabled", False)):
+                or self.dist.pp_size != 1):
             return set()
+        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        restricted_model = (
+            getattr(self, "is_encoder_decoder", False)
+            or getattr(self, "_mm_encoder_item_scheduling_enabled", False))
         cancel_ids = set(self.canceled_req_ids)
         model_ids = set()
         for request in self.active_requests:
             cancel_id = (request.parent_request_id
                          if request.is_child else request.py_request_id)
-            if (cancel_id not in cancel_ids
-                    or request.py_multimodal_params is not None
+            replicated_gen = replicated_gen_cancel and request.is_generation_only_request
+            if (cancel_id not in cancel_ids or
+                ((restricted_model or request.py_multimodal_params is not None)
+                 and not replicated_gen)
                     or not (request.is_context_only_request
                             or request.is_generation_only_request)):
                 continue
@@ -11105,9 +11109,7 @@ class PyExecutor:
                                      LlmRequestState.GENERATION_IN_PROGRESS):
                 continue
             if (self.kv_cache_transceiver.supports_idle_request_cancellation(
-                    request) is True
-                    or (request.is_generation_only_request
-                        and self.disagg.requires_gen_cancellation_consensus)):
+                    request) is True or replicated_gen):
                 model_ids.add(request.py_request_id)
         return model_ids
 
@@ -11314,6 +11316,10 @@ class PyExecutor:
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
         still_pending_canceled_ids = []
+        if self.disagg.requires_gen_cancellation_consensus:
+            # Keep cancellation IDs even without a local request until the
+            # loop-head vote has checked the other ranks.
+            still_pending_canceled_ids.extend(canceled_req_ids_set)
         ready_to_cancel = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
@@ -11361,7 +11367,11 @@ class PyExecutor:
 
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.canceled_req_ids.clear()
-        self.canceled_req_ids.extend(still_pending_canceled_ids)
+        if self.disagg.requires_gen_cancellation_consensus:
+            self.canceled_req_ids.extend(sorted(
+                set(still_pending_canceled_ids)))
+        else:
+            self.canceled_req_ids.extend(still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):

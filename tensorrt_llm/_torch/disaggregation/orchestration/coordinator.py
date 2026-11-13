@@ -563,22 +563,31 @@ class DisaggTransferCoordinator:
         gen_ready = {
             request.py_request_id for request in ready if request.is_generation_only_request
         }
-        payload = (list(cancel_ids), gen_active, list(gen_ready))
+        active_clients = [
+            request.parent_request_id if request.is_child else request.py_request_id
+            for request in active
+            if not request.is_finished
+        ]
+        payload = (list(cancel_ids), gen_active, list(gen_ready), active_clients)
         gather = self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
         peers = gather(payload, small_payload=True)
         all_cancel_ids = set().union(*(set(peer[0]) for peer in peers))
-        requests = {rid: client for _, active_ids, _ in peers for rid, client in active_ids.items()}
+        requests = {
+            rid: client for _, active_ids, _, _ in peers for rid, client in active_ids.items()
+        }
+        all_active_clients = set(requests.values()) | set().union(*(set(peer[3]) for peer in peers))
         complete = {
             client
             for client in all_cancel_ids
             if any(owner == client for owner in requests.values())
             and all(
                 rid in set(peer_ready)
-                for _, peer_active, peer_ready in peers
+                for _, peer_active, peer_ready, _ in peers
                 for rid, owner in peer_active.items()
                 if owner == client
             )
         }
+        complete.update(all_cancel_ids - all_active_clients)
         aligned = [
             request
             for request in ready
@@ -1370,8 +1379,10 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def requires_gen_cancellation_consensus(self) -> bool:
         return False
 
-    def align_gen_cancellation(self, ready: List[LlmRequest]) -> List[LlmRequest]:
-        return ready
+    def align_gen_cancellation(
+        self, ready: List[LlmRequest], active: List[LlmRequest], cancel_ids: List[int]
+    ) -> Tuple[List[LlmRequest], Set[int], Set[int]]:
+        return ready, set(cancel_ids), set()
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         return None
