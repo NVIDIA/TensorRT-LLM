@@ -339,9 +339,9 @@ async def async_request_openai_chat_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
-    ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
+    last_output_timestamp = None
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -354,16 +354,23 @@ async def async_request_openai_chat_completions(
                         data = json.loads(chunk)
 
                         if choices := data.get("choices"):
-                            content = choices[0]["delta"].get("content")
-                            # First token
-                            if ttft == 0.0:
-                                ttft = timestamp - st
-                                output.ttft = ttft
-
-                            # Decoding phase
-                            else:
-                                output.itl.append(timestamp -
-                                                  most_recent_timestamp)
+                            delta = choices[0]["delta"]
+                            content = delta.get("content")
+                            # Role-only and finish-only events do not contain
+                            # generated output. Keep a separate timestamp so
+                            # metadata cannot shorten the next output interval.
+                            if any(
+                                    delta.get(key)
+                                    for key in ("content", "reasoning_content",
+                                                "reasoning", "tool_calls",
+                                                "function_call", "refusal",
+                                                "audio")):
+                                if last_output_timestamp is None:
+                                    output.ttft = timestamp - st
+                                else:
+                                    output.itl.append(timestamp -
+                                                      last_output_timestamp)
+                                last_output_timestamp = timestamp
 
                             generated_text += content or ""
 
