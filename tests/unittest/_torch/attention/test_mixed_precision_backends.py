@@ -1159,7 +1159,7 @@ def test_staging_covers_allocated_capacity(backend):
 
 @pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16", "cold"])
 def test_steady_decode_step_skips_mixed_precision(dtype):
-    """The steady MTP decode shortcut stands in for prepare() only without mixed precision."""
+    """The steady decode shortcuts stand in for prepare() only without mixed precision."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     block, cached = 128, 32
@@ -1170,6 +1170,7 @@ def test_steady_decode_step_skips_mixed_precision(dtype):
         metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached)
         metadata.prepare()
         assert metadata.supports_steady_decode_step == (dtype == "auto")
+        assert metadata.support_steady_gen_step() == (dtype == "auto")
     finally:
         manager.shutdown()
 

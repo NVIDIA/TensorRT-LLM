@@ -1567,7 +1567,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         (the sparse-attention subclasses keep per-step state in their own
         ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
         domains / flash-MLA / MLA cached-kv prefill handling, no mixed-precision
-        KV staging, and a KV cache manager with a known block size.
+        KV staging or cold-page window (prepare() redirects its block offsets),
+        and a KV cache manager with a known block size.
         """
         return (type(self) is TrtllmAttentionMetadata
                 and self.fp4_mla_state is None
@@ -1578,6 +1579,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not self.enable_flash_mla
                 and not self.enable_context_mla_with_cached_kv
                 and not self._has_mixed_precision_staging()
+                and self.mixed_precision_high_block_table is None
                 and self.kv_cache_params is not None
                 and self.kv_cache_params.use_cache)
 
