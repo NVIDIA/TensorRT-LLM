@@ -1,5 +1,9 @@
 name: msa
-description: MiniMax Sparse Attention (fmha_sm100) kernels for SM100 sparse attention
+description: MiniMax Sparse Attention (MSA) kernels (fmha_sm100, the Q8KV4/Q8KV8 index scorers and the BF16 / E4M3
+  paged sparse prefill), vendored from oss-components/msa and vllm-project/MSA, MIT
 source: fetched
 directory_matches:
 - fmha_sm100
+- msa_kernels
+- fmha_sm100_q8kv8
+- prefill_bf16x

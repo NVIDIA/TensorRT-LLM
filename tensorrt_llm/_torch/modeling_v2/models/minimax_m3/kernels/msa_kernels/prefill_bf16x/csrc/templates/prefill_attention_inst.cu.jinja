@@ -1,0 +1,15 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+// SPDX-License-Identifier: MIT
+
+#include "sm100/device/prefill_attention_launch.cuh"
+
+namespace fmha_sm100::prefill_bf16x {
+
+static_assert(detail::kQHeadsPerKv == {{ q_heads_per_kv }});
+static_assert(detail::kHeadDim == {{ head_dim }});
+static_assert(detail::kPageSize == {{ page_size }});
+static_assert(detail::kQStages == {{ q_stages }});
+static_assert(detail::kScoreStages == {{ score_stages }});
+
+}  // namespace fmha_sm100::prefill_bf16x
