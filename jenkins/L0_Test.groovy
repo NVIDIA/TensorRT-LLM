@@ -4690,7 +4690,13 @@ def loadStageResourceRequests(pipeline)
 
 def applyStageResourceRequests(pipeline, Map podConfig, String stageName)
 {
-    def resources = stageResourceRequests[stageName]
+    def entryName = stageName
+    def resources = stageResourceRequests[entryName]
+    // CBTS runs a narrowed stage as "<stage>-cbts". Without its own entry, it uses the entry of <stage>.
+    if (resources == null && stageName.endsWith(CBTS_STAGE_SUFFIX)) {
+        entryName = stageName.substring(0, stageName.length() - CBTS_STAGE_SUFFIX.length())
+        resources = stageResourceRequests[entryName]
+    }
     if (resources == null) {
         pipeline.echo "[Stage resources] ${stageName}: using default requests and limits."
         return podConfig
@@ -4701,7 +4707,7 @@ def applyStageResourceRequests(pipeline, Map podConfig, String stageName)
     def requests = [cpu: "${resources.cpu_m}m".toString(), memory: "${resources.memory_mi}Mi".toString()]
     container.resources.requests.putAll(requests)
     container.resources.limits.putAll(requests)
-    pipeline.echo "[Stage resources] ${stageName}: requests=${requests}, limits=${requests}."
+    pipeline.echo "[Stage resources] ${stageName}: entry ${entryName}, requests=${requests}, limits=${requests}."
     return podConfig + [yaml: pipeline.writeYaml(returnText: true, data: pod)]
 }
 
