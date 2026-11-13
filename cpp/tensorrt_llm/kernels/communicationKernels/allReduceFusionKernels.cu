@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
-#include "tensorrt_llm/kernels/communicationKernels/lamportComm.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
@@ -62,6 +61,56 @@ struct SyncComm
     int* flag_ptr;
     void* comm_bufs[NRanks];
     void* barrier_flags[NRanks];
+    int flag_value;
+};
+
+template <int NRanks>
+struct LamportComm
+{
+    __device__ __forceinline__ LamportComm(void** workspace, int rank)
+    {
+        counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
+        flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
+        // Bytes the previous Lamport kernel wrote to its sub-buffer. Every Lamport kernel on this workspace reads and
+        // writes it, whatever its dtype, so it stays in bytes. Readers round it up to whole 16-byte stores: the scalar
+        // MiniMax kernel writes 4-byte words.
+        clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
+        flag_value = *flag_ptr;
+        auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
+        clear_size = *clear_ptr;
+        int data_offset = flag_value % 3;
+        int clear_offset = (flag_value + 2) % 3;
+        for (int r = 0; r < NRanks; ++r)
+        {
+            data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) + data_offset * comm_size;
+        }
+        clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            atomicAdd(counter_ptr, 1);
+        }
+    }
+
+    __device__ __forceinline__ void update(int64_t new_clear_size)
+    {
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+        {
+            while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x)
+            {
+            }
+            *flag_ptr = (flag_value + 1) % 3;
+            *clear_ptr = new_clear_size;
+            *counter_ptr = 0;
+        }
+    }
+
+    int* counter_ptr;
+    int* flag_ptr;
+    int64_t* clear_ptr;
+    uint8_t* data_bufs[NRanks];
+    uint8_t* clear_buf;
+    int64_t clear_size;
     int flag_value;
 };
 
@@ -296,6 +345,36 @@ private:
     float4 m_gamma_val;
 };
 
+__device__ __forceinline__ bool is_neg_zero(float v)
+{
+    return *reinterpret_cast<uint32_t*>(&v) == 0x80000000;
+}
+
+__device__ __forceinline__ bool is_neg_zero(float4 v)
+{
+    return is_neg_zero(v.x) || is_neg_zero(v.y) || is_neg_zero(v.z) || is_neg_zero(v.w);
+}
+
+__device__ __forceinline__ float4 get_neg_zero()
+{
+    float4 vec;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        reinterpret_cast<uint32_t*>(&vec)[i] = 0x80000000;
+    }
+    return vec;
+}
+
+__device__ __forceinline__ float4 ld_global_volatile(float4* addr)
+{
+    float4 val;
+    asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
+                 : "l"(addr));
+    return val;
+}
+
 template <typename DType, int NRanks, bool Fp32Acc>
 __device__ __forceinline__ float4 allreduce_sum(float4* vals)
 {
@@ -514,6 +593,20 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
+}
+
+int get_sm_count()
+{
+    static int sm_count = 0;
+    if (sm_count == 0)
+    {
+        int device_id;
+        TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
+        cudaDeviceProp device_prop;
+        cudaGetDeviceProperties(&device_prop, device_id);
+        sm_count = device_prop.multiProcessorCount;
+    }
+    return sm_count;
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool TriggerCompletionAtEnd = true>
