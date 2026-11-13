@@ -209,6 +209,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         float2* localPartialStatsPtr = partialStatsPtr + loadRowIdx;
         DtypePartialO* localPartialOPtr = partialOPtr + destMemOffset;
 
+        // The attention sink of this row, loaded ahead of the reduction loop to hide its latency.
+        float const attentionSink{attentionSinksPtr != nullptr ? attentionSinksPtr[localHeadIdxO] : 0.f};
+
         // Reduce max, sum and partialO vectors from different CtasKv.
         float sumVal{0.f};
         float oldMaxVal{-FLT_MAX}, maxVal{-FLT_MAX};
@@ -253,7 +256,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         // Update the sums with the attention sink value.
         if (attentionSinksPtr != nullptr)
         {
-            float attentionSinkVal = exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+            // One FP64 FMA, written out so that the compiler cannot split it into a hoisted multiply and an add.
+            float attentionSinkVal = exp2f(static_cast<float>(
+                ::fma(static_cast<double>(attentionSink), M_LOG2E, -static_cast<double>(maxVal * softmaxScaleLog2))));
             // Multiply the attention sink value by the quantization scale included in the sum value.
             sumVal += attentionSinkVal * softmaxPScale;
         }

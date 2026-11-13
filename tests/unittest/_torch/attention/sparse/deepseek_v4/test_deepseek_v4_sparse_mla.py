@@ -504,8 +504,12 @@ def calculate_deepseek_v4_ref_gen_sparse(
     compress_ratio: int,
     attn_sink: Optional[torch.Tensor] = None,
     seq_lens_q: Optional[List[int]] = None,
+    return_lse: bool = False,
 ):
-    """Reference attention for DeepSeek-V4 generation phase."""
+    """Reference attention for DeepSeek-V4 generation phase.
+
+    With return_lse, also returns the per-token, per-head log-sum-exp of the logits and the sink.
+    """
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
     bmm1_scale = 1 / (math.sqrt(qk_nope_head_dim + qk_rope_head_dim) * q_scaling)
     num_requests = len(seq_lens_kv)
@@ -515,6 +519,7 @@ def calculate_deepseek_v4_ref_gen_sparse(
         q_starts.append(q_starts[-1] + q_len)
 
     ref_results = []
+    lse_results = []
     latent_cache_list = []
     total_past_tokens = 0
     for i in range(num_requests):
@@ -576,6 +581,11 @@ def calculate_deepseek_v4_ref_gen_sparse(
             v_sel = all_kv[:, :v_head_dim].unsqueeze(0).expand(num_heads, -1, -1)
 
             attn_w = torch.matmul(q_tok.unsqueeze(1), k_sel.transpose(1, 2)) * bmm1_scale
+            if return_lse:
+                logits = (q_tok.float() @ all_kv.float().transpose(0, 1)) * bmm1_scale
+                if attn_sink is not None:
+                    logits = torch.cat([logits, attn_sink.float().view(-1, 1)], dim=-1)
+                lse_results.append(torch.logsumexp(logits, dim=-1))
             attn_w = _softmax_with_sink(attn_w, attn_sink, fused_q_rot.dtype)
             out = torch.matmul(attn_w, v_sel).squeeze(1)
             ref_results.append(out.reshape(1, num_heads * v_head_dim))
@@ -584,6 +594,8 @@ def calculate_deepseek_v4_ref_gen_sparse(
 
     ref_result = torch.cat(ref_results, dim=0)
     new_latent_cache_out = torch.cat(latent_cache_list).squeeze(-2)
+    if return_lse:
+        return ref_result, new_latent_cache_out, torch.stack(lse_results)
     return ref_result, new_latent_cache_out
 
 
@@ -817,18 +829,30 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 # green. What this does cover is the RoPE, KV-write, sparse-MLA and compressor
 # paths at widths other than one, which was previously nothing at all.
 @pytest.mark.parametrize(
-    "context_lengths,generation_seq_len_q",
+    "context_lengths,generation_seq_len_q,sinks,exports_softmax_stats",
     [
-        ([4399], 1),
-        ([14, 508, 3947], 1),
-        ([2, 1406, 3327], 1),
-        ([14, 508, 3947], 2),
-        ([14, 508, 3947], 6),
-        ([14, 508, 3947], [1, 2, 4]),
-        ([14, 508, 3947], [2, 2, 2]),
+        ([4399], 1, "small", False),
+        ([14, 508, 3947], 1, "small", False),
+        ([2, 1406, 3327], 1, "small", False),
+        ([14, 508, 3947], 2, "small", False),
+        ([14, 508, 3947], 6, "small", False),
+        ([14, 508, 3947], [1, 2, 4], "small", False),
+        ([14, 508, 3947], [2, 2, 2], "small", False),
+        # The split-KV reduction of the generation kernel adds the sink term and exports the softmax
+        # stats. Large sinks hold up to most of the softmax mass; the small ones above stay below the
+        # tolerance even when dropped.
+        ([14, 508, 3947], 2, "large", False),
+        ([14, 508, 3947], 2, "large", True),
+        ([14, 508, 3947], 2, "none", False),
+        ([14, 508, 3947], 2, "none", True),
     ],
 )
-def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q: int | List[int]):
+def test_deepseek_v4_sparse_mla(
+    context_lengths: List[int],
+    generation_seq_len_q: int | List[int],
+    sinks: str,
+    exports_softmax_stats: bool,
+):
     num_generation_steps = 2
     is_ragged = isinstance(generation_seq_len_q, list)
     generation_lens = (
@@ -927,9 +951,15 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
         layers[layer_idx] = layer
 
     # Install a per-layer attention sink
-    attn_sinks: Dict[int, torch.Tensor] = {}
+    attn_sinks: Dict[int, Optional[torch.Tensor]] = {}
     for layer_idx in TEST_LAYERS:
-        sink = torch.randn(num_heads, dtype=torch.float32, device=device).mul_(0.5)
+        if sinks == "none":
+            attn_sinks[layer_idx] = None
+            continue
+        if sinks == "large":
+            sink = torch.empty(num_heads, dtype=torch.float32, device=device).uniform_(3.0, 9.0)
+        else:
+            sink = torch.randn(num_heads, dtype=torch.float32, device=device).mul_(0.5)
         layers[layer_idx].attn_sink = torch.nn.Parameter(sink, requires_grad=False)
         attn_sinks[layer_idx] = sink
 
@@ -1307,6 +1337,11 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                     device,
                 )
 
+            softmax_stats = (
+                torch.empty(total_gen_tokens, num_heads, 2, dtype=torch.float32, device=device)
+                if exports_softmax_stats
+                else None
+            )
             result = layers[layer_idx].forward(
                 fused_q,
                 None,
@@ -1319,6 +1354,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 cu_kv_seqlens=cu_kv_seqlens,
                 fmha_scheduler_counter=fmha_scheduler_counter,
                 sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
+                softmax_stats_tensor=softmax_stats,
             )
 
             if uniform_metadata is not None:
@@ -1365,7 +1401,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 qk_rope_head_dim,
                 seq_lens_q=generation_lens,
             )
-            ref_result, new_latent_cache = calculate_deepseek_v4_ref_gen_sparse(
+            ref_result, new_latent_cache, ref_lse = calculate_deepseek_v4_ref_gen_sparse(
                 fused_q_rot,
                 new_latent,
                 latent_cache_ref_all[layer_idx],
@@ -1382,6 +1418,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 ratio,
                 attn_sink=attn_sinks[layer_idx],
                 seq_lens_q=generation_lens,
+                return_lse=True,
             )
             latent_cache_ref_all[layer_idx] = new_latent_cache
 
@@ -1401,6 +1438,15 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 f"Gen step {step + 1} mismatch at layer {layer_idx} "
                 f"(ratio={ratio}): max diff={diff.max().item():.6f}"
             )
+            if sinks != "small":
+                rel_l2 = (
+                    (result.float() - ref_result.float()).norm() / ref_result.float().norm()
+                ).item()
+                assert rel_l2 <= 0.02, f"layer {layer_idx}: relative L2 error {rel_l2:.4f}"
+            if exports_softmax_stats:
+                # The stats hold the max logit and the sum of exp(logit - max), sink included.
+                lse = softmax_stats[..., 0] + softmax_stats[..., 1].log()
+                torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=0)
             print("  PASSED")
 
     cache_manager.shutdown()
@@ -1787,4 +1833,6 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
 
 if __name__ == "__main__":
-    test_deepseek_v4_sparse_mla(context_lengths=[4399], generation_seq_len_q=1)
+    test_deepseek_v4_sparse_mla(
+        context_lengths=[4399], generation_seq_len_q=1, sinks="small", exports_softmax_stats=False
+    )
