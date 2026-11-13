@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Each module of the MTP-fused target that declares ``UNCERTIFIED_GENERIC_CALLS`` (its ``modeling.py`` must) names
-there every stock tensorrt_llm name it imports with ``from ... import``, and nothing else.
+"""Each module of the MTP-fused target that imports stock tensorrt_llm code declares
+``UNCERTIFIED_GENERIC_CALLS`` (its ``modeling.py`` must) and names there every stock name it imports, and nothing
+else.
 
 The check is ``_glm5_next_generic_calls``; it reads the source and imports nothing."""
 
@@ -10,14 +11,14 @@ import pytest
 __extra_import_path__ = [".."]
 from _glm5_next_generic_calls import (  # noqa: E402
     FAMILY_DIR,
+    audited_modules,
     check_names_every_stock_import,
-    declaring_modules,
 )
 
 pytestmark = pytest.mark.cpu_only
 
 TARGET = "glm_5_3_flash_nvfp4__sm_100__default_mtp_fused"
-MODULES = declaring_modules(TARGET)
+MODULES = audited_modules(TARGET)
 
 
 def test_modeling_declares_the_generic_calls():

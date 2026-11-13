@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The check that a GLM-5.3-Flash target module's ``UNCERTIFIED_GENERIC_CALLS`` names the stock code it runs.
 
-A target's generic path runs stock tensorrt_llm modules that no catalog entry certifies. The module that imports
-them lists them in ``UNCERTIFIED_GENERIC_CALLS``, so a dependency on stock code is visible and the list shrinks as
-entries replace stock calls. The check reads the source and imports nothing. Each target's test directory runs it on
-that target's declaring modules.
+A target's generic path runs stock tensorrt_llm modules that no catalog entry certifies. Every module of the target
+that imports them lists them in ``UNCERTIFIED_GENERIC_CALLS``, so a dependency on stock code is visible and the list
+shrinks as entries replace stock calls. The check reads the source and imports nothing. Each target's test directory
+runs it on every module of that target that imports stock code or declares the list.
 """
 
 from __future__ import annotations
@@ -59,8 +59,12 @@ def declared(tree: ast.Module) -> tuple[str, ...] | None:
 
 
 def stock_imports(tree: ast.Module, target: str) -> set[str]:
-    """Every tensorrt_llm name the module imports with ``from ... import`` outside modeling_v2 entries, module level,
-    function local or for type checking only, except the names that compute nothing."""
+    """Every stock tensorrt_llm name the module imports outside modeling_v2 entries, module level, function local or
+    for type checking only, except the names that compute nothing.
+
+    ``from <module> import <name>`` contributes ``<module>.<name>``; ``import <module>`` (aliased or not) contributes
+    ``<module>``, since every name reached through it is stock code.
+    """
     imported = set()
     for node in ast.walk(tree):
         if (
@@ -75,23 +79,36 @@ def stock_imports(tree: ast.Module, target: str) -> set[str]:
                 for alias in node.names
                 if alias.name not in _NON_COMPUTE_IMPORTS
             )
+        elif isinstance(node, ast.Import):
+            imported.update(
+                alias.name
+                for alias in node.names
+                if alias.name.split(".")[0] == "tensorrt_llm"
+                and not is_entry_module(alias.name, target)
+            )
     return imported
 
 
-def declaring_modules(target: str) -> list[Path]:
-    """The modules of ``target`` that declare ``UNCERTIFIED_GENERIC_CALLS``."""
-    return sorted(
-        p
-        for p in (FAMILY_DIR / target).rglob("*.py")
-        if declared(ast.parse(p.read_text())) is not None
-    )
+def audited_modules(target: str, family_dir: Path = FAMILY_DIR) -> list[Path]:
+    """The modules of ``target`` that import stock code or declare ``UNCERTIFIED_GENERIC_CALLS``."""
+    audited = []
+    for path in sorted((family_dir / target).rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        if declared(tree) is not None or stock_imports(tree, target):
+            audited.append(path)
+    return audited
 
 
 def check_names_every_stock_import(path: Path, target: str) -> None:
     """The list of the module at ``path`` in ``target`` names every stock import, and nothing it does not import, so
     it cannot go stale."""
     tree = ast.parse(path.read_text())
-    names, imported = set(declared(tree)), stock_imports(tree, target)
+    imported = stock_imports(tree, target)
+    declaration = declared(tree)
+    assert declaration is not None, (
+        f"imports stock code but declares no UNCERTIFIED_GENERIC_CALLS: {sorted(imported)}"
+    )
+    names = set(declaration)
     assert imported <= names, (
         f"imported but not in UNCERTIFIED_GENERIC_CALLS: {sorted(imported - names)}"
     )
