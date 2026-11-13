@@ -295,6 +295,8 @@ class _Owner:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
+            # The receiver exports its pools only when fabric writes are opted in.
+            env={**os.environ, "TRTLLM_KV_FABRIC_WRITE": "1"},
         )
         while True:
             line = self._line(timeout=900)

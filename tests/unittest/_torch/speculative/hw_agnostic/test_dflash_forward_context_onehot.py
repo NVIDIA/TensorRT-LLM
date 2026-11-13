@@ -110,7 +110,7 @@ def _drafter(num_gens):
 
 
 # The context_onehot_index_fill value _metadata gives the spec metadata (set by onehot_write).
-_INDEX_FILL = [False]
+_INDEX_FILL = {"on": False}
 
 
 def _metadata(num_contexts, num_gens, published):
@@ -129,7 +129,7 @@ def _metadata(num_contexts, num_gens, published):
         batch_slot_ids=torch.tensor(slots, device="cuda"),
         draft_probs_last_dim=published,
         draft_probs_vocab_size=FULL,
-        context_onehot_index_fill=_INDEX_FILL[0],
+        context_onehot_index_fill=_INDEX_FILL["on"],
     )
     return attn, spec
 
@@ -158,7 +158,7 @@ def _onehot():
 @pytest.fixture(params=[True, False], ids=["index_fill", "put"])
 def onehot_write(request, monkeypatch):
     # The spec metadata's own opt-in (SpecMetadata.context_onehot_index_fill).
-    monkeypatch.setitem(_INDEX_FILL, 0, request.param)
+    monkeypatch.setitem(_INDEX_FILL, "on", request.param)
 
 
 def test_step_without_generation_requests(onehot_write):

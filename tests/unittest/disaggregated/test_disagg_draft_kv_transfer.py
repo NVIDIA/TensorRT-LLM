@@ -158,6 +158,7 @@ class _Pool:
             pool_role=_ROLES,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=2 * buf,
+            num_kv_heads=heads,
         )
         views = [view]
         pools = [

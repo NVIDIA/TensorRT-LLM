@@ -561,10 +561,13 @@ def t_sender_worker_stuck(fw):
         t.join(20)
         return box
 
+    workers = list(shell._worker_threads)
     try:
         box = _with_short_sender_joins(transfer_mod, fw, body)
     finally:
         release.set()
+        for worker in workers:
+            worker.join(5)
     assert box.get("result", "").startswith("stopped"), box
     assert len(stops) == 1 and "invalidate" not in calls and not shell._shutdown, (stops, calls)
     return "a worker still running after the drain fail-stops before any teardown"

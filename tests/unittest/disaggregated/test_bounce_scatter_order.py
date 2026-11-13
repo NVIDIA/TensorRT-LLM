@@ -20,7 +20,9 @@ after warmup, the transceiver forwards the execution stream's handle, and the wo
 agent only when the transfer-agent bounce is active.
 """
 
+import ast
 import inspect
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -159,11 +161,22 @@ class TestExecutorArming:
         assert ex._arm_kv_transfer_order_stream() is False
 
     def test_init_arms_after_warmup_and_graph_capture(self):
-        src = inspect.getsource(py_executor.PyExecutor.__init__)
-        warmup = src.index("self.model_engine.warmup(")
-        warmup_done = src.index("self.is_warmup = False")
-        arm = src.index("self._arm_kv_transfer_order_stream()")
-        assert warmup < warmup_done < arm
+        # Warmup and graph capture run inside ``warmup_scope()``; arming must follow that block.
+        src = textwrap.dedent(inspect.getsource(py_executor.PyExecutor._initialize_execution))
+        body = ast.parse(src).body[0].body
+        scope = next(
+            i
+            for i, stmt in enumerate(body)
+            if isinstance(stmt, ast.With)
+            and "warmup_scope" in ast.unparse(stmt.items[0].context_expr)
+        )
+        assert "self.model_engine.warmup(" in ast.unparse(body[scope])
+        arm = next(
+            i
+            for i, stmt in enumerate(body)
+            if "self._arm_kv_transfer_order_stream()" in ast.unparse(stmt)
+        )
+        assert scope < arm
 
 
 def test_cpp_agent_wrapper_forwards_to_binding():

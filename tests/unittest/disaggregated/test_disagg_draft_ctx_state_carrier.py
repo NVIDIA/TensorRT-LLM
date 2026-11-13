@@ -71,6 +71,10 @@ def _context_result(draft_ctx_state=None):
         request_perf_metrics=None,
         additional_context_outputs=None,
         additional_generation_outputs=None,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+        time_breakdown_metrics=None,
     )
     if draft_ctx_state is not None:
         result.draft_ctx_state = draft_ctx_state

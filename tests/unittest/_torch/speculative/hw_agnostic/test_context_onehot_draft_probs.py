@@ -37,6 +37,7 @@ def test_context_onehot_matches_indexed_write_without_sync(num_gens):
         batch_slot_ids=slot_ids,
         draft_probs_vocab_size=vocab,
         draft_probs_last_dim=None,
+        context_onehot_index_fill=True,
     )
     onehot_vocab = gen_vocab if num_gens > 0 else vocab
     expected = draft_probs.clone()
