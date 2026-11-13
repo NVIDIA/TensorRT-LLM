@@ -513,6 +513,72 @@ def test_query_tiling_matches_reference(monkeypatch, qkv):
 
 @skip_not_sm100
 @pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_full_launch_rows_bind_the_caller_tensors_without_staging(monkeypatch, qkv):
+    """Tiles that fill the launch read Q, weights and Q scales and write the selection in place;
+    only the shorter last tile goes through the staging buffers and the output copy."""
+    runner = _runner("ds_v32", 16384, max_chunk=256, monkeypatch=monkeypatch, qkv=qkv)
+    plan = runner._wrapper._capacity_plan
+    staged, direct = [], []
+    real_stage, real_direct = plan._state.stage_payload, plan._run_direct
+
+    def stage_spy(q, *args, **kwargs):
+        staged.append(q.shape[0])
+        return real_stage(q, *args, **kwargs)
+
+    def direct_spy(*args, **kwargs):
+        direct.append(True)
+        return real_direct(*args, **kwargs)
+
+    monkeypatch.setattr(plan._state, "stage_payload", stage_spy)
+    monkeypatch.setattr(plan, "_run_direct", direct_spy)
+    _check("ds_v32", 256, 3000, qkv=qkv, seed=41, runner=runner)
+    assert (staged, len(direct)) == ([], 1)
+    # Two full tiles, then a 188-row tile; the staged buffers hold stale rows from before.
+    _check("ds_v32", 700, 3000, qkv=qkv, seed=42, runner=runner)
+    assert (staged, len(direct)) == ([188], 3)
+    _check("ds_v32", 256, 5000, qkv=qkv, seed=43, runner=runner)
+    assert (staged, len(direct)) == ([188], 4)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_staging_buffers_passed_back_take_the_staged_path(monkeypatch, qkv):
+    """Inputs inside the plan's own storage (here the staging buffers themselves) are not
+    bound in place; the staged path runs them without a copy and gets the same selection."""
+    runner = _runner("ds_v32", 16384, max_chunk=256, monkeypatch=monkeypatch, qkv=qkv)
+    num_q, kv_prefix, top_k = 256, 3000, CONFIGS["ds_v32"][1]
+    inputs = _make_inputs("ds_v32", num_q, kv_prefix, 45, qkv)
+    expected = _run(runner, inputs, kv_prefix, top_k)
+    plan = runner._wrapper._capacity_plan
+    state = plan._state
+    q = inputs.q.view(torch.uint8) if qkv == "mxfp4" else inputs.q
+    state.q.copy_(q)
+    state.weights.copy_(inputs.weights)
+    q_scale = None
+    if qkv == "mxfp4":
+        q_scale = plan._q_scale
+        q_scale.copy_(inputs.q_scale.contiguous().view(torch.int32).reshape(q_scale.shape))
+    direct = []
+    real_direct = plan._run_direct
+    monkeypatch.setattr(
+        plan, "_run_direct", lambda *a, **k: direct.append(1) or real_direct(*a, **k)
+    )
+    out = torch.full_like(expected, -2)
+    runner._wrapper.run(
+        state.q,
+        state.weights,
+        runner._k_stage,
+        k_scale=runner._k_scale_stage,
+        out=out,
+        q_scale=q_scale,
+    )
+    assert direct == []
+    # Row order within a selection is not part of the contract.
+    assert torch.equal(out.sort(dim=1).values, expected.sort(dim=1).values)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
 def test_plan_is_issued_once_per_chunk_and_reissued_when_the_chunk_changes(monkeypatch, qkv):
     """Layers of one chunk share a plan; a different chunk (or returning to one) needs a new
     plan, and every layer's result stays correct either way."""
