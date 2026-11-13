@@ -139,6 +139,9 @@ def test_graph_replay_equals_eager() -> None:
     entry.prebuild(probs.device)
     ref = entry.top_p_renorm_det(probs, top_p)
     stream = torch.cuda.Stream()
+    # The eager warm-up on the side stream shares the persistent workspace with the default-stream
+    # calls above (and reads their inputs): order it after them.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         entry.top_p_renorm_det(probs, top_p)
         torch.cuda.synchronize()
