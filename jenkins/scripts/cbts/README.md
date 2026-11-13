@@ -211,7 +211,10 @@ Stage patterns match original stage names even when narrowed stages have a
 `-cbts` suffix. With `--stage-list` or `--extra-stage`, stages retain their
 original shard IDs and split counts. Pytest collects and splits the full source
 test list using the original durations, then intersects each shard with CBTS's
-selected cases. An empty intersection is a successful no-op. Cases never move
+selected cases. A successful collection that removes every case from a nonempty
+original shard is a successful no-op. The ordinary/agent runner records a skipped
+CBTS control testcase so normal JUnit reporting still has a result; unexpected
+empty collections and collection failures remain errors. Cases never move
 from an unselected shard into a selected shard.
 
 ## Stage scheduling
