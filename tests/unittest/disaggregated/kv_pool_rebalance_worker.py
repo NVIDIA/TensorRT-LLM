@@ -70,10 +70,7 @@ NUM_LAYERS = 5
 TPB = 32
 MAX_SEQ_LEN = 1024
 # VSWA with unequal layer counts per window -> two pool groups with different
-# slot sizes, which is what gives adjust() something to rebalance. The slot sizes
-# (512 KiB and 128 KiB) divide the 2 MiB VMM chunk, so no block straddles a chunk
-# boundary: NIXL's remote-descriptor check currently rejects a destination block
-# that does, independently of rebalancing.
+# slot sizes, which is what gives adjust() something to rebalance.
 WINDOWS = [256, 256, 256, 256, MAX_SEQ_LEN]
 REQ_LEN = 200
 MODE = os.environ.get("MODE", "refresh")
