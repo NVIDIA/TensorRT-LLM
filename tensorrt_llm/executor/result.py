@@ -1038,6 +1038,16 @@ class GenerationResultBase:
                                    time_correction) * 1e9))
 
 
+def _find_stop_string(text: str, stop: str, searched_len: int) -> int:
+    """Return ``text.find(stop)`` when ``text[:searched_len]`` has no match.
+
+    Only matches that end past ``searched_len`` are searched for, so a streamed
+    response costs time in proportion to its new text, not the whole text.
+    """
+    start = max(0, searched_len - len(stop) + 1) if stop else 0
+    return text.find(stop, start)
+
+
 class DetokenizedGenerationResultBase(GenerationResultBase):
     """The base class for the generation result with detokenization support."""
     # import once and avoid cyclic import
@@ -1121,11 +1131,18 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                     or beam_output.finish_reason == 'length')
 
                 if is_generating or is_finished_with_stop_or_length:
+                    # Incremental decoding appends to text that earlier responses
+                    # searched; a post-processor hook may have rewritten it since.
+                    searched_len = 0
+                    if use_incremental and self._post_processor_hook is None:
+                        searched_len = beam_output._last_text_len
                     for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
                     ):
-                        if isinstance(stop_reason,
-                                      str) and stop_reason in beam_output.text:
-                            stop_pos = beam_output.text.find(stop_reason)
+                        if not isinstance(stop_reason, str):
+                            continue
+                        stop_pos = _find_stop_string(beam_output.text,
+                                                     stop_reason, searched_len)
+                        if stop_pos >= 0:
                             if not self.sampling_params.include_stop_str_in_output:
                                 beam_output.text = beam_output.text[:stop_pos]
                             else:
