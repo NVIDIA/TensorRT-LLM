@@ -434,3 +434,22 @@ def test_v3_adversarial_rows_bitwise(case, v) -> None:
                     ref,
                     f"{case} v={v} batch={batch} seed={seed} ctas={ctas}",
                 )
+
+
+@pytest.mark.parametrize("case", ["realistic", "same", "far"])
+def test_the_rej_v3_kill_switch_runs_v2_with_the_same_tokens(case) -> None:
+    """v3=False (REJ_V3 off) launches the v2 kernel on every device and still equals the stock op."""
+    _gpu()
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
+
+    ops = family_ops()
+    assert int(ops.minimax_m31_chain_speculative_sampling_mc_version(False)) == 2
+    for batch in (1, 8):
+        args = _make(case, batch, 7, 200064, 17 * batch)
+        ref = _stock(*args)
+        ws = entry.prebuild(args[0].device)
+        for ctas in (1, 16):
+            if ctas > 1 and batch * ctas > entry.sm_count(args[0].device):
+                continue
+            got = ops.minimax_m31_chain_speculative_sampling_mc(*args, ws, ctas, v3=False)
+            _same(got, ref, f"{case} batch={batch} ctas={ctas} v2")

@@ -6,6 +6,8 @@ tiers, a masked 144-slot layout, ties, strided logits), -1 / 0 on pad-mask rows,
 topk (SeAppendRouting.stage_appended), nothing past the live rows or the routing columns, and CUDA graph replay with
 PDL. GPU (SM107)."""
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -47,7 +49,7 @@ def _stage(cap, cols):
     )
 
 
-def _reference(logits, bias, topk, cap, appended, pad):
+def _reference(logits, bias, topk, cap, appended, pad, fp32_weight=True):
     """noaux_tc_fp4_quantize_stage_out on the same logits (+ stage_appended's column on the live rows)."""
     rows = logits.shape[0]
     cols = topk + (1 if appended >= 0 else 0)
@@ -62,7 +64,11 @@ def _reference(logits, bias, topk, cap, appended, pad):
         torch.empty(0, HIDDEN // 2, dtype=torch.uint8, device="cuda"),
         torch.empty(0, HIDDEN // 16, dtype=torch.uint8, device="cuda"),
     )
-    kw = {} if pad is None else {"pad_mask": pad}
+    kw = (
+        {"fp32_weight": fp32_weight}
+        if pad is None
+        else {"pad_mask": pad, "fp32_weight": fp32_weight}
+    )
     family_ops().noaux_tc_fp4_quantize_stage_out(
         logits.contiguous(),
         bias,
@@ -84,9 +90,11 @@ def _reference(logits, bias, topk, cap, appended, pad):
     return ids, w
 
 
-def _route_stage(logits, bias, topk, cap, appended, pad, pdl=False):
+def _route_stage(logits, bias, topk, cap, appended, pad, pdl=False, fp32_weight=True):
     ids, w = _stage(cap, topk + (1 if appended >= 0 else 0))
-    native_ops.minimax_m31_route_stage(logits, bias, pad, topk, RSF, appended, ids, w, pdl)
+    native_ops.minimax_m31_route_stage(
+        logits, bias, pad, topk, RSF, appended, ids, w, pdl, fp32_weight=fp32_weight
+    )
     return ids, w
 
 
@@ -201,6 +209,31 @@ def test_rejects_bad_arguments():
             one_w.expand(rows, -1),
             False,
         )
+
+
+@pytest.mark.parametrize("e, topk", [(128, 8), (256, 8), (144, 4)])
+@pytest.mark.parametrize("rows", [5, 777])
+def test_fp64_weight_form_under_the_kill_switch(e, topk, rows):
+    """NOAUX_TC_FP32 off (fp32_weight=False on both ops): the route stage still equals the fused stage bit for bit,
+    and the FP64 expression gives the FP32 form's weights."""
+    logits, bias = _inputs(rows, e, rows + e)
+    ref = _reference(logits, bias, topk, rows, 35, None, fp32_weight=False)
+    got = _route_stage(logits, bias, topk, rows, 35, None, fp32_weight=False)
+    fast = _route_stage(logits, bias, topk, rows, 35, None)
+    torch.cuda.synchronize()
+    _assert_live_rows_equal(ref, got, rows)
+    _assert_live_rows_equal(fast, got, rows)
+
+
+def test_the_boundary_passes_the_noaux_tc_fp32_switch():
+    """The dep2ctx boundary hands NOAUX_TC_FP32 to the route stage op as fp32_weight."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx import (  # noqa: E501
+        m31_switches,
+        modeling,
+    )
+
+    assert modeling._NOAUX_TC_FP32 is (not m31_switches.m31_disabled("NOAUX_TC_FP32"))
+    assert "fp32_weight=_NOAUX_TC_FP32" in Path(modeling.__file__).read_text()
 
 
 def test_dep2ctx_row_b_sees_the_route_stage_op():

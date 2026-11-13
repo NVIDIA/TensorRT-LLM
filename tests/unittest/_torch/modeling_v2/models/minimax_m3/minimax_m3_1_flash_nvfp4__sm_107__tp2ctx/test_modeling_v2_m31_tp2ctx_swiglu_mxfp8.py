@@ -249,3 +249,23 @@ def test_rows_form_first_launch_under_graph_capture():
     log = out.stdout + out.stderr
     assert "rows form kRows=4 at d 3072 (h elided)" in log, log
     assert "NOT ENGAGED" not in log and "occupancy query failed" not in log, log
+
+
+@pytest.mark.parametrize("k_rows", [2, 4, 8])
+def test_the_rows_form_arguments_keep_the_bits(k_rows):
+    """rows_form=False (the SWIGLU_MXFP8_ROWS kill switch: the one-row launch) and every k_rows write the default
+    launch's bytes on the stress inputs."""
+    op = _op()
+    ns = {}
+    exec(_STRESS_SRC, ns)
+    for rows, d in ((1160, 3072), (8192, 3072)):
+        base = ns["run_case"](op, rows, d, True, seed=rows + d)
+        for kwargs in (dict(rows_form=False), dict(k_rows=k_rows)):
+            got = ns["run_case"](
+                lambda x, q, sf, h, kw=kwargs: op(x, q, sf, h, **kw), rows, d, True, seed=rows + d
+            )
+            for key in ("h", "q", "sf"):
+                assert torch.equal(got[key].view(torch.uint8), base[key].view(torch.uint8)), (
+                    kwargs,
+                    key,
+                )

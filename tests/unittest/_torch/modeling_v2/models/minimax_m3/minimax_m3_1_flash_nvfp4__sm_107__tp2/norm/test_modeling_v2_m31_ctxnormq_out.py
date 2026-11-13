@@ -131,3 +131,23 @@ def test_out_edge_rows_and_norm_off(rows, fp4, write_norm, pdl):
         assert torch.equal(_u8(fq), _u8(ref[3])) and torch.equal(_u8(fsf), _u8(ref[4])), (
             "nvfp4 differs"
         )
+
+
+@pytest.mark.parametrize("T", [129, 8192])
+@pytest.mark.parametrize("f32", [False, True])
+def test_the_lb2_kill_switch_keeps_the_bits(T, f32):
+    """lb2=False (CTXNORM_LB2 off) launches one CTA per SM: every output equals the two-CTA launch's."""
+    x, r = _bf16(T, H, "stress", T), _bf16(T, H, "randn", T + 1)
+    w = _bf16(1, H, "randn", 3).view(H)
+    gs = torch.tensor([448.0 * 6.0 / 64.0], device="cuda")
+    outs = []
+    for lb2 in (True, False):
+        inter = x.clone()
+        if f32:
+            out = _ops.minimax_m31_ctx_residual_rmsnorm_mxfp8_f32(inter, r, w, EPS, gs, lb2=lb2)
+        else:
+            out = _ops.minimax_m31_ctx_residual_rmsnorm_mxfp8(inter, r, w, EPS, True, gs, lb2=lb2)
+        outs.append((inter, *out))
+    torch.cuda.synchronize()
+    for a, b in zip(*outs):
+        assert torch.equal(_u8(a), _u8(b))

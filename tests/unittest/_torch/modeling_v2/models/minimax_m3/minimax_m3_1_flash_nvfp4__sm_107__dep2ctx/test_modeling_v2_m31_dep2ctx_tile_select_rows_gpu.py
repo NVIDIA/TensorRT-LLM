@@ -165,3 +165,28 @@ def test_ops_reject_operands_on_another_device(op_name, moved):
         out = torch.empty((4, 300, 16), dtype=torch.int32, device="cuda:1").permute(1, 0, 2)
     with pytest.raises(RuntimeError, match="same CUDA device"):
         getattr(family_ops(), op_name)(scores, nvb, out, 0, 1)
+
+
+@pytest.mark.parametrize("blocks", [1, 16, 17, 64, 128])
+@pytest.mark.parametrize("rows", [256, 1001])
+def test_the_narrow_kill_switch_keeps_the_table(blocks, rows):
+    """narrow=False (TSEL_NARROW off) runs the tile kernel on the short tiles the narrow-row kernel takes on sm_107:
+    both ops write the same table either way."""
+    g = torch.Generator(device="cuda").manual_seed(blocks * 7 + rows)
+    nvb = torch.randint(0, blocks + 4, (rows,), generator=g, device="cuda", dtype=torch.int32)
+    for kind in ("random", "ties", "specials"):
+        values = _values(kind, 4, blocks, rows, blocks + rows, True)
+        view = _row_major(values, 0, 0)
+        tables = []
+        for narrow in (True, False):
+            tile = torch.empty((4, rows, 16), dtype=torch.int32, device="cuda").permute(1, 0, 2)
+            rows_out = torch.empty_like(tile.permute(1, 0, 2)).permute(1, 0, 2)
+            family_ops().minimax_m31_select_prefill_tile(
+                values.contiguous(), nvb, tile, 0, 1, narrow=narrow
+            )
+            family_ops().minimax_m31_select_prefill_tile_rows(
+                view, nvb, rows_out, 0, 1, narrow=narrow
+            )
+            tables += [tile, rows_out]
+        for t in tables[1:]:
+            assert torch.equal(t, tables[0]), f"{kind}: {_diff(t, tables[0])}"
