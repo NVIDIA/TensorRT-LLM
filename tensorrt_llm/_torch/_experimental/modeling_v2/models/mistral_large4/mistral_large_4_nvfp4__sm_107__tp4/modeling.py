@@ -164,6 +164,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
     cute_dsl_fp8_block_scale_linear,
     prepare_weight_scale,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fused_fp8_block_scale_linear import (
+    cute_dsl_fused_fp8_block_scale_linear,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
 )
@@ -1524,6 +1527,8 @@ class DecodeTarget:
 
     def _linear_fp8(self, x, w, w_s):
         """K128-quantized FP8 linear through the Rubin MXFP8 kernel."""
+        if self.core.tp_size == 8 and x.shape[0] == 4:
+            return cute_dsl_fused_fp8_block_scale_linear(x, w, w_s)
         return cute_dsl_fp8_block_scale_linear(x, w, w_s)
 
     def _latent(self, x, L, nope_lat):
