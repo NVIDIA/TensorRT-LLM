@@ -71,6 +71,10 @@ class TestTP8Chain(unittest.TestCase):
             "_WORKER_HOOKS": module_constant("_WORKER_HOOKS"),
             "functools": functools,
             "m31_disabled": killed.__contains__,
+            "m31_enabled": lambda item: False,  # every opt-in at its default (off)
+            "S9B_MC": False,
+            "S9B_MC_MAX_ROWS": 8,
+            "_s9b_mc_op": None,
             "s10_applies": lambda _: True,
             "logger": Mock(),
             "FC_SHARD": False,
