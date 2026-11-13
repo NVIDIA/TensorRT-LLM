@@ -5019,6 +5019,42 @@ class TestToolParserIntegration:
 # ============================================================================
 
 
+class TestMiniMaxM3StreamingIndices:
+
+    @staticmethod
+    def _block(*names):
+        ns = "]<]minimax[>["
+        invokes = "".join(ns + f'<invoke name="{name}">' + ns + "</invoke>"
+                          for name in names)
+        return ns + "<tool_call>" + invokes + ns + "</tool_call>"
+
+    def test_indices_continue_across_blocks(self):
+        parser = MiniMaxM3ToolParser()
+        first = parser.parse_streaming_increment(self._block("one"), [])
+        second = parser.parse_streaming_increment(self._block("two"), [])
+        assert [call.tool_index for call in first.calls] == [0]
+        assert [call.tool_index for call in second.calls] == [1]
+        assert [call.name
+                for call in first.calls + second.calls] == ["one", "two"]
+
+    def test_multiple_calls_then_another_block_and_fresh_parser(self):
+        parser = MiniMaxM3ToolParser()
+        first = parser.parse_streaming_increment(self._block("one", "two"), [])
+        assert parser.parse_streaming_increment("plain text", []).calls == []
+        second = parser.parse_streaming_increment(self._block("three"), [])
+        assert [call.tool_index
+                for call in first.calls + second.calls] == [0, 1, 2]
+        assert [
+            call.tool_index
+            for call in MiniMaxM3ToolParser().parse_streaming_increment(
+                self._block("fresh"), []).calls
+        ] == [0]
+        assert [
+            call.tool_index for call in parser.detect_and_parse(
+                self._block("one", "two"), []).calls
+        ] == [0, 1]
+
+
 class TestMiniMaxM2ToolParser:
     """Test suite for MiniMaxM2ToolParser class."""
 
