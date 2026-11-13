@@ -15,6 +15,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
 from ....ops.attention.sparse_reference import _E2M1 as _E2M1
 from ....ops.attention.sparse_reference import dequant_nvfp4_pages as _dequant_nvfp4_pages
@@ -229,7 +230,7 @@ class M3SparseDecodeLc(OpWrapper):
         prewait: bool,
         n1_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        torch.ops.trtllm.minimax_m3_sm107_tp2_sparse_decode_lc(
+        family_ops().minimax_m3_sm107_tp2_sparse_decode_lc(
             q,
             k,
             v,

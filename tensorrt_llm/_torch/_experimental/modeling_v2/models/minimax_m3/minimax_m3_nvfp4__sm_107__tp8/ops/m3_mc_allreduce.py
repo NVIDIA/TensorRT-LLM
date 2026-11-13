@@ -23,7 +23,7 @@ Producers that push (the o_proj / shared-expert GEMV ``ar`` tuple, the routed-ex
 pointed at a bucket's exchange by its ``mc`` address, ``flags_for(8)`` counters, ``rank``, ``world_size`` and
 ``max_tokens``; ``get_workspace`` and ``_bucket`` select it.
 
-The kernel is ``torch.ops.trtllm.minimax_m3_mc_allreduce_norm``, reached through the ``ops/comm`` entries
+The kernel is ``family_ops().minimax_m3_mc_allreduce_norm``, reached through the ``ops/comm`` entries
 ``m3_mc_allreduce_norm`` and ``m3_mc_finalize_allreduce_norm``; this module owns the workspaces, the bucket and
 epilogue-option choice and the MXFP8 publication.
 """
@@ -32,6 +32,7 @@ import functools
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.comm.mc_workspace import (
     McAllReduceWorkspace as McAllReduceWorkspace,
 )
@@ -253,11 +254,11 @@ def m3_mc_finalize_allreduce_norm(
 
 @functools.lru_cache(maxsize=None)
 def _own_op_loaded() -> bool:
-    torch.ops.trtllm.minimax_m3_sm107_tp8_mc_allreduce_norm
+    family_ops().minimax_m3_sm107_tp8_mc_allreduce_norm
     return True
 
 
-# The boundary all-reduces run this target's op (trtllm::minimax_m3_sm107_tp8_mc_allreduce_norm) rather than the
+# The boundary all-reduces run this target's op (mv2_minimax_m3::minimax_m3_sm107_tp8_mc_allreduce_norm) rather than the
 # image's: the same exchange and arithmetic built for the two-tray TP8 group.
 OWN_OP = True
 OWN_OP_PATH = "m3_mc_ar_own_op"
@@ -281,7 +282,7 @@ def capture_supported() -> bool:
         if own_op()
         else "minimax_m3_sm107_tp2_mc_allreduce_norm"
     )
-    op = getattr(torch.ops.trtllm, name)
+    op = getattr(family_ops(), name)
     return any(a.name == "cap_out" for a in op.default._schema.arguments)
 
 

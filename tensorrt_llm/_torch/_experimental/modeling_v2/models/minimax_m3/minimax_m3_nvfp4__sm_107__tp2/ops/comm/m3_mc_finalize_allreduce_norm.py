@@ -11,6 +11,7 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper as OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
 from ....ops.comm.reference import McFinalizeAllreduceNormReference
 from ....ops.comm.reference import boundary as boundary
@@ -95,7 +96,7 @@ class M3McFinalizeAllreduceNorm(McFinalizeAllreduceNormReference):
         cap_w: Optional[torch.Tensor] = None,
         cap_eps: float = 0.0,
     ) -> list[torch.Tensor]:
-        return torch.ops.trtllm.minimax_m3_sm107_tp2_mc_allreduce_norm(
+        return family_ops().minimax_m3_sm107_tp2_mc_allreduce_norm(
             fc2,
             shared,
             residual,

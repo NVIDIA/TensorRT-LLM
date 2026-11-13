@@ -128,6 +128,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config impo
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
     _validate_runtime as _validate_runtime,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (
     m3_silu_and_mul,
 )
@@ -6105,6 +6106,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
+        # The fused all-reduces and the long-context sparse decode (LC2) run the family library's fixed copies: an
+        # installation without the library refuses here (NoTarget), and modeling_v2='auto' keeps the built-in model.
+        family_ops()
         # Under modeling_v2='require' a covered decode shape that cannot take its fast path raises.
         set_require(resolved_mode(type(self)) is ModelingV2Mode.REQUIRE)
         model_config = _text_model_config(model_config)
