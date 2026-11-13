@@ -401,13 +401,14 @@ def _dsmla_decode_kernel(
     scale_log2: cutlass.Float32,
     num_heads: cutlass.Constexpr[int],
     num_splits: cutlass.Constexpr[int],
+    global_partials: cutlass.Constexpr[bool] = False,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     warp = cute.arch.warp_idx()
     lane = tidx % cutlass.Int32(32)
     split_x, _, row = cute.arch.block_idx()
     split = split_x
-    if cutlass.const_expr(num_splits > 1):
+    if cutlass.const_expr(num_splits > 1 and not global_partials):
         split = cute.arch.block_idx_in_cluster()
     tokens_per_cta: cutlass.Constexpr[int] = TOPK // num_splits
     num_kt: cutlass.Constexpr[int] = tokens_per_cta // BT
@@ -484,11 +485,11 @@ def _dsmla_decode_kernel(
             prims.mbarrier_init(o_empty, 4)
             prims.mbarrier_init(fin_full, 1)
     prims.fence_mbarrier_init()
-    if cutlass.const_expr(num_splits > 1):
+    if cutlass.const_expr(num_splits > 1 and not global_partials):
         prims.barrier_cluster_arrive_relaxed()
     if warp == W_PV:
         prims.tcgen05_alloc(tmem_i32, TMEM_COLS, group="cta_1")
-    if cutlass.const_expr(num_splits > 1):
+    if cutlass.const_expr(num_splits > 1 and not global_partials):
         prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
     tmem_raw = tmem_i32.load()
@@ -956,10 +957,32 @@ def _dsmla_decode_kernel(
                 ov = prims.tcgen05_ld("32x32b", tp, num=N_MMA)
                 prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                 for h in cutlass.range_constexpr(num_heads):
-                    part[h * D_NOPE + s * 128 + col] = _mul_rn(ov[h], osc[h])
+                    value = _mul_rn(ov[h], osc[h])
+                    if cutlass.const_expr(global_partials):
+                        offset = (
+                            (cutlass.Int64(row) * cutlass.Int64(num_splits) + cutlass.Int64(split))
+                            * cutlass.Int64(num_heads)
+                            + cutlass.Int64(h)
+                        ) * cutlass.Int64(516)
+                        out.iterator.raw_ptr()[offset + cutlass.Int32(s * 128) + col] = value
+                    else:
+                        part[h * D_NOPE + s * 128 + col] = value
             if cw == cutlass.Int32(0) and lane < cutlass.Int32(1):
                 for h in cutlass.range_constexpr(N_MMA):
-                    sLse[h] = _add_ftz(_lg2(fin_l[h]), fin_m[h])
+                    lse = _add_ftz(_lg2(fin_l[h]), fin_m[h])
+                    if cutlass.const_expr(global_partials):
+                        if cutlass.const_expr(h < num_heads):
+                            offset = (
+                                (
+                                    cutlass.Int64(row) * cutlass.Int64(num_splits)
+                                    + cutlass.Int64(split)
+                                )
+                                * cutlass.Int64(num_heads)
+                                + cutlass.Int64(h)
+                            ) * cutlass.Int64(516)
+                            out.iterator.raw_ptr()[offset + cutlass.Int32(512)] = lse
+                    else:
+                        sLse[h] = lse
 
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     prims.barrier_cta_sync(0)
@@ -967,7 +990,9 @@ def _dsmla_decode_kernel(
         prims.tcgen05_dealloc(
             cutlass.inttoptr(tmem_raw, 6, cutlass.Float32), TMEM_COLS, group="cta_1"
         )
-    if cutlass.const_expr(num_splits > 1):
+    if cutlass.const_expr(global_partials):
+        prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
+    if cutlass.const_expr(num_splits > 1 and not global_partials):
         # FlashMLA's combine (smxx/decode/combine/combine.cu) over the cluster's partials:
         # each CTA merges 1/num_splits of the [heads x 512] output.
         prims.barrier_cluster_arrive()
@@ -1038,6 +1063,7 @@ def _launch(
     stream: cuda_driver.CUstream,
     num_heads: cutlass.Constexpr[int],
     num_splits: cutlass.Constexpr[int],
+    global_partials: cutlass.Constexpr[bool] = False,
 ) -> None:
     rows = indices.shape[0]
     h_q = q.shape[1]
@@ -1059,10 +1085,13 @@ def _launch(
         box_dims=[ROW_BYTES // 8, 1],
         swizzle=cuda.TensorMapSwizzle.none,
     )
-    _dsmla_decode_kernel(tma_q, tma_raw, indices, out, scale_log2, num_heads, num_splits).launch(
+    cluster_splits: cutlass.Constexpr[int] = 1 if global_partials else num_splits
+    _dsmla_decode_kernel(
+        tma_q, tma_raw, indices, out, scale_log2, num_heads, num_splits, global_partials
+    ).launch(
         grid=(num_splits, 1, rows),
         block=(THREADS, 1, 1),
-        cluster=(num_splits, 1, 1),
+        cluster=(cluster_splits, 1, 1),
         stream=stream,
         min_blocks_per_mp=1,
         use_pdl=True,
@@ -1125,4 +1154,147 @@ def launch(
     pool = kv_cache.view(torch.uint8).view(-1, ROW_BYTES)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     fn(q, pool, indices, out.view(torch.int16), scale_log2_of(softmax_scale), stream)
+    return out
+
+
+@cute.kernel
+def _global_combine_kernel(
+    partials: cute.Tensor,
+    out: cute.Tensor,
+    num_heads: cutlass.Constexpr[int],
+    num_splits: cutlass.Constexpr[int],
+) -> None:
+    """Merge independent CTA partials with the cluster combine's FP32 arithmetic."""
+    tidx, _, _ = cute.arch.thread_idx()
+    row, head, _ = cute.arch.block_idx()
+    prims.griddepcontrol(prims.GridDepAction.WAIT)
+    ptr = partials.iterator.raw_ptr()
+    base = (
+        cutlass.Int64(row) * cutlass.Int64(num_splits * num_heads) + cutlass.Int64(head)
+    ) * cutlass.Int64(516)
+    lses = [
+        cutlass.Float32(ptr[base + cutlass.Int32(p * num_heads * 516 + 512)])
+        for p in range(num_splits)
+    ]
+    max_lse = lses[0]
+    for p in cutlass.range_constexpr(1, num_splits):
+        max_lse = _fmax(max_lse, lses[p])
+    max_lse = _sel_lit(_cmp_i32("ne", max_lse, F32_NEG_INF), max_lse, F32_ZERO)
+    sum_lse = _butterfly_sum([_ex2(_sub_ftz(lses[p], max_lse)) for p in range(num_splits)])
+    global_lse = _sel_lit(
+        _cmp_i32("ne", sum_lse, F32_ZERO), _add_ftz(_lg2(sum_lse), max_lse), F32_POS_INF
+    )
+    acc = []
+    for p in cutlass.range_constexpr(num_splits):
+        weight = _ex2(_sub_ftz(lses[p], global_lse))
+        offset = base + cutlass.Int32(p * num_heads * 516) + tidx * cutlass.Int32(4)
+        o4 = (ptr + offset).load(count=4, alignment=16)
+        if cutlass.const_expr(p == 0):
+            acc = [_mul_into_zero(weight, o4[e]) for e in range(4)]
+        else:
+            acc = [_fma_ftz(weight, o4[e], acc[e]) for e in range(4)]
+    lo, hi = _bf16x2(acc[0], acc[1]), _bf16x2(acc[2], acc[3])
+    mask = cutlass.Int32(0xFFFF)
+    halves = (
+        lo & mask,
+        (lo >> cutlass.Int32(16)) & mask,
+        hi & mask,
+        (hi >> cutlass.Int32(16)) & mask,
+    )
+    offset = (cutlass.Int64(row) * cutlass.Int64(num_heads) + cutlass.Int64(head)) * cutlass.Int64(
+        D_NOPE
+    ) + cutlass.Int64(tidx * 4)
+    (out.iterator.raw_ptr() + offset).store(
+        cutlass.Vector.from_elements(tuple(cutlass.Int16(x) for x in halves), dtype=cutlass.Int16),
+        alignment=8,
+    )
+    prims.barrier_cta_sync(0)
+    prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
+
+
+@cute.jit
+def _launch_global_combine(
+    partials: cute.Tensor,
+    out: cute.Tensor,
+    stream: cuda_driver.CUstream,
+    num_heads: cutlass.Constexpr[int],
+    num_splits: cutlass.Constexpr[int],
+) -> None:
+    _global_combine_kernel(partials, out, num_heads, num_splits).launch(
+        grid=(out.shape[0], num_heads, 1),
+        block=(128, 1, 1),
+        stream=stream,
+        use_pdl=True,
+    )
+
+
+_GLOBAL_COMPILED: dict[tuple[int, int, int], tuple[Callable, Callable]] = {}
+
+
+def _compile_global_variant(
+    num_heads: int, num_splits: int, device_index: int
+) -> tuple[Callable, Callable]:
+    """Compile independent split CTAs and a separate FP32 combine launch."""
+    if num_heads not in SUPPORTED_HEADS or num_splits not in (8, 16):
+        raise ValueError(f"no global variant for {num_heads} heads and {num_splits} splits")
+    key = (device_index, num_heads, num_splits)
+    if key not in _GLOBAL_COMPILED:
+        make = cute.runtime.make_fake_compact_tensor
+        rows, h_q, n_rows = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
+        cutlass.cuda.initialize_cuda_context(device_index)
+        workspace = make(
+            cutlass.Float32,
+            (rows, num_splits, num_heads, 516),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=16,
+        )
+        output = make(
+            cutlass.Int16, (rows, num_heads, D_NOPE), stride_order=(2, 1, 0), assumed_align=16
+        )
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False)
+        partial = cute.compile(
+            _launch,
+            make(cutlass.BFloat16, (rows, h_q, D_QK), stride_order=(2, 1, 0), assumed_align=16),
+            make(cutlass.Uint8, (n_rows, ROW_BYTES), stride_order=(1, 0), assumed_align=16),
+            make(cutlass.Int32, (rows, TOPK), stride_order=(1, 0), assumed_align=16),
+            workspace,
+            cutlass.Float32(0.0),
+            stream,
+            num_heads,
+            num_splits,
+            True,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+        combine = cute.compile(
+            _launch_global_combine,
+            workspace,
+            output,
+            stream,
+            num_heads,
+            num_splits,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+        _GLOBAL_COMPILED[key] = (partial, combine)
+    return _GLOBAL_COMPILED[key]
+
+
+def _launch_global(
+    fns: tuple[Callable, Callable],
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    workspace: torch.Tensor,
+) -> torch.Tensor:
+    """Write caller-owned workspace and output on the current stream in two launches.
+
+    Workspace is FP32 [rows, splits, heads, 516]. The caller owns its lifetime and
+    must supply distinct workspaces to concurrently executing streams or graphs.
+    """
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    pool = kv_cache.view(torch.uint8).view(-1, ROW_BYTES)
+    partial, combine = fns
+    partial(q, pool, indices, workspace, scale_log2_of(softmax_scale), stream)
+    combine(workspace, out.view(torch.int16), stream)
     return out
