@@ -239,7 +239,6 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
             logits,
             1,
             [0, 1 if handled else end - start],
-            True,
             context_logits_handled=handled,
         )
     assert projected_rows == ([32, 22, 1] if legacy_first else [32, 5, 1])

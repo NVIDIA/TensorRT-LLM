@@ -12,11 +12,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.profiling import ProfileController, load_iteration_indexes
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     PyExecutor,
     PyExecutorResources,
     _ExecutorExecutionConfig,
 )
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
@@ -88,8 +90,9 @@ def executor(monkeypatch):
     ex.dense_dwdp_manager = None
     ex.pending_encoder_steps = [object()]
     ex.active_requests = [object()]
-    ex.responses = {17: object()}
-    ex.result_wait_queues = {17: object()}
+    ex._response_channel = ResponseChannel()
+    ex._response_channel.responses[17] = [object()]
+    ex._response_channel.register([17], object())
     ex._pending_transfer_responses = [object()]
     ex._pending_response_terminations = [object()]
     ex.request_accumulated = [object()]
@@ -156,7 +159,11 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
     assert ex.scheduler is None
     assert ex.kv_cache_transceiver is None
     assert ex.hang_detector is None  # Drops the old transceiver's status-provider reference.
-    assert not ex.responses and not ex.active_requests and not ex.result_wait_queues
+    assert (
+        not ex._response_channel.responses
+        and not ex.active_requests
+        and not ex._response_channel.result_wait_queues
+    )
     assert not ex.pending_encoder_steps
     assert not ex.request_accumulated and not ex.control_requests
     assert ex.waiting_queue is None and ex._pending_adp_dummy_request is None
@@ -239,12 +246,12 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     create_waiting_queue = Mock(wraps=executor_module.create_waiting_queue)
     monkeypatch.setattr(executor_module, "create_waiting_queue", create_waiting_queue)
     monkeypatch.setenv("TLLM_PROFILE_START_STOP", "2-4")
-    executor_module._load_iteration_indexes.cache_clear()
+    load_iteration_indexes.cache_clear()
     monkeypatch.setattr(torch.cuda, "Stream", Mock())
     monkeypatch.setattr(torch.cuda, "Event", Mock())
     monkeypatch.setattr(torch.cuda, "current_stream", Mock())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(executor_module, "_distributed_warmup_guard", lambda *args: nullcontext())
+    monkeypatch.setattr(executor_module, "distributed_warmup_guard", lambda *args: nullcontext())
     monkeypatch.setattr(executor_module.ADPRouter, "create", Mock())
     monkeypatch.setattr(executor_module, "HangDetector", Mock())
     monkeypatch.setattr(executor_module, "ExecutorRequestQueue", Mock())
@@ -330,8 +337,15 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     )
     ex.iter_counter = 42
     ex._ctx_mla_kv_len_cap = None
-    ex.profile_start_iters = {99}
-    ex.profile_stop_iters = set()
+    ex._profile_controller = ProfileController(
+        rank=0,
+        current_iteration=lambda: ex.iter_counter,
+        is_warmup=lambda: False,
+        broadcast_start=Mock(),
+        broadcast_stop=Mock(),
+    )
+    ex._profile_controller.profile_start_iters = {99}
+    ex._profile_controller.profile_stop_iters = set()
     old_shutdown_event = ex.shutdown_event
     engine, stream = ex.model_engine, ex.execution_stream
     sample_stream, sample_event = ex.sample_stream, ex.finish_sample_event
@@ -360,8 +374,8 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     try:
         ex.rebind_resources(resources)
         assert ex.iter_counter == 0
-        assert ex.profile_start_iters == {2}
-        assert ex.profile_stop_iters == {4}
+        assert ex._profile_controller.profile_start_iters == {2}
+        assert ex._profile_controller.profile_stop_iters == {4}
         assert ex._ctx_mla_kv_len_cap == "unset"
         assert ex._disagg_coordinator is None
         assert not ex.worker_started
@@ -384,7 +398,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         engine.warmup.assert_called_once_with(resources.resource_manager)
         ex.start_worker.assert_not_called()
     finally:
-        executor_module._load_iteration_indexes.cache_clear()
+        load_iteration_indexes.cache_clear()
 
 
 def test_failed_rebind_cannot_be_retried_over_partial_resources(executor):

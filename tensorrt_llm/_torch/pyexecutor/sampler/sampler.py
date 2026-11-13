@@ -14,13 +14,13 @@
 """Sampler orchestration: the entry points the executor drives each step.
 
 Holds the :class:`Sampler` ABC and its ``SampleState`` types, the trivial
-early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
-:class:`EarlyStopWithMMResult` for the multimodal-encoder-only engine), and
-:class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
-sampling logic of its own beyond batching and orchestration: each feature
-(beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-seeds) lives in its own module and is held here as a handler, driven through
-``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
+early-stop sampler (:class:`EarlyStopWithMMResult` for the
+multimodal-encoder-only engine), and :class:`TorchSampler` -- the PyTorch
+sampling path. ``TorchSampler`` owns no sampling logic of its own beyond
+batching and orchestration: each feature (beam search, penalties, token bans,
+top-p decay, finish reasons, log-probs, seeds) lives in its own module and is
+held here as a handler, driven through ``setup_sampler_step`` /
+``sample_async`` / ``update_requests``.
 """
 
 import sys
@@ -296,55 +296,6 @@ def _validate_single_forward_request(request: LlmRequest, max_num_tokens: Option
                 max_context_length=max_num_tokens, num_prompt_tokens=request.prompt_len
             )
         )
-
-
-class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensors]]):
-    """
-    Use for skipping decoding step for non generation model,
-    such as encoder-only model (e.g., BERT) or reward models that only need context phase.
-
-    Args:
-        max_num_tokens: The engine's token budget. A request runs whole in one
-            forward, so a prompt longer than this is rejected; None skips the check.
-    """
-
-    SampleState: TypeAlias = SampleState[SampleStateTensors, SampleStateTensors]
-
-    def __init__(self, max_num_tokens: Optional[int] = None) -> None:
-        self.max_num_tokens = max_num_tokens
-
-    @override
-    def validate_request(self, request: LlmRequest) -> None:
-        _validate_single_forward_request(request, self.max_num_tokens)
-
-    @override
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, Any],
-        num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> SampleState:
-        host = SampleStateTensors(new_tokens=torch.empty(0))
-        assert not scheduled_requests.generation_requests
-        return self.SampleState(requests=scheduled_requests.context_requests, host=host)
-
-    @override
-    def update_requests(
-        self,
-        state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        assert isinstance(state, SampleState)
-        requests = state.requests
-        for idx, request in enumerate(requests):
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            # NOTE: This is a hack: set finish reason manually and set the beam 0
-            request.set_finished_reason(FinishReason.LENGTH, 0)
-
-    @override
-    def is_generation_model(self) -> bool:
-        return False
 
 
 @dataclass(kw_only=True)

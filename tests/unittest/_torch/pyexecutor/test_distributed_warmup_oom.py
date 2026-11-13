@@ -8,7 +8,7 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
+from tensorrt_llm._torch.pyexecutor import hang_detector as hang_detector_module
 
 pytestmark = pytest.mark.cpu_only
 
@@ -18,11 +18,11 @@ def _guard_env(
     *, global_size: int, symmetric_crash: bool = False
 ) -> Iterator[tuple[mock.Mock, mock.Mock]]:
     with (
-        mock.patch.object(py_executor_module, "start_rank_crash_kill_watchdog") as watchdog,
-        mock.patch.object(py_executor_module, "propagate_hard_kill") as hard_kill,
-        mock.patch.object(py_executor_module, "global_mpi_size", return_value=global_size),
+        mock.patch.object(hang_detector_module, "start_rank_crash_kill_watchdog") as watchdog,
+        mock.patch.object(hang_detector_module, "propagate_hard_kill") as hard_kill,
+        mock.patch.object(hang_detector_module, "global_mpi_size", return_value=global_size),
         mock.patch.object(
-            py_executor_module, "all_ranks_crashed", return_value=symmetric_crash
+            hang_detector_module, "all_ranks_crashed", return_value=symmetric_crash
         ) as probe,
     ):
         yield watchdog, hard_kill, probe
@@ -31,7 +31,7 @@ def _guard_env(
 def _run_guard(*, world_size: int, dwdp_size: int, error: BaseException) -> None:
     dist = SimpleNamespace(world_size=world_size)
     mapping = SimpleNamespace(dwdp_enabled=dwdp_size > 1)
-    with py_executor_module._distributed_warmup_guard(dist, mapping):
+    with hang_detector_module.distributed_warmup_guard(dist, mapping):
         raise error
 
 

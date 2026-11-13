@@ -1229,8 +1229,9 @@ class BaseWorker(GenerationExecutor):
                 startup_metrics[model_engine_stage] = dict(model_engine_metrics)
         startup_metrics["py_executor"] = executor_metrics
 
-        model_engine = getattr(self.engine, "model_engine", None)
-        model_loader = getattr(model_engine, "model_loader", None)
+        # An executor without a model engine holds its loader itself.
+        loader_owner = getattr(self.engine, "model_engine", self.engine)
+        model_loader = getattr(loader_owner, "model_loader", None)
         if model_loader is not None:
             startup_metrics["model_loader"] = {
                 **model_loader.metrics,

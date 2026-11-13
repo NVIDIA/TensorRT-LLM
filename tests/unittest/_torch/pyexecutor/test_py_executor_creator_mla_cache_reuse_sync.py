@@ -322,7 +322,7 @@ def _run_create_py_executor(
     monkeypatch.setattr(
         py_executor_creator,
         "_load_config_and_create_checkpoint_loader",
-        lambda llm_args, checkpoint_dir: (llm_args, None),
+        lambda llm_args, checkpoint_dir: (llm_args, None, True),
     )
     monkeypatch.setattr(py_executor_creator, "_get_mapping", lambda _: fake_mapping)
     monkeypatch.setattr(

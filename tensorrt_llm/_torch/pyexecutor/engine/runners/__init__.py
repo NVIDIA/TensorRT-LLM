@@ -35,9 +35,6 @@ def resolve_runner_type(
     if llm_args.mm_encoder_only:
         return MultimodalEncoderRunner
 
-    if llm_args.encode_only or not model.model_config.is_generation:
-        return EncoderRunner
-
     if model.model_config.is_encoder_decoder:
         return EncoderDecoderRunner
 

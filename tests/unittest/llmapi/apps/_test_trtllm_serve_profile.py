@@ -123,7 +123,7 @@ def test_start_profile_backend_error_returns_500(server_with_mock_generator):
 def test_start_profile_double_start_returns_409(server_with_mock_generator, backend_message):
     """A rejected overlapping profile window maps to 409, not 500.
 
-    ``PyExecutorProfileManager.start_profile`` raises ``RequestError``
+    ``ProfileController.start_profile`` raises ``RequestError``
     (a ``RuntimeError`` subclass) when a window is already active or a
     start is already pending. The handler distinguishes that from a
     generic backend failure so callers can retry instead of treating it

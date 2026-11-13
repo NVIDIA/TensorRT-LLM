@@ -5,10 +5,11 @@
 
 import os
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .executor_request_queue import RequestQueueItem
+    from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
     from .scheduler import WaitingQueue
 
 import numpy as np
@@ -149,6 +150,26 @@ def get_from_waiting_queue(
     waiting_queue.mark_admitted(items)
 
     return items
+
+
+def drain_queued_items(
+    waiting_queue: "WaitingQueue", request_queue: "ExecutorRequestQueue"
+) -> Iterator["RequestQueueItem"]:
+    """Yield waiting items, then incoming items other than the shutdown signal."""
+    while waiting_queue:
+        yield waiting_queue.pop_request()
+
+    # Also drain executor_request_queue so items already queued
+    # but not yet fetched by the main loop are not scheduled
+    # after the CUDA context is corrupted. Safe to use empty()
+    # here because is_shutdown is True and the queue's active
+    # flag is about to be set False, so no new items arrive.
+    raw_queue = request_queue.get_request_queue()
+    while not raw_queue.empty():
+        item = raw_queue.get_nowait()
+        if item.is_shutdown_request:
+            continue
+        yield item
 
 
 def partition_context_for_helix(

@@ -364,7 +364,9 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
     def block_subordinates(self):
         if self.rank != 0:
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-            if isinstance(self.engine, PyExecutor):
+            from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import \
+                ScheduledEncoderExecutor
+            if isinstance(self.engine, (PyExecutor, ScheduledEncoderExecutor)):
                 self.engine.wait_shutdown()
 
 

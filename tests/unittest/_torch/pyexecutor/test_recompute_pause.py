@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
 from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN, PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 
@@ -35,7 +36,7 @@ def _make_executor(handler: Mock | None) -> PyExecutor:
     executor._disagg_coordinator = NoopDisaggCoordinator()
     executor.gather_all_responses = False
     executor.dist = types.SimpleNamespace(rank=0)
-    executor.result_wait_queues = {}
+    executor._response_channel = ResponseChannel()
     executor.active_requests = []
     return executor
 
@@ -70,7 +71,7 @@ def test_recompute_pause_defers_reset_until_pp_consensus() -> None:
     executor = _make_executor(handler)
     request = _StubRequest()
     executor.active_requests = [request]
-    executor.result_wait_queues[request.py_request_id] = Mock()
+    executor._response_channel.result_wait_queues[request.py_request_id] = Mock()
     scheduled_batch = ScheduledRequests()
     scheduled_batch.recompute_paused_requests = [request]
     events = []
@@ -85,7 +86,7 @@ def test_recompute_pause_defers_reset_until_pp_consensus() -> None:
     executor.sampler.release_request.assert_not_called()
     assert request.py_request_id in executor._pending_recompute_pause_ids
     assert request.py_request_id in executor.inflight_req_ids
-    assert request.py_request_id in executor.result_wait_queues
+    assert request.py_request_id in executor._response_channel.result_wait_queues
 
     executor._progress_recompute_pause_termination_if_idle(0)
     handler.terminate_pending_requests.assert_called_once_with()
@@ -96,7 +97,7 @@ def test_recompute_pause_defers_reset_until_pp_consensus() -> None:
     assert events == ["free", "reset"]
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids
-    assert request.py_request_id in executor.result_wait_queues
+    assert request.py_request_id in executor._response_channel.result_wait_queues
 
 
 def test_terminal_request_does_not_recompute_after_pp_consensus() -> None:
@@ -104,7 +105,7 @@ def test_terminal_request_does_not_recompute_after_pp_consensus() -> None:
     request = _StubRequest()
     request.is_finished = True
     executor.active_requests = [request]
-    executor.result_wait_queues[request.py_request_id] = Mock()
+    executor._response_channel.result_wait_queues[request.py_request_id] = Mock()
     executor._pending_recompute_pause_ids.add(request.py_request_id)
     executor.inflight_req_ids.insert(request.py_request_id)
 
@@ -115,4 +116,4 @@ def test_terminal_request_does_not_recompute_after_pp_consensus() -> None:
     request.reset_for_recompute.assert_not_called()
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids
-    assert request.py_request_id not in executor.result_wait_queues
+    assert request.py_request_id not in executor._response_channel.result_wait_queues

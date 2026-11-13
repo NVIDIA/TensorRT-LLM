@@ -1134,12 +1134,32 @@ class ModelLoader:
             checkpoint_dir: str, llm_args: TorchLlmArgs,
             checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
         """Load model config and apply model-specific defaults to llm_args."""
+        return ModelLoader.load_config_with_defaults(checkpoint_dir, llm_args,
+                                                     checkpoint_loader)[0]
+
+    @staticmethod
+    def load_config_with_defaults(
+        checkpoint_dir: str, llm_args: TorchLlmArgs,
+        checkpoint_loader: BaseCheckpointLoader
+    ) -> tuple[TorchLlmArgs, Optional[ModelConfig]]:
+        """Load the model config and apply its model-specific defaults to llm_args.
+
+        The config has ``model_kwargs`` applied, as model loading applies them.
+
+        Args:
+            checkpoint_dir: The checkpoint to read the config from.
+            llm_args: The arguments the defaults are applied to, in place.
+            checkpoint_loader: The loader that reads the config.
+
+        Returns:
+            ``llm_args``, and the loaded config, which is None without a checkpoint loader.
+        """
         if checkpoint_loader is None:
             # No config to resolve a model class from; still resolve the
             # "auto" sentinel so it never leaks past config loading.
             _resolve_transceiver_runtime_auto(llm_args)
             _resolve_kv_cache_manager_v2_auto(llm_args)
-            return llm_args
+            return llm_args, None
 
         config_kwargs = {
             'trust_remote_code': llm_args.trust_remote_code,
@@ -1234,7 +1254,7 @@ class ModelLoader:
                 model_cls.__name__
                 if model_cls is not None else "unknown model")
 
-        return llm_args
+        return llm_args, config
 
     @staticmethod
     def _needs_source_identity(checkpoint_loader: BaseCheckpointLoader,

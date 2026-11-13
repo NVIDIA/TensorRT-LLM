@@ -85,7 +85,7 @@ from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .runtime_hooks import runtime_hooks_of
-from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
+from .sampler import EarlyStopWithMMResult, TorchSampler
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
@@ -5164,9 +5164,6 @@ def instantiate_sampler(
                                                   and 0 in mapping.tp_group)
         return EarlyStopWithMMResult(return_mm_results=returns_responses,
                                      max_num_tokens=engine.max_num_tokens)
-    if not engine.model.model_config.is_generation:
-        # NOTE: choose sampler based on model type
-        return EarlyStopSampler(max_num_tokens=engine.max_num_tokens)
     return TorchSampler(sampler_args)
 
 

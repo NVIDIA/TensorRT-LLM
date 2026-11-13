@@ -443,6 +443,7 @@ def _worker(args: argparse.Namespace) -> None:
     from tensorrt_llm._torch.distributed.communicator import MPIDist
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
     from tensorrt_llm._torch.pyexecutor.resource_manager import (
         CacheTypeCpp,
         ResourceManager,
@@ -586,7 +587,9 @@ def _worker(args: argparse.Namespace) -> None:
     executor._prefetched_request_ids = {request.py_request_id}
     executor.gather_all_responses = False
     executor._disagg_pp_termination_handler = None
-    executor.result_wait_queues = {request.py_request_id: None} if rank == 0 else {}
+    executor._response_channel = ResponseChannel()
+    if rank == 0:
+        executor._response_channel.register([request.py_request_id], None)
     assert executor.disagg is not None
     _record(
         directory,
@@ -1005,7 +1008,7 @@ def _exercise_live_session(
     executor._terminate_request(request)
     executor.disagg._retire_cancelled_gen_receives()
     assert request.py_request_id not in executor._prefetched_request_ids
-    assert request.py_request_id not in executor.result_wait_queues
+    assert request.py_request_id not in executor._response_channel.result_wait_queues
     retired_pool = _pool_state(manager)
     assert retired_pool["free"] == retired_pool["available"] == 1, retired_pool
     replacement = _new_request(role, 4, rid + 3, "")

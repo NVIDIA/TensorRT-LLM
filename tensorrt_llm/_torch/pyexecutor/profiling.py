@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Runtime profiling controller for ``PyExecutor``.
+"""Runtime profiling for the PyTorch executors.
 
-The ``PyExecutorProfileManager`` owns the entire profile-state machine
-that backs the ``trtllm-serve`` ``/start_profile`` / ``/stop_profile``
-HTTP endpoints (and the equivalent programmatic
-``LLM.start_profile`` / ``LLM.stop_profile`` calls):
+The ``ProfileController`` owns the profile-state machine that backs the
+``trtllm-serve`` ``/start_profile`` / ``/stop_profile`` HTTP endpoints
+(and the equivalent programmatic ``LLM.start_profile`` /
+``LLM.stop_profile`` calls) as well as the ``TLLM_PROFILE_START_STOP`` /
+``TLLM_TORCH_PROFILE_TRACE`` environment variables:
 
 * ``start_profile`` / ``stop_profile`` — caller-thread entry points
   that schedule a profile window via the executor's request queue.
@@ -26,28 +27,25 @@ HTTP endpoints (and the equivalent programmatic
 * ``apply_start_config`` / ``apply_stop_config`` — replay the
   broadcasted config on every rank so all ranks fire the same start
   and stop iterations.
-* ``profile_step`` — context manager driving the per-iteration
-  ``torch.profiler`` / ``cudaProfilerStart`` / ``Stop`` calls. Runs
-  on the executor thread because torch.profiler / Kineto require
-  the start and stop calls to happen on the same thread.
+* ``iterations`` — context manager inside which the executor loop
+  calls ``end_iteration`` / ``begin_iteration`` once per iteration to
+  drive the ``torch.profiler`` / ``cudaProfilerStart`` / ``Stop``
+  calls. Runs on the executor thread because torch.profiler / Kineto
+  require the start and stop calls to happen on the same thread.
 * ``cleanup`` — best-effort tear-down on executor shutdown.
 
-The profile state itself (``profile_start_iters``, ``profile_stop_iters``,
-``_runtime_profile_*`` fields, ``_profile_state_lock``,
-``_profile_enabled``) lives on the ``PyExecutor`` instance so callers
-and unit tests can introspect it directly. The manager holds a weak
-reference back to the executor and operates on those fields. This
-keeps ``py_executor.py`` mostly orchestration / thin forwarding while
-isolating the lifecycle logic in this module for review.
+``PyExecutorProfileManager`` adds ``PyExecutor``'s per-iteration
+timing and iteration log around the controller's windows.
 """
 
 import functools
 import os
+import threading
 import time
 import uuid
 import weakref
 from contextlib import contextmanager
-from typing import Dict, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 import torch
 
@@ -104,36 +102,91 @@ def load_iteration_indexes(env_var: str):
     return frozenset(starts), frozenset(stops)
 
 
-class PyExecutorProfileManager:
-    """Owns the runtime-profiling state machine for ``PyExecutor``.
+class ProfileController:
+    """Profile windows scheduled by executor iteration, from the environment or at runtime.
 
-    Instantiated from ``PyExecutor.__init__`` after the executor has
-    populated ``profile_start_iters`` / ``profile_stop_iters`` /
-    ``_runtime_profile_*`` / ``_profile_state_lock`` /
-    ``_profile_enabled``. The manager keeps a ``weakref`` back to the
-    executor so it can read ``iter_counter``, ``is_warmup``,
-    ``executor_request_queue``, ``dist``, and ``global_rank`` on demand
-    without creating a cycle that defeats garbage collection.
+    One controller serves one executor. Callers on any thread schedule a
+    window with ``start_profile`` / ``stop_profile``; rank 0 broadcasts it
+    through the executor's request queue, and every rank applies it with
+    ``apply_start_config`` / ``apply_stop_config`` when the broadcast item
+    arrives, so all ranks open and close the window on the same iteration.
+    The executor thread drives the windows inside ``iterations()``.
 
-    All methods follow the same threading invariants as the inline
-    code they replace; see the per-method docstrings for details.
+    Args:
+        rank: This rank; rank 0 broadcasts, and trace files are named after it.
+        current_iteration: The executor's iteration counter, which advances
+            once per loop iteration.
+        is_warmup: Whether the executor is warming up; no window opens or
+            closes during warmup.
+        broadcast_start: Enqueue a profile-start item carrying a config.
+        broadcast_stop: Enqueue a profile-stop item.
     """
 
-    def __init__(self, executor: "PyExecutor") -> None:  # noqa: F821
-        self._executor_ref = weakref.ref(executor)
+    def __init__(
+        self,
+        *,
+        rank: int,
+        current_iteration: Callable[[], int],
+        is_warmup: Callable[[], bool],
+        broadcast_start: Callable[[dict], None],
+        broadcast_stop: Callable[[], None],
+    ) -> None:
+        self.rank = rank
+        self._current_iteration = current_iteration
+        self._is_warmup = is_warmup
+        self._broadcast_start = broadcast_start
+        self._broadcast_stop = broadcast_stop
 
-    # ---- helpers ---------------------------------------------------
+        # Runtime-configurable profiling state. Populated by start_profile()
+        # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
+        # or API calls. When these are None/False the window falls back to
+        # the environment-variable driven configuration.
+        self._runtime_profile_trace_path: Optional[str] = None
+        self._runtime_profile_activities: Optional[List[str]] = None
+        self._runtime_profile_cuda_only: bool = False
+        # Iteration markers added by the most recent runtime start_profile().
+        # Tracked so stop_profile() can cancel a start that has not fired
+        # yet (e.g. the caller stops before sending any requests) without
+        # leaking a pending profile window that would start later.
+        self._runtime_profile_pending_start_iter: Optional[int] = None
+        self._runtime_profile_pending_stop_iter: Optional[int] = None
+
+        # ``_profile_state_lock`` guards every read and write of
+        # ``_profile_enabled`` AND of the pending markers /
+        # ``_runtime_profile_*`` window fields above. Both the
+        # re-entrancy guard in ``start_profile()`` and the
+        # cancel-vs-schedule decision in ``apply_stop_config()`` depend
+        # on that combined state, and they race against the executor
+        # thread flipping the same fields inside ``iterations()``.
+        self._profile_state_lock = threading.Lock()
+        self._profile_enabled: bool = False
+
+        self.profile_start_iters: set[int] = set()
+        self.profile_stop_iters: set[int] = set()
+        self.reset_iterations()
+
+        # Window state owned by the executor thread inside ``iterations()``.
+        self._window_open = False
+        self._step = -1
+        self._calibrator = None
+        self._torch_profiler = None
+        self._active_torch_trace_path: Optional[str] = None
+        self._active_enable_torch_trace = False
+        self._env_torch_trace_path: Optional[str] = None
+        self._env_enable_torch_trace = False
 
     @property
-    def _executor(self) -> "PyExecutor":  # noqa: F821
-        ex = self._executor_ref()
-        if ex is None:
-            raise RuntimeError(
-                "PyExecutorProfileManager: owning PyExecutor has been "
-                "garbage collected; profile control calls are no longer "
-                "valid."
-            )
-        return ex
+    def enabled(self) -> bool:
+        """Whether a profile window is open; read without the lock, so it may lag one iteration."""
+        return self._profile_enabled
+
+    def reset_iterations(self) -> None:
+        """Schedule only the environment's windows, dropping runtime-scheduled iterations."""
+        start_iters, stop_iters = load_iteration_indexes(PROFILE_START_STOP_ENV_VAR_NAME)
+        # Mutable copies so start_profile()/stop_profile() can add
+        # runtime-configured iteration indices.
+        self.profile_start_iters = set(start_iters)
+        self.profile_stop_iters = set(stop_iters)
 
     @staticmethod
     def _activities_from_names(
@@ -184,7 +237,6 @@ class PyExecutorProfileManager:
         rejected immediately, then broadcasts the config on rank 0 via
         the executor's request queue so every rank sees the same start.
         """
-        executor = self._executor
         # Reject overlapping profile windows. Check locally on the
         # caller thread so the HTTP handler gets a clean error instead
         # of the executor thread crashing on ``assert not enabled``
@@ -201,9 +253,9 @@ class PyExecutorProfileManager:
         # broadcast a profile start, and the second
         # ``apply_start_config`` would overwrite the trace path and
         # activities of the first window.
-        with executor._profile_state_lock:
-            already_active = executor._profile_enabled
-            pending_start = executor._runtime_profile_pending_start_iter
+        with self._profile_state_lock:
+            already_active = self._profile_enabled
+            pending_start = self._runtime_profile_pending_start_iter
             claimed = not already_active and pending_start is None
             if claimed:
                 # Claim the window before releasing the lock. The
@@ -212,7 +264,7 @@ class PyExecutorProfileManager:
                 # is only populated once the broadcast reaches
                 # ``_handle_special_queue_items``. Every failure path
                 # below rolls the claim back under the same lock.
-                executor._runtime_profile_pending_start_iter = 0
+                self._runtime_profile_pending_start_iter = 0
 
         if not claimed:
             # Use ``RequestError`` (a ``RuntimeError`` subclass) so the
@@ -227,9 +279,9 @@ class PyExecutorProfileManager:
                 f"{already_active}, _runtime_profile_pending_start_iter="
                 f"{pending_start}, "
                 f"profile_start_iters="
-                f"{sorted(executor.profile_start_iters)[:5]}, "
+                f"{sorted(self.profile_start_iters)[:5]}, "
                 f"profile_stop_iters="
-                f"{sorted(executor.profile_stop_iters)[:5]})"
+                f"{sorted(self.profile_stop_iters)[:5]})"
             )
 
         started = False
@@ -253,10 +305,9 @@ class PyExecutorProfileManager:
         rollback is atomic with respect to a concurrent
         ``start_profile()`` / ``stop_profile()`` on another thread.
         """
-        executor = self._executor
-        with executor._profile_state_lock:
-            executor._runtime_profile_pending_start_iter = None
-            executor._runtime_profile_activities = None
+        with self._profile_state_lock:
+            self._runtime_profile_pending_start_iter = None
+            self._runtime_profile_activities = None
 
     def _prepare_and_broadcast_start(
         self,
@@ -272,7 +323,6 @@ class PyExecutorProfileManager:
         claim back through a single ``finally``. Must only be called
         once ``_runtime_profile_pending_start_iter`` has been claimed.
         """
-        executor = self._executor
 
         # Reject ``num_steps <= 0``. The HTTP layer already rejects
         # this via the ``StartProfileRequest`` Pydantic schema, but
@@ -345,8 +395,8 @@ class PyExecutorProfileManager:
         # The pending marker was already claimed by ``start_profile``;
         # publish the requested activities under the same lock so a
         # concurrent reader never observes a half-written window.
-        with executor._profile_state_lock:
-            executor._runtime_profile_activities = list(activities)
+        with self._profile_state_lock:
+            self._runtime_profile_activities = list(activities)
 
         # Broadcast to every rank via the request queue so non-zero
         # ranks update their own ``profile_start_iters`` in
@@ -357,11 +407,9 @@ class PyExecutorProfileManager:
         # ``_handle_special_queue_items`` — no forward pass runs for
         # this iteration, so the chrome trace captures only real
         # user workload).
-        rank = getattr(getattr(executor, "dist", None), "rank", 0)
-        eq = getattr(executor, "executor_request_queue", None)
-        if rank == 0 and eq is not None:
+        if self.rank == 0:
             try:
-                eq.enqueue_profile_start_request(profile_config)
+                self._broadcast_start(profile_config)
             except (RuntimeError, OSError, ValueError, AttributeError) as e:
                 # ``start_profile``'s ``finally`` rolls the pending
                 # markers back, so a subsequent ``start_profile()`` is
@@ -394,7 +442,6 @@ class PyExecutorProfileManager:
           when the engine would otherwise be idle (see
           ``OpenAIServer.stop_profile``).
         """
-        executor = self._executor
         # Apply locally so diagnostic state (profile_stop_iters,
         # pending_stop_iter) is visible on the caller thread
         # immediately. ``apply_stop_config`` decides atomically
@@ -410,11 +457,9 @@ class PyExecutorProfileManager:
         # the subordinates). Also wakes the idle executor loop on
         # rank 0; the broadcast then propagates the wake to all ranks
         # inside ``_fetch_and_enqueue_requests``.
-        rank = getattr(getattr(executor, "dist", None), "rank", 0)
-        eq = getattr(executor, "executor_request_queue", None)
-        if rank == 0 and eq is not None:
+        if self.rank == 0:
             try:
-                eq.enqueue_profile_stop_request()
+                self._broadcast_stop()
             except (RuntimeError, OSError, ValueError, AttributeError) as e:
                 # Subordinate ranks won't see the stop. Bail out
                 # with a real error rather than silently waiting on
@@ -435,8 +480,8 @@ class PyExecutorProfileManager:
         # to read the trace file would see an empty directory.
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
-            with executor._profile_state_lock:
-                if not executor._profile_enabled:
+            with self._profile_state_lock:
+                if not self._profile_enabled:
                     return
             time.sleep(0.005)
         logger.warning(
@@ -457,7 +502,6 @@ class PyExecutorProfileManager:
         arrives. The operation is idempotent: the second call on
         rank 0 sees the same state and is a no-op.
         """
-        executor = self._executor
         activities = config.get("activities") or ["CPU", "GPU"]
         # ``/tmp`` matches the documented developer default; see
         # ``start_profile`` for the rationale.
@@ -474,7 +518,7 @@ class PyExecutorProfileManager:
             start_iter = int(config["start_iter"])
         else:
             start_step = int(config.get("start_step", 0))
-            current_iter = int(getattr(executor, "iter_counter", 0))
+            current_iter = self._current_iteration()
             start_iter = current_iter + 1 + start_step
         num_steps = config.get("num_steps")
         stop_iter = config.get("stop_iter")
@@ -483,14 +527,14 @@ class PyExecutorProfileManager:
 
         # Rank-specific trace path so every rank writes its own file
         # when running with TP/PP > 1.
-        trace_filename = f"trtllm-trace-{profile_id}-rank-{executor.global_rank}.json"
+        trace_filename = f"trtllm-trace-{profile_id}-rank-{self.rank}.json"
         trace_path = os.path.join(output_dir, trace_filename)
 
         # Publish the whole window under ``_profile_state_lock`` so a
         # concurrent ``start_profile()`` / ``stop_profile()`` on a
         # caller thread never observes a half-applied window (this
         # method runs on the executor thread for the broadcast path).
-        with executor._profile_state_lock:
+        with self._profile_state_lock:
             # First apply on this rank? If the start_iter is already in
             # profile_start_iters it means either rank 0's local apply
             # ran (before the broadcast echo-back) or a prior broadcast
@@ -498,20 +542,20 @@ class PyExecutorProfileManager:
             # belongs to the original apply, and re-setting it here
             # would overwrite a subsequent clear by ``profile_step()``
             # and leak stale state.
-            is_first_apply = start_iter not in executor.profile_start_iters
+            is_first_apply = start_iter not in self.profile_start_iters
 
-            executor._runtime_profile_trace_path = trace_path
-            executor._runtime_profile_activities = list(activities)
-            executor._runtime_profile_cuda_only = (
+            self._runtime_profile_trace_path = trace_path
+            self._runtime_profile_activities = list(activities)
+            self._runtime_profile_cuda_only = (
                 len(activities) == 1 and activities[0].upper() == "CUDA_PROFILER"
             )
 
-            executor.profile_start_iters.add(start_iter)
+            self.profile_start_iters.add(start_iter)
             if is_first_apply:
-                executor._runtime_profile_pending_start_iter = start_iter
+                self._runtime_profile_pending_start_iter = start_iter
                 if stop_iter is not None:
-                    executor.profile_stop_iters.add(int(stop_iter))
-                    executor._runtime_profile_pending_stop_iter = int(stop_iter)
+                    self.profile_stop_iters.add(int(stop_iter))
+                    self._runtime_profile_pending_stop_iter = int(stop_iter)
                 # ``num_steps is None`` branch: leave pending_stop_iter
                 # alone — caller set it to None in start_profile.
             elif stop_iter is not None:
@@ -519,10 +563,10 @@ class PyExecutorProfileManager:
                 # or after the start has already fired. Only ensure the
                 # stop iter is in the set on this rank (idempotent);
                 # don't reset pending markers.
-                executor.profile_stop_iters.add(int(stop_iter))
+                self.profile_stop_iters.add(int(stop_iter))
 
         logger.info(
-            f"_apply_profile_start_config[rank={executor.global_rank}]: "
+            f"_apply_profile_start_config[rank={self.rank}]: "
             f"start_iter={start_iter}, stop_iter={stop_iter}, "
             f"activities={activities}, trace_path={trace_path}, "
             f"is_first_apply={is_first_apply}"
@@ -544,7 +588,6 @@ class PyExecutorProfileManager:
             flush), ``False`` when a stop iteration was scheduled for
             an active window.
         """
-        executor = self._executor
         # Fire condition inside profile_step(): stop iter matches
         # ``self.iter_counter`` at the top of the NEXT executor loop
         # iteration. ``iter_counter`` is incremented at the END of
@@ -554,33 +597,33 @@ class PyExecutorProfileManager:
         # between iterations (post-increment). One cancel-wake (or
         # the profile-stop broadcast item acting as a wake) is
         # enough to flush.
-        current_iter = getattr(executor, "iter_counter", 0)
+        current_iter = self._current_iteration()
         stop_iter = current_iter + 1
 
-        with executor._profile_state_lock:
-            currently_enabled = executor._profile_enabled
-            pending_start = executor._runtime_profile_pending_start_iter
+        with self._profile_state_lock:
+            currently_enabled = self._profile_enabled
+            pending_start = self._runtime_profile_pending_start_iter
             cancelled_pending_start = not currently_enabled and pending_start is not None
             if cancelled_pending_start:
-                pending_stop = executor._runtime_profile_pending_stop_iter
-                executor.profile_start_iters.discard(pending_start)
+                pending_stop = self._runtime_profile_pending_stop_iter
+                self.profile_start_iters.discard(pending_start)
                 if pending_stop is not None:
-                    executor.profile_stop_iters.discard(pending_stop)
-                executor._runtime_profile_pending_start_iter = None
-                executor._runtime_profile_pending_stop_iter = None
+                    self.profile_stop_iters.discard(pending_stop)
+                self._runtime_profile_pending_start_iter = None
+                self._runtime_profile_pending_stop_iter = None
             else:
-                executor.profile_stop_iters.add(stop_iter)
-                executor._runtime_profile_pending_stop_iter = stop_iter
+                self.profile_stop_iters.add(stop_iter)
+                self._runtime_profile_pending_stop_iter = stop_iter
 
         if cancelled_pending_start:
             logger.info(
-                f"_apply_profile_stop_config[rank={executor.global_rank}]: "
+                f"_apply_profile_stop_config[rank={self.rank}]: "
                 f"cancelled pending start at iteration {pending_start} "
                 "before it fired"
             )
         else:
             logger.info(
-                f"_apply_profile_stop_config[rank={executor.global_rank}]: "
+                f"_apply_profile_stop_config[rank={self.rank}]: "
                 f"scheduled stop at iteration {stop_iter}"
             )
         return cancelled_pending_start
@@ -588,22 +631,236 @@ class PyExecutorProfileManager:
     # ---- per-iteration driver (executor thread) --------------------
 
     @contextmanager
+    def iterations(self) -> Iterator[None]:
+        """Drive profile windows from the executor thread.
+
+        Inside the context the executor loop calls ``end_iteration`` and
+        then ``begin_iteration`` at the top of every iteration.
+        ``torch.profiler.start`` / ``stop`` MUST happen on the same
+        thread, so all of the per-iteration ``torch.profiler``
+        activations live here rather than on the HTTP-caller path. A
+        window still open when the context exits is stopped and its
+        trace exported.
+        """
+        env_torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
+        if env_torch_trace_path is not None:
+            # Append the rank so each rank writes to its own file.
+            # Without this, TP/PP/DP > 1 runs have every rank calling
+            # ``torch_profiler.export_chrome_trace()`` on the same
+            # path concurrently, producing interleaved output that
+            # fails to parse in Chrome tracing / Perfetto.
+            trace_base, trace_ext = os.path.splitext(env_torch_trace_path)
+            env_torch_trace_path = f"{trace_base}-rank-{self.rank}{trace_ext}"
+        profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME, None)
+        self._env_torch_trace_path = env_torch_trace_path
+        self._env_enable_torch_trace = bool(env_torch_trace_path and profile_start_stop)
+        if env_torch_trace_path and profile_start_stop is None:
+            logger.warning(
+                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
+                "needs to be set to enable the torch trace. Example to "
+                f"profile iteration 10-20: export "
+                f"{PROFILE_START_STOP_ENV_VAR_NAME}=10-20"
+            )
+
+        # ``torch_profiler`` is created lazily on the first start
+        # iteration so it can pick up runtime-configured trace paths
+        # / activity lists set via ``start_profile()``. The following
+        # fields track the active configuration for the current
+        # profiling window.
+        self._torch_profiler = None
+        self._active_torch_trace_path = None
+        self._active_enable_torch_trace = False
+        self._window_open = False
+        self._step = -1
+        self._calibrator = get_calibrator()
+        # Make sure ``_profile_enabled`` starts cleared for a fresh
+        # executor run (in case the instance is re-entered).
+        with self._profile_state_lock:
+            self._profile_enabled = False
+
+        try:
+            yield
+        finally:
+            if self._window_open:
+                # Stop on early exit / exception
+                self._stop_window()
+                with self._profile_state_lock:
+                    self._profile_enabled = False
+
+    def end_iteration(self) -> None:
+        """Close the open window if the current iteration is its stop iteration."""
+        self._calibrator.post_step(self._step)
+        iteration = self._current_iteration()
+        if iteration in self.profile_stop_iters and not self._is_warmup():
+            if not self._window_open:
+                # Happens when stop_profile() was called before
+                # the scheduled start_iter was reached (e.g.
+                # the user calls /start_profile then
+                # /stop_profile quickly while the engine is
+                # still warming up).  Silently drop the stale
+                # stop marker so we do not crash the event
+                # loop.
+                logger.warning(
+                    f"profile stop scheduled at iter "
+                    f"{iteration} but no active "
+                    "profiling window - skipping"
+                )
+                self.profile_stop_iters.discard(iteration)
+            else:
+                self._stop_window()
+                self._window_open = False
+                # Reset lazy state so a subsequent start/stop
+                # window can pick up a fresh runtime
+                # configuration.
+                self._torch_profiler = None
+                self._active_torch_trace_path = None
+                with self._profile_state_lock:
+                    self._profile_enabled = False
+                    # Clear the pending-stop marker so
+                    # ``start_profile()``'s guard no longer sees a
+                    # stale window. Same critical section as
+                    # ``_profile_enabled`` so a caller thread
+                    # cannot observe "not enabled but still
+                    # pending" and reject a legitimate restart.
+                    if self._runtime_profile_pending_stop_iter == iteration:
+                        self._runtime_profile_pending_stop_iter = None
+            self._active_enable_torch_trace = False
+
+    def begin_iteration(self) -> None:
+        """Open a window if the current iteration is a start iteration, then start the step."""
+        self._step += 1
+        iteration = self._current_iteration()
+        if iteration in self.profile_start_iters and not self._is_warmup():
+            assert not self._window_open, "Inconsistent CUDA profiling state"
+            # Resolve active trace path + torch.profiler
+            # configuration at start time so runtime overrides
+            # from ``start_profile()`` take precedence over the
+            # environment variables.
+            runtime_trace_path = self._runtime_profile_trace_path
+            runtime_cuda_only = self._runtime_profile_cuda_only
+            runtime_activities = self._runtime_profile_activities
+            if runtime_trace_path is not None:
+                self._active_torch_trace_path = runtime_trace_path
+                # CUDA_PROFILER only: skip torch.profiler so we
+                # do not pay its overhead and so nsys traces
+                # stay clean.
+                self._active_enable_torch_trace = not runtime_cuda_only
+                torch_activities = self._activities_from_names(runtime_activities)
+                if self._active_enable_torch_trace and not torch_activities:
+                    # Runtime requested only CUDA_PROFILER even
+                    # though cuda_only was False; treat as
+                    # cuda-only.
+                    self._active_enable_torch_trace = False
+            else:
+                self._active_torch_trace_path = self._env_torch_trace_path
+                self._active_enable_torch_trace = self._env_enable_torch_trace
+                torch_activities = [
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                    torch.profiler.ProfilerActivity.XPU,
+                ]
+
+            self._calibrator.start()
+            torch.cuda.cudart().cudaProfilerStart()
+            if self._active_enable_torch_trace:
+                if self._torch_profiler is None:
+                    self._torch_profiler = torch.profiler.profile(
+                        activities=torch_activities, record_shapes=True, with_modules=True
+                    )
+                self._torch_profiler.start()
+            logger.info(f"Profiling started at iteration {iteration}.")
+            self._window_open = True
+            with self._profile_state_lock:
+                self._profile_enabled = True
+                # The scheduled start has arrived; clear the
+                # pending marker so the next ``start_profile()``
+                # after this window ends is not rejected as
+                # "already pending". Same critical section as
+                # ``_profile_enabled`` so the two markers always
+                # flip together from a caller thread's view.
+                if self._runtime_profile_pending_start_iter == iteration:
+                    self._runtime_profile_pending_start_iter = None
+
+        # Notify host line profiler of iteration for
+        # iteration-aware profiling.
+        host_profiler = get_global_profiler()
+        if host_profiler is not None:
+            host_profiler.notify_iteration(iteration)
+
+        self._calibrator.pre_step(self._step)
+
+    def _stop_window(self) -> None:
+        if self._active_enable_torch_trace and self._torch_profiler is not None:
+            self._torch_profiler.stop()
+            self._torch_profiler.export_chrome_trace(self._active_torch_trace_path)
+            logger.info(
+                f"Profiling stopped at iteration "
+                f"{self._current_iteration()}, "
+                f"trace saved to {self._active_torch_trace_path}"
+            )
+        torch.cuda.cudart().cudaProfilerStop()
+        self._calibrator.stop()
+
+    # ---- shutdown --------------------------------------------------
+
+    def cleanup(self) -> None:
+        """Best-effort shutdown of any active profile window.
+
+        Called during executor shutdown when an HTTP caller forgot to
+        issue a matching ``stop_profile()``. Idempotent and never
+        raises -- shutdown must continue even if the underlying
+        ``torch.profiler`` / ``cudaProfilerStop`` fails.
+        """
+        try:
+            with self._profile_state_lock:
+                still_active = self._profile_enabled
+                self._profile_enabled = False
+        except Exception:  # pragma: no cover - defensive
+            still_active = False
+        if not still_active:
+            return
+        try:
+            torch.cuda.cudart().cudaProfilerStop()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"profile cleanup: cudaProfilerStop failed: {e!r}")
+
+
+class PyExecutorProfileManager:
+    """PyExecutor's per-iteration timing and iteration log, around its profile windows.
+
+    The executor loop calls the step that ``profile_step`` yields once per
+    iteration. The step closes and opens profile windows through the
+    executor's ``ProfileController``, and in between records the
+    iteration's host and device time for iteration stats and the
+    ``print_iter_log`` line. The manager keeps a ``weakref`` back to the
+    executor so it can read its counters on demand without creating a
+    cycle that defeats garbage collection.
+    """
+
+    def __init__(self, executor: "PyExecutor") -> None:  # noqa: F821
+        self._executor_ref = weakref.ref(executor)
+
+    @property
+    def _executor(self) -> "PyExecutor":  # noqa: F821
+        ex = self._executor_ref()
+        if ex is None:
+            raise RuntimeError(
+                "PyExecutorProfileManager: owning PyExecutor has been "
+                "garbage collected; profile control calls are no longer "
+                "valid."
+            )
+        return ex
+
+    @contextmanager
     def profile_step(self):
         """Context manager driving per-iteration profile bookkeeping.
 
-        Replaces the inline ``_profiler()`` context manager that used
-        to live on ``PyExecutor``. Yields a callable
-        (``profile_step``) the executor loop invokes once per
-        iteration.
-
-        Runs on the executor thread; ``torch.profiler.start`` /
-        ``stop`` MUST happen on the same thread, so all of the
-        per-iteration ``torch.profiler`` activations live here
-        rather than on the HTTP-caller path.
+        Yields a callable (``profile_step``) the executor loop invokes
+        once per iteration, on the executor thread.
         """
         executor = self._executor
+        controller = executor._profile_controller
         it = -1
-        enabled = False
         start_time = None
 
         # These events are used to record the time of the previous
@@ -633,38 +890,6 @@ class PyExecutorProfileManager:
         kv_util_str = "N/A"
         kv_util_iter = None
 
-        env_torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
-        if env_torch_trace_path is not None:
-            # Append the rank so each rank writes to its own file.
-            # Without this, TP/PP/DP > 1 runs have every rank calling
-            # ``torch_profiler.export_chrome_trace()`` on the same
-            # path concurrently, producing interleaved output that
-            # fails to parse in Chrome tracing / Perfetto.
-            trace_base, trace_ext = os.path.splitext(env_torch_trace_path)
-            env_torch_trace_path = f"{trace_base}-rank-{executor.global_rank}{trace_ext}"
-        profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME, None)
-        env_enable_torch_trace = bool(env_torch_trace_path and profile_start_stop)
-        if env_torch_trace_path and profile_start_stop is None:
-            logger.warning(
-                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
-                "needs to be set to enable the torch trace. Example to "
-                f"profile iteration 10-20: export "
-                f"{PROFILE_START_STOP_ENV_VAR_NAME}=10-20"
-            )
-
-        # ``torch_profiler`` is created lazily on the first start
-        # iteration so it can pick up runtime-configured trace paths
-        # / activity lists set via ``start_profile()``. The following
-        # variables track the active configuration for the current
-        # profiling window.
-        torch_profiler = None
-        active_torch_trace_path: Optional[str] = None
-        active_enable_torch_trace: bool = False
-        # Make sure ``_profile_enabled`` starts cleared for a fresh
-        # executor run (in case the instance is re-entered).
-        with executor._profile_state_lock:
-            executor._profile_enabled = False
-
         log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
         if log_ranks_str.strip().lower() == "all":
             log_all_ranks = True
@@ -673,65 +898,13 @@ class PyExecutorProfileManager:
             log_all_ranks = False
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
 
-        calibrator = get_calibrator()
-
-        # Local helper so the inner closure does not need to call
-        # ``self._activities_from_names`` which would force a
-        # method-name lookup per iteration.
-        activities_from_names = self._activities_from_names
-
         def profile_step_fn():
-            nonlocal it, enabled, start_time
+            nonlocal it, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
             nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
             nonlocal boundary_count
             nonlocal kv_util_str, kv_util_iter
-            nonlocal torch_profiler, active_torch_trace_path
-            nonlocal active_enable_torch_trace
-            calibrator.post_step(it)
-            if executor.iter_counter in executor.profile_stop_iters and not executor.is_warmup:
-                if not enabled:
-                    # Happens when stop_profile() was called before
-                    # the scheduled start_iter was reached (e.g.
-                    # the user calls /start_profile then
-                    # /stop_profile quickly while the engine is
-                    # still warming up).  Silently drop the stale
-                    # stop marker so we do not crash the event
-                    # loop.
-                    logger.warning(
-                        f"profile stop scheduled at iter "
-                        f"{executor.iter_counter} but no active "
-                        "profiling window - skipping"
-                    )
-                    executor.profile_stop_iters.discard(executor.iter_counter)
-                else:
-                    if active_enable_torch_trace and torch_profiler is not None:
-                        torch_profiler.stop()
-                        torch_profiler.export_chrome_trace(active_torch_trace_path)
-                        logger.info(
-                            f"Profiling stopped at iteration "
-                            f"{executor.iter_counter}, "
-                            f"trace saved to {active_torch_trace_path}"
-                        )
-                    torch.cuda.cudart().cudaProfilerStop()
-                    calibrator.stop()
-                    enabled = False
-                    # Reset lazy state so a subsequent start/stop
-                    # window can pick up a fresh runtime
-                    # configuration.
-                    torch_profiler = None
-                    active_torch_trace_path = None
-                    with executor._profile_state_lock:
-                        executor._profile_enabled = False
-                        # Clear the pending-stop marker so
-                        # ``start_profile()``'s guard no longer sees a
-                        # stale window. Same critical section as
-                        # ``_profile_enabled`` so a caller thread
-                        # cannot observe "not enabled but still
-                        # pending" and reject a legitimate restart.
-                        if executor._runtime_profile_pending_stop_iter == executor.iter_counter:
-                            executor._runtime_profile_pending_stop_iter = None
-                active_enable_torch_trace = False
+            controller.end_iteration()
 
             # Capture per-loop timing whenever stats or the iter log
             # are enabled. The reading of the OTHER parity's event
@@ -826,64 +999,7 @@ class PyExecutorProfileManager:
             executor._iter_adp_dummy_gen_tokens = 0
             it += 1
 
-            if executor.iter_counter in executor.profile_start_iters and not executor.is_warmup:
-                assert not enabled, "Inconsistent CUDA profiling state"
-                # Resolve active trace path + torch.profiler
-                # configuration at start time so runtime overrides
-                # from ``start_profile()`` take precedence over the
-                # environment variables.
-                runtime_trace_path = executor._runtime_profile_trace_path
-                runtime_cuda_only = executor._runtime_profile_cuda_only
-                runtime_activities = executor._runtime_profile_activities
-                if runtime_trace_path is not None:
-                    active_torch_trace_path = runtime_trace_path
-                    # CUDA_PROFILER only: skip torch.profiler so we
-                    # do not pay its overhead and so nsys traces
-                    # stay clean.
-                    active_enable_torch_trace = not runtime_cuda_only
-                    torch_activities = activities_from_names(runtime_activities)
-                    if active_enable_torch_trace and not torch_activities:
-                        # Runtime requested only CUDA_PROFILER even
-                        # though cuda_only was False; treat as
-                        # cuda-only.
-                        active_enable_torch_trace = False
-                else:
-                    active_torch_trace_path = env_torch_trace_path
-                    active_enable_torch_trace = env_enable_torch_trace
-                    torch_activities = [
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                        torch.profiler.ProfilerActivity.XPU,
-                    ]
-
-                calibrator.start()
-                torch.cuda.cudart().cudaProfilerStart()
-                if active_enable_torch_trace:
-                    if torch_profiler is None:
-                        torch_profiler = torch.profiler.profile(
-                            activities=torch_activities, record_shapes=True, with_modules=True
-                        )
-                    torch_profiler.start()
-                logger.info(f"Profiling started at iteration {executor.iter_counter}.")
-                enabled = True
-                with executor._profile_state_lock:
-                    executor._profile_enabled = True
-                    # The scheduled start has arrived; clear the
-                    # pending marker so the next ``start_profile()``
-                    # after this window ends is not rejected as
-                    # "already pending". Same critical section as
-                    # ``_profile_enabled`` so the two markers always
-                    # flip together from a caller thread's view.
-                    if executor._runtime_profile_pending_start_iter == executor.iter_counter:
-                        executor._runtime_profile_pending_start_iter = None
-
-            # Notify host line profiler of iteration for
-            # iteration-aware profiling.
-            host_profiler = get_global_profiler()
-            if host_profiler is not None:
-                host_profiler.notify_iteration(executor.iter_counter)
-
-            calibrator.pre_step(it)
+            controller.begin_iteration()
             start_time = time.time()
             if should_capture_timing and not one_timing_event:
                 if it % 2 == 0:
@@ -895,46 +1011,11 @@ class PyExecutorProfileManager:
                         start_event_2 = torch.cuda.Event(enable_timing=True)
                     start_event_2.record()
 
-        try:
+        with controller.iterations():
             yield profile_step_fn
-        finally:
-            if enabled:
-                # Stop on early exit / exception
-                if active_enable_torch_trace and torch_profiler is not None:
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(active_torch_trace_path)
-                    logger.info(
-                        f"Profiling stopped at iteration "
-                        f"{executor.iter_counter}, "
-                        f"trace saved to {active_torch_trace_path}"
-                    )
-                torch.cuda.cudart().cudaProfilerStop()
-                calibrator.stop()
-                with executor._profile_state_lock:
-                    executor._profile_enabled = False
-
-    # ---- shutdown --------------------------------------------------
 
     def cleanup(self) -> None:
-        """Best-effort shutdown of any active profile window.
-
-        Called during ``PyExecutor.shutdown()`` when an HTTP caller
-        forgot to issue a matching ``stop_profile()``. Idempotent
-        and never raises -- shutdown must continue even if the
-        underlying ``torch.profiler`` / ``cudaProfilerStop`` fails.
-        """
+        """Best-effort shutdown of any active profile window; see ``ProfileController.cleanup``."""
         executor = self._executor_ref()
-        if executor is None:
-            return
-        try:
-            with executor._profile_state_lock:
-                still_active = executor._profile_enabled
-                executor._profile_enabled = False
-        except Exception:  # pragma: no cover - defensive
-            still_active = False
-        if not still_active:
-            return
-        try:
-            torch.cuda.cudart().cudaProfilerStop()
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug(f"profile cleanup: cudaProfilerStop failed: {e!r}")
+        if executor is not None:
+            executor._profile_controller.cleanup()

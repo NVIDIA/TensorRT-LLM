@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import torch
 from utils.util import skip_ray
 
 from tensorrt_llm import LLM
@@ -9,8 +10,8 @@ from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .test_llm import (_test_llm_capture_request_error, llama_model_path,
-                       llm_get_stats_async_test_harness,
+from .test_llm import (_test_llm_capture_request_error, get_model_path,
+                       llama_model_path, llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness,
                        tinyllama_logits_processor_test_harness)
@@ -155,3 +156,48 @@ def test_llm_get_stats_async_tp2():
 @pytest.mark.gpu2
 def test_llm_get_stats_async_pp2():
     llm_get_stats_async_test_harness(pp_size=2, pytorch_backend=True)
+
+
+@skip_ray
+@pytest.mark.gpu2
+def test_scheduled_pooling_tp2():
+    llm_kwargs = dict(model=get_model_path("Qwen3/Qwen3-Embedding-0.6B"),
+                      model_kwargs={"architectures": ["Qwen3ForTextEmbedding"]},
+                      max_seq_len=2048,
+                      max_batch_size=1)
+    prompts = [
+        "Hello, my name is", "The president of the United States is",
+        "The capital of France is", "The future of AI is"
+    ]
+    params = SamplingParams(max_tokens=1, return_context_logits=True)
+
+    with LLM(**llm_kwargs, tensor_parallel_size=2) as llm:
+        sharded = [
+            output.context_logits.float().cpu()
+            for output in llm.generate(prompts, sampling_params=params)
+        ]
+        futures = [
+            llm.generate_async(prompts[i % len(prompts)],
+                               sampling_params=params) for i in range(50)
+        ]
+        futures[-1].abort()
+        finished = [
+            future.result(timeout=60).outputs[0].finish_reason
+            for future in futures
+        ]
+        # A forward after the abort runs on both ranks only if they dropped the same request.
+        after_abort = llm.generate(prompts[:1], sampling_params=params)
+    with LLM(**llm_kwargs) as llm:
+        single = [
+            output.context_logits.float().cpu()
+            for output in llm.generate(prompts, sampling_params=params)
+        ]
+
+    # The abort may land before or after the request's forward.
+    assert finished[:-1] == ["length"] * 49
+    assert finished[-1] in ("cancelled", "length")
+    sharded.append(after_abort[0].context_logits.float().cpu())
+    for got, expected in zip(sharded, single + single[:1]):
+        assert torch.nn.functional.cosine_similarity(got.flatten(),
+                                                     expected.flatten(),
+                                                     dim=0) > 0.999

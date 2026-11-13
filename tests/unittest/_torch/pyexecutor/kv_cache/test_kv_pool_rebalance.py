@@ -43,6 +43,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager, OutOfPagesError
 
@@ -541,9 +542,7 @@ class TestConsumePreviousBatch:
             exe.dist.world_size = 2
             exe.dist.mapping.tp_group = [0, 1]
             exe.gather_all_responses = False
-            exe.responses = {}
-            exe.response_cv = MagicMock()
-            exe.result_wait_queues = {}
+            exe._response_channel = ResponseChannel()
             exe._pending_transfer_responses = []
             exe._pending_response_terminations = []
             exe._is_preemption_pending.return_value = False
@@ -622,8 +621,10 @@ class TestConsumePreviousBatch:
         expected_calls = ["transfer", "response"] + (["events"] if enable_events else [])
         assert transcripts == [expected_calls, expected_calls]
         assert batch_order == expected_batch_order
-        assert executors[0].responses == {rank + 1: [responses[rank]] for rank in batch_ranks}
-        assert executors[1].responses == {}
+        assert executors[0]._response_channel.responses == {
+            rank + 1: [responses[rank]] for rank in batch_ranks
+        }
+        assert executors[1]._response_channel.responses == {}
         for rank, exe in enumerate(executors):
             assert exe.previous_batch is None
             assert exe._pending_transfer_responses == []
@@ -1177,7 +1178,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe._pending_recompute_pause_ids = set()
     # The loop wraps forward+sample in ``_step_scope()``, which reads this to
     # decide whether to open a profiler range. False keeps it at nullcontext.
-    exe._profile_enabled = False
+    exe._profile_controller = MagicMock(enabled=False)
 
     # Rebalance state uses the executor's global KV manager gate.
     exe._is_kv_manager_v2 = True

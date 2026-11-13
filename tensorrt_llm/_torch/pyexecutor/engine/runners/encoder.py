@@ -35,7 +35,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunnerConfig,
     EncoderKeyType,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.utils import torch_multi_arange, with_model_extra_attrs
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (
@@ -956,13 +956,7 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
     def warmup(self, resource_manager: ResourceManager | None = None) -> None:
-        if resource_manager is not None:
-            kv_cache_manager = resource_manager.get_resource_manager(
-                ResourceManagerType.KV_CACHE_MANAGER
-            )
-            assert kv_cache_manager is None, (
-                "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
-            )
+        del resource_manager
         AutoTuner.get()
         max_shape = (
             self._config.max_batch_size,

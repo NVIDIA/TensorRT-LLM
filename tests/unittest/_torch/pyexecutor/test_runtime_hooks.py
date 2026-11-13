@@ -21,6 +21,7 @@ import pytest
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     ExecutorEvents,
@@ -713,7 +714,7 @@ def _cleanup_executor(events, completed: bool):
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = PyExecutor.__new__(PyExecutor)
-    executor.response_cv = threading.Condition()
+    executor._response_channel = ResponseChannel()
     executor.shutdown_event = threading.Event()
     executor.num_micro_batches = 0
     executor._event_loop_completed = completed

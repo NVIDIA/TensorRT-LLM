@@ -30,9 +30,9 @@ except ImportError:
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
-                                 global_mpi_size, is_trace_enabled, mpi_comm,
-                                 mpi_disabled, nvtx_range,
-                                 set_thread_local_mpi_comm, trace_func)
+                                 is_trace_enabled, mpi_comm, mpi_disabled,
+                                 nvtx_range, set_thread_local_mpi_comm,
+                                 trace_func)
 # yapf: disable
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
@@ -55,7 +55,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
@@ -98,7 +98,7 @@ from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import (HangDetector, all_ranks_crashed,
+from .hang_detector import (HangDetector, distributed_warmup_guard,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
@@ -118,11 +118,12 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
-from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
-from .profiling import load_iteration_indexes as _load_iteration_indexes
+from .profiling import ProfileController, PyExecutorProfileManager
+from .request_delivery import ResponseChannel
 from .request_utils import (RequestBroadcaster,
                             derive_attention_dp_per_rank_request_cap,
-                            get_from_waiting_queue, merge_requests)
+                            drain_queued_items, get_from_waiting_queue,
+                            merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, is_context_only_kv_cache,
                                request_context)
@@ -476,56 +477,6 @@ def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
                                         time.monotonic() + timeout_s)
 
 
-@contextmanager
-def _distributed_warmup_guard(dist: Distributed,
-                              mapping: Mapping) -> Iterator[None]:
-    """Arm the rank-crash watchdog when warmup fails on a subset of ranks.
-
-    Warmup runs from ``PyExecutor.__init__``, before the executor loop and so
-    before ``_event_loop_wrapper`` arms this watchdog itself. A rank that
-    raises here leaves every peer blocked in a warmup collective it will
-    never join, until that peer's own HangDetector times out.
-
-    The watchdog's grace period is what keeps the failure diagnosable: the
-    worker's setup/RPC error path reports the exception before the abort
-    tears the world down, and ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` tunes it.
-
-    ``SystemExit`` / ``KeyboardInterrupt`` are excluded for the same reason
-    ``_event_loop_wrapper`` leaves them unarmed: they are teardown signals
-    the launcher is already acting on, and an MPI_Abort on top would turn a
-    clean Ctrl-C into exit 137.
-
-    A SYMMETRIC crash -- every rank raising out of warmup, e.g. an OOM every
-    rank hits at the same allocation -- arms no watchdog at all: the
-    ``all_ranks_crashed`` probe proves nobody is stranded in a collective, so
-    the error can propagate through the worker's setup/RPC path and the serve
-    front end can tear the world down cleanly. This matters because the kill
-    armed here (``error_delivered=None``) cannot be suppressed, and in the
-    launcher-spawned (mgmn) deployment the rank processes host a persistent
-    MPI task loop that legitimately outlives a failed engine.
-
-    Peer count spans the model communicator and ``MPI.COMM_WORLD``: DWDP
-    peers live only in the latter, while a TorchDist launch can have several
-    model ranks in a single-process MPI world. The symmetric-crash probe only
-    trusts a communicator that spans the whole peer count, so a DWDP mismatch
-    falls back to arming the watchdog.
-    """
-    try:
-        yield
-    except Exception:
-        if dist.world_size > 1 or mapping.dwdp_enabled:
-            world = max(dist.world_size, global_mpi_size())
-            if all_ranks_crashed(world):
-                logger.error(
-                    f"Warmup failed on all {world} ranks (symmetric crash): "
-                    "no peer is stranded in a collective, so the cross-rank "
-                    "hard kill is not armed and the error propagates to a "
-                    "clean shutdown.")
-            else:
-                start_rank_crash_kill_watchdog(world, error_delivered=None)
-        raise
-
-
 @dataclasses.dataclass
 class ScheduledBatchStats:
     # None means the counter was not captured and _update_iter_stats should
@@ -770,43 +721,17 @@ class PyExecutor:
 
         self.peft_cache_config = peft_cache_config
 
-        # Runtime-configurable profiling state. Populated by start_profile()
-        # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
-        # or API calls. When these are None/False the _profiler() context
-        # falls back to the environment-variable driven configuration.
-        self._runtime_profile_trace_path: Optional[str] = None
-        self._runtime_profile_activities: Optional[List[str]] = None
-        self._runtime_profile_cuda_only: bool = False
-        # Iteration markers added by the most recent runtime start_profile().
-        # Tracked so stop_profile() can cancel a start that has not fired
-        # yet (e.g. the caller stops before sending any requests) without
-        # leaking a pending profile window that would start later.
-        self._runtime_profile_pending_start_iter: Optional[int] = None
-        self._runtime_profile_pending_stop_iter: Optional[int] = None
-
-        # Mirrors the in-loop profile window state (maintained by
-        # ``_profiler()``) so external callers can query whether a profile
-        # is currently active. torch.profiler is not thread-safe so we do
-        # NOT call .stop() from other threads; ``stop_profile()`` schedules
-        # the iteration-scoped stop and (when triggered via an HTTP
-        # handler) the server tickles the executor loop so the stop fires
-        # even when the engine is otherwise idle.
-        #
-        # ``_profile_state_lock`` guards every read and write of
-        # ``_profile_enabled`` AND of the pending markers /
-        # ``_runtime_profile_*`` window fields above. Both the
-        # re-entrancy guard in ``start_profile()`` and the
-        # cancel-vs-schedule decision in ``apply_stop_config()`` depend
-        # on that combined state, and they race against the executor
-        # thread flipping the same fields inside ``profile_step``.
-        self._profile_state_lock = threading.Lock()
-        self._profile_enabled: bool = False
-
-        # The profile-state machine (start/stop scheduling, broadcast
-        # apply, per-iteration torch.profiler driver) lives in the
-        # ``PyExecutorProfileManager``. ``PyExecutor`` keeps the state
-        # fields above on ``self`` for backward-compat introspection;
-        # the manager operates on those fields via a weakref.
+        # Profile windows (runtime start_profile()/stop_profile() and the
+        # TLLM_PROFILE_START_STOP environment variable) live in the
+        # controller; the manager adds per-iteration timing and the
+        # iteration log around them.
+        self._profile_controller = ProfileController(
+            rank=self.global_rank,
+            current_iteration=lambda: self.iter_counter,
+            is_warmup=lambda: self.is_warmup,
+            broadcast_start=self._broadcast_profile_start,
+            broadcast_stop=self._broadcast_profile_stop,
+        )
         self._profile_manager = PyExecutorProfileManager(self)
 
         self.model_engine = model_engine
@@ -894,14 +819,7 @@ class PyExecutor:
                                      disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
-        # profile config
-        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
-            PROFILE_START_STOP_ENV_VAR_NAME)
-        # Convert to mutable sets so start_profile()/stop_profile() can
-        # .add() runtime-configured iteration indices.
-        # _load_iteration_indexes returns frozensets.
-        self.profile_start_iters = set(_env_start_iters)
-        self.profile_stop_iters = set(_env_stop_iters)
+        self._profile_controller.reset_iterations()
 
         self._metrics = {}
         self._disagg_coordinator = None
@@ -1056,11 +974,7 @@ class PyExecutor:
             self._dspark_cost_profiler = DSparkCostProfiler.from_env(
                 rank=getattr(self.dist, "rank", 0) if self.dist else 0)
 
-        # response used data
-        self.response_lock = threading.Lock()
-        self.response_cv = threading.Condition(self.response_lock)
-        self.responses = {}
-        self.result_wait_queues = {}
+        self._response_channel = ResponseChannel()
         # If the event-loop thread (PyExecutor._event_loop_wrapper) raises
         # an exception (e.g. KV cache OOM), it is stashed here and read by
         # two local consumers so they can surface it instead of hanging:
@@ -1341,7 +1255,7 @@ class PyExecutor:
         with self.warmup_scope():
             self.execution_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.execution_stream), \
-                    _distributed_warmup_guard(self.dist, self.dist.mapping):
+                    distributed_warmup_guard(self.dist, self.dist.mapping):
                 self.model_engine.warmup(self.resource_manager)
                 if self.draft_model_engine is not None:
                     self.draft_model_engine.warmup(self.resource_manager)
@@ -1354,7 +1268,7 @@ class PyExecutor:
                 # The model's actions after warmup and graph capture, on every
                 # rank (some are collective, so every rank reaches this point,
                 # and a rank-local failure arms the rank-crash watchdog).
-                with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                with distributed_warmup_guard(self.dist, self.dist.mapping):
                     self._executor_events.after_warmup()
             self.encoder_launch_executor = (ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="encoder-launch") if
@@ -1364,7 +1278,7 @@ class PyExecutor:
                 # CUDA graph capture inherits per-thread CUDA library state. Capture
                 # on the same single worker that owns every runtime encoder replay.
                 self.encoder_stream.wait_stream(self.execution_stream)
-                with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                with distributed_warmup_guard(self.dist, self.dist.mapping):
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
@@ -2328,9 +2242,7 @@ class PyExecutor:
         """
         req_ids = self.executor_request_queue.enqueue_requests(requests)
         if result_wait_queue is not None:
-            with self.response_cv:
-                for req_id in req_ids:
-                    self.result_wait_queues[req_id] = result_wait_queue
+            self._response_channel.register(req_ids, result_wait_queue)
         return req_ids
 
     @staticmethod
@@ -2515,8 +2427,7 @@ class PyExecutor:
         self.micro_batches = []
         self.pending_encoder_steps.clear()
         self.active_requests.clear()
-        self.responses.clear()
-        self.result_wait_queues.clear()
+        self._response_channel.clear()
         self._pending_transfer_responses.clear()
         self._pending_response_terminations.clear()
         self.request_accumulated.clear()
@@ -2909,8 +2820,7 @@ class PyExecutor:
         """
         req_id = self.executor_request_queue.enqueue_request(request)
         if result_wait_queue is not None:
-            with self.response_cv:
-                self.result_wait_queues[req_id] = result_wait_queue
+            self._response_channel.register([req_id], result_wait_queue)
         return req_id
 
     def set_resource_governor_queue(self, queue):
@@ -2979,10 +2889,10 @@ class PyExecutor:
                 starts (relative to the current iteration counter).
             activities: Subset of ``["CPU", "GPU", "CUDA_PROFILER"]``.
 
-        See ``PyExecutorProfileManager.start_profile`` for the full
+        See ``ProfileController.start_profile`` for the full
         state-machine contract.
         """
-        return self._profile_manager.start_profile(
+        return self._profile_controller.start_profile(
             output_dir=output_dir,
             num_steps=num_steps,
             start_step=start_step,
@@ -2993,29 +2903,35 @@ class PyExecutor:
         """Schedule the in-progress runtime profiling to stop on the
         next executor iteration.
 
-        See ``PyExecutorProfileManager.stop_profile`` for details.
+        See ``ProfileController.stop_profile`` for details.
         """
-        return self._profile_manager.stop_profile()
+        return self._profile_controller.stop_profile()
+
+    def _broadcast_profile_start(self, config: Dict) -> None:
+        self.executor_request_queue.enqueue_profile_start_request(config)
+
+    def _broadcast_profile_stop(self) -> None:
+        self.executor_request_queue.enqueue_profile_stop_request()
 
     def _apply_profile_start_config(self, config: Dict) -> None:
         """Apply a broadcasted profile-start config on this rank.
 
-        Forwards to ``PyExecutorProfileManager.apply_start_config``.
+        Forwards to ``ProfileController.apply_start_config``.
         Kept on ``PyExecutor`` so ``_handle_special_queue_items`` and
         unit tests that patch this name continue to work unchanged.
         """
-        return self._profile_manager.apply_start_config(config)
+        return self._profile_controller.apply_start_config(config)
 
     def _apply_profile_stop_config(self) -> bool:
         """Apply a broadcasted profile-stop on this rank.
 
-        Forwards to ``PyExecutorProfileManager.apply_stop_config``.
+        Forwards to ``ProfileController.apply_stop_config``.
 
         Returns:
             ``True`` when a pending start was cancelled before it
             fired, ``False`` when a stop iteration was scheduled.
         """
-        return self._profile_manager.apply_stop_config()
+        return self._profile_controller.apply_stop_config()
 
     # _wake_executor_loop_for_profile was previously used to enqueue a
     # sentinel cancel-request to unblock the idle executor loop.  It is
@@ -3729,9 +3645,9 @@ class PyExecutor:
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
         # crash leaves PP send handles in a bad state), the await loop
         # must not hang with it.
-        with self.response_cv:
+        with self._response_channel.response_cv:
             self.is_shutdown = True
-            self.response_cv.notify_all()
+            self._response_channel.response_cv.notify_all()
         self.shutdown_event.set()
 
         # The loop may exit while the benchmark fill gate is still closed.
@@ -6209,7 +6125,7 @@ class PyExecutor:
         its offset from a single round trip, so a few milliseconds of added
         latency there skews every timestamp the server reports afterwards.
 
-        ``_profile_enabled`` is read without ``_profile_state_lock`` on
+        ``ProfileController.enabled`` is read without its lock on
         purpose: this is a per-iteration fast path, and the worst case is
         that a window that just opened or closed is reflected one
         iteration late in the trace. Taking the lock here would put a
@@ -6219,7 +6135,7 @@ class PyExecutor:
             A context manager -- ``nullcontext()`` when no profile window
             is active, otherwise a ``record_function`` for this iteration.
         """
-        if not self._profile_enabled:
+        if not self._profile_controller.enabled:
             return nullcontext()
         return torch.profiler.record_function(
             self._build_step_scope_label(scheduled_batch, phase))
@@ -8511,9 +8427,8 @@ class PyExecutor:
         # do not wait for a model batch or flush unrelated resource teardown.
         self._enqueue_responses(responses)
         if self.dist.rank == 0 or self.gather_all_responses:
-            with self.response_cv:
-                for req_id in handled_ids:
-                    self.result_wait_queues.pop(req_id, None)
+            for req_id in handled_ids:
+                self._response_channel.release(req_id)
 
     def _handle_special_queue_items(
             self,
@@ -10543,7 +10458,6 @@ class PyExecutor:
                                batch_outputs.get("logits"),
                                beam_width,
                                num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model(),
                                context_logits_handled=context_logits_handled)
 
                 HandleAdditionalOutputs()(scheduled_batch.context_requests,
@@ -10737,28 +10651,10 @@ class PyExecutor:
             # enters the same number of collectives (attention-DP /
             # gather-all modes use collective gathers internally).
             waiting_responses: List[Tuple[int, LlmResponse]] = []
-            while self.waiting_queue:
-                item = self.waiting_queue.pop_request()
+            for item in drain_queued_items(self.waiting_queue,
+                                           self.executor_request_queue):
                 if (self.gather_all_responses
                         or self.dist.rank == 0) and item.request is not None:
-                    waiting_responses.append(
-                        (item.id,
-                         LlmResponse(request_id=item.id,
-                                     error_msg=error_msg,
-                                     client_id=getattr(item.request,
-                                                       'client_id', None))))
-            # Also drain executor_request_queue so items already queued
-            # but not yet fetched by the main loop are not scheduled
-            # after the CUDA context is corrupted.  Safe to use empty()
-            # here because is_shutdown is True and the queue's active
-            # flag is about to be set False, so no new items arrive.
-            raw_queue = self.executor_request_queue.get_request_queue()
-            while not raw_queue.empty():
-                item = raw_queue.get_nowait()
-                if item.is_shutdown_request:
-                    continue
-                if ((self.gather_all_responses or self.dist.rank == 0)
-                        and item.request is not None):
                     waiting_responses.append(
                         (item.id,
                          LlmResponse(request_id=item.id,
@@ -10978,7 +10874,7 @@ class PyExecutor:
             request.py_encoder_output = None
             request.py_encoder_output_ready_event = None
         if self.gather_all_responses or self.dist.rank == 0:
-            self.result_wait_queues.pop(request.py_request_id, None)
+            self._response_channel.release(request.py_request_id)
 
     def _on_disagg_pp_termination(self, request: LlmRequest) -> None:
         """Finish a PP-synchronized termination and any deferred recompute."""
@@ -11364,20 +11260,7 @@ class PyExecutor:
             )
 
         if self.dist.rank == 0 or self.gather_all_responses:
-            with self.response_cv:
-                for req_id, resp in responses:
-                    if req_id in self.responses.keys():
-                        self.responses[req_id].append(resp)
-                    else:
-                        self.responses.update({req_id: [resp]})
-                    # (TODO: joyang) There are other types of responses, we need to sort out.
-                    if type(
-                            resp
-                    ) == LlmResponse and req_id in self.result_wait_queues and self.result_wait_queues[
-                            req_id] is not None:
-                        self.result_wait_queues[req_id].put_response.remote(
-                            resp.client_id, resp)
-                self.response_cv.notify_all()
+            self._response_channel.publish(responses)
         self._maybe_record_hang_diagnostic_phase("responses_enqueued")
 
     @nvtx_range("_handle_first_token_response")
@@ -11655,54 +11538,19 @@ class PyExecutor:
     def _await_any_response(self,
                             timeout: Optional[float] = None
                             ) -> List[LlmResponse]:
-
-        def any_responses_ready():
-            return len(self.responses) > 0 or self.is_shutdown
-
-        responses = []
-        with self.response_cv:
-            self.response_cv.wait_for(any_responses_ready, timeout=timeout)
-            for req_id, response in self.responses.items():
-                responses += response
-            self.responses = {}
-
-        return responses
+        return self._response_channel.await_any(
+            timeout, is_shutdown=lambda: self.is_shutdown)
 
     def _await_single_response(
             self,
             id: int,
             timeout: Optional[float] = None) -> List[LlmResponse]:
-        with self.response_cv:
-
-            def key_has_response():
-                # Wake on shutdown too so that an event-loop crash
-                # cannot trap callers here forever (nvbug 6038228).
-                return id in self.responses or self.is_shutdown
-
-            self.response_cv.wait_for(key_has_response, timeout=timeout)
-            if id in self.responses:
-                return self.responses.pop(id)
-            if self.is_shutdown:
-                # The event-loop thread terminated before producing a
-                # response for this request. Re-raise the original
-                # exception (if any) so callers see a meaningful error
-                # instead of hanging here or hitting a KeyError below.
-                error = self._event_loop_error
-                if error is not None:
-                    # The caller is about to see the original exception, so
-                    # the crash is reportable without killing the world.
-                    self._event_loop_error_delivered.set()
-                    raise RuntimeError(
-                        f"Event loop terminated with error: {error}") from error
-                raise RuntimeError(
-                    f"Event loop shut down before a response was received "
-                    f"for request {id}.")
-            # Timed out without shutdown. Return [] to match the
-            # documented timeout contract used by _await_any_response and
-            # the other executor-API timeouts; the pre-fix code raised a
-            # bare KeyError on this path, which all known callers had to
-            # defend against anyway.
-            return []
+        return self._response_channel.await_single(
+            id,
+            timeout,
+            is_shutdown=lambda: self.is_shutdown,
+            read_error=lambda: self._event_loop_error,
+            mark_error_delivered=self._event_loop_error_delivered.set)
 
     def _terminate_requests(
             self, requests_to_terminate: Iterable[LlmRequest]) -> None:
@@ -12031,7 +11879,7 @@ class PyExecutor:
         # The same teardown an immediate recompute pause does (see
         # ``_resume_preempted_request``): free the execution resources, then
         # reset the request for a re-prefill. Terminating instead would pop
-        # the request's response routing (``result_wait_queues``) and release
+        # the request's response routing (its Ray result wait queue) and release
         # its multimodal inputs, neither of which a continuing request can lose.
         for request in requests_to_recompute:
             self._free_request_resources(request)

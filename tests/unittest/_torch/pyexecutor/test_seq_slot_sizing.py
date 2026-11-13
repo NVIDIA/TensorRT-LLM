@@ -989,7 +989,7 @@ def _sampler_with(store):
 def test_penalty_store_is_read_from_the_torch_sampler_only():
     store = _penalty_store(16)
     assert get_penalty_store(_sampler_with(store)) is store
-    # EarlyStopSampler and friends own no penalty handler, and estimation may have no sampler.
+    # Early-stop samplers own no penalty handler, and estimation may have no sampler.
     assert get_penalty_store(SimpleNamespace()) is None
     assert get_penalty_store(None) is None
     # A mocked sampler auto-creates the attributes; that is not a store to size from.

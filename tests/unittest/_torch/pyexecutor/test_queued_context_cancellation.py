@@ -7,7 +7,6 @@ and model/resource work are controlled boundaries; these CPU tests do not
 qualify in-flight transfer cancellation or GPU/NIXL retirement.
 """
 
-import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -20,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, executor_request_to_llm_request
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, WaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
 from tensorrt_llm.bindings.executor import (
@@ -77,9 +77,7 @@ def executor() -> PyExecutor:
     engine.waiting_queue = FCFSWaitingQueue()
     engine._pending_transfer_responses = []
     engine._pending_response_terminations = []
-    engine.response_cv = threading.Condition()
-    engine.responses = {}
-    engine.result_wait_queues = {}
+    engine._response_channel = ResponseChannel()
     engine.enable_attention_dp = False
     engine.gather_all_responses = False
     engine.kv_connector_manager = None
@@ -122,7 +120,7 @@ def _assert_no_resource_cleanup(executor: PyExecutor) -> None:
 
 def _results(executor: PyExecutor, request_id: int) -> list[LlmResponse]:
     """Read responses already delivered by cancellation, without driving another batch."""
-    responses = executor.responses[request_id]
+    responses = executor._response_channel.responses[request_id]
     for response in responses:
         assert not response.has_error()
         if isinstance(response.result._result, bytes):
@@ -185,7 +183,7 @@ def test_duplicate_cancel_preserves_other_waiters_and_cancel_ids(
     assert [item.id for item in executor.waiting_queue] == surviving_order
     assert executor.canceled_req_ids == [999, 2]
     assert len(_results(executor, 2)) == 1
-    assert len(executor.responses[2]) == 1
+    assert len(executor._response_channel.responses[2]) == 1
     _assert_no_resource_cleanup(executor)
 
 
@@ -224,7 +222,7 @@ def test_cancel_delivers_all_sequences_before_removing_result_route(executor: Py
 
     def record_delivery(client_id: int, response: LlmResponse) -> None:
         """Observe the registered route while each sequence response is enqueued."""
-        assert executor.result_wait_queues[request_id] is route
+        assert executor._response_channel.result_wait_queues[request_id] is route
         assert client_id == 101
         delivered.append(response)
 
@@ -234,7 +232,7 @@ def test_cancel_delivers_all_sequences_before_removing_result_route(executor: Py
 
     assert len(delivered) == 3
     assert [response.result.is_final for response in delivered] == [False, False, True]
-    assert request_id not in executor.result_wait_queues
+    assert request_id not in executor._response_channel.result_wait_queues
     _assert_no_resource_cleanup(executor)
 
 
@@ -284,7 +282,7 @@ def test_queued_result_does_not_flush_unrelated_retirement(executor: PyExecutor)
     executor._cancel_queued_context_requests(executor.waiting_queue)
 
     assert len(_results(executor, 1)) == 1
-    assert 2 not in executor.responses
+    assert 2 not in executor._response_channel.responses
     assert executor._pending_transfer_responses == [(2, original)]
     assert executor._pending_response_terminations == [retained]
     executor._terminate_request.assert_not_called()

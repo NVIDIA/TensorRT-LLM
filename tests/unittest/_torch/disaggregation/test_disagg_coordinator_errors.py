@@ -8,7 +8,6 @@ rank over a ``FakeDistGroup`` and pin what each rank exchanges and what it
 then asks its executor to do.
 """
 
-import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
@@ -385,9 +385,7 @@ def _executor_with_real_error_path(monkeypatch) -> tuple:
     executor.dist = SimpleNamespace(
         rank=0, world_size=1, tp_size=1, pp_size=1, mapping=SimpleNamespace(tp_group=[0])
     )
-    executor.response_cv = threading.Condition()
-    executor.responses = {}
-    executor.result_wait_queues = {}
+    executor._response_channel = ResponseChannel()
     executor._disagg_pp_termination_handler = None
     executor._prefetched_request_ids = set()
     executor.resource_manager = Mock(spec=["free_resources"])
@@ -492,17 +490,17 @@ def test_generation_receive_failure_reaches_the_response_queue_through_the_real_
 
     coordinator.poll_gen_transfers()
 
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert (response.request_id, response.client_id) == (1, 101)
     assert response.error_msg == "Error in kv cache transfer for generation requests"
     assert failing.state == LlmRequestState.GENERATION_COMPLETE
     assert executor.active_requests == [healthy]
     executor.resource_manager.free_resources.assert_called_once_with(failing)
     assert healthy.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-    assert 2 not in executor.responses
+    assert 2 not in executor._response_channel.responses
 
     coordinator.poll_gen_transfers()
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(failing)
 
     transceiver.finish_recv(healthy)
@@ -562,7 +560,7 @@ def test_refused_python_cancel_is_retried_and_settled_through_the_real_response_
     assert not cancelled.is_finished
     assert cancelled.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
     assert executor.active_requests == [cancelled, kept]
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     executor.resource_manager.free_resources.assert_not_called()
 
     _iteration(executor, coordinator)  # accepted
@@ -570,7 +568,7 @@ def test_refused_python_cancel_is_retried_and_settled_through_the_real_response_
     assert executor.canceled_req_ids == []
     assert cancelled.is_finished
     assert cancelled.state == LlmRequestState.GENERATION_COMPLETE
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     assert executor.active_requests == [kept]
     executor.resource_manager.free_resources.assert_called_once_with(cancelled)
@@ -606,7 +604,7 @@ def test_cancelling_part_of_a_saturated_receive_batch_settles_only_those_request
         assert req.is_finished
         assert req.state == LlmRequestState.GENERATION_COMPLETE
         assert transceiver.call_log.count(f"cancel_request:{req.py_request_id}") == 1
-        (response,) = executor.responses[req.py_request_id]
+        (response,) = executor._response_channel.responses[req.py_request_id]
         assert response.error_msg is None
     assert executor.active_requests == kept
     freed = [call.args[0] for call in executor.resource_manager.free_resources.call_args_list]
@@ -614,7 +612,7 @@ def test_cancelling_part_of_a_saturated_receive_batch_settles_only_those_request
     for req in kept:
         assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         assert f"cancel_request:{req.py_request_id}" not in transceiver.call_log
-        assert req.py_request_id not in executor.responses
+        assert req.py_request_id not in executor._response_channel.responses
 
     for req in kept:
         transceiver.finish_recv(req)
@@ -707,8 +705,7 @@ def test_idle_legacy_gen_timeout_defers_adp_failure_to_existing_error_vote(monke
     # tp_gather only runs when a response is enqueued; none is here.
     ranks[0].dist.mapping = SimpleNamespace(tp_group=[0, 1])
     ranks[0].dist.tp_gather = Mock(return_value=[[], []])
-    executor.responses = {}
-    executor.response_cv = threading.Condition()
+    executor._response_channel = ResponseChannel()
     executor._pending_transfer_responses = []
     executor._is_preemption_pending = lambda request: False
     executor._disagg_coordinator = ranks[0].coordinator

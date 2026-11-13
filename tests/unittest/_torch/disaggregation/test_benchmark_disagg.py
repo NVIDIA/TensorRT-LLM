@@ -34,6 +34,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.error_classification import ErrorBudget
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.scheduler import RankState, RequestScheduler, ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 
@@ -1564,9 +1565,7 @@ class TestFailFastDuringBenchmarkFill:
         ex._fatal_error = None
         ex.gather_all_responses = False
         ex.dist.mapping.tp_group = [0]
-        ex.response_cv = threading.Condition()
-        ex.responses = {}
-        ex.result_wait_queues = {}
+        ex._response_channel = ResponseChannel()
         ex._pending_transfer_responses = []
         ex._pending_response_terminations = []
         ex._disagg_pp_termination_handler = None
@@ -1597,7 +1596,7 @@ class TestFailFastDuringBenchmarkFill:
         assert result is None
         assert ex.active_requests == []
         for request in requests:
-            (response,) = ex.responses[request.py_request_id]
+            (response,) = ex._response_channel.responses[request.py_request_id]
             assert response.has_error()
             assert "Insufficient KV cache for gen-only benchmark mode" in response.error_msg
             assert response.client_id == request.py_client_id
@@ -1616,7 +1615,7 @@ class TestFailFastDuringBenchmarkFill:
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        assert ex.responses == {}
+        assert ex._response_channel.responses == {}
         assert ex.active_requests == requests
         ex.resource_manager.free_resources.assert_not_called()
         ex.sampler.release_request.assert_not_called()
@@ -1629,7 +1628,7 @@ class TestFailFastDuringBenchmarkFill:
         ``wait()`` released the condition; without the notify the consumer
         would sit out the full timeout and miss the join deadline."""
         ex, requests = self._executor_with_real_error_path(monkeypatch)
-        ex.response_cv = condition = _WaitSignallingCondition()
+        ex._response_channel.response_cv = condition = _WaitSignallingCondition()
         delivered = []
         consumer = threading.Thread(
             target=lambda: delivered.extend(
@@ -1648,7 +1647,7 @@ class TestFailFastDuringBenchmarkFill:
                 request.py_request_id for request in requests
             ]
             assert all(response.has_error() for response in delivered)
-            assert ex.responses == {}
+            assert ex._response_channel.responses == {}
         finally:
             with condition:  # release the consumer on failure; shutdown satisfies its predicate
                 ex.is_shutdown = True
