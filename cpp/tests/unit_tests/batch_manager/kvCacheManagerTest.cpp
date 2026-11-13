@@ -4454,52 +4454,56 @@ TEST_F(KVCacheManagerTest, VariableWindowReuseUsesShortestMatchedPrefix)
     SizeType32 constexpr kPromptLength = 7;
     SizeType32 constexpr kBeamWidth = 1;
     SizeType32 constexpr kBlocksPerWindow = 8;
-    auto const stream = std::make_shared<tr::CudaStream>();
-    auto const blocksPerWindow
-        = BlocksPerWindow{{kSlidingWindow, {kBlocksPerWindow, 0}}, {kMaxSequenceLength, {kBlocksPerWindow, 0}}};
-    KVCacheManager manager(/*numLayers=*/2, /*numKvHeads=*/2, /*sizePerHead=*/64, kTokensPerBlock, blocksPerWindow,
-        /*maxNumSequences=*/2, kBeamWidth, std::vector<SizeType32>{kSlidingWindow, kMaxSequenceLength},
-        tensorrt_llm::DataType::kHALF, /*sinkTokenLength=*/0, stream, kMaxSequenceLength,
-        /*chunkSize=*/kMaxSequenceLength, /*enableBlockReuse=*/true, CacheType::kSELF,
-        /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr, /*enablePartialReuse=*/true);
-    manager.allocatePools(/*useUvm=*/false);
+    for (auto const shorterWindow : {kSlidingWindow, kMaxSequenceLength})
+    {
+        SCOPED_TRACE(shorterWindow);
+        auto const stream = std::make_shared<tr::CudaStream>();
+        auto const blocksPerWindow
+            = BlocksPerWindow{{kSlidingWindow, {kBlocksPerWindow, 0}}, {kMaxSequenceLength, {kBlocksPerWindow, 0}}};
+        KVCacheManager manager(/*numLayers=*/2, /*numKvHeads=*/2, /*sizePerHead=*/64, kTokensPerBlock, blocksPerWindow,
+            /*maxNumSequences=*/2, kBeamWidth, std::vector<SizeType32>{kSlidingWindow, kMaxSequenceLength},
+            tensorrt_llm::DataType::kHALF, /*sinkTokenLength=*/0, stream, kMaxSequenceLength,
+            /*chunkSize=*/kMaxSequenceLength, /*enableBlockReuse=*/true, CacheType::kSELF,
+            /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr, /*enablePartialReuse=*/true);
+        manager.allocatePools(/*useUvm=*/false);
 
-    auto const seedTokens = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14, 15, 16, 17});
-    auto seed = std::make_shared<LlmRequest>(
-        /*requestId=*/0, /*maxNewTokens=*/1, seedTokens, tle::SamplingConfig{kBeamWidth}, /*isStreaming=*/false);
-    manager.addSequenceBatch({{{0, kSeedLength, kBeamWidth}}}, {std::ref(*seed)});
-    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seed);
-    (void) manager.removeSequence(0, seed);
+        auto const seedTokens = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14, 15, 16, 17});
+        auto seed = std::make_shared<LlmRequest>(
+            /*requestId=*/0, /*maxNewTokens=*/1, seedTokens, tle::SamplingConfig{kBeamWidth}, /*isStreaming=*/false);
+        manager.addSequenceBatch({{{0, kSeedLength, kBeamWidth}}}, {std::ref(*seed)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seed);
+        (void) manager.removeSequence(0, seed);
 
-    auto blockedTokens = chopVectorIntoBlocks<UniqueToken>(
-        seed->getUniqueTokens(0), kSeedLength - 1, kTokensPerBlock, /*allowPartial=*/true);
-    auto const blockKeys = buildBlockKeys(blockedTokens, *seed);
-    auto slidingTail = manager.findBlocksInReuseTreeByBlockKeys(blockKeys, kSlidingWindow);
-    ASSERT_NE(slidingTail, nullptr);
-    ASSERT_NE(manager.findBlocksInReuseTreeByBlockKeys(blockKeys, kMaxSequenceLength), nullptr);
-    // Evict only the sliding window's tail; the full-attention pool keeps its longer prefix.
-    slidingTail->detachFromLookupNode();
-    slidingTail.reset();
-    ASSERT_EQ(manager.findBlocksInReuseTreeByBlockKeys(blockKeys, kSlidingWindow), nullptr);
-    (void) manager.getIterationStats();
+        auto blockedTokens = chopVectorIntoBlocks<UniqueToken>(
+            seed->getUniqueTokens(0), kSeedLength - 1, kTokensPerBlock, /*allowPartial=*/true);
+        auto const blockKeys = buildBlockKeys(blockedTokens, *seed);
+        auto tail = manager.findBlocksInReuseTreeByBlockKeys(blockKeys, shorterWindow);
+        ASSERT_NE(tail, nullptr);
+        ASSERT_NE(manager.findBlocksInReuseTreeByBlockKeys(blockKeys, kSlidingWindow), nullptr);
+        ASSERT_NE(manager.findBlocksInReuseTreeByBlockKeys(blockKeys, kMaxSequenceLength), nullptr);
+        // Evict one window's tail while the other pool keeps its longer prefix.
+        tail->detachFromLookupNode();
+        tail.reset();
+        ASSERT_EQ(manager.findBlocksInReuseTreeByBlockKeys(blockKeys, shorterWindow), nullptr);
+        (void) manager.getIterationStats();
 
-    auto const promptTokens = std::make_shared<VecTokens>(seedTokens->begin(), seedTokens->begin() + kPromptLength);
-    auto request = std::make_shared<LlmRequest>(
-        /*requestId=*/1, /*maxNewTokens=*/1, promptTokens, tle::SamplingConfig{kBeamWidth}, /*isStreaming=*/false);
-    manager.addSequenceBatch({{{1, kPromptLength, kBeamWidth}}}, {std::ref(*request)});
+        auto const promptTokens = std::make_shared<VecTokens>(seedTokens->begin(), seedTokens->begin() + kPromptLength);
+        auto request = std::make_shared<LlmRequest>(
+            /*requestId=*/1, /*maxNewTokens=*/1, promptTokens, tle::SamplingConfig{kBeamWidth}, /*isStreaming=*/false);
+        ASSERT_NO_THROW(manager.addSequenceBatch({{{1, kPromptLength, kBeamWidth}}}, {std::ref(*request)}));
 
-    auto const stats = manager.getIterationStats();
-    // Full attention matches six tokens (one full block plus two tokens); SWA matches only four.
-    EXPECT_EQ(stats.at(kMaxSequenceLength).iterFullReusedBlocks, 1);
-    EXPECT_EQ(stats.at(kSlidingWindow).iterFullReusedBlocks, 1);
-    EXPECT_EQ(stats.at(kSlidingWindow).iterPartialReusedBlocks, 0);
-    EXPECT_EQ(request->getPrepopulatedPromptLen(), 4);
-    EXPECT_EQ(request->getContextCurrentPosition(), 4);
-    EXPECT_EQ(request->getContextRemainingLength(), 3);
-    EXPECT_EQ(request->getContextChunkSize(), 3);
+        auto const stats = manager.getIterationStats();
+        // The shorter pool matches four tokens and caps the final cursor for both windows.
+        EXPECT_EQ(stats.at(kMaxSequenceLength).iterFullReusedBlocks, 1);
+        EXPECT_EQ(stats.at(kSlidingWindow).iterFullReusedBlocks, 1);
+        EXPECT_EQ(request->getPrepopulatedPromptLen(), 4);
+        EXPECT_EQ(request->getContextCurrentPosition(), 4);
+        EXPECT_EQ(request->getContextRemainingLength(), 3);
+        EXPECT_EQ(request->getContextChunkSize(), 3);
 
-    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
-    EXPECT_NO_THROW(static_cast<void>(manager.removeSequence(1, request)));
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        EXPECT_NO_THROW(static_cast<void>(manager.removeSequence(1, request)));
+    }
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)

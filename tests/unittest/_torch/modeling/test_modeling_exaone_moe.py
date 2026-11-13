@@ -114,7 +114,7 @@ class Scenario:
 
 
 class TestExaoneMoe(unittest.TestCase):
-    @parameterized.expand([63, 65, 85, 100, 130])
+    @parameterized.expand([63, 65, 85, 94, 95, 100, 130])
     @torch.no_grad()
     def test_exaone_moe_prefix_reuse_logits(self, prefix_len: int) -> None:
         """Full and partial prefix hits preserve logits across the sliding window."""
@@ -125,11 +125,8 @@ class TestExaoneMoe(unittest.TestCase):
         config_dict.update(
             hidden_size=256,
             intermediate_size=512,
-            moe_intermediate_size=256,
             num_attention_heads=2,
             num_key_value_heads=1,
-            num_experts=4,
-            num_experts_per_tok=2,
             is_moe_layer=[False] * NUM_HIDDEN_LAYERS,
             mlp_layer_types=["dense"] * NUM_HIDDEN_LAYERS,
             vocab_size=256,
@@ -216,11 +213,8 @@ class TestExaoneMoe(unittest.TestCase):
                                 self.assertEqual(
                                     sliding_pages[:stale_blocks], [BAD_PAGE_INDEX] * stale_blocks
                                 )
-                                self.assertTrue(
-                                    all(
-                                        page != BAD_PAGE_INDEX for page in full_pages[:stale_blocks]
-                                    )
-                                )
+                                self.assertNotIn(BAD_PAGE_INDEX, sliding_pages[stale_blocks:])
+                                self.assertNotIn(BAD_PAGE_INDEX, full_pages)
                             remaining = len(tokens) - reused
                             self.assertTrue(manager.resize_context(request, remaining))
                             metadata = get_attention_backend("TRTLLM").Metadata(
@@ -255,18 +249,6 @@ class TestExaoneMoe(unittest.TestCase):
                                 else:
                                     self.assertIsNotNone(baseline)
                                     # Cached prefix rows are omitted from context logits.
-                                    max_abs_delta = (
-                                        (logits.float() - baseline[reused:].float())
-                                        .abs()
-                                        .max()
-                                        .item()
-                                    )
-                                    print(
-                                        f"KV prefix reuse: prefix_len={prefix_len}, "
-                                        f"partial_reuse={partial_reuse}, max_abs_delta={max_abs_delta}, "
-                                        "atol=0.01, rtol=0.01",
-                                        flush=True,
-                                    )
                                     torch.testing.assert_close(
                                         logits, baseline[reused:], atol=1e-2, rtol=1e-2
                                     )
