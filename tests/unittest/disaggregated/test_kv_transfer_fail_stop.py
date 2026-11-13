@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation import diagnostics
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
@@ -279,6 +280,54 @@ def test_deadline_hard_kill_bypasses_blocking_diagnostic_helpers(
     kill.assert_called_once_with(os.getpid(), signal.SIGKILL)
     flush.assert_not_called()
     log.assert_not_called()
+
+
+def test_worker_fatal_dispatches_containment_before_qualification_capture_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real synchronous capture cannot block the worker's once-only fatal callback."""
+    from tensorrt_llm._torch.disaggregation import transceiver
+
+    entered, release, killed = (threading.Event() for _ in range(3))
+    capture_threads: list[threading.Thread] = []
+    records = []
+
+    def blocked_capture(record: diagnostics.DiagnosticRecord) -> None:
+        records.append(record)
+        capture_threads.append(threading.current_thread())
+        entered.set()
+        assert release.wait(timeout=5), "test did not release diagnostic capture"
+
+    worker = object.__new__(transfer_mod.TransferWorker)
+    worker._config = SimpleNamespace(quiescence_fatal_callback=_fail_unproven_kv_transfer)
+    worker._rank_info = SimpleNamespace(
+        instance_name="gen", instance_rank=0, tp_rank=0, pp_rank=0, cp_rank=0, dp_rank=0
+    )
+    event = QuiescenceFatalEvent(12, "receive", "cancelled", 1.0, 2.0, 2.0)
+    kill = Mock(side_effect=lambda **_: killed.set())
+    critical = Mock()
+    monkeypatch.setattr(transceiver.logger, "critical", critical)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(hang_detector, "propagate_hard_kill", kill)
+    diagnostics.install_qualification_observers(blocked_capture)
+    thread = threading.Thread(target=worker._on_quiescence_fatal, args=(event,), daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(timeout=1), "fatal diagnostic capture did not start"
+        critical.assert_called_once()
+        assert killed.wait(timeout=2), "capture blocked containment dispatch"
+        assert not release.is_set()
+        kill.assert_called_once_with(diagnostics=False, communicator=None)
+        assert records[0]["event"] == "retirement_fatal"
+        assert records[0]["local_request_id"] == 12
+    finally:
+        release.set()
+        thread.join(timeout=2)
+        for writer in capture_threads:
+            writer.join(timeout=2)
+        diagnostics.install_qualification_observers(None)
+        assert not thread.is_alive()
+        assert not any(writer.is_alive() for writer in capture_threads)
 
 
 @pytest.mark.parametrize("exposure", ["never_exposed", "settled_before_grace", "unresolved"])

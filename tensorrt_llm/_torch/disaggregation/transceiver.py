@@ -114,6 +114,16 @@ def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
         )
     except Exception:  # noqa: BLE001 - diagnostics cannot alter containment
         pass
+    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            disagg_diagnostics.emit_event(
+                "retirement_fatal",
+                side="ctx" if event.direction == "send" else "gen",
+                request_id=None,
+                local_request_id=event.request_id,
+                reason=event.reason,
+                failure_kind=event.failure_kind,
+            )
 
 
 def _fail_unproven_kv_transfer(
@@ -1378,6 +1388,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 request_id_scope = disagg_diagnostics.get_request_id_scope(
                     session._base_args.params
                 )
+            retirement = getattr(session, "_retirement", None)
+            closed, reason, fatal = (
+                retirement.diagnostic_snapshot()
+                if retirement is not None
+                else (False, "untracked", False)
+            )
             disagg_diagnostics.emit_event(
                 f"{side}_transfer_settled",
                 side=side,
@@ -1388,6 +1404,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 instance=self._instance_name,
                 outcome=outcome,
                 session_retired=True,
+                retirement_owner_closed=closed,
+                retirement_reason=reason,
+                retirement_fatal=fatal,
                 tp_rank=self._mapping.tp_rank,
                 pp_rank=self._mapping.pp_rank,
                 cp_rank=self._mapping.cp_rank,

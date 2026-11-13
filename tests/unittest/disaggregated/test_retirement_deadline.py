@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from tensorrt_llm._torch.disaggregation import diagnostics
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
@@ -705,6 +706,66 @@ def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBa
     assert session._sender._begin_task_operation(task, 7)
     assert session._sender._submit_transfer(task, 7, _write_request()) == (True, None)
     task.complete()
+
+
+def test_submitted_observer_sees_rooted_status_outside_ownership_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qualification cannot supply DONE, drop a root, or block deadline inspection."""
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    watchdog = RetirementWatchdog(Mock(), clock=Mock(return_value=10.0))
+    session = _tx_session(watchdog, need_aux=False)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    sender, task = session._sender, session.kv_tasks[0]
+    sender._instance_rank = 0
+    request = _write_request()
+    status = sender._agent.submit_transfer_requests.return_value
+    acquired = threading.Event()
+    observed = []
+    records = []
+
+    def inspect_lock() -> None:
+        with watchdog.lock:
+            acquired.set()
+
+    def submitted(request_id: int, rank: int, peer_rank: int, piece_id: int | None) -> None:
+        operation = task._physical_operations[peer_rank]
+        observed.append((request_id, rank, peer_rank, piece_id))
+        assert operation.request is request and operation.status is status
+        assert operation.state is PhysicalOperationState.SUBMITTED
+        status.wait.assert_not_called()
+        thread = threading.Thread(target=inspect_lock)
+        thread.start()
+        try:
+            assert acquired.wait(1), "submitted observer held ownership lock"
+        finally:
+            thread.join(timeout=1)
+
+    diagnostics.install_qualification_observers(records.append, submitted)
+    try:
+        assert sender._begin_task_operation(task, 7)
+        assert sender._submit_transfer(task, 7, request) == (True, None)
+        diagnostics.emit_event("qualification_checkpoint", side="ctx", request_id=4)
+        assert records[-1]["capture_errors"] == 0
+        assert observed == [(4, 0, 7, 0)]
+        status.wait.assert_called_once()
+        assert task._physical_operations[7].state is PhysicalOperationState.BACKEND_DONE
+    finally:
+        diagnostics.install_qualification_observers(None)
+
+
+def test_retirement_diagnostic_snapshot_does_not_advance_an_expired_clock() -> None:
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+    owner.request_drain("cancellation")
+    clock.return_value = 100.0
+    clock.reset_mock()
+    assert owner.diagnostic_snapshot() == (False, "cancellation", False)
+    clock.assert_not_called()
+    assert owner._claims == {id(claim): claim}
 
 
 def test_operation_snapshot_distinguishes_empty_and_retains_state_values() -> None:

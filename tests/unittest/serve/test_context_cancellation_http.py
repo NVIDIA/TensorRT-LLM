@@ -18,6 +18,7 @@ from fastapi import HTTPException, Request
 from starlette.requests import ClientDisconnect
 from starlette.types import Message
 from test_common.serve.app_factory import AggConfig, ServeTestEnv
+from test_common.serve.context_cancellation import with_context_reservation
 
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.executor.context_cancellation import ContextReservationCapacityError
@@ -194,16 +195,11 @@ def test_cancellation_auth_is_required_and_bound_to_action_and_identity() -> Non
 def test_submission_token_reaches_executor_only_with_authenticated_ctx_identity(
     context_worker: OpenAIServer,
 ) -> None:
-    request = CompletionRequest(
-        model="model",
-        prompt="hello",
-        disaggregated_params=DisaggregatedParams(
-            request_type="context_only",
-            disagg_request_id=42,
-            schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
-            context_cancellation_token="opaque",
-        ),
+    payload = with_context_reservation(
+        {"model": "model", "prompt": "hello"}, pair_id=42, token="opaque"
     )
+    request = CompletionRequest.model_validate_json(json.dumps(payload))
+    assert request.disaggregated_params.schedule_style is DisaggScheduleStyle.CONTEXT_FIRST
     server = context_worker
     headers = build_context_cancellation_headers(
         "secret", "submit", context_cancellation_submission_payload(request)
