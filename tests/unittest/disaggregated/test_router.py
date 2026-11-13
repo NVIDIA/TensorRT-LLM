@@ -18,7 +18,7 @@ import pytest
 from llmapi.apps.render_helpers import use_harmony_vocab
 from utils.llm_data import llm_datasets_root, llm_models_root
 
-from tensorrt_llm.llmapi.disagg_utils import RouterConfig
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig, ServerRole
 from tensorrt_llm.runtime.kv_cache_hash import (hash_v1_block_key,
                                                 truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -1844,6 +1844,148 @@ async def test_conversation_router_load_balancing():
     s, _ = await router.get_next_server(req_x2)
     assert s == sx
     await router.finish_request(req_x2)
+
+
+async def _remove_and_readd(router, server):
+    """Drop ``server`` from the pool, then add it back as a fresh server."""
+    router._fetch_server_info = mock.AsyncMock(return_value={})
+    await router.remove_server(server)
+    assert await router.add_server(server)
+
+
+@pytest.mark.asyncio
+async def test_load_balancing_router_finish_after_server_readd_keeps_load():
+    """A request routed before its server left does not unload the re-added server."""
+    router = LoadBalancingRouter(server_role=ServerRole.CONTEXT,
+                                 servers=["a:1", "b:2"])
+    stale = _make_request()
+    server, _ = await router.get_next_server(stale)
+
+    await _remove_and_readd(router, server)
+    fresh = _make_request()
+    assert (await router.get_next_server(fresh))[0] == server
+    await router.finish_request(stale)
+
+    assert router._server_state[server]._num_active_requests == 1
+    await router.finish_request(fresh)
+    assert router._server_state[server]._num_active_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_load_balancing_router_readd_keeps_retained_server_requests():
+    """Removing one server keeps the routing entries of the other servers."""
+    router = LoadBalancingRouter(server_role=ServerRole.CONTEXT,
+                                 servers=["a:1", "b:2"])
+    on_removed = _make_request()
+    removed, _ = await router.get_next_server(on_removed)
+    on_retained = _make_request()
+    retained, _ = await router.get_next_server(on_retained)
+    assert retained != removed
+
+    await _remove_and_readd(router, removed)
+    assert router._server_state[retained]._num_active_requests == 1
+    await router.finish_request(on_retained)
+    assert router._server_state[retained]._num_active_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_load_balancing_router_finish_by_id_after_server_readd_keeps_load(
+):
+    router = LoadBalancingRouter(server_role=ServerRole.CONTEXT,
+                                 servers=["a:1", "b:2"],
+                                 use_tokens=True)
+    server, _, _ = await router.get_next_server_by_key({"num_tokens": 7},
+                                                       req_id=1)
+
+    await _remove_and_readd(router, server)
+    await router.finish_request_by_id(1)
+
+    state = router._server_state[server]
+    assert state._num_active_requests == 0
+    assert state._num_active_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_finish_after_server_readd_keeps_state(
+        servers):
+    router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT,
+                                servers=list(servers),
+                                max_batch_size=32,
+                                tokens_per_block=4,
+                                track_routed_blocks=True)
+    request = CompletionRequest(model="TinyLlama", prompt=[list(range(9))])
+    server, info = await router.get_next_server(request)
+
+    await _remove_and_readd(router, server)
+    await router.finish_request(request)
+
+    state = router._server_state[server]
+    assert state.num_active_requests() == 0
+    # The blocks were routed to the server before it left the pool; nothing
+    # says the re-added server still holds them.
+    assert await state.matched_tokens(info["block_hashes"],
+                                      hash_algo=info["hash_algo"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_finish_after_server_readd_keeps_load():
+    router = ConversationRouter(server_role=ServerRole.CONTEXT,
+                                servers=["server1", "server2"])
+    stale = _make_request(conversation_id="sess-stale")
+    server, _ = await router.get_next_server(stale)
+
+    await _remove_and_readd(router, server)
+    fresh = _make_request(conversation_id="sess-fresh")
+    assert (await router.get_next_server(fresh))[0] == server
+    fresh_load = router._get_content_load(server)
+    await router.finish_request(stale)
+
+    assert router._get_content_load(server) == fresh_load
+    await router.finish_request(fresh)
+    assert router._get_content_load(server) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_readd_keeps_retained_server_requests():
+    """Removing one server keeps the routing entries of the other servers."""
+    router = ConversationRouter(server_role=ServerRole.CONTEXT,
+                                servers=["server1", "server2"])
+    on_removed = _make_request(conversation_id="sess-removed")
+    removed, _ = await router.get_next_server(on_removed)
+    on_retained = _make_request(conversation_id="sess-retained")
+    retained, _ = await router.get_next_server(on_retained,
+                                               exclude_server=removed)
+    assert retained != removed
+
+    await _remove_and_readd(router, removed)
+    assert router._get_content_load(retained) > 0
+    await router.finish_request(on_retained)
+    assert router._get_content_load(retained) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_finish_by_id_after_server_readd_keeps_load():
+    """A coordinator request routed before its server left keeps the new load."""
+    router = ConversationRouter(server_role=ServerRole.CONTEXT,
+                                servers=["server1", "server2"])
+    server, _, _ = await router.get_next_server_by_key(None, req_id=1)
+    other = "server2" if server == "server1" else "server1"
+    assert (await router.get_next_server_by_key(None,
+                                                exclude_server=server,
+                                                req_id=2))[0] == other
+
+    await _remove_and_readd(router, server)
+    assert (await router.get_next_server_by_key(None,
+                                                exclude_server=other,
+                                                req_id=3))[0] == server
+    await router.finish_request_by_id(2)
+    assert router._get_content_load(other) == 0
+    assert router._get_content_load(server) == 1
+    await router.finish_request_by_id(1)
+
+    assert router._get_content_load(server) == 1
+    await router.finish_request_by_id(3)
+    assert router._get_content_load(server) == 0
 
 
 @pytest.mark.asyncio

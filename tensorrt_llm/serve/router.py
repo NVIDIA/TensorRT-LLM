@@ -293,6 +293,22 @@ class LoadBalancingMixin:
         if server not in self._servers:
             self._server_state.pop(server, None)
 
+    def _forget_requests_of_removed_servers(self,
+                                            new_servers: List[str]) -> None:
+        """Drop the routing entries of in-flight requests on removed servers.
+
+        A removed server's state is discarded, and a server that is added back
+        gets a new one. Finishing such a request must not decrement the load
+        of that new state, so it finds no routing entry instead.
+        """
+        live_servers = set(new_servers)
+        stale_keys = [
+            key for key, server in self._req_routing_table.items()
+            if server not in live_servers
+        ]
+        for key in stale_keys:
+            del self._req_routing_table[key]
+
     def _get_server_load(self, server: str) -> int:
         state = self._server_state[server]
         return state._num_active_tokens if self._use_tokens \
@@ -779,6 +795,7 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
             new_state[server] = (self._server_state.get(server)
                                  or self._create_server_state(server))
         self._server_state = new_state
+        self._forget_requests_of_removed_servers(new_servers)
 
     async def get_next_server(self,
                               request: OpenAIRequest,
@@ -1227,6 +1244,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             new_state[server] = (self._server_state.get(server)
                                  or self._create_server_state(server))
         self._server_state = new_state
+        self._forget_requests_of_removed_servers(new_servers)
 
 
 class _BlockHashTrie:
@@ -1500,6 +1518,21 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     self._hash_trie.remove(conv_id, entry[1])
                 self._forget_conversation_content(conv_id)
             self._server_content_load.pop(removed, None)
+
+        # In-flight requests on removed servers must not unload a server that
+        # is added back under the same address.
+        self._forget_requests_of_removed_servers(new_servers)
+        if removed_servers:
+            self._req_content_entry = {
+                key: entry
+                for key, entry in self._req_content_entry.items()
+                if entry[0] not in removed_servers
+            }
+            self._coord_pending = {
+                req_id: server
+                for req_id, server in self._coord_pending.items()
+                if server not in removed_servers
+            }
 
         self._server_sessions = new_server_sessions
 
