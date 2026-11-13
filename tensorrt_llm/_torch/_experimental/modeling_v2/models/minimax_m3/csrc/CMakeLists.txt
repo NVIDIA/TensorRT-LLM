@@ -53,6 +53,11 @@ add_modeling_v2_target(
   SOURCES *.cu *.cpp
   REQUIRES MULTI_DEVICE)
 add_modeling_v2_target(
+  minimax_m3 minimax_m3_1_flash_nvfp4__sm_107__tp4
+  ARCHS 100f 107a
+  SOURCES *.cu *.cpp
+  REQUIRES MULTI_DEVICE)
+add_modeling_v2_target(
   minimax_m3 minimax_m3_1_flash_nvfp4__sm_107__tp8
   ARCHS 100f 107a
   SOURCES *.cu *.cpp
