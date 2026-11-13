@@ -409,12 +409,12 @@ def test_index_k_views_are_fullgraph_safe(
         for _ in range(2)
     ]
     metadata = [object.__new__(MiniMaxM3MsaSparseAttentionMetadata) for _ in managers]
+    expected_shape = (3, 1, 4, 8) if implementation == "msa" else (3, 4, 1, 8)
     for manager, meta in zip(managers, metadata):
         meta.kv_cache_manager = manager
         for layer in (0, 5, 60):
             assert manager.get_index_k_buffer(layer) is None
         cache = manager.get_index_k_buffer(3)
-        expected_shape = (3, 1, 4, 8) if implementation == "msa" else (3, 4, 1, 8)
         assert cache.shape == expected_shape
         assert cache.data_ptr() == manager._test_index_pool.data_ptr()
         assert cache.stride(0) == 2 * 4 * 8

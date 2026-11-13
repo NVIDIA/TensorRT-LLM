@@ -183,8 +183,7 @@ def _generate_tokens(*, model_path: str, disable_overlap: bool, enable_rebalance
         kv_cache_config=_vswa_kv_cache_config(enable_rebalance=enable_rebalance),
     ) as llm:
         impl = llm._executor.engine.kv_cache_manager.impl
-        if enable_rebalance:
-            rebalances = _arm_mid_generation_rebalance(llm)
+        rebalances = _arm_mid_generation_rebalance(llm) if enable_rebalance else []
         ratio_before = list(_introspection.current_gpu_ratio(impl))
         outputs = llm.generate(_PROMPTS, _SAMPLING)
         ratio_after = list(_introspection.current_gpu_ratio(impl))

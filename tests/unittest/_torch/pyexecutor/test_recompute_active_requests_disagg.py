@@ -67,6 +67,7 @@ class _RecomputeExecutor:
         self.async_transfer_manager = transfer_manager
         # recompute runs at a control-action boundary: no in-flight batch.
         self.dist = MagicMock(pp_size=1)
+        self.is_encoder_decoder = False
         self.previous_batch = previous_batch
         # The response routing of a request that continues after the recompute.
         self._response_channel = ResponseChannel()

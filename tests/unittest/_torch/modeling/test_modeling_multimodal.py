@@ -703,6 +703,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         # Context Phase
         print("  Running context phase...")
         with torch.inference_mode():
+            logits = None
             if scenario.chunked_prefill:
                 chunk_size = 128
                 total_prompt_len = len(trtllm_input_ids)

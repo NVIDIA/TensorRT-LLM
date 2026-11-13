@@ -136,7 +136,10 @@ def _accept_case():
         num_contexts=0,
         num_seqs=NUM_GENS,
         kv_cache_manager=_kda_manager(),
-        mamba_metadata=SimpleNamespace(state_indices=torch.zeros(4, dtype=torch.int32)),
+        mamba_metadata=SimpleNamespace(
+            state_indices=torch.zeros(4, dtype=torch.int32),
+            replay_state_indices=torch.zeros(4, dtype=torch.int32),
+        ),
         draft_kv_cache_block_offsets=torch.zeros(1, 4, 2, 3, dtype=torch.int32),
         kv_lens_cuda=torch.zeros(4, dtype=torch.int32),
     )
@@ -235,8 +238,8 @@ _ACCEPT_DECLINES = {
     "no replay record": _set("attn.kv_cache_manager._kda_replay.prev_num_accepted_tokens", None),
     "no dummy-request mask": _set("attn.kv_cache_manager._dummy_request_mask_buffer", None),
     "no Mamba metadata": _set("attn.mamba_metadata", None),
-    "int64 state indices": _set(
-        "attn.mamba_metadata.state_indices", torch.zeros(4, dtype=torch.int64)
+    "int64 replay state indices": _set(
+        "attn.mamba_metadata.replay_state_indices", torch.zeros(4, dtype=torch.int64)
     ),
     "the private context arena": _set("worker._ctx_block_tables", None),
     "a sliding-window draft pool": _set("worker._ctx_pool_windowed", True),

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from dataclasses import replace
 
 import torch
@@ -64,7 +65,7 @@ _ACTIVATION_MAP = {
     ActivationType.Swiglu: "silu",
 }
 
-# FlashInfer's SM12x W4A16 fused MoE (0.6.17 and 0.6.18) selects a TC-decode
+# FlashInfer's SM12x W4A16 fused MoE (0.6.17 to 0.7.1) selects a TC-decode
 # "ultra-wide" FC2 tile of tile_n=512 / tile_k=32 for small m whenever that
 # collapses FC2 to FC1's wave count (m=3 and m=4 for Qwen3.6-35B-A3B on the
 # 188-SM RTX PRO 6000). tile_k=32 sits below the tile_k>=64 floor of its
@@ -72,12 +73,26 @@ _ACTIVATION_MAP = {
 # the ``force_tile_config`` re-pin across the custom-op boundary does not, so
 # the kernel it just selected is rejected with "force_tile_config fc2 tile
 # (tile_k=32, tile_n=512) does not fit ..." and CUDA-graph warmup aborts
-# executor init (nvbug 6721561). Accepting the ultra tile in the re-validation
-# under the same rule that produced it is the upstream fix; this shim mirrors
-# it so the pinned wheel behaves like the fixed one. Drop it once the
-# flashinfer pin carries ``_ultra_wide_fc2_tile_fits``.
+# executor init (nvbug 6721561). FlashInfer 0.7.2 fixes the re-pin: it calls
+# ``_candidate_tile_fits(..., enforce_search_floor=False)``. This shim accepts
+# the ultra tile in the re-validation of the releases before that, under the
+# same rule that produced it. It installs only over the validator signature of
+# those releases, which it mirrors, and stands aside on any other, such as
+# 0.7.2's with ``enforce_search_floor``.
 _FLASHINFER_W4A16_ULTRA_WIDE_FC2_TILE = (512, 32, 256)  # (tile_n, tile_k, cta_threads)
 _FLASHINFER_W4A16_ULTRA_WIDE_FC2_SINCE = Version("0.6.17")
+_FLASHINFER_W4A16_PRE_FIX_FITS_PARAMS = (
+    "problem_n",
+    "problem_k",
+    "cta_m_blocks",
+    "tile_n",
+    "tile_k",
+    "cta_threads",
+    "max_shared_mem",
+    "scale_format",
+    "weight_layout",
+    "allow_logical_tail",
+)
 
 
 def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
@@ -103,6 +118,8 @@ def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
         return False
     if getattr(upstream_fits, "_trtllm_ultra_wide_fc2_shim", False):
         return True
+    if tuple(inspect.signature(upstream_fits).parameters) != _FLASHINFER_W4A16_PRE_FIX_FITS_PARAMS:
+        return False
 
     def candidate_tile_fits(
         *,

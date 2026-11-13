@@ -46,7 +46,10 @@ def executor(monkeypatch):
 
     engine.release_executor_resources = Mock(side_effect=release_engine_resources)
     cache = SimpleNamespace(shutdown=lambda: events.append("cache"))
-    transceiver = SimpleNamespace(shutdown=lambda: events.append("unregister"))
+    transceiver = SimpleNamespace(
+        prepare_shutdown=lambda: events.append("drain"),
+        shutdown=lambda: events.append("unregister"),
+    )
     ex = object.__new__(PyExecutor)
     ex._closed = False
     ex.enable_attention_dp = False
@@ -141,9 +144,10 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
         "graphs",
         "draft_graphs",
         "synchronize",
-        "unregister",
+        "drain",
         "slots",
         "cache",
+        "unregister",
     ]
     assert ex.draft_model_engine is draft_engine
     assert draft_engine.attn_metadata is None
@@ -182,7 +186,7 @@ def test_release_exits_a_bound_dwdp_manager_after_the_caches(
 
     ex.release_resources()
 
-    assert events[-2:] == ["cache", field]
+    assert events[-3:] == ["cache", "unregister", field]
     assert getattr(ex, field) is None
     ex.shutdown()
     manager.__exit__.assert_called_once_with(None, None, None)
@@ -193,7 +197,7 @@ def test_release_before_worker_start_does_not_wait_for_shutdown(executor):
     ex.worker_started = False
     ex.shutdown_event.clear()
     ex.release_resources()
-    assert events == ["graphs", "synchronize", "unregister", "cache"]
+    assert events == ["graphs", "synchronize", "drain", "cache", "unregister"]
     ex.worker_thread.join.assert_not_called()
 
 
@@ -436,13 +440,15 @@ def test_hung_worker_does_not_release_live_resources(executor):
     assert slots.slot_manager.get_slot(17) is not None
 
 
-def test_transfer_shutdown_failure_keeps_cache_owned(executor):
+def test_transfer_drain_failure_keeps_cache_owned(executor):
     ex, events = executor
     manager = ex.resource_manager
     slots = manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
-    ex.kv_cache_transceiver.shutdown = Mock(side_effect=RuntimeError("DMA still active"))
+    ex.kv_cache_transceiver.prepare_shutdown = Mock(side_effect=RuntimeError("DMA still active"))
+
     with pytest.raises(RuntimeError, match="DMA still active"):
         ex.release_resources()
+    assert "unregister" not in events
     assert "cache" not in events
     assert ex.resource_manager is manager
     assert slots.slot_manager.get_slot(17) is not None
@@ -470,3 +476,11 @@ def test_release_stops_pipeline_progress_before_gpu_teardown(executor):
     assert ex._pp_mpi_progress_quiesced.is_set()
     assert ex._mpi_progress_thread is None
     assert ex._mpi_progress_thread_exit_hook is None
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_both_release_paths_unmap_before_deregistration(executor, terminal):
+    """Profiling and terminal release must use the same two-phase order."""
+    ex, events = executor
+    assert ex._release_execution_resources(release_model_owned_graphs=terminal)
+    assert events.index("drain") < events.index("cache") < events.index("unregister")

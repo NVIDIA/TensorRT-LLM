@@ -8,7 +8,7 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
-from .ptx_helpers import red_add_release_gpu_s32, red_async_add_release_gpu_s32
+from .ptx_helpers import red_add_release_gpu_s32, red_add_release_sys_s32, red_async_add_release_gpu_s32
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,6 +57,22 @@ class GpuReleaseFlagBatchTracker:
             current_address = Int64(0)
 
         return self._make(flag_address=current_address, accumulated_flags=accumulated_flags, phase=Int32(next_phase))
+
+
+@dataclasses.dataclass(frozen=True)
+class SysReleaseFlagBatchTracker(GpuReleaseFlagBatchTracker):
+    """Lane-distributed tracker whose counters are read by another rank's system-scope acquire.
+
+    Same batching as the GPU-scope tracker; ``fire`` publishes with
+    ``red.release.sys.global.add.s32`` so an FC2 row set written by ordinary STG becomes
+    visible to a node-local peer (or an RDMA reader) that acquires ``fc2_done`` at system
+    scope. Used by the internode communication component (design invariant I9).
+    """
+
+    @cute.jit
+    def fire(self) -> None:
+        if self.flag_address != Int64(0):
+            red_add_release_sys_s32(self.flag_address, Int32(1))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,4 +146,9 @@ def make_flag_batch_tracker(
     )
 
 
-__all__ = ["GpuAsyncReleaseFlagBatchTracker", "GpuReleaseFlagBatchTracker", "make_flag_batch_tracker"]
+__all__ = [
+    "GpuAsyncReleaseFlagBatchTracker",
+    "GpuReleaseFlagBatchTracker",
+    "SysReleaseFlagBatchTracker",
+    "make_flag_batch_tracker",
+]
