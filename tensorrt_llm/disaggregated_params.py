@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
@@ -66,6 +66,9 @@ class DisaggregatedParams:
     draft_tokens: Optional[List[int]] = None
     # If disagg_request_id is set, both context and generation requests will use it as underlying request id.
     disagg_request_id: Optional[int] = None
+    # Internal one-shot native HTTP admission/cancellation identity. This is
+    # not a transfer-completion receipt or a replacement for the pairing ID.
+    context_cancellation_token: Optional[str] = field(default=None, repr=False)
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None

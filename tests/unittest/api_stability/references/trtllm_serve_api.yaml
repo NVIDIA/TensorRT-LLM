@@ -53,6 +53,22 @@
 # default change or a rename, both of which the gate does catch.
 
 models:
+  ContextCancellationReservationRequest:
+    fields:
+      disagg_request_id:
+        kind: extension
+        type: int
+        default: null
+        status: prototype
+        required: true
+  ContextCancellationRequest:
+    fields:
+      token:
+        kind: extension
+        type: str
+        default: null
+        status: prototype
+        required: true
   CompletionRequest:
     fields:
       kv_hints:

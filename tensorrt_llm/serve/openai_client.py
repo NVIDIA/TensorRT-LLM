@@ -44,8 +44,10 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
+    build_context_cancellation_headers,
     build_internal_disagg_auth_headers,
     build_subagent_affinity_headers,
+    context_cancellation_submission_payload,
     request_requires_internal_disagg_auth,
 )
 from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
@@ -141,6 +143,14 @@ _REFUSED_AFFINITY_PORT_BYPASS_SECS = 10.0
 
 
 class OpenAIClient(ABC):
+    async def reserve_context_cancellation(self, server: str, request_id: int) -> str:
+        """Reserve one CTX submission identity on the selected worker."""
+        raise NotImplementedError("Context cancellation requires the native HTTP client")
+
+    async def cancel_context_cancellation(self, server: str, token: str) -> str:
+        """Close a reservation or queue cancellation; never report physical retirement."""
+        raise NotImplementedError("Context cancellation requires the native HTTP client")
+
     async def send_request(
         self,
         request: UCompletionRequest,
@@ -332,7 +342,83 @@ class OpenAIHttpClient(OpenAIClient):
             headers.update(
                 build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
             )
+        payload = context_cancellation_submission_payload(request)
+        if payload is not None:
+            if self._role != ServerRole.CONTEXT or not self._no_retry:
+                raise ValueError("Context cancellation requires a no-retry context client")
+            headers.update(
+                build_context_cancellation_headers(
+                    self._internal_disagg_auth_key, "submit", payload
+                )
+            )
         return headers
+
+    async def _context_cancellation_control(
+        self, server: str, action: str, payload: dict[str, str | int]
+    ) -> dict:
+        """Send one authenticated control message outside routing/load accounting.
+
+        Args:
+            server: Selected context worker's shared HTTP address.
+            action: Reserve or cancel endpoint suffix.
+            payload: Exact identity fields to authenticate and send.
+
+        Returns:
+            The worker's JSON control response, without interpreting retirement.
+        """
+        if self._role != ServerRole.CONTEXT or not self._no_retry:
+            raise ValueError("Context cancellation requires a no-retry context client")
+        headers = build_context_cancellation_headers(
+            self._internal_disagg_auth_key, action, payload
+        )
+        url = f"{_server_base_url(server)}/internal/context-cancellation/{action}"
+        async with self._session.post(
+            url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as response:
+            if response.status >= 400:
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"Context cancellation {action} failed: {response.reason}",
+                    headers=response.headers,
+                )
+            return await response.json()
+
+    async def reserve_context_cancellation(self, server: str, request_id: int) -> str:
+        """Reserve an exact worker identity without admitting model work.
+
+        Args:
+            server: Already selected context worker, shared across its HTTP frontends.
+            request_id: The request's context-first pairing identity.
+
+        Returns:
+            Opaque, single-use submission and cancellation token.
+        """
+        result = await self._context_cancellation_control(
+            server, "reserve", {"disagg_request_id": request_id}
+        )
+        token = result.get("token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("Context worker returned no cancellation reservation")
+        return token
+
+    async def cancel_context_cancellation(self, server: str, token: str) -> str:
+        """Submit idempotent cancellation without retrying a generation request.
+
+        Args:
+            server: Worker that issued the token.
+            token: Opaque identity retained across context HTTP completion.
+
+        Returns:
+            ``not_submitted`` if pending admission was removed, otherwise ``queued``.
+            Neither result reports physical quiescence.
+        """
+        result = await self._context_cancellation_control(server, "cancel", {"token": token})
+        status = result.get("status")
+        if status not in ("not_submitted", "queued"):
+            raise ValueError("Context worker returned an invalid cancellation status")
+        return status
 
     async def post_json(
         self,
