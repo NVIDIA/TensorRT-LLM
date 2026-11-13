@@ -33,6 +33,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_decode_scope_source.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_tp8_routing_source.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/dspark/test_modeling_v2_dspark_prefill_store_cpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/msa
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_drafter_fullctx_cells.py
   # MiniMax-M3 target unit tests.
