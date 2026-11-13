@@ -1848,7 +1848,10 @@ class TestCtxFrontendAffinity:
         hooks.on_ctx_resp.assert_called_once_with("localhost:8000", response_body)
 
     @pytest.mark.asyncio
-    async def test_refused_frontend_port_falls_back_to_shared_port(self, mock_router, mock_session):
+    @pytest.mark.parametrize("server", [None, "http://localhost:8000"], ids=["bare", "scheme"])
+    async def test_refused_frontend_port_falls_back_to_shared_port(
+        self, mock_router, mock_session, server
+    ):
         _reset_prometheus_registry()
         client = OpenAIHttpClient(
             router=mock_router,
@@ -1880,16 +1883,16 @@ class TestCtxFrontendAffinity:
             side_effect=lambda: now,
         ):
             # The refused attempt is not a retry: it succeeds with max_retries=0.
-            await client.send_request(self._request("conv-a"))
+            await client.send_request(self._request("conv-a"), server=server)
             assert ports() == [affinity_port, 8000]
             mock_router.renew_request.assert_not_called()
             # Later turns of the conversation skip the refused port for a while ...
             now += 1.0
-            await client.send_request(self._request("conv-a"))
+            await client.send_request(self._request("conv-a"), server=server)
             assert ports()[2:] == [8000]
             # ... and try it again once that window has passed.
             now += 60.0
-            await client.send_request(self._request("conv-a"))
+            await client.send_request(self._request("conv-a"), server=server)
             assert ports()[3:] == [affinity_port]
 
     @pytest.mark.asyncio
@@ -1909,6 +1912,22 @@ class TestCtxFrontendAffinity:
         with pytest.raises(aiohttp.ClientConnectorError):
             await client.send_request(self._request(None))
         assert mock_session.post.call_count == 1
+
+    @pytest.mark.parametrize(
+        "server, expected",
+        [
+            ("localhost:8000/", "localhost:8100"),
+            ("http://localhost:8000", "http://localhost:8100"),
+            ("http://localhost:8000/", "http://localhost:8100"),
+            ("https://localhost:8000/", "https://localhost:8100"),
+        ],
+    )
+    def test_frontend_port_for_scheme_and_trailing_slash_entries(
+        self, mock_router, mock_session, server, expected
+    ):
+        # crc32(b"conv-a") % 4 == 0 picks the first frontend: port 8000 + 100.
+        client = self._client(mock_router, mock_session, (4, 100))
+        assert client._url_server(server, self._request("conv-a")) == expected
 
 
 class TestGenerationLegRetry:

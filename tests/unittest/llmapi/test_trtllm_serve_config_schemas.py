@@ -79,6 +79,21 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             {"disagg_cluster": {"cluster_uri": "etcd://localhost:2379", "cluster_nmae": "bad"}},
             False,
         ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "disagg_cluster": {
+                    "cluster_uri": "etcd://localhost:2379",
+                    "user": "u",
+                    "password": "p",
+                    "ca_cert": "/ca.pem",
+                    "cert_key": "/key.pem",
+                    "cert_cert": "/cert.pem",
+                    "record_auth_key": "secret",
+                }
+            },
+            True,
+        ),
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
@@ -345,6 +360,51 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             },
             False,
         ),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"cache_backend": "seacache"}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "cache_config": {
+                    "cache_backend": "seacache",
+                    "threshold": 0.3,
+                    "max_warmup_steps": 4,
+                    "max_continuous_cached_steps": -1,
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "threshold": 0}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "threshold": -0.1}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_continuous_cached_steps": -2}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_warmup_steps": -1}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_consecutive_cached_steps": 2}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "thresh": 0.2}},
+            False,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"cache_backend": "seacach"}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"threshold": 0.3}}, False),
     ],
 )
 def test_config_validation(
@@ -1010,6 +1070,26 @@ def test_auth_key_schema_matches_runtime(schemas: dict[str, dict], value: object
         if filename == generator.DISAGG_SCHEMA:
             for section in ("context_servers", "generation_servers"):
                 assert validator.is_valid({section: config}) == valid
+
+
+@pytest.mark.parametrize(
+    "name", ["user", "password", "ca_cert", "cert_key", "cert_cert", "record_auth_key"]
+)
+@pytest.mark.parametrize("value", [None, "example", " ", "", 123, False, ["x"]])
+def test_disagg_cluster_etcd_settings_schema_matches_runtime(
+    schemas: dict[str, dict], name: str, value: object
+) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig
+
+    valid = value is None or isinstance(value, str) and bool(value)
+    if not valid:
+        with pytest.raises(ValueError) as error:
+            DisaggClusterConfig("etcd://localhost:2379", **{name: value})
+        assert str(error.value) == f"disagg_cluster {name} must be a non-empty string"
+
+    config = {"disagg_cluster": {"cluster_uri": "etcd://localhost:2379", name: value}}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        assert Draft202012Validator(schemas[filename]).is_valid(config) == valid
 
 
 def test_disagg_router_default_is_derived(monkeypatch: pytest.MonkeyPatch) -> None:

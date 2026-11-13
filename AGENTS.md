@@ -196,21 +196,39 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
-Pass product Python file paths to `scripts/run_pyrefly.sh` for a file-list static
+Pass product or test Python file paths to `scripts/run_pyrefly.sh` for a file-list static
 check; pre-commit supplies these paths with `pass_filenames: true`. If none are
 eligible, the script skips the check. `--full-project` requests a scan of all
-product Python files. For supplied files, diagnostics are filtered to added
-and modified lines when Git provides them and retained at file level otherwise.
+configured Python files under `tensorrt_llm/` and `tests/`. For supplied files,
+diagnostics are filtered to added and modified lines when Git provides them and
+retained at file level otherwise.
 File-list checks print every remaining diagnostic; full-project checks save the
 report and print its absolute path.
 Jenkins runs a full-project check with path/module and symbol exclusions.
 Whole-project checks always return success; file-list checks can opt into
 `--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
-section in `pyproject.toml` defines the product roots, diagnostics, and native
-exclusions. `[tool.pyrefly-exclusions]` defines additional symbol exclusions
-for the wrapper.
+section in `pyproject.toml` defines product roots, diagnostics, and native exclusions.
+`[tool.pyrefly-tests]` in the same file defines test roots, helper search paths,
+and diagnostic overrides. The wrapper generates a temporary test configuration
+that inherits shared rules and exclusions, runs each scope separately, and
+combines the diagnostics into one report. Temporary configurations are removed
+after the check. Mixed file
+lists are selected from each configuration's `project-includes`; full-project mode
+runs both passes.
+`[tool.pyrefly-exclusions]` defines additional symbol exclusions for the wrapper.
 Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
-PyTorch, generated bindings, and configured third-party libraries.
+PyTorch, generated bindings, and configured third-party libraries. In test file-list
+mode, missing imports of declared dependencies that are not installed are also
+filtered; full-project scans retain them. Release-Check installs pytest so that
+`pytest.skip()` remains recognizable as a terminating call.
+The test configuration disables `missing-argument`, `unexpected-keyword`, and
+`bad-argument-count`; these diagnostics remain enabled for product code. Other
+configured diagnostics, including `unbound-name` and `missing-import`, remain
+enabled for tests. Product import resolution uses only the project root as its
+search path, with fallback resolution disabled. The broader helper search paths
+and fallback resolution apply only to the test pass. `--no-path-module-filter`
+disables exclusions in both passes while preserving their separate search paths
+and diagnostic settings.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly

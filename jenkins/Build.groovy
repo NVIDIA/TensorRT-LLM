@@ -757,7 +757,7 @@ def runLLMBuild(
         }
     }
 
-    // Check the configured product sources and record diagnostics after exclusions.
+    // Check configured product and test sources, applying exclusions and test-specific diagnostics.
     // The advisory check does not fail the build.
     // Running directly avoids pre-commit hook downloads.
     if (typeCheck) {

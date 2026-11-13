@@ -2427,7 +2427,6 @@ def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
 def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
-    moe._last_staged_T = {8: 6}
     trace = []
     moe._wait_rebalance_routes = lambda replica_plan=None: trace.append(("wait", replica_plan))
     bufs = SimpleNamespace(
@@ -2454,9 +2453,8 @@ def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
     # One copy widens the int32 routes into the int64 kernel index buffer.
     assert bufs.topk_idx_local.dtype == torch.int64
     assert torch.equal(bufs.topk_idx_local[:3], routes.to(torch.int64))
-    # Rows a previous launch wrote, and only those, are reset to -1.
-    assert torch.equal(bufs.topk_idx_local[3:6], torch.full((3, 4), -1, dtype=torch.int64))
-    assert torch.equal(bufs.topk_idx_local[6:], torch.full((2, 4), 5, dtype=torch.int64))
+    # The whole tail is reset to -1, whatever earlier calls wrote (graph replays bypass host state).
+    assert torch.equal(bufs.topk_idx_local[3:], torch.full((5, 4), -1, dtype=torch.int64))
     assert torch.equal(bufs.topk_weights[:3], weights)
     assert not bufs.topk_weights[3:].any()
     assert trace == [("wait", "plan")]
@@ -4418,6 +4416,94 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
 
 
+@pytest.mark.cpu_only
+def test_sm107_kimi_k3_genphase_tactics_take_precedence() -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    def k3_key(world_size: int, max_tokens_per_rank: int, **overrides) -> tuple:
+        fields = dict(
+            sm_version=107,
+            world_size=world_size,
+            num_topk=16,
+            num_experts_per_rank=896 // world_size,
+            hidden_size=3584,
+            intermediate_size_per_partition=3072,
+            expand_intermediate_size_per_partition=6144,
+            max_tokens_per_rank=max_tokens_per_rank,
+            output_dtype=torch.bfloat16,
+            apply_topk_in_fc1=False,
+            gate_up_clamp=None,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            in_kernel_fc2_reduce=False,
+            combine_format="bf16",
+        )
+        fields.update(overrides)
+        return megamoe_op._megamoe_problem_key(**fields)
+
+    table = megamoe_op._SM107_KIMI_K3_GENPHASE_TACTICS
+    for key, tactic in table.items():
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=107)
+        assert key == k3_key(key[1], key[7])
+        assert megamoe_op._default_megamoe_tactic_for_key(
+            key, num_tokens=key[7]
+        ) == megamoe_op._unpack_tactic(tactic)
+
+    # Buckets without a K3 entry keep the generic generation-phase table.
+    for bucket in (64, 128, 256, 1024):
+        assert megamoe_op._default_megamoe_tactic_for_key(
+            k3_key(4, bucket), num_tokens=bucket
+        ) == megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
+
+    # Keys next to the 512 entry keep the default they had without the K3 table.
+    for key in (
+        k3_key(8, 512),
+        k3_key(4, 448),
+        k3_key(4, 512, combine_format="32e4m3xe8m0"),
+        k3_key(4, 512, helper_expert_count=8),
+        k3_key(4, 512, apply_topk_in_fc1=True),
+    ):
+        assert key not in table
+        assert megamoe_op._default_megamoe_tactic_for_key(
+            key, num_tokens=key[7]
+        ) == megamoe_op._default_megamoe_tactic_for_problem(
+            sm_version=key[0],
+            max_tokens_per_rank=key[7],
+            num_tokens=key[7],
+            apply_topk_in_fc1=key[9],
+            in_kernel_fc2_reduce=key[13],
+            combine_format=key[14],
+            shape_tuned_tactic=megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS.get(key),
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("hidden_size,uses_genphase", [(7168, True), (2880, False)])
+def test_megamoe_genphase_rejects_compact_rows_it_cannot_address(
+    monkeypatch: pytest.MonkeyPatch, hidden_size: int, uses_genphase: bool
+) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
+    # Construction only; the occupancy query would need a CUDA context.
+    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
+    # hidden 2880 stages 180-byte SF rows; the gen kernel addresses 192-byte ones, so the
+    # query must fall back to the generic kernel instead of trapping at launch.
+    _, is_genphase = megamoe_op.query_megamoe_kernel_properties(
+        world_size=4,
+        num_topk=6,
+        num_experts_per_rank=96,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+        max_tokens_per_rank=128,
+        gate_up_clamp=10.0,
+    )
+    assert is_genphase is uses_genphase
+
+
 @pytest.mark.gpu
 def test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants(
     monkeypatch: pytest.MonkeyPatch,
@@ -4691,7 +4777,7 @@ def test_megamoe_cutedsl_nvfp4_awq_matches_cutlass() -> None:
 
 
 @pytest.fixture(scope="module")
-def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
+def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("The scheduler helper regression requires an SM107 CUDA GPU")
 
@@ -4821,7 +4907,8 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
     compiled = cute.compile(probe, *tensors, stream)
     counter_index = probe.device.offset(probe.scheduler._work_id_worker.work_id_counter_region) // 4
 
-    def run(counter: int, input_exhausted: bool) -> torch.Tensor:
+    def run(counter: int, input_exhausted: bool, token_count: int) -> torch.Tensor:
+        counts.fill_(token_count)
         workspace.zero_()
         workspace.view(torch.int32)[counter_index] = counter
         workspace.view(torch.int32)[counter_index + 1] = 1
@@ -4840,17 +4927,28 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
     ids=["slow-peek", "fast-peek", "already-exhausted"],
 )
 def test_fc1_prologue_wait_preserves_exhaustion(
-    _run_megamoe_prologue_helper: Callable[[int, bool], torch.Tensor],
+    _run_megamoe_prologue_helper: Callable[[int, bool, int], torch.Tensor],
     counter: int,
     input_exhausted: bool,
 ) -> None:
     # One observer warp represents a three-cluster snapshot with one real FC1
     # tile. Counter 1 precedes peer arrivals; counter 3 includes two invalid peer
-    # claims. Already-exhausted controls include an invalid local claim.
-    actual = _run_megamoe_prologue_helper(counter, input_exhausted)
-    expected = torch.tensor(
-        [int(input_exhausted), counter, 1, 1, 1, 1], dtype=torch.int32
-    ).expand_as(actual)
+    # claims. Already-exhausted controls include an invalid local claim. The
+    # stream ends before the prologue target, so every CTA of a cluster must
+    # report FC1 exhausted no matter what its counter peek saw.
+    actual = _run_megamoe_prologue_helper(counter, input_exhausted, 1)
+    expected = torch.tensor([1, counter, 1, 1, 1, 1], dtype=torch.int32).expand_as(actual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_fc1_prologue_wait_keeps_a_longer_stream_open(
+    _run_megamoe_prologue_helper: Callable[[int, bool, int], torch.Tensor],
+) -> None:
+    # 512 tokens give four FC1 tiles, more than the three-claim prologue target.
+    # Once the target is claimed, FC1 still has work, so the wait must not mark
+    # it exhausted; marking it unconditionally would drop the fourth tile.
+    actual = _run_megamoe_prologue_helper(3, False, 512)
+    expected = torch.tensor([0, 3, 3, 0, 1, 1], dtype=torch.int32).expand_as(actual)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 

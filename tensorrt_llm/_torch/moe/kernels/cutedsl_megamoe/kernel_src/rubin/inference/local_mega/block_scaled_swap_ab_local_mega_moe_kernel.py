@@ -32,7 +32,7 @@ from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
 from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
 from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
-from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
 from .local_routing import LocalRouting, LocalRoutingArgs
 

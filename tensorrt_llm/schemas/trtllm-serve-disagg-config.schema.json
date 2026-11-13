@@ -2206,6 +2206,48 @@
             {
               "additionalProperties": false,
               "properties": {
+                "ca_cert": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Path to the PEM file of the CA certificate used to verify etcd. Enables TLS for an `etcd://` cluster_uri.",
+                  "title": "Ca Cert"
+                },
+                "cert_cert": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Path to the PEM file of the client certificate. Requires `cert_key` and `ca_cert`.",
+                  "title": "Cert Cert"
+                },
+                "cert_key": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Path to the PEM file of the client key. Requires `cert_cert` and `ca_cert`.",
+                  "title": "Cert Key"
+                },
                 "cluster_name": {
                   "default": "",
                   "title": "Cluster Name",
@@ -2235,6 +2277,48 @@
                     }
                   ],
                   "default": null
+                },
+                "password": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Password for an `etcd://` cluster_uri. Requires `user` and `ca_cert`.",
+                  "title": "Password"
+                },
+                "record_auth_key": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Shared secret used to sign and verify the records in an `etcd://` cluster storage. When set, records without a valid signature are ignored by readers. Set the same value on the disaggregated server and on every worker.",
+                  "title": "Record Auth Key"
+                },
+                "user": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "User name for an `etcd://` cluster_uri. Requires `password` and `ca_cert`.",
+                  "title": "User"
                 }
               },
               "required": [
@@ -9432,6 +9516,48 @@
         {
           "additionalProperties": false,
           "properties": {
+            "ca_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the CA certificate used to verify etcd. Enables TLS for an `etcd://` cluster_uri.",
+              "title": "Ca Cert"
+            },
+            "cert_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client certificate. Requires `cert_key` and `ca_cert`.",
+              "title": "Cert Cert"
+            },
+            "cert_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client key. Requires `cert_cert` and `ca_cert`.",
+              "title": "Cert Key"
+            },
             "cluster_name": {
               "default": "",
               "title": "Cluster Name",
@@ -9461,6 +9587,48 @@
                 }
               ],
               "default": null
+            },
+            "password": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Password for an `etcd://` cluster_uri. Requires `user` and `ca_cert`.",
+              "title": "Password"
+            },
+            "record_auth_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Shared secret used to sign and verify the records in an `etcd://` cluster storage. When set, records without a valid signature are ignored by readers. Set the same value on the disaggregated server and on every worker.",
+              "title": "Record Auth Key"
+            },
+            "user": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "User name for an `etcd://` cluster_uri. Requires `password` and `ca_cert`.",
+              "title": "User"
             }
           },
           "required": [

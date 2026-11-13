@@ -694,26 +694,42 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"waiting_for_peer_info={len(self._wait_reqs)}"
         )
 
+    def _get_shutdown_lock(self) -> threading.Lock:
+        """Return the shutdown lock, including after partial initialization."""
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._shutdown_lock = lock
+        return lock
+
+    def prepare_shutdown(self) -> None:
+        """Retire sessions and stop transfers without deregistering the KV pools."""
+        with self._get_shutdown_lock():
+            if getattr(self, "_shutdown_complete", False):
+                return
+            self._close_sessions_for_shutdown()
+            self._transfer_worker.prepare_shutdown()
+
     def shutdown(self) -> None:
-        shutdown_lock = getattr(self, "_shutdown_lock", None)
-        if shutdown_lock is None:
-            shutdown_lock = threading.Lock()
-            self._shutdown_lock = shutdown_lock
-        with shutdown_lock:
+        with self._get_shutdown_lock():
             self._shutdown_once()
 
     def _shutdown_once(self) -> None:
         if getattr(self, "_shutdown_complete", False):
             return
+        self._close_sessions_for_shutdown()
+        self._transfer_worker.shutdown()
+        # Record completion only after every owner and worker has shut down.
+        # A refusal leaves shutdown retryable after the physical operation drains.
+        self._shutdown_complete = True
+
+    def _close_sessions_for_shutdown(self) -> None:
         # Preflight may refuse closure while DMA remains active. Start the
-        # bounded drain before that refusal, not only in worker.shutdown().
+        # bounded drain before that refusal, not only in worker.prepare_shutdown().
         self._transfer_worker.request_shutdown()
         for rid in list(getattr(self, "_cancelled_receive_fences", {})):
             if not self._retire_cancelled_receive_fence(rid):
                 raise RuntimeError(f"Unpublished receive {rid} still owns destination memory")
-        # This flag records completed teardown, not an attempted shutdown. If
-        # an active owner refuses closure, leave it false so shutdown can be
-        # retried after the physical operation drains.
         # Close receive owners before touching send-side or worker state. The
         # separate drain snapshot would not be sufficient: late evidence can make an
         # owner unretirable before close() acquires its lock.
@@ -729,8 +745,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
-        self._transfer_worker.shutdown()
-        self._shutdown_complete = True
 
     def __enter__(self):
         return self

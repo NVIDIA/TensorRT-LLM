@@ -1094,41 +1094,41 @@ tileiras = ["cuda-toolkit[nvcc,nvvm,tileiras] (>=13.2,<13.5)"]
 
 [[package]]
 name = "cuda-tile"
-version = "1.8.0"
+version = "1.8.1"
 description = "CUDA Tile Compiler"
 optional = false
 python-versions = "<3.16,>=3.11"
 groups = ["main"]
 markers = "python_version >= \"3.11\""
 files = [
-    {file = "cuda_tile-1.8.0-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:6c0346e139ebfe398cc47add06b3ce922347711b902c8163e19ed48581420bb2"},
-    {file = "cuda_tile-1.8.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:860d239dafedf4c4164a7b2237d223aa5b75040d6235461ca3b4e07d1045990d"},
-    {file = "cuda_tile-1.8.0-cp311-cp311-win_amd64.whl", hash = "sha256:7cf8907e64831a98dcf74003c5efd102cc9f7a316891f515171536cec757f2a9"},
-    {file = "cuda_tile-1.8.0-cp311-cp311-win_arm64.whl", hash = "sha256:84b9a3640f26cb4e768ee935fad6411396617d7d4e9199493c7e321fbb8431b7"},
-    {file = "cuda_tile-1.8.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:530232e8080c4d831e433d2e50bda0b8e4a2d5f803d9c1a878191852babd2752"},
-    {file = "cuda_tile-1.8.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:0453bcb9ca8c1f23d7aefd5701b9f23d1935b0486493e5a499b21ffcdedc6621"},
-    {file = "cuda_tile-1.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:874797bdb7123ce3d5cbf5721f5e122457b5aae6b9c1bc5e264fbaa49b12d611"},
-    {file = "cuda_tile-1.8.0-cp312-cp312-win_arm64.whl", hash = "sha256:cd2e67df9222be8594c0d2042b4a8fededc88a0f50ef885437bc6f60f55a152b"},
-    {file = "cuda_tile-1.8.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:c911e2a278544d938ac978c52d07509f9f3cb7976221e831043954be4840bfb3"},
-    {file = "cuda_tile-1.8.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:eaa67afede2ba02bce3c04d8c53de786c2d70124f23039e9cac47fc83b0490ca"},
-    {file = "cuda_tile-1.8.0-cp313-cp313-win_amd64.whl", hash = "sha256:d293641dc9530863c5c4aa5139289883e42176e8692bed1eb5983f97cee4c38b"},
-    {file = "cuda_tile-1.8.0-cp313-cp313-win_arm64.whl", hash = "sha256:61be982811053589a7fda9b3eebf3bc56e3f98fc6a8ad24ba43a755dbb41e961"},
-    {file = "cuda_tile-1.8.0-cp314-cp314-manylinux2014_aarch64.whl", hash = "sha256:e96f0772d604f8d94ea7846fd5ee54cbb4ca4aae9d0ddad314f8a0b8a723f950"},
-    {file = "cuda_tile-1.8.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:ad7701477a78b15b80c5d8a1b2afe965549c3efa20c228213328d37b4c67d8a8"},
-    {file = "cuda_tile-1.8.0-cp314-cp314-win_amd64.whl", hash = "sha256:8d0542a5a90f77d2a13eb5dfb90f517980d64d57603c1eb80c955b997d06d933"},
-    {file = "cuda_tile-1.8.0-cp314-cp314-win_arm64.whl", hash = "sha256:ee2c99b439ecd16bc0e039072d53bc1fb609433759c83b3e07df22b0a473268e"},
-    {file = "cuda_tile-1.8.0-cp314-cp314t-manylinux2014_aarch64.whl", hash = "sha256:0816cf5bb8e83668fc7e53a04ae2ca5ac65339cd95a6286a3e35a89fdfbcaf17"},
-    {file = "cuda_tile-1.8.0-cp314-cp314t-manylinux2014_x86_64.whl", hash = "sha256:4d640c39cfbf8f340820d74d81fe50c74d1ff1ba46e1bbf2d6a15dfb6fa5f710"},
-    {file = "cuda_tile-1.8.0-cp314-cp314t-win_amd64.whl", hash = "sha256:828022e36bad3df47fd20d3f02c74a103a095cc56884381b6260a36ee7fe71c8"},
-    {file = "cuda_tile-1.8.0-cp314-cp314t-win_arm64.whl", hash = "sha256:bcc150cab075857b052081c228833a0b48d27182705bdf601c78f90dbea3e680"},
-    {file = "cuda_tile-1.8.0-cp315-cp315-manylinux2014_aarch64.whl", hash = "sha256:1768d4991bbf8e3096e4db298c3432117b5a3a255d8038f814f8167de589ef07"},
-    {file = "cuda_tile-1.8.0-cp315-cp315-manylinux2014_x86_64.whl", hash = "sha256:78e08a2aad46f0ddc6405d9491fa0d7eeef6a1589b92cbf1cf4597f6dfc57bbf"},
-    {file = "cuda_tile-1.8.0-cp315-cp315-win_amd64.whl", hash = "sha256:a9f9a53f078c332727c121b4ae232eb88f340ea6916fc0d1b80287db89504e8a"},
-    {file = "cuda_tile-1.8.0-cp315-cp315-win_arm64.whl", hash = "sha256:b6ba4f1f2197a9af40ae054753cba2846e439b3f44735b444d62f2a3570081bf"},
-    {file = "cuda_tile-1.8.0-cp315-cp315t-manylinux2014_aarch64.whl", hash = "sha256:0218a49ea9febf8484d59b6d63516188a988d21a6b9903dcc7c4f3f12fa803f4"},
-    {file = "cuda_tile-1.8.0-cp315-cp315t-manylinux2014_x86_64.whl", hash = "sha256:4d48bc384aac7a334a0b032ebe542ac68ec092aa192df9a6a5c002fedc368864"},
-    {file = "cuda_tile-1.8.0-cp315-cp315t-win_amd64.whl", hash = "sha256:addc035b7c5357307765e0ba012ff88dd6e500eadf9d33f0ff7f5e9d79776453"},
-    {file = "cuda_tile-1.8.0-cp315-cp315t-win_arm64.whl", hash = "sha256:f3959f236557812d279cf366cd3a68a954bb25bf0636d770c0ec744456f32397"},
+    {file = "cuda_tile-1.8.1-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:10e07b638301e30680d6b30f3ba75019e5d1c0e6e85fb5f157d25bf9d967c427"},
+    {file = "cuda_tile-1.8.1-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:17f7434b92c19f63ba658785c39dd67f70b92a35f4e4363b6d3f9be615a8dec0"},
+    {file = "cuda_tile-1.8.1-cp311-cp311-win_amd64.whl", hash = "sha256:a992ed00034da909a5faaf6ff70a6ba80770a3442c9e4bf6b8e92288305619c2"},
+    {file = "cuda_tile-1.8.1-cp311-cp311-win_arm64.whl", hash = "sha256:6f1c34da0cd225dde7d0221eef5d6fd43b7bb6cd9b4f7b7559cdfdc1b202b49e"},
+    {file = "cuda_tile-1.8.1-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:014e6abfa8b84570bfb5ac9f9568ad536f58c4540fdc8c30e0593dcc60c3cbb7"},
+    {file = "cuda_tile-1.8.1-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:c4aaf00d3dd927645b15d743c87ad7e3540e4ca8c160a4085ab22255cb7f678d"},
+    {file = "cuda_tile-1.8.1-cp312-cp312-win_amd64.whl", hash = "sha256:552ab1c6363e0625d64cff990d01cae60b1d96910bf84355f370616e3a7336d3"},
+    {file = "cuda_tile-1.8.1-cp312-cp312-win_arm64.whl", hash = "sha256:5e3b4af407b4a6f6b86dbecf1559553590b2b752b0489bb492ee61ead5f1b8ed"},
+    {file = "cuda_tile-1.8.1-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:528e7e7e81e0e704d0ea4d41909c5d40efae82c12ee9e5753942ba634804627b"},
+    {file = "cuda_tile-1.8.1-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:d731319054a76f4492c169e7ad93af872a4e8ffe221f9cc6fba9522e24812a75"},
+    {file = "cuda_tile-1.8.1-cp313-cp313-win_amd64.whl", hash = "sha256:9cbc86e09b5f547ffc56529444803e4504c9dc8b833079a292aad4ed9a660194"},
+    {file = "cuda_tile-1.8.1-cp313-cp313-win_arm64.whl", hash = "sha256:9bb81b7595b11f35feb5d138526e3391ef98b27211ad1414423a0c93a50ada57"},
+    {file = "cuda_tile-1.8.1-cp314-cp314-manylinux2014_aarch64.whl", hash = "sha256:45ab4c2f570d314aa844e415afc7502eae2c430f29b94fa3b996a259c3ff5440"},
+    {file = "cuda_tile-1.8.1-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:b1605b96427b076707f5137d0d44f1b3f5b477c6e1702dde871c14e04bb0e197"},
+    {file = "cuda_tile-1.8.1-cp314-cp314-win_amd64.whl", hash = "sha256:22c0f6c333999df5246ca7d6e67bf5035f70320e8527dd34a5451e681fe2af94"},
+    {file = "cuda_tile-1.8.1-cp314-cp314-win_arm64.whl", hash = "sha256:4b04c970c633e340ea723e6002f93c79399da5a1afdd058a1351894cc013034a"},
+    {file = "cuda_tile-1.8.1-cp314-cp314t-manylinux2014_aarch64.whl", hash = "sha256:7eb2854bbc688b847df17f86d18ebfc2844306d19a784c3622f3b738c89c367d"},
+    {file = "cuda_tile-1.8.1-cp314-cp314t-manylinux2014_x86_64.whl", hash = "sha256:bc11259691566d23c55650ae96aed61e88adc47d5c4eb4a1c4d30360b95b0086"},
+    {file = "cuda_tile-1.8.1-cp314-cp314t-win_amd64.whl", hash = "sha256:699717ff36852d6b52a8e832f7a2ca00aa344e3b4f42612258fe2934a3dd1e83"},
+    {file = "cuda_tile-1.8.1-cp314-cp314t-win_arm64.whl", hash = "sha256:15f7c962454642a7bb983e8e7d15c8d58bd9b5148195aa6dabcb884f834d1287"},
+    {file = "cuda_tile-1.8.1-cp315-cp315-manylinux2014_aarch64.whl", hash = "sha256:014234b473d0b798d59b2ab05648a7ec0391508bd073b0753ce63ebf10c020f9"},
+    {file = "cuda_tile-1.8.1-cp315-cp315-manylinux2014_x86_64.whl", hash = "sha256:b1a8366b73914f2ac7a33a7ff1002de234760286b0c56d705185982fcd2fdd3e"},
+    {file = "cuda_tile-1.8.1-cp315-cp315-win_amd64.whl", hash = "sha256:906a6b6ee27ddd58b06f57389259f90f26d6614fd688425f0f8d7358650c7c30"},
+    {file = "cuda_tile-1.8.1-cp315-cp315-win_arm64.whl", hash = "sha256:5f0233eb8393fae3ff07cf1a1c085ea87e122d8848335355c91976cf57847009"},
+    {file = "cuda_tile-1.8.1-cp315-cp315t-manylinux2014_aarch64.whl", hash = "sha256:48cb0e82ee2f9a01f282869c54e35d931c5a317809cc99f0005782737ba664c7"},
+    {file = "cuda_tile-1.8.1-cp315-cp315t-manylinux2014_x86_64.whl", hash = "sha256:59a31ce730088a092439c4c92c99f115ad46df6a3ec3244f3d10603e876b390a"},
+    {file = "cuda_tile-1.8.1-cp315-cp315t-win_amd64.whl", hash = "sha256:fd2f69ce0f37304e7f706b034ccac078c92429339ebbf62d7254a2a45d6a5828"},
+    {file = "cuda_tile-1.8.1-cp315-cp315t-win_arm64.whl", hash = "sha256:ab57af676baeabbf61f3de5b4f547d4659a78af52df71b954385c319e7f99341"},
 ]
 
 [package.dependencies]
@@ -3540,24 +3540,24 @@ sqlframe = ["sqlframe (>=3.22.0,!=3.39.3)"]
 
 [[package]]
 name = "nccl-extensions"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python bindings for the nccl-extensions communication libraries (nccl_ep, nccl_m2n)"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nccl_extensions-0.1.0-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1739bd8d22d3118948bcabb05fda19c375b572301518d8e77e4dd622cab976f3"},
-    {file = "nccl_extensions-0.1.0-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a76dca0d039640e9a49447d679beaa0307f5df5c1b46efd6772ce955bd7b16df"},
-    {file = "nccl_extensions-0.1.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b5130d94bbc02852f1deb5ab38e944dc7e0db0f1b4769f5f3c8d652eb5776a86"},
-    {file = "nccl_extensions-0.1.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:30d42d0218f46e394a21c5663f09ee9bb8a90caf4d69f0040e5a9eb2fef7b8ad"},
-    {file = "nccl_extensions-0.1.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d85e203e284b50dad3846d6fb0d35560378537689f23d92a16c67f7d854025d7"},
-    {file = "nccl_extensions-0.1.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:54d46bee108f0bc18cdc35dbe17bba6452d6a38a270fa5e8ccde03267460fa87"},
-    {file = "nccl_extensions-0.1.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3678bce16864064a9f8774ec69f5c023cb2cbcd91db60a7f98e7c87fd4f18a50"},
-    {file = "nccl_extensions-0.1.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3328dc1cfeed0ddf37caac00be8c49b3e4f727dce0e7980f8831696165619a4f"},
-    {file = "nccl_extensions-0.1.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:de0ac4801a9ca851a13b2abe3825a8c60fe2a12c637d96b675ea564b31db9152"},
-    {file = "nccl_extensions-0.1.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:28f2513696bd03453857db32a5f6144631f874efb23b5fede4c6218e6026d6b1"},
-    {file = "nccl_extensions-0.1.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:11226949d4daaa9c95ca1b0de4227712291954ae50f8408d97e19af2c0f45d19"},
-    {file = "nccl_extensions-0.1.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:647f28b3a7a7d5c5c40cc7db544ed7ff362ac091b28e806de93c6215d2af45fe"},
+    {file = "nccl_extensions-0.2.0-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:029a0a35cd1c9371a7556fd3be929f89dbb15640fa0ed67572fcad02ab20bf60"},
+    {file = "nccl_extensions-0.2.0-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c0e69f3b40c6003c92657c72a2accd30724c8a9db5f83e7d5c1d8a4c33293c55"},
+    {file = "nccl_extensions-0.2.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:929b0cc8f3812ec649cd0d905396314fb58ee92cbaccb4f99baaf69d603bbc15"},
+    {file = "nccl_extensions-0.2.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d50298ff2d0176e60f5deb1f5ca977071d8e1cd796f50177d2f217b66b330247"},
+    {file = "nccl_extensions-0.2.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6ec10419199cf662519deaa5a7ebf9b8f8c6bcab26623b31a78af4b44ab20a4f"},
+    {file = "nccl_extensions-0.2.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7db0d5980c734fa94823125d35e1024af86090c7b8f5ffe7de3ba2d242dc52e9"},
+    {file = "nccl_extensions-0.2.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ea1c5d9e38355ec48668be8dab483dcb7afbbdcd71015afbd21c49993c2dc052"},
+    {file = "nccl_extensions-0.2.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1dcd4aff2d85216b6410048b09b2599e1c20d03fbd063d8a428e7ba5a0168114"},
+    {file = "nccl_extensions-0.2.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:51753bf18102e856d9400248b917aad71d2c33098290def9000ab357efad566a"},
+    {file = "nccl_extensions-0.2.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:eee14860a9fe5bf4eb6441f1bd17be7d9814c36a3471255e30d9cc9b3baf68ff"},
+    {file = "nccl_extensions-0.2.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:32f9262e995b535d033a1f0d8731d9ed4d0a763334d0155eeead5d2ff949152d"},
+    {file = "nccl_extensions-0.2.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5360b46c5a28dfdb46c0dd9d50d0f4d9a4e2c5096fb90666bae0d66ef3c01695"},
 ]
 
 [package.dependencies]
@@ -4275,14 +4275,14 @@ dev = ["PyYAML (>=5.1.0)", "attrs", "build", "bump-my-version", "coveralls", "no
 
 [[package]]
 name = "openai"
-version = "3.49.0"
+version = "3.50.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.49.0-py3-none-any.whl", hash = "sha256:3977754792115027ba80ae16996ba3366478b5b228e1ab58e2660bd7ac8c3d78"},
-    {file = "openai-3.49.0.tar.gz", hash = "sha256:44badf2bea9bcd643dafa0bc4d5a109a14395889219fd68b8560322288196e96"},
+    {file = "openai-3.50.0-py3-none-any.whl", hash = "sha256:7002115247cacb167154a3da4c668d074e61014a661d2c1ac02583da24e2ce19"},
+    {file = "openai-3.50.0.tar.gz", hash = "sha256:ff094ba851ce512e0682f259e8c5bdc4802c7ef5373f68e7fd261261bb4496f2"},
 ]
 
 [package.dependencies]
@@ -7819,4 +7819,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "9ce43a3cb01daf3c10cc946fc44b9e90c47e1bf25c80592ee0ce9df555f31f48"
+content-hash = "fac2dd79d54e87bb98f7bc09725cdcfe55486eb7fd468dcf58c8c64bba6192b7"
