@@ -45,13 +45,19 @@ def uninstalled_dependencies(project_root: Path) -> set[str]:
             if match:
                 names.add(match[1].lower().replace("-", "_"))
     aliases = {
-        "_pytest": "pytest",
-        "yaml": "pyyaml",
-        "PIL": "pillow",
-        "sklearn": "scikit_learn",
-        "pynvml": "nvidia_ml_py",
+        "_pytest": ("pytest",),
+        "yaml": ("pyyaml",),
+        "PIL": ("pillow",),
+        "sklearn": ("scikit_learn",),
+        "pynvml": ("nvidia_ml_py",),
+        "flashinfer": ("flashinfer_python",),
+        "fla": ("fla_core", "flash_linear_attention"),
     }
-    names.update(module for module, distribution in aliases.items() if distribution in names)
+    names.update(
+        module
+        for module, distributions in aliases.items()
+        if any(distribution in names for distribution in distributions)
+    )
     missing = set()
     for name in names:
         try:
