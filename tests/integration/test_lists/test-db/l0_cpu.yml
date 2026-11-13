@@ -178,6 +178,9 @@ l0_cpu:
   # MiniMax-M3.1-Flash sm_107 tp8 target: its device-free (cpu_only) tests; the stage's -m cpu_only collects
   # only them. The comm tests run 2 to 8 ranks.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/*
+  # MiniMax-M3.1-Flash sm_107 tp4 target: its device-free (cpu_only) tests; the stage's -m cpu_only collects
+  # only them. The comm tests run 4 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/*
   # MiniMax-M3.1-Flash sm_107 tp2 target: its device-free (cpu_only) tests; the stage's -m cpu_only collects
   # only them. The comm tests run 2 ranks.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/*
