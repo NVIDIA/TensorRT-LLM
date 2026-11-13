@@ -68,6 +68,26 @@ def _parse_param_value(value_str: str, param_type: Optional[str]) -> Any:
     return value_str
 
 
+def _serialize_streamed_params(
+    params: list[tuple[str, str]],
+    func_name: str,
+    tools: List[Tool],
+    *,
+    collapse_repeated: bool = False,
+) -> str:
+    """Keep the streamed JSON prefix stable, including for repeated names."""
+    arguments = []
+    for param_name, param_value in params:
+        param_name = param_name.strip()
+        param_type = _get_param_types(param_name, func_name, tools)
+        value = _parse_param_value(param_value, param_type)
+        arguments.append((param_name, value))
+    if collapse_repeated:
+        return json.dumps(dict(arguments), ensure_ascii=False)
+    pairs = [json.dumps({name: value}, ensure_ascii=False)[1:-1] for name, value in arguments]
+    return "{" + ", ".join(pairs) + "}"
+
+
 class MiniMaxM2ToolParser(BaseToolParser):
     r"""Tool parser for MiniMax-M2 models.
 
@@ -155,6 +175,32 @@ class MiniMaxM2ToolParser(BaseToolParser):
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """Streaming incremental parsing for MiniMax-M2 tool call format."""
         self._buffer += new_text
+        result = StreamingParseResult()
+
+        while True:
+            start = self._buffer.find(self.bot_token)
+            if start < 0:
+                return self._parse_streaming_block(tools)
+
+            end = self._buffer.find(self.eot_token, start + len(self.bot_token))
+            if end < 0:
+                parsed = self._parse_streaming_block(tools)
+                result.normal_text += parsed.normal_text
+                result.calls.extend(parsed.calls)
+                return result
+
+            end += len(self.eot_token)
+            remainder = self._buffer[end:]
+            self._buffer = self._buffer[:end]
+            parsed = self._parse_streaming_block(tools)
+            result.normal_text += parsed.normal_text
+            result.calls.extend(parsed.calls)
+            self._buffer = remainder
+            if self.bot_token not in remainder:
+                return result
+
+    def _parse_streaming_block(self, tools: List[Tool]) -> StreamingParseResult:
+        """Parse at most one tool-call block from the streaming buffer."""
         current_text = self._buffer
 
         has_tool = self.bot_token in current_text
@@ -184,7 +230,7 @@ class MiniMaxM2ToolParser(BaseToolParser):
             # Extract content after <minimax:tool_call>
             tc_start = current_text.find(self.bot_token)
             # Preserve any text before the tool call opening tag.
-            prefix_text = current_text[:tc_start].strip() if tc_start > 0 else ""
+            prefix_text = current_text[:tc_start]
             # Drop the returned prefix so later increments do not re-emit it.
             self._buffer = current_text[tc_start:]
             inner_text = current_text[tc_start + len(self.bot_token) :]
@@ -216,13 +262,15 @@ class MiniMaxM2ToolParser(BaseToolParser):
                 params_text = match.group(2)
 
                 params = self.param_regex.findall(params_text)
-                arguments: Dict[str, Any] = {}
-                for param_name, param_value in params:
-                    param_name = param_name.strip()
-                    param_type = _get_param_types(param_name, func_name, tools)
-                    arguments[param_name] = _parse_param_value(param_value, param_type)
-
-                args_json = json.dumps(arguments, ensure_ascii=False)
+                args_json = _serialize_streamed_params(
+                    params,
+                    func_name,
+                    tools,
+                    collapse_repeated=(
+                        not self.current_tool_name_sent
+                        or not self._json_buffers.get(self.current_tool_id)
+                    ),
+                )
                 if self.current_tool_name_sent:
                     # The name and an argument prefix were already streamed
                     # while this invoke was partial; send only the remainder.
@@ -270,14 +318,11 @@ class MiniMaxM2ToolParser(BaseToolParser):
                 if self.current_tool_name_sent and partial_params_text:
                     complete_params = self.param_regex.findall(partial_params_text)
                     if complete_params:
-                        arguments = {}
-                        for param_name, param_value in complete_params:
-                            param_name = param_name.strip()
-                            param_type = _get_param_types(param_name, func_name, tools)
-                            arguments[param_name] = _parse_param_value(param_value, param_type)
                         # Leave the object open so that later parameters
                         # extend the already-streamed prefix.
-                        new_args_json = json.dumps(arguments, ensure_ascii=False)[:-1]
+                        new_args_json = _serialize_streamed_params(
+                            complete_params, func_name, tools
+                        )[:-1]
                         prev_json = self._json_buffers.get(self.current_tool_id, "")
                         if len(new_args_json) > len(prev_json):
                             calls.append(
@@ -291,6 +336,8 @@ class MiniMaxM2ToolParser(BaseToolParser):
 
             # Check if tool call block is complete
             if after_block is not None:
+                if self.current_tool_name_sent:
+                    calls.append(self._close_streamed_call())
                 self._buffer = after_block
                 self.current_tool_name_sent = False
                 self._current_invoke_count = 0
@@ -301,6 +348,28 @@ class MiniMaxM2ToolParser(BaseToolParser):
         except Exception as e:
             logger.error(f"Error in MiniMaxM2 parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
+
+    def _close_streamed_call(self) -> ToolCallItem:
+        """Close the JSON arguments of a call whose name was already streamed."""
+        streamed_json = self._json_buffers.get(self.current_tool_id, "")
+        self.current_tool_name_sent = False
+        return ToolCallItem(
+            tool_index=self.current_tool_id,
+            name=None,
+            parameters="}" if streamed_json else "{}",
+        )
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release trailing text and close any already-started tool call."""
+        tool_start = self._buffer.find(self.bot_token)
+        if tool_start >= 0:
+            normal_text = self._buffer[:tool_start]
+            self._buffer = self._buffer[tool_start:]
+        else:
+            normal_text = self._buffer
+            self._buffer = ""
+        calls = [self._close_streamed_call()] if self.current_tool_name_sent else []
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def supports_structural_tag(self) -> bool:
         """Return whether this parser supports structural tag guided decoding."""
