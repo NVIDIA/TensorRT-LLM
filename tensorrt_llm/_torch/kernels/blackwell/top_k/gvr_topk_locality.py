@@ -5,12 +5,13 @@
 import operator
 from contextlib import nullcontext
 from dataclasses import dataclass
+from math import gcd
 
 import torch
 from cuda.bindings import driver as cuda
 
 from . import gvr_topk_decode_self_sampling_host as gvr
-from .gvr_topk_locality_policy import choose_locality
+from .gvr_topk_locality_policy import COSCHEDULED_SM_COUNT, choose_locality
 
 
 def _check(result: tuple, operation: str) -> object:
@@ -36,7 +37,7 @@ class LocalityDomainExecutor:
     def __init__(
         self,
         device: int = 0,
-        coscheduled_sm_count: int = 8,
+        coscheduled_sm_count: int = COSCHEDULED_SM_COUNT,
         sm_counts: tuple[int, ...] | None = None,
     ) -> None:
         self.device = device
@@ -177,13 +178,79 @@ class _Bound:
             lc[1](x, out, out, self.ws, *lc[2], lengths, *lc[3])
 
 
+def _allocation_rows(x: torch.Tensor, device: int) -> tuple[int, ...] | None:
+    """Verify complete padded rows before selecting any locality policy."""
+    if any(
+        not callable(getattr(cuda, name, None))
+        for name in (
+            "cuPointerGetAttribute",
+            "cuDeviceGetAttribute",
+            "cuMemGetAllocationGranularity",
+        )
+    ):
+        return None
+    attribute = getattr(
+        cuda.CUpointer_attribute, "CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL", None
+    )
+    domain_attribute = getattr(
+        cuda.CUdevice_attribute, "CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT", None
+    )
+    location_type = getattr(
+        cuda.CUmemLocationType, "CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN", None
+    )
+    if attribute is None or domain_attribute is None or location_type is None:
+        return None
+    first = cuda.cuPointerGetAttribute(attribute, x.data_ptr())
+    if first[0] != cuda.CUresult.CUDA_SUCCESS or int(first[1]) < 0:
+        return None
+    capability = cuda.cuDeviceGetAttribute(domain_attribute, device)
+    if capability[0] != cuda.CUresult.CUDA_SUCCESS or int(capability[1]) < 1:
+        return None
+    domains = int(capability[1])
+    if int(first[1]) >= domains:
+        return None
+    prop = cuda.CUmemAllocationProp()
+    prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = location_type
+    prop.location.localized.deviceId = device
+    unit = 0
+    for ordinal in range(domains):
+        prop.location.localized.localityDomainId = ordinal
+        granularity = cuda.cuMemGetAllocationGranularity(
+            prop, cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+        )
+        if granularity[0] != cuda.CUresult.CUDA_SUCCESS or int(granularity[1]) < 1:
+            return None
+        unit = gcd(unit, int(granularity[1]))
+    counts = [0] * domains
+    previous = 0
+    row_bytes = x.stride(0) * x.element_size()
+    for row in range(x.shape[0]):
+        begin = x.data_ptr() + row * row_bytes
+        end = begin + row_bytes
+        result = cuda.cuPointerGetAttribute(attribute, begin)
+        if result[0] != cuda.CUresult.CUDA_SUCCESS:
+            return None
+        domain = int(result[1])
+        if domain < previous or domain >= domains:
+            return None
+        for address in (end - 1, *range(((begin // unit) + 1) * unit, end, unit)):
+            result = cuda.cuPointerGetAttribute(attribute, address)
+            if result[0] != cuda.CUresult.CUDA_SUCCESS or int(result[1]) != domain:
+                return None
+        counts[domain] += 1
+        previous = domain
+    return tuple(counts)
+
+
 class PreparedRowTopK:
     """One non-reentrant call, including graph-safe fork/join when locality wins.
 
     Prepare and warm before graph capture. Keep this object, its input allocation,
     and its resource executor alive until all captured graphs are destroyed.
     Values and per-row lengths may change; addresses and row ownership may not.
-    ``co_local=True`` requires each declared row range to be in its named domain.
+    Allocation ownership is queried once during preparation. ``co_local=False``
+    disables locality; ``True`` still requires verified allocation ownership.
     The caller owns placement; this API does not copy or reallocate logits.
     ``max_seq_len`` and ``kv_lens`` use uncompressed token counts, matching
     ``run_varlen``. This row API uses ``next_n=1``; MTP batches use ``run_varlen``.
@@ -198,7 +265,7 @@ class PreparedRowTopK:
         max_seq_len,
         compress_ratio=1,
         row_counts=None,
-        co_local=False,
+        co_local=None,
         executor=None,
     ):
         self.executor = None
@@ -283,10 +350,18 @@ class PreparedRowTopK:
         counts = None if row_counts is None else tuple(operator.index(c) for c in row_counts)
         if counts is not None and (any(c < 0 for c in counts) or sum(counts) != rows):
             raise ValueError("row_counts must cover logits exactly")
-        choice = choose_locality(logits.dtype, k, max_seq_len, rows, sms, sm) if co_local else None
-        if choice is not None and choice[0] == "global_original":
-            self.mode = "global_original"
-            choice = None
+        verified = None
+        if co_local is not False and sm >= 107:
+            verified = _allocation_rows(x, self.device)
+        if verified is not None and counts is not None and counts != verified:
+            verified = None
+        counts = verified
+        self.locality_allocation = verified is not None
+        choice = (
+            choose_locality(logits.dtype, k, max_seq_len, rows, sms, sm)
+            if self.locality_allocation
+            else None
+        )
         if choice is not None:
             capability = cuda.cuDeviceGetAttribute(
                 cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, self.device
@@ -307,47 +382,6 @@ class PreparedRowTopK:
                 raise ValueError("row_counts needs one entry for every queried domain")
             self.executor = executor
             if executor.coscheduled_sm_count == budget:
-                # Query every allocation-granularity interval, including the end.
-                # Ordinary allocations without a definite domain fall back globally.
-                prop = cuda.CUmemAllocationProp()
-                prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-                prop.location.type = (
-                    cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
-                )
-                prop.location.localized.deviceId = self.device
-                prop.location.localized.localityDomainId = 0
-                unit = int(
-                    _check(
-                        cuda.cuMemGetAllocationGranularity(
-                            prop,
-                            cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
-                        ),
-                        "locality granularity",
-                    )
-                )
-                valid = True
-                offset = 0
-                for domain, count in zip(executor.domains, counts):
-                    if count:
-                        begin = x.data_ptr() + offset * stride * x.element_size()
-                        end = begin + count * stride * x.element_size()
-                        addresses = [
-                            begin,
-                            end - 1,
-                            *range(((begin // unit) + 1) * unit, end, unit),
-                        ]
-                        for ptr in addresses:
-                            result = cuda.cuPointerGetAttribute(
-                                cuda.CUpointer_attribute.CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL,
-                                ptr,
-                            )
-                            if (
-                                result[0] != cuda.CUresult.CUDA_SUCCESS
-                                or int(result[1]) != domain.ordinal
-                            ):
-                                valid = False
-                                break
-                    offset += count
                 # Unbalanced ownership can exhaust one domain while leaving others idle.
                 # Use the measured policy only when the assigned rows follow SM resources.
                 total = sum(d.sm_count for d in executor.domains)
@@ -355,7 +389,9 @@ class PreparedRowTopK:
                     abs(c - rows * d.sm_count / total) <= 1
                     for c, d in zip(counts, executor.domains)
                 )
-                if valid and balanced:
+                if balanced and mode == "global_original":
+                    self.mode = mode
+                if balanced and mode != "global_original":
                     offset = 0
                     prepared = []
                     for domain, count in zip(executor.domains, counts):
