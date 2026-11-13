@@ -156,7 +156,7 @@ def _dispatch(geometry: tuple, inputs: list) -> Optional[tuple]:
     """`(runner, tactic)` as `torch.ops.trtllm.fp8_block_scale_moe_runner` would choose them,
     remembered; None while the AutoTuner tunes or captures (the custom op then runs as is)."""
     tuner = AutoTuner.get()
-    if tuner.is_tuning_mode or tuner.active_capture is not None:
+    if tuner.is_tuning_mode or tuner._active_capture is not None:
         return None
     shapes = tuple(None if t is None else tuple(t.shape) for t in inputs)
     key = (geometry, shapes, len(tuner.profiling_cache))

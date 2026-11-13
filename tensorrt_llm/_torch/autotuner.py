@@ -1059,11 +1059,6 @@ class AutoTuner:
             cls._instance = AutoTuner()
         return cls._instance
 
-    @property
-    def active_capture(self) -> Optional['AutoTuner.TacticsCapture']:
-        """The `capture()` / `replay()` context currently open, or None."""
-        return self._active_capture
-
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.
 
