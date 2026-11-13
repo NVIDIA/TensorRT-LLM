@@ -134,6 +134,18 @@ def test_the_switch_is_the_dep_drafter_mxfp8_item():
     assert drafter_mxfp8.DEP_MXDRAFT == (not m31_switches.m31_disabled("DEP_DRAFTER_MXFP8"))
 
 
+def test_tp8_drafter_mxfp8_uses_the_family_recovery():
+    try:
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
+            drafter_mxfp8 as tp8_drafter_mxfp8,
+        )
+    except NoTarget as exc:
+        pytest.skip(str(exc))
+
+    assert tp8_drafter_mxfp8.mxfp8_from_bf16 is mxfp8_recover.mxfp8_from_bf16
+    assert (tp8_drafter_mxfp8.E4M3_MAX, tp8_drafter_mxfp8.BLOCK) == (448.0, 32)
+
+
 def test_the_recovery_is_exact_or_refuses():
     w = _mxfp8_weight(64, 256, seed=3)
     codes, exp = mxfp8_recover.mxfp8_from_bf16(w)

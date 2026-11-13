@@ -341,6 +341,14 @@ def test_the_gate_is_stock_where_the_stock_gate_runs_no_cat_gemm(gate):
     assert router_operand.SLOT.pending is None
 
 
+def test_under_torch_compile_the_gate_keeps_the_cat_gemm(gate, monkeypatch):
+    monkeypatch.setattr(router_operand, "is_torch_compiling", lambda: True)
+    x, operand = _publish(8)
+    assert gate(x) == "ours"
+    ((taken, _),) = gate.gemm_calls
+    assert taken is operand and gate.stock_calls == []
+
+
 def test_a_take_and_a_miss_are_logged_once_per_width(gate, monkeypatch):
     lines = []
     monkeypatch.setattr(router_operand, "_LOGGED", set())

@@ -8,19 +8,28 @@
   the boundary's residual add + RMSNorm) equals the stock composition (megamoe_topk_reduce_shared_add, then the
   boundary) bit for bit in an exact FP32 emulation, incl. signed zeros, FP32 subnormal inputs / products / sums and
   overflow.
-- The fold's decline / taken log stays bounded (row counts do not make new entries), and each decline names the first
-  failing check.
+- _ctx_moe_tail_add parks the deferred reduce only when forward_MoE armed the fold; forward_MoE hands it to the fold
+  op (MXFP8 pair published, (normed, shared) returned, the slot disarmed), and on every decline (before the MoE, on
+  the plane, or when the op rejects its arguments) the reduce runs exactly once and the stock boundary follows.
+- The slot is disarmed and empty after an exception inside an armed MoE call; the kill switch is read at import.
+- An op rejection turns the fold off for the process; the fold's decline / taken log stays bounded (row counts do not
+  make new entries), and each decline names the first failing check.
 - CBNQ_TOPK_DUAL: the dual-group form is taken on sm_107 only (thread-limited, P2-shaped hidden sizes); its O(1)
   position -> row map equals the ring producer's row order; a randomized model of its ring (owner-only refill +
   release counter, quad barriers, any TMA completion order) never lets a parity wait see a stage two phases away,
   never deadlocks, and hands every position to exactly one group.
 
-The fold's hand-off from the MoE needs the MegaMoE backend's deferred top-k reduce, which this engine does not have.
+The modeling-hook tests need the MegaMoE backend's deferred top-k reduce (``MegaMoEDeferredTopkReduce``, the routed
+output of a launch that leaves its reduce to the caller); they skip on an engine without it.
 """
 
 import fractions
+import os
 import random
 import struct
+import subprocess
+import sys
+import types
 
 import pytest
 import torch
@@ -343,6 +352,282 @@ def test_fold_order_equals_stock_composition_cpu(rows, kind):
         assert torch.equal(
             got_sum[0].view(torch.int16), torch.full((256,), -32768, dtype=torch.int16)
         )
+
+
+# ---- modeling hooks ------------------------------------------------------------------------------------------------
+_ENGINE_DEFERRED = modeling.MegaMoEDeferredTopkReduce
+_NO_DEFERRED = (
+    "needs the MegaMoE backend's deferred top-k reduce (MegaMoEDeferredTopkReduce), "
+    "which this engine does not have"
+)
+
+
+class _Deferred(*((_ENGINE_DEFERRED,) if _ENGINE_DEFERRED is not None else ())):
+    """The engine's deferred top-k reduce with an ``add_into`` that records its calls instead of launching the reduce
+    kernel."""
+
+    calls = []
+
+    def __init__(self, plane, scores):
+        self.plane, self.scores = plane, scores
+
+    def add_into(self, shared):
+        type(self).calls.append(shared)
+        return shared
+
+
+class _Slot:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, x, xq, xsf):
+        self.published.append((x, xq, xsf))
+
+
+ROWS = 1024
+HS = 256  # a small hidden size keeps the CPU tensors small; the fold op is a fake
+
+
+@pytest.fixture
+def env(monkeypatch):
+    """The ring boundary and the fold op present on an sm_107 device (fakes recording their calls), and ``_Deferred``
+    recording the deferred reduce's calls."""
+    if _ENGINE_DEFERRED is None:
+        pytest.skip(_NO_DEFERRED)
+    calls = types.SimpleNamespace(fold=[], stock=[], v2=[])
+    _Deferred.calls = []
+
+    def fold_op(shared, plane, scores, residual, weight, eps, write_norm, pdl):
+        calls.fold.append((shared, plane, scores, residual, weight, eps, write_norm, pdl))
+        if getattr(calls, "raise_", False):
+            raise RuntimeError("minimax_m31_ctx_boundary_normq_topk: bad arguments")
+        rows, hidden = shared.shape
+        return (
+            torch.zeros(rows, hidden, dtype=torch.bfloat16),
+            torch.zeros(rows, hidden, dtype=torch.uint8),
+            torch.zeros(rows * hidden // 32, dtype=torch.uint8),
+        )
+
+    def v2_op(inter, residual, weight, eps, write_norm, write_f32=False, fp4=None, pdl=False):
+        calls.v2.append(inter)
+        rows, hidden = inter.shape
+        return (
+            torch.zeros(rows, hidden, dtype=torch.bfloat16),
+            torch.zeros(rows, hidden, dtype=torch.uint8),
+            torch.zeros(rows * hidden // 32, dtype=torch.uint8),
+        )
+
+    slot = _Slot()
+    monkeypatch.setattr(modeling, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling, "_TOPK_FOLD", True)
+    monkeypatch.setattr(modeling, "_TOPK_FOLD_STATE", {"op": fold_op})
+    monkeypatch.setattr(modeling, "_TOPK_FOLD_SLOT", modeling._TopkFoldSlot())
+    monkeypatch.setattr(modeling, "_NORMQ", True)
+    monkeypatch.setitem(modeling._NORMQ_STATE, "op", object())
+    monkeypatch.setitem(modeling._NORMQ_V2_STATE, "ops", (v2_op, object()))
+    monkeypatch.setattr(modeling, "_dep2ctx_capture_blocked", lambda: False)
+    monkeypatch.setattr(modeling, "_bcg_note", lambda item, x: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)  # eager
+    monkeypatch.setattr(modeling, "_NORMQ_SLOT", slot)
+    calls.slot = slot
+    return calls
+
+
+def _deferred(rows=ROWS, k=K, hidden=HS):
+    plane = torch.randn(rows, k, hidden).bfloat16()
+    scores = torch.rand(rows, k)
+    return _Deferred(plane=plane, scores=scores)
+
+
+class _Spec:
+    def __init__(self, capture):
+        self.capture = capture
+        self.captured = []
+
+    def is_layer_capture(self, layer_idx):
+        return self.capture
+
+    def maybe_capture_hidden_states(self, layer_idx, hidden_states, residual):
+        self.captured.append(layer_idx)
+
+
+def _layer(env, routed, feeds=True, raise_in_moe=False, fused_comm=True):
+    """A decoder layer stand-in: the pre-MoE boundary is the identity, the MoE is the shared expert (zeros) plus
+    _ctx_moe_tail_add of ``routed``, the stock next-layer boundary is recorded."""
+    norm = types.SimpleNamespace(weight=torch.ones(HS, dtype=torch.bfloat16), variance_epsilon=1e-6)
+
+    def moe(x, attn_metadata, lora_params=None):
+        shared = torch.zeros_like(x)
+        out = modeling._ctx_moe_tail_add(routed, shared)
+        env.moe_out = out
+        if raise_in_moe:
+            raise ValueError("boom")
+        return out
+
+    moe.allreduce = None if fused_comm else object()
+    moe.routed_output_is_global = fused_comm
+
+    def stock(hidden_states, residual):
+        env.stock.append((hidden_states, residual))
+        return hidden_states, residual
+
+    return types.SimpleNamespace(
+        layer_idx=3,
+        _normq_feeds_mxfp8=feeds,
+        next_layer_layernorm=norm,
+        block_sparse_moe=moe,
+        _apply_pre_feed_forward_norm=lambda h, r, m=None: (h, r),
+        _apply_next_layer_layernorm=stock,
+    )
+
+
+def _forward(layer, rows=ROWS, spec=None):
+    x = torch.randn(rows, HS).bfloat16()
+    residual = torch.randn(rows, HS).bfloat16()
+    out = modeling.MiniMaxM3DecoderLayer.forward_MoE(
+        layer, x, types.SimpleNamespace(all_rank_num_tokens=None), residual, spec_metadata=spec
+    )
+    return out, residual
+
+
+def test_tail_add_parks_only_when_armed(env):
+    deferred = _deferred()
+    shared = torch.zeros(ROWS, HS).bfloat16()
+    assert modeling._ctx_moe_tail_add(deferred, shared) is shared
+    assert len(_Deferred.calls) == 1, "unarmed: the reduce runs in the tail add"
+    modeling._TOPK_FOLD_SLOT.arm()
+    shared2 = torch.zeros(ROWS, HS).bfloat16()
+    assert modeling._ctx_moe_tail_add(deferred, shared2) is shared2
+    assert len(_Deferred.calls) == 1, "armed: parked, not reduced"
+    assert modeling._TOPK_FOLD_SLOT.take() == (deferred, shared2)
+    assert not modeling._TOPK_FOLD_SLOT.armed and modeling._TOPK_FOLD_SLOT.parked is None
+
+
+def test_forward_moe_takes_the_fold(env):
+    deferred = _deferred()
+    layer = _layer(env, deferred)
+    (normed, new_residual), residual = _forward(layer)
+    assert len(env.fold) == 1 and not _Deferred.calls and not env.stock and not env.v2
+    shared, plane, scores, res, w, eps, write_norm, pdl = env.fold[0]
+    assert shared is env.moe_out and new_residual is shared
+    assert plane is deferred.plane and scores is deferred.scores
+    assert torch.equal(res, residual) and w is layer.next_layer_layernorm.weight and eps == 1e-6
+    assert write_norm is True and isinstance(pdl, bool)
+    assert len(env.slot.published) == 1 and env.slot.published[0][0] is normed
+    assert not modeling._TOPK_FOLD_SLOT.armed and modeling._TOPK_FOLD_SLOT.parked is None
+
+
+def _case(name, env, monkeypatch):
+    """(routed output, layer kwargs, forward kwargs, whether the reduce runs) of one decline case."""
+    routed, layer_kw, fwd_kw, reduced = _deferred(), {}, {}, 1
+    if name == "capture layer":
+        # A capture layer declines only with TRTLLM_M31_DISABLE_DEP2CTX_TOPK_CAPTURE=1.
+        monkeypatch.setattr(modeling, "_TOPK_CAPTURE", False)
+        fwd_kw["spec"] = _Spec(True)
+    elif name == "last layer":
+        layer_kw["feeds"] = False
+    elif name == "moe allreduce":
+        layer_kw["fused_comm"] = False
+    elif name == "rows 1023":
+        fwd_kw["rows"] = 1023
+        routed = _deferred(rows=1023)
+    elif name == "capture blocked":
+        monkeypatch.setattr(modeling, "_dep2ctx_capture_blocked", lambda: True)
+    elif name == "op missing":
+        monkeypatch.setitem(modeling._TOPK_FOLD_STATE, "op", None)
+    elif name == "no v2":
+        monkeypatch.setitem(modeling._NORMQ_V2_STATE, "ops", (None, None))
+    elif name == "non-deferred":
+        routed, reduced = torch.zeros(ROWS, HS).bfloat16(), 0
+    elif name == "plane K 8":
+        routed = _deferred(k=8)
+    elif name == "scores rows":
+        base = _deferred()
+        routed = _Deferred(plane=base.plane, scores=torch.rand(ROWS - 1, K))
+    elif name == "unaligned scores":
+        base = _deferred()
+        scores = torch.rand(ROWS * K + 1)[1:].view(ROWS, K)  # 4-byte offset
+        routed = _Deferred(plane=base.plane, scores=scores)
+    elif name == "op raises":
+        env.raise_ = True
+    else:
+        raise AssertionError(name)
+    return routed, layer_kw, fwd_kw, reduced
+
+
+DECLINES = [
+    "capture layer",
+    "last layer",
+    "moe allreduce",
+    "rows 1023",
+    "capture blocked",
+    "op missing",
+    "no v2",
+    "non-deferred",
+    "plane K 8",
+    "unaligned scores",
+    "scores rows",
+    "op raises",
+]
+
+
+@pytest.mark.parametrize("name", DECLINES)
+def test_fold_declines(env, monkeypatch, name):
+    routed, layer_kw, fwd_kw, reduced = _case(name, env, monkeypatch)
+    layer = _layer(env, routed, **layer_kw)
+    out, residual = _forward(layer, **fwd_kw)
+    assert len(_Deferred.calls) == reduced, "the deferred reduce runs exactly once on a decline"
+    if reduced:
+        assert _Deferred.calls[0] is env.moe_out
+    assert len(env.stock) == 1 and env.stock[0][0] is env.moe_out, "the stock boundary follows"
+    assert out == env.stock[0]
+    assert len(env.fold) == (1 if name == "op raises" else 0)
+    assert not modeling._TOPK_FOLD_SLOT.armed and modeling._TOPK_FOLD_SLOT.parked is None
+    if name == "capture layer":
+        assert fwd_kw["spec"].captured == [3]
+
+
+def test_op_rejection_latches_the_fold_off(env):
+    """A rejection is the device's or the build's (the plane checks passed): the next MoE layers decline before the
+    MoE instead of calling the op again, and still reduce exactly once with the stock boundary."""
+    env.raise_ = True
+    for i in range(3):
+        _forward(_layer(env, _deferred()))
+        assert len(env.fold) == 1, "the op is called once, then latched off"
+        assert len(_Deferred.calls) == i + 1 and len(env.stock) == i + 1
+    assert modeling._topk_fold_decline_reason(
+        _layer(env, _deferred()), torch.zeros(ROWS, HS).bfloat16(), None
+    ).startswith("the fold op is not built")
+
+
+def test_slot_disarmed_on_exception(env):
+    layer = _layer(env, _deferred(), raise_in_moe=True)
+    with pytest.raises(ValueError):
+        _forward(layer)
+    assert not modeling._TOPK_FOLD_SLOT.armed and modeling._TOPK_FOLD_SLOT.parked is None
+    # the next (unarmed) tail add reduces as usual
+    shared = torch.zeros(ROWS, HS).bfloat16()
+    modeling._ctx_moe_tail_add(_deferred(), shared)
+    assert len(_Deferred.calls) == 1
+
+
+def test_switch_off_subprocess():
+    code = (
+        "from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
+        "minimax_m3_1_flash_nvfp4__sm_107__dep2ctx import modeling as m; print(m._TOPK_FOLD)"
+    )
+    cases = {
+        (): "True",
+        (("TRTLLM_M31_DISABLE_DEP2CTX_TOPK_FOLD", "1"),): "False",
+    }
+    for extra, want in cases.items():
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TRTLLM_M31_DISABLE_")}
+        env.update(dict(extra))
+        out = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=600
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().splitlines()[-1] == want, (extra, out.stdout)
 
 
 def test_fold_log_is_bounded(monkeypatch):
