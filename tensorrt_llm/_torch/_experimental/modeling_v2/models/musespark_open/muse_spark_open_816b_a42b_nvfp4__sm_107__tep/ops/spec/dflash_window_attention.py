@@ -227,20 +227,21 @@ def _window_attention_split_kernel(
     block_start = seqlen - M
     new_row0 = b.to(tl.int64) * M
     if PRE_WAIT:
-        # split_pre_wait (with APPEND and PDL): the lengths, the slots and the
-        # context columns below the block are final once this grid is released
-        # (window_attention_launch), so the context part of the first key tile
-        # is loaded before the wait; q and the block's K/V only after it.
+        # split_pre_wait (with APPEND and PDL): the lengths, the slots, the page
+        # table and the context columns below the block are final once this
+        # grid is released (window_attention_launch), so the context part of
+        # the first key tile is loaded before the wait; q and the block's K/V
+        # only after it.
         cols_pre = start + tl.arange(0, BLOCK_N)
         arena_pre = (cols_pre < seqlen) & (cols_pre < block_start)
-        cols_pre64 = cols_pre.to(tl.int64)
+        rows_pre = _context_rows(table, cols_pre, arena_pre, page_rows, PAGE)
         k_pre = tl.load(
-            k_base + cols_pre64[:, None] * stride_kn + dims[None, :],
+            k_base + rows_pre[:, None] * stride_kn + dims[None, :],
             mask=arena_pre[:, None],
             other=0.0,
         )
         v_pre = tl.load(
-            v_base + cols_pre64[:, None] * stride_vn + dims[None, :],
+            v_base + rows_pre[:, None] * stride_vn + dims[None, :],
             mask=arena_pre[:, None],
             other=0.0,
         )
@@ -355,8 +356,7 @@ def _window_attention_split_kernel(
             in_arena = col_ok & (cols < block_start)
             new_rows = new_row0 + (cols - block_start)
             if PRE_WAIT and t == 0:
-                # Loaded before the wait over a dense arena (PRE_WAIT excludes PAGE), whose rows
-                # are the columns ``kv_rows`` names.
+                # Loaded before the wait, from the rows ``kv_rows`` names.
                 k = k_pre
             else:
                 k = tl.load(
@@ -554,8 +554,7 @@ def window_attention_launch(
     ``merge_entry_trigger`` (with ``enable_pdl``): the merge kernel releases its
     dependent before its own wait instead of at its exit (the PDL chain's ``pdl_merge``).
     ``page_table``: the caches are pools of pages (see the module docstring).
-    ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``, over a dense arena): see
-    ``DflashWindowAttention``.
+    ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``): see ``DflashWindowAttention``.
     ``qk_fold`` (with ``k_new``): see ``DflashWindowAttention``.
 
     Raises:
@@ -655,7 +654,7 @@ def window_attention_launch(
         DIRECT=direct,
         LAUNCH_WITH_PDL=enable_pdl,
         PAGE=page,
-        PRE_WAIT=enable_pdl and append and split_pre_wait and not page,
+        PRE_WAIT=enable_pdl and append and split_pre_wait,
         QK_FOLD=qk_fold is not None,
         num_warps=num_warps,
         launch_pdl=enable_pdl,
@@ -725,13 +724,13 @@ class DflashWindowAttention(OpWrapper):
       are pools ``[pages, page_size, Hkv, D]`` whose page stride is the same
       whole number of rows for both, and ``cache_batch_idx`` names table rows
       (see the module docstring);
-    * ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``, over a dense arena:
-      a paged call ignores it; ``drafter_folds``' attention PDL copy): the split
-      kernel loads the lengths, the slots and the context part (columns below
-      ``L - M``) of its first key tile before its ``griddepcontrol.wait``, and
-      ``q`` and the block's K/V after it. The caller guarantees those
-      tensors were final before the split's predecessor released it (its
-      predecessor triggers only after its own wait, in every CTA). The same values;
+    * ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``; ``drafter_folds``'
+      attention PDL copy): the split kernel loads the lengths, the slots, a
+      paged call's table rows and the context part (columns below ``L - M``) of
+      its first key tile before its ``griddepcontrol.wait``, and ``q`` and the
+      block's K/V after it. The caller guarantees those tensors were final
+      before the split's predecessor released it (its predecessor triggers only
+      after its own wait, in every CTA). The same values;
     * ``qk_fold`` (a ``QkFold``, with ``k_new``; ``dr3_folds``' QK fold): ``q`` and ``k_new`` hold the
       projection's raw query / key heads; each split program normalizes and rotates the rows it reads
       (``dr3_qk_norm_rope``: the bits of ``drafter_attn_pdl``'s CUDA kernel) and the append stores the

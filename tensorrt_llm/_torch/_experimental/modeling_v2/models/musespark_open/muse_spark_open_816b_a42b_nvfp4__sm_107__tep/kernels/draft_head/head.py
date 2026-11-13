@@ -25,10 +25,21 @@ With this feature the draft step runs, per rank:
 5. the built-in ``hidden_projection`` and the built-in einsum, unchanged;
 6. ``draft_path_walk``: the walk and the greedy draft tokens.
 
-The draft tokens are bitwise the built-in ones. Batches that sample drafts
-(rejection sampling of a non-greedy batch) or map draft vocab ids need the
-full-vocab logits; for those the worker all-gathers the shard logits itself
-and runs the built-in selector, which is the built-in computation.
+The draft tokens are bitwise the built-in ones. Batches that map draft vocab
+ids need the full-vocab logits; for those the worker all-gathers the shard
+logits itself and runs the built-in selector, which is the built-in
+computation.
+
+Batches that sample their drafts (rejection sampling of a non-greedy batch)
+take stages 1 to 5 too under fast path ``draft_head_sampled``
+(``install_sampled``), and in place of stage 6 ``draft_path_sample``: the
+built-in sampled walk (``dflash2_sample_candidate_paths`` with the worker's
+``sample_step``), its draft tokens and its slot-indexed ``draft_probs`` rows,
+in one launch, bit for bit on the lattice the merge built. The candidates are
+``torch.topk``'s over the full vocabulary, as on a single rank; the built-in
+sampled path of a sharded head tops each shard first (``_dflash2_global_top_k``),
+which differs only in the order of exactly tied logits. Without the fast path
+these batches take the built-in path on the drafter's transformed fp32 shard.
 
 A drafter that declares a logit transform (``DFlashForCausalLM.
 apply_draft_logit_transform``: a multiplier and a tanh softcap, in fp32) is
@@ -79,8 +90,11 @@ from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecWorkerBase
 from tensorrt_llm.logger import logger
 
+from ...ops.spec import head_sampler
+from ...ops.spec.draft_path_sample import DraftPathSample
 from ...ops.spec.draft_path_walk import DraftPathWalk
 from ...ops.spec.draft_shard_topk import CHUNK, FINITE_KEYS, NUM_WARPS, DraftShardTopK
 from ...ops.spec.draft_topk_merge import SORT_SLOTS, DraftTopKMerge
@@ -90,10 +104,13 @@ from .logit_transform import DraftLogitTransform
 draft_shard_topk = DraftShardTopK()
 draft_topk_merge = DraftTopKMerge()
 draft_path_walk = DraftPathWalk()
+draft_path_sample = DraftPathSample()
 
 #: Attribute of the zero-copy block-logits stand-in that carries the draft tokens.
 TOKENS_ATTR = "_draft_head_tokens"
 
+#: Worker attribute: sampled drafts take ``draft_path_sample`` (fast path ``draft_head_sampled``).
+SAMPLED_ATTR = "_draft_head_sampled"
 #: Worker attribute holding the drafter's ``DraftLogitTransform`` (absent without a transform).
 TRANSFORM_ATTR = "_draft_head_transform"
 #: Worker attribute: this step's logits were kept untransformed for the sharded selector.
@@ -199,6 +216,78 @@ def values_kwargs(transform: Optional[DraftLogitTransform]) -> dict:
     return {} if transform is None else {"values": transform.values}
 
 
+def selector_lattice(
+    local_logits: torch.Tensor,
+    block_hidden_states: torch.Tensor,
+    anchor_tokens: torch.Tensor,
+    selector: nn.Module,
+    mapping,
+    allreduce: nn.Module | None = None,
+    *,
+    transform: Optional[DraftLogitTransform],
+):
+    """The DFlash 2 selector's lattice from this rank's ``[B, K, shard]`` logits.
+
+    Returns ``(edges, unary, ids)``: the selector's bilinear term ``[B, K, top_k,
+    top_k]`` fp32 (without the unary term), and the candidates ``torch.topk`` takes
+    over the full vocabulary, their values ``[B, K, top_k]`` fp32 and vocab ids
+    ``[B, K, top_k]`` int64.
+
+    ``allreduce`` (from ``key_allreduce``) exchanges the keys as fp32 halves;
+    without it they are all-gathered as int32. An ``allreduce`` with a
+    ``takes(rows)`` method (``wide_draft_topk``'s ``RankTopKExchange``) selects
+    and packs the keys itself (``keys``) and names the merge's launch
+    (``merge_launch``) on the steps it takes.
+
+    ``transform`` is the drafter's logit transform when ``local_logits`` are
+    the untransformed bf16 shard of a drafter that declares one, else None:
+    the keys are then canonical and the unary values the transformed ones, so
+    the lattice is the built-in one on the transformed logits. Keyword-only
+    and required, so no call site drops it by accident.
+    """
+    requests, positions, shard = local_logits.shape
+    local = local_logits.reshape(requests * positions, shard)
+    canon = canon_kwargs(transform)
+    merge_launch = {}
+    if allreduce is not None:
+        takes = getattr(allreduce, "takes", None)
+        if takes is not None and takes(local.shape[0]):
+            packed = allreduce.keys(
+                local, selector.top_k, mapping.tp_rank, mapping.tp_size, **canon
+            )
+            merge_launch = allreduce.merge_launch(local.shape[0])
+        else:
+            packed = draft_shard_topk(
+                local, selector.top_k, CHUNK, NUM_WARPS, mapping.tp_rank, mapping.tp_size, **canon
+            )
+        gathered = allreduce(packed)
+    else:
+        gathered = allgather(
+            draft_shard_topk(local, selector.top_k, CHUNK, NUM_WARPS, **canon), mapping, dim=0
+        )
+    # The built-in selector's projection call, operand for operand.
+    gate = selector.hidden_projection(
+        block_hidden_states.to(selector.hidden_projection.weight.dtype)
+    )
+    ids, unary, predecessors, successors = draft_topk_merge(
+        gathered,
+        shard,
+        requests,
+        positions,
+        anchor_tokens.reshape(-1),
+        gate,
+        selector.predecessor_codebook,
+        selector.successor_codebook,
+        selector.top_k,
+        mapping.tp_size,
+        **merge_launch,
+        **values_kwargs(transform),
+    )
+    # dflash2_score_edges' einsum on tensors of its shapes and strides: the same kernel.
+    edges = torch.einsum("blpr,blcr->blpc", predecessors, successors)
+    return edges, unary, ids
+
+
 def selector_draft_tokens(
     local_logits: torch.Tensor,
     block_hidden_states: torch.Tensor,
@@ -215,19 +304,9 @@ def selector_draft_tokens(
 ):
     """Greedy DFlash 2 draft tokens ``[B, K]`` int32 from this rank's ``[B, K, shard]`` logits.
 
-    ``allreduce`` (from ``key_allreduce``) exchanges the keys as fp32 halves;
-    without it they are all-gathered as int32. An ``allreduce`` with a
-    ``takes(rows)`` method (``wide_draft_topk``'s ``RankTopKExchange``) selects
-    and packs the keys itself (``keys``) and names the merge's launch
-    (``merge_launch``) on the steps it takes. ``walk`` stands in for
-    ``draft_path_walk`` (same arguments; its result is returned as is):
-    the ``path_walk_tail`` fast path passes a walk that also writes the step's tail.
-
-    ``transform`` is the drafter's logit transform when ``local_logits`` are
-    the untransformed bf16 shard of a drafter that declares one, else None:
-    the keys are then canonical and the unary values the transformed ones, so
-    the tokens are the built-in ones on the transformed logits. Keyword-only
-    and required, so no call site drops it by accident.
+    ``selector_lattice`` (same arguments), then ``draft_path_walk``. ``walk`` stands in for
+    ``draft_path_walk`` (same arguments; its result is returned as is): the
+    ``path_walk_tail`` fast path passes a walk that also writes the step's tail.
 
     ``tail`` (``dr_draft_tail.tail.DrDraftTail``, ``draft_head_tail``) runs the steps after the
     shard GEMM as its own launches when it ``takes`` the call and ``transform`` is None (it
@@ -269,46 +348,15 @@ def selector_draft_tokens(
         raise RuntimeError(
             "[musespark_open] draft head: rejection-sampled drafts need the dr draft tail to take the step"
         )
-    requests, positions, shard = local_logits.shape
-    local = local_logits.reshape(requests * positions, shard)
-    canon = canon_kwargs(transform)
-    merge_launch = {}
-    if allreduce is not None:
-        takes = getattr(allreduce, "takes", None)
-        if takes is not None and takes(local.shape[0]):
-            packed = allreduce.keys(
-                local, selector.top_k, mapping.tp_rank, mapping.tp_size, **canon
-            )
-            merge_launch = allreduce.merge_launch(local.shape[0])
-        else:
-            packed = draft_shard_topk(
-                local, selector.top_k, CHUNK, NUM_WARPS, mapping.tp_rank, mapping.tp_size, **canon
-            )
-        gathered = allreduce(packed)
-    else:
-        gathered = allgather(
-            draft_shard_topk(local, selector.top_k, CHUNK, NUM_WARPS, **canon), mapping, dim=0
-        )
-    # The built-in selector's projection call, operand for operand.
-    gate = selector.hidden_projection(
-        block_hidden_states.to(selector.hidden_projection.weight.dtype)
+    edges, unary, ids = selector_lattice(
+        local_logits,
+        block_hidden_states,
+        anchor_tokens,
+        selector,
+        mapping,
+        allreduce,
+        transform=transform,
     )
-    ids, unary, predecessors, successors = draft_topk_merge(
-        gathered,
-        shard,
-        requests,
-        positions,
-        anchor_tokens.reshape(-1),
-        gate,
-        selector.predecessor_codebook,
-        selector.successor_codebook,
-        selector.top_k,
-        mapping.tp_size,
-        **merge_launch,
-        **values_kwargs(transform),
-    )
-    # dflash2_score_edges' einsum on tensors of its shapes and strides: the same kernel.
-    edges = torch.einsum("blpr,blcr->blpc", predecessors, successors)
     return (draft_path_walk if walk is None else walk)(edges, unary, ids)
 
 
@@ -481,7 +529,11 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
         ):
             return "draft logits outside the [B, K, shard] layout"
         if spec_metadata.wants_advanced_draft_sampling:
-            return SAMPLED_DRAFTS
+            # rejection_sampler's fused walk owns the sampled steps of a worker that has it.
+            if not self.__dict__.get(SAMPLED_ATTR) or self.__dict__.get("_rs") is not None:
+                return SAMPLED_DRAFTS
+            if not spec_metadata.advanced_sampling_mode.is_fused:
+                return "sampled drafts in a sampling mode other than the fused one"
         if self._d2t is not None:
             return "a d2t draft vocab map"
         return None
@@ -616,6 +668,72 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
             draft_model, full_logits, block_hidden_states, anchor_tokens, spec_metadata
         )
 
+    def _sample_dflash2_block(
+        self,
+        draft_model,
+        gen_logits,
+        block_hidden_states,
+        anchor_tokens,
+        spec_metadata,
+        num_contexts,
+        batch_size,
+    ):
+        """Sampled drafts: the lattice on vocab shards and ``draft_path_sample`` (``draft_head_sampled``).
+
+        On a step ``_draft_head_takes`` admits (``SAMPLED_ATTR`` set, the fused
+        sampling mode), the built-in method's computation on the full-vocab
+        ``torch.topk`` candidates: its ``draft_probs`` zeroing, then the sampled
+        walk, the token gather and the scatter of the distributions in one launch.
+        Any other step runs the built-in method on the drafter's transformed logits.
+        """
+        selector = draft_model.candidate_selector
+        full_vocab = selector.predecessor_codebook.shape[0]
+        if gen_logits.shape[-1] == full_vocab or not self._draft_head_takes(
+            draft_model, gen_logits, spec_metadata, full_vocab
+        ):
+            return super()._sample_dflash2_block(
+                draft_model,
+                self._draft_head_transformed(draft_model, gen_logits),
+                block_hidden_states,
+                anchor_tokens,
+                spec_metadata,
+                num_contexts,
+                batch_size,
+            )
+        edges, unary, ids = selector_lattice(
+            gen_logits,
+            block_hidden_states,
+            anchor_tokens,
+            selector,
+            self.mapping,
+            self.__dict__.get("_draft_head_allreduce"),
+            transform=self._draft_head_transform_for(draft_model, gen_logits),
+        )
+        gen = slice(num_contexts, batch_size)
+        draft_probs = spec_metadata.draft_probs
+        slots = None
+        if draft_probs is not None:
+            slots = spec_metadata.batch_slot_ids[gen]
+            # The built-in zeroing of the rows the walk writes, as the built-in method runs it.
+            draft_probs[slots, : unary.shape[1], :full_vocab] = draft_probs.new_zeros(())
+            spec_metadata.draft_probs_last_dim = full_vocab
+        tokens, _ = draft_path_sample(
+            edges,
+            unary,
+            ids,
+            spec_metadata.request_temperatures[gen],
+            spec_metadata.request_top_ks[gen],
+            spec_metadata.request_top_ps[gen],
+            spec_metadata.request_min_ps[gen],
+            spec_metadata.request_seeds[gen],
+            spec_metadata.request_offsets[gen],
+            spec_metadata.rng_draft_slot(0),
+            _RNG_SLOT_SPAN,
+            draft_probs,
+            slots,
+        )
+        return tokens, full_vocab
+
     def sample_draft_tokens(self, logits, spec_metadata, batch_size, **kwargs):
         if self.__dict__.get(OWED_ATTR):
             self.__dict__[OWED_ATTR] = False
@@ -689,6 +807,65 @@ def unsupported_reason(worker, draft_model) -> str | None:
     if shadow is not None and not isinstance(shadow, _DeferredTransform):
         return f"the drafter's {TRANSFORM_METHOD} is replaced on the instance"
     return None
+
+
+def sampled_unsupported_reason(worker, draft_model) -> str | None:
+    """Why ``draft_path_sample`` cannot stand in for the worker's sampled walk, or None.
+
+    The fast path reproduces ``DFlashWorker._sample_dflash2_block`` with the
+    base class's RNG layout (``_rng_state_per_request``) and fused sampler
+    (``_sample_from_logits_with_probs``) and the drafter's own
+    ``sample_candidate_path``; a class that overrides one of them samples
+    something else.
+    """
+    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+
+    cls = type(worker)
+    owner = _owner(cls, "_sample_dflash2_block", after=ShardedDraftHeadDFlashWorker)
+    if _owner(cls, "_sample_dflash2_block") is not ShardedDraftHeadDFlashWorker or (
+        owner is not DFlashWorker
+    ):
+        return f"the worker class {cls.__name__} overrides the sampled walk"
+    for name in ("_rng_state_per_request", "_sample_from_logits_with_probs"):
+        if _owner(cls, name) is not SpecWorkerBase:
+            return f"the worker class {cls.__name__} overrides {name}"
+    if _owner(type(draft_model), "sample_candidate_path") is not DFlashForCausalLM:
+        return f"the drafter class {type(draft_model).__name__} overrides sample_candidate_path"
+    if "sample_candidate_path" in getattr(draft_model, "__dict__", {}):
+        return "the drafter's sample_candidate_path is replaced on the instance"
+    return None
+
+
+def install_sampled(llm: nn.Module, load=head_sampler.load_library_agreed) -> bool:
+    """Put the sampled drafts of ``llm``'s draft head on ``draft_path_sample``; return True.
+
+    Needs ``install`` first. ``load(mapping)`` loads the head sampler library on
+    every rank of the TP group and agrees on the result (collective: every rank
+    installs at the same point of the load). A second call changes nothing.
+
+    Raises:
+        ValueError: when the draft head is not installed, or the worker or the
+            drafter samples its walk other than as the built-in classes do
+            (``sampled_unsupported_reason``, agreed over the TP group).
+        RuntimeError: when the library fails to load on some rank (every rank raises).
+    """
+    worker = getattr(llm, "spec_worker", None)
+    if not installed(llm):
+        raise ValueError(
+            "[musespark_open] draft_head_sampled cannot run here: the draft head is not installed"
+        )
+    if worker.__dict__.get(SAMPLED_ATTR):
+        return True
+    reason = agreed_refusal(worker.mapping, sampled_unsupported_reason(worker, llm.draft_model))
+    if reason is not None:
+        raise ValueError(f"[musespark_open] draft_head_sampled cannot run here: {reason}")
+    path = load(worker.mapping)
+    worker.__dict__[SAMPLED_ATTR] = True
+    logger.info(
+        "[musespark_open] draft_head_sampled: sampled DFlash 2 drafts walked in one launch on the "
+        f"draft head's lattice (top_k {llm.draft_model.candidate_selector.top_k}; library {path})"
+    )
+    return True
 
 
 def tie_order_probe_logits(vocab: int, shard: int, rows: int = PROBE_ROWS) -> torch.Tensor:

@@ -3668,7 +3668,10 @@ class KVCacheManagerV2(BaseResourceManager):
         rows = torch.empty(
             self.num_pools, num_seqs, width, dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        torch.index_select(self.host_kv_cache_block_offsets[:, :, 0, :width], 1, copy_idx, out=rows)
+        # Row by row on this thread, without an intra-op thread team.
+        host_rows, snapshot = self.host_kv_cache_block_offsets.numpy(), rows.numpy()
+        for seq, row in enumerate(copy_idx.tolist()):
+            snapshot[:, seq] = host_rows[:, row, 0, :width]
         device_rows = self._device_batch_block_offsets[: rows.numel()].view(rows.shape)
         device_rows.copy_(rows, non_blocking=True)
         _convert_batch_block_offsets(

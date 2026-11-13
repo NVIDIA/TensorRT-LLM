@@ -343,16 +343,21 @@ order:
   multi-request window attention;
 * ``draft_head`` on the DFlash worker and the drafter's logits processor, then
   ``wide_draft_topk`` (tep4 only) on the draft head's key all-reduce: draft
-  steps of 33 or more rows exchange each rank's own top-k keys;
+  steps of 33 or more rows exchange each rank's own top-k keys; then
+  ``draft_head_sampled`` on the draft head's worker: sampled drafts walk the
+  draft head's lattice in one launch (it loads the head sampler library);
 * ``drafter_fc_shard``, ``fused_accept`` and ``drafter_fixed_gemms`` on the
   drafter's ``fc`` and GEMMs and on the worker's acceptance -- after
   ``draft_head``, because ``fused_accept`` derives its worker class from
   ``draft_head``'s while ``draft_head`` accepts only the built-in class;
 * ``context_kv_fork``, which re-classes the worker on top of those, binds the
   fork point on the LM head's GEMM call and is armed per decode step by
-  ``DecodeTarget``;
-* ``verify_fold`` and ``path_walk_tail`` on top of that (on a folded step its
-  prepare takes the context-K/V fork's side chain);
+  ``DecodeTarget`` (with ``paged_context_commit``, a paged context's commit is one
+  launch, with ``paged_ctx_block_tables`` its page table's decode is two, and with
+  ``paged_ctx_kv_store`` its K/V store is one);
+* ``verify_fold`` (with ``rejection_fold``, also on rejection-sampled steps) and
+  ``path_walk_tail`` on top of that (on a folded step its prepare takes the context-K/V
+  fork's side chain);
 * ``drafter_hops`` on the drafter's block decode;
 * ``drafter_pdl_chain``;
 * ``step_window_compact`` last, on the worker the others left (and after the
@@ -1233,17 +1238,25 @@ _TEP4_BITWISE_PATHS = frozenset(
         "model_boundary",
         "fused_accept",
         "verify_fold",
+        "rejection_fold",
         "draft_head",
         "path_walk_tail",
         "drafter_block_conv",
         "context_kv_fork",
+        "paged_context_commit",
+        "paged_ctx_block_tables",
+        "paged_ctx_kv_store",
         "split_sampler",
     }
 )
-#: TEP4: the bitwise paths and ``drafter_fc_shard``, whose
+#: TEP4: the bitwise paths, ``drafter_fc_shard``, whose
 #: sharded drafter projection can move a draft token's bf16 last place (the target
-#: still verifies every draft; it shards every row count at TP4).
-_TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
+#: still verifies every draft; it shards every row count at TP4), and
+#: ``draft_head_sampled``, whose sampled drafts take the full-vocab ``torch.topk``
+#: candidates where the built-in sampled path tops each shard first (the two order
+#: exactly tied logits differently; rejection sampling verifies against the
+#: distribution each draft was drawn from).
+_TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard", "draft_head_sampled"})
 #: The TEP4 communication paths of decode steps above 32 rows: the MoE output all-reduce
 #: of 129..1024-row steps on the MNNVL two-shot, the post-attention hop of 33..1024-row
 #: steps on its own transports (the 8-row hop and its wide TP4 transport keep 1..32 rows),
@@ -1376,8 +1389,8 @@ _SM107_LEVERS = frozenset(
         "head_sampler_coop_fold",
     }
 )
-#: The levers sm107 TEP8 adds: the drafter's fused context-K/V side chain, its early fc fork
-#: and the drafter preamble written by the folded commit (a dense arena), and the 8-row head
+#: The levers sm107 TEP8 adds: the drafter's fused context-K/V side chain, its early fc fork and
+#: the drafter preamble written by the folded commit (a dense arena or pages), and the 8-row head
 #: logits gathered over MULTIMEM.
 _SM107_TEP8_LEVERS = frozenset(
     {

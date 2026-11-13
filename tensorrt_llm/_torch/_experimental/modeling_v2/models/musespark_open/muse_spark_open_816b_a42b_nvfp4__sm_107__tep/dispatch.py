@@ -359,8 +359,38 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("fused_accept",),
     ),
     FastPath(
+        "paged_context_commit",
+        "the context-K/V fork's commit over a paged drafter context in one launch",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "paged_ctx_block_tables",
+        "the context-K/V fork's decode of a paged drafter context's page table in two launches",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "paged_ctx_kv_store",
+        "a paged drafter context's K/V store of every drafter layer in one launch",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "rejection_fold",
+        "a rejection-sampled step's bookkeeping folded into one launch after the rejection sampler",
+        "draft",
+        ("verify_fold",),
+    ),
+    FastPath(
         "path_walk_tail",
         "step bookkeeping folded into the draft-head walk",
+        "draft",
+        ("draft_head",),
+    ),
+    FastPath(
+        "draft_head_sampled",
+        "sampled drafts (rejection sampling) on the draft head's lattice, walked in one launch",
         "draft",
         ("draft_head",),
     ),
@@ -477,7 +507,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "drafter_kv_side_chain",
-        "the context-K/V side chain with its prologue and arena store fused (dense arena)",
+        "the context-K/V side chain with its prologue and arena store fused (dense arena or pages)",
         "draft",
         ("context_kv_fork",),
     ),
@@ -489,7 +519,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "drafter_preamble_from_commit",
-        "the drafter forward's integer preamble written by the folded step's commit (dense arena)",
+        "the drafter forward's integer preamble written by the folded step's commit (dense arena or pages)",
         "draft",
         ("verify_fold", "context_kv_fork"),
     ),
@@ -1656,7 +1686,7 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
     Precondition(
         "ninja and nvcc for the head sampler's build (torch.utils.cpp_extension)",
         _head_sampler_toolchain,
-        ("split_sampler",),
+        ("split_sampler", "draft_head_sampled"),
     ),
 )
 
@@ -1705,10 +1735,10 @@ def dependents(names: Iterable[str]) -> FrozenSet[str]:
     return frozenset(path for path in FAST_PATH_NAMES if closure((path,)) & names)
 
 
-#: The levers that write the dense full-length drafter arena by its own column rule, and so
-#: need it: the context-K/V side chain with its fused store, its early fc fork, and the
-#: folded commit that also writes the drafter's preamble.
-DENSE_ARENA_LEVERS: Tuple[str, ...] = (
+#: The levers whose store is the dense full-length arena's or the KV cache manager's pages,
+#: and so not a windowed arena's: the context-K/V side chain with its fused store, its early fc
+#: fork, and the folded commit that also writes the drafter's preamble.
+UNWINDOWED_ARENA_LEVERS: Tuple[str, ...] = (
     "drafter_kv_side_chain",
     "drafter_fc_early_fork",
     "drafter_preamble_from_commit",
@@ -1732,12 +1762,10 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
 
     * An arena that is not windowed leaves the per-step compaction (``WINDOWED_STEP_PATHS``)
       out.
-    * ``DENSE_ARENA_LEVERS`` need a dense full-length arena.
+    * ``UNWINDOWED_ARENA_LEVERS`` need a dense full-length arena or pages.
     * ``windowed_commit_parallel`` runs inside the windowed commit, so it needs a windowed
       arena.
-    * A paged arena leaves out ``incremental_block_offsets``: the step-input stager
-      declines the block-table copy while a draft KV cache manager is attached; and
-      ``drafter_kv_glue``, whose store writes a worker-owned arena.
+    * A paged arena leaves out ``drafter_kv_glue``, whose store writes a worker-owned arena.
     * ``TRTLLM_KV_DEFER_CLOSE=1`` leaves out ``step_loop_on_execution_stream``, which is
       not validated with the deferred close.
     * A drafter that declares a logit transform, or one whose transform is not known,
@@ -1754,11 +1782,12 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
         for name in WINDOWED_STEP_PATHS:
             if name in served:
                 exclusions[name] = f"the drafter context arena is {arena.value}, not windowed"
-    if arena is not _levers.Arena.DENSE:
-        for name in DENSE_ARENA_LEVERS:
+    if arena is _levers.Arena.WINDOWED:
+        for name in UNWINDOWED_ARENA_LEVERS:
             if name in served:
                 exclusions[name] = (
-                    f"it needs a dense full-length drafter context arena, not a {arena.value} one"
+                    "it needs a dense full-length drafter context arena or pages, not a "
+                    f"{arena.value} one"
                 )
     if "windowed_commit_parallel" in served and arena is not _levers.Arena.WINDOWED:
         exclusions["windowed_commit_parallel"] = (
@@ -1768,10 +1797,6 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
     if arena is _levers.Arena.PAGED and "drafter_kv_glue" in served:
         exclusions["drafter_kv_glue"] = (
             "a paged drafter context has no worker-owned arena for its store"
-        )
-    if arena is _levers.Arena.PAGED and "incremental_block_offsets" in served:
-        exclusions["incremental_block_offsets"] = (
-            "the step-input stager declines the block-table copy over a paged drafter context"
         )
     if deployment.facts.kv_defer_close and "step_loop_on_execution_stream" in served:
         exclusions["step_loop_on_execution_stream"] = (

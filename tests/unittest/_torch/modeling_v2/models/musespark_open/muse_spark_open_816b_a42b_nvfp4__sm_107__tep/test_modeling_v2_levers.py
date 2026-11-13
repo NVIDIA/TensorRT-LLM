@@ -298,6 +298,8 @@ def test_the_rule_table_is_the_lever_registry():
 # The regions under auto
 # --------------------------------------------------------------------------
 LL = {"step_loop_on_execution_stream", "incremental_block_offsets", "head_sampler_coop_fold"}
+#: The drafter-arena levers: their stores and commits are a dense full-length arena's or the KV
+#: cache manager's pages (``dispatch.UNWINDOWED_ARENA_LEVERS``).
 DENSE = {"drafter_kv_side_chain", "drafter_fc_early_fork", "drafter_preamble_from_commit"}
 MIDC = {"wide_direct_transports", "wide_oproj_publish", "wide_finalize_transport"}
 HC = {"packed_prep_append", "windowed_commit_parallel"}
@@ -854,6 +856,14 @@ def test_agg_tep8_mbs1_dense():
     assert base_off(lever_table) == set()
 
 
+def test_agg_tep8_mbs1_paged():
+    lever_table = table((107, 8), 1, "agg", "paged")
+    assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | VR_SINGLE
+    assert rule_levers_on(rs_table(arena="paged")) == (
+        LL | DENSE | SINGLE | VR_SINGLE | SINGLE_TAIL | SINGLE_RS
+    )
+
+
 @pytest.mark.parametrize(
     "transform, expected",
     [(None, set()), (True, set()), (False, SINGLE_TAIL)],
@@ -885,7 +895,6 @@ def test_the_draft_head_tail_waits_for_a_drafter_without_a_logit_transform(trans
     [
         ((107, 8), 2, "agg", "dense"),
         ((107, 8), 1, "gen", "dense"),
-        ((107, 8), 1, "agg", "paged"),
         ((107, 8), 1, "agg", "windowed"),
         ((107, 4), 1, "agg", "windowed"),
     ],
@@ -1490,7 +1499,10 @@ def c55_plan(key, max_batch_size, arena) -> set:
     that carries the half window, and the drafter arena's: over a windowed arena on an
     architecture other than sm107, ``context_kv_fork`` and ``verify_fold`` only with the
     window compaction; any other arena leaves the compaction out. No served path builds on
-    one of these names there, so each rule removes the name alone."""
+    one of these names there, so each rule removes the name alone. Then the base paths added
+    since, each beside the path it builds on: ``draft_head_sampled`` (``draft_head``),
+    ``rejection_fold`` (``verify_fold``), ``paged_context_commit``,
+    ``paged_ctx_block_tables`` and ``paged_ctx_kv_store`` (``context_kv_fork``)."""
     paths = set(C55_SERVED[key])
     if max_batch_size is None or max_batch_size > 8:
         paths.discard("half_window_experts")
@@ -1501,6 +1513,15 @@ def c55_plan(key, max_batch_size, arena) -> set:
             paths -= {"context_kv_fork", "verify_fold"}
     else:
         paths.discard("drafter_window_compact")
+    for added, base in (
+        ("draft_head_sampled", "draft_head"),
+        ("rejection_fold", "verify_fold"),
+        ("paged_context_commit", "context_kv_fork"),
+        ("paged_ctx_block_tables", "context_kv_fork"),
+        ("paged_ctx_kv_store", "context_kv_fork"),
+    ):
+        if base in paths:
+            paths.add(added)
     return paths
 
 
@@ -1980,10 +2001,13 @@ def test_context_fp8_dense_on_refuses_a_reachable_decode_step():
 
 def test_a_paged_arena_leaves_the_arena_writing_levers_out():
     lever_table = table((107, 8), 1, "agg", "paged")
-    for name in DENSE | {"incremental_block_offsets", "windowed_commit_parallel"}:
-        assert lever_table.decisions[name].source == "structural", name
+    assert lever_table.decisions["windowed_commit_parallel"].source == "structural"
+    for name in DENSE | {"drafter_preamble_late_join"}:
+        assert lever_table.on(name), name
     assert lever_table.on("step_loop_on_execution_stream")
     assert lever_table.on("context_kv_fork")
+    # The drafter's pages are in the target's manager, whose tables the stager copies.
+    assert lever_table.on("incremental_block_offsets")
 
 
 def test_the_window_compaction_needs_a_windowed_arena_and_the_full_context_paths_need_it():
