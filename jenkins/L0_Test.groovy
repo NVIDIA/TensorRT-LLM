@@ -4648,9 +4648,21 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
 
 def loadStageResourceRequests(pipeline)
 {
+    def configPath = "jenkins/config/stage_resources.json"
     def configDir = "${pipeline.pwd(tmp: true)}/stage-resources"
-    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/config/stage_resources.json", configDir)
-    def requests = pipeline.readJSON(file: "${configDir}/stage_resources.json", returnPojo: true).stages
+    def configFile = "${configDir}/stage_resources.json"
+    try {
+        // Download only this file. A git fetch of the commit downloads the whole source tree.
+        pipeline.sh "mkdir -p '${configDir}' && wget -nv --tries=3 --timeout=60 -O '${configFile}' " +
+            "'https://artifactory.pdx.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${env.gitlabCommit}/${configPath}'"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        // For example, the commit is not on GitHub or Artifactory is not available.
+        pipeline.echo "Failed to download ${configPath} at ${env.gitlabCommit} from Artifactory; using git instead. Error: ${e.toString()}"
+        trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, configPath, configDir)
+    }
+    def requests = pipeline.readJSON(file: configFile, returnPojo: true).stages
     if (!(requests instanceof Map)) {
         pipeline.error("stage_resources.json must contain a stages object")
     }
@@ -4684,6 +4696,10 @@ def applyStageResourceRequests(pipeline, Map podConfig, String stageName)
 
 def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelExpress = false)
 {
+    // The trt-llm cpu and memory values in this function are defaults.
+    // runKubernetesPodWithInfraRetry replaces them with the stage's entry in
+    // jenkins/config/stage_resources.json when the stage has one (see
+    // applyStageResourceRequests). SLURM dispatcher Pods always use these values.
     def targetCloud = "kubernetes-cpu"
     def selectors = """
                   nvidia.com/node_type: builder
@@ -4801,6 +4817,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
             // Not a hard requirement, but based on empirical values.
             // Keep ModelExpress services inside the existing pod resource envelope;
             // otherwise their requests can make an otherwise valid GPU pod unschedulable.
+            // A stage_resources.json entry replaces cpuCount and memorySize, so the
+            // entry must leave the same room for the sidecars.
             def serviceCpuReserve = modelExpress ? 6 : 0
             def serviceMemoryReserveGi = modelExpress ? 16 : 0
             def serviceStorageReserveGi = modelExpress ? 8 : 0
@@ -4815,6 +4833,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
         targetCloud = "kubernetes"
         // DGX Spark requires a special setting for accessing the device.
         // It has 128GB unified memory as per spec. Use half of the memory at the CPU side.
+        // A stage_resources.json entry replaces this value; keep it near half as well.
         if (type.contains("gb10x")) {
             targetCloud = "nvks-sparks-cloud"
             memorySize = "64Gi"

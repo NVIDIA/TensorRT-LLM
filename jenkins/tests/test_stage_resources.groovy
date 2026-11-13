@@ -1,5 +1,17 @@
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 // Run from the repository root: groovy -cp <snakeyaml.jar> jenkins/tests/test_stage_resources.groovy
@@ -35,6 +47,8 @@ dumpOptions.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK)
 def yamlWriter = new Yaml(dumpOptions)
 def messages = []
 def checkouts = []
+def shellCommands = []
+boolean downloadFails = false
 def launches = []
 String configJson = new File('jenkins/config/stage_resources.json').text
 def utils = new Expando(
@@ -53,6 +67,10 @@ def utils = new Expando(
 )
 def pipeline = new Expando(
     pwd: { Map options -> assert options.tmp; '/tmp/stage-resource-test' },
+    sh: { String command ->
+        shellCommands << command
+        if (downloadFails) throw new RuntimeException('wget failed')
+    },
     readJSON: { Map options ->
         assert options.returnPojo
         assert options.file.toString() == '/tmp/stage-resource-test/stage-resources/stage_resources.json'
@@ -87,8 +105,18 @@ def script = new GroovyShell(loader, new Binding(variables)).parse(
 script.run()
 
 assert script.loadStageResourceRequests(pipeline) == [:]
+assert shellCommands.size() == 1
+assert shellCommands[0].contains("mkdir -p '/tmp/stage-resource-test/stage-resources'")
+assert shellCommands[0].contains("-O '/tmp/stage-resource-test/stage-resources/stage_resources.json'")
+assert shellCommands[0].contains("'https://artifactory.pdx.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/" +
+                                 "test-sha/jenkins/config/stage_resources.json'")
+assert checkouts.isEmpty()
+downloadFails = true
+assert script.loadStageResourceRequests(pipeline) == [:]
 assert checkouts == [['test-repo', 'test-sha', 'jenkins/config/stage_resources.json',
                       '/tmp/stage-resource-test/stage-resources']]
+assert messages.any { it.contains('from Artifactory; using git instead') }
+downloadFails = false
 configJson = JsonOutput.toJson([stages: ['test-stage': [cpu_m: 1001, memory_mi: 10241]]])
 variables.stageResourceRequests = script.loadStageResourceRequests(pipeline)
 assert variables.stageResourceRequests['test-stage'] == [cpu_m: 1001, memory_mi: 10241]
@@ -169,4 +197,4 @@ def expressions = yaml.load(launches[1].yaml).spec.affinity.nodeAffinity
     .requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions
 assert expressions.find { it.key == 'kubernetes.io/hostname' }.values == ['host-1']
 
-println 'PASS: config loading and validation, CPU/GPU/Spark/sidecars, defaults, debug/single-attempt, SLURM exclusion, retry placement'
+println 'PASS: config download and git fallback, validation, CPU/GPU/Spark/sidecars, defaults, debug/single-attempt, SLURM exclusion, retry placement'
