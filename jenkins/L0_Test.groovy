@@ -905,7 +905,7 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, durationsPath="") {
+def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collectionLogDir, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
@@ -961,7 +961,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, duratio
     def testListCmd = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-        "pytest",
+        "python3 '${llmSrc}/jenkins/scripts/collect_pytest.py'",
+        "--log-dir='${collectionLogDir}'",
+        "--timeout-seconds=1800",
+        "--retries=2",
+        "--",
         "--collect-only",
         "--splitting-algorithm least_duration",
         "--test-list=${cleanedTestDBList}",
@@ -979,10 +983,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, duratio
 
     try {
         // First execute the pytest command and check if it succeeds
-        def pytestOutput = sh(
-            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
-            returnStdout: true
-        ).trim()
+        sh(script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}")
+        def pytestOutput = readFile(file: "${collectionLogDir}/output.txt").trim()
 
         // Debug: Show the raw pytest output
         echo "<<<START_PYTEST_OUTPUT>>>"
@@ -1011,6 +1013,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, duratio
             return shouldInclude
         }
         echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception e) {
         echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
         error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
@@ -6424,7 +6428,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, stageName, clusterDurationsPath)
+        def collectionLogDir = "${WORKSPACE}/${stageName}/collection${postTag}"
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collectionLogDir, clusterDurationsPath)
         def cppTestTarArtifactPath = cppTestArtifactPath(config, stageName)
         if (cppTestTarArtifactPath) {
             def cppTestArchive = "${llmPath}/cpp-tests.tar.gz"

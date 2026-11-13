@@ -65,6 +65,13 @@ Scope: this directory and its descendants. Supplements the repository-root
 
 ## Path-valued pytest options
 
+- Shard collection runs through `scripts/collect_pytest.py`: each attempt has a
+  30-minute deadline and only timed-out attempts get up to two retries. Ordinary
+  pytest failures and user cancellation must not retry. The enclosing Pipeline
+  deadline still applies. Keep attempt stdout/stderr under the stage result
+  directory so the normal result upload preserves them on failure. Only the
+  successful attempt's `output.txt` is parsed into the shard list.
+
 - For new or modified long pytest options that take a single file or directory
   path, use `--option=value` when supported. Keep the option and value in one
   argument, for example:
