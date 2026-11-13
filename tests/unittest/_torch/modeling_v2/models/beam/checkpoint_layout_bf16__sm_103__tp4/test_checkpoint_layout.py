@@ -24,6 +24,7 @@ import json
 import math
 import os
 import struct
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -274,6 +275,48 @@ def test_inconsistent_configuration_is_rejected(change) -> None:
     cfg.update(change)
     with pytest.raises(ValueError):
         layout.tensor_specs(cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("as_object", [False, True])
+@pytest.mark.parametrize("scaling", [{}, {"rope_type": "linear", "factor": 2.0}, False])
+def test_top_level_rope_scaling_is_rejected(as_object: bool, scaling: object) -> None:
+    cfg = model_config()
+    cfg["rope_scaling"] = scaling
+    with pytest.raises(ValueError, match="rope_scaling"):
+        layout.check_config(SimpleNamespace(**cfg) if as_object else cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("partial", [None, 1.0])
+def test_supported_rope_with_null_scaling(partial: float | None) -> None:
+    cfg = model_config()
+    cfg["rope_scaling"] = None
+    if partial is not None:
+        cfg["rope_parameters"]["sliding_attention"]["partial_rotary_factor"] = partial
+    assert layout.check_config(cfg).num_layers == NUM_LAYERS
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "group,field,value",
+    [
+        ("sliding_attention", "partial_rotary_factor", 0.5),
+        ("sliding_attention", "factor", 2.0),
+        ("sliding_attention", "attention_factor", 1.0),
+        ("sliding_attention", "original_max_position_embeddings", 4096),
+        ("sliding_attention", "unknown", 1.0),
+        (None, "unknown", None),
+    ],
+)
+def test_unsupported_rope_options_are_rejected(
+    group: str | None, field: str, value: object
+) -> None:
+    cfg = model_config()
+    rope = cfg["rope_parameters"]
+    (rope[group] if group else rope)[field] = value
+    with pytest.raises(ValueError, match="rope_parameters"):
+        layout.check_config(cfg)
 
 
 @pytest.mark.cpu_only
