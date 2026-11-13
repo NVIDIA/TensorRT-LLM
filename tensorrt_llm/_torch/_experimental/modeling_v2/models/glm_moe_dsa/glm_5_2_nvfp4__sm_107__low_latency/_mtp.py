@@ -39,11 +39,6 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams, allgather
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_speculative import (
-    _copy_model_config_with_moe_backend,
-    _enable_trtllm_moe_preload_for_draft,
-    _get_mtp_moe_quant_config,
-)
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModelForCausalLM,
     apply_layerwise_quant_config,
@@ -58,6 +53,11 @@ from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 
 from ._model import Glm52DecoderLayer
+from ._mtp_config import (
+    _copy_model_config_with_moe_backend,
+    _enable_trtllm_moe_preload_for_draft,
+    _get_mtp_moe_quant_config,
+)
 
 
 class Glm52MTPHead(nn.Module):

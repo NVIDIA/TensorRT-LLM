@@ -175,7 +175,7 @@ comprehensive early-validation layer for every incompatible feature.
 `ExternalCommMoEScheduler._forward_chunk_impl` runs per chunk:
 
 ```text
-[EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
+[EPLB start_wait_gpu] → routing (or backend.try_route_with_sort) → [EPLB done_wait_gpu + update_statistic + route]
   → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
   → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
   → comm.combine → [EPLB done_set_cpu]
@@ -186,6 +186,16 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 ```
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`, unless the backend declares `input_requirement.run_moe_reuses_buffers`: its `run_moe` returns a view of a buffer the next call overwrites and keeps scratch across calls (the B12x leaves, whose `B12xMoEWrapper` output buffer is also shared across layers). `ExternalCommMoEScheduler` then runs its chunks on one stream and copies every chunk but the last out before the next chunk runs — the trailing `torch.cat` copies the last one. `FusedCommMoEScheduler` copies no chunk output at all, so it refuses a backend that declares the field rather than aliasing its chunks.
+
+Routing may come from one kernel that also writes the backend's `moe_sort` tables. `ConfigurableMoE.sort_routing_applies` decides once whether that can happen: the routed ids reach the rank unchanged (no comm strategy, EPLB or `apply_router_weight_on_input`) and the backend `consumes_sort_tables()` (`TrtllmCutedslGroupedGemmNvfp4Impl` and `TrtllmCutedslFusedFc12Nvfp4Impl`, both without a slot remap). Then, for forwards without `routing_aux`, the scheduler routes through `backend.try_route_with_sort(router_logits)`, which forwards to `routing_method.apply_with_sort(...)` for the backend's expert range; the tables reach `run_moe` as `MoERunContext.sort_tables` and the backend runs on them when their tile is the tuned one. `DeepSeekV3MoeRoutingMethod` serves ungrouped fused top-16 routing with `trtllm::noaux_tc_route_sort` (`moe/kernels/blackwell/kimi_k3_routing.py`: up to 256 tokens, any multiple of 128 experts up to 1024, SM100/SM103/SM107, bitwise `noaux_tc_op` + `moe_sort`)
+
+A staged routing override (e.g. the layer-wise benchmark's balanced replacement) must cover `apply_with_sort` as well: while `sort_routing_applies` lets it, the scheduler routes through that method, so replacing only `apply` leaves the override unexercised — `tools/layer_wise_benchmarks/runner.py`'s `replace_routing_method_ctx` patches `apply_with_sort` to decline and thereby routes every forward through the replaced `apply`.
+
+`MoESortTables` is the decode-time hand-off to a backend's `run_moe` (the sorting kernel wrote the tables for the ids it produced). `PreroutedRouting` is the other hand-off — routing a *caller* computed for one `run_moe` of an impl that declares `supports_prerouted_routing` (the TRT-LLM-Gen decode front): eager, stricter (one chunk, no comm) and table-format-specific. They are not interchangeable; folding them into one hand-off (covering `PreroutedRouting`, `MoESortTables` and the `MoERoutingTables` hand-off proposed in #21438) is tracked as TRTLLM-17649, under the TRTLLM-14607 MoE refactor epic — for now a producer that owns the whole front builds `PreroutedRouting` and a backend-side sorting forward builds `sort_tables`..
+
+A model that orders work around the routing asks `ConfigurableMoE.routes_with_sort_tables(num_tokens)` instead of re-deriving these conditions. Likewise, a producer that can emit the routed experts' NVFP4 input (e.g. from a GEMM epilogue) asks `ConfigurableMoE.nvfp4_input_scale(num_tokens)`: the global scale of an `Fp4QuantizedTensor` input (linear scale factors) that the forward takes as is, or `None` when the forward needs an unquantized input (the backend declares no `MoEImplBase.prequantized_nvfp4_input_scale()`, or a comm strategy, EPLB, `apply_router_weight_on_input` or more than one chunk). `ConfigurableMoE.quantize_nvfp4_input(x)` quantizes as the backend would.
+
+A model that runs other work on a side stream while the routed experts run (e.g. a shared expert) asks the backend, once per forwards's launch, to keep SMs free of its persistent grid: `backend.reserve_sms_for_concurrent_kernels(num_sms)` returns the SMs applied to that launch (default 0: declined). Ask for the shared work's count only while it runs beside the routed grid (multi-stream); an in-order launch hands 0 so the grid keeps every SM. The paired confinement is torch's SM carveout, which only GEMM launches issued through torch's cuBLAS (`F.linear`) honor — a CuTe DSL shared GEMM ignores it, and a model whose shared projections take those paths must not reserve SMs for them. `TrtllmCutedslFusedFc12Nvfp4Impl` applies the count to the fused FC12 kernel (`reserved_sms` of `trtllm::cute_dsl_nvfp4_fc12_fused_rubin`, alongside `cute_dsl_utils.sm_reserve()`).
 
 `unfinalized_combine_fn` is a constructor argument (`create_moe(..., unfinalized_combine_fn=...)`) for a model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum. Once registered it runs on **every** `do_finalize=False` forward, with or without a comm strategy, so the forward's return type (dense tensor vs. unfinalized triple) depends only on static config. Under a comm strategy the scheduler runs it on the dispatched rows and the combine reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. That reordering is only sound for a combine that is an unweighted row sum over a dense per-token tensor; `DeepEPLowLatency.combine` is not one (it consumes expert-major rows and applies the routing weights itself), which is what `Communication.supports_finalize_before_combine()` declares. `ConfigurableMoE.validate_backend` rejects at construction: a backend without `supports_unfinalized_output()`, a comm without `supports_finalize_before_combine()`, and `apply_router_weight_on_input`. With no hook registered, `do_finalize=False` plus a comm strategy stays a named runtime refusal instead of a crash inside the comm layer.
 
@@ -276,14 +286,14 @@ Still on old path (standalone, with embedded communication):
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
 | `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, and HALO-Q/TMA `planner` |
-| `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
+| `moe_op_backend.py` | Op backend registry for TRTLLMGen: the in-tree `trtllm` ops every leaf runs on |
 
 ### Backends (`fused_moe/`)
 
 | File | Backend | Hardware | Scenario | Scheduler |
 |------|---------|----------|----------|-----------|
 | `cutlass/` (+ the `fused_moe_cutlass.py` alias module) | the abstract `CutlassFusedMoEBase` and its thirteen leaves (`CUTLASS_LEAVES`): one per quantization format, two for FP8 block scales (see [CUTLASS leaves](#cutlass-leaves-fused_moecutlass)) | SM80+ | High throughput, the widest quant support; the fallback family | `EXTERNAL_COMM` |
-| `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103/SM107 | Min-latency and high-throughput on Blackwell/Rubin; also serves unquantized BF16 through FlashInfer, on a gate of its own (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
+| `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103/SM107 | Min-latency and high-throughput on Blackwell/Rubin; also serves unquantized BF16 (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
 | `cutedsl/dense_gemm.py` (+ the `fused_moe_densegemm.py` alias module) | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its three leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`), `TrtllmCutedslGroupedGemmNvfp4PlusImpl` (`trtllm.cutedsl.grouped_gemm.nvfp4_plus`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; NVFP4_PLUS and BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; NVFP4_PLUS (MXFP4 checkpoints, UE5M3 scales) and unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
@@ -364,48 +374,36 @@ holds no code: it defines `TRTLLMGenFusedMoE` (the abstract
 |------|------|
 | `identity.py` | TRTLLM-Gen's values of the types `impl_identity.py` defines: the identity constants (`PROVIDER_*`, `TECHNIQUE_TRTLLM_GEN`, `KERNEL_FUSED_MOE`), the two published contracts (`TRTLLM_GEN_CAPABILITIES`, `TRTLLM_GEN_INPUT_REQUIREMENT`), and the `trtllm_gen_descriptor` factory that stamps those segments into what the registry reads |
 | `base.py` | `TrtllmGenFusedMoEBase` — the abstract root every leaf shares: construction, the weight-creation skeleton, the two routing predicates the framework reads off a module, the fake-output shapes. Reads both axes as leaf-declared attributes and overridable hooks, never as a branch on `quant_config` or the provider string |
-| `fp4_block_scale.py` | `run_fp4_block_scale_moe` and the formats that reach it — NVFP4, W4A16_MXFP4, W4A8_MXFP4_MXFP8 — each supplying only its weight/input preparation, its SiTu alignment, and its scale group size. Two leaves per format, one per provider |
-| `fp8_block_scale.py` | DeepSeek-style FP8 with 1x128 block scales: `run_fp8_block_scale_moe`, the narrowed activation ABI (scalar clamp), and shared-expert fusion. Two leaves. Shares nothing with the fp4 module, which is why the two sit side by side rather than under a common quant layer |
+| `fp4_block_scale.py` | `run_fp4_block_scale_moe` and the formats that reach it — NVFP4, W4A16_MXFP4, W4A8_MXFP4_MXFP8 — each supplying only its weight/input preparation, its SiTu alignment, and its scale group size. One leaf per format |
+| `fp8_block_scale.py` | DeepSeek-style FP8 with 1x128 block scales: `run_fp8_block_scale_moe`, the narrowed activation ABI (scalar clamp), and shared-expert fusion. One leaf. Shares nothing with the fp4 module, which is why the two sit side by side rather than under a common quant layer |
 | `eligibility.py` | the eligibility checks each leaf's `can_implement` composes, as free functions — every caller is a leaf |
 | `kernel_inputs.py` | the `run_moe` prologue the kernel bodies share, as free functions taking the impl |
-| `trtllm_<quant>.py` | one registered native leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
-| `flashinfer_<quant>.py` | one registered FlashInfer leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `bf16` |
+| `trtllm_<quant>.py` | one registered leaf each: `bf16` (quant `none`), `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
 
 #### The leaves
 
-Module names carry the two identity segments that differ: `provider` — the
-in-tree `trtllm` ops or the FlashInfer package — and `quant`. Technique and
-kernel are `trtllm_gen` / `fused_moe` for every leaf, which the package name
-says once. The grid is not full: FlashInfer has no `w4a8_nvfp4_fp8` or
-`w4a8_mxfp4_fp8` runner and alone serves the unquantized format, so some
-cells of the provider x format grid have no leaf.
+Module names carry the `provider` segment — the in-tree `trtllm` ops, for
+every leaf — and the `quant` one. Technique and kernel are `trtllm_gen` /
+`fused_moe` for every leaf, which the package name says once. Each format has
+exactly one leaf.
 
-| `quant` segment | `trtllm.` leaf | `flashinfer.` leaf |
-|---|---|---|
-| `nvfp4` | `TrtllmTrtllmGenNvfp4Impl` | `FlashinferTrtllmGenNvfp4Impl` |
-| `fp8_block_scales` | `TrtllmTrtllmGenFp8BlockScalesImpl` | `FlashinferTrtllmGenFp8BlockScalesImpl` |
-| `w4a16_mxfp4` | `TrtllmTrtllmGenW4a16Mxfp4Impl` | `FlashinferTrtllmGenW4a16Mxfp4Impl` |
-| `w4a8_mxfp4_mxfp8` | `TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl` | `FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl` |
-| `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` | — |
-| `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` | — |
-| `none` (BF16) | — | `FlashinferTrtllmGenBf16Impl` |
+| `quant` segment | Leaf |
+|---|---|
+| `nvfp4` | `TrtllmTrtllmGenNvfp4Impl` |
+| `fp8_block_scales` | `TrtllmTrtllmGenFp8BlockScalesImpl` |
+| `w4a16_mxfp4` | `TrtllmTrtllmGenW4a16Mxfp4Impl` |
+| `w4a8_mxfp4_mxfp8` | `TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl` |
+| `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` |
+| `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` |
+| `none` (BF16) | `TrtllmTrtllmGenBf16Impl` |
 
 Ids follow the class names (`trtllm.trtllm_gen.fused_moe.nvfp4`,
-`flashinfer.trtllm_gen.fused_moe.none`), keeping the technique and kernel
-segments so a future non-TRTLLM-Gen kernel from the same wheel stays
-distinguishable. The two native-only formats subclass the family base directly:
-a per-quant parent implementing three methods for one subclass buys nothing.
-
-The provider split is a policy call, not a capability one. With the FlashInfer
-wheel installed a `TRTLLM` literal still picks the native leaf, and only
-`TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER=1` moves it — read through
-`MoEEnvironment.env_flag`, so `can_implement` never touches `os.environ`. A
-FlashInfer leaf asked for without the flag declines with `PATH_NOT_ENABLED`,
-which distinguishes "not chosen" from "not installed" (`DEP_MISSING`).
-`IMPL_PRIORITY` lists each FlashInfer leaf ahead of the native leaf of the same
-format, so the flag alone decides the order the two are asked in.
-`FlashinferTrtllmGenBf16Impl` is outside that policy — see the `§` footnote
-under [Quantization Support](#quantization-support).
+`trtllm.trtllm_gen.fused_moe.none`), keeping the technique and kernel
+segments so a future non-TRTLLM-Gen kernel from the same provider stays
+distinguishable. The three formats on runner ops of their own (`none`,
+`w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8`) subclass the family base directly: a
+per-quant parent implementing three methods for one subclass buys nothing. Because the `quant` segments are disjoint, the order of
+the TRTLLM-Gen leaves within `IMPL_PRIORITY` does not matter.
 
 Only a registered class may be resolved to, and importing the package is what
 registers, which `moe_resolution` guarantees. `trtllm_gen_leaf` sits at the
@@ -715,7 +713,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 
 | Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | Vanilla |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103/107, BF16, needs FlashInfer)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
+| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103/107, BF16)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
 | NVFP4 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
@@ -731,20 +729,21 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |
 
-§ The unquantized TRTLLM-Gen path is `FlashinferTrtllmGenBf16Impl`, and it is
-not a TRTLLM-Gen kernel at all: it calls FlashInfer's `trtllm_bf16_moe` /
-`trtllm_bf16_routed_moe`, which is why it is gated on
-`MoEDep.FLASHINFER_BF16_MOE` rather than on a quant algo or on the
-`TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER` opt-in, and why `TRTLLMOpBackend` raises
-`NotImplementedError` for it. It is the only leaf reachable on a host with no
-quantization configured at all. The row reads `Y` because `can_implement`
-really can select it; without the FlashInfer symbols the layer degrades to
-Cutlass with `DEP_MISSING` recorded in `degraded_from`, where the pre-resolver
-code raised `RuntimeError` instead. One shape gate applies:
-`Bf16MoeLauncher::check_moe` requires a multiple of 128, and what the wrapper
-passes it is `intermediate_size_per_partition`, so a non-aligned shard is
-`SHAPE_UNALIGNED` and falls back to Cutlass rather than dying in the kernel
-launcher — Qwen3.5-35B BF16 TP8 shards 512 → 64 and takes that path.
+§ The unquantized TRTLLM-Gen leaf is `TrtllmTrtllmGenBf16Impl`: BF16
+activations and weights on the `Bmm_Bfloat16_Bfloat16Bfloat16` batched-GEMM
+cubins through `trtllm::bf16_moe_runner`, with the weights in the shuffled
+BlockMajorK layout `BF16TRTLLMGenFusedMoEMethod` produces. It is the only
+TRTLLM-Gen leaf reachable on a host with no quantization configured at all. Its
+cubins ship gated SwiGLU and Relu2 gemm1 epilogues and take no expert bias or
+activation constants. Its shape gates are kernel requirements: every BF16 cubin
+has tileM 128 and tileK 128 (or 64), so `hidden_size` and
+`intermediate_size_per_partition` both have to be multiples of 128. A
+non-aligned layer is `SHAPE_UNALIGNED` and falls back to Cutlass rather than
+failing at warmup — Qwen3.5-35B BF16 TP8 shards 512 → 64 and takes that path.
+More than 2048 expert slots or `top_k` above 32 is `ROUTING_UNSUPPORTED`. The
+kernel routes from the logits, except while something reads the host top-k
+(Router Replay, ExpertStatistic, the layer-wise benchmark calibrator,
+`ENABLE_PERFECT_ROUTER=expert_ids`): then the leaf routes on the host.
 
 ¶ On SM107 both CuteDSL grouped-GEMM leaves need `MoEDep.CUTEDSL_RUBIN` (the
 installed CuTe DSL exposes the Rubin helpers), and the family carries three
@@ -1110,7 +1109,7 @@ out between technique and quant, in id order
 (`mega_moe`, `fused_fc12`, `dense_gemm`, `grouped_gemm`) differ in
 `kernel_name` alone, so their classes spell the kernel out;
 `TrtllmCutedslGroupedGemmBf16Impl` keeps it to match its NVFP4 sibling. Quant
-`none` is `Bf16` on a BF16-only kernel (`FlashinferTrtllmGenBf16Impl`,
+`none` is `Bf16` on a BF16-only kernel (`TrtllmTrtllmGenBf16Impl`,
 `TrtllmCutedslGroupedGemmBf16Impl`) and `Unquantized` on
 `TrtllmCutlassUnquantizedImpl`, which also takes FP16. A bare `cutedsl` token
 matches several leaves; name the kernel segment to pin one. A partial pin can

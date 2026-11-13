@@ -364,9 +364,13 @@ class AttentionMetadata:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager,
-                              "mixed_precision_high_layers", None)
-        return isinstance(high_layers, dict) and bool(high_layers)
+        manager = self.kv_cache_manager
+        high_layers = getattr(manager, "mixed_precision_high_layers", None)
+        # The cold-page window keeps the history at the high precision and reads
+        # the high rows through the page tables instead of a staging copy.
+        return (isinstance(high_layers, dict) and bool(high_layers)
+                and manager.mixed_precision_low_dtype
+                != manager.mixed_precision_high_dtype)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
@@ -1050,6 +1054,10 @@ class AttentionForwardArgs:
     # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
+    variable_window_token_starts: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    variable_window_token_ends: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
     kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
@@ -1069,6 +1077,14 @@ class AttentionForwardArgs:
     quant_q_buffer: Optional[torch.Tensor] = None
     cross_kv: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
+    # Caller-quantized FP8 Q for the MLA FP8 context / fused generation paths;
+    # only meaningful together with `quant_q_buffer`. The fused paths that
+    # quantize into `quant_q_buffer` (DSv4 generation / context RoPE) read the
+    # value as the quant scale. The non-sparse FP8 context path reads only the
+    # presence: its FMHA dequantizes Q / K / V with the kv cache scale, so
+    # caller-quantized FP8 `k` / `v` and `quant_q_buffer` must have been
+    # quantized with `kv_scale_orig_quant`, and this tensor must carry that
+    # scale.
     quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
         dtype=torch.float32)

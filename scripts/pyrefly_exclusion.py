@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Apply path and symbol filters to Pyrefly JSON reports."""
+
+import argparse
+import ast
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+NAME_PATTERN = re.compile(r"`([^`]+)`|\"([^\"]+)\"")
+SYMBOL_PATTERN = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\.\*)?")
+
+
+def uninstalled_dependencies(project_root: Path) -> set[str]:
+    """Find declared dependency roots unavailable in a lightweight lint environment."""
+    names = set()
+    for filename in ("requirements.txt", "requirements-dev.txt"):
+        path = project_root / filename
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            match = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[|[<>=!~;\s]|$)", line)
+            if match:
+                names.add(match[1].lower().replace("-", "_"))
+    aliases = {
+        "_pytest": "pytest",
+        "yaml": "pyyaml",
+        "PIL": "pillow",
+        "sklearn": "scikit_learn",
+        "pynvml": "nvidia_ml_py",
+    }
+    names.update(module for module, distribution in aliases.items() if distribution in names)
+    missing = set()
+    for name in names:
+        try:
+            installed = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            installed = False
+        if not installed:
+            missing.add(name)
+    return missing
+
+
+def is_uninstalled_dependency(error: dict, missing: set[str], project_root: Path) -> bool:
+    """Suppress missing optional distributions in test file-list checks, not local modules."""
+    if error.get("name") != "missing-import":
+        return False
+    match = re.fullmatch(r"Cannot find module `([^`]+)`", error.get("concise_description", ""))
+    if match is None:
+        return False
+    root = match[1].split(".")[0]
+    if root not in missing:
+        return False
+    # Fallback search also finds sibling helpers and packages in ancestor directories.
+    diagnostic_path = project_root / error.get("path", "")
+    for parent in diagnostic_path.resolve().parents:
+        if not parent.is_relative_to(project_root.resolve()):
+            break
+        candidate = parent / root
+        if (
+            candidate.is_dir()
+            or candidate.with_suffix(".py").exists()
+            or candidate.with_suffix(".pyi").exists()
+        ):
+            return False
+    config = tomllib.loads((project_root / "pyproject.toml").read_text())
+    for section in ("pyrefly", "pyrefly-tests"):
+        native = config.get("tool", {}).get(section, {})
+        for entry in native.get("search-path", []):
+            candidate = project_root / entry / root
+            if (
+                candidate.is_dir()
+                or candidate.with_suffix(".py").exists()
+                or candidate.with_suffix(".pyi").exists()
+            ):
+                return False
+    return True
+
+
+def load_exclusions(config_path: Path) -> tuple[str, ...]:
+    """Load and validate custom symbol exclusions from pyproject.toml."""
+    config = tomllib.loads(config_path.read_text())
+    exclusions = config.get("tool", {}).get("pyrefly-exclusions")
+    if not isinstance(exclusions, dict) or set(exclusions) != {"symbols"}:
+        raise ValueError(f"{config_path}: expected [tool.pyrefly-exclusions] with a symbols array")
+    entries = exclusions["symbols"]
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, str) or not entry or entry != entry.strip() for entry in entries
+    ):
+        raise ValueError(f"{config_path}: symbols must contain nonempty strings")
+    if len(entries) != len(set(entries)):
+        raise ValueError(f"{config_path}: duplicate entry in symbols")
+    for pattern in entries:
+        if SYMBOL_PATTERN.fullmatch(pattern) is None:
+            raise ValueError(f"{config_path}: invalid symbol pattern: {pattern}")
+    return tuple(entries)
+
+
+def load_excluded_paths(config_path: Path) -> set[Path]:
+    """Expand project-excludes globs relative to the Pyrefly configuration."""
+    config = tomllib.loads(config_path.read_text())
+    patterns = config.get("tool", {}).get("pyrefly", {}).get("project-excludes", [])
+    if not isinstance(patterns, list) or any(
+        not isinstance(pattern, str) or not pattern for pattern in patterns
+    ):
+        raise ValueError(f"{config_path}: project-excludes must contain nonempty strings")
+    return {path.resolve() for pattern in patterns for path in config_path.parent.glob(pattern)}
+
+
+def relative_source_path(source_path: str, project_root: Path) -> Path | None:
+    """Return a source path relative to the project root, if it is inside it."""
+    path = Path(source_path)
+    resolved = path.resolve() if path.is_absolute() else (project_root / path).resolve()
+    try:
+        return resolved.relative_to(project_root.resolve())
+    except ValueError:
+        return None
+
+
+def is_excluded_path(source_path: str, project_root: Path, excluded_paths: set[Path]) -> bool:
+    relative_path = relative_source_path(source_path, project_root)
+    if relative_path is None:
+        return False
+    path = (project_root / relative_path).resolve()
+    return path in excluded_paths or any(parent in excluded_paths for parent in path.parents)
+
+
+def filter_input_paths(
+    input_path: Path, output_path: Path, config_path: Path, project_root: Path
+) -> None:
+    """Keep supplied paths that are not excluded, preserving NUL separators."""
+    excluded_paths = load_excluded_paths(config_path)
+    paths = (os.fsdecode(path) for path in input_path.read_bytes().split(b"\0") if path)
+    output_path.write_bytes(
+        b"".join(
+            os.fsencode(path) + b"\0"
+            for path in paths
+            if not is_excluded_path(path, project_root, excluded_paths)
+        )
+    )
+
+
+class ImportScope:
+    """Imports and local bindings in a Python lexical scope."""
+
+    def __init__(self, node: ast.AST) -> None:
+        self.start = getattr(node, "lineno", 0)
+        self.end = getattr(node, "end_lineno", 2**31)
+        self.imports: dict[str, list[tuple[int, str]]] = {}
+        self.other_bindings: set[str] = set()
+        self.children: list[ImportScope] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            self.other_bindings.update(
+                argument.arg for argument in ast.walk(node.args) if isinstance(argument, ast.arg)
+            )
+
+        def visit(child: ast.AST) -> None:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                if hasattr(child, "name"):
+                    self.other_bindings.add(child.name)
+                self.children.append(ImportScope(child))
+                return
+            if isinstance(child, ast.Import):
+                for alias in child.names:
+                    local_name = alias.asname or alias.name.split(".")[0]
+                    target = alias.name if alias.asname else local_name
+                    self.imports.setdefault(local_name, []).append((child.lineno, target))
+                return
+            if isinstance(child, ast.ImportFrom):
+                for alias in child.names:
+                    if alias.name == "*":
+                        continue
+                    local_name = alias.asname or alias.name
+                    if child.level == 0 and child.module:
+                        target = f"{child.module}.{alias.name}"
+                        self.imports.setdefault(local_name, []).append((child.lineno, target))
+                    else:
+                        self.other_bindings.add(local_name)
+                return
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                self.other_bindings.add(child.id)
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                self.other_bindings.add(child.name)
+            for descendant in ast.iter_child_nodes(child):
+                visit(descendant)
+
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    def resolve(self, name: str, line: int) -> str | None:
+        scopes = [self]
+        while True:
+            child = next(
+                (item for item in scopes[-1].children if item.start <= line <= item.end), None
+            )
+            if child is None:
+                break
+            scopes.append(child)
+        for scope in reversed(scopes):
+            if name in scope.other_bindings:
+                return None
+            imports = scope.imports.get(name)
+            if imports is not None:
+                targets = {target for _, target in imports}
+                if len(targets) == 1 and any(import_line <= line for import_line, _ in imports):
+                    return next(iter(targets))
+                return None
+        return None
+
+
+def load_import_scope(source_path: Path) -> ImportScope | None:
+    try:
+        return ImportScope(ast.parse(source_path.read_text()))
+    except (OSError, SyntaxError, UnicodeError):
+        return None
+
+
+def matches_symbol(name: str, patterns: tuple[str, ...]) -> bool:
+    exact = {pattern for pattern in patterns if not pattern.endswith(".*")}
+    prefixes = tuple(pattern[:-1] for pattern in patterns if pattern.endswith(".*"))
+    return name in exact or name.startswith(prefixes)
+
+
+def matches_symbol_reference(name: str, patterns: tuple[str, ...]) -> bool:
+    """Match a symbol in a qualified name, including callable descriptions."""
+    if matches_symbol(name, patterns):
+        return True
+    parts = name.split(".")
+    for pattern in patterns:
+        if pattern.endswith(".*"):
+            prefix = pattern[:-2].split(".")
+            if any(
+                parts[index : index + len(prefix)] == prefix and len(parts) > index + len(prefix)
+                for index in range(len(parts))
+            ):
+                return True
+            continue
+        target = pattern.split(".")
+        if any(parts[index : index + len(target)] == target for index in range(len(parts))):
+            return True
+    return False
+
+
+def is_excluded_symbol(
+    error: dict[str, Any],
+    patterns: tuple[str, ...],
+    project_root: Path,
+    scopes_by_path: dict[str, ImportScope | None],
+) -> bool:
+    description = str(error.get("concise_description") or error.get("description", ""))
+    line = error.get("line")
+    path = str(error.get("path", ""))
+    for first, second in NAME_PATTERN.findall(description):
+        name = first or second
+        if matches_symbol_reference(name, patterns):
+            return True
+        if error.get("name") == "missing-import" and any(
+            pattern.startswith(f"{name}.") for pattern in patterns
+        ):
+            return True
+        if error.get("name") not in (
+            "missing-import",
+            "missing-module-attribute",
+            "unknown-name",
+        ):
+            continue
+        local_name, separator, remainder = name.partition(".")
+        if path not in scopes_by_path:
+            source_path = relative_source_path(path, project_root)
+            scopes_by_path[path] = (
+                load_import_scope(project_root / source_path) if source_path is not None else None
+            )
+        scope = scopes_by_path[path]
+        imported_name = scope.resolve(local_name, line) if scope and isinstance(line, int) else None
+        resolved_name = imported_name + separator + remainder if imported_name else None
+        if resolved_name and matches_symbol_reference(resolved_name, patterns):
+            return True
+    return False
+
+
+def filter_report(
+    input_path: Path,
+    output_path: Path,
+    config_path: Path,
+    project_root: Path,
+    pyrefly_exit_code: int,
+    stderr_path: Path | None,
+    ignore_uninstalled_dependencies: bool = False,
+) -> int:
+    """Filter excluded diagnostics and save a deterministic JSON report."""
+    output = input_path.read_text(errors="replace")
+    stderr = stderr_path.read_text(errors="replace") if stderr_path else ""
+    try:
+        result = json.loads(output)
+        if not isinstance(result, dict) or not isinstance(result.get("errors"), list):
+            raise ValueError("Pyrefly JSON output must contain an errors array")
+        symbols = load_exclusions(config_path)
+        excluded_paths = load_excluded_paths(config_path)
+        scopes_by_path: dict[str, ImportScope | None] = {}
+        missing_dependencies = (
+            uninstalled_dependencies(project_root) if ignore_uninstalled_dependencies else set()
+        )
+        filtered_errors = []
+        excluded_count = 0
+        for error in result["errors"]:
+            if not isinstance(error, dict):
+                raise ValueError("Pyrefly errors must be JSON objects")
+            excluded_path = is_excluded_path(
+                str(error.get("path", "")), project_root, excluded_paths
+            )
+            if (
+                excluded_path
+                or is_excluded_symbol(error, symbols, project_root, scopes_by_path)
+                or is_uninstalled_dependency(error, missing_dependencies, project_root)
+            ):
+                excluded_count += 1
+            else:
+                filtered_errors.append(error)
+        result["errors"] = filtered_errors
+        report: dict[str, Any] = {
+            "tool": "pyrefly",
+            "pyrefly_exit_code": pyrefly_exit_code,
+            "excluded_diagnostic_count": excluded_count,
+            "remaining_diagnostic_count": len(filtered_errors),
+            "result": result,
+        }
+        if stderr:
+            report["stderr"] = stderr
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        report = {
+            "tool": "pyrefly",
+            "pyrefly_exit_code": pyrefly_exit_code,
+            "report_error": str(error),
+            "stdout": output,
+            "stderr": stderr,
+        }
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    matches_parser = subparsers.add_parser("matches")
+    matches_parser.add_argument("source", type=str)
+    matches_parser.add_argument("config", type=Path)
+    matches_parser.add_argument("--project-root", type=Path, required=True)
+    paths_parser = subparsers.add_parser("filter-input-paths")
+    paths_parser.add_argument("input", type=Path)
+    paths_parser.add_argument("output", type=Path)
+    paths_parser.add_argument("config", type=Path)
+    paths_parser.add_argument("--project-root", type=Path, required=True)
+    report_parser = subparsers.add_parser("filter-report")
+    report_parser.add_argument("input", type=Path)
+    report_parser.add_argument("output", type=Path)
+    report_parser.add_argument("config", type=Path)
+    report_parser.add_argument("--project-root", type=Path, required=True)
+    report_parser.add_argument("--pyrefly-exit-code", type=int, required=True)
+    report_parser.add_argument("--stderr", type=Path)
+    report_parser.add_argument("--ignore-uninstalled-dependencies", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "matches":
+            excluded_paths = load_excluded_paths(args.config)
+            return 0 if is_excluded_path(args.source, args.project_root, excluded_paths) else 1
+        if args.command == "filter-input-paths":
+            filter_input_paths(args.input, args.output, args.config, args.project_root)
+            return 0
+        return filter_report(
+            args.input,
+            args.output,
+            args.config,
+            args.project_root,
+            args.pyrefly_exit_code,
+            args.stderr,
+            args.ignore_uninstalled_dependencies,
+        )
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

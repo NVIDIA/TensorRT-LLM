@@ -33,7 +33,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import get_device_count, llm_models_root, trt_environment
+from ..conftest import get_device_count, llm_models_root
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
@@ -77,6 +77,10 @@ DEEPSEEK_V41_MODELS = {
     "deepseek_v41_flash_nvfp4",
     "deepseek_v41_flash_nvfp4_dspark",
 }
+GLM53_FLASH_NVFP4_MODELS = {
+    "glm_5.3_flash_nvfp4",
+    "glm_5.3_flash_nvfp4_mtp",
+}
 QWEN38_MTP_MODELS = {
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
@@ -87,6 +91,7 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *GLM53_FLASH_NVFP4_MODELS,
     *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
@@ -126,7 +131,11 @@ OPENAI_CHAT_BACKEND_MODELS = {
 SPEC_DEC_REAL_DATASET_MODELS = {
     **{
         model: "cnn_dailymail"
-        for model in DEEPSEEK_V41_MODELS
+        for model in GLM53_FLASH_NVFP4_MODELS
+    },
+    **{
+        model: "cnn_dailymail"
+        for model in DEEPSEEK_V41_MODELS | QWEN38_MTP_MODELS
     },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
@@ -185,15 +194,12 @@ def cpu_socket_count_gt_1():
 
 # A helper function to import allowed_configs.py.
 def import_allowed_perf_config():
-    if trt_environment:
-        from llm import allowed_configs
+    global ALLOWED_CONFIGS_CACHE
+    if ALLOWED_CONFIGS_CACHE is None:
+        import allowed_configs
+        ALLOWED_CONFIGS_CACHE = allowed_configs
     else:
-        global ALLOWED_CONFIGS_CACHE
-        if ALLOWED_CONFIGS_CACHE is None:
-            import allowed_configs
-            ALLOWED_CONFIGS_CACHE = allowed_configs
-        else:
-            allowed_configs = ALLOWED_CONFIGS_CACHE
+        allowed_configs = ALLOWED_CONFIGS_CACHE
     return allowed_configs
 
 
@@ -1308,7 +1314,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                        dataset_source: str,
                                        num_requests: Optional[int] = None,
                                        skip_requests: int = 0):
-        """Write a real-text dataset of fixed-length prompts.
+        """Write a real-text dataset with target-length prompts.
 
         Args:
             num_requests: Samples to write; the case's request count if None.
@@ -1360,8 +1366,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if not prompt_ids:
                         continue
                     if len(prompt_ids) < input_len:
-                        # Keep strict fixed-length requests for perf coverage
-                        # by extending short real-dataset prompts.
+                        # Extend short articles to the target token-ID length.
                         repeats = (input_len + len(prompt_ids) -
                                    1) // len(prompt_ids)
                         prompt_ids = (prompt_ids * repeats)[:input_len]
@@ -1382,8 +1387,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         enable_thinking=False,
                         add_generation_prompt=True,
                     )
-                    prompt_ids = tokenizer.encode(prompt_text,
-                                                  add_special_tokens=False)
+
+                # Count the final text after decoding and any template rendering.
+                prompt_ids = tokenizer.encode(prompt_text,
+                                              add_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
                     max_seq_len = model_config['max_seq_len']
                     if len(prompt_ids) + output_len > max_seq_len:
                         raise ValueError(
@@ -1636,7 +1644,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # Allow time for NVFP4 checkpoint loading and executor warmup.
                 server_timeout = 3600
             elif self._config.model_name in {
-                    "glm_5.3_flash_fp8", "glm_5.3_flash_fp8_mtp"
+                    "glm_5.3_flash_fp8",
+                    "glm_5.3_flash_fp8_mtp",
+                    *GLM53_FLASH_NVFP4_MODELS,
             }:
                 # Weight loading and executor warmup can exceed 10 minutes.
                 server_timeout = 3600

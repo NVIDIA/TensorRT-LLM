@@ -65,6 +65,26 @@ class BindingsNixlTransferStatus(TransferStatus):
         get = getattr(self._cpp_status, "get_last_status", None)
         return int(get()) if get is not None else -1
 
+    def release(self) -> bool:
+        """Release the backend request handle (releases GIL).
+
+        Returns:
+            True if the backend accepted the release. For NIXL, calls after a
+            successful release return True without reaching the backend.
+        """
+        return self._cpp_status.release()
+
+    def __del__(self):
+        """Release the handle without the GIL before the C++ status is destroyed.
+
+        Releasing waits for the NIXL agent's lock, which load_remote_agent holds
+        for the whole metadata load. The C++ destructor that runs next finds
+        nothing left to release, so it cannot stop every Python thread while
+        it waits.
+        """
+        if getattr(self, "_cpp_status", None) is not None:
+            self.release()
+
 
 class BindingsNixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using C++ bindings with GIL release support.

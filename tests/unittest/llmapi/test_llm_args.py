@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
@@ -46,6 +47,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
                                           DSparkDecodingConfig, DwdpConfig,
@@ -63,9 +65,10 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
                                           RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
-                                          SleepConfig, SpeculativeConfig,
-                                          StrictBaseModel, TorchCompileConfig,
-                                          TorchLlmArgs,
+                                          SleepConfig,
+                                          SparseKvCacheOffloadConfig,
+                                          SpeculativeConfig, StrictBaseModel,
+                                          TorchCompileConfig, TorchLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict,
                                           update_llm_args_with_extra_options)
@@ -106,6 +109,26 @@ def test_iter_perf_stats_interval_defaults_and_validation() -> None:
 
 
 @pytest.mark.cpu_only
+def test_checkpoint_format_accepts_builtin_and_custom_strings() -> None:
+    assert public_llmapi.CheckpointFormat is CheckpointFormat
+    # A built-in format string becomes the enum member with that value.
+    # "mistral" is not the member name MISTRAL, so this checks a value lookup.
+    args = TorchLlmArgs(model=llama_model_path, checkpoint_format="mistral")
+    assert args.checkpoint_format is CheckpointFormat.MISTRAL
+    assert json.loads(args.model_dump_json(include={"checkpoint_format"})) == {
+        "checkpoint_format": "mistral"
+    }
+    # A custom registered format stays a plain string.
+    args = TorchLlmArgs(model=llama_model_path,
+                        checkpoint_format="custom_format")
+    assert type(args.checkpoint_format) is str
+    assert args.checkpoint_format == "custom_format"
+    # A value that is not a string is still rejected.
+    with pytest.raises(ValidationError, match="checkpoint_format"):
+        TorchLlmArgs(model=llama_model_path, checkpoint_format=123)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("policy", list(CheckpointIOPolicy))
 @pytest.mark.parametrize("as_string", [False, True])
 def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
@@ -121,7 +144,8 @@ def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
         args.model_dump_json(include={"checkpoint_io_policy"})) == {
             "checkpoint_io_policy": policy.value
         }
-    assert args.checkpoint_format == "HF"
+    # The default checkpoint format is the enum member, not a plain string.
+    assert args.checkpoint_format is CheckpointFormat.HF
 
 
 @pytest.mark.cpu_only
@@ -1088,6 +1112,24 @@ def test_post_processor_hook_rejected_with_skip_tokenizer_init():
 @pytest.mark.cpu_only
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
+
+    @pytest.mark.parametrize("key", [None, b"deployment-key"])
+    def test_model_defaults_preserve_private_transceiver_key(self, key):
+        config = CacheTransceiverConfig(backend="NIXL",
+                                        transceiver_runtime="PYTHON")
+        config._rank_info_auth_key = key
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            cache_transceiver_config=config)
+
+        applied = apply_model_defaults_to_llm_args(
+            args, {"enable_chunked_prefill": False})
+
+        assert applied == {"enable_chunked_prefill": False}
+        assert args.cache_transceiver_config._rank_info_auth_key == key
+        assert args.cache_transceiver_config.backend == "NIXL"
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert "_rank_info_auth_key" not in args.model_dump(
+        )["cache_transceiver_config"]
 
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}
@@ -2166,8 +2208,12 @@ class TestMultimodalConfig:
             setattr(llm, method, lambda *args, **kwargs: None)
         module = "mm_encoder" if encoder_only else "llm"
         with patch.object(BaseLLM, "_build_model"), patch(
-                f"tensorrt_llm.llmapi.{module}.create_input_processor",
-                side_effect=ValueError("input processor boundary")) as factory:
+                "tensorrt_llm.llmapi.llm.check_quantization_compute_capability"
+        ), patch(
+                "tensorrt_llm.llmapi.llm.check_architecture_registered"), patch(
+                    f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                    side_effect=ValueError(
+                        "input processor boundary")) as factory:
             with pytest.raises(ValueError, match="input processor boundary"):
                 llm._build_model()
         kwargs = factory.call_args.kwargs
@@ -2443,6 +2489,48 @@ def test_SchedulerConfig_declaration() -> None:
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
     assert pybind_config.enable_prefix_aware_scheduling is False
+
+
+@pytest.mark.cpu_only
+def test_gen_preemption_config() -> None:
+    assert not SchedulerConfig().gen_preemption.enabled
+    merged = update_llm_args_with_extra_dict({"model": "dummy"},
+                                             yaml.safe_load("""
+scheduler_config:
+  gen_preemption:
+    target_output_tps: 32.5
+"""))
+    config = SchedulerConfig(**merged["scheduler_config"]).gen_preemption
+    assert config.target_output_tps == 32.5 and config.enabled
+    assert SchedulerConfig(gen_preemption={
+        "tpot_budget": 0.1
+    }).gen_preemption.enabled
+    for bad in ({
+            "target_output_tps": 0
+    }, {
+            "tpot_budget": 1.0
+    }, {
+            "tpot_budget": 0.1,
+            "target_output_tps": 40
+    }, {
+            "policy": "wait"
+    }):
+        with pytest.raises(ValidationError):
+            llm_args_mod.GenPreemptionConfig(**bad)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("parallel", [{
+    "pipeline_parallel_size": 2
+}, {
+    "tensor_parallel_size": 2,
+    "enable_attention_dp": True
+}])
+def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
+    on = SchedulerConfig(gen_preemption={"target_output_tps": 40})
+    with pytest.raises(ValueError, match="does not support"):
+        TorchLlmArgs(model=llama_model_path, scheduler_config=on, **parallel)
+    TorchLlmArgs(model=llama_model_path, **parallel)  # off: no restriction
 
 
 @pytest.mark.cpu_only
@@ -3575,6 +3663,7 @@ class TestTorchLlmArgs:
     @pytest.mark.cpu_only
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
 
         with pytest.raises(ValueError):
@@ -3905,8 +3994,10 @@ class TestStrictBaseModelArbitraryArgs:
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            TorchLlmArgs(model=llama_model_path,
-                         unsupported_option="should_fail")
+            TorchLlmArgs(
+                model=llama_model_path,
+                # pyrefly: ignore [unexpected-keyword]
+                unsupported_option="should_fail")
         assert "unsupported_option" in str(exc_info.value)
 
     def test_nested_config_arbitrary_args(self):
@@ -4754,7 +4845,10 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         "skip_rope_quantization": False,
         "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
+        "mixed_precision_first_n": 0,
+        "mixed_precision_last_n": 0,
     }
+    assert cold_config.mixed_precision_high_window is None
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()
     assert cold_config.supports_speculative_decoding()
@@ -4806,6 +4900,63 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                 "quant": "fp8",
             },
         )
+
+    cold_window = {
+        "algorithm": "quantization_for_cold_page",
+        "mixed_precision_first_n": 64,
+        "mixed_precision_last_n": 256,
+    }
+
+    def cold(**overrides):
+        kwargs = dict(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+            kv_cache_compression_config=cold_window)
+        return TorchLlmArgs(**{**kwargs, **overrides})
+
+    assert cold().kv_cache_compression_config.mixed_precision_high_window == (
+        64, 256)
+    # The limits of mixed-precision KV, narrowed to the TRTLLM backend.
+    for match, overrides in (
+        ("use_kv_cache_manager_v2",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False))),
+        ("TRTLLM attention backend;", dict(attn_backend="VANILLA")),
+        ("TRTLLM attention backend;", dict(attn_backend="FLASHINFER")),
+        ("kv_cache_compression_config",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="mixed_nvfp4_fp8"))),
+        ("fp8_ds_mla",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="fp8_ds_mla"))),
+        ("sparse KV cache offload",
+         dict(sparse_attention_config=DeepSeekSparseAttentionConfig(
+             index_head_dim=128, enable_kv_cache_offload=True))),
+        ("dynamic-tree",
+         dict(
+             speculative_config={
+                 "decoding_type": "MTP",
+                 "num_nextn_predict_layers": 1,
+                 "max_draft_len": 1,
+                 "use_dynamic_tree": True,
+                 "dynamic_tree_max_topK": 2
+             })),
+    ):
+        with pytest.raises(ValueError, match=match):
+            cold(**overrides)
+    cold(speculative_config={
+        "decoding_type": "MTP",
+        "num_nextn_predict_layers": 1
+    })
+    for sparse in (DeepSeekSparseAttentionConfig(index_head_dim=128),
+                   DeepSeekV4SparseAttentionConfig(index_head_dim=128,
+                                                   window_size=128,
+                                                   compress_ratios=[1, 4])):
+        cold(sparse_attention_config=sparse)
+    # Plain cold-page compression keeps its unrestricted backend choice.
+    TorchLlmArgs(
+        model="/tmp/dummy_model",
+        attn_backend="VANILLA",
+        kv_cache_compression_config={"algorithm": "quantization_for_cold_page"})
 
     config_dict = yaml.safe_load("""
 kv_cache_compression_config:
@@ -5164,6 +5315,40 @@ sparse_attention_config:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("config_cls", [
+    llm_args_mod.DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+])
+class TestSparseOffloadIndexerDefault:
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("requested", [None, False, True])
+    def test_default_override_and_round_trip(
+        self,
+        config_cls: type[llm_args_mod.DeepSeekSparseAttentionConfig],
+        enabled: bool,
+        requested: bool | None,
+    ) -> None:
+        kwargs = {"enable_kv_cache_offload": enabled}
+        if requested is not None:
+            kwargs["use_cute_dsl_paged_mqa_logits"] = requested
+        expected = True if requested is None else requested
+        config = config_cls(**kwargs)
+
+        for resolved in (
+                config,
+                config_cls.model_validate_json(config.model_dump_json()),
+                config_cls.model_validate(
+                    config.model_dump(exclude_unset=True)),
+        ):
+            assert resolved.use_cute_dsl_paged_mqa_logits is expected
+            assert resolved.to_sparse_params(
+            ).use_cute_dsl_paged_mqa_logits is expected
+            assert resolved.to_sparse_metadata_params(
+            ).use_cute_dsl_paged_mqa_logits is expected
+
+
+@pytest.mark.cpu_only
 class TestDeepSeekV4SparseAttentionConfig:
 
     def test_zero_compress_ratios_are_normalized(self):
@@ -5222,6 +5407,54 @@ class TestDeepSeekV4SparseAttentionConfig:
         with pytest.raises(ValidationError, match="positive index_topk"):
             DeepSeekV4SparseAttentionConfig(index_topk=index_topk,
                                             enable_kv_cache_offload=True)
+
+    def test_kv_cache_offload_size_defaults_round_trip(self):
+        config = DeepSeekV4SparseAttentionConfig()
+
+        assert config.kv_cache_offload_config == SparseKvCacheOffloadConfig()
+        assert config.kv_cache_offload_config.gpu_cache_factor == 2.0
+        assert config.kv_cache_offload_config.host_history_size is None
+        assert config.get_kv_cache_offload_config() is None
+        # Defaults stay valid when a dump passes every field back explicitly.
+        DeepSeekV4SparseAttentionConfig(**config.model_dump())
+
+    def test_kv_cache_offload_sizes_round_trip(self):
+        config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True,
+                                                 kv_cache_offload_config={
+                                                     "gpu_cache_factor": 3.0,
+                                                     "host_history_size":
+                                                     1 << 30
+                                                 })
+
+        restored = DeepSeekV4SparseAttentionConfig.model_validate_json(
+            config.model_dump_json())
+
+        assert restored.get_kv_cache_offload_config(
+        ) == SparseKvCacheOffloadConfig(gpu_cache_factor=3.0,
+                                        host_history_size=1 << 30)
+
+    @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 0.5),
+                                              ("host_history_size", -1)])
+    def test_kv_cache_offload_sizes_reject_out_of_range(self, field, value):
+        with pytest.raises(ValidationError, match=field):
+            SparseKvCacheOffloadConfig(**{field: value})
+
+    @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 3.0),
+                                              ("host_history_size", 1 << 30)])
+    def test_kv_cache_offload_sizes_require_offload(self, field, value):
+        with pytest.raises(ValidationError,
+                           match="requires enable_kv_cache_offload"):
+            DeepSeekV4SparseAttentionConfig(
+                kv_cache_offload_config={field: value})
+
+    def test_only_offloading_configs_report_kv_cache_offload(self):
+        assert llm_args_mod.DeepSeekSparseAttentionConfig(
+        ).get_kv_cache_offload_config() is None
+        assert SkipSoftmaxAttentionConfig().get_kv_cache_offload_config(
+        ) is None
+        config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+        assert config.get_kv_cache_offload_config(
+        ) is config.kv_cache_offload_config
 
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):
@@ -5663,6 +5896,32 @@ class TestTransceiverRuntimeAutoResolution:
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
         assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_model_loader_applies_defaults_from_architecture_override(
+            self, monkeypatch):
+        """Early config loading must include model_kwargs for class defaults."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        class _PreferFlashinferModel:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {"attn_backend": "FLASHINFER"}
+
+        monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
+                            "_resolve_class",
+                            staticmethod(lambda config: _PreferFlashinferModel))
+        fake_loader = self._fake_checkpoint_loader(["PplxDeciderForDecision"])
+        model_kwargs = {"architectures": ["PplxDeciderForDecision"]}
+        args = TorchLlmArgs(model="/tmp/dummy_model", model_kwargs=model_kwargs)
+
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+
+        assert fake_loader.load_config.call_args.kwargs[
+            "model_kwargs"] == model_kwargs
+        assert args.attn_backend == "FLASHINFER"
 
     @pytest.mark.parametrize("arch,expected", [
         ("ModelAForCausalLM", "CPP"),

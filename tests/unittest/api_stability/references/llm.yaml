@@ -116,7 +116,7 @@ methods:
         status: deprecated
       modeling_v2:
         annotation: Literal['off', 'auto', 'require']
-        default: 'off'
+        default: auto
         status: prototype
       cuda_graph_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
@@ -147,7 +147,7 @@ methods:
         default: null
         status: prototype
       checkpoint_format:
-        annotation: Optional[str]
+        annotation: Union[tensorrt_llm.checkpoint_format.CheckpointFormat, str, NoneType]
         default: null
         status: prototype
       checkpoint_io_policy:
@@ -190,6 +190,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      watermark_config:
+        annotation: Optional[WatermarkConfig]
+        default: null
+        status: prototype
       lm_head_output_dtype:
         annotation: Literal['auto', 'float32']
         default: auto

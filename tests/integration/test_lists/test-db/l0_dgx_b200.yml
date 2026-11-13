@@ -45,12 +45,16 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-2-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FLASHINFER-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_ulysses_and_parallel_vae
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_tp2_example_lpips TIMEOUT (30)
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world2]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_text_encoder_tp_lpips[2] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
 - condition:
@@ -71,8 +75,12 @@ l0_dgx_b200:
   - unittest/disaggregated/test_transfer_lifecycle_gpu.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-4-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FLASHINFER-4-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-2]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-2]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-2-2]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FLASHINFER-2-2]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_partial_vae_groups
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world4]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_text_encoder_tp_lpips[4] TIMEOUT (30)
@@ -108,6 +116,10 @@ l0_dgx_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache TIMEOUT (60)
+  # GLM-5.3-Flash modeling_v2 targets (SM100 only): the split target with vanilla MTP and the
+  # MTP-fused target with MTP-Eagle.
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k_mtp_vanilla
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp
   # Exercise VisualGen worker-failure containment with live CUDA allocations
   # spread across four local processes.
   - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
@@ -136,6 +148,9 @@ l0_dgx_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and MXFP8 and not W4A8"
   # --- TRTLLM ---
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_TWO_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=ALLGATHER-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
@@ -281,12 +296,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP4_PP2] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op TIMEOUT (60)
   - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
-  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2_attn2d_2x1]
-  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2_ulysses2]
 - condition:
     ranges:
       system_gpu_count:
@@ -302,6 +313,8 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # GLM-5.3-Flash modeling_v2 split target without speculation (SM100 only).
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=fp8]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex-kv_dtype=fp8]

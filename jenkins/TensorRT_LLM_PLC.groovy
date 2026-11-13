@@ -600,13 +600,13 @@ def processScanResults(ref) {
         if (params.postMergeBuildNumber?.trim()) {
             postMergeArgs += " --post-merge-build-number ${params.postMergeBuildNumber}"
         }
-        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+        withCredentials([string(credentialsId: 'CORA_SLACK_BOT_TOKEN', variable: 'CORA_BOT_TOKEN')]) {
             withEnv([
                 "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
                 "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
                 "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                 "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
-                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
+                "CORA_SLACK_BOT_TOKEN=${CORA_BOT_TOKEN}"
             ]) {
                 sh """
                     python3 -m venv venv
@@ -736,6 +736,7 @@ pipeline {
         booleanParam(name: 'runContainerOssScanning', defaultValue: true, description: 'Run Container OSS Scanning (Pulse container scan)')
         booleanParam(name: 'runContainerMalwareScanning', defaultValue: false, description: 'Run Container Malware Scanning (Pulse container scan)')
         booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
+        string(name: 'slack_thread_id', defaultValue: '', description: 'Optional: Slack thread to reply in via the Cora bot; when empty the message goes to the swdl-trtllm-plc channel')
     }
     options {
         skipDefaultCheckout()
@@ -830,11 +831,13 @@ pipeline {
                         echo detectedLicensesTable
                     }
                     currentBuild.description = "⚠️ Manual approval required — click 'Console Output' to review licenses, then approve or abort"
-                    withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
-                        def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
-                        writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]
-                        sh "curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/slack_payload.json \$PLC_SLACK_WEBHOOK"
-                    }
+                    def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
+                    slackSend(
+                        channel: params.slack_thread_id?.trim() ?: 'swdl-trtllm-plc',
+                        tokenCredentialId: 'CORA_SLACK_BOT_TOKEN',
+                        botUser: true,
+                        message: "${slackReport}\n<${manualReviewUrl}|Review licenses>",
+                    )
                     timeout(time: 96, unit: 'HOURS') {
                         input(
                             message: "New licenses detected in release mode. Please review the licenses listed above and confirm they are all approved for release.",

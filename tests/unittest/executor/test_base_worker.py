@@ -6,6 +6,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from threading import Event, Lock
 from types import MethodType, ModuleType, SimpleNamespace
@@ -67,6 +68,7 @@ def test_prompt_logprobs_computation_and_streaming_cache(
     def make_response(context_logits):
         result = SimpleNamespace(
             context_logits=context_logits,
+            context_prompt_logprob_rows=None,
             is_final=False,
             get_result=lambda: SimpleNamespace(output_token_ids=[[13]]))
         return SimpleNamespace(client_id=1,
@@ -278,6 +280,57 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
             "total_model_loading_seconds": 0.75
         },
     }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("primary_observed", [False, True])
+def test_get_startup_metrics_preserves_loader_policy_metadata(
+        primary_observed: bool) -> None:
+    """Forward nested target and draft policies without conflating their status."""
+    primary_policy = {
+        "requested": "auto",
+        "selected": "rank_striped_read_ahead",
+        "activated": True,
+        "effective": "native",
+        "fallback_reason": "reader failed after activation",
+    } if primary_observed else None
+    draft_policy = {
+        "requested": "native",
+        "selected": "native",
+        "activated": False,
+        "effective": "native",
+        "fallback_reason": None,
+    }
+    target_metadata = {
+        "checkpoint_io_policy": primary_policy,
+        "draft_checkpoint_io_policy": draft_policy,
+    }
+    draft_metadata = {"checkpoint_io_policy": draft_policy}
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker.engine = SimpleNamespace(
+        metrics={},
+        model_engine=SimpleNamespace(model_loader=SimpleNamespace(
+            metrics={"total_model_loading_seconds": 1.5},
+            startup_metadata=target_metadata)),
+        draft_model_engine=SimpleNamespace(model_loader=SimpleNamespace(
+            metrics={"total_model_loading_seconds": 0.75},
+            startup_metadata=draft_metadata)),
+    )
+
+    expected = deepcopy({
+        "py_executor": {},
+        "model_loader": {
+            "total_model_loading_seconds": 1.5,
+            **target_metadata,
+        },
+        "draft_model_loader": {
+            "total_model_loading_seconds": 0.75,
+            **draft_metadata,
+        },
+    })
+
+    assert worker.get_startup_metrics() == expected
 
 
 @pytest.mark.cpu_only
@@ -712,6 +765,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
     response_result = SimpleNamespace(
         is_final=False,
         context_logits=torch.tensor([[0., 1., 2., 3.]] * 3),
+        context_prompt_logprob_rows=None,
         get_result=lambda: SimpleNamespace(output_token_ids=[[0]]),
     )
 
@@ -897,3 +951,61 @@ def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
             need_response=False)
         assert request.id == 7
         assert proxy._results == {7: result, 8: peer_result}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ignore_eos", [False, True])
+@pytest.mark.parametrize("simple", [False, True])
+def test_worker_enqueues_serializable_python_input_envelope(
+        ignore_eos: bool, simple: bool) -> None:
+    import pickle
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import \
+        executor_request_to_llm_request
+    from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.sampling_params import LogprobMode
+
+    captured = []
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker._lora_manager = None
+    worker.max_seq_len = 20
+    worker.engine = SimpleNamespace(
+        is_generation_model=True,
+        enqueue_request=lambda request: captured.append(request) or 42)
+    request = GenerationRequest(
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(
+            max_tokens=2,
+            end_id=7,
+            ignore_eos=ignore_eos,
+            n=3,
+            top_k=10,
+            logprobs=0 if simple else 2,
+            logprobs_mode=LogprobMode.PROCESSED,
+            logprobs_simple_format=simple,
+            return_routed_experts=True,
+        ),
+        multimodal_params=MultimodalParams(
+            multimodal_data={"embedding": torch.ones(2, 4)}),
+        arrival_time=123.0,
+    ).set_id(11)
+
+    assert worker._enqueue_request(request) == 42
+    assert len(captured) == 1
+    envelope = captured[0]
+    assert isinstance(envelope, ExecutorRequest)
+    assert not hasattr(envelope.request, "py_logprobs_mode")
+    restored = pickle.loads(pickle.dumps(envelope))
+    parent = executor_request_to_llm_request(42, restored, [43, 44], False)
+    for translated in (parent, *parent.child_requests):
+        assert translated.py_client_id == 11
+        assert translated.py_original_end_id == 7
+        assert translated.py_end_id == (-1 if ignore_eos else 7)
+        assert translated.py_logprobs_mode == LogprobMode.PROCESSED
+        assert translated.py_logprobs_simple_format is simple
+        assert translated.py_num_logprobs == (0 if simple else 2)
+        assert translated.py_return_routed_experts
+        torch.testing.assert_close(translated.py_multimodal_data["embedding"],
+                                   torch.ones(2, 4))

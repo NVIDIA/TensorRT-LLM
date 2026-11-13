@@ -1320,13 +1320,12 @@ def _run_test_for_backend(backend_name,
                         num_seqs = len(context_sequence_lengths)
                         cu_q_seqlens = torch.empty(num_seqs + 1,
                                                    dtype=torch.int32,
-                                                   device=q.device)
+                                                   device=fused_q.device)
                         cu_kv_seqlens = torch.empty(num_seqs + 1,
                                                     dtype=torch.int32,
-                                                    device=q.device)
-                        fmha_scheduler_counter = torch.empty(1,
-                                                             dtype=torch.uint32,
-                                                             device=q.device)
+                                                    device=fused_q.device)
+                        fmha_scheduler_counter = torch.empty(
+                            1, dtype=torch.uint32, device=fused_q.device)
                         has_fp8_kv_cache = gen_layers[
                             layer_idx].has_fp8_kv_cache if hasattr(
                                 gen_layers[layer_idx],
@@ -1335,15 +1334,15 @@ def _run_test_for_backend(backend_name,
                         if has_fp8_kv_cache:
                             mla_bmm1_scale = torch.empty(2,
                                                          dtype=torch.float32,
-                                                         device=q.device)
+                                                         device=fused_q.device)
                             mla_bmm2_scale = torch.empty(1,
                                                          dtype=torch.float32,
-                                                         device=q.device)
+                                                         device=fused_q.device)
                             quant_q_buffer = torch.empty(
                                 num_tokens,
                                 num_heads * (kv_lora_rank + qk_rope_head_dim),
                                 dtype=torch.uint8,
-                                device=q.device)
+                                device=fused_q.device)
                         else:
                             mla_bmm1_scale = None
                             mla_bmm2_scale = None

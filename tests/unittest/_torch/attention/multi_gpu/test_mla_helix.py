@@ -644,7 +644,7 @@ def _v_up_builder(kv_b_weight, kv_b_scale, *, num_heads, cp_size, cp_rank, nope,
 
 
 @pytest.mark.parametrize("cp_rank", [0, 1])
-def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int):
+def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int) -> None:
     """MLA dequantizes every tp-local head's V weight from the loaded FP8 kv_b_proj; this rank's
     dequantized V chunk becomes a view of it."""
     h, n, v, k, cp = 4, 128, 128, 256, 2
@@ -671,7 +671,7 @@ def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int):
     )
 
 
-def test_helix_v_up_weight_views_bf16_kv_b():
+def test_helix_v_up_weight_views_bf16_kv_b() -> None:
     h, n, v, k = 4, 64, 128, 256
     weight = torch.randn(h * (n + v), k, dtype=torch.bfloat16)
     module = _v_up_builder(weight, None, num_heads=h, cp_size=2, cp_rank=0, nope=n, v=v, k=k)

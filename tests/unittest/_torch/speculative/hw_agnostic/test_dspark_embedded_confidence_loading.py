@@ -15,7 +15,9 @@ from tensorrt_llm._torch.models.modeling_speculative import DSparkConfidenceHead
 pytestmark = pytest.mark.cpu_only
 
 
-def _wrapper(monkeypatch, v41):
+def _wrapper(
+    monkeypatch: pytest.MonkeyPatch, v41: bool, use_bf16_linear: bool = True
+) -> tuple[nn.Module, dict[str, torch.Tensor]]:
     module = modeling_dspark_v41 if v41 else modeling_dspark
     cls = module.DSv41DSparkForCausalLM if v41 else module.DSv4DSparkForCausalLM
     wrapper = object.__new__(cls)
@@ -27,6 +29,7 @@ def _wrapper(monkeypatch, v41):
     stage.markov_head = None
     stage.confidence_head = DSparkConfidenceHead(hidden_size=2, block_size=2)
     model = nn.Module()
+    model._use_bf16_linear = use_bf16_linear
     model.mtp_layers = nn.ModuleList([stage])
     model.config = SimpleNamespace(
         q_lora_rank=1,
@@ -45,7 +48,6 @@ def _wrapper(monkeypatch, v41):
         )
     )
     model.post_load_weights = Mock()
-    model.cache_attn_weights_from_state_dict = Mock()
     wrapper.dspark_model = model
     wrapper.config = model.config
     wrapper.num_stages = 1
@@ -58,9 +60,12 @@ def _wrapper(monkeypatch, v41):
 
 
 @pytest.mark.parametrize("v41", [False, True])
+@pytest.mark.parametrize("use_bf16_linear", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
-def test_embedded_confidence_load_validates_and_copies_real_parameters(monkeypatch, v41, bias):
-    wrapper, weights = _wrapper(monkeypatch, v41)
+def test_embedded_confidence_load_validates_and_copies_real_parameters(
+    monkeypatch: pytest.MonkeyPatch, v41: bool, bias: bool, use_bf16_linear: bool
+) -> None:
+    wrapper, weights = _wrapper(monkeypatch, v41, use_bf16_linear=use_bf16_linear)
     head = wrapper.dspark_model.mtp_layers[-1].confidence_head
     prefix = "mtp_layers.0.confidence_head."
     if bias:
@@ -74,12 +79,15 @@ def test_embedded_confidence_load_validates_and_copies_real_parameters(monkeypat
     assert (head.proj.bias is not None) is bias
     if bias:
         assert torch.equal(head.proj.bias, weights[prefix + "proj.bias"])
-    wrapper.dspark_model.post_load_weights.assert_called_once()
+    # V4 and V4.1 both bind attention from the raw checkpoint in one call.
+    wrapper.dspark_model.post_load_weights.assert_called_once_with(weights)
 
 
 @pytest.mark.parametrize("v41", [False, True])
 @pytest.mark.parametrize("fault", ["unknown", "missing_weight", "broadcast_weight"])
-def test_embedded_confidence_rejects_incomplete_or_unknown_tensors(monkeypatch, v41, fault):
+def test_embedded_confidence_rejects_incomplete_or_unknown_tensors(
+    monkeypatch: pytest.MonkeyPatch, v41: bool, fault: str
+) -> None:
     wrapper, weights = _wrapper(monkeypatch, v41)
     prefix = "mtp_layers.0.confidence_head."
     if fault == "unknown":
@@ -95,7 +103,9 @@ def test_embedded_confidence_rejects_incomplete_or_unknown_tensors(monkeypatch, 
 
 
 @pytest.mark.parametrize("v41", [False, True])
-def test_entirely_absent_confidence_head_remains_supported(monkeypatch, v41):
+def test_entirely_absent_confidence_head_remains_supported(
+    monkeypatch: pytest.MonkeyPatch, v41: bool
+) -> None:
     wrapper, weights = _wrapper(monkeypatch, v41)
     weights.pop("mtp_layers.0.confidence_head.proj.weight")
     wrapper.load_weights(weights)

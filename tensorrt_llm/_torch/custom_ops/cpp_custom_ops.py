@@ -148,10 +148,6 @@ def _register_fake():
     ) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::validate_allreduce_tuning_buckets")
-    def _(buckets: List[int]) -> None:
-        return None
-
     @torch.library.register_fake("trtllm::clear_allreduce_tactic_cache")
     def _() -> None:
         return None
@@ -192,7 +188,8 @@ def _register_fake():
           rmsnorm_fusion,
           scale=None,
           fusion_op: int = 0,
-          fp8_payload: bool = False):
+          fp8_payload: bool = False,
+          trigger_completion_at_end: bool = True):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
@@ -1218,6 +1215,7 @@ def _register_fake():
         old_g: torch.Tensor,
         cache_buf_idx: torch.Tensor,
         prev_num_accepted_tokens: torch.Tensor,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
         return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),
@@ -1482,6 +1480,20 @@ def _register_fake():
             (max_num_permuted_tokens * interm_size // sf_vec_size, ),
             dtype=torch.uint8,
             device=input.device)
+        return output, output_sf
+
+    @torch.library.register_fake("trtllm::swiglu_nvfp4_quantize")
+    def _(
+        input: torch.Tensor,
+        global_sf: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = input.size(0)
+        interm_size = input.size(1) // 2
+        output = input.new_empty((num_tokens, interm_size // 2),
+                                 dtype=torch.float4_e2m1fn_x2)
+        output_sf = input.new_empty((fp4_utils.pad_up(num_tokens, 128) *
+                                     fp4_utils.pad_up(interm_size // 16, 4), ),
+                                    dtype=torch.uint8)
         return output, output_sf
 
     @torch.library.register_fake("trtllm::moe_gelu")
@@ -1904,6 +1916,43 @@ def _register_fake():
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
         return y_fp4, sf_out
+
+    @torch.library.register_fake("trtllm::fmha_dense_fp8")
+    def _(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        scale_bmm1: Optional[torch.Tensor],
+        scale_out: torch.Tensor,
+        fp16_softmax: bool,
+        out_dtype: torch.dtype,
+    ):
+        return q.new_empty(q.shape, dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::dit_v_amax")
+    def _(qkv: torch.Tensor, num_heads: int, head_dim: int):
+        return qkv.new_empty((1, ), dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::fused_dit_qk_norm_rope_fp8")
+    def _(
+        qkv: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_emb: torch.Tensor,
+        sin_emb: torch.Tensor,
+        interleave: bool,
+        qk_mul: float,
+        v_amax: Optional[torch.Tensor],
+    ):
+        shape = (qkv.shape[0], num_heads, head_dim)
+        q8, k8, v8 = (qkv.new_empty(shape, dtype=torch.float8_e4m3fn)
+                      for _ in range(3))
+        return q8, k8, v8, qkv.new_empty((1, ), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::fused_adaptive_layernorm")
     def _(
