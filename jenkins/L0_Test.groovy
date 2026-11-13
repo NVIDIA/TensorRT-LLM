@@ -3202,6 +3202,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
+                // Temporary proof of both initial and repeated cleanup retention.
+                def cbtsRetentionProbe = ""
+                if (stageName.contains("CBTSProbe") && fileExists("${testListPathLocal}.cbts")) {
+                    cbtsRetentionProbe = """
+                    test -s "${testListPathNode}.cbts"
+                    echo "CBTS_PROBE: companion survived first submission cleanup"
+                    find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
+                    test -s "${testListPathNode}.cbts"
+                    echo "CBTS_PROBE: companion survived simulated resubmission cleanup"
+                    """
+                }
+
                 def scriptSubmit = """#!/bin/bash
                     set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
@@ -3230,6 +3242,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     # Clean up workspace: remove all files/dirs not in the keep list
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
+                    ${cbtsRetentionProbe}
 
                     echo "=== [Run Pytest] Submitting GPU SLURM job: \$(date '+%Y-%m-%d %H:%M:%S') on \$(hostname) ==="
                     # Prepare Container stage has already completed; fat sqsh is ready on disk
@@ -7653,6 +7666,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     }]]}
 
     x86SlurmTestConfigs = [
+        // Temporary native-sbatch probe; revert before merging PR #21982.
+        "DGX_H100-PyTorch-OnDemand-CBTSProbe-1": ["auto:dgx-h100-x1", "l0_h100", 1, 1, 1, 1, true],
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
         "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 6],
         "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 6],
