@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -10,6 +11,7 @@ import triton
 import triton.language as tl
 from torch.nn.parameter import Parameter
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -27,6 +29,16 @@ def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
     None keeps the model dtype. An FP32 override stores the result directly
     in FP32 without first rounding it to the BF16/FP16 model dtype.
     """
+    if (os.getenv("FORCE_DETERMINISTIC") == "1" and input.is_cuda
+            and input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+            and get_sm_version() in (100, 103)):
+        # Same K reduction order for every token count, as in
+        # UnquantizedLinearMethod.apply; the FP32 accumulator is stored
+        # directly when output_dtype is FP32.
+        from .deterministic_linear import deterministic_linear
+
+        return deterministic_linear(input, weight, output_dtype=output_dtype)
+
     out_features = weight.shape[0]
     output_shape = (*input.shape[:-1], out_features)
     input_2d = input.reshape(-1, input.shape[-1])

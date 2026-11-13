@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
 from tensorrt_llm._utils import get_sm_version
 
@@ -76,3 +77,30 @@ def test_linear_cuda_graph_reads_updated_input(monkeypatch):
     expected = method.apply(layer, x, None)
     graph.replay()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("output_dtype", [None, torch.float32], ids=["bf16", "fp32"])
+@torch.inference_mode()
+def test_lm_head_token_count_invariance(monkeypatch, output_dtype):
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    torch.manual_seed(11)
+    hidden_size, vocab_size = 4096, 131072
+    head = LMHead(vocab_size, hidden_size, dtype=torch.bfloat16, output_dtype=output_dtype).cuda()
+    head.weight.copy_(
+        torch.randn(vocab_size, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.02
+    )
+    target = torch.randn(8, hidden_size, device="cuda", dtype=torch.bfloat16)
+    expected = torch.cat([head(row[None]) for row in target])
+    assert expected.dtype == (output_dtype or torch.bfloat16)
+    reference = target.double() @ head.weight[:4096].double().T
+    if output_dtype is None:
+        torch.testing.assert_close(
+            expected[:, :4096].float(), reference.bfloat16().float(), rtol=0.008, atol=0.001
+        )
+    else:
+        torch.testing.assert_close(expected[:, :4096].double(), reference, rtol=1e-4, atol=1e-4)
+    for m in (8, 31, 64, 257, 513):
+        inputs = torch.randn(m, hidden_size, device="cuda", dtype=torch.bfloat16)
+        indices = torch.linspace(0, m - 1, 8, device="cuda").long()
+        inputs[indices] = target
+        torch.testing.assert_close(head(inputs)[indices], expected, rtol=0, atol=0)
