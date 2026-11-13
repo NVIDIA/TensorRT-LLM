@@ -4662,10 +4662,12 @@ def loadStageResourceRequests(pipeline)
         pipeline.echo "Failed to download ${configPath} at ${env.gitlabCommit} from Artifactory; using git instead. Error: ${e.toString()}"
         trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, configPath, configDir)
     }
-    def requests = pipeline.readJSON(file: configFile, returnPojo: true).stages
-    if (!(requests instanceof Map)) {
-        pipeline.error("stage_resources.json must contain a stages object")
+    def config = pipeline.readJSON(file: configFile, returnPojo: true)
+    if (!(config instanceof Map)) {
+        pipeline.error("stage_resources.json must contain a JSON object")
     }
+    // Top-level keys are stage names. Keys that start with "_", such as _copyright, are not stages.
+    def requests = config.findAll { stageName, resources -> !stageName.startsWith("_") }
     requests.each { stageName, resources ->
         ["cpu_m", "memory_mi"].each { key ->
             def value = resources[key]

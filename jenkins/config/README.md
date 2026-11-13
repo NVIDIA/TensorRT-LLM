@@ -17,19 +17,18 @@ limitations under the License.
 # Test stage resources
 
 `stage_resources.json` configures the CPU and memory requests and limits of the `trt-llm`
-container in Kubernetes test stages. Entries in `stages` match the exact stage
-name. Values are positive integers: `cpu_m` is CPU millicores, and `memory_mi`
+container in Kubernetes test stages. Each top-level key is an exact stage name.
+Keys that start with `_`, such as `_copyright`, are not stage names and are
+skipped. Values are positive integers: `cpu_m` is CPU millicores, and `memory_mi`
 is memory in MiB. Requests and limits use the same values.
 
 For example, this entry sets both requests and limits to 8 CPUs and 20 GiB:
 
 ```json
 {
-  "stages": {
-    "A10-PyTorch-1": {
-      "cpu_m": 8000,
-      "memory_mi": 20480
-    }
+  "A10-PyTorch-1": {
+    "cpu_m": 8000,
+    "memory_mi": 20480
   }
 }
 ```
