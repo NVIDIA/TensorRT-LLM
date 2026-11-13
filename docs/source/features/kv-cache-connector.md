@@ -744,7 +744,7 @@ no per-request or per-layer connector cost.
 ### Pool eviction
 
 A full pool evicts on the master, and two settings shape what it evicts. Both apply only to a role
-that writes the pool (`both` or `producer`), both need `mooncake-transfer-engine-cuda13` 0.3.13 or
+that writes the pool (`both` or `producer`), both need `mooncake-transfer-engine-cuda13` 0.3.14 or
 newer, and both are off by default.
 
 ```yaml

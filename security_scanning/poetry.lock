@@ -2789,26 +2789,31 @@ soxr = ["soxr (>=0.5.0)"]
 
 [[package]]
 name = "mooncake-transfer-engine-cuda13"
-version = "0.3.13"
+version = "0.3.14"
 description = "A KVCache-centric Disaggregated Architecture for large-scale LLM inference and training. (CUDA 13 version)"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:fd0b41cca5550f244ecf2e1a92979262d2aefc4acf34bd5ddb1d8e7f698c6d55"},
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:fb56dbcb174f1b573c7fce216e5be8c368557b9064bed6d5c67fc8c3b51e7f5c"},
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:47289507b5d1ab495270b63ef42530cf78ba4b2628fbd99d3443d4737a8a987f"},
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:f65e034c3257203e4173c0c5838b034546e4f52bb1717629a726a27f0bc0efc0"},
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:b8bbe5d9a5e30996f956ca5f7d1193e63abcc67bcba66d2886cf945705f34d6c"},
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:d98837392fdba3ec0eab65cdb6727af0849367b5935265b610412a415343a4fe"},
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:6ac9673102be62b5cbc061eaad030219dc1c28cfb7c91080f6aaca194cae67c2"},
-    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:7ff638b4d782f64d7eebe7c3c34f2b4f3471be9eb1962970e6ae0a80b70ec65c"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:c2866f1258d8b257776515dc5ef9024389f1ab0a8d13c5df3aa1b2e91e4b6471"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:6efbc7dab08f3dcfeab83bfbb9e277070b142ffc3a69782d278d94b0e4d80e16"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:f453fe42b314d8256214d06845286982e606fd7d9019c9c45b6bc8b463658df4"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:1fc1d8597e5501d6967a3d2835878500460d7dd40999f6f987131126dcba5c8f"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:15c54971584f1d16e939a6c4b05af0a8447a19f5a59ad70a58962786b0bdb0f3"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:74fa5f0684b143167503e33f85cccb9ca687d3f9843d4b594dbd5342c7df3e17"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:1ab47d346d935b66d5a4df07ed6138aba4fd720b3ebae3b3e0059bfe58d75f63"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:504d4a9aa848dd417f61eb4acb349b4a23f2e033469657c41f63b4fe32b4c6c6"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:d05029875c4cbdbc7c5c023c5e7fa01a91552bce001190c9ddfa26d05119fa43"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.14-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:24311f9d3a0a7c84509a094df4a3fd20978db32c35c16f0e6a7474b63dbc5fda"},
 ]
 
 [package.dependencies]
 aiohttp = "*"
 msgpack = "*"
 requests = "*"
+
+[package.extras]
+administration = ["paramiko"]
 
 [[package]]
 name = "mpi4py"
@@ -7765,4 +7770,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "8ef158193fd594e9c5fcafb2f22ffcb88479aefee280621a61c63b0c8352c7ea"
+content-hash = "80563d7af1cfb16a4b53f8de4a96610b5d35eeff4326ce50185ca24643b1a498"
