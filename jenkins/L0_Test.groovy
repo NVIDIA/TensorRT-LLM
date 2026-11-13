@@ -917,14 +917,18 @@ def isIntentionalCbtsEmpty(result) {
 
 def reportCbtsEmptyShard(String stageName) {
     echo "CBTS: ${stageName} has an empty intersection with its original shard; successful no-op"
-    sh "mkdir -p ${stageName}"
     // A distinct skipped control record survives empty-results.xml cleanup and
     // lets normal junit reporting accept the no-op without allowing missing results.
-    writeFile file: "${stageName}/results-cbts-empty.xml", text: """<?xml version="1.0" encoding="UTF-8"?>
+    // Match the ordinary runner's container UID when creating result files.
+    sh(label: "Record successful empty CBTS shard", script: """
+mkdir -p '${stageName}'
+cat > '${stageName}/results-cbts-empty.xml' <<'CBTS_XML'
+<?xml version="1.0" encoding="UTF-8"?>
 <testsuites><testsuite name="${stageName}" tests="1" failures="0" errors="0" skipped="1">
 <testcase classname="cbts" name="original-shard-empty-intersection"><skipped message="No CBTS-selected cases belong to this original shard"/></testcase>
 </testsuite></testsuites>
-"""
+CBTS_XML
+""")
 }
 
 def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") {
@@ -5452,10 +5456,18 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     sh "rm -f ${testList}.cbts"
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
     if (preserveCbtsShardScope() && testDBPath != "${llmSrc}/tests/integration/test_lists/test-db") {
-        def narrowedLines = readFile(file: testList).readLines().collect {
-            it.replace('ISOLATION,', '').replace(',ISOLATION', '').replace(' ISOLATION', '').trim()
-        }
-        writeFile file: "${testList}.cbts", text: narrowedLines.join('\n')
+        // The source tree can belong to the test container's UID. Jenkins
+        // writeFile runs as the agent UID, so create the companion in the same
+        // container as trt-test-db instead of changing workspace permissions.
+        sh(label: "Write CBTS companion in the test container", script: """
+            python3 - '${testList}' '${testList}.cbts' <<'CBTS_PY'
+from pathlib import Path
+import sys
+lines = Path(sys.argv[1]).read_text().splitlines()
+cleaned = [line.replace('ISOLATION,', '').replace(',ISOLATION', '').replace(' ISOLATION', '').strip() for line in lines]
+Path(sys.argv[2]).write_text('\\n'.join(cleaned))
+CBTS_PY
+        """)
         def sourceQuery = testDBQueryCmd.replace(
             "-d ${testDBPath}", "-d ${llmSrc}/tests/integration/test_lists/test-db")
         sh(label: "Render original test list for shard assignment", script: sourceQuery)
