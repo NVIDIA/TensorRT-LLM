@@ -23,7 +23,8 @@ from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
-from .proxy import _check_collective_rpc_guard
+from .proxy import (_ASYNC_STATS_RPC, _check_collective_rpc_guard,
+                    _stats_rpc_timeout)
 from .result import IterationResult
 from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
@@ -183,18 +184,29 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
+        self._iter_stats_result.set_timeout(timeout)
+        if _ASYNC_STATS_RPC:
+            # The result awaits the RPC when it is read (IterationResult.
+            # add_pending_records), so the caller's event loop keeps running.
+            try:
+                self._iter_stats_result.add_pending_records(
+                    self.rpc_client.fetch_stats_wait_async(
+                        timeout=timeout).remote_future(
+                            timeout=_stats_rpc_timeout(timeout)))
+            except Exception as e:
+                logger.debug(f"Error fetching stats via RPC: {e}")
+            return self._iter_stats_result
+
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote(
-                    timeout=None if timeout is None else timeout + 1.0)
+                timeout=timeout).remote(timeout=_stats_rpc_timeout(timeout))
         except Exception:
             stats = []
 
         for stat in stats:
             self._iter_stats_result.queue.put(stat)
 
-        self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result
 
     def get_kv_events(self, timeout: float) -> List[dict]:

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -46,6 +47,41 @@ if TYPE_CHECKING:
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
 _NEUTRAL_CONFIDENCE_LOGIT = NEUTRAL_CONFIDENCE_LOGIT
+
+# A target's replacement of the ancestral draft loop's per-position glue,
+# installed at load time: an object whose
+#   step_bias(prev_tokens, markov_w1, markov_w2)  -> bias or None
+#   biased_logits(gen_logits, step, bias)         -> logits or None
+#   store_probs(draft_probs, slots, step, probs)  -> bool
+# each give exactly the stock line's result (``dspark_markov_step_bias``;
+# ``gen_logits[:, step] + bias.to(gen_logits.dtype)``;
+# ``draft_probs[slots, step, :vocab] = probs``) or decline (None / False), and
+# the stock line then runs. None (the default) keeps the stock lines.
+_ANCESTRAL_GLUE_OVERRIDE = None
+
+
+def set_ancestral_glue_override(glue) -> None:
+    """Install (or, with None, remove) the ancestral glue override used by
+    ``DSparkWorker._sample_block_ancestrally``."""
+    global _ANCESTRAL_GLUE_OVERRIDE
+    _ANCESTRAL_GLUE_OVERRIDE = glue
+
+
+# A target's replacement of the whole ancestral draft block, installed at load
+# time: a callable
+#   (worker, draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size)
+#       -> (int32 tokens [num_gens, K], stored vocab width) or None
+# that draws the same distribution as the per-position loop (not its RNG
+# stream) and stores each position's proposal, or declines (None) and the loop
+# then runs. None (the default) keeps the loop.
+_ANCESTRAL_BLOCK_OVERRIDE = None
+
+
+def set_ancestral_block_override(draw_block) -> None:
+    """Install (or, with None, remove) the ancestral block override used by
+    ``DSparkWorker._sample_block_ancestrally``."""
+    global _ANCESTRAL_BLOCK_OVERRIDE
+    _ANCESTRAL_BLOCK_OVERRIDE = draw_block
 
 
 def load_sts_temperatures_from_path(path: str) -> list[float]:
@@ -214,6 +250,10 @@ class DSparkSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Preserve the initial slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
+
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -802,6 +842,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if capture_lens is not None and len(capture_lens) != attn_metadata.num_contexts:
             raise ValueError("DSpark capture lengths must match the context requests")
         flat_position_ids = position_ids.reshape(-1)
+        # Scalar token positions on the host. They match the device ids token for
+        # token when those hold one row (no rope expansion); the device ids may
+        # carry padding past them. Reading the device ids costs a D2H sync.
+        host_positions = getattr(spec_metadata, "host_position_ids", None)
+        if host_positions is not None and position_ids.numel() != position_ids.shape[-1]:
+            host_positions = None
         context_offset = 0
         for i in range(attn_metadata.num_contexts):
             chunk_len = int(attn_metadata._seq_lens[i])
@@ -814,7 +860,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 continue
 
             req_id = spec_metadata.request_ids[i]
-            first_position = int(chunk_positions[0].item())
+            first_position = int(
+                host_positions[context_offset]
+                if host_positions is not None and context_offset < host_positions.numel()
+                else chunk_positions[0].item()
+            )
             slot = self._assign_slot(req_id, reset=first_position == 0)
             self._ctx_len[slot] = chunk_positions[-1] + 1
             self._position_initialized[slot] = True
@@ -1256,6 +1306,9 @@ class DSparkWorker(DFlashWorker):
     :class:`DSv4DSparkWorker`.
     """
 
+    # Sampled drafts drawn ancestrally through the Markov head (enable_ancestral_draft_sampling).
+    _ancestral_draft_sampling = False
+
     def set_draft_model(self, draft_model) -> None:
         """Reject an unsupported vocab mapping here rather than mid-decode.
 
@@ -1342,6 +1395,105 @@ class DSparkWorker(DFlashWorker):
             local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
 
+    def enable_ancestral_draft_sampling(self, enabled: bool = True) -> None:
+        """Draw sampled drafts ancestrally through the Markov head (see ``_sample_block_ancestrally``).
+
+        Off by default: a sampled block then proposes from the logits refined along the greedy chain
+        (``_refine_block_logits``), which is lossless too but conditions each position on the greedy
+        token rather than on the one drawn. Installing an ancestral override
+        (``set_ancestral_block_override`` / ``set_ancestral_glue_override``) also opts in."""
+        self._ancestral_draft_sampling = bool(enabled)
+
+    def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
+        """Whether this step's sampled drafts follow the Markov head through the tokens actually drawn."""
+        opted_in = (
+            self._ancestral_draft_sampling
+            or _ANCESTRAL_BLOCK_OVERRIDE is not None
+            or _ANCESTRAL_GLUE_OVERRIDE is not None
+        )
+        return bool(
+            opted_in
+            and getattr(draft_model, "has_markov_head", False)
+            and spec_metadata.wants_advanced_draft_sampling
+        )
+
+    def _draft_block_tokens(
+        self, draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
+    ):
+        if self._samples_block_ancestrally(draft_model, spec_metadata):
+            return self._sample_block_ancestrally(
+                draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+            )
+        return super()._draft_block_tokens(
+            draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
+        )
+
+    def _sample_block_ancestrally(
+        self, draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+    ):
+        """Draw position k from ``softmax((base_k + bias(d_{k-1})) / T)``, ``d_{k-1}`` the token drawn
+        before it (the anchor for k = 0), with the temperature only, and store that distribution as
+        the proposal. Returns the int32 tokens and the stored vocab width."""
+        from ..models.modeling_speculative import dspark_markov_step_bias
+
+        if _ANCESTRAL_BLOCK_OVERRIDE is not None:
+            drawn = _ANCESTRAL_BLOCK_OVERRIDE(
+                self, draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+            )
+            if drawn is not None:
+                return drawn
+        num_gens, num_drafts, _ = gen_logits.shape
+        # The chain indexes the full Markov table; verification reads full-vocab q.
+        gen_logits = self.maybe_gather_sharded_draft_logits(gen_logits, spec_metadata)
+        vocab = gen_logits.shape[-1]
+        # Zero the CUDA-graph padding rows (uninitialized state) so every draw is legal.
+        gen_logits = self._zero_padding_rows(
+            gen_logits.reshape(num_gens * num_drafts, vocab),
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            num_drafts,
+        ).reshape(num_gens, num_drafts, vocab)
+        params = self._temperature_only_params(
+            spec_metadata.request_temperatures[num_contexts:batch_size]
+        )
+        # The draws are temperature-only, but a non-fused mode would still run its top-k mask and top-p renorm
+        # (identities at top_k = max and top_p = 1) at every position.
+        mode = spec_metadata.advanced_sampling_mode
+        if not mode.is_fused:
+            mode = AdvancedSamplingMode.NO_TOPK_NO_TOPP
+        draft_probs = spec_metadata.draft_probs
+        slots = spec_metadata.batch_slot_ids[num_contexts:batch_size]
+        tokens = inputs["first_prev_tokens"]
+        w1, w2 = draft_model.markov_w1, draft_model.markov_w2
+        glue = _ANCESTRAL_GLUE_OVERRIDE
+        drafts = []
+        for step in range(num_drafts):
+            bias = None if glue is None else glue.step_bias(tokens, w1, w2)
+            if bias is None:
+                bias = dspark_markov_step_bias(tokens, w1, w2)
+            seed, offset = self._rng_state_per_request(
+                spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(step)
+            )
+            logits = None if glue is None else glue.biased_logits(gen_logits, step, bias)
+            if logits is None:
+                logits = gen_logits[:, step] + bias.to(gen_logits.dtype)
+            tokens, probs = self._sample_from_logits_with_probs(
+                mode,
+                logits,
+                *params,
+                seed=seed,
+                offset=offset,
+            )
+            if draft_probs is not None and (
+                glue is None or not glue.store_probs(draft_probs, slots, step, probs)
+            ):
+                draft_probs[slots, step, :vocab] = probs
+            drafts.append(tokens)
+        if draft_probs is not None:
+            spec_metadata.draft_probs_last_dim = vocab
+        return torch.stack(drafts, dim=1).to(torch.int32), vocab
+
     def _refine_block_logits(
         self,
         draft_model,
@@ -1353,9 +1505,12 @@ class DSparkWorker(DFlashWorker):
 
         A DSpark drafter checkpoint may omit the Markov head (``markov_rank``
         0), which loads as a drafter without one; that case falls through to
-        the unmodified backbone logits.
+        the unmodified backbone logits, as does a block drawn ancestrally
+        (:meth:`_sample_block_ancestrally` adds the bias per position).
         """
         if not getattr(draft_model, "has_markov_head", False):
+            return gen_logits
+        if self._samples_block_ancestrally(draft_model, spec_metadata):
             return gen_logits
         return self._apply_dspark_markov_bias(draft_model, gen_logits, inputs["first_prev_tokens"])
 
@@ -1372,8 +1527,10 @@ class DSparkWorker(DFlashWorker):
         logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
         is the greedy token from step i-1's biased logits. Greedy per-position
         argmax of the returned logits therefore reproduces the reference
-        sampled chain; the rejection-sampling path samples from the same
-        biased distributions (proposal conditioned on the greedy chain).
+        chain; the rejection-sampling path samples from the same biased
+        distributions (proposal conditioned on the greedy chain), unless the
+        block is drawn ancestrally (:meth:`_sample_block_ancestrally`), which
+        conditions each position on the token actually drawn before it.
 
         A TP vocab-sharded draft lm_head yields this rank's vocab shard of the
         logits; the chain then takes each step's global argmax over the TP

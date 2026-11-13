@@ -65,6 +65,27 @@ _SchedulerResult = TypeVar("_SchedulerResult")
 AllocationFence = Callable[[Iterable[int]], None]
 
 
+def _is_dummy_request(request: LlmRequest) -> bool:
+    """Whether ``request`` is a placeholder with no prompt of its own.
+
+    Attention DP pads idle ranks with these, and they carry nothing a connector
+    could load or save. Reads ``is_dummy_request``, which the C++ ``LlmRequest``
+    binds and so is readable on the base class some callers hand over, and the
+    Python-only ``is_attention_dp_dummy``. Each is compared against True, since
+    a mock request answers every attribute truthily and is not a dummy.
+
+    Args:
+        request: The request to classify.
+
+    Returns:
+        True when either dummy flag is set.
+    """
+    return (
+        getattr(request, "is_dummy_request", False) is True
+        or getattr(request, "is_attention_dp_dummy", False) is True
+    )
+
+
 # Used to store data for a single inflight request.
 @dataclass
 class RequestData:
@@ -416,6 +437,22 @@ class KvCacheConnectorScheduler(ABC):
             The number of tokens that can be loaded from remote KV cache.
             Whether the tokens will be loaded asynchronously.
         """
+
+    def probe_num_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Optional[int]:
+        """Estimate what ``get_num_new_matched_tokens`` would offer, without its effects.
+
+        Used to rank queued context requests, so it may run long before the
+        request's own query, or for a request that is never queried. It must
+        not start a transfer, record an offer, or change what a later query
+        answers.
+
+        Returns:
+            Tokens beyond ``num_computed_tokens`` the connector could supply
+            now, or None when it cannot tell without querying.
+        """
+        return None
 
     def reserve_prefix(
         self, request: LlmRequest, num_computed_tokens: int, reservation_id: int
@@ -1089,6 +1126,32 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         finished = self._finished_load_terminations
         self._finished_load_terminations = []
         return finished
+
+    def probe_num_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Optional[int]:
+        """The leader's side-effect-free estimate of a request's connector prefix.
+
+        See `KvCacheConnectorScheduler.probe_num_matched_tokens`. Without
+        attention DP this is a leader broadcast, so every tensor-parallel rank
+        must call it for the same requests in the same order. A leader-side
+        failure answers None rather than raising: raising on the leader alone
+        would leave the other ranks waiting in the broadcast.
+        """
+        if _is_dummy_request(request) or self.capacity_only:
+            return None
+
+        def probe() -> Optional[int]:
+            try:
+                return self.scheduler.probe_num_matched_tokens(request, num_computed_tokens)
+            except Exception as error:  # noqa: BLE001 - see the docstring
+                logger.warning(
+                    f"KV connector prefix probe failed for request {request.request_id}; "
+                    f"ranking it on the local cache only: {type(error).__name__}: {error}"
+                )
+                return None
+
+        return self._run_on_leader(probe)
 
     def query_num_new_matched_tokens(
         self, request: LlmRequest, num_computed_tokens: int

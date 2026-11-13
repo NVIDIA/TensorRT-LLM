@@ -15,7 +15,7 @@ own deployment; none is a general default.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Protocol, Sequence, Tuple
 
 if TYPE_CHECKING:
     import torch
@@ -198,6 +198,9 @@ class RuntimeHooks:
     # ``op(window, epoch_or_None, max_desc)``. It writes the window's host copies, then its device copies, zeroes the
     # window's header and increments the epoch, which the default prologue does with two scatter launches and a fill.
     pack_prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None
+    # The step-input pack launches no Triton kernel: eager flushes take the native serial scatter, and the in-graph
+    # prologue runs only as pack_prologue_op (step_inputs.StepInputPack cpp_scatter).
+    pack_cpp_scatter: bool = False
     decode_prologue: Optional[DecodePrologue] = None
     executor_events: Optional[ExecutorEvents] = None
     # Skip host-to-device metadata copies whose values the destination already holds.
@@ -221,6 +224,10 @@ class RuntimeHooks:
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
+    # With TLLM_AUTOTUNER_CACHE_PATH set, save the autotuner cache again after the
+    # FlashInfer MXFP8 passes (warmup and the decode-graph pass) tune, so their
+    # tactics persist across starts instead of being re-profiled on every start.
+    persist_flashinfer_mxfp8_tactics: bool = False
     # Streaming: also emit a response on decoding iterations 2..N, so the first
     # counted text reaches the client one step after the first token instead of
     # one stream interval later (a reasoning parser holds a leading reasoning
@@ -253,8 +260,63 @@ class RuntimeHooks:
     # stream that waits for the current stream, instead of an end and a start event back to back on the
     # current stream (the same instant, with no GPU work between them). The reported step times are unchanged.
     iteration_timing_one_event: bool = False
+    # The one-model speculative sampler's tail bookkeeping without its no-op launches, bitwise the same outputs
+    # (copied to spec_metadata.tail_bookkeep).
+    spec_tail_bookkeep: bool = False
+    # Write the context one-hot draft-probability rows with index_fill_ instead of an advanced-index put that
+    # synchronizes the host with the GPU (SpecMetadata.context_onehot_index_fill, set by the decoder runner on this
+    # model's spec metadata only).
+    context_onehot_index_fill: bool = False
+    # The DFlash / DSpark worker computes a request's drafter context allocation on the host where it is known instead
+    # of reading it back from the device (DFlashWorker.enable_host_ctx_alloc, called by the decoder runner on this
+    # model's spec worker only).
+    dflash_host_ctx_alloc: bool = False
+    # With KV cache manager V2 and block reuse: a waiting context request whose reusable prefix sits in the host tier
+    # has it migrated to the GPU off the execution stream (KVCacheManagerV2.prefetch_to_gpu) and is held out of
+    # scheduling for a few rank-agreed steps while the copy runs, so the swap does not stall the whole step. Read by
+    # this model's executor at construction.
+    kv_gpu_prefetch: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
+    # Standalone-drafter KV pool: ceil(heads / tp) per-rank cost and the history-first context resize
+    # (kv_cache_manager_v2.py). Passed by the KV-cache creator to this model's draft manager and its sizing.
+    draft_pool_fixes: bool = False
+    # DFlash / DSpark draft KV manager: reserve the drafter's block width per generation step and keep page 0 as an
+    # unowned guard page, so drafter writes through unallocated block-table entries cannot land in another request's
+    # page (kv_cache_manager_v2.py). Passed by the KV-cache creator to this model's draft manager and its sizing.
+    draft_kv_reserve_guard: bool = False
+    # A separate draft KV cache manager (KVCacheManagerV2) skips a decode-only block-table copy whose destination,
+    # copied rows and those rows' page indices equal the previous copy's (the standalone DSpark drafter's table is
+    # unchanged on most decode steps).
+    skip_unchanged_draft_block_offsets: bool = False
+    # With skip_unchanged_draft_block_offsets: a decode-only draft block-table copy whose rows changed in a few page
+    # indices (the drafter's sliding window) rewrites the rows with one host-to-device row copy instead of the copy
+    # kernel.
+    patch_unchanged_draft_block_offsets: bool = False
+    # Under disaggregated serving, ship a standalone drafter's context window (its separate draft
+    # KV pool) alongside the target's KV, so the generation worker drafts from the prompt instead
+    # of an empty window. Takes effect only with a separate draft KV cache manager on both sides
+    # (see disaggregation/draft_kv.py).
+    disagg_draft_kv: bool = False
+    # Commit a disaggregated-generation request's received prompt blocks for reuse right after the step's forward
+    # is launched instead of before it: the commit is host work, and the request itself never reads the reuse
+    # tree (DisaggTransferCoordinator.commit_deferred_gen_receives).
+    defer_gen_reuse_commit: bool = False
+    # Prefill CUDA graph token buckets the model adds to the configured capture list (breakable backend only; each
+    # one at most the engine's capturable ceiling). They extend a configured list and never start prefill graphs on
+    # their own: an empty configured list stays empty. Applied once by the engine (apply_prefill_capture_hooks).
+    prefill_capture_extra_num_tokens: Tuple[int, ...] = ()
+    # The extra buckets join only a configured list whose top bucket is at least this. A shorter list would otherwise
+    # pad every step between its top bucket and the first extra one up to that extra bucket; such a list keeps its
+    # own buckets and the engine logs a warning.
+    prefill_capture_extra_min_top: int = 0
+    # Cap on the final breakable prefill capture list (None: no cap).
+    prefill_capture_max_num_tokens: Optional[int] = None
+    # Called with the model after the engine releases that model's breakable prefill graphs
+    # (DecoderRunner._release_decoder_graphs), so state the model instance keeps per captured graph (the addresses a
+    # captured producer baked) ends with the graphs. The engine releases them, among other times, between the
+    # KV-estimation executor and the final one, which recaptures on a new KV pool and new metadata.
+    prefill_graphs_released: Optional[Callable[[Any], None]] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:
@@ -263,7 +325,11 @@ class RuntimeHooks:
         Such a skip is sound only while no other engine writes those buffers, so the engine
         then gives its CUDA graph metadata a buffer pool of its own.
         """
-        return self.skip_unchanged_h2d or self.msa.skip_unchanged_block_offsets
+        return (
+            self.skip_unchanged_h2d
+            or self.msa.skip_unchanged_block_offsets
+            or self.skip_unchanged_draft_block_offsets
+        )
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()
@@ -283,3 +349,46 @@ def runtime_hooks_of(model: object) -> RuntimeHooks:
             f"{type(model).__name__}.runtime_hooks must be a RuntimeHooks, got {type(hooks).__name__}"
         )
     return hooks
+
+
+def apply_prefill_capture_hooks(
+    kept: Sequence[int], hooks: RuntimeHooks, *, max_num_tokens: int, breakable: bool
+) -> Tuple[List[int], List[int], List[int]]:
+    """The prefill capture list after a model's hooks: ``(final, added, dropped)``.
+
+    ``kept`` is the engine's filtered list. On the breakable backend (any other backend keeps ``kept``),
+    ``prefill_capture_extra_num_tokens`` entries in (0, ``max_num_tokens``] join a non-empty ``kept`` whose top bucket
+    is at least ``prefill_capture_extra_min_top`` (``added`` lists the new ones; a shorter list gets none and a
+    warning); then every entry above ``prefill_capture_max_num_tokens`` is removed (``dropped``). ``final`` is sorted
+    ascending and deduplicated.
+    """
+    final = sorted({int(n) for n in kept})
+    added: List[int] = []
+    if not breakable:
+        return final, added, []
+    if (
+        final
+        and hooks.prefill_capture_extra_num_tokens
+        and final[-1] < hooks.prefill_capture_extra_min_top
+    ):
+        from tensorrt_llm.logger import logger
+
+        logger.warning(
+            f"Prefill CUDA graph capture list tops out at {final[-1]} (< {hooks.prefill_capture_extra_min_top}): "
+            f"the model's extra buckets {list(hooks.prefill_capture_extra_num_tokens)} are not added, since every "
+            f"step between {final[-1]} and the first of them would pad up to it. List the buckets up to "
+            f"{hooks.prefill_capture_extra_min_top} to take them."
+        )
+    elif final:
+        extra = {
+            int(n) for n in hooks.prefill_capture_extra_num_tokens if 0 < int(n) <= max_num_tokens
+        }
+        added = sorted(extra - set(final))
+        final = sorted(set(final) | extra)
+    cap = hooks.prefill_capture_max_num_tokens
+    dropped: List[int] = []
+    if cap is not None:
+        dropped = [n for n in final if n > cap]
+        final = [n for n in final if n <= cap]
+        added = [n for n in added if n <= cap]
+    return final, added, dropped

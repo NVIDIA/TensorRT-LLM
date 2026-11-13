@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,20 @@ from ..attention.backends import AttentionMetadata
 from .context_logits import project_context_logits
 from .embedding import LMHead
 from .linear import Linear
+
+# A model's replacement of the logits widening, installed at load time:
+# fn(logits) returns exactly ``logits.float()`` (the same values and a
+# contiguous layout) or None, and the stock ``.float()`` then runs. None (the
+# default) keeps the stock widening.
+_LogitsWidenOverride = Callable[[torch.Tensor], Optional[torch.Tensor]]
+_LOGITS_WIDEN_OVERRIDE: Optional[_LogitsWidenOverride] = None
+
+
+def set_logits_widen_override(fn: Optional[_LogitsWidenOverride]) -> None:
+    """Install (or, with None, remove) the logits widen override used by
+    ``LogitsProcessor.forward``."""
+    global _LOGITS_WIDEN_OVERRIDE
+    _LOGITS_WIDEN_OVERRIDE = fn
 
 
 def scale_and_soft_cap_logits(logits: torch.Tensor, multiplier: float,
@@ -63,5 +77,6 @@ class LogitsProcessor(nn.Module):
                 hidden_states = hidden_states[-1]
 
         logits = lm_head(hidden_states)
-        logits = logits.float()
-        return logits
+        widened = (None if _LOGITS_WIDEN_OVERRIDE is None else
+                   _LOGITS_WIDEN_OVERRIDE(logits))
+        return logits.float() if widened is None else widened

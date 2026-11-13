@@ -724,6 +724,20 @@ class PyResult:
         return self._encoder_output
 
 
+def _response_draft_ctx_state(request) -> Optional[List[int]]:
+    """Context-first disagg: the drafter window decision ``[ctx_len, ctx_base, ok]`` the context
+    worker's response carries to the generation request (DisaggregatedParams.draft_ctx_state).
+
+    Set by the KV transceiver's last-slice decision (``py_draft_ctx_aux``) before the response is
+    built; None for any other request.
+    """
+    draft_ctx = getattr(request, "py_draft_ctx_aux", None)
+    if draft_ctx is None or not getattr(request, "is_context_only_request",
+                                        False):
+        return None
+    return [int(draft_ctx[0]), int(draft_ctx[1]), 1 if draft_ctx[2] else 0]
+
+
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
@@ -755,6 +769,9 @@ class LlmResult:
         self.ctx_usage = None
         # Explicit context-to-generation remote-tail replay boundary.
         self.remote_tail_start: Optional[int] = None
+        # Context-first disagg: the standalone drafter's window decision [ctx_len, ctx_base, ok]
+        # for the generation request (disaggregation/draft_kv.py); never via opaque_state.
+        self.draft_ctx_state: Optional[List[int]] = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
@@ -1271,6 +1288,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         )
         if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
             llm_result.remote_tail_start = self.py_csa2_remote_tail_start
+        llm_result.draft_ctx_state = _response_draft_ctx_state(self)
         llm_result.cached_tokens = self.cached_tokens
         return LlmResponse(
             request_id=self.py_request_id

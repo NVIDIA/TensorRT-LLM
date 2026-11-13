@@ -51,7 +51,8 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
+from tensorrt_llm.inputs.prefix_token_cache import (int32_bytes,
+                                                    tokenization_routing_key)
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
@@ -2557,10 +2558,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 if (request.disaggregated_params is not None and
                         request.disaggregated_params.return_prompt_token_ids_b64
                         and response.prompt_token_ids is not None):
-                    import numpy as np
+                    # A prefix-cache hit already holds these ids as int32.
                     response.prompt_token_ids_b64 = base64.b64encode(
-                        np.asarray(response.prompt_token_ids,
-                                   dtype=np.int32).tobytes()).decode("ascii")
+                        int32_bytes(response.prompt_token_ids)).decode("ascii")
                     response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
@@ -3630,10 +3630,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 if (request.disaggregated_params is not None and
                         request.disaggregated_params.return_prompt_token_ids_b64
                         and response.prompt_token_ids is not None):
-                    import numpy as np
                     response.prompt_token_ids_b64 = base64.b64encode(
-                        np.asarray(response.prompt_token_ids,
-                                   dtype=np.int32).tobytes()).decode("ascii")
+                        int32_bytes(response.prompt_token_ids)).decode("ascii")
                     response.prompt_token_ids = None
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(content=response.model_dump(by_alias=True))

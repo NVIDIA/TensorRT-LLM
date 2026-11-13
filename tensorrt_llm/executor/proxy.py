@@ -67,6 +67,18 @@ __all__ = [
     "GenerationExecutorFrontendProxy",
 ]
 
+# aget_stats awaits the stats RPC, so trtllm-serve's event loop (which also
+# sends every response and token) does not stall while the RPC waits up to
+# `timeout` for a stats record. The records and their order are the same either
+# way; TRTLLM_DISABLE_ASYNC_STATS_RPC=1 restores the blocking RPC.
+_ASYNC_STATS_RPC = os.environ.get("TRTLLM_DISABLE_ASYNC_STATS_RPC", "0") != "1"
+
+
+def _stats_rpc_timeout(timeout: Optional[float]) -> Optional[float]:
+    """The RPC deadline of a stats fetch that waits up to ``timeout`` on the worker."""
+    return None if timeout is None else timeout + 1.0
+
+
 # Methods that are explicitly implemented for multi-rank MPI/IPC executor
 # deployments and may be called via collective_rpc even when world_size > 1.
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
@@ -1573,11 +1585,23 @@ class GenerationExecutorProxy(GenerationExecutor):
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
+        self._iter_stats_result.set_timeout(timeout)
+        if _ASYNC_STATS_RPC:
+            # The result awaits the RPC when it is read (IterationResult.
+            # add_pending_records), so the caller's event loop keeps running.
+            try:
+                self._iter_stats_result.add_pending_records(
+                    self.rpc_client.fetch_stats_wait_async(
+                        timeout=timeout).remote_future(
+                            timeout=_stats_rpc_timeout(timeout)))
+            except Exception as e:
+                logger.debug(f"Error fetching stats via RPC: {e}")
+            return self._iter_stats_result
+
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote(
-                    timeout=None if timeout is None else timeout + 1.0)
+                timeout=timeout).remote(timeout=_stats_rpc_timeout(timeout))
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             stats = []
@@ -1585,7 +1609,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         for stat in stats:
             self._iter_stats_result.queue.put(stat)
 
-        self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result
 
     def get_kv_events(self, timeout: float) -> List[dict]:

@@ -361,6 +361,11 @@ def get_spec_metadata(spec_config,
         # dispatcher routes to a backend that takes no min_p argument -- so the filter is
         # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
+        # The verification rule of the rejection path (block verification or
+        # token-level); configs that predate the field keep token-level.
+        metadata.rejection_sample_method = getattr(spec_config,
+                                                   "rejection_sample_method",
+                                                   "standard")
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
         metadata.temperature_only_graphs = temperature_only_graphs
@@ -1123,6 +1128,38 @@ def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
             request.py_draft_tokens = request.py_draft_tokens[:draft_len]
 
     return draft_len
+
+
+def disagg_gen_first_draft_tokens(ctx_draft_tokens, spec_config,
+                                  enable_spec_decode: bool,
+                                  max_total_draft_tokens: int):
+    """Draft tokens a generation-only request (received from the context
+    server) verifies on its first step, and whether its draft-probability row
+    must be the one-hot placeholder.
+
+    Without speculative decoding: the context server's tokens (None -> []).
+    Without rejection sampling: those tokens, padded with dummy zeros to
+    ``max_total_draft_tokens`` when the context server drafted fewer (or
+    none); strict acceptance rejects a dummy unless the target samples it.
+    With rejection sampling: always dummy zeros verified against the one-hot
+    row at token 0. No proposal row was written on this server (the prefill
+    and any drafting ran on the context server), and a stale or uninitialized
+    row would accept the dummies or make chain_speculative_sampling emit an
+    out-of-range token id.
+
+    Returns ``(draft_tokens, needs_onehot_draft_probs)``.
+    """
+    if not enable_spec_decode:
+        return ([] if ctx_draft_tokens is None else ctx_draft_tokens), False
+    if getattr(spec_config, "use_rejection_sampling", False):
+        return [0] * max_total_draft_tokens, True
+    if not ctx_draft_tokens:
+        return [0] * max_total_draft_tokens, False
+    if len(ctx_draft_tokens) < max_total_draft_tokens:
+        # A context server with a smaller max_draft_len than this one.
+        return list(ctx_draft_tokens) + [0] * (max_total_draft_tokens -
+                                               len(ctx_draft_tokens)), False
+    return ctx_draft_tokens, False
 
 
 def update_draft_len(model_engine: "ModelEngine",

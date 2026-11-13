@@ -213,6 +213,46 @@ def find_replicated_role_mismatch(
     return sorted((sorted(role), gid) for role, gid in differing if gid in shared)
 
 
+def get_replicated_role_layer_bytes(
+    page_table: KVCachePageTable, kind: CacheKind
+) -> Dict[Tuple[FrozenSet[str], int], int]:
+    """``{(pool_role, global_layer_id): bytes_per_layer}`` of every REPLICATED view of *kind*."""
+    sizes: Dict[Tuple[FrozenSet[str], int], int] = {}
+    for layer_group in page_table.layer_groups:
+        if layer_group.kind != kind:
+            continue
+        for pool_view in layer_group.pool_views:
+            if pool_view.mapper_kind != MapperKind.REPLICATED:
+                continue
+            _, bytes_per_layer = get_layer_byte_ranges(pool_view)
+            for global_layer_id in get_pool_view_global_layer_ids(pool_view, layer_group):
+                sizes[(pool_view.pool_role, global_layer_id)] = bytes_per_layer
+    return sizes
+
+
+def find_replicated_size_mismatch(
+    self_page_table: Optional[KVCachePageTable],
+    peer_page_table: Optional[KVCachePageTable],
+    kind: CacheKind,
+) -> List[Tuple[List[str], int, int, int]]:
+    """Replicated roles both sides declare on a layer but with different bytes per layer.
+
+    A replicated view is copied byte for byte between pools of the same ``tokens_per_block``,
+    so the two sides must store it in the same format (e.g. the same index-key dtype). Returns
+    a sorted list of ``(sorted_role_names, global_layer_id, self_bytes, peer_bytes)``; empty
+    when the two sides agree or either page table is missing.
+    """
+    if self_page_table is None or peer_page_table is None:
+        return []
+    self_sizes = get_replicated_role_layer_bytes(self_page_table, kind)
+    peer_sizes = get_replicated_role_layer_bytes(peer_page_table, kind)
+    return sorted(
+        (sorted(role), gid, self_bytes, peer_sizes[(role, gid)])
+        for (role, gid), self_bytes in self_sizes.items()
+        if (role, gid) in peer_sizes and self_bytes != peer_sizes[(role, gid)]
+    )
+
+
 def get_layer_group_num_layers(layer_group: AttentionLayerGroup) -> int:
     """
     Number of layers in *layer_group*

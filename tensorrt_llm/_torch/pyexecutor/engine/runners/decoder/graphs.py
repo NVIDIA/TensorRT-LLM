@@ -739,6 +739,18 @@ class DecoderCudaGraphs:
                         # Tactics tuned while warming the decode graphs agree across
                         # ranks before the capture pass reads them.
                         AutoTuner.get().post_tune_merge_tactics()
+                    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+                    if (
+                        runtime_hooks_of(self.model).persist_flashinfer_mxfp8_tactics
+                        and is_warmup_only
+                        and flashinfer_methods
+                        and cache_path is not None
+                    ):
+                        # The decode-graph pass tunes after the warmup's autotune() context saved the
+                        # cache: save again so these tactics persist across starts instead of being
+                        # re-profiled on every server start.
+                        autotuner = AutoTuner.get()
+                        autotuner.profiling_cache.save_cache(cache_path, autotuner.mapping.rank)
                     self._capture_additional_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
@@ -1150,6 +1162,10 @@ class DecoderCudaGraphs:
             self.breakable_cuda_graph_runner.clear(
                 release_nccl_window_owners=release_nccl_window_owners
             )
+            # The model's per-graph state (RuntimeHooks.prefill_graphs_released) ends with the graphs.
+            released = runtime_hooks_of(self.model).prefill_graphs_released
+            if released is not None:
+                released(self.model)
 
     def _set_warmup_ragged_windows(self, batch, verify_bucket: int, draft_len: int) -> None:
         """Give a capture batch per-request windows summing to ``verify_bucket``.

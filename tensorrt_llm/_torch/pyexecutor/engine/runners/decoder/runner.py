@@ -222,6 +222,7 @@ class DecoderRunner(ScheduledModelRunner):
                 early_copy=self.runtime_hooks.pack_early_copy,
                 step_epoch=self.runtime_hooks.pack_step_epoch,
                 prologue_op=self.runtime_hooks.pack_prologue_op,
+                cpp_scatter=self.runtime_hooks.pack_cpp_scatter,
             )
             if self.runtime_hooks.pack_step_inputs
             else None

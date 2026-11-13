@@ -15,6 +15,7 @@
 
 import enum
 import os
+import time
 from collections import Counter
 from typing import Callable, Optional
 
@@ -164,6 +165,77 @@ class BudgetTracker:
         self._seen_peft_task_ids.add(lora_task_id)
 
 
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        raise ValueError(f"{name} must be a number of seconds, got {raw!r}") from None
+
+
+class _StoreLeaseTouch:
+    """Keeps the stored prefix of queued first-chunk context requests leased.
+
+    A store such as Mooncake grants a key a read lease when a lookup finds it,
+    and once the pool is full it evicts unleased keys first. A first-chunk
+    request waiting behind long prefills can outlive the lease its ranking
+    probe granted, and then loses its own prefix and recomputes it. Every
+    pass, each waiting request whose last probe is ``interval_s`` old is probed
+    again through the connector's side-effect-free probe, at most
+    ``max_per_pass`` of them, oldest first; a request never probed is first due
+    after ``first_s``. The answers are dropped: ranking, admission and
+    allocation stay as they are, only lookups are added.
+
+    Attention DP only: without it the probe is a leader broadcast, and
+    wall-clock due times could differ across ranks.
+    TLLM_DISABLE_STORE_LEASE_TOUCH=1 turns it off; TLLM_STORE_LEASE_TOUCH_S,
+    TLLM_STORE_LEASE_TOUCH_FIRST_S and TLLM_STORE_LEASE_TOUCH_MAX_PER_PASS set
+    the three limits.
+    """
+
+    LOG_INTERVAL_S = 60.0
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.interval_s = max(_env_seconds("TLLM_STORE_LEASE_TOUCH_S", 20.0), 0.1)
+        self.first_s = min(
+            max(_env_seconds("TLLM_STORE_LEASE_TOUCH_FIRST_S", 1.0), 0.0), self.interval_s
+        )
+        self.max_per_pass = max(int(_env_seconds("TLLM_STORE_LEASE_TOUCH_MAX_PER_PASS", 8)), 1)
+        self.clock = clock
+        # Clock time of each waiting first-chunk request's last probe.
+        self.last: dict[int, float] = {}
+        # Counted over one log interval.
+        self.touches = 0
+        self.shrunk = 0
+        self.lost_tokens = 0
+        self._last_log = clock()
+
+    @staticmethod
+    def engages(connector) -> bool:
+        """Whether *connector* can be touched: it loads, and runs under attention DP."""
+        return (
+            connector is not None
+            and connector.capacity_only is not True
+            and connector.enable_attention_dp is True
+        )
+
+    def note_probe(self, request_id: int) -> None:
+        """A ranking probe just looked this request up, so its leases are fresh."""
+        self.last[request_id] = self.clock()
+
+    def maybe_log(self, now: float) -> None:
+        if now - self._last_log < self.LOG_INTERVAL_S:
+            return
+        if self.touches:
+            logger.info(
+                f"KVCacheV2Scheduler store lease touch: touches={self.touches} "
+                f"prefixes_shrunk={self.shrunk} lost_tokens={self.lost_tokens} "
+                f"in the last {now - self._last_log:.0f} s"
+            )
+        self.touches = self.shrunk = self.lost_tokens = 0
+        self._last_log = now
+
+
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
 
@@ -188,6 +260,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         enable_recompute_pause: bool = True,
         context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
         context_starvation_iterations: Optional[int] = None,
+        enable_context_only_preemption: Optional[bool] = None,
+        preempt_least_prefill_progress: Optional[bool] = None,
     ) -> None:
         self.remote_tail_phase: RemoteTailPhase | None = None
         self._remote_tail_context_ids: frozenset[int] = frozenset()
@@ -213,6 +287,54 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         self.enable_recompute_pause = enable_recompute_pause
+        # Opt-in (default off; None reads TLLM_V2_CTX_PREEMPT_LEAST_PROGRESS=1):
+        # a context request out of pages preempts the eligible request with the
+        # least prefill progress (ties: the newest), so the pass discards the
+        # least finished prefill, instead of the newest eligible request. See
+        # _try_preempt_for_pages.
+        if preempt_least_prefill_progress is None:
+            preempt_least_prefill_progress = (
+                os.environ.get("TLLM_V2_CTX_PREEMPT_LEAST_PROGRESS", "0") == "1"
+            )
+        self._ctx_preempt_least_progress = preempt_least_prefill_progress
+        # Opt-in (default off; None reads TLLM_V2_CTX_ONLY_PREEMPTION=1).
+        # Disaggregated workers turn recompute pause off because a generation
+        # worker cannot replay a prefill it received. A context-only request on a
+        # context worker computed every page it holds, so with this opt-in it
+        # stays a preemption victim there; without it, a context worker whose
+        # pool fills with started prefills can only wait for them or declare a
+        # deadlock. Pipeline parallelism keeps a chunk in its microbatch ring for
+        # more passes than the in-flight window below covers, so it stays off
+        # there.
+        if enable_context_only_preemption is None:
+            enable_context_only_preemption = (
+                os.environ.get("TLLM_V2_CTX_ONLY_PREEMPTION", "0") == "1"
+            )
+        pp_size = getattr(getattr(kv_cache_manager, "mapping", None), "pp_size", 1)
+        self._ctx_only_preempt = (
+            enable_context_only_preemption
+            and not enable_recompute_pause
+            and not (isinstance(pp_size, int) and pp_size > 1)
+        )
+        # Context request ids scheduled in the last two passes. The overlap
+        # executor schedules a pass while the previous pass's batch may still run
+        # on the GPU (a batch that cannot queue under attention DP does not run
+        # at all), so such a request may still have a chunk executing or a
+        # connector save reading its pages. Two passes leave a margin and expire
+        # on their own, so a chunk dropped or shortened after scheduling never
+        # pins a request. Context-only preemption never takes one of them.
+        self._ctx_scheduled_last: frozenset[int] = frozenset()
+        self._ctx_scheduled_prev: frozenset[int] = frozenset()
+        # The last batch known to have launched, and the positions of the last
+        # pass's requests. The executor applies a batch's chunks
+        # (move_to_next_context_chunk) only when it runs it, so a position that
+        # moved since the last pass means that pass's batch launched. Under
+        # attention DP a launched batch stays unprocessed, and may still run,
+        # through passes that launch nothing, which the two-pass window alone
+        # would outlast; it is replaced only when another batch launches, after
+        # the executor has processed it.
+        self._ctx_launched: frozenset[int] = frozenset()
+        self._ctx_scheduled_pos: dict[int, int] = {}
         # Every input to the prefix-aware skip is fixed for this scheduler's
         # lifetime: the knob is a constructor argument, and both manager
         # attributes are assigned once in ``KVCacheManagerV2.__init__``. Resolve
@@ -257,7 +379,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
             f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
             f"prefix_skip_enabled={self._prefix_skip_enabled}, "
-            f"enable_recompute_pause={enable_recompute_pause}"
+            f"enable_recompute_pause={enable_recompute_pause}, "
+            f"ctx_only_preempt={self._ctx_only_preempt}, "
+            f"preempt_least_prefill_progress={self._ctx_preempt_least_progress}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -335,6 +459,22 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._sched_iter = 0
         # Reuse probe results of this scheduling pass, by request id (_uncached_tokens).
         self._reuse_probes: dict[int, Optional[int]] = {}
+        # Shortest-uncached-first also counts the prefix a KV connector can load,
+        # so a request its store holds is not ranked as a cold prompt.
+        # TLLM_CTX_SHORTEST_FIRST_STORE_AWARE=0 ranks on the local cache only.
+        self._ctx_store_aware = (
+            self._ctx_shortest_first
+            and os.environ.get("TLLM_CTX_SHORTEST_FIRST_STORE_AWARE", "1").strip() != "0"
+        )
+        # End of the connector-served prefix of each ranked first-chunk request
+        # (None: nothing to load), by request id. Probed once per request.
+        self._store_probes: dict[int, Optional[int]] = {}
+        # Lease renewal for the stored prefixes of waiting first-chunk requests.
+        self._lease_touch: Optional[_StoreLeaseTouch] = (
+            _StoreLeaseTouch()
+            if os.environ.get("TLLM_DISABLE_STORE_LEASE_TOUCH", "").strip() != "1"
+            else None
+        )
         # In-forward Mamba snapshots (MambaHybridCacheManagerV2): staging rows
         # per batch, and those left in the batch being scheduled.
         self._inforward_snapshot_rows = kv_cache_manager.inforward_snapshot_rows
@@ -422,7 +562,11 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> SchedulerOutput:
         self._sched_iter += 1
         self._reuse_probes.clear()
+        if self._store_probes:
+            self._prune_store_probes(active_requests)
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        if self._ctx_only_preempt:
+            self._track_launched_context(active_requests)
         # Main scheduling loop
         (
             scheduled_encoder,
@@ -433,6 +577,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
+        if self._ctx_only_preempt:
+            self._ctx_scheduled_prev = self._ctx_scheduled_last
+            self._ctx_scheduled_last = frozenset(r.py_request_id for r in scheduled_ctx)
+            self._ctx_scheduled_pos = {
+                r.py_request_id: r.context_current_position for r in scheduled_ctx
+            }
+        if self._lease_touch is not None:
+            self._lease_touch_pass(active_requests, scheduled_ctx)
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -447,6 +599,21 @@ class KVCacheV2Scheduler(RequestScheduler):
             fitting_disagg_gen_init_requests=disagg_candidates,
             num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
+
+    def _track_launched_context(self, active_requests: RequestList) -> None:
+        """Record which of the last pass's context requests may still run (context-only preemption)."""
+        pos = self._ctx_scheduled_pos
+        if not pos:
+            # The last pass scheduled no context work here: its batch was empty,
+            # and the executor processes the previous batch when this rank has
+            # nothing, or held only an attention-DP dummy, which an idle rank gets
+            # so the batch runs. Either way no context chunk is left in flight.
+            self._ctx_launched = frozenset()
+        elif any(
+            r.py_request_id in pos and r.context_current_position != pos[r.py_request_id]
+            for r in active_requests
+        ):
+            self._ctx_launched = frozenset(pos)
 
     def set_remote_tail_phase(
         self,
@@ -797,9 +964,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             pending_ctx, starved_ctx = (
                 sorted(
                     reqs,
-                    key=lambda r: not (
-                        r.state_value == self._context_init_state_value
-                        and self._pregrown_context_tokens(r) > 0
+                    key=lambda r: (
+                        not (
+                            r.state_value == self._context_init_state_value
+                            and self._pregrown_context_tokens(r) > 0
+                        )
                     ),
                 )
                 for reqs in (pending_ctx, starved_ctx)
@@ -854,6 +1023,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
                     continue
                 if req.py_request_id in preempted_ids:
+                    continue
+                # Its host-tier prefix is being copied to the GPU off the
+                # execution stream (KVCacheManagerV2.prefetch_to_gpu); admit it
+                # when the hold ends.
+                hold = getattr(req, "py_kv_gpu_hold", 0)
+                if type(hold) is int and hold > 0:
                     continue
                 remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
                 if defer_remote_tail_context and remote_mode is not None:
@@ -1047,7 +1222,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         A first-chunk request has not claimed its reusable prefix yet, so its
         remaining length still counts it; the prefix is probed once per
-        scheduling pass, without claiming pages.
+        scheduling pass, without claiming pages. With store-aware ranking the
+        prefix a KV connector can load counts too (see _store_prefix_end).
         """
         remaining = req.context_remaining_length
         if not req.is_first_context_chunk:
@@ -1055,9 +1231,105 @@ class KVCacheV2Scheduler(RequestScheduler):
         if req.py_request_id not in self._reuse_probes:
             self._reuse_probes[req.py_request_id] = self.kv_cache_manager.probe_context_reuse(req)
         reusable = self._reuse_probes[req.py_request_id]
+        if self._ctx_store_aware:
+            store_end = self._store_prefix_end(req, reusable)
+            if store_end is not None and (reusable is None or store_end > reusable):
+                reusable = store_end
         if reusable is None:
             return remaining
         return remaining - min(max(reusable - req.context_current_position, 0), remaining)
+
+    def _store_prefix_end(self, req: LlmRequest, local_reusable: Optional[int]) -> Optional[int]:
+        """End of the prompt prefix the KV connector can load for *req*, or None.
+
+        Probed once per request, from the local depth when it is first ranked: the
+        query that loads a prefix runs once per allocation and may start the
+        transfer, so ranking cannot reuse it. Blocks stored later leave the rank
+        conservative, never ahead of what the query will offer.
+        """
+        request_id = req.py_request_id
+        if request_id in self._store_probes:
+            return self._store_probes[request_id]
+        local_end = max(local_reusable or 0, req.context_current_position)
+        offered = self.kv_cache_manager.probe_connector_prefix(req, local_end)
+        if self._lease_touch is not None:
+            self._lease_touch.note_probe(request_id)
+        store_end = min(local_end + offered, req.prompt_len - 1) if offered else None
+        self._store_probes[request_id] = store_end
+        return store_end
+
+    def _lease_touch_pass(self, active_requests: RequestList, scheduled_ctx: RequestList) -> None:
+        """Re-probe the waiting first-chunk context requests whose probe is due.
+
+        See `_StoreLeaseTouch`. Fails open: an error turns the touch off for this
+        scheduler and is logged once.
+        """
+        lease = self._lease_touch
+        manager = self.kv_cache_manager
+        connector = getattr(manager, "kv_connector_manager", None)
+        if not lease.engages(connector):
+            lease.last.clear()
+            return
+        try:
+            now = lease.clock()
+            admitted = {req.py_request_id for req in scheduled_ctx}
+            waiting = []
+            seen = set()
+            for req in active_requests:
+                if (
+                    req.state_value != self._context_init_state_value
+                    or not req.is_first_context_chunk
+                    or req.py_connector_allocation_reported
+                ):
+                    continue
+                request_id = req.py_request_id
+                seen.add(request_id)
+                if request_id in admitted:
+                    # Its own lookup runs at allocation.
+                    continue
+                last = lease.last.get(request_id)
+                if last is None:
+                    # First seen unprobed: due once it has waited first_s.
+                    last = now - lease.interval_s + lease.first_s
+                    lease.last[request_id] = last
+                if now - last >= lease.interval_s:
+                    waiting.append((last, request_id, req))
+            for request_id in [rid for rid in lease.last if rid not in seen]:
+                del lease.last[request_id]
+            waiting.sort(key=lambda item: item[0])
+            for _, request_id, req in waiting[: lease.max_per_pass]:
+                lease.last[request_id] = now
+                local_end = max(
+                    self._reuse_probes.get(request_id) or 0, req.context_current_position
+                )
+                offered = manager.probe_connector_prefix(req, local_end)
+                if offered is None:
+                    continue
+                lease.touches += 1
+                # A stored prefix shorter than the ranking probe saw was lost while queued.
+                ranked_end = self._store_probes.get(request_id)
+                if ranked_end is not None:
+                    now_end = min(local_end + offered, req.prompt_len - 1) if offered else local_end
+                    if now_end < ranked_end:
+                        lease.shrunk += 1
+                        lease.lost_tokens += ranked_end - now_end
+            lease.maybe_log(now)
+        except Exception as error:  # noqa: BLE001 - a lease renewal must never fail scheduling
+            logger.warning(
+                f"KVCacheV2Scheduler store lease touch off after an error: "
+                f"{type(error).__name__}: {error}"
+            )
+            self._lease_touch = None
+
+    def _prune_store_probes(self, active_requests: RequestList) -> None:
+        """Forget the store probe of every request that is no longer ranked."""
+        ranked = {
+            req.py_request_id
+            for req in active_requests
+            if req.state_value == self._context_init_state_value and req.is_first_context_chunk
+        }
+        for request_id in [rid for rid in self._store_probes if rid not in ranked]:
+            del self._store_probes[request_id]
 
     def _order_ctx_shortest_first(self, pending_ctx: RequestList) -> RequestList:
         """Order context requests by uncached prompt tokens, fewest first.
@@ -1297,6 +1569,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         Source reservations advance the prefix before budget checks. Destination
         pages are allocated here; loads are accepted after the final batch trims.
         A loading request remains outside the schedulable state range.
+
+        On a disaggregated server without an eviction tier whose connector
+        declares `requires_completion_reservation`, or whose
+        `kv_cache_config.enable_disagg_completion_reservation` is set, a
+        connector first chunk can be deferred for completion headroom; the
+        rollback below also drops its bound.
         """
         first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
@@ -1421,6 +1699,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
         req.context_chunk_size = context_tokens
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # Admitted requests own the completion headroom. Defer this prompt
+            # instead of preempting one of them to make room for it.
+            logger.debug(
+                "Deferring context request %s: admitted requests hold the completion headroom",
+                req.py_request_id,
+            )
+            return ScheduleAction.SKIP, 0, False
         if not self._try_allocate_context(req, context_tokens + draft_len):
             # Out of pages. Give up one started request so this one can
             # proceed, and retry next iteration: a failed resize leaves a
@@ -1623,6 +1909,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 chunk_tokens += draft_len
                 resize_tokens += draft_len
 
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # As in _try_schedule_context_full: wait for headroom, do not preempt.
+            logger.debug(
+                "Deferring context request %s: admitted requests hold the completion headroom",
+                req.py_request_id,
+            )
+            return ScheduleAction.SKIP, 0, False
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
         if not self._try_allocate_context(req, resize_tokens):
@@ -2214,6 +2507,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         instead would leave the slot owned by SeqSlotManager while
         `py_seq_slot` is None, which asserts on the next schedule.
 
+        The victim is the newest eligible request, so the requests closest to
+        completing keep their pages and the pool drains instead of thrashing.
+        With ``preempt_least_prefill_progress`` it is the eligible request with
+        the least prefill progress (see `_prefill_progress`), the newest of them
+        on a tie, so the pass discards the least finished prefill.
+
         Returns True when pages became available in this iteration.
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
@@ -2230,8 +2529,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 return False
         # A disaggregated generation worker received its context KV rather
-        # than computing it, so it cannot replay a prefill at all.
-        if not self.enable_recompute_pause:
+        # than computing it, so it cannot replay a prefill at all. Without
+        # recompute pause only a context-only request still mid-prefill is a
+        # victim, and only with context-only preemption (see __init__).
+        ctx_only = not self.enable_recompute_pause
+        if ctx_only and not self._ctx_only_preempt:
             return False
 
         # Newest first, so the requests closest to completing keep their
@@ -2247,6 +2549,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             for victim in reversed(requests_list[stop + 1 :])
             if victim.py_request_id not in protected_ids
             and self._is_recompute_pause_candidate(victim, inflight_request_ids)
+            and (not ctx_only or self._is_ctx_only_victim(victim))
         ]
         # An active request holds its pages on GPU, so preempting it always
         # frees GPU memory. A suspended request's pages move to the lower tier
@@ -2260,17 +2563,51 @@ class KVCacheV2Scheduler(RequestScheduler):
         ]
         if active or not self.kv_cache_manager.has_cache_tier_below_gpu:
             candidates = active
-        for victim in candidates:
-            if not self._preempt_or_defer(victim, recompute_paused):
-                return False
-            logger.debug(
-                f"[V2Scheduler] Preempting request {victim.py_request_id} "
-                f"(state={victim.state.name})"
-            )
+        if not candidates:
+            return False
+        victim = candidates[0]
+        if self._ctx_preempt_least_progress:
+            # min() keeps the first of equal values, the newest.
+            victim = min(candidates, key=self._prefill_progress)
+        if not self._preempt_or_defer(victim, recompute_paused):
+            # A connector save parks the victim; it may still be on this pass's
+            # pending context list, and scheduling it there would size a chunk
+            # for a request outside the context phase.
             preempted_ids.add(victim.py_request_id)
-            return True
+            return False
+        logger.debug(
+            f"[V2Scheduler] Preempting request {victim.py_request_id} (state={victim.state.name})"
+        )
+        preempted_ids.add(victim.py_request_id)
+        return True
 
-        return False
+    def _is_ctx_only_victim(self, req: LlmRequest) -> bool:
+        """A context-only request still in its prefill and idle.
+
+        Its own worker computed the pages it holds and can compute them again,
+        none of them is being sent yet (a remote tail request may already be
+        exchanging its prefix, so it is left alone), and no chunk of it is still
+        on the GPU (not scheduled in the last two passes, not in the last batch
+        known to have launched).
+        """
+        rid = req.py_request_id
+        return (
+            getattr(req, "is_context_only_request", False) is True
+            and req.is_context_init_state
+            and getattr(req, "py_csa2_remote_tail_mode", None) is None
+            and rid not in self._ctx_scheduled_last
+            and rid not in self._ctx_scheduled_prev
+            and rid not in self._ctx_launched
+        )
+
+    @staticmethod
+    def _prefill_progress(req: LlmRequest) -> int:
+        """Prompt tokens *req* has computed past the prefix it reused or loaded.
+
+        This is the prefill work a preemption discards; the reused prefix can be
+        matched again on re-admission.
+        """
+        return max(req.context_current_position - req.prepopulated_prompt_len, 0)
 
     # Consecutive scheduling passes that reclaimed nothing before this counts
     # as a deadlock. A stalled pass costs ~2ms, so it trips within seconds,
