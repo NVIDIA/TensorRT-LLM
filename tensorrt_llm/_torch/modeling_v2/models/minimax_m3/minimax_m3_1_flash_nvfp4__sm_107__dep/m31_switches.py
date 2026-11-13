@@ -108,6 +108,8 @@ SWITCHES: Dict[str, str] = {
     "DRAFT_APPEND_FUSE": "the drafter's q / k norm + RoPE without the fused KV append",
     "STRICT_ACCEPT_FUSED": "the stock strict accept (no fused KV rewind)",
     "DRAFT_KV_REWIND_FUSED": "the stock drafter KV rewind",
+    "TOPP_V6": "the top-p renorm's staged summation loop on every device",
+    "DEP_OWNT_FASTPLAN": "OWN-T's main kernel loads the union's block weights (no plan-side derivation)",
 }
 
 

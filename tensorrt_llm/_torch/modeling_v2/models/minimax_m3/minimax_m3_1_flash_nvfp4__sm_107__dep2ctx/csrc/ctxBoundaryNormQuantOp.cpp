@@ -100,6 +100,15 @@ int64_t rowStride(
     return t.stride(0);
 }
 
+//! The launch choice the op arguments carry (CBNQ_P2 / CBNQ_2CTA kill switches and the ring depths).
+void setChoice(tk::CtxBoundaryNormQuantParams& p, bool p2, bool twoCta, int64_t stages, int64_t p2Stages)
+{
+    p.p2 = p2;
+    p.twoCta = twoCta;
+    p.stages = static_cast<int>(stages);
+    p.p2Stages = static_cast<int>(p2Stages);
+}
+
 void launch(char const* op, tk::CtxBoundaryNormQuantParams const& p, bool enablePdl, torch::Tensor const& inter)
 {
     cudaError_t const e
@@ -116,7 +125,8 @@ void launch(char const* op, tk::CtxBoundaryNormQuantParams const& p, bool enable
 //! write_f32 does not need write_norm. inter becomes inter + residual in place.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 minimaxM31CtxBoundaryNormQ(torch::Tensor& inter, torch::Tensor const& residual, torch::Tensor const& weight, double eps,
-    bool writeNorm, bool writeF32, std::optional<torch::Tensor> const& fp4GlobalScale, bool enablePdl)
+    bool writeNorm, bool writeF32, std::optional<torch::Tensor> const& fp4GlobalScale, bool enablePdl, bool p2,
+    bool twoCta, int64_t stages, int64_t p2Stages)
 {
     char const* op = "minimax_m31_ctx_boundary_normq";
     auto const [rows, hidden] = checkInputs(op, inter, residual, weight);
@@ -145,6 +155,7 @@ minimaxM31CtxBoundaryNormQ(torch::Tensor& inter, torch::Tensor const& residual, 
     p.normOut = writeNorm ? reinterpret_cast<__nv_bfloat16*>(normOut.data_ptr()) : nullptr;
     p.qOut = reinterpret_cast<uint64_t*>(qOut.data_ptr());
     p.sfOut = sfOut.data_ptr<uint8_t>();
+    setChoice(p, p2, twoCta, stages, p2Stages);
     p.f32Out = writeF32 ? f32Out.data_ptr<float>() : nullptr;
     if (fp4)
     {
@@ -176,12 +187,14 @@ void minimaxM31CtxBoundaryNormQOut(torch::Tensor& inter, std::optional<torch::Te
     std::optional<torch::Tensor> sfOut, std::optional<torch::Tensor> f32Out,
     std::optional<torch::Tensor> const& fp4GlobalScale, std::optional<torch::Tensor> fp4Out,
     std::optional<torch::Tensor> fp4SfOut, std::optional<torch::Tensor> stageIds,
-    std::optional<torch::Tensor> stageWeights, int64_t stageTopk, bool enablePdl)
+    std::optional<torch::Tensor> stageWeights, int64_t stageTopk, bool enablePdl, bool p2, bool twoCta, int64_t stages,
+    int64_t p2Stages)
 {
     char const* op = "minimax_m31_ctx_boundary_normq_out";
     auto const [rows, hidden] = checkInputs(op, inter, residual, weight);
     at::Device const device = inter.device();
     tk::CtxBoundaryNormQuantParams p;
+    setChoice(p, p2, twoCta, stages, p2Stages);
     p.inter = reinterpret_cast<__nv_bfloat16*>(inter.data_ptr());
     p.weight = reinterpret_cast<__nv_bfloat16 const*>(weight.data_ptr());
     p.rows = static_cast<int>(rows);
@@ -268,7 +281,7 @@ void minimaxM31CtxBoundaryNormQOut(torch::Tensor& inter, std::optional<torch::Te
 //! [rows, 4, hidden] BF16 plane, scores the [rows, 4] FP32 weights; every tensor contiguous and 16-byte aligned.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> minimaxM31CtxBoundaryNormQTopk(torch::Tensor& shared,
     torch::Tensor const& plane, torch::Tensor const& scores, torch::Tensor const& residual, torch::Tensor const& weight,
-    double eps, bool writeNorm, bool enablePdl)
+    double eps, bool writeNorm, bool enablePdl, bool dual)
 {
     char const* op = "minimax_m31_ctx_boundary_normq_topk";
     auto const [rows, hidden] = checkInputs(op, shared, residual, weight);
@@ -298,6 +311,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> minimaxM31CtxBoundaryNor
     p.normOut = writeNorm ? reinterpret_cast<__nv_bfloat16*>(normOut.data_ptr()) : nullptr;
     p.qOut = reinterpret_cast<uint64_t*>(qOut.data_ptr());
     p.sfOut = sfOut.data_ptr<uint8_t>();
+    p.dual = dual;
     p.rows = static_cast<int>(rows);
     p.hidden = static_cast<int>(hidden);
     p.eps = static_cast<float>(eps);
@@ -347,11 +361,12 @@ tk::CtxBoundaryNormQuantParams shapeParams(
 //! (CTAs per SM, grid, dynamic shared memory bytes) the boundary launch would use on rows shaped like inter (rows x
 //! hidden, on its device) with these flags; nothing is launched or read. The UT checks it against the pure-Python
 //! plan (ctx_boundary_plan.py).
-std::tuple<int64_t, int64_t, int64_t> minimaxM31CtxBoundaryNormQShape(
-    torch::Tensor const& inter, bool add, bool writeNorm, bool writeF32, bool fp4)
+std::tuple<int64_t, int64_t, int64_t> minimaxM31CtxBoundaryNormQShape(torch::Tensor const& inter, bool add,
+    bool writeNorm, bool writeF32, bool fp4, bool p2, bool twoCta, int64_t stages, int64_t p2Stages)
 {
     char const* op = "minimax_m31_ctx_boundary_normq_shape";
-    tk::CtxBoundaryNormQuantParams const p = shapeParams(op, inter, add, writeNorm, writeF32, fp4);
+    tk::CtxBoundaryNormQuantParams p = shapeParams(op, inter, add, writeNorm, writeF32, fp4);
+    setChoice(p, p2, twoCta, stages, p2Stages);
     int ctas = 0;
     int grid = 0;
     int smem = 0;
@@ -363,27 +378,28 @@ std::tuple<int64_t, int64_t, int64_t> minimaxM31CtxBoundaryNormQShape(
 
 //! (chunks per thread, CTAs per SM, grid, dynamic shared memory bytes, ring depth) of that launch: chunks 2 is the
 //! CBNQ_P2 kernel (hidden / 16 threads), 1 the hidden / 8-thread kernel. For the UT and the MB receipts.
-std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> minimaxM31CtxBoundaryNormQForm(
-    torch::Tensor const& inter, bool add, bool writeNorm, bool writeF32, bool fp4)
+std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> minimaxM31CtxBoundaryNormQForm(torch::Tensor const& inter,
+    bool add, bool writeNorm, bool writeF32, bool fp4, bool p2, bool twoCta, int64_t stages, int64_t p2Stages)
 {
     char const* op = "minimax_m31_ctx_boundary_normq_form";
-    tk::CtxBoundaryNormQuantParams const p = shapeParams(op, inter, add, writeNorm, writeF32, fp4);
+    tk::CtxBoundaryNormQuantParams p = shapeParams(op, inter, add, writeNorm, writeF32, fp4);
+    setChoice(p, p2, twoCta, stages, p2Stages);
     int chunks = 0;
     int ctas = 0;
     int grid = 0;
     int smem = 0;
-    int stages = 0;
+    int ringStages = 0;
     at::cuda::CUDAGuard const guard(inter.device());
-    cudaError_t const e = tk::ctxBoundaryNormQuantLaunchForm(p, &chunks, &ctas, &grid, &smem, &stages);
+    cudaError_t const e = tk::ctxBoundaryNormQuantLaunchForm(p, &chunks, &ctas, &grid, &smem, &ringStages);
     TORCH_CHECK(e == cudaSuccess, op, ": ", cudaGetErrorString(e));
-    return {chunks, ctas, grid, smem, stages};
+    return {chunks, ctas, grid, smem, ringStages};
 }
 
 //! (dual, CTAs per SM, grid, dynamic shared memory bytes) of the top-k fold's launch on rows shaped like shared (rows
 //! x hidden): dual 1 is the CBNQ_TOPK_DUAL kernel (two row groups per CTA), 0 the one-group fold. Nothing is launched
 //! or read. For the UT and the MB receipts.
 std::tuple<int64_t, int64_t, int64_t, int64_t> minimaxM31CtxBoundaryNormQTopkForm(
-    torch::Tensor const& shared, bool writeNorm)
+    torch::Tensor const& shared, bool writeNorm, bool dual)
 {
     char const* op = "minimax_m31_ctx_boundary_normq_topk_form";
     TORCH_CHECK(shared.is_cuda() && shared.dim() == 2, op, ": a CUDA [rows, hidden]");
@@ -401,14 +417,15 @@ std::tuple<int64_t, int64_t, int64_t, int64_t> minimaxM31CtxBoundaryNormQTopkFor
     p.sfOut = reinterpret_cast<uint8_t*>(dummy);
     p.rows = static_cast<int>(shared.size(0));
     p.hidden = static_cast<int>(shared.size(1));
-    int dual = 0;
+    p.dual = dual;
+    int dualForm = 0;
     int ctas = 0;
     int grid = 0;
     int smem = 0;
     at::cuda::CUDAGuard const guard(shared.device());
-    cudaError_t const e = tk::ctxBoundaryTopkNormQuantLaunchForm(p, &dual, &ctas, &grid, &smem);
+    cudaError_t const e = tk::ctxBoundaryTopkNormQuantLaunchForm(p, &dualForm, &ctas, &grid, &smem);
     TORCH_CHECK(e == cudaSuccess, op, ": ", cudaGetErrorString(e));
-    return {dual, ctas, grid, smem};
+    return {dualForm, ctas, grid, smem};
 }
 
 } // namespace torch_ext
@@ -419,23 +436,31 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "minimax_m31_ctx_boundary_normq(Tensor(a!) inter, Tensor residual, Tensor weight, float eps, bool write_norm, "
-        "bool write_f32=False, Tensor? fp4_global_scale=None, bool enable_pdl=False) -> (Tensor, Tensor, Tensor, "
+        "bool write_f32=False, Tensor? fp4_global_scale=None, bool enable_pdl=False, bool p2=True, bool two_cta=True, "
+        "int stages=3, int p2_stages=3) -> (Tensor, Tensor, "
+        "Tensor, "
         "Tensor, Tensor, Tensor)");
     m.def(
         "minimax_m31_ctx_boundary_normq_out(Tensor(a!) inter, Tensor? residual, Tensor weight, float eps, "
         "Tensor(b!)? norm_out, Tensor(c!)? q_out, Tensor(d!)? sf_out, Tensor(e!)? f32_out=None, "
         "Tensor? fp4_global_scale=None, Tensor(f!)? fp4_out=None, Tensor(g!)? fp4_sf_out=None, "
-        "Tensor(h!)? stage_ids=None, Tensor(i!)? stage_weights=None, int stage_topk=0, bool enable_pdl=False) -> ()");
+        "Tensor(h!)? stage_ids=None, Tensor(i!)? stage_weights=None, int stage_topk=0, bool enable_pdl=False, "
+        "bool p2=True, bool two_cta=True, int stages=3, int p2_stages=3) -> ()");
     m.def(
-        "minimax_m31_ctx_boundary_normq_shape(Tensor inter, bool add, bool write_norm, bool write_f32, bool fp4) -> "
+        "minimax_m31_ctx_boundary_normq_shape(Tensor inter, bool add, bool write_norm, bool write_f32, bool fp4, "
+        "bool p2=True, bool two_cta=True, int stages=3, int p2_stages=3) -> "
         "(int, int, int)");
     m.def(
         "minimax_m31_ctx_boundary_normq_topk(Tensor(a!) shared, Tensor plane, Tensor scores, Tensor residual, "
-        "Tensor weight, float eps, bool write_norm, bool enable_pdl=False) -> (Tensor, Tensor, Tensor)");
+        "Tensor weight, float eps, bool write_norm, bool enable_pdl=False, bool dual=True) -> (Tensor, Tensor, "
+        "Tensor)");
     m.def(
-        "minimax_m31_ctx_boundary_normq_form(Tensor inter, bool add, bool write_norm, bool write_f32, bool fp4) -> "
+        "minimax_m31_ctx_boundary_normq_form(Tensor inter, bool add, bool write_norm, bool write_f32, bool fp4, "
+        "bool p2=True, bool two_cta=True, int stages=3, int p2_stages=3) -> "
         "(int, int, int, int, int)");
-    m.def("minimax_m31_ctx_boundary_normq_topk_form(Tensor shared, bool write_norm) -> (int, int, int, int)");
+    m.def(
+        "minimax_m31_ctx_boundary_normq_topk_form(Tensor shared, bool write_norm, bool dual=True) -> (int, int, int, "
+        "int)");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

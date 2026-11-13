@@ -57,11 +57,13 @@ namespace minimaxM31
 //! keepAllGe1: rows with top_p >= 1 keep every element (the keep-all rule). False runs FlashInfer's radix passes and
 //! threshold on those rows too, so every row is bitwise FlashInfer's deterministic output (which drops tail buckets on
 //! some top_p = 1 rows).
+//! chainPrefetch (TOPP_V6, default on): on sm_107 each chain loads its own values straight from global memory (the same
+//! adds in the same order); false (the TOPP_V6 kill switch) runs the staged loop on every device.
 //! Workspace: toppRenormDetV3WorkspaceBytesPerRow() x rows bytes, ZERO-initialized once before the first launch,
 //! then reused as is (CUDA-graph safe) by any mix of the flags. Launches sharing one workspace must be stream-ordered.
 cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* topP, int rows, int d, int ctasPerRow,
     void* workspace, int* keptOut, bool pdl, bool candidateList, bool listPath, bool wideHist, bool keepAllGe1,
-    cudaStream_t stream);
+    cudaStream_t stream, bool chainPrefetch = true);
 
 //! FOLD_F1: a second destination of the output rows (the spec sampler's per-slot draft-prob rows). Every store of row
 //! r's output is repeated, with the same value, at dst + slotIds[r / k] * slotStride + (r % k) * rowStride (elements;
@@ -78,7 +80,7 @@ struct ToppRowStore
 //! invokeToppRenormDetV3 that also writes every output row to `rowStore`'s destination row.
 cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* topP, int rows, int d, int ctasPerRow,
     void* workspace, int* keptOut, bool pdl, bool candidateList, bool listPath, bool wideHist, cudaStream_t stream,
-    ToppRowStore const& rowStore);
+    ToppRowStore const& rowStore, bool chainPrefetch = true);
 
 //! Workspace bytes per row of invokeToppRenormDetV3.
 size_t toppRenormDetV3WorkspaceBytesPerRow();

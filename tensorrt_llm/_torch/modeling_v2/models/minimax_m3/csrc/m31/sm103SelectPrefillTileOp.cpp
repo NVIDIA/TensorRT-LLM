@@ -38,7 +38,7 @@ namespace torch_ext
 //! @param out Int32 CUDA tensor of logical shape [total_q, num_kv_heads, 16] with unit stride in the last dim (a
 //! head-major backing is a permuted view). Every entry is written.
 void minimaxM31SelectPrefillTile(torch::Tensor const& scores, torch::Tensor const& nValidBlocks, torch::Tensor& out,
-    int64_t initBlocks, int64_t localBlocks)
+    int64_t initBlocks, int64_t localBlocks, bool narrow)
 {
     TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == torch::kFloat32 && scores.dim() == 3,
         "minimax_m31_select_prefill_tile: scores must be a 3-D float32 CUDA tensor [num_kv_heads, num_blocks, "
@@ -61,11 +61,11 @@ void minimaxM31SelectPrefillTile(torch::Tensor const& scores, torch::Tensor cons
 
     c10::cuda::CUDAGuard const deviceGuard{scores.device()};
     auto const stream = at::cuda::getCurrentCUDAStream(scores.get_device());
-    cudaError_t const err
-        = TRTLLM_MV2_NS::kernels::minimaxM31Sm103::invokeMinimaxM3SelectPrefillTile(scores.data_ptr<float>(),
-            scores.stride(0), scores.stride(1), nValidBlocks.data_ptr<int32_t>(), out.data_ptr<int32_t>(),
-            out.stride(0), out.stride(1), static_cast<int32_t>(numKvHeads), static_cast<int32_t>(numBlocks),
-            static_cast<int32_t>(totalQ), static_cast<int32_t>(initBlocks), static_cast<int32_t>(localBlocks), stream);
+    cudaError_t const err = TRTLLM_MV2_NS::kernels::minimaxM31Sm103::invokeMinimaxM3SelectPrefillTile(
+        scores.data_ptr<float>(), scores.stride(0), scores.stride(1), nValidBlocks.data_ptr<int32_t>(),
+        out.data_ptr<int32_t>(), out.stride(0), out.stride(1), static_cast<int32_t>(numKvHeads),
+        static_cast<int32_t>(numBlocks), static_cast<int32_t>(totalQ), static_cast<int32_t>(initBlocks),
+        static_cast<int32_t>(localBlocks), stream, narrow);
     if (err != cudaSuccess)
     {
         cudaGetLastError();
@@ -81,7 +81,7 @@ void minimaxM31SelectPrefillTile(torch::Tensor const& scores, torch::Tensor cons
 //! @param nValidBlocks Contiguous int32 CUDA tensor with at least total_q elements.
 //! @param out As minimax_m31_select_prefill_tile. The table equals that op's on the same values bit for bit.
 void minimaxM31SelectPrefillTileRows(torch::Tensor const& scores, torch::Tensor const& nValidBlocks, torch::Tensor& out,
-    int64_t initBlocks, int64_t localBlocks)
+    int64_t initBlocks, int64_t localBlocks, bool narrow)
 {
     TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == torch::kFloat32 && scores.dim() == 3,
         "minimax_m31_select_prefill_tile_rows: scores must be a 3-D float32 CUDA tensor [num_kv_heads, num_blocks, "
@@ -107,11 +107,11 @@ void minimaxM31SelectPrefillTileRows(torch::Tensor const& scores, torch::Tensor 
 
     c10::cuda::CUDAGuard const deviceGuard{scores.device()};
     auto const stream = at::cuda::getCurrentCUDAStream(scores.get_device());
-    cudaError_t const err
-        = TRTLLM_MV2_NS::kernels::minimaxM31Sm103::invokeMinimaxM3SelectPrefillTileRows(scores.data_ptr<float>(),
-            scores.stride(0), scores.stride(2), nValidBlocks.data_ptr<int32_t>(), out.data_ptr<int32_t>(),
-            out.stride(0), out.stride(1), static_cast<int32_t>(numKvHeads), static_cast<int32_t>(numBlocks),
-            static_cast<int32_t>(totalQ), static_cast<int32_t>(initBlocks), static_cast<int32_t>(localBlocks), stream);
+    cudaError_t const err = TRTLLM_MV2_NS::kernels::minimaxM31Sm103::invokeMinimaxM3SelectPrefillTileRows(
+        scores.data_ptr<float>(), scores.stride(0), scores.stride(2), nValidBlocks.data_ptr<int32_t>(),
+        out.data_ptr<int32_t>(), out.stride(0), out.stride(1), static_cast<int32_t>(numKvHeads),
+        static_cast<int32_t>(numBlocks), static_cast<int32_t>(totalQ), static_cast<int32_t>(initBlocks),
+        static_cast<int32_t>(localBlocks), stream, narrow);
     if (err != cudaSuccess)
     {
         cudaGetLastError();
@@ -127,10 +127,10 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "minimax_m31_select_prefill_tile(Tensor scores, Tensor n_valid_blocks, Tensor(a!) out, int init_blocks, "
-        "int local_blocks) -> ()");
+        "int local_blocks, bool narrow=True) -> ()");
     m.def(
         "minimax_m31_select_prefill_tile_rows(Tensor scores, Tensor n_valid_blocks, Tensor(a!) out, int init_blocks, "
-        "int local_blocks) -> ()");
+        "int local_blocks, bool narrow=True) -> ()");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

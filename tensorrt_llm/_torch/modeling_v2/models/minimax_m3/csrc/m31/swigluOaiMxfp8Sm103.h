@@ -42,9 +42,10 @@ namespace minimaxM31
 //! min(pad128(rows), resident CTAs x SMs) with the resident CTAs from the occupancy API, where the one-row launch
 //! assumes 2048 threads per SM (sm_107 holds 1024, so two 384-thread CTAs at d 3072, not five). Only the row-to-CTA map
 //! changes: every output byte is the one-row kernel's. An occupancy query that fails or finds no resident CTA keeps
-//! the one-row launch.
+//! the one-row launch. rowsForm = false (the SWIGLU_MXFP8_ROWS kill switch) keeps the one-row launch at every row
+//! count; kRows picks the rows in flight per CTA (2, 4 or 8; other values: 4).
 cudaError_t invokeSwigluOaiMxfp8(uint4 const* x, uint64_t* qOut, uint32_t* sfOut, uint4* hOut, int64_t rows, int64_t d,
-    int multiProcessorCount, bool pdl, cudaStream_t stream);
+    int multiProcessorCount, bool pdl, cudaStream_t stream, bool rowsForm = true, int kRows = 4);
 
 } // namespace minimaxM31
 } // namespace kernels

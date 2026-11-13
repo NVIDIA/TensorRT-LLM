@@ -328,8 +328,8 @@ def _routes(monkeypatch, rows_op=True):
     calls = []
 
     def op(name):
-        def run(scores, nvb, out, init, local):
-            calls.append((name, scores.stride()))
+        def run(scores, nvb, out, init, local, narrow=True):
+            calls.append((name, scores.stride(), narrow))
             out.fill_(0)
 
         return run
@@ -354,6 +354,8 @@ def test_tsel_routes_by_layout(monkeypatch) -> None:
     assert tile_select.select_rows(head_major, nvb, 0, 1) is None
     assert tile_select.select_rows(neither, nvb, 0, 1) is None
     assert [c[0] for c in calls] == ["tile", "rows"] and calls[1][1] == (40, 1, 160)
+    # Both pass the TSEL_NARROW switch as the op's narrow argument.
+    assert [c[2] for c in calls] == [tile_select.TSEL_NARROW] * 2
     # The unchanged gates on both: too few rows, too many blocks, not fp32.
     for fn, few, many, half in (
         (tile_select.select, torch.randn(4, 40, 255), torch.randn(4, 5857, 300), head_major.half()),

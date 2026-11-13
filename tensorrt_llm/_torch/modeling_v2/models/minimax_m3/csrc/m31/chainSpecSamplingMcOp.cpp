@@ -40,7 +40,7 @@ namespace torch_ext
 static std::tuple<torch::Tensor, torch::Tensor> chainSpecMcImpl(torch::Tensor const& draftProbs,
     torch::Tensor const& draftTokenIds, torch::Tensor const& targetProbs, torch::Tensor const& seed,
     torch::Tensor const& offset, torch::Tensor& workspace, int64_t ctasPerRow,
-    TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow const& rng)
+    TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow const& rng, bool v3)
 {
     TORCH_CHECK(draftProbs.dim() == 3,
         "minimax_m31_chain_speculative_sampling_mc: draft_probs must be [batch, "
@@ -113,7 +113,7 @@ static std::tuple<torch::Tensor, torch::Tensor> chainSpecMcImpl(torch::Tensor co
     params.vocabSize = static_cast<int32_t>(vocabSize);
     auto const err = TRTLLM_MV2_NS::kernels::minimaxM31::invokeChainSpecSamplingMc(params, static_cast<int>(ctasPerRow),
         workspace.data_ptr(), at::cuda::getCurrentCUDAStream(draftProbs.get_device()),
-        TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcDraftRows{}, rng);
+        TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcDraftRows{}, rng, v3);
     TORCH_CHECK(
         err == cudaSuccess, "minimax_m31_chain_speculative_sampling_mc launch failed: ", cudaGetErrorString(err));
     return {outputTokenIds, outputNumTokens};
@@ -121,10 +121,10 @@ static std::tuple<torch::Tensor, torch::Tensor> chainSpecMcImpl(torch::Tensor co
 
 std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMc(torch::Tensor const& draftProbs,
     torch::Tensor const& draftTokenIds, torch::Tensor const& targetProbs, torch::Tensor const& seed,
-    torch::Tensor const& offset, torch::Tensor& workspace, int64_t ctasPerRow)
+    torch::Tensor const& offset, torch::Tensor& workspace, int64_t ctasPerRow, bool v3)
 {
     return chainSpecMcImpl(draftProbs, draftTokenIds, targetProbs, seed, offset, workspace, ctasPerRow,
-        TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow{});
+        TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow{}, v3);
 }
 
 //! minimax_m31_chain_speculative_sampling_mc with slot-indexed draft rows (VR REJ_SLOTS): the draft distributions are
@@ -135,7 +135,7 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMc(torch::Te
 static std::tuple<torch::Tensor, torch::Tensor> chainSpecMcSlotsImpl(torch::Tensor const& draftBuf,
     torch::Tensor const& slotIds, int64_t numDraft, torch::Tensor const& draftTokenIds,
     torch::Tensor const& targetProbs, torch::Tensor const& seed, torch::Tensor const& offset, torch::Tensor& workspace,
-    int64_t ctasPerRow, TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow const& rng)
+    int64_t ctasPerRow, TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow const& rng, bool v3)
 {
     TORCH_CHECK(draftBuf.dim() == 3 && draftBuf.is_cuda() && draftBuf.is_contiguous()
             && draftBuf.scalar_type() == torch::kFloat32,
@@ -206,7 +206,7 @@ static std::tuple<torch::Tensor, torch::Tensor> chainSpecMcSlotsImpl(torch::Tens
     rows.rowStride = draftBuf.stride(0);
     rows.posStride = draftBuf.stride(1);
     auto const err = TRTLLM_MV2_NS::kernels::minimaxM31::invokeChainSpecSamplingMc(params, static_cast<int>(ctasPerRow),
-        workspace.data_ptr(), at::cuda::getCurrentCUDAStream(draftBuf.get_device()), rows, rng);
+        workspace.data_ptr(), at::cuda::getCurrentCUDAStream(draftBuf.get_device()), rows, rng, v3);
     TORCH_CHECK(
         err == cudaSuccess, "minimax_m31_chain_speculative_sampling_mc_slots launch failed: ", cudaGetErrorString(err));
     return {outputTokenIds, outputNumTokens};
@@ -215,10 +215,10 @@ static std::tuple<torch::Tensor, torch::Tensor> chainSpecMcSlotsImpl(torch::Tens
 std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMcSlots(torch::Tensor const& draftBuf,
     torch::Tensor const& slotIds, int64_t numDraft, torch::Tensor const& draftTokenIds,
     torch::Tensor const& targetProbs, torch::Tensor const& seed, torch::Tensor const& offset, torch::Tensor& workspace,
-    int64_t ctasPerRow)
+    int64_t ctasPerRow, bool v3)
 {
     return chainSpecMcSlotsImpl(draftBuf, slotIds, numDraft, draftTokenIds, targetProbs, seed, offset, workspace,
-        ctasPerRow, TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow{});
+        ctasPerRow, TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow{}, v3);
 }
 
 //! FOLD_F3: the Philox window operands. Request r's offset is base[base_row + r] + add (mod 2^64; `offset` is not
@@ -254,20 +254,20 @@ static TRTLLM_MV2_NS::kernels::minimaxM31::ChainSpecMcRngWindow rngWindow(
 std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMcWin(torch::Tensor const& draftProbs,
     torch::Tensor const& draftTokenIds, torch::Tensor const& targetProbs, torch::Tensor const& seed,
     torch::Tensor const& offset, torch::Tensor& workspace, int64_t ctasPerRow, torch::Tensor const& base, int64_t add,
-    torch::Tensor& window, int64_t baseRow)
+    torch::Tensor& window, int64_t baseRow, bool v3)
 {
     auto const rng = rngWindow(base, add, window, baseRow, draftProbs.size(0), draftProbs.device());
-    return chainSpecMcImpl(draftProbs, draftTokenIds, targetProbs, seed, offset, workspace, ctasPerRow, rng);
+    return chainSpecMcImpl(draftProbs, draftTokenIds, targetProbs, seed, offset, workspace, ctasPerRow, rng, v3);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMcSlotsWin(torch::Tensor const& draftBuf,
     torch::Tensor const& slotIds, int64_t numDraft, torch::Tensor const& draftTokenIds,
     torch::Tensor const& targetProbs, torch::Tensor const& seed, torch::Tensor const& offset, torch::Tensor& workspace,
-    int64_t ctasPerRow, torch::Tensor const& base, int64_t add, torch::Tensor& window, int64_t baseRow)
+    int64_t ctasPerRow, torch::Tensor const& base, int64_t add, torch::Tensor& window, int64_t baseRow, bool v3)
 {
     auto const rng = rngWindow(base, add, window, baseRow, slotIds.size(0), draftBuf.device());
     return chainSpecMcSlotsImpl(
-        draftBuf, slotIds, numDraft, draftTokenIds, targetProbs, seed, offset, workspace, ctasPerRow, rng);
+        draftBuf, slotIds, numDraft, draftTokenIds, targetProbs, seed, offset, workspace, ctasPerRow, rng, v3);
 }
 
 //! Workspace bytes per request of minimax_m31_chain_speculative_sampling_mc.
@@ -277,9 +277,9 @@ int64_t minimaxM31ChainSpecSamplingMcWsBytes()
 }
 
 //! The kernel minimax_m31_chain_speculative_sampling_mc launches on the current device: 3 (REJ v3, sm_107) or 2.
-int64_t minimaxM31ChainSpecSamplingMcVersion()
+int64_t minimaxM31ChainSpecSamplingMcVersion(bool v3)
 {
-    return static_cast<int64_t>(TRTLLM_MV2_NS::kernels::minimaxM31::chainSpecSamplingMcKernelVersion());
+    return static_cast<int64_t>(TRTLLM_MV2_NS::kernels::minimaxM31::chainSpecSamplingMcKernelVersion(v3));
 }
 
 namespace
@@ -426,22 +426,22 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "minimax_m31_chain_speculative_sampling_mc(Tensor draft_probs, Tensor draft_token_ids, Tensor target_probs, "
-        "Tensor seed, Tensor offset, Tensor(a!) workspace, int ctas_per_row) -> (Tensor, Tensor)");
+        "Tensor seed, Tensor offset, Tensor(a!) workspace, int ctas_per_row, bool v3=True) -> (Tensor, Tensor)");
     m.def(
         "minimax_m31_chain_speculative_sampling_mc_slots(Tensor draft_buf, Tensor slot_ids, int num_draft, "
         "Tensor draft_token_ids, Tensor target_probs, Tensor seed, Tensor offset, Tensor(a!) workspace, "
-        "int ctas_per_row) -> (Tensor, Tensor)");
+        "int ctas_per_row, bool v3=True) -> (Tensor, Tensor)");
     m.def(
         "minimax_m31_chain_speculative_sampling_mc_win(Tensor draft_probs, Tensor draft_token_ids, "
         "Tensor target_probs, Tensor seed, Tensor offset, Tensor(a!) workspace, int ctas_per_row, Tensor base, "
-        "int add, Tensor(b!) window, int base_row) -> (Tensor, Tensor)");
+        "int add, Tensor(b!) window, int base_row, bool v3=True) -> (Tensor, Tensor)");
     m.def(
         "minimax_m31_chain_speculative_sampling_mc_slots_win(Tensor draft_buf, Tensor slot_ids, int num_draft, "
         "Tensor draft_token_ids, Tensor target_probs, Tensor seed, Tensor offset, Tensor(a!) workspace, "
-        "int ctas_per_row, Tensor base, int add, Tensor(b!) window, int base_row) -> (Tensor, Tensor)");
+        "int ctas_per_row, Tensor base, int add, Tensor(b!) window, int base_row, bool v3=True) -> (Tensor, Tensor)");
     // No tensor arguments: a catch-all kernel (as moe_a2a_get_timeout), callable without a device.
     m.def("minimax_m31_chain_speculative_sampling_mc_ws_bytes() -> int");
-    m.def("minimax_m31_chain_speculative_sampling_mc_version() -> int");
+    m.def("minimax_m31_chain_speculative_sampling_mc_version(bool v3=True) -> int");
     m.def(
         "minimax_m31_chain_speculative_sampling_mc_fi(Tensor draft_probs, Tensor draft_token_ids, Tensor "
         "target_probs, Tensor seed, Tensor offset, Tensor(a!) workspace, int ctas_per_row) -> (Tensor, Tensor)");

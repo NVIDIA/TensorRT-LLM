@@ -1771,6 +1771,12 @@ _CTXNORMQ_FP4 = m3_prequant.PrequantSlot()
 _CTXNORMQ_STATE = {}
 
 
+# CTXNORM_LB2: the CTX residual add + RMSNorm + MXFP8 kernel launches at two CTAs per SM (a two-CTA launch bound) where
+# hidden / 8 <= 768, the same outputs bit for bit. Default ON; kill switch TRTLLM_M31_DISABLE_CTXNORM_LB2=1 (one CTA per
+# SM), passed to the op as its lb2 argument.
+_CTXNORM_LB2 = not m31_disabled("CTXNORM_LB2")
+
+
 def _ctxnormq_op():
     """The op for the CTXNORMQ prefill boundary, or None: ``mv2_minimax_m3::minimax_m31_ctx_residual_rmsnorm_mxfp8`` is
     built for SM103 only and refuses this device, so the boundary keeps the fused all-reduce. Decided once per
@@ -1795,7 +1801,14 @@ def _ctxnormq_allreduce_norm(core, x, residual, norm_w, fp4_scale):
         return None
     reduced = m3_allreduce(x, core.allreduce, None)
     normed, xq, xsf, xfp4, xfp4_sf = op(
-        reduced, residual.contiguous(), norm_w, core.rms_eps, True, fp4_scale, get_env_enable_pdl()
+        reduced,
+        residual.contiguous(),
+        norm_w,
+        core.rms_eps,
+        True,
+        fp4_scale,
+        get_env_enable_pdl(),
+        lb2=_CTXNORM_LB2,
     )
     _CTXNORMQ_MX.publish(normed, xq, xsf)
     if fp4_scale is not None:

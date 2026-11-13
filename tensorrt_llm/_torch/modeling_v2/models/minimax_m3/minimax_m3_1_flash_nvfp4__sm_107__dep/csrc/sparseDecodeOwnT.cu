@@ -1632,10 +1632,11 @@ __global__ void __launch_bounds__(256, 2) own_t_merge_wide(Params const p, Ws co
 }
 
 // DEP_OWNT_FASTPLAN: the main kernel's plan derives the union's block weights (kFastPlan) when they are fixed
-// (kFixedBlockWeights); weights that are not fixed are loaded. Both give the same split, bitwise.
-bool fastPlan()
+// (kFixedBlockWeights) and the caller allows it; otherwise (the kill switch, or weights that are not fixed) they are
+// loaded. Both give the same split, bitwise.
+bool fastPlan(bool allowed)
 {
-    return kFixedBlockWeights;
+    return kFixedBlockWeights && allowed;
 }
 
 // The main kernel's instances: [fast plan][plan chunks]. Without fixed block weights the fast entries are the loading
@@ -1678,7 +1679,7 @@ cudaError_t minimaxM3Sm107SparseDecodeOwnTConfigure()
 }
 
 cudaError_t invokeMinimaxM3Sm107SparseDecodeOwnT(MinimaxM3Sm107SparseDecodeOwnTParams const& params, void* workspace,
-    size_t workspaceBytes, int32_t grid, bool usePdl, cudaStream_t stream)
+    size_t workspaceBytes, int32_t grid, bool usePdl, cudaStream_t stream, bool allowFastPlan)
 {
     int const items = params.num_requests * params.num_kv_heads;
     if (items <= 0 || items > kMaxItems || params.dql != kRows || grid <= 0)
@@ -1714,7 +1715,7 @@ cudaError_t invokeMinimaxM3Sm107SparseDecodeOwnT(MinimaxM3Sm107SparseDecodeOwnTP
     cfg.gridDim = dim3(grid);
     cfg.blockDim = dim3(kThreads);
     cfg.dynamicSmemBytes = kSmemBytes;
-    MainKernel const mainKernel = kMainKernels[fastPlan() ? 1 : 0][items <= kSmallPlanPer * 32 ? 0 : 1];
+    MainKernel const mainKernel = kMainKernels[fastPlan(allowFastPlan) ? 1 : 0][items <= kSmallPlanPer * 32 ? 0 : 1];
     err = cudaLaunchKernelEx(&cfg, mainKernel, params, ws, items);
     if (err != cudaSuccess)
     {

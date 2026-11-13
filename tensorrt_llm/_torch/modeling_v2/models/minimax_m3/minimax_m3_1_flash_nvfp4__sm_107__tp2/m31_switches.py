@@ -210,6 +210,10 @@ ITEMS: Dict[str, str] = {
     "WC_MOE_ENGINE": "the m3_moe engine at 8 rows",
     "WHOLECHAIN": "every part of the 8-row MoE engine chain (WC_MOE_ENGINE, TP2_DIE_LOCAL, WC_EARLY_TRIG)",
     "X1": "the routed experts' own quantize of the router's input",
+    "CTXNORM_LB2": "the CTX norm + MXFP8 boundary kernel at one CTA per SM",
+    "TSEL_NARROW": "the prefill tile select's tile kernel for every tile (no narrow-row kernel)",
+    "REJ_V3": "the rejection sampler's v2 kernel on every device",
+    "TOPP_V6": "the top-p renorm's staged summation loop on every device",
 }
 
 

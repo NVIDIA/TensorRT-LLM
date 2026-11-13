@@ -53,6 +53,9 @@ SWITCHES: Dict[str, str] = {
     "TP2CTX_SWIGLU_NOH": "the SwiGLU's bf16 activation always written",
     "TP2CTX_TSEL": "the built-in prefill top-16 block select",
     "TP2CTX_UNPERMUTE_ADD": "the separate shared-expert add after the unpermute",
+    "CTXNORM_LB2": "the CTX norm + MXFP8 boundary kernel at one CTA per SM",
+    "SWIGLU_MXFP8_ROWS": "the SwiGLU + MXFP8 op's one-row launch at every row count",
+    "TSEL_NARROW": "the prefill tile select's tile kernel for every tile (no narrow-row kernel)",
 }
 
 

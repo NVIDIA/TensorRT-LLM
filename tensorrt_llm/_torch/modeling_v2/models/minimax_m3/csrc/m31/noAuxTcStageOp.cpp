@@ -71,7 +71,8 @@ tk::NoAuxTcFp4QuantStage makeNoAuxTcFp4QuantStage(th::Tensor& topkIndices, th::T
 void noaux_tc_fp4_quantize_stage_out(th::Tensor const& scores, th::Tensor const& bias, th::Tensor const& hiddenStates,
     th::Tensor const& globalScale, int64_t topk, double routed_scaling_factor, int64_t rows0, th::Tensor& topkIndices0,
     th::Tensor& topkWeights0, th::Tensor& fp4Out0, th::Tensor& sfOut0, th::Tensor& topkIndices1,
-    th::Tensor& topkWeights1, th::Tensor& fp4Out1, th::Tensor& sfOut1, std::optional<th::Tensor> const& padMask)
+    th::Tensor& topkWeights1, th::Tensor& fp4Out1, th::Tensor& sfOut1, std::optional<th::Tensor> const& padMask,
+    bool fp32Weight)
 {
     int const smVersion = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(smVersion >= 100 && smVersion < 110, "noaux_tc_fp4_quantize_stage_out requires an SM10x architecture");
@@ -113,7 +114,7 @@ void noaux_tc_fp4_quantize_stage_out(th::Tensor const& scores, th::Tensor const&
         reinterpret_cast<float const*>(bias.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(hiddenStates.data_ptr()),
         reinterpret_cast<float const*>(globalScale.data_ptr()), padMaskPtr, stage0, stage1, numTokens, numExperts, topk,
-        hiddenSize, routed_scaling_factor, stream);
+        hiddenSize, routed_scaling_factor, stream, fp32Weight);
 }
 
 // The ids and weights noaux_tc_fp4_quantize_stage_out writes into a single stage (rows0 = M), in one launch without
@@ -121,7 +122,7 @@ void noaux_tc_fp4_quantize_stage_out(th::Tensor const& scores, th::Tensor const&
 // the weights past M through topk_weights' first dimension 0, as do those of every token with a nonzero pad_mask[t].
 void noaux_tc_route_stage_out(th::Tensor const& scores, th::Tensor const& bias, int64_t topk,
     double routed_scaling_factor, th::Tensor& topkIndices, th::Tensor& topkWeights,
-    std::optional<th::Tensor> const& padMask)
+    std::optional<th::Tensor> const& padMask, bool fp32Weight)
 {
     int const smVersion = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(smVersion >= 100 && smVersion < 110, "noaux_tc_route_stage_out requires an SM10x architecture");
@@ -161,7 +162,7 @@ void noaux_tc_route_stage_out(th::Tensor const& scores, th::Tensor const& bias, 
     auto stream = at::cuda::getCurrentCUDAStream(device);
     tk::invokeNoAuxTcRouteStage(reinterpret_cast<float const*>(scores.data_ptr()),
         reinterpret_cast<float const*>(bias.data_ptr()), padMaskPtr, stage, numExperts, topk, routed_scaling_factor,
-        stream);
+        stream, fp32Weight);
 }
 } // namespace torch_ext
 
@@ -173,10 +174,10 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "noaux_tc_fp4_quantize_stage_out(Tensor scores, Tensor bias, Tensor hidden_states, Tensor global_scale, int "
         "topk, float routed_scaling_factor, int rows0, Tensor(a!) topk_indices0, Tensor(b!) topk_weights0, Tensor(c!) "
         "fp4_out0, Tensor(d!) sf_out0, Tensor(e!) topk_indices1, Tensor(f!) topk_weights1, Tensor(g!) fp4_out1, "
-        "Tensor(h!) sf_out1, Tensor? pad_mask=None) -> ()");
+        "Tensor(h!) sf_out1, Tensor? pad_mask=None, bool fp32_weight=True) -> ()");
     m.def(
         "noaux_tc_route_stage_out(Tensor scores, Tensor bias, int topk, float routed_scaling_factor, Tensor(a!) "
-        "topk_indices, Tensor(b!) topk_weights, Tensor? pad_mask=None) -> ()");
+        "topk_indices, Tensor(b!) topk_weights, Tensor? pad_mask=None, bool fp32_weight=True) -> ()");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

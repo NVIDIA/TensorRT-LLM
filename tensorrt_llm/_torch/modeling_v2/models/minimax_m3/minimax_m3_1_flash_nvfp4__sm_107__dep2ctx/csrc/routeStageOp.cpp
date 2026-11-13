@@ -33,11 +33,12 @@ namespace torch_ext
 //! minimax_m31_ctx_boundary_normq_out), from the stock router's logits (fp32 [M, E], unit column stride, E <= 256 =
 //! bias.numel()): bit for bit what noaux_tc_fp4_quantize_stage_out(logits, bias, x, ..., pad_mask) + stage_appended
 //! write into rows 0..M-1 of topk_indices / topk_weights (the top-k ids and weights; -1 / 0 on pad-mask rows; with
-//! appended_slot >= 0 the slot / 1.0 in column topk). The weights take the FP32 form the family's
-//! noaux_tc_fp4_quantize_stage_out uses (the same values as the FP64 expression).
+//! appended_slot >= 0 the slot / 1.0 in column topk). With fp32_weight (NOAUX_TC_FP32, default) the weights take the
+//! FP32 form the family's noaux_tc_fp4_quantize_stage_out uses (the same values as the FP64 expression); false (its
+//! kill switch) evaluates the FP64 expression for every weight.
 void minimaxM31RouteStage(torch::Tensor const& logits, torch::Tensor const& bias, std::optional<torch::Tensor> padMask,
     int64_t topk, double routedScalingFactor, int64_t appendedSlot, torch::Tensor& topkIndices,
-    torch::Tensor& topkWeights, bool pdl)
+    torch::Tensor& topkWeights, bool pdl, bool fp32Weight)
 {
     TORCH_CHECK(logits.is_cuda() && logits.scalar_type() == at::kFloat && logits.dim() == 2 && logits.stride(1) == 1
             && logits.size(0) <= 65535,
@@ -81,7 +82,7 @@ void minimaxM31RouteStage(torch::Tensor const& logits, torch::Tensor const& bias
     p.topk = static_cast<int>(topk);
     p.appendedSlot = static_cast<int>(appendedSlot);
     p.routedScalingFactor = routedScalingFactor;
-    p.fp32Weight = true;
+    p.fp32Weight = fp32Weight;
     at::cuda::CUDAGuard const guard(logits.device());
     cudaError_t const e = TRTLLM_MV2_NS::kernels::minimaxM31::invokeRouteStage(
         p, pdl, at::cuda::getCurrentCUDAStream(logits.get_device()));
@@ -96,7 +97,8 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "minimax_m31_route_stage(Tensor logits, Tensor bias, Tensor? pad_mask, int topk, float routed_scaling_factor, "
-        "int appended_slot, Tensor(a!) topk_indices, Tensor(b!) topk_weights, bool pdl=True) -> ()");
+        "int appended_slot, Tensor(a!) topk_indices, Tensor(b!) topk_weights, bool pdl=True, bool fp32_weight=True) "
+        "-> ()");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

@@ -6,8 +6,9 @@ plain Python (no torch, no CUDA) so it runs in CPU tests. Shared by the DEP2CTX 
 ``invokeSwigluOaiMxfp8`` (``cpp/tensorrt_llm/kernels/minimaxM31/swigluOaiMxfp8Sm103.cu``) runs one CTA of ``d / 8``
 threads per row. The one-row launch sizes its grid for 2048 threads per SM (``2048 / threads`` CTAs), but an sm_107 SM
 holds 1024, so at d 3072 two 384-thread CTAs are resident (not five) with one 32-byte (gate, up) load each in flight.
-The rows form (from :data:`ROWS_MIN` rows, unless ``TRTLLM_M31_DISABLE_SWIGLU_MXFP8_ROWS`` is set) keeps ``k_rows``
-rows in flight per CTA on an occupancy-true grid, ``min(pad128(rows), resident CTAs x SMs)``. CTA ``c`` still visits
+The rows form (from :data:`ROWS_MIN` rows, unless ``TRTLLM_M31_DISABLE_SWIGLU_MXFP8_ROWS`` makes the targets pass
+``rows_form=False``) keeps ``k_rows`` rows in flight per CTA on an occupancy-true grid,
+``min(pad128(rows), resident CTAs x SMs)``. CTA ``c`` still visits
 rows ``c, c + grid, ...`` in that order, only ``k_rows`` at a time, and every row runs the one-row kernel's
 instructions, so every output byte is the one-row kernel's (bitwise by construction). The functions mirror the C++
 formulas one for one.
@@ -18,7 +19,7 @@ from typing import List, Optional, Tuple
 ELTS_PER_THREAD = 8
 #: The rows form engages from this many rows (``kSwigluRowsMinRows``).
 ROWS_MIN = 1024
-#: ``kSwigluRowsDefaultK``; ``TRTLLM_M31_SWIGLU_MXFP8_ROWS_K`` picks another of :data:`K_ROWS_CHOICES`.
+#: The rows in flight the targets pass as the op's ``k_rows`` (the op takes any of :data:`K_ROWS_CHOICES`).
 K_ROWS_DEFAULT = 4
 K_ROWS_CHOICES = (2, 4, 8)
 #: The thread count the one-row grid assumes per SM, and what sm_100 / sm_103 / sm_107 hold.

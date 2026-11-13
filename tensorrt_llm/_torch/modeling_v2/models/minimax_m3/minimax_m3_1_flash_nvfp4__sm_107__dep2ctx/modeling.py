@@ -146,6 +146,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, runtime_hooks_compat
+from ..ops import swiglu_rows_plan
 from . import ctx_boundary_plan as _cbplan
 from . import idx_scorer as _idx_scorer
 from . import tile_select as _tsel
@@ -1529,6 +1530,7 @@ class MiniMaxM3MoE(nn.Module):
             stage.ids,
             stage.weights,
             False,
+            fp32_weight=_NOAUX_TC_FP32,
         )
         backend._prestaged_route_quant = (
             _route_quant_key(x, router_logits),
@@ -2146,6 +2148,12 @@ class _C1BcgSink:
 _C1_SINK = _C1BcgSink() if _C1_BCG else _combine_mxfp8_sink
 
 
+# CTXNORM_LB2: the CTX residual add + RMSNorm + MXFP8 kernel launches at two CTAs per SM (a two-CTA launch bound) where
+# hidden / 8 <= 768, the same outputs bit for bit. Default ON; kill switch TRTLLM_M31_DISABLE_CTXNORM_LB2=1 (one CTA per
+# SM), passed to the op as its lb2 argument.
+_CTXNORM_LB2 = not m31_disabled("CTXNORM_LB2")
+
+
 def _normq_op():
     """family_ops().minimax_m31_ctx_residual_rmsnorm_mxfp8, or None when the build lacks it. Decided once."""
     if "op" not in _NORMQ_STATE:
@@ -2203,6 +2211,19 @@ _NORMQ_STAGE = not m31_disabled("DEP2CTX_NORMQ_STAGE")
 # DEP2CTX_ROUTER_BF16S on (the default) the router reads the BF16 norm itself, so the plan keeps the norm written; the
 # drop engages under TRTLLM_M31_DISABLE_DEP2CTX_ROUTER_BF16S=1.
 _NORMQ_STAGE_DROP_NORM = not m31_disabled("DEP2CTX_NORMQ_STAGE_DROP_NORM")
+# The ring kernel's launch choice, passed to every minimax_m31_ctx_boundary_normq* call (each form writes the same
+# bits). CBNQ_P2: the two-chunk kernel at two CTAs per SM on sm_107, kill switch TRTLLM_M31_DISABLE_CBNQ_P2=1 (the
+# one-chunk kernel). CBNQ_2CTA: the one-chunk ring at the requested depth, kill switch TRTLLM_M31_DISABLE_CBNQ_2CTA=1
+# (three stages, no carveout attribute: only differs when a deeper ring is requested). CBNQ_TOPK_DUAL: the top-k fold
+# at two row groups per CTA on sm_107, kill switch TRTLLM_M31_DISABLE_CBNQ_TOPK_DUAL=1 (one row group). Ring depths:
+# ctx_boundary_plan's defaults.
+_CBNQ_CHOICE: Dict[str, Any] = dict(
+    p2=not m31_disabled("CBNQ_P2"),
+    two_cta=not m31_disabled("CBNQ_2CTA"),
+    stages=_cbplan.L6_STAGES,
+    p2_stages=_cbplan.P2_STAGES,
+)
+_CBNQ_TOPK_DUAL = not m31_disabled("CBNQ_TOPK_DUAL")
 _NORMQ_V2_STATE: Dict[str, Any] = {}
 
 
@@ -2227,6 +2248,12 @@ def _normq_v2_op():
 
 def _normq_v2_out_op():
     return _normq_v2_ops()[1]
+
+
+# NOAUX_TC_FP32: the route stage's routing weights take the FP32 form (the FP64 expression's values without FP64
+# instructions on the common path). Kill switch TRTLLM_M31_DISABLE_NOAUX_TC_FP32=1 (the FP64 expression for every
+# weight), passed as the op's fp32_weight argument.
+_NOAUX_TC_FP32 = not m31_disabled("NOAUX_TC_FP32")
 
 
 def _route_stage_op():
@@ -2347,7 +2374,7 @@ class _DroppedNorms:
         if done is not None:
             torch.cuda.current_stream(normed.device).wait_event(done)
             return
-        _normq_v2_out_op()(summed, None, weight, eps, normed, None, None)
+        _normq_v2_out_op()(summed, None, weight, eps, normed, None, None, **_CBNQ_CHOICE)
         done = torch.cuda.Event()
         done.record(torch.cuda.current_stream(normed.device))
         entry[4] = done
@@ -2404,6 +2431,7 @@ def _normq_stage_boundary(
         stage.ids,
         stage.weights,
         stage.top_k,
+        **_CBNQ_CHOICE,
     )
     stage.normed = normed
     moe._normq_stage = stage
@@ -2478,17 +2506,38 @@ def _normq_boundary(
             True,
             write_f32,
             fp4_scale,
+            **_CBNQ_CHOICE,
         )
         if write_f32:
             moe._router_input_f32 = (outs[0], outs[5])
     elif write_f32:
-        outs = f32_op(reduced, residual.contiguous(), norm.weight, norm.variance_epsilon, fp4_scale)
+        outs = f32_op(
+            reduced,
+            residual.contiguous(),
+            norm.weight,
+            norm.variance_epsilon,
+            fp4_scale,
+            lb2=_CTXNORM_LB2,
+        )
         moe._router_input_f32 = (outs[0], outs[5])
     elif fp4_scale is None:
-        outs = op(reduced, residual.contiguous(), norm.weight, norm.variance_epsilon, True)
+        outs = op(
+            reduced,
+            residual.contiguous(),
+            norm.weight,
+            norm.variance_epsilon,
+            True,
+            lb2=_CTXNORM_LB2,
+        )
     else:
         outs = op(
-            reduced, residual.contiguous(), norm.weight, norm.variance_epsilon, True, fp4_scale
+            reduced,
+            residual.contiguous(),
+            norm.weight,
+            norm.variance_epsilon,
+            True,
+            fp4_scale,
+            lb2=_CTXNORM_LB2,
         )
     normed, xq, xsf = outs[0], outs[1], outs[2]
     if fp4_scale is not None:
@@ -2633,6 +2682,7 @@ def _normq_topk_boundary(
             norm.variance_epsilon,
             True,
             get_env_enable_pdl(),
+            dual=_CBNQ_TOPK_DUAL,
         )
     except RuntimeError as err:
         # Argument checks run before the launch: shared is still unreduced. Latch the fold off (the decline then
@@ -2844,6 +2894,14 @@ _SWIGLU_MXFP8 = not m31_disabled("DEP2CTX_SWIGLU_MXFP8")
 _SWIGLU_MXFP8_STATE: Dict[str, Any] = {}
 
 
+# SWIGLU_MXFP8_ROWS: from ops/swiglu_rows_plan.ROWS_MIN rows the op keeps K_ROWS_DEFAULT rows in flight per CTA on an
+# occupancy-true grid, every output byte the one-row launch's. Default ON; kill switch
+# TRTLLM_M31_DISABLE_SWIGLU_MXFP8_ROWS=1 (the one-row launch at every row count), passed as the op's rows_form argument.
+_SWIGLU_ROWS: Dict[str, Any] = dict(
+    rows_form=not m31_disabled("SWIGLU_MXFP8_ROWS"), k_rows=swiglu_rows_plan.K_ROWS_DEFAULT
+)
+
+
 def _swiglu_mxfp8_op():
     """family_ops().minimax_m31_swiglu_oai_mxfp8 from the build; None when it is not built. Decided once."""
     if "op" not in _SWIGLU_MXFP8_STATE:
@@ -2934,7 +2992,7 @@ class _SwigluMxfp8GatedMLP(GatedMLP):
                 ((rows + 127) // 128 * 128 * d // 32,), dtype=torch.uint8, device=h1.device
             )
             _bcg_note("SWIGLU_MXFP8", h1)
-            _swiglu_mxfp8_op()(h1, q, sf, None if _swiglu_noh(self) else h2)
+            _swiglu_mxfp8_op()(h1, q, sf, None if _swiglu_noh(self) else h2, **_SWIGLU_ROWS)
             _NORMQ_SLOT.publish(h2, q, sf)
         return self.down_proj(
             h2, all_reduce_params=final_all_reduce_params, layer_idx=self.layer_idx

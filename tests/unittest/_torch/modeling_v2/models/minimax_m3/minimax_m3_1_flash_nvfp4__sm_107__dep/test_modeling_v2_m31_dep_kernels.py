@@ -409,8 +409,18 @@ def test_own_t_runs_the_calls_lc2_takes_with_lc2s_operands(monkeypatch, pdl):
     assert out.shape == (320, 8192) and out.data_ptr() == kwargs["output"].data_ptr()
     q8, sf = call[11], call[12]
     assert q8.shape == (320, 8192) and sf.numel() == merge_mxfp8.scale_bytes(320)
-    assert call[13:] == (64, 8, kwargs["sm_scale"], pdl)
+    assert call[13:] == (64, 8, kwargs["sm_scale"], pdl, lc2_decode.OWNT_FASTPLAN)
     assert merge_mxfp8.SLOT.take(out) == (q8, sf)
+
+
+@pytest.mark.parametrize("fast_plan", [True, False])
+def test_own_t_passes_the_fastplan_kill_switch_as_fast_plan(monkeypatch, fast_plan):
+    _, own_t_calls = _own_t_route(monkeypatch, True)
+    monkeypatch.setattr(lc2_decode, "OWNT_FASTPLAN", fast_plan)
+    args, kwargs = _decode_call(reqs=40)
+    lc2_decode.dep_lc2_decode(*args, **kwargs)
+    (call,) = own_t_calls
+    assert call[-1] is fast_plan
 
 
 def test_own_t_without_buffers_hands_none_and_publishes_nothing(monkeypatch):
@@ -588,9 +598,11 @@ class _V3Op:
             _schema=f"minimax_m31_topp_renorm_det_v3({schema}) -> ()"
         )
         self.calls = []
+        self.kwargs = []
 
-    def __call__(self, *args):
+    def __call__(self, *args, **kwargs):
         self.calls.append(args)
+        self.kwargs.append(kwargs)
 
 
 _V3_ARGS = (
@@ -643,6 +655,8 @@ def test_topp_det_launches_flashinfer_rows_on_top_p_1(v3_op):
     ((call),) = op.calls
     assert call[0] is probs and call[1] is top_p and call[2] is ws and call[3] is out
     assert call[4:] == (2, True, True, True, True, False)
+    # TOPP_V6's kill switch reaches the op as its chain_prefetch argument.
+    assert op.kwargs == [{"chain_prefetch": topp_det.TOPP_V6}]
 
 
 @pytest.mark.parametrize(

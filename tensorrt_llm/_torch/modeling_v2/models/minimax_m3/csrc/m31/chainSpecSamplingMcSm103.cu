@@ -811,9 +811,14 @@ __global__ void __launch_bounds__(kBlockSize, 1) chainSpecSamplingMcKernelV3(Cha
         });
 }
 
-//! REJ v3 on sm_107 devices; other devices launch v2. The compute capability is read once per device.
-bool rejV3Enabled()
+//! REJ v3 on sm_107 devices unless allowV3 is false (the REJ_V3 kill switch: the v2 kernel); other devices launch v2.
+//! The compute capability is read once per device.
+bool rejV3Enabled(bool allowV3)
 {
+    if (!allowV3)
+    {
+        return false;
+    }
     static std::once_flag smOnce[64];
     static bool sm107[64] = {};
     int device = 0;
@@ -836,7 +841,7 @@ bool rejV3Enabled()
 } // namespace
 
 cudaError_t invokeChainSpecSamplingMc(ChainSpeculativeSamplingParams const& params, int ctasPerRow, void* workspace,
-    cudaStream_t stream, ChainSpecMcDraftRows const& rows, ChainSpecMcRngWindow const& rng)
+    cudaStream_t stream, ChainSpecMcDraftRows const& rows, ChainSpecMcRngWindow const& rng, bool allowV3)
 {
     if (rng.windowLen < 0 || rng.windowLen > kBlockSize || (rng.window != nullptr && rng.base == nullptr))
     {
@@ -859,7 +864,7 @@ cudaError_t invokeChainSpecSamplingMc(ChainSpeculativeSamplingParams const& para
     cfg.blockDim = dim3(kBlockSize);
     cfg.dynamicSmemBytes = 0;
     cfg.stream = stream;
-    if (!rejV3Enabled())
+    if (!rejV3Enabled(allowV3))
     {
         return cudaLaunchKernelEx(
             &cfg, chainSpecSamplingMcKernel, params, static_cast<RowWorkspace*>(workspace), rows, rng);
@@ -897,9 +902,9 @@ size_t chainSpecSamplingMcWorkspaceBytesPerRow()
     return sizeof(RowWorkspace);
 }
 
-int chainSpecSamplingMcKernelVersion()
+int chainSpecSamplingMcKernelVersion(bool allowV3)
 {
-    return rejV3Enabled() ? 3 : 2;
+    return rejV3Enabled(allowV3) ? 3 : 2;
 }
 
 } // namespace minimaxM31

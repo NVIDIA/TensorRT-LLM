@@ -67,7 +67,7 @@ std::vector<torch::Tensor> minimaxM3Sm107Tp8McAllreduceNorm(torch::Tensor const&
     torch::Tensor& wsUc, int64_t wsMcPtr, torch::Tensor& flags, int64_t rank, int64_t world, int64_t cluster, bool pdl,
     std::optional<torch::Tensor> const& perm, std::optional<torch::Tensor> const& scales, int64_t maxt, bool quant,
     int64_t prepushed, int64_t opts, std::optional<torch::Tensor> const& capOut,
-    std::optional<torch::Tensor> const& capW, double capEps)
+    std::optional<torch::Tensor> const& capW, double capEps, bool ar2OrderFix)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 107, "minimax_m3_sm107_tp8_mc_allreduce_norm requires SM107, got SM", sm);
@@ -139,7 +139,8 @@ std::vector<torch::Tensor> minimaxM3Sm107Tp8McAllreduceNorm(torch::Tensor const&
     p.outQuant = quant ? reinterpret_cast<uint8_t*>(outQ.data_ptr()) : nullptr;
     p.outSf = quant ? outSf.data_ptr<uint8_t>() : nullptr;
     TORCH_CHECK(prepushed >= 0 && prepushed <= 3, "mc_allreduce_norm: prepushed 0..3, got ", prepushed);
-    p.prepushed = static_cast<int32_t>(prepushed);
+    // AR2_ORDER_FIX kill switch (ar2_order_fix false): bit 8 asks the kernel for the legacy early parity rotation.
+    p.prepushed = static_cast<int32_t>(prepushed) | (ar2OrderFix ? 0 : 256);
     if (capOut.has_value())
     {
         TORCH_CHECK((opts & 16) == 0, "the capture epilogue is not built for the drafter boundary (opts bit 16)");
@@ -175,7 +176,7 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "minimax_m3_sm107_tp8_mc_allreduce_norm(Tensor x, Tensor? x2, Tensor residual, Tensor norm_w, float eps, "
         "Tensor(a!) ws_uc, int ws_mc_ptr, Tensor(b!) flags, int rank, int world, int cluster, bool pdl, "
         "Tensor? perm, Tensor? scales, int maxt, bool quant, int prepushed, int opts, Tensor(c!)? cap_out=None, "
-        "Tensor? cap_w=None, float cap_eps=0.) -> Tensor[]");
+        "Tensor? cap_w=None, float cap_eps=0., bool ar2_order_fix=True) -> Tensor[]");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

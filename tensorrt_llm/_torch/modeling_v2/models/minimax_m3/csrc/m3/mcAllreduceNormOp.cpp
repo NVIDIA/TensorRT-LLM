@@ -62,7 +62,7 @@ std::vector<torch::Tensor> minimaxM3McAllreduceNorm(torch::Tensor const& x, std:
     torch::Tensor const& residual, torch::Tensor const& normWeight, double eps, torch::Tensor& wsUc, int64_t wsMcPtr,
     torch::Tensor& flags, int64_t rank, int64_t world, int64_t cluster, bool pdl,
     std::optional<torch::Tensor> const& perm, std::optional<torch::Tensor> const& scales, int64_t maxt, bool quant,
-    int64_t prepushed, int64_t opts)
+    int64_t prepushed, int64_t opts, bool ar2OrderFix)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100 || sm == 103, "minimax_m3_mc_allreduce_norm requires SM100 or SM103, got SM", sm);
@@ -134,7 +134,8 @@ std::vector<torch::Tensor> minimaxM3McAllreduceNorm(torch::Tensor const& x, std:
     p.outQuant = quant ? reinterpret_cast<uint8_t*>(outQ.data_ptr()) : nullptr;
     p.outSf = quant ? outSf.data_ptr<uint8_t>() : nullptr;
     TORCH_CHECK(prepushed >= 0 && prepushed <= 3, "mc_allreduce_norm: prepushed 0..3, got ", prepushed);
-    p.prepushed = static_cast<int32_t>(prepushed);
+    // AR2_ORDER_FIX kill switch (ar2_order_fix false): bit 8 asks the kernel for the legacy early parity rotation.
+    p.prepushed = static_cast<int32_t>(prepushed) | (ar2OrderFix ? 0 : 256);
     TRTLLM_MV2_NS::kernels::invokeMinimaxM3McAllreduceNorm(p, static_cast<int32_t>(maxt), static_cast<int32_t>(opts),
         pdl, at::cuda::getCurrentCUDAStream(residual.get_device()));
     if (quant)
@@ -153,7 +154,8 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
     m.def(
         "minimax_m3_mc_allreduce_norm(Tensor x, Tensor? x2, Tensor residual, Tensor norm_w, float eps, "
         "Tensor(a!) ws_uc, int ws_mc_ptr, Tensor(b!) flags, int rank, int world, int cluster, bool pdl, "
-        "Tensor? perm, Tensor? scales, int maxt, bool quant, int prepushed, int opts) -> Tensor[]");
+        "Tensor? perm, Tensor? scales, int maxt, bool quant, int prepushed, int opts, bool ar2_order_fix=True) -> "
+        "Tensor[]");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

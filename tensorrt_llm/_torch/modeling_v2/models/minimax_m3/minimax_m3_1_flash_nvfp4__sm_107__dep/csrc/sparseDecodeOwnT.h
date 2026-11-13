@@ -81,9 +81,11 @@ cudaError_t minimaxM3Sm107SparseDecodeOwnTConfigure();
 //! covers as BF16 rows and the others as fp32 partials; the merge of the partials (and the zero rows of items without
 //! blocks). When params.q8 is set, the merge also writes the MXFP8 copy of every row. The main and merge
 //! grids, and the union grid after the previous kernel, launch with PDL when usePdl; values do not depend on it. Call
-//! minimaxM3Sm107SparseDecodeOwnTConfigure on the device first.
+//! minimaxM3Sm107SparseDecodeOwnTConfigure on the device first. fastPlan (DEP_OWNT_FASTPLAN, default on): the main
+//! kernel's plan derives the union's block weights when they are fixed; false (its kill switch) loads them. Both give
+//! the same split, bitwise.
 cudaError_t invokeMinimaxM3Sm107SparseDecodeOwnT(MinimaxM3Sm107SparseDecodeOwnTParams const& params, void* workspace,
-    size_t workspaceBytes, int32_t grid, bool usePdl, cudaStream_t stream);
+    size_t workspaceBytes, int32_t grid, bool usePdl, cudaStream_t stream, bool fastPlan = true);
 
 } // namespace kernels
 

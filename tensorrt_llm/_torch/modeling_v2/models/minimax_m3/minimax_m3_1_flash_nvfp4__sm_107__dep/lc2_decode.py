@@ -62,6 +62,9 @@ DEP_LC2 = not m31_disabled("DEP_LC2")
 #: costs the split more than it hides), and the 8-row cluster launches without PDL.
 DEP_LC2_PDL = not m31_disabled("DEP_LC2_PDL")
 DEP_OWNT = not m31_disabled("DEP_OWNT")
+# DEP_OWNT_FASTPLAN: OWN-T's main kernel derives the union's fixed block weights in its plan instead of loading them
+# (the same split, bitwise). Kill switch TRTLLM_M31_DISABLE_DEP_OWNT_FASTPLAN=1, passed as the op's fast_plan argument.
+OWNT_FASTPLAN = not m31_disabled("DEP_OWNT_FASTPLAN")
 # TP2WIDE_LC2_SPLIT: steps of 33..448 query rows run LC2 without its thread-block cluster (the per-(row, block) work
 # split over CTAs, then merged), bit for bit the cluster kernel. Kill switch TRTLLM_M31_DISABLE_TP2WIDE_LC2_SPLIT=1
 # runs the cluster kernel at every row count and reserves no split workspace.
@@ -308,6 +311,7 @@ def dep_lc2_decode(
                 decode_query_len,
                 sm_scale,
                 DEP_LC2_PDL,
+                OWNT_FASTPLAN,
             )
             if handoff is not None:
                 _mx.SLOT.publish(out_2d, *handoff)

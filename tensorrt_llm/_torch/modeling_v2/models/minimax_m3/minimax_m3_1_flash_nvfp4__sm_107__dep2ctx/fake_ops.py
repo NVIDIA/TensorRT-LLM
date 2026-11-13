@@ -60,6 +60,10 @@ def _ctx_boundary_normq_fake(
     write_f32=False,
     fp4_global_scale=None,
     enable_pdl=False,
+    p2=True,
+    two_cta=True,
+    stages=3,
+    p2_stages=3,
 ):
     """ctxBoundaryNormQuantOp.cpp (DEP2CTX_NORMQ_V2): the served op's five outputs plus the float32 norm;
     outputs that are off are empty 1-D tensors of inter's dtype (write_f32 does not need write_norm)."""
@@ -86,6 +90,10 @@ def _ctx_boundary_normq_out_fake(
     stage_weights=None,
     stage_topk=0,
     enable_pdl=False,
+    p2=True,
+    two_cta=True,
+    stages=3,
+    p2_stages=3,
 ):
     """minimax_m31_ctx_boundary_normq_out (DEP2CTX_NORMQ_V2 / _STAGE): writes into the given buffers; returns
     nothing."""
@@ -93,7 +101,7 @@ def _ctx_boundary_normq_out_fake(
 
 
 def _ctx_boundary_normq_topk_fake(
-    shared, plane, scores, residual, weight, eps, write_norm, enable_pdl=False
+    shared, plane, scores, residual, weight, eps, write_norm, enable_pdl=False, dual=True
 ):
     """minimax_m31_ctx_boundary_normq_topk (DEP2CTX_TOPK_FOLD): shared becomes moe + residual in place; returns
     (norm_out, MXFP8 rows, swizzled scale bytes), norm_out an empty 1-D tensor unless write_norm."""

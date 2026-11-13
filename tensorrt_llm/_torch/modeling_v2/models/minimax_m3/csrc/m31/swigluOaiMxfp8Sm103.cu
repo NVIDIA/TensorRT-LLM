@@ -163,8 +163,6 @@ __global__ void swigluOaiMxfp8RowsKernel(uint4 const* __restrict__ x, uint64_t* 
 
 //! The rows form engages from this many rows (below it the one-row launch already has every row in flight).
 constexpr int64_t kSwigluRowsMinRows = 1024;
-//! Rows in flight per CTA of the rows form.
-constexpr int kSwigluRowsK = 4;
 
 //! Resident CTAs per SM of `kernel` at `block` threads on the current device (the occupancy API, so registers and the
 //! device's thread limit both count: sm_107 holds 1024 threads per SM, not the 2048 the one-row grid assumes), cached
@@ -271,7 +269,7 @@ cudaError_t launchSwigluRows(cudaLaunchConfig_t cfg, uint4 const* x, uint64_t* q
     return cudaLaunchKernelEx(&cfg, kernel, x, qOut, sfOut, hOut, rows, d);
 }
 
-//! The rows form at the configured kRows (2 / 4 / 8).
+//! The rows form at the requested kRows (2 / 4 / 8; other values: 4).
 template <bool kWriteH>
 cudaError_t dispatchSwigluRows(int kRows, cudaLaunchConfig_t const& cfg, uint4 const* x, uint64_t* qOut,
     uint32_t* sfOut, uint4* hOut, int rows, int d, int64_t paddedRows, int multiProcessorCount, bool* taken)
@@ -290,7 +288,7 @@ cudaError_t dispatchSwigluRows(int kRows, cudaLaunchConfig_t const& cfg, uint4 c
 } // namespace
 
 cudaError_t invokeSwigluOaiMxfp8(uint4 const* x, uint64_t* qOut, uint32_t* sfOut, uint4* hOut, int64_t rows, int64_t d,
-    int multiProcessorCount, bool pdl, cudaStream_t stream)
+    int multiProcessorCount, bool pdl, cudaStream_t stream, bool rowsForm, int kRows)
 {
     if (d % 256 != 0 || d > 8192 || rows > (int64_t{1} << 30))
     {
@@ -312,18 +310,18 @@ cudaError_t invokeSwigluOaiMxfp8(uint4 const* x, uint64_t* qOut, uint32_t* sfOut
     cfg.numAttrs = 1;
     int const r = static_cast<int>(rows);
     int const dd = static_cast<int>(d);
-    if (rows >= kSwigluRowsMinRows)
+    if (rowsForm && rows >= kSwigluRowsMinRows)
     {
         bool taken = false;
         auto const dispatch = hOut != nullptr ? &dispatchSwigluRows<true> : &dispatchSwigluRows<false>;
         cudaError_t const e
-            = dispatch(kSwigluRowsK, cfg, x, qOut, sfOut, hOut, r, dd, paddedRows, multiProcessorCount, &taken);
+            = dispatch(kRows, cfg, x, qOut, sfOut, hOut, r, dd, paddedRows, multiProcessorCount, &taken);
         if (e != cudaSuccess || taken)
         {
             return e;
         }
     }
-    // The one-row launch (below 1024 rows, or no resident rows-form CTA at this width):
+    // The one-row launch (below 1024 rows, the kill switch, or no resident rows-form CTA at this width):
     // quantize_with_block_size's grid, one CTA per (padded) row, capped at 2048 / threads CTAs per SM.
     int const blocksPerSm = std::max(1, 2048 / threads);
     cfg.gridDim

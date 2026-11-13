@@ -126,6 +126,10 @@ ITEMS: Dict[str, str] = {
     "VERIFY_LOGITS_COPY_FUSED": "the gather_ids copy, vocab concat and fp32 cast of the verify logits",
     "VR_BANDS": "the 32-row decode step bound",
     "VR_GEMV48": "FlashInfer's MXFP8 GEMM for the 33..48-row projections the GEMV takes",
+    "CTXNORM_LB2": "the CTX norm + MXFP8 boundary kernel at one CTA per SM",
+    "REJ_V3": "the rejection sampler's v2 kernel on every device",
+    "TOPP_V6": "the top-p renorm's staged summation loop on every device",
+    "AR2_ORDER_FIX": "the boundary all-reduce's legacy parity rotation after thread 0's poll",
 }
 
 
