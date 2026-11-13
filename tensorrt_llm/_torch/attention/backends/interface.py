@@ -617,7 +617,25 @@ class AttentionMetadata:
     ) -> None:
         """
         Hook to be called when using helix parallelism.
+
+        Args:
+            helix_position_offsets: Position offsets for helix parallelism with shape (num_tokens,).
+            helix_is_inactive_rank: Whether the current rank is inactive with shape (batch_size,).
+            helix_owned_new_tokens: Per-sequence count of this step's new
+                tokens owned by this rank (speculative verify groups). None on
+                the single-token path, where the boolean flag carries it.
+
+        Raises:
+            NotImplementedError: If helix_owned_new_tokens is not None. The base
+                hook has no storage for the owned counts; backends that support
+                helix speculative decoding (TrtllmAttentionMetadata) override
+                this hook.
         """
+        if helix_owned_new_tokens is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not consume helix_owned_new_tokens; "
+                "helix speculative decode requires a backend whose "
+                "update_helix_param override handles the owned counts.")
 
     def create_cross_metadata(
         self,
