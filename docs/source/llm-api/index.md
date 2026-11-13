@@ -232,6 +232,18 @@ and other unintended behavior. As such, we recommend using distinct
 `TRTLLM_CACHE_DIR` caches for different models, and invalidating them anytime 
 a component in the software stack changes.
 
+TensorRT-LLM can also keep the results of `cute.compile`, which the CuTe DSL does not cache,
+so that later processes and ranks load the CuTe DSL kernels they need instead of compiling
+them again. Set `TRTLLM_CUTE_DSL_CACHE_DIR` to a directory before importing TensorRT-LLM to
+turn this on. `TRTLLM_CACHE_DIR` does not set it, because the cache hooks CuTe DSL internals
+and its directory only grows: nothing prunes it, and kernels whose generated names carry a
+per-process value add an entry on every launch. An entry is keyed on everything the compile
+reads: the traced kernel, the compile pipeline and options, the CuTe DSL build, the target
+architecture and the call's TVM-FFI signature, so a changed kernel or toolchain compiles anew.
+Entries run as compiled code, so only trusted users may write to the directory. A process
+killed while it writes an entry leaves a `.tmp.<pid>.<hex>` file, which the cache never reads
+and which can be deleted.
+
 The directories are created by their respective consumers when needed.
 TensorRT-LLM does not add cache locking or cleanup; per-rank isolation is
 enabled only for the exceptions described below. The
