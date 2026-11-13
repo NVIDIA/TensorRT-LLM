@@ -40,6 +40,7 @@ same iteration's metadata, which they bind after the KV cache manager's
 allocation fence.
 """
 
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
@@ -55,6 +56,12 @@ from .validation import validate_attention_dp_config, validate_llm_args
 from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
 
 __all__ = ["MooncakeStoreConnectorScheduler"]
+
+
+#: Hash chains `probe_num_matched_tokens` built for requests not looked up
+#: yet, kept so their lookup does not hash the prompt again. The oldest go
+#: first past this many; a dropped chain is only rebuilt.
+PROBE_CHAIN_CACHE_SIZE = 512
 
 
 def _multimodal_item_digests(request: LlmRequest) -> Optional[Tuple[bytes, ...]]:
@@ -186,6 +193,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # `None` of an unestablished span never keys a page.
         self._prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
         self._requests: Dict[int, _RequestState] = {}
+        self._probe_chains: "OrderedDict[int, BlockHashChain]" = OrderedDict()
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
         # Saves bound in the last metadata, by request: the block ordinal they
         # end at. Settled by `_confirm_submitted_saves` at the next build.
@@ -427,6 +435,47 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
                     state.saved_upto = max(state.saved_upto, saves_end)
         return metadata
 
+    def probe_num_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+        """The offer `get_num_new_matched_tokens` would make now, without recording it.
+
+        The request's offer and its load and save bookkeeping are left as they
+        were. Mooncake renews the lease of every key the existence check finds,
+        so a probe also keeps a queued request's stored prefix from expiring.
+        The hash chain is kept for the request's own lookup.
+        """
+        if self._config.capacity_only or not self._config.role.loads:
+            return 0
+        scope = _reuse_scope(request)
+        if scope is None:
+            return 0
+        # The lookup offers whole blocks after a whole-block local match only.
+        if num_computed_tokens % self._tokens_per_block:
+            return 0
+
+        tokens = request.get_tokens(0)
+        state = self._requests.get(request.request_id)
+        if state is not None:
+            chain = state.chain
+        else:
+            chain = self._probe_chains.pop(request.request_id, None)
+            if chain is None:
+                chain = BlockHashChain(
+                    self._tokens_per_block, scope=scope, prompt_lookahead=self._prompt_lookahead
+                )
+            self._probe_chains[request.request_id] = chain
+            while len(self._probe_chains) > PROBE_CHAIN_CACHE_SIZE:
+                self._probe_chains.popitem(last=False)
+        chain.extend(tokens)
+
+        # The same candidate window as the lookup.
+        first_block = num_computed_tokens // self._tokens_per_block
+        last_block = (len(tokens) - 1) // self._tokens_per_block
+        candidates = chain.hashes[first_block:last_block]
+        if not candidates:
+            return 0
+        hit_blocks = self._require_worker().count_prefix_hit(candidates, record_stats=False)
+        return hit_blocks * self._tokens_per_block
+
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
         """Report whether pages must stay pinned for in-flight saves.
 
@@ -443,6 +492,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             thread, so freeing its pages now could let a later request
             overwrite bytes mid-transfer.
         """
+        self._probe_chains.pop(request.request_id, None)
         state = self._requests.pop(request.request_id, None)
         return bool(state is not None and state.emitted_saves)
 
@@ -457,6 +507,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         reset while a load owns the allocation, so this is defensive.
         """
         self._requests.pop(request.request_id, None)
+        self._probe_chains.pop(request.request_id, None)
         self._unconfirmed_saves.pop(request.request_id, None)
         self._pending_async_loads = [
             transfers
@@ -528,11 +579,13 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     ) -> _RequestState:
         state = self._requests.get(request.request_id)
         if state is None:
-            state = _RequestState(
-                BlockHashChain(
+            # A chain a probe already built for this request is reused.
+            chain = self._probe_chains.pop(request.request_id, None)
+            if chain is None:
+                chain = BlockHashChain(
                     self._tokens_per_block, scope=scope, prompt_lookahead=self._prompt_lookahead
                 )
-            )
+            state = _RequestState(chain)
             self._requests[request.request_id] = state
         # The lookup runs before the request is scheduled, so the chain has to
         # be ready before any scheduler output exists.

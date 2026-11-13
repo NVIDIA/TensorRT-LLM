@@ -3069,7 +3069,7 @@ class FakeWorker:
         #: What the last `wait_for_save` queued; see `submit_saves`.
         self.submitted = set()
 
-    def count_prefix_hit(self, block_hashes):
+    def count_prefix_hit(self, block_hashes, record_stats=True):
         self.queries.append(list(block_hashes))
         return min(self.hit_blocks, len(block_hashes))
 

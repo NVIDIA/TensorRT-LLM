@@ -1022,7 +1022,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         """Whether a KV cache layout has been registered yet."""
         return self._addressing is not None
 
-    def count_prefix_hit(self, block_hashes: Sequence[bytes]) -> int:
+    def count_prefix_hit(self, block_hashes: Sequence[bytes], *, record_stats: bool = True) -> int:
         """How many leading blocks of `block_hashes` are fully present.
 
         A block counts only when every layer group and every attention shard
@@ -1031,6 +1031,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         Args:
             block_hashes: Candidate hashes in block order.
+            record_stats: Count the lookup in the prefix-hole statistics. A
+                ranking probe leaves them to the request's own lookup.
 
         Returns:
             Length of the usable prefix, in blocks.
@@ -1068,7 +1070,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             if not all(status == 1 for status in window):
                 break
             hit_blocks += 1
-        if self._hole_stats is not None:
+        if record_stats and self._hole_stats is not None:
             # From the same answer, so the diagnostics cost no store call.
             self._record_prefix_hole(present, keys_per_block, len(block_hashes), hit_blocks)
         return hit_blocks
