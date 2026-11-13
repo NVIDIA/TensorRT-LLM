@@ -5425,6 +5425,43 @@ class TestLongContextDemotionExact:
             assert first.context_chunk_size + second.context_chunk_size == 1024
             assert min(first.context_chunk_size, second.context_chunk_size) >= 256
 
+    def _run_behind_full_budgets(self, sched, mgr, lost, iterations):
+        """Schedule *lost* first in arrival order, each iteration behind a new
+        short request that takes the whole token budget. A first chunk that
+        is not scheduled releases its cache. Returns the iteration (1-based)
+        that scheduled *lost*, or None."""
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id, None)
+        for iteration in range(1, iterations + 1):
+            short = self._req(100 + iteration, 1024, 1024)
+            out = sched.schedule_request([lost, short], set())
+            if lost.py_request_id in ids(out.context_requests):
+                return iteration
+        return None
+
+    def test_request_found_long_at_first_prepare_ages_out(self):
+        """Found long only by its first prepare, behind short requests that fill
+        the budget: demoted at most context_demote_max_iters iterations, then
+        let through. Its exact remainder demotes it at the door from the second
+        iteration on, so it is not prepared again until it runs."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000}, context_demote_max_iters=2)
+        lost = self._req(0, 10_000, 256)
+        assert self._run_behind_full_budgets(sched, mgr, lost, 5) == 3
+        assert lost.py_uncached_prefill_tokens is None  # let through for good
+        prepared = [c.args[0] for c in mgr.prepare_context.call_args_list]
+        assert prepared.count(lost) == 2  # found long, then scheduled
+
+    def test_request_found_long_at_first_prepare_without_bound(self):
+        """context_demote_max_iters=0 sets no bound: the request stays demoted
+        while short requests fill the budget, demoted at the door after its
+        first prepare."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost = self._req(0, 10_000, 256)
+        assert self._run_behind_full_budgets(sched, mgr, lost, 5) is None
+        assert lost.py_uncached_prefill_tokens == 10_000
+        assert sched._ctx_demote_skips == {0: 5}
+        prepared = [c.args[0] for c in mgr.prepare_context.call_args_list]
+        assert prepared.count(lost) == 1
+
     def test_request_found_short_is_not_deferred(self):
         sched, _ = self._make(prepared_remaining={0: 512})
         first, second = self._req(0, 512, 512), self._req(1, 256, 256)

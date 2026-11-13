@@ -1593,7 +1593,21 @@ class KVCacheV2Scheduler(RequestScheduler):
             # and the next iteration would order it as short and defer it again.
             self._ctx_unverified_short.discard(req.py_request_id)
             if token_cap is None and self._is_long_context(req):
-                return ScheduleAction.DEFER, 0, False
+                if (
+                    self._ctx_demote_max_iters > 0
+                    and self._ctx_demote_skips.get(req.py_request_id, 0)
+                    >= self._ctx_demote_max_iters
+                ):
+                    # Demoted as long as the bound allows: let through for good,
+                    # as at the door (see _defer_long_context).
+                    req.py_uncached_prefill_tokens = None
+                else:
+                    # The exact remainder replaces the estimate, so the next
+                    # iteration demotes the request at the door, where the
+                    # aging bound applies, without preparing it first.
+                    req.py_uncached_prefill_tokens = req.context_remaining_length
+                    req.py_uncached_prefill_probed = True
+                    return ScheduleAction.DEFER, 0, False
 
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
