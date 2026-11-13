@@ -362,6 +362,21 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._pending_copies.discard(request_id)
         self._initialized_requests.discard(request_id)
 
+    def _draft_tokens_view(self, batch_size: int, max_draft_len: int) -> torch.Tensor:
+        """Return the [batch_size, max_draft_len] block the native kernels write.
+
+        The kernels write draft tokens as a packed [batch_size, max_draft_len]
+        array through the raw data pointer (row i at i * max_draft_len). The
+        workspace keeps the width it was allocated with, so slicing it as
+        [:batch_size, :max_draft_len] gives a strided view whenever
+        max_draft_len is smaller, e.g. under a draft_len_schedule, and every
+        row after the first would read the wrong tokens. Viewing the leading
+        elements instead keeps the same storage and address (CUDA-graph safe).
+        """
+        return self._gpu_draft_tokens.view(-1)[: batch_size * max_draft_len].view(
+            batch_size, max_draft_len
+        )
+
     def prepare(self, request_ids: List[int], max_draft_len: int):
         """
         Prepare batch indices for the upcoming extend() call.
@@ -457,7 +472,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         # Native GPU kernel - CUDA graph compatible
         match_len = self._gpu_match_len[:batch_size]
-        draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
+        draft_tokens = self._draft_tokens_view(batch_size, max_draft_len)
 
         # Ensure accepted_tokens is contiguous and int32
         if accepted_tokens.dtype != torch.int32:
@@ -519,7 +534,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         # Native GPU kernel - CUDA graph compatible
         match_len = self._gpu_match_len[:batch_size]
-        draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
+        draft_tokens = self._draft_tokens_view(batch_size, max_draft_len)
 
         # Ensure accepted_tokens is contiguous and int32
         if accepted_tokens.dtype != torch.int32:
@@ -577,7 +592,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         match_len = self._gpu_match_len[:batch_size]
         match_slot = self._gpu_match_slot[:batch_size]
-        draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
+        draft_tokens = self._draft_tokens_view(batch_size, max_draft_len)
 
         if accepted_tokens.dtype != torch.int32:
             accepted_tokens = accepted_tokens.to(torch.int32)
