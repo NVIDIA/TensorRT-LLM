@@ -253,6 +253,16 @@ def test_v41_block32_dequant_uses_each_tile_scale():
             )
 
 
+def test_v41_draft_rejects_fp8_attention_projections(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "fp8")
+    assert DSv41DSparkDraftModel.supports_fp8_attn_projections is False
+    mapping = SimpleNamespace(tp_size=1, enable_attention_dp=False)
+    with pytest.raises(ValueError, match="not supported by this DSpark drafter"):
+        modeling_dspark._use_dspark_bf16_linear(
+            mapping, fp8_supported=DSv41DSparkDraftModel.supports_fp8_attn_projections
+        )
+
+
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):
     captured = {}
 
@@ -360,7 +370,7 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch):
         model_config=SimpleNamespace(mapping=SimpleNamespace(enable_attention_dp=False, tp_size=1)),
     )
     monkeypatch.setattr(
-        modeling_dspark, "_dspark_attention_forward_legacy", Mock(return_value=attention_output)
+        modeling_dspark, "dspark_attention_forward", Mock(return_value=attention_output)
     )
     result, next_pre = modeling_dspark.DSv4DSparkDraftModel._forward_stage(
         model,
@@ -421,7 +431,7 @@ def test_v41_attention_query_has_no_per_head_rmsnorm(monkeypatch, batched):
             x, main_x, torch.tensor([1]), window, torch.tensor([0]), **kwargs
         )
     else:
-        modeling_dspark._dspark_attention_forward_legacy(x, main_x, 1, window, **kwargs)
+        modeling_dspark.dspark_attention_forward(x, main_x, 1, window, **kwargs)
     q = F.linear(x, q_a)
     q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-20) * norm_weight
     q = F.linear(q, q_b).unflatten(-1, (heads, head_dim))

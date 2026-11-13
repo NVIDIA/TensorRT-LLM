@@ -4,7 +4,7 @@
 
 import hashlib
 import os
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from functools import lru_cache
 
 import jinja2
@@ -115,6 +115,36 @@ def _referenced_template_variables(template_source: str) -> frozenset[str] | Non
 def _warn_unused_key(template_hash: str, key: str) -> None:
     logger.warning(
         f"chat_template_kwargs key '{key}' is not referenced by the active chat template."
+    )
+
+
+def unreferenced_chat_template_kwargs(
+    template_source: str | None,
+    keys: Iterable[str],
+) -> frozenset[str]:
+    """Subset of `keys` the active template never reads.
+
+    The same reference analysis the validator runs, exposed as a query so
+    that code which *constructs* template kwargs (rather than forwarding a
+    caller's) can avoid injecting a key the active template never reads: a
+    key is flagged when the template does not reference it and the renderer
+    does not always consume it. For a template the analysis cannot see into
+    (parse failure, includes/imports) every key outside the always-consumed
+    surface is flagged: constructing code can safely omit an unverifiable
+    key and leave the template its own default, whereas the validator (which
+    faces caller-supplied kwargs it cannot remove) skips instead. A
+    non-string `template_source` flags nothing, matching the validator's
+    skip.
+    """
+    if not isinstance(template_source, str):
+        return frozenset()
+    referenced = _referenced_template_variables(template_source)
+    if referenced is None:
+        return frozenset(key for key in keys if key not in ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS)
+    return frozenset(
+        key
+        for key in keys
+        if key not in referenced and key not in ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS
     )
 
 

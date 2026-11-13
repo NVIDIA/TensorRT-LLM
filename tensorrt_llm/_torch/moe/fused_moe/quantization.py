@@ -7662,6 +7662,8 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
+        # GEMM1 ScaleC stores FC1 input scale / FC2 input scale; ScaleGate
+        # stores the raw FC1 dequant scale, also used to quantize the input.
         fc31_input_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
                                           requires_grad=False)
@@ -7718,6 +7720,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
                 w1_input_scale, w3_input_scale, w2_input_scale,
                 tmp_fc31_input_scale[expert_id], tmp_fc2_input_scale[expert_id])
 
+        # Keep GEMM1's output-scale ratio separate from the raw input scale.
         module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max() /
                                              tmp_fc2_input_scale.max())
         module.fc31_input_gate_dequant.data.copy_(tmp_fc31_input_scale.max())

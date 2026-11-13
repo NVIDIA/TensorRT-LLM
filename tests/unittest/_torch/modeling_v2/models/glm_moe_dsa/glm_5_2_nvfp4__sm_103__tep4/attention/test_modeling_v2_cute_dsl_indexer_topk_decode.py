@@ -93,7 +93,38 @@ def test_certified_cells(cell) -> None:
     with validating(op):
         out = op(logits, seq_lens, indices, **kw)
     assert out is indices, "the op writes the caller's buffer and returns it"
-    _compare(out, op.reference(logits, seq_lens, indices, **kw))
+    ref = op.reference(logits, seq_lens, indices, **kw)
+    # Not degenerate: some row selects keys, and some row is longer than top-k, where the
+    # selection is a real choice rather than the identity.
+    assert bool((ref >= 0).any()), "the reference selects no key"
+    assert int(seq_lens.max()) > TOP_K
+    _compare(out, ref)
+
+
+@pytest.mark.parametrize("next_n", [2, 4, 6], ids=["mtp1", "mtp3", "mtp5"])
+def test_graph_replay_matches_eager(next_n) -> None:
+    """The target captures this op in its decode graph at each MTP width's full batch: a
+    replay must select the eager call's keys, and a second replay on new logits copied into
+    the same buffer must select that call's keys. Compared as sets per row, as `_compare`
+    does: the order of the winners in a row is unspecified."""
+    spec = dict(
+        next_n=next_n, max_columns=8192, seq_lens=[2100 + 190 * i for i in range(32)], width=8192
+    )
+    logits, seq_lens, indices = _build(spec, seed=70 + next_n)
+    new_logits = _build(spec, seed=80 + next_n)[0]
+    kw = dict(top_k=TOP_K, next_n=next_n, compiled=_compiled(8192, next_n))
+    eager = [op(x, seq_lens, indices, **kw).clone() for x in (logits.clone(), new_logits)]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(logits, seq_lens, indices, **kw)
+    first = logits.clone()
+    for scores, want in zip((first, new_logits), eager):
+        logits.copy_(scores)
+        indices.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _compare(indices, want)
+    assert not torch.equal(eager[0].sort(dim=1).values, eager[1].sort(dim=1).values)
 
 
 def test_short_rows_list_their_columns_in_order() -> None:
@@ -111,6 +142,7 @@ def test_top_k_and_next_n_cannot_be_passed_positionally() -> None:
         dict(next_n=1, max_columns=8192, seq_lens=[3000], width=8192), seed=12
     )
     with pytest.raises(TypeError):
+        # pyrefly: ignore [unexpected-positional-argument]
         op(logits, seq_lens, indices, 1, TOP_K, _compiled(8192, 1))
 
 

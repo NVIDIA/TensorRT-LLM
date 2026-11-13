@@ -26,6 +26,7 @@ from tensorrt_llm._torch.weight_sharing import (
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
@@ -112,6 +113,13 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
 _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_fusion=frozenset({False}),
+)
+# Tied Qwen3 checkpoints alias `lm_head.weight` to `model.embed_tokens.weight`
+# at construction, so the shared table is transferred once and the tied profile
+# has its own layout ABI.
+_MX_QWEN3_BF16_DENSE_TIED_RUNTIME_CONSTRAINTS = replace(
+    _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    tied_word_embeddings=frozenset({True}),
 )
 # Mistral realizes a per-layer attention window from its checkpoint config.
 # The dense profile is qualified only when every layer runs full attention.
@@ -871,10 +879,14 @@ class ModelLoaderMetricNames(Enum):
     WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
+_CheckpointStartupMetadata = dict[str,
+                                  str | dict[str, str | bool | None] | None]
+
+
 def _checkpoint_startup_metadata(
     checkpoint_loader: BaseCheckpointLoader,
     load_format: LoadFormat,
-) -> dict[str, str]:
+) -> _CheckpointStartupMetadata:
     """Describe the concrete checkpoint source selected for this load."""
     weight_loader = getattr(checkpoint_loader, "weight_loader", None)
     source_kind = getattr(checkpoint_loader, "checkpoint_format", None)
@@ -888,6 +900,42 @@ def _checkpoint_startup_metadata(
         str(source_kind or "unknown"),
         "load_format":
         load_format.name.lower(),
+        # Explicitly unknown until a supported weight load has finished.
+        "checkpoint_io_policy":
+        None,
+    }
+
+
+def _checkpoint_io_policy_metadata(
+    checkpoint_loader: BaseCheckpointLoader
+) -> dict[str, str | bool | None] | None:
+    """Snapshot observed policy for loads using the built-in HF weight loader.
+
+    Args:
+        checkpoint_loader: Loader whose completed weight load is observed.
+
+    Returns:
+        A detached policy snapshot, or None for unsupported or unobserved loads.
+    """
+    from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+        HfCheckpointLoader
+    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
+        HfWeightLoader
+
+    if (not isinstance(checkpoint_loader, HfCheckpointLoader)
+            or type(checkpoint_loader.weight_loader) is not HfWeightLoader
+            or checkpoint_loader.is_weights_preloaded()):
+        return None
+    status = checkpoint_loader.weight_loader.last_checkpoint_io_status
+    if status.effective not in (CheckpointIOPolicy.NATIVE,
+                                CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD):
+        return None
+    return {
+        "requested": status.requested,
+        "selected": status.selected,
+        "activated": status.activated,
+        "effective": status.effective,
+        "fallback_reason": status.fallback_reason,
     }
 
 
@@ -957,6 +1005,19 @@ class ModelLoader:
             transform_abi_id=QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3-for-causal-lm-bf16-tied-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3",
+                "Qwen3ForCausalLM"),
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_QWEN3_BF16_DENSE_TIED_RUNTIME_CONSTRAINTS,
         ),
         PostTransformProfile(
             profile_id="mistral-for-causal-lm-bf16-target-v1",
@@ -1056,7 +1117,7 @@ class ModelLoader:
         self._checkpoint_loader: Optional[BaseCheckpointLoader] = None
         # Mostly weight loading and processing time metrics, updated when load() is called.
         self._metrics: dict[str, float] = {}
-        self._startup_metadata: dict[str, str] = {}
+        self._startup_metadata: _CheckpointStartupMetadata = {}
 
     @property
     def metrics(self) -> dict[str, float]:
@@ -1064,7 +1125,7 @@ class ModelLoader:
         return self._metrics
 
     @property
-    def startup_metadata(self) -> dict[str, str]:
+    def startup_metadata(self) -> _CheckpointStartupMetadata:
         """Return checkpoint-source metadata captured by the latest load."""
         return self._startup_metadata
 
@@ -1084,6 +1145,8 @@ class ModelLoader:
             'trust_remote_code': llm_args.trust_remote_code,
             'mm_encoder_only': llm_args.mm_encoder_only,
         }
+        if llm_args.model_kwargs is not None:
+            config_kwargs['model_kwargs'] = llm_args.model_kwargs
         if llm_args.parallel_config:
             config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 
@@ -1576,6 +1639,9 @@ class ModelLoader:
                                     "did not preload the model. Refusing to "
                                     "commit an unpopulated model to the GMS "
                                     "pool.")
+
+                            self._startup_metadata["checkpoint_io_policy"] = \
+                                _checkpoint_io_policy_metadata(checkpoint_loader)
 
                             if loads_draft_weights:
                                 self._load_separate_draft_weights(
@@ -2432,6 +2498,7 @@ class ModelLoader:
                                         checkpoint_dir: str, model, config,
                                         load_weights_kwargs: dict) -> bool:
         """Keep loader-specific work alive through weight materialization."""
+        self._startup_metadata["checkpoint_io_policy"] = None
         with _timed_checkpoint_weight_session(
                 checkpoint_loader, checkpoint_dir, self._metrics,
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
@@ -2454,11 +2521,16 @@ class ModelLoader:
                                             self.weight_mapper)
                     if torch.cuda.is_available():  # CPU guard
                         torch.cuda.synchronize()
+        # Session finalization can degrade activated read-ahead to native.
+        # Snapshot before a same-engine draft load resets the shared loader.
+        self._startup_metadata["checkpoint_io_policy"] = \
+            _checkpoint_io_policy_metadata(checkpoint_loader)
         return weights_preloaded
 
     def _materialize_draft_checkpoint_weights(self, checkpoint_loader,
                                               model) -> None:
         """Keep loader-specific work alive through draft materialization."""
+        self._startup_metadata["draft_checkpoint_io_policy"] = None
         with _timed_checkpoint_weight_session(
                 checkpoint_loader,
                 self.spec_config.speculative_model,
@@ -2491,6 +2563,8 @@ class ModelLoader:
                                         draft_weight_mapper)
                 if torch.cuda.is_available():  # CPU guard
                     torch.cuda.synchronize()
+        self._startup_metadata["draft_checkpoint_io_policy"] = \
+            _checkpoint_io_policy_metadata(checkpoint_loader)
 
     def _call_load_weights(self,
                            load_method: Callable,

@@ -98,6 +98,7 @@ def test_indexed_prefill_uses_current_stream(
 ) -> None:
     """Inputs, indexed state updates, and consumers stay on the current stream."""
     optimized, reference = dispatch_pair
+    sequence_lengths = None
     if regime == "eqlen":
         inputs = _make_inputs(256, seed=31337, batch_size=2)
         cu_seqlens = None
@@ -119,7 +120,9 @@ def test_indexed_prefill_uses_current_stream(
     with torch.cuda.stream(execution_stream):
         torch.cuda._sleep(1 << 28)
         streamed_inputs = tuple(tensor * 1.0 for tensor in inputs)
-        streamed_cu_seqlens = _make_cu_seqlens(sequence_lengths) if regime == "varlen" else None
+        streamed_cu_seqlens = (
+            _make_cu_seqlens(sequence_lengths) if sequence_lengths is not None else None
+        )
         actual_output, actual_state, _ = run_indexed_prefill(
             optimized,
             gate_params,

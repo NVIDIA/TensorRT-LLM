@@ -91,7 +91,7 @@ only names the code that demonstrates them. Paths are relative to
   - `trtllm_gen/`: per-kernel-ABI layers (`fp4_block_scale.py`,
     `fp8_block_scale.py`) between `TrtllmGenFusedMoEBase` and the nvfp4,
     fp8_block_scales, w4a16_mxfp4 and w4a8_mxfp4_mxfp8 leaves;
-    `flashinfer_bf16.py` and the two W4A8 FP8-activation leaves subclass the
+    `trtllm_bf16.py` and the two W4A8 FP8-activation leaves subclass the
     base directly.
   - `marlin/`: one kernel ABI, so `MarlinFusedMoEBase` implements three of the
     four abstract methods and a leaf is an identity plus `can_implement`.

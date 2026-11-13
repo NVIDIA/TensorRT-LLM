@@ -965,7 +965,7 @@ def test_dspark_worker_policies_come_from_the_drafter():
     from tensorrt_llm.mapping import Mapping
 
     worker = DSparkWorker(_routing_config(False), Mapping())
-    legacy = types.SimpleNamespace(_dspark_shift_label=False, has_markov_head=False)
+    legacy = types.SimpleNamespace(shift_label=False, has_markov_head=False)
 
     # shift_label off -> the base class' slots 1..K, not the dspark 0..K-1.
     ids = worker._draft_slot_ids(legacy, num_gens=2, block_size=5, num_draft_tokens=3)
