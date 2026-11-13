@@ -222,7 +222,7 @@ def test_attention_dp_declines_the_breakable_prefill_graph(member):
     config = _model_config(**_ATTENTION_DP[member])
     _declined(
         config,
-        match=rf"prefill_cuda_graph_backend='breakable' with attention DP \({member}\)",
+        match="prefill_cuda_graph_backend='breakable' with attention DP",
         prefill_cuda_graph_backend="breakable",
     )
     _claimed(config, prefill_cuda_graph_backend="disabled")
@@ -244,7 +244,7 @@ def test_dep4_declines_mtp_with_the_breakable_prefill_graph():
     config = _model_config(MTPDecodingConfig(max_draft_len=3), **_LAYOUTS["dep4"])
     _declined(
         config,
-        match=r"prefill_cuda_graph_backend='breakable' with attention DP \(dep4\)",
+        match="prefill_cuda_graph_backend='breakable' with attention DP",
         prefill_cuda_graph_backend="breakable",
     )
 

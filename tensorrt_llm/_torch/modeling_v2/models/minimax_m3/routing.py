@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
+from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig, PrefillCudaGraphBackend
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
@@ -224,6 +224,14 @@ def route(
             raise ValueError(
                 f"{', '.join(stale)}: removed; the MiniMax-M3 sm107 tp2 target serves every batch size (its "
                 "wide-decode cells are part of it), so unset these variables"
+            )
+        # Its sparse layers run under a breakable prefill CUDA graph only with the five-way projection.
+        if llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE and not getattr(
+            model_config.sparse_attention_config, "fuse_qkv_index_projection", False
+        ):
+            raise NoTarget(
+                "MiniMax-M3 sm107 tp2 supports prefill_cuda_graph_backend='breakable' only with "
+                "fuse_qkv_index_projection"
             )
         from .minimax_m3_nvfp4__sm_107__tp2.modeling import ModelingV2MiniMaxM3Nvfp4Sm107Tp2
 

@@ -40,6 +40,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
+from tensorrt_llm._torch.modeling_v2._features import PrefillCudaGraph
 from tensorrt_llm._torch.modeling_v2._router_index import (
     _RESOLVED_MODES,
     _ROUTES,
@@ -59,6 +60,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MTPDecodingConfig,
     MultimodalConfig,
     NGramDecodingConfig,
+    TorchCompileConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
@@ -264,6 +266,50 @@ def test_a_set_mode_builds_a_target_disabled_by_default(monkeypatch, mode):
     """Setting ``modeling_v2`` is the opt-in, including to the value it defaults to."""
     config = _claimed_by(monkeypatch, _TargetDisabledByDefault)
     assert modeling_v2_resolve(config, _llm_args(mode)) is _TargetDisabledByDefault
+
+
+class _TargetWithoutPrefillCudaGraph:
+    """A target that declares no feature."""
+
+
+def test_a_feature_the_target_does_not_declare_is_refused(monkeypatch):
+    config = _claimed_by(monkeypatch, _TargetWithoutPrefillCudaGraph)
+    assert modeling_v2_resolve(config, _llm_args("require")) is _TargetWithoutPrefillCudaGraph
+    _declined(
+        config,
+        dict(prefill_cuda_graph_backend="breakable"),
+        match="_TargetWithoutPrefillCudaGraph does not support prefill_cuda_graph_backend='breakable'$",
+    )
+
+
+@PrefillCudaGraph.supported()
+class _PrefillTarget:
+    """A step target for the steps with context rows that serves every prefill CUDA graph."""
+
+
+@PrefillCudaGraph.supported(when=lambda feature: not feature.compiles_decode)
+class _DecodeTarget:
+    """A step target for the steps without context rows, which it runs only uncompiled."""
+
+
+class _TargetWithStepTargets:
+    """A deployment whose core hands its steps to ``_PrefillTarget`` and ``_DecodeTarget``."""
+
+    step_targets = (_PrefillTarget, _DecodeTarget)
+
+
+def test_every_step_target_must_serve_the_feature(monkeypatch):
+    """A breakable prefill graph leaves the decode steps uncompiled, so the decode step target
+    serves it; a piecewise one torch.compiles them too unless ``compile_only_piecewise_graphs``
+    keeps them eager."""
+    target = _TargetWithStepTargets
+    config = _claimed_by(monkeypatch, target)
+    breakable = dict(prefill_cuda_graph_backend="breakable")
+    assert modeling_v2_resolve(config, _llm_args("require", **breakable)) is target
+    piecewise = dict(prefill_cuda_graph_backend="piecewise")
+    _declined(config, piecewise, match="_TargetWithStepTargets's _DecodeTarget does not support")
+    piecewise["torch_compile_config"] = TorchCompileConfig(compile_only_piecewise_graphs=True)
+    assert modeling_v2_resolve(config, _llm_args("require", **piecewise)) is target
 
 
 @pytest.mark.parametrize(

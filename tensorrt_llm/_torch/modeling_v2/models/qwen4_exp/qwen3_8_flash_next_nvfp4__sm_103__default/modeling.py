@@ -151,6 +151,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._features import PrefillCudaGraph
 from tensorrt_llm._torch.modeling_v2._router_index import (
     NoTarget,
     engine_kv_cache_quant_algo,
@@ -428,6 +429,7 @@ from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate
 from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -3759,6 +3761,18 @@ class _PrefillStep(NamedTuple):
     live_cols: int | None = None
 
 
+def _prefill_cuda_graph_supported(feature: PrefillCudaGraph) -> bool:
+    """The breakable prefill graph under attention TP.
+
+    'piecewise' makes the engine torch.compile the model, which the target does not implement.
+    Under attention DP the engine pads every rank to one prefill bucket, so a rank holding only
+    generation requests is handed more rows than its batch, which the target's decode step
+    refuses.
+    """
+    return feature.backend == PrefillCudaGraphBackend.BREAKABLE and not feature.attention_dp
+
+
+@PrefillCudaGraph.supported(when=_prefill_cuda_graph_supported)
 class PrefillTarget:
     """Any batch with context rows (`num_contexts > 0`), possibly with generation rows
     beside them."""
@@ -4743,6 +4757,13 @@ class PrefillTarget:
 # ------------------------------------------------------------------- decode ---
 
 
+def _decode_left_uncompiled(feature: PrefillCudaGraph) -> bool:
+    """A prefill graph that leaves the steps without context rows uncompiled; the target does not run under
+    torch.compile."""
+    return not feature.compiles_decode
+
+
+@PrefillCudaGraph.supported(when=_decode_left_uncompiled)
 class DecodeTarget:
     """Generation-only batches (no context rows): one token per sequence, every op inside
     the captured decode graph."""
@@ -6766,6 +6787,9 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
 ):
     """Qwen3.8-Flash-Next-NVFP4 at tp1, tp4, tep4, dep4 or dep2 on sm_103."""
 
+    #: The step targets ``_select_target`` hands the steps to.
+    step_targets = (PrefillTarget, DecodeTarget)
+
     # At tp1 one-engine speculative decoding takes the engine's fast paths (greedy and
     # temperature-only sampling CUDA graph variants, the overlap loop on the execution stream,
     # hoisted position ids, the MTP-Eagle draft loop's step-0 epilogue, the recorded steady
@@ -6831,7 +6855,6 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
         mapping = model_config.mapping
         one_rank = mapping.world_size == 1
         spec = model_config.spec_config
-        prefill_graph = str(llm_args.prefill_cuda_graph_backend.value)
         # The draft loop runs the checkpoint's single MTP module as one linear chain, verified
         # at one width, `max_draft_len + 1` rows a request.
         if spec is not None:
@@ -6859,13 +6882,6 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
                     "acceptance_rate_threshold), but this target's verify step runs at the one "
                     "width max_draft_len + 1"
                 )
-        if mapping.enable_attention_dp and prefill_graph == "breakable":
-            raise NoTarget(
-                f"prefill_cuda_graph_backend='breakable' with attention DP ({layout}): the engine "
-                "pads every rank to one prefill bucket, so a rank holding only generation "
-                "requests is handed more rows than its batch, which the target's decode step "
-                "refuses"
-            )
         kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
         if kv_cache_quant_algo not in (None, QuantAlgo.FP8, QuantAlgo.NVFP4):
             raise NoTarget(
@@ -6901,12 +6917,6 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
                 f"moe_config.load_balancer (EPLB) at {layout}: the target runs fixed contiguous "
                 "expert windows and registers no layer with the balancer, so the placement "
                 "would do nothing"
-            )
-        if prefill_graph == "piecewise":
-            raise NoTarget(
-                "prefill_cuda_graph_backend='piecewise' makes the engine torch.compile the model, "
-                "which the target does not implement; 'breakable' runs the prefill step as a "
-                "breakable CUDA graph"
             )
         mm_config = llm_args.multimodal_config
         if mm_config is not None and mm_config.encoder_attention_backend:

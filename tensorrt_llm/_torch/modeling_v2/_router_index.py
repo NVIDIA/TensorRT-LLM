@@ -46,6 +46,8 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
+from ._features import feature_refusal
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -311,7 +313,9 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
 
     Returns the target class, or None for the built-in implementation:
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
-    for the architecture, or when that ``route`` raises ``NoTarget``.
+    for the architecture, when that ``route`` raises ``NoTarget``, or when the
+    deployment turns on a feature that a step target of the returned class does
+    not declare (``_features``).
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
     It also returns None for a ``@disable_v2_by_default`` target when
     ``modeling_v2`` was left at its default.
@@ -334,6 +338,9 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         target = route(config, llm_args, _device_compute_capability())
         if target is not None:
             _refuse_unhonored_moe_tactics(config, target, arch)
+            refusal = feature_refusal(target, config, llm_args)
+            if refusal is not None:
+                raise NoTarget(refusal)
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

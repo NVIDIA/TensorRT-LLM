@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSABackendF
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._features import PrefillCudaGraph
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.swiglu import swiglu
@@ -130,6 +131,7 @@ _SUPPORTED_TP = (4, 8, 16)
 _LOGITS_EXCHANGE_BYTES = 16 << 20
 
 
+@PrefillCudaGraph.supported()
 class PrefillTarget:
     """Forwards that carry context rows: the decoder stack the context server runs."""
 
@@ -202,6 +204,7 @@ class _DraftState:
     half_done: torch.cuda.Event
 
 
+@PrefillCudaGraph.supported()
 class DecodeTarget:
     """Generation kernels selected from the actual row count and TP mapping.
 
@@ -1756,6 +1759,8 @@ class ModelingV2Glm52Nvfp4Sm107LowLatency(
     # that module, which the steps with context requests run (PrefillTarget).
     moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.nvfp4"})
     draft_moe_impls_honored = frozenset()
+    #: The step targets ``_select_target`` hands the steps to.
+    step_targets = (PrefillTarget, DecodeTarget)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
