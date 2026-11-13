@@ -3410,16 +3410,16 @@
         },
         "mixed_precision_recompute_last_n": {
           "default": false,
-          "description": "With mixed_precision_reuse_last_n_from_low: when the high-precision copy of a reused prefix's last N tokens was evicted, reuse the prefix only up to before them and recompute them, so they keep the high precision. The N tokens before them are restored from the history as context for that recomputation.",
+          "description": "With mixed_precision_reuse_with_optional_last_n: when the high-precision copy of a reused prefix's last N tokens was evicted, reuse the prefix only up to before them and recompute them, so they keep the high precision. The N tokens before them are restored from the history as context for that recomputation.",
           "status": "prototype",
           "title": "Mixed Precision Recompute Last N",
           "type": "boolean"
         },
-        "mixed_precision_reuse_last_n_from_low": {
+        "mixed_precision_reuse_with_optional_last_n": {
           "default": false,
           "description": "Mixed-precision KV and the cold-page first/last-N window: reuse a cached prefix in full even when the high-precision copy of its last N tokens was evicted. Resuming the cache then restores that copy from the history (the low-precision pool, or with the cold-page window the layer's own pages), so those tokens keep the history's precision. When False (default), reuse stops where the high-precision copy is still complete and the rest is recomputed.",
           "status": "prototype",
-          "title": "Mixed Precision Reuse Last N From Low",
+          "title": "Mixed Precision Reuse With Optional Last N",
           "type": "boolean"
         },
         "pool_ratio": {

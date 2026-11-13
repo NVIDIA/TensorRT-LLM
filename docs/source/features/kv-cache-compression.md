@@ -293,7 +293,7 @@ chunk is history, as for a native sliding-window layer. Attention kernels are
 unchanged: the page tables point the first/last tokens at that copy, and each
 step's new tokens are copied into the history pages as well.
 
-`mixed_precision_reuse_last_n_from_low` and `mixed_precision_recompute_last_n`
+`mixed_precision_reuse_with_optional_last_n` and `mixed_precision_recompute_last_n`
 reuse a prefix whose GPU copy of the last N tokens was evicted, as described for
 the [mixed-precision KV cache](kvcache.md).
 

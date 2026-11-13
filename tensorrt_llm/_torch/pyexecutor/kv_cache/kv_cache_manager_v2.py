@@ -2046,7 +2046,7 @@ class KVCacheManagerV2(BaseResourceManager):
     _supports_mixed_precision_kv = False
     # True when the manager's own pool already holds the history in the mixed-precision low format.
     _own_pool_is_mixed_precision_low = False
-    mixed_precision_reuse_last_n_from_low = False
+    mixed_precision_reuse_with_optional_last_n = False
     mixed_precision_recompute_last_n = False
     # Requests whose cache made its one reuse-group selection, at its first resume.
     _mixed_precision_selected: set[int] = set()
@@ -4826,8 +4826,8 @@ class KVCacheManagerV2(BaseResourceManager):
             raise NotImplementedError(f"{requested} is not supported by {type(self).__name__}")
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision KV requires Blackwell")
-        self.mixed_precision_reuse_last_n_from_low = getattr(
-            kv_cache_config, "mixed_precision_reuse_last_n_from_low", False
+        self.mixed_precision_reuse_with_optional_last_n = getattr(
+            kv_cache_config, "mixed_precision_reuse_with_optional_last_n", False
         )
         self.mixed_precision_recompute_last_n = getattr(
             kv_cache_config, "mixed_precision_recompute_last_n", False
@@ -4838,12 +4838,12 @@ class KVCacheManagerV2(BaseResourceManager):
             self.mixed_precision_high_dtype = str_dtype_to_binding(mixed.high)
             # A sparse MLA backend restores rows as its NVFP4 read returns them: FP8.
             if (
-                self.mixed_precision_reuse_last_n_from_low
+                self.mixed_precision_reuse_with_optional_last_n
                 and self._own_pool_is_mixed_precision_low
                 and self.mixed_precision_high_dtype != DataType.FP8
             ):
                 raise NotImplementedError(
-                    "mixed_precision_reuse_last_n_from_low requires FP8 high-precision KV on "
+                    "mixed_precision_reuse_with_optional_last_n requires FP8 high-precision KV on "
                     f"{type(self).__name__}"
                 )
             # The model's KV dtype is the high dtype unless the manager's own pool is the low format.
@@ -4984,7 +4984,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # SINK_REQUIRED_ONLY reuses a prefix whose last-N pages were evicted.
         high_policy = (
             ReusePolicy.SINK_REQUIRED_ONLY
-            if self.mixed_precision_reuse_last_n_from_low
+            if self.mixed_precision_reuse_with_optional_last_n
             else ReusePolicy.REQUIRED
         )
         if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
@@ -5995,7 +5995,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         """Resume context pages; subclasses may select model-specific reuse groups."""
         if (
-            not self.mixed_precision_reuse_last_n_from_low
+            not self.mixed_precision_reuse_with_optional_last_n
             or not req.is_first_context_chunk
             or kv_cache.is_active
             # Only the first resume selects; a cache suspended before its first forward keeps it.

@@ -896,7 +896,7 @@
     {
       "capture_policy": "bool",
       "kind": "value",
-      "path": "kv_cache_config.mixed_precision_reuse_last_n_from_low"
+      "path": "kv_cache_config.mixed_precision_reuse_with_optional_last_n"
     },
     {
       "capture_policy": "list[float]|none",

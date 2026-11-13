@@ -261,10 +261,10 @@ def test_native_common_reuse_and_window_retention(make_manager, policy, reused_t
         assert shortened.resume(stream)
 
 
-def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
+def test_reuse_with_optional_last_n_restores_evicted_window(make_manager):
     """A prefix whose high-precision last-N pages were evicted is reused in full; resuming the
     cache decodes those pages from the low-precision history."""
-    manager = make_manager(config=mixed_config(mixed_precision_reuse_last_n_from_low=True))
+    manager = make_manager(config=mixed_config(mixed_precision_reuse_with_optional_last_n=True))
     block = manager.tokens_per_block
     staging = MixedPrecisionKVStaging(
         manager, Buffers(), rows=1, layout="NHD", pool_layout="NHD", tokens_per_block=block
@@ -315,7 +315,7 @@ def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
     recompute only up to the block boundary before them. The resume restores the window: the
     cold-page window copies the layer's own pages, checked here."""
     options = dict(
-        mixed_precision_reuse_last_n_from_low=True, mixed_precision_recompute_last_n=recompute
+        mixed_precision_reuse_with_optional_last_n=True, mixed_precision_recompute_last_n=recompute
     )
     if window == "mixed_dtype":
         manager = make_manager(config=mixed_config(**options))
@@ -355,7 +355,7 @@ def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
     missing last-N window, and restores its own window there instead of backing off again."""
     draft = make_manager(
         config=mixed_config(
-            mixed_precision_reuse_last_n_from_low=True, mixed_precision_recompute_last_n=True
+            mixed_precision_reuse_with_optional_last_n=True, mixed_precision_recompute_last_n=True
         ),
         is_draft=True,
         joint_kv_cache_reuse=True,
@@ -1042,7 +1042,7 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
 
 
 @pytest.mark.parametrize("high_dtype", [DataType.FP8, DataType.BF16])
-def test_reuse_last_n_from_low_on_sparse_managers(high_dtype):
+def test_reuse_with_optional_last_n_on_sparse_managers(high_dtype):
     """A sparse manager restores an FP8 high pool from its NVFP4 pool; other high dtypes are
     rejected when the manager is built."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
@@ -1051,7 +1051,7 @@ def test_reuse_last_n_from_low_on_sparse_managers(high_dtype):
     def build():
         return DSACacheManagerV2(
             kv_cache_config=mixed_config(
-                high_dtype, pool_ratio=None, mixed_precision_reuse_last_n_from_low=True
+                high_dtype, pool_ratio=None, mixed_precision_reuse_with_optional_last_n=True
             ),
             kv_cache_type=CacheType.SELFKONLY,
             num_layers=1,

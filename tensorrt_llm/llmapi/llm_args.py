@@ -5426,7 +5426,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept "
         "in whole cache pages.")
 
-    mixed_precision_reuse_last_n_from_low: bool = Field(
+    mixed_precision_reuse_with_optional_last_n: bool = Field(
         default=False,
         status="prototype",
         description=
@@ -5441,7 +5441,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=False,
         status="prototype",
         description=
-        "With mixed_precision_reuse_last_n_from_low: when the high-precision copy of a reused "
+        "With mixed_precision_reuse_with_optional_last_n: when the high-precision copy of a reused "
         "prefix's last N tokens was evicted, reuse the prefix only up to before them and recompute "
         "them, so they keep the high precision. The N tokens before them are restored from the "
         "history as context for that recomputation.")
@@ -5848,9 +5848,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 "Mixed-precision KV requires mixed_precision_first_n or "
                 "mixed_precision_last_n to be greater than zero.")
         if (self.mixed_precision_recompute_last_n
-                and not self.mixed_precision_reuse_last_n_from_low):
+                and not self.mixed_precision_reuse_with_optional_last_n):
             raise ValueError("mixed_precision_recompute_last_n requires "
-                             "mixed_precision_reuse_last_n_from_low.")
+                             "mixed_precision_reuse_with_optional_last_n.")
         return self
 
     @field_validator('pool_ratio')
