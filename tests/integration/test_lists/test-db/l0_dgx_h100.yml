@@ -132,6 +132,8 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python
   - disaggregated/test_disaggregated.py::test_disaggregated_context_first_bf16_ownership
+  - disaggregated/test_context_cancellation.py::test_context_first_cancellation_serving[tp1]
+  - disaggregated/test_context_cancellation.py::test_context_first_cancellation_serving[tp2]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4]
   - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_ctx_pp_gen_tp_asymmetric

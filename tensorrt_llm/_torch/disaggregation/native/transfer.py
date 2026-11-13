@@ -1107,6 +1107,14 @@ class Sender(SenderBase):
         if on_submitted is not None:
             with disagg_diagnostics.suppress_diagnostic_errors():
                 on_submitted()
+        if disagg_diagnostics.SUBMISSION_OBSERVER_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.observe_backend_submitted(
+                    task._unique_rid,
+                    self._instance_rank,
+                    peer_rank,
+                    task.slice_id if isinstance(task, KVSendTask) else None,
+                )
         try:
             if not status.wait():
                 # A non-success query is a logical transfer failure, but the

@@ -40,7 +40,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Iterator, Optional, TypeAlias
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, TypeAlias
 
 if TYPE_CHECKING:
     from tensorrt_llm import DisaggregatedParams
@@ -65,6 +65,108 @@ DiagnosticValue: TypeAlias = str | int | float | bool | None
 DiagnosticRecord: TypeAlias = dict[str, DiagnosticValue]
 DiagnosticTimestamp: TypeAlias = tuple[int, int]
 
+# Qualification observers are installed explicitly in owned test processes.
+# Ordinary serving keeps its nonblocking, best-effort diagnostic sink.
+_capture_lock = threading.RLock()
+_capture_observer: Callable[[DiagnosticRecord], None] | None = None
+_capture_sequence = 0
+_capture_errors = 0
+_capture_first_error: str | None = None
+_capture_process_uuid: str | None = None
+_submitted_observer: Callable[[int, int, int, int | None], None] | None = None
+SUBMISSION_OBSERVER_ENABLED = False
+
+
+def install_qualification_observers(
+    capture: Callable[[DiagnosticRecord], None] | None,
+    submitted: Callable[[int, int, int, int | None], None] | None = None,
+) -> None:
+    """Install or clear process-local, test-only observers before serving work.
+
+    Args:
+        capture: Synchronously consume the existing diagnostic schema. The
+            observer must complete writes or raise. Exceptions are counted,
+            never propagated into request ownership or scheduling. Tests must
+            require complete sequences and a zero-error checkpoint per process.
+        submitted: Optional bounded hold point called with the stable request
+            ID, local rank, peer rank and piece ID. Backends call it only after
+            rooting the returned status and outside ownership locks, before
+            observing completion. It supplies no completion or fencing evidence.
+
+    Installation requires diagnostics enabled. Reset observers after the owned
+    test has stopped submitting work. Only the native backend binds this hook.
+    """
+    global _capture_observer, _submitted_observer
+    global _capture_sequence, _capture_errors, _capture_first_error, _capture_process_uuid
+    global SUBMISSION_OBSERVER_ENABLED
+    if capture is not None and not DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+        raise ValueError("qualification capture requires enabled diagnostics")
+    if submitted is not None and capture is None:
+        raise ValueError("a submitted observer requires reliable diagnostic capture")
+    with _capture_lock:
+        _capture_observer = capture
+        _submitted_observer = submitted
+        SUBMISSION_OBSERVER_ENABLED = submitted is not None
+        _capture_sequence = 0
+        _capture_errors = 0
+        _capture_first_error = None
+        _capture_process_uuid = str(uuid.uuid4()) if capture is not None else None
+
+
+def _record_capture_error(error: Exception) -> None:
+    global _capture_errors, _capture_first_error
+    if _capture_observer is not None:
+        with _capture_lock:
+            _capture_errors += 1
+            if _capture_first_error is None:
+                _capture_first_error = type(error).__name__
+
+
+def _capture_record(record: DiagnosticRecord) -> bool:
+    """Return whether qualification owns this record, including failed writes."""
+    global _capture_sequence, _capture_errors
+    if _capture_observer is None:
+        return False
+    with _capture_lock:
+        if _capture_observer is None:
+            return False
+        _capture_sequence += 1
+        record.update(
+            capture_sequence=_capture_sequence,
+            capture_errors=_capture_errors,
+            capture_first_error=_capture_first_error,
+            process_uuid=_capture_process_uuid,
+            run_uuid=os.getenv(_DIAGNOSTICS_RUN_ID_ENV),
+            host=_host_identity(),
+        )
+        try:
+            _capture_observer(record)
+        except Exception as error:
+            # A later checkpoint exposes this loss; request progress is intact.
+            _record_capture_error(error)
+    return True
+
+
+def observe_backend_submitted(
+    request_id: int | None, rank: int, peer_rank: int, piece_id: int | None
+) -> None:
+    """Notify an explicitly installed qualification hold point after rooting.
+
+    The callback may delay completion observation, not backend DMA. It runs
+    without the capture lock so other threads can report cancellation/release.
+    Callback failures are latched for qualification, never ownership decisions.
+    """
+    observer = _submitted_observer
+    if observer is None:
+        return
+    if request_id is None:
+        _record_capture_error(ValueError("submitted observer requires a stable request ID"))
+        return
+    try:
+        observer(request_id, rank, peer_rank, piece_id)
+    except Exception as error:
+        _record_capture_error(error)
+
 
 @contextmanager
 def suppress_diagnostic_errors() -> Iterator[None]:
@@ -76,8 +178,9 @@ def suppress_diagnostic_errors() -> Iterator[None]:
     """
     try:
         yield
-    except Exception:
+    except Exception as error:
         # Diagnostics are best-effort and must never affect request progress.
+        _record_capture_error(error)
         return
 
 
@@ -426,9 +529,14 @@ _sink: Optional[_AsyncDiagnosticSink] = None
 
 def _reset_sink_after_fork() -> None:
     """Discard inherited thread and lock state in a forked child."""
-    global _sink, _sink_lock
+    global _sink, _sink_lock, _capture_lock, _capture_observer, _submitted_observer
+    global SUBMISSION_OBSERVER_ENABLED
     _sink = None
     _sink_lock = threading.Lock()
+    _capture_lock = threading.RLock()
+    _capture_observer = None
+    _submitted_observer = None
+    SUBMISSION_OBSERVER_ENABLED = False
 
 
 def _get_sink(pid: int) -> _AsyncDiagnosticSink:
@@ -529,7 +637,9 @@ def emit_event(
         if peer_rank is not None:
             record["peer_rank"] = peer_rank
         record.update(details)
-        _get_sink(pid).submit(record)
-    except Exception:
+        if not _capture_record(record):
+            _get_sink(pid).submit(record)
+    except Exception as error:
         # Diagnostics are best-effort and must never affect request progress.
+        _record_capture_error(error)
         return

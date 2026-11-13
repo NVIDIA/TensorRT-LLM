@@ -198,6 +198,14 @@ class RetirementDeadline:
             self.controller._owners.discard(self)
             return True
 
+    def diagnostic_snapshot(self) -> tuple[bool, str, bool]:
+        """Read closure, first drain cause and fatal status without advancing time.
+
+        This is diagnostic metadata, not permission to release any resource.
+        """
+        with self.lock:
+            return self._closed, self._reason, self.controller.fatal is not None
+
     def _check_locked(self, now: float) -> None:
         """Latch expiry using metadata only while holding the shared arbiter.
 

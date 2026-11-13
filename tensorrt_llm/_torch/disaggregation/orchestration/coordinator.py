@@ -1249,6 +1249,10 @@ class DisaggTransferCoordinator:
             return False
         if request.py_request_id in self._transfers.requests_in_transfer():
             self._context_cancellation_drains.add(request.py_request_id)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            disagg_diagnostics.emit_request_event(
+                "logical_cancellation_accepted", request, side="ctx", dist=self._dist
+            )
         return True
 
     def inflight_cancel_active(self) -> bool:
@@ -1342,6 +1346,10 @@ class DisaggTransferCoordinator:
             return outcome
         if not self.request_cancellation(request):
             self._retiring_gen_receives[request.py_request_id] = request
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            disagg_diagnostics.emit_request_event(
+                "logical_cancellation_accepted", request, side="gen", dist=self._dist
+            )
         return outcome
 
     def defer_gen_termination(self, request: LlmRequest) -> bool:

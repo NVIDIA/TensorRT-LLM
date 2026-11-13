@@ -12294,6 +12294,17 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     cache_indirection_buffer):
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    for request in scheduled_requests.all_requests():
+                        if request.py_disaggregated_params is not None:
+                            disagg_diagnostics.emit_request_event(
+                                "request_model_dispatch",
+                                request,
+                                side="ctx"
+                                if request.is_context_only_request else "gen",
+                                rank=self.global_rank,
+                                dist=self.dist)
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
@@ -12887,12 +12898,27 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        diagnostic_was_owned = None
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if isinstance(self.kv_cache_manager, KVCacheManagerV2):
+                    diagnostic_was_owned = request.py_request_id in self.kv_cache_manager.kv_cache_map
         connector = getattr(self, "kv_connector_manager", None)
         if (self.enable_attention_dp and connector is not None
                 and connector.has_pending_transfers(request.request_id)):
             self._kv_connector_fail(
                 f"Attempted to release request {request.request_id} with pending DMA"
             )
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if request.py_disaggregated_params is not None:
+                    disagg_diagnostics.emit_request_event(
+                        "request_resource_release_started",
+                        request,
+                        side="ctx"
+                        if request.is_context_only_request else "gen",
+                        rank=self.global_rank,
+                        dist=self.dist)
         self.sampler.release_request(request)
         self.resource_manager.free_resources(request)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
@@ -12915,6 +12941,28 @@ class PyExecutor:
                               "release_request_state", None)
             if release is not None:
                 release(request.py_request_id)
+
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if request.py_disaggregated_params is not None:
+                    manager = self.kv_cache_manager
+                    transfers = self.async_transfer_manager
+                    disagg_diagnostics.emit_request_event(
+                        "request_resources_released",
+                        request,
+                        side="ctx"
+                        if request.is_context_only_request else "gen",
+                        rank=self.global_rank,
+                        dist=self.dist,
+                        was_owned=diagnostic_was_owned,
+                        kv_owned=(request.py_request_id
+                                  in manager.kv_cache_map if isinstance(
+                                      manager, KVCacheManagerV2) else None),
+                        transfer_owned=(request.py_request_id
+                                        in transfers.requests_in_transfer()
+                                        if transfers is not None else None),
+                        transfer_timed_out=request.py_kv_transfer_timed_out,
+                        state=request.state.name)
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
         self._free_request_resources(request)
@@ -13452,15 +13500,45 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            responses = list(responses)
         merged, self._merged_transfer_flush = self._merged_transfer_flush, None
         if merged is None:
             self._gather_and_publish_responses(responses)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                self._emit_response_diagnostics(responses)
             return
         # A merged transfer flush: its responses go first in the gather and its
         # requests terminate after the gather has published them.
-        self._gather_and_publish_responses(merged[0] + list(responses))
+        responses = merged[0] + list(responses)
+        self._gather_and_publish_responses(responses)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            self._emit_response_diagnostics(responses)
         for request in merged[1]:
             self._terminate_request(request)
+
+    def _emit_response_diagnostics(
+            self, responses: Iterable[Tuple[int, LlmResponse]]) -> None:
+        """Observe each rank's enqueued result, not remote client receipt or release."""
+        if not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            return
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            for request_id, response in responses:
+                if response is None:
+                    continue
+                result = None if response.result is None else response.result.get_result(
+                )
+                disagg_diagnostics.emit_event(
+                    "request_response_enqueued",
+                    side="executor",
+                    request_id=None,
+                    local_request_id=request_id,
+                    rank=self.global_rank,
+                    error=response.error_msg,
+                    terminal=response.result is None
+                    or response.result.is_final,
+                    finish_reasons="" if result is None else "|".join(
+                        reason.name for reason in result.finish_reasons))
 
     def _gather_and_publish_responses(self,
                                       responses: Iterable[Tuple[int,
