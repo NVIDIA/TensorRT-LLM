@@ -632,8 +632,11 @@ def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary
     )
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
-    executor.kv_cache_manager = Mock(spec=["update_resources", "is_preemption_pending"])
+    executor.kv_cache_manager = Mock(
+        spec=["update_resources", "is_preemption_pending", "has_pending_preemption"]
+    )
     executor.kv_cache_manager.is_preemption_pending.return_value = False
+    executor.kv_cache_manager.has_pending_preemption.return_value = False
     executor.resource_manager = Mock(spec=["free_resources", "update_resources"])
     executor.model_engine.attn_metadata = object()
     executor.model_engine.kv_cache_dtype_byte_size = 2
@@ -701,8 +704,11 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
     executor.sampler.update_requests = sampler.update_requests
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
-    executor.kv_cache_manager = Mock(spec=["update_resources", "is_preemption_pending"])
+    executor.kv_cache_manager = Mock(
+        spec=["update_resources", "is_preemption_pending", "has_pending_preemption"]
+    )
     executor.kv_cache_manager.is_preemption_pending.return_value = False
+    executor.kv_cache_manager.has_pending_preemption.return_value = False
     executor.resource_manager = Mock(spec=["free_resources", "update_resources"])
     executor.model_engine.attn_metadata = object()
     executor.model_engine.kv_cache_dtype_byte_size = 2
