@@ -15,6 +15,9 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     disable_v2_by_default,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.dspark import (
+    dflash_merge as _dflash_merge,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.dspark import (
     dspark_glue_install as _dsg,
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
@@ -404,6 +407,7 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep(MiniMaxM3VLForConditionalGeneration
         self._pad_mask = _pad.PadMask(mapping.rank)
         self._pad_layers = 0
         _install_sampler_overrides()
+        self._dflash_merge = _dflash_merge.install()
 
     def cache_derived_state(self) -> None:
         """The built-in model's derived state, then, once the weights are real and before the executor sizes its KV
@@ -567,6 +571,10 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep(MiniMaxM3VLForConditionalGeneration
             else _dsg.engagement(self._dspark_glue)
         )
         logger.info(f"[M3.1 DEP] rank {self._rank}: DEP_DSPARK_GLUE drafter glue {glue}")
+        logger.info(
+            f"[M3.1 DEP] rank {self._rank}: NATIVE_DFLASH_MERGE drafter non-causal block merge "
+            f"{'on' if getattr(self, '_dflash_merge', False) else 'not installed'}"
+        )
         logger.info(
             f"[M3.1 DEP] rank {self._rank}: DEP_DRAFTER_MXFP8 drafter projections {_mxd.engagement(self._mxdraft)}"
         )
