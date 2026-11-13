@@ -31,16 +31,17 @@ class QueuedLoadTracker:
     """Incremental (requests, tokens) totals for the requests in a waiting queue.
 
     Queue-depth statistics are read on every sampled iteration, so the totals
-    are maintained on insert/remove instead of rescanning the queue. Entries are
-    keyed by request id; re-adding a present id is a no-op and removing an
-    absent id is ignored, so the put-back path (pop, then prepend) stays
-    consistent. Items without a readable ``input_token_ids`` are not counted,
-    matching the former per-sample scan.
+    are maintained on insert/remove instead of rescanning the queue. Entries
+    are keyed by request id and an id counts once however many queued items
+    share it (its tokens are those of the first one added); it stops counting
+    when the last of them leaves. Removing an absent id is ignored, so the
+    put-back path (pop, then prepend) stays consistent. Items without a
+    readable ``input_token_ids`` are not counted.
     """
 
     def __init__(self) -> None:
-        # request id -> (is_generation_only, tokens)
-        self._entries: dict[int, tuple[bool, int]] = {}
+        # request id -> [is_generation_only, tokens, queued items with this id]
+        self._entries: dict[int, list] = {}
         self.num_ctx_requests = 0
         self.num_ctx_tokens = 0
         self.num_gen_requests = 0
@@ -50,7 +51,11 @@ class QueuedLoadTracker:
         return request_id in self._entries
 
     def add(self, item: RequestQueueItem) -> None:
-        if item.id in self._entries or not item.is_normal_request or item.request is None:
+        if not item.is_normal_request or item.request is None:
+            return
+        entry = self._entries.get(item.id)
+        if entry is not None:
+            entry[2] += 1
             return
         try:
             tokens = int(item.request.num_input_tokens)
@@ -61,12 +66,17 @@ class QueuedLoadTracker:
                 f"input_token_ids not readable ({type(e).__name__})"
             )
             return
-        self._entries[item.id] = (is_gen, tokens)
+        self._entries[item.id] = [is_gen, tokens, 1]
         self._apply(is_gen, tokens, 1)
 
-    def discard(self, request_id: int) -> None:
-        entry = self._entries.pop(request_id, None)
-        if entry is not None:
+    def discard(self, request_id: int, *, all_items: bool = False) -> None:
+        """Account for one queued item with this id leaving, or all of them."""
+        entry = self._entries.get(request_id)
+        if entry is None:
+            return
+        entry[2] -= 1
+        if all_items or entry[2] <= 0:
+            del self._entries[request_id]
             self._apply(entry[0], entry[1], -1)
 
     def _apply(self, is_gen: bool, tokens: int, sign: int) -> None:
@@ -196,7 +206,8 @@ class FCFSWaitingQueue(deque, WaitingQueue):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.queued_load = QueuedLoadTracker()
-        for item in self:
+        # deque's own iterator: a subclass may override __iter__.
+        for item in deque.__iter__(self):
             self.queued_load.add(item)
 
     @staticmethod
@@ -261,7 +272,7 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         self.clear()
         self.extend(filtered_requests)
         for request_id in request_ids:
-            self.queued_load.discard(request_id)
+            self.queued_load.discard(request_id, all_items=True)
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
@@ -385,7 +396,7 @@ class PriorityWaitingQueue(WaitingQueue):
         self._heap = [e for e in self._heap if e[2].id not in request_ids]
         heapq.heapify(self._heap)
         for request_id in request_ids:
-            self.queued_load.discard(request_id)
+            self.queued_load.discard(request_id, all_items=True)
 
     def __bool__(self) -> bool:
         return len(self._heap) > 0

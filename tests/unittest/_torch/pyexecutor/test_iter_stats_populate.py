@@ -89,6 +89,7 @@ class _StubRequest:
         context_remaining_length: int = 0,
         is_disagg_generation_init_state: bool = False,
         is_finished: bool = False,
+        state=None,
         num_draft_tokens: int = 0,
         py_draft_tokens=None,
         py_num_accepted_draft_tokens=None,
@@ -99,6 +100,7 @@ class _StubRequest:
         self.context_remaining_length = context_remaining_length
         self.is_disagg_generation_init_state = is_disagg_generation_init_state
         self.is_finished = is_finished
+        self.state = state
         self.is_child = False
         self.context_current_position = context_current_position
         # py_last_context_chunk = (begin_compute, end_compute). For a fresh
@@ -171,10 +173,13 @@ class _StubQueueItem:
             from tensorrt_llm.bindings.executor import RequestType
 
             request_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+        from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+
         self.request = types.SimpleNamespace(
             input_token_ids=input_token_ids,
             num_input_tokens=len(input_token_ids),
             request_type=request_type,
+            priority=DEFAULT_REQUEST_PRIORITY,
         )
         self.is_normal_request = is_normal_request
         self.is_canceled_request = False
@@ -194,6 +199,7 @@ def _build_fake_self(
     rank=0,
     canceled_ids=(),
     inflight_ids=(),
+    parked_items=(),
 ):
     """Minimal 'self' for ``PyExecutor._update_iter_stats(self, ...)``.
 
@@ -233,6 +239,7 @@ def _build_fake_self(
 
     fake.waiting_queue = FCFSWaitingQueue()
     fake.waiting_queue.add_requests(waiting_items)
+    fake.request_accumulated = list(parked_items)
     fake.active_requests = list(active_requests)
     fake.canceled_req_ids = list(canceled_ids)
     fake.inflight_req_ids = set(inflight_ids)
@@ -256,6 +263,8 @@ def _invoke_update_iter_stats(
     rank=0,
     canceled_ids=(),
     inflight_ids=(),
+    parked_items=(),
+    current_batch=None,
 ):
     """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
 
@@ -297,6 +306,7 @@ def _invoke_update_iter_stats(
         rank=rank,
         canceled_ids=canceled_ids,
         inflight_ids=inflight_ids,
+        parked_items=parked_items,
     )
 
     stats = IterationStats()
@@ -318,6 +328,7 @@ def _invoke_update_iter_stats(
             scheduled_batch=scheduled_batch,
             micro_batch_id=0,
             scheduled_batch_stats=scheduled_batch_stats,
+            current_batch=current_batch,
         )
     return stats
 
@@ -532,6 +543,132 @@ def test_attention_dp_local_backlog_excludes_replicated_waiting_queue():
     )
     assert stats.inflight_batching_stats.num_queued_context_requests == 1
     assert stats.inflight_batching_stats.num_queued_ctx_tokens == 300
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_queued_includes_requests_parked_behind_control_request(enable_attention_dp):
+    """Requests fetched after a control request stay queued while it drains."""
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+        CONTROL_REQUEST_ID,
+        RequestQueueItem,
+    )
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm.bindings.executor import RequestType
+
+    def normal(req_id, num_tokens, request_type=RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION):
+        return RequestQueueItem(
+            req_id,
+            types.SimpleNamespace(num_input_tokens=num_tokens, request_type=request_type),
+        )
+
+    envelope = [
+        RequestQueueItem(CONTROL_REQUEST_ID),
+        normal(1_000_001, 200),
+        normal(1_000_002, 300, RequestType.REQUEST_TYPE_GENERATION_ONLY),
+        normal(1_000_003, 400),
+        RequestQueueItem(1_000_003, is_canceled_request=True),
+        RequestQueueItem(CONTROL_REQUEST_ID),
+    ]
+    fetcher = types.SimpleNamespace(
+        control_requests=[],
+        request_accumulated=[],
+        dist=types.SimpleNamespace(rank=0),
+    )
+    assert PyExecutor._handle_special_queue_items(fetcher, envelope) == []
+    assert len(fetcher.control_requests) == 1
+    assert fetcher.request_accumulated == envelope[1:]
+
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [_StubQueueItem(list(range(100)))],  # Arrived during the drain; still in ingress.
+        num_ctx_tokens=0,
+        enable_attention_dp=enable_attention_dp,
+        parked_items=fetcher.request_accumulated,
+    )
+    ifb = stats.inflight_batching_stats
+    # The cancelled request and the second control item are not backlog.
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 300
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 300
+    assert stats.num_queued_requests == 3
+
+
+def test_queued_excludes_current_overlap_batch():
+    """The previous batch's record must not report the batch now running as queued."""
+    previous = _StubRequest(num_tokens=1000)
+    # Admitted after the previous batch was built. A non-final chunk is in the
+    # current forward pass, so the request is still context-init with tokens left.
+    chunking = _StubRequest(is_context_init_state=True, context_remaining_length=64)
+    # Paused by the current batch, which resets them to context-init.
+    paused_now = _StubRequest(is_context_init_state=True, context_remaining_length=700)
+    recompute_paused_now = _StubRequest(is_context_init_state=True, context_remaining_length=900)
+    waiting = _StubRequest(is_context_init_state=True, context_remaining_length=300)
+
+    def collect(current_batch):
+        return _invoke_update_iter_stats(
+            _StubScheduledBatch(gen_reqs=[previous]),
+            [],
+            num_ctx_tokens=0,
+            active_requests=[previous, chunking, paused_now, recompute_paused_now, waiting],
+            current_batch=current_batch,
+        )
+
+    stats = collect(
+        _StubScheduledBatch(
+            context_reqs=[chunking],
+            paused_reqs=[paused_now],
+            recompute_paused_reqs=[recompute_paused_now],
+        )
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 1
+    assert ifb.num_queued_ctx_tokens == 300
+    assert stats.num_queued_requests == 1
+    # The scheduled counters still describe the previous batch only.
+    assert ifb.num_gen_requests == 1
+    assert ifb.num_context_requests == 0
+    assert ifb.num_paused_requests == 0
+
+    # Without a running batch (non-overlap, drain paths) all four are backlog.
+    ifb = collect(None).inflight_batching_stats
+    assert ifb.num_queued_context_requests == 4
+    assert ifb.num_queued_ctx_tokens == 64 + 700 + 900 + 300
+
+
+@pytest.mark.parametrize("enable_attention_dp,rank", [(False, 0), (True, 1)])
+def test_queued_counts_gen_first_context_waiting_for_peer(enable_attention_dp, rank):
+    """A generation-first context request parked until its peer is ready is unscheduled prefill."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+
+    waiting_for_peer = _StubRequest(
+        context_remaining_length=400,
+        state=LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+    )
+    promoted = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=300,
+        state=LlmRequestState.CONTEXT_INIT,
+    )
+    canceled = _StubRequest(
+        context_remaining_length=999,
+        state=LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+    )
+    decode = _StubRequest(num_tokens=1000, state=LlmRequestState.GENERATION_IN_PROGRESS)
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [],
+        num_ctx_tokens=0,
+        enable_attention_dp=enable_attention_dp,
+        rank=rank,
+        active_requests=[waiting_for_peer, promoted, canceled, decode],
+        canceled_ids=[canceled.py_request_id],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 700
+    assert ifb.num_queued_gen_requests == 0
+    assert stats.num_queued_requests == 2
 
 
 def test_queued_routes_by_request_type():
@@ -983,6 +1120,172 @@ def test_attention_dp_fanout_preserves_rank_local_kv_snapshots(
         assert cross.reused_blocks == expected_cross.reused_blocks
         assert cross.missed_blocks == expected_cross.missed_blocks
         assert cross.cache_hit_rate == expected_cross.cache_hit_rate
+
+
+def _exchange_idle_heartbeat(buffers, *, iter_id=9, idle_heartbeat=True, busy_rank=None):
+    """Queue a zero-duration snapshot on every rank and fan it out on rank 0."""
+    states = []
+    for rank, buffer in enumerate(buffers):
+        stats = _make_adp_iteration_stats(
+            iter_id=iter_id, num_gen_requests=1 if rank == busy_rank else 0
+        )
+        stats.kv_cache_stats = _make_kv_cache_snapshot(rank * 10)
+        buffer.queue(
+            stats,
+            is_rank0=rank == 0,
+            host_step_time_ms=0.0,
+            prev_device_step_time_ms=0.0,
+            gpu_forward_time_ms=0.0,
+            idle_heartbeat=idle_heartbeat,
+        )
+        states.append(RankState(rank=rank, iter_stats=buffer.next_payload()))
+    # Every rank finalizes the same gathered states; only rank 0 gets rows.
+    for buffer in buffers[1:]:
+        assert buffer.finalize(states, is_rank0=False) == []
+        assert buffer.last_idle_rank_states is None
+    return buffers[0].finalize(states, is_rank0=True)
+
+
+def test_attention_dp_idle_heartbeat_repeats_per_rank_rows_without_an_exchange():
+    """Rank 0 repeats the exchanged idle rows from its own fresh snapshot."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    exchanged = _exchange_idle_heartbeat(buffers)
+    assert [record.attention_dp_rank for record in exchanged] == [0, 1]
+    assert buffers[0].last_idle_rank_states is not None
+    assert buffers[0].next_payload() is None
+
+    fresh = _make_adp_iteration_stats(iter_id=10)
+    fresh.timestamp = "fresh"
+    fresh.gpu_mem_usage = 4321
+    fresh.kv_cache_stats = _make_kv_cache_snapshot(5)
+    repeated = buffers[0].make_idle_heartbeat_records(fresh)
+
+    assert [record.attention_dp_rank for record in repeated] == [0, 1]
+    for rank, record in enumerate(repeated):
+        assert record.stats.timestamp == "fresh"
+        assert record.stats.iter == 10
+        assert record.stats.gpu_mem_usage == 4321
+        assert record.stats.iter_latency_ms == 0
+        assert record.stats.inflight_batching_stats.num_scheduled_requests == 0
+        assert record.req_stats is None and record.kv_iter_stats is None
+        assert (record.host_step_time_ms, record.prev_device_step_time_ms) == (0.0, 0.0)
+        assert record.gpu_forward_time_ms == 0.0
+    # Rank 0's row follows its fresh snapshot; the parked peer keeps its own.
+    assert (
+        repeated[0].stats.kv_cache_stats.used_num_blocks
+        == _make_kv_cache_snapshot(5).used_num_blocks
+    )
+    assert (
+        repeated[1].stats.kv_cache_stats.used_num_blocks
+        == _make_kv_cache_snapshot(10).used_num_blocks
+    )
+    # Each repeat owns its rows: a later heartbeat does not rewrite this one.
+    later = _make_adp_iteration_stats(iter_id=10)
+    later.timestamp = "later"
+    assert buffers[0].make_idle_heartbeat_records(later)[1].stats.timestamp == "later"
+    assert repeated[1].stats.timestamp == "fresh"
+
+
+@pytest.mark.parametrize("case", ["measured", "peer-scheduled", "nothing-pending"])
+def test_attention_dp_idle_rows_expire_with_the_next_fanout(case):
+    """Only the latest fanout, and only an all-rank idle one, may be repeated."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    _exchange_idle_heartbeat(buffers)
+    assert buffers[0].last_idle_rank_states is not None
+
+    if case == "measured":
+        records = _exchange_idle_heartbeat(buffers, iter_id=10, idle_heartbeat=False)
+        assert len(records) == 2
+    elif case == "peer-scheduled":
+        records = _exchange_idle_heartbeat(buffers, iter_id=10, busy_rank=1)
+        assert len(records) == 2
+    else:
+        assert buffers[0].finalize([RankState(rank=0), RankState(rank=1)], is_rank0=True) == []
+
+    assert buffers[0].last_idle_rank_states is None
+    assert not buffers[0].last_fanout_is_queue_snapshot
+    assert buffers[0].make_idle_heartbeat_records(_make_adp_iteration_stats(iter_id=11)) == []
+
+
+def test_attention_dp_pending_idle_heartbeat_is_superseded_on_every_rank():
+    """A second pending heartbeat would keep the buffers from ever draining."""
+    for is_rank0 in (True, False):
+        buffer = ADPIterStatsBuffer()
+        buffer.queue(_make_adp_iteration_stats(iter_id=8, num_gen_requests=1), is_rank0=is_rank0)
+        for iter_id in (9, 10, 11):
+            buffer.queue(
+                _make_adp_iteration_stats(iter_id=iter_id),
+                is_rank0=is_rank0,
+                idle_heartbeat=True,
+            )
+        # The measured record stays; only the newest heartbeat is behind it.
+        assert sorted(buffer._payloads) == [8, 11]
+        assert buffer.next_payload().iter_stats_iter == 8
+
+
+def test_attention_dp_finalize_reports_whether_it_settled_an_iteration():
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    idle_states = [RankState(rank=0), RankState(rank=1)]
+    assert buffers[0].finalize(idle_states, is_rank0=True) == []
+    assert not buffers[0].last_finalize_settled
+
+    # Rank 1 has no record for rank 0's iteration yet: nothing is settled.
+    buffers[0].queue(_make_adp_iteration_stats(iter_id=9, num_gen_requests=1), is_rank0=True)
+    waiting = [RankState(rank=0, iter_stats=buffers[0].next_payload()), RankState(rank=1)]
+    for rank, buffer in enumerate(buffers):
+        assert buffer.finalize(waiting, is_rank0=rank == 0) == []
+        assert not buffer.last_finalize_settled
+
+    # Rank 1 answers with a placeholder on the next exchange.
+    aligned = [
+        RankState(rank=rank, iter_stats=buffer.next_payload())
+        for rank, buffer in enumerate(buffers)
+    ]
+    assert len(buffers[0].finalize(aligned, is_rank0=True)) == 2
+    assert buffers[0].last_finalize_settled
+
+
+def test_attention_dp_snapshot_sharing_an_iteration_with_measured_work_is_not_a_queue_snapshot():
+    """A peer's measured row must not be rate-limited away with rank 0's snapshot."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    buffers[0].queue(
+        _make_adp_iteration_stats(iter_id=9, num_queued_context_requests=1),
+        is_rank0=True,
+        allow_empty_heartbeat=False,
+    )
+    buffers[1].queue(_make_adp_iteration_stats(iter_id=9, num_gen_requests=3), is_rank0=False)
+    states = [
+        RankState(rank=rank, iter_stats=buffer.next_payload())
+        for rank, buffer in enumerate(buffers)
+    ]
+
+    records = buffers[0].finalize(states, is_rank0=True)
+
+    assert [record.attention_dp_rank for record in records] == [0, 1]
+    assert records[1].stats.inflight_batching_stats.num_gen_requests == 3
+    assert not buffers[0].last_fanout_is_queue_snapshot
+    assert buffers[0].last_idle_rank_states is None
+
+
+def test_attention_dp_fanout_marks_busy_queue_snapshots():
+    """Only a zero-duration snapshot of a busy engine is a queue snapshot."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    states = []
+    for rank, buffer in enumerate(buffers):
+        stats = _make_adp_iteration_stats(iter_id=9, num_queued_context_requests=rank)
+        buffer.queue(stats, is_rank0=rank == 0, allow_empty_heartbeat=False)
+        states.append(RankState(rank=rank, iter_stats=buffer.next_payload()))
+
+    records = buffers[0].finalize(states, is_rank0=True)
+
+    # Rank 0's row carries the summed backlog; the empty peer row is dropped.
+    assert [record.attention_dp_rank for record in records] == [0]
+    assert records[0].stats.inflight_batching_stats.num_queued_context_requests == 1
+    assert buffers[0].last_fanout_is_queue_snapshot
+    assert buffers[0].last_idle_rank_states is None
+
+    _exchange_idle_heartbeat([buffers[0], ADPIterStatsBuffer()], iter_id=10)
+    assert not buffers[0].last_fanout_is_queue_snapshot
 
 
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
@@ -1457,6 +1760,7 @@ def test_queued_scan_skips_unreadable_active_request_state():
         parent_request_id = None
         is_child = False
         is_finished = False
+        state = None
         is_context_init_state = True
         is_disagg_generation_init_state = False
 

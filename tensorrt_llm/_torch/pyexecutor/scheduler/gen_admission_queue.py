@@ -512,7 +512,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._order = None
         self._entries = [e for e in self._entries if e[4].id not in request_ids]
         for request_id in request_ids:
-            self.queued_load.discard(request_id)
+            self.queued_load.discard(request_id, all_items=True)
 
     def __bool__(self) -> bool:
         return len(self) > 0

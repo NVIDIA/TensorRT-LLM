@@ -373,7 +373,7 @@ class TestRankState:
             connector_poll_failed=True,
         )
         wire = state.serialize(include_kv_cache_load)
-        assert wire[4] == -3
+        assert wire[5] == -3  # Payload version follows the five-field rank prefix.
         assert RankState.deserialize(wire) == state
         with pytest.raises(ValueError, match="four trailing fields"):
             RankState.deserialize(wire[:-1])
@@ -386,7 +386,7 @@ class TestRankState:
         payload = RankIterStatsPayload(has_pending_work=True)
         state = RankState(rank=1, iter_stats=payload, num_connector_transfers=7)
         wire = state.serialize(include_kv_cache_load)
-        assert wire[4] == -3
+        assert wire[5] == -3  # Payload version follows the five-field rank prefix.
         assert RankState.deserialize(wire) == state
         assert not RankState.deserialize(wire).iter_stats.has_iter_stats
 

@@ -39,6 +39,8 @@ def _make_stub_executor(rank=0, queued_items=None):
     stub.canceled_req_ids = []
     stub._disable_mpi = False
     stub.is_shutdown = False
+    # Iteration stats off: the idle wait publishes no heartbeats.
+    stub.enable_iter_perf_stats = False
     stub.dist = Mock(rank=rank)
     stub.hang_detector = MagicMock()
     stub.executor_request_queue = Mock()
