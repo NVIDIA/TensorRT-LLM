@@ -585,3 +585,38 @@ def test_ultra_nvfp4_refuses_another_moe_backend(_on_sm107):
 def test_ultra_nvfp4_on_sm103_does_not_match(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
     _refused(_nvfp4_config(**_TEP4), r"compute capability \(10, 3\)", kv_cache_config=_nvfp4_kv())
+
+
+# An RL engine: the weight-sync worker extension streams partial checkpoints into the built model.
+_RL_WEIGHT_SYNC = dict(
+    orchestrator_type="ray",
+    ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+)
+
+
+@pytest.mark.parametrize(
+    "mapping", [_TEP8, _TP8EP2, _DEP16, _DEP32], ids=["tep8", "tp8ep2", "dep16", "dep32"]
+)
+def test_ultra_bf16_refuses_in_flight_weight_updates(mapping):
+    """The targets load a whole checkpoint only, so an RL engine keeps the built-in model in auto
+    and fails at build in require, not at its first weight sync."""
+    config = _model_config(_ultra_bf16_config(), **mapping)
+    _refused(config, "ray_worker_extension_cls", **_RL_WEIGHT_SYNC)
+
+
+def test_ultra_nvfp4_refuses_in_flight_weight_updates(_on_sm107):
+    config = _nvfp4_config(**_DEP4)
+    _refused(config, "ray_worker_extension_cls", kv_cache_config=_nvfp4_kv(), **_RL_WEIGHT_SYNC)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "mapping, target",
+    [(_TEP8, _ULTRA_BF16_TARGET), (_DEP16, _ULTRA_BF16_DEP16_TARGET)],
+    ids=["tep8", "dep16"],
+)
+def test_ultra_bf16_ray_engine_without_an_extension_keeps_its_target(mapping, target, mode):
+    """The refusal follows the weight-sync extension, not the Ray orchestrator."""
+    config = _model_config(_ultra_bf16_config(), **mapping)
+    llm_args = _llm_args(mode, orchestrator_type="ray")
+    assert _qualified(modeling_v2_resolve(config, llm_args)) == target
