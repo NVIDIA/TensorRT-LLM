@@ -4906,8 +4906,8 @@ class KVCacheManagerV2(BaseResourceManager):
             for local_layer in self.mixed_precision_high_layers
         }
         for source_layer in sorted(source_layers):
-            pool_id = int(self.impl.get_layer_group_id(source_layer))
-            for layer_id in self.impl.layer_grouping[pool_id]:
+            pool_id = self._get_layer_execution_group(source_layer)
+            for layer_id in self._layer_ids_by_group[pool_id]:
                 if int(layer_id) not in source_layers:
                     raise ValueError(
                         f"Layer {int(layer_id)} takes no first/last-N mixed precision but shares KV "
@@ -4937,7 +4937,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             self.mixed_precision_high_layer_offsets[local_layer] = int(high_converter.layer_offset)
             block_delta = int(high_converter.layer_offset) - int(source_converter.layer_offset)
-            pool_id = int(self.impl.get_layer_group_id(source_layer))
+            pool_id = self._get_layer_execution_group(source_layer)
             if (
                 self.mixed_precision_high_block_deltas.setdefault(pool_id, block_delta)
                 != block_delta

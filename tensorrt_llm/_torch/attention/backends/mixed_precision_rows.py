@@ -104,7 +104,7 @@ def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_id
     num_seqs = metadata.num_seqs
     if num_seqs == 0:
         return
-    pool_id = int(manager.impl.get_layer_group_id(local_layer))
+    pool_id = manager._get_layer_execution_group(local_layer)
     # Block offsets as attention used them (held blocks point at the high layer's blocks) and
     # the layer's own block offsets saved before that redirect.
     redirected_offsets = metadata.kv_cache_block_offsets[pool_id]
