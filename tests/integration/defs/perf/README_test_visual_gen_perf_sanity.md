@@ -32,11 +32,14 @@ shared perf regression pipeline. It is responsible for:
 | `MINIMIZE_METRICS` | `d_mean_latency`, `d_median_latency`, `d_p90_latency`, `d_p99_latency`, `d_mean_generation`, `d_median_generation`, `d_p90_generation`, `d_p99_generation` |
 | `REGRESSION_METRICS` | `d_median_generation` |
 
-Latency and generation metrics are read from the VisualGen benchmark JSON in
-seconds. Latency includes media encoding and persistence overhead, while median
-generation tracks the typical engine-side generation time used for regression
-checks. Online benchmarks receive generation timing from the VisualGen serving
-`Server-Timing` response header and store it in the result JSON.
+Latency and generation metrics use client wall-clock seconds, not server inference
+time. `result_metric_paths` in `visual_gen_perf_utils.py` selects `gen_latency` for
+video and `e2e_latency` for synchronous image/image-edit routes, which currently
+have no separate client generation observation. Both populate the existing
+`d_*_generation` fields; server timings under `timings` are diagnostic only.
+
+Historical server-generation baselines are not interchangeable with client timing.
+Reconciling those baselines is separate work.
 
 ## Match Keys
 
