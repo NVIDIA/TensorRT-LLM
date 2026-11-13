@@ -4085,6 +4085,7 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
+index fa63a02..653a2ff 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -4093,7 +4094,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  # SPDX-License-Identifier: MIT
  
  """Per-variant lazy JIT compilation for FMHA varlen kernels.
-@@ -6,11 +7,12 @@
+@@ -6,27 +7,109 @@
  Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) is compiled
  independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
  
@@ -4104,10 +4105,18 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  import itertools
  import fcntl
 +import hashlib
++import importlib.metadata
++import json
  import logging
  import os
++import platform
  import shutil
-@@ -22,11 +24,18 @@
+ import subprocess
+ import threading
++from functools import lru_cache
+ from pathlib import Path
+ 
+ import jinja2
  
  logger = logging.getLogger(__name__)
  
@@ -4120,6 +4129,76 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +_CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
 +
 +
++def _aot_source_digest():
++    """Fingerprint the packaged FMHA sources and the CUTLASS headers they use."""
++    paths = [_PACKAGE_DIR / "jit.py"]
++    for root in (_FMHA_VARLEN_DIR, _PACKAGE_DIR / "cutlass/include",
++                 _PACKAGE_DIR / "cutlass/tools/util/include"):
++        paths.extend(p for p in root.rglob("*") if p.is_file())
++    digest = hashlib.sha256()
++    for path in sorted(paths):
++        content = path.read_bytes()
++        digest.update(path.relative_to(_PACKAGE_DIR).as_posix().encode() + b"\0")
++        digest.update(len(content).to_bytes(8, "little"))
++        digest.update(content)
++    return digest.hexdigest()
++
++
++def _aot_ffi_version():
++    return importlib.metadata.version("apache-tvm-ffi")
++
++
++def _aot_gpu_arch():
++    import torch
++    major, minor = torch.cuda.get_device_capability()
++    return f"sm_{major}{minor}a"
++
++
++@lru_cache(maxsize=1)
++def _aot_validated_manifest():
++    root = _PACKAGE_DIR / "_aot"
++    if not root.is_dir():
++        return None
++    try:
++        digest = _aot_source_digest()
++        artifact_dir = root / digest
++        manifest = json.loads((artifact_dir / "manifest.json").read_text())
++        if (manifest["format_version"] != 1 or manifest["source_sha256"] != digest or
++            manifest["tvm_ffi_version"] != _aot_ffi_version() or
++            manifest["host_arch"] != platform.machine()):
++            return None
++        names = manifest["variants"]
++        expected = _aot_variant_names()
++        if not isinstance(names, list) or len(names) != len(expected) or set(names) != set(expected):
++            return None
++        paths = {}
++        for item in ("variants", "plan", "sparse_topk", "reduction"):
++            path = (artifact_dir / manifest["files"][item]).resolve()
++            path.relative_to(artifact_dir.resolve())
++            if not path.is_file():
++                return None
++            paths[item] = path
++        return paths, frozenset(manifest["cuda_architectures"])
++    except (OSError, ValueError, TypeError, KeyError,
++            importlib.metadata.PackageNotFoundError):
++        return None
++
++
++def _aot_module_path(kind):
++    if any(os.environ.get(name) is not None for name in (
++        "GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"
++    )):
++        return None
++    validated = _aot_validated_manifest()
++    if validated is None:
++        return None
++    paths, architectures = validated
++    try:
++        return paths.get(kind) if _aot_gpu_arch() in architectures else None
++    except (RuntimeError, AssertionError):
++        return None
++
++
  def _compute_cache_base():
      explicit = os.environ.get("MINFER_FMHA_CACHE_DIR")
 -    if explicit:
@@ -4129,7 +4208,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
      if os.environ.get("GPU_TRACE") is not None:
-@@ -35,9 +44,27 @@
+@@ -35,9 +118,35 @@ def _compute_cache_base():
          suffix += "_sm_timing"
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
@@ -4142,6 +4221,8 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +    # to dispatch and compiler flags. Use relative names so installs share keys.
 +    digest = hashlib.sha256()
 +    sources = sorted(path for path in _FMHA_VARLEN_DIR.rglob("*") if path.is_file())
++    for root in (_PACKAGE_DIR / "cutlass/include", _PACKAGE_DIR / "cutlass/tools/util/include"):
++        sources.extend(sorted(path for path in root.rglob("*") if path.is_file()))
 +    sources.append(_PACKAGE_DIR / "jit.py")
 +    for path in sources:
 +        content = path.read_bytes()
@@ -4150,6 +4231,12 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +        digest.update(content)
 +    # An explicit cache root must also isolate instrumented and normal binaries.
 +    digest.update(suffix.encode())
++    try:
++        ffi_version = _aot_ffi_version()
++    except importlib.metadata.PackageNotFoundError:
++        ffi_version = "unavailable"
++    digest.update(b"\0tvm-ffi\0" + ffi_version.encode())
++    digest.update(b"\0host-arch\0" + platform.machine().encode())
 +    cache_base = base / ("sources_sha256_" + digest.hexdigest())
 +    logger.info(
 +        "Using FMHA cache %s (source/build fingerprint; changed sources or "
@@ -4159,7 +4246,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  
  
  CACHE_BASE = _compute_cache_base()
-@@ -55,13 +82,6 @@
+@@ -55,13 +164,6 @@ def _release_file_lock(fd):
      os.close(fd)
  
  
@@ -4173,7 +4260,26 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  
  _PACK_FACTORS = [1,2,4,6,8,16]
  # _PACK_FACTORS = [1, 6]
-@@ -199,6 +219,9 @@
+@@ -109,6 +211,18 @@ _FMHA_SM100_IMPOSSIBLE = lambda p: (
+ )
+ 
+ 
++def _aot_variant_names():
++    dimensions = [values for _, values in _FMHA_SM100_DISPATCH]
++    names = []
++    for indices in itertools.product(*(range(len(values)) for values in dimensions)):
++        params = {}
++        for values, index in zip(dimensions, indices):
++            params.update(values[index][1])
++        if not _FMHA_SM100_IMPOSSIBLE(params):
++            names.append("_".join(str(index) for index in indices))
++    return names
++
++
+ def _dlpack_dtype_code(torch_dtype):
+     """Encode a torch dtype as a DLPack int64 code."""
+     import torch
+@@ -199,6 +313,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
          "--expt-relaxed-constexpr", "--expt-extended-lambda",
          "-gencode=arch=compute_100a,code=sm_100a",
          "-gencode=arch=compute_103a,code=sm_103a",
@@ -4183,6 +4289,227 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
+@@ -236,6 +353,9 @@ class _VariantWrapper:
+         return self._fn(*args)
+ 
+ 
++_AOT_UNSPECIFIED = object()
++
++
+ class FMHAVariantManager:
+     """Manages FMHA variant kernels. Loads from all_variants.so or per-variant .so."""
+ 
+@@ -244,6 +364,7 @@ class FMHAVariantManager:
+         self._lock = threading.Lock()
+         self._all_module = None
+         self._all_module_checked = False
++        self._all_module_packaged = False
+         self._inst_template = None
+         self._run_template = None
+ 
+@@ -254,12 +375,21 @@ class FMHAVariantManager:
+             with open(_FMHA_VARLEN_DIR / "fmha_sm100_variant_run.cu.jinja") as f:
+                 self._run_template = jinja2.Template(f.read())
+ 
+-    def _ensure_all_module(self):
+-        if not self._all_module_checked:
+-            self._all_module_checked = True
+-            if _ALL_VARIANTS_SO.exists():
++    def _ensure_all_module(self, packaged=_AOT_UNSPECIFIED):
++        if packaged is _AOT_UNSPECIFIED:
++            packaged = _aot_module_path("variants")
++        use_packaged = packaged is not None
++        if not self._all_module_checked or self._all_module_packaged != use_packaged:
++            path = packaged or _ALL_VARIANTS_SO
++            if packaged is not None and not path.is_file():
++                raise FileNotFoundError(path)
++            module = None
++            if path.exists():
+                 import tvm_ffi
+-                self._all_module = tvm_ffi.load_module(str(_ALL_VARIANTS_SO))
++                module = tvm_ffi.load_module(str(path))
++            self._all_module = module
++            self._all_module_packaged = use_packaged
++            self._all_module_checked = True
+ 
+     def get_variant(self, dtype_code, qo_tile_size, single_wg,
+                     sparse_mode, page_size, split_kv, pack_factor):
+@@ -267,26 +397,29 @@ class FMHAVariantManager:
+             dtype_code, qo_tile_size, single_wg,
+             sparse_mode, page_size, split_kv, pack_factor)
+ 
+-        cached = self._loaded.get(variant_name)
++        packaged = _aot_module_path("variants")
++        cache_key = (variant_name, packaged is not None)
++        cached = self._loaded.get(cache_key)
+         if cached is not None:
+             return cached
+ 
+         with self._lock:
+-            cached = self._loaded.get(variant_name)
++            cached = self._loaded.get(cache_key)
+             if cached is not None:
+                 return cached
+ 
+             fn_name = f"run_{variant_name}"
+ 
+             # Try all_variants.so
+-            self._ensure_all_module()
++            self._ensure_all_module(packaged)
+             if self._all_module is not None:
+                 try:
+                     fn = getattr(self._all_module, fn_name)
+-                    self._loaded[variant_name] = _VariantWrapper(fn)
+-                    return self._loaded[variant_name]
+-                except AttributeError:
+-                    pass
++                    self._loaded[cache_key] = _VariantWrapper(fn)
++                    return self._loaded[cache_key]
++                except AttributeError as exc:
++                    if self._all_module_packaged:
++                        raise RuntimeError(f"Packaged FMHA library is missing {fn_name}") from exc
+ 
+             # Try per-variant .so
+             cache_dir = CACHE_BASE / variant_name
+@@ -301,8 +434,8 @@ class FMHAVariantManager:
+                 fn = getattr(module, fn_name)
+             finally:
+                 _release_file_lock(lock_fd)
+-            self._loaded[variant_name] = _VariantWrapper(fn)
+-            return self._loaded[variant_name]
++            self._loaded[cache_key] = _VariantWrapper(fn)
++            return self._loaded[cache_key]
+ 
+     def _compile_only(self, variant_name, params):
+         """Compile a variant without loading. Safe to call from subprocesses."""
+@@ -391,7 +524,7 @@ def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
+ # Plan kernel JIT (also needs sm_100a, can't be statically compiled)
+ # ============================================================================
+ 
+-_plan_module = None
++_plan_modules = {}
+ _plan_lock = threading.Lock()
+ 
+ 
+@@ -453,8 +586,11 @@ def _compile_plan_only():
+     _do_compile_plan()
+ 
+ 
+-def _compile_plan_module():
++def _compile_plan_module(aot_path):
+     """Compile and load plan kernel."""
++    if aot_path is not None:
++        import tvm_ffi
++        return tvm_ffi.load_module(str(aot_path))
+     lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
+     try:
+         _do_compile_plan()
+@@ -467,22 +603,22 @@ def _compile_plan_module():
+ 
+ def get_plan_fn():
+     """Get the plan function. JIT compiles on first call."""
+-    global _plan_module
+-    if _plan_module is not None:
+-        return _plan_module
++    aot_path = _aot_module_path("plan")
++    key = aot_path is not None
++    if key in _plan_modules:
++        return _plan_modules[key]
+ 
+     with _plan_lock:
+-        if _plan_module is not None:
+-            return _plan_module
+-        _plan_module = _compile_plan_module()
+-        return _plan_module
++        if key not in _plan_modules:
++            _plan_modules[key] = _compile_plan_module(aot_path)
++        return _plan_modules[key]
+ 
+ 
+ # ============================================================================
+ # Sparse TopK Select kernel JIT
+ # ============================================================================
+ 
+-_sparse_topk_module = None
++_sparse_topk_modules = {}
+ _sparse_topk_lock = threading.Lock()
+ 
+ 
+@@ -546,29 +682,34 @@ build {so_path}: nvcc_link {obj}
+ 
+ def get_sparse_topk_module():
+     """Get the sparse_topk_select module. JIT compiles on first call."""
+-    global _sparse_topk_module
+-    if _sparse_topk_module is not None:
+-        return _sparse_topk_module
++    aot_path = _aot_module_path("sparse_topk")
++    key = aot_path is not None
++    if key in _sparse_topk_modules:
++        return _sparse_topk_modules[key]
+ 
+     with _sparse_topk_lock:
+-        if _sparse_topk_module is not None:
+-            return _sparse_topk_module
++        if key in _sparse_topk_modules:
++            return _sparse_topk_modules[key]
++        if aot_path is not None:
++            import tvm_ffi
++            _sparse_topk_modules[key] = tvm_ffi.load_module(str(aot_path))
++            return _sparse_topk_modules[key]
+         lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
+         try:
+             _do_compile_sparse_topk()
+             import tvm_ffi
+             so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
+-            _sparse_topk_module = tvm_ffi.load_module(str(so_path))
++            _sparse_topk_modules[key] = tvm_ffi.load_module(str(so_path))
+         finally:
+             _release_file_lock(lock_fd)
+-        return _sparse_topk_module
++        return _sparse_topk_modules[key]
+ 
+ 
+ # ============================================================================
+ # Split-KV reduction kernel JIT
+ # ============================================================================
+ 
+-_reduction_module = None
++_reduction_modules = {}
+ _reduction_lock = threading.Lock()
+ 
+ 
+@@ -631,19 +772,24 @@ build {so_path}: nvcc_link {obj}
+ 
+ def get_reduction_module():
+     """Get the split-KV reduction module. JIT compiles on first call."""
+-    global _reduction_module
+-    if _reduction_module is not None:
+-        return _reduction_module
++    aot_path = _aot_module_path("reduction")
++    key = aot_path is not None
++    if key in _reduction_modules:
++        return _reduction_modules[key]
+ 
+     with _reduction_lock:
+-        if _reduction_module is not None:
+-            return _reduction_module
++        if key in _reduction_modules:
++            return _reduction_modules[key]
++        if aot_path is not None:
++            import tvm_ffi
++            _reduction_modules[key] = tvm_ffi.load_module(str(aot_path))
++            return _reduction_modules[key]
+         lock_fd = _acquire_file_lock(CACHE_BASE / "reduction.lock")
+         try:
+             _do_compile_reduction()
+             import tvm_ffi
+             so_path = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
+-            _reduction_module = tvm_ffi.load_module(str(so_path))
++            _reduction_modules[key] = tvm_ffi.load_module(str(so_path))
+         finally:
+             _release_file_lock(lock_fd)
+-        return _reduction_module
++        return _reduction_modules[key]
 diff --git a/python/fmha_sm100/sparse.py b/python/fmha_sm100/sparse.py
 index 7006fcd..9a09324 100644
 --- a/python/fmha_sm100/sparse.py
@@ -4993,3 +5320,98 @@ diff --git a/python/fmha_sm100/csrc/gmem_bounds_check.h b/python/fmha_sm100/csrc
 +#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
  
  #endif  // FMHA_GMEM_BOUNDS_CHECK
+diff --git a/scripts/warmup_fmha_sm100.py b/scripts/warmup_fmha_sm100.py
+index c44156f..9121886 100644
+--- a/scripts/warmup_fmha_sm100.py
++++ b/scripts/warmup_fmha_sm100.py
+@@ -14,6 +14,7 @@ import argparse
+ import glob
+ import itertools
+ import os
++import shlex
+ import shutil
+ import subprocess
+ import sys
+@@ -24,6 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+ 
+ from fmha_sm100.jit import _FMHA_SM100_DISPATCH, _FMHA_SM100_IMPOSSIBLE, _get_nvcc_flags
+ 
++def _ninja_path(path):
++    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
++
+ def enumerate_all_variants():
+ 
+     dims = _FMHA_SM100_DISPATCH
+@@ -161,6 +165,9 @@ def main():
+     # ── Generate all .cu files ──
+     build_dir = CACHE_BASE / "_warmup_build"
+     build_dir.mkdir(parents=True, exist_ok=True)
++    # Keep the aggregate link command short even for long cache paths.
++    def ninja_path(path):
++        return _ninja_path(os.path.relpath(path, build_dir))
+ 
+     with open(_FMHA_VARLEN_DIR / "fmha_sm100_inst.jinja") as f:
+         inst_template = jinja2.Template(f.read())
+@@ -180,7 +187,7 @@ def main():
+ 
+     ninja_lines = [
+         f"ninja_required_version = 1.5\n",
+-        f"nvcc = {nvcc}\n",
++        f"nvcc = {shlex.quote(nvcc).replace('$', '$$')}\n",
+         f"nvcc_flags = {_get_nvcc_flags(build_dir)}\n",
+         "rule nvcc_compile\n",
+         "  command = $nvcc $nvcc_flags -c $in -o $out\n",
+@@ -207,16 +214,16 @@ def main():
+         run_o = build_dir / f"run_{vname}.o"
+         all_variant_objs.extend([inst_o, run_o])
+ 
+-        ninja_lines.append(f"build {inst_o}: nvcc_compile {inst_cu}\n")
+-        ninja_lines.append(f"build {run_o}: nvcc_compile {run_cu}\n")
++        ninja_lines.append(f"build {ninja_path(inst_o)}: nvcc_compile {ninja_path(inst_cu)}\n")
++        ninja_lines.append(f"build {ninja_path(run_o)}: nvcc_compile {ninja_path(run_cu)}\n")
+ 
+     # Link all variants into one .so
+     all_so_dir = CACHE_BASE / "_all_variants"
+     all_so_dir.mkdir(parents=True, exist_ok=True)
+     all_so_path = all_so_dir / "all_variants.so"
+     if all_variant_objs:
+-        objs_str = " ".join(str(o) for o in all_variant_objs)
+-        ninja_lines.append(f"build {all_so_path}: nvcc_link {objs_str}\n\n")
++        objs_str = " ".join(ninja_path(o) for o in all_variant_objs)
++        ninja_lines.append(f"build {ninja_path(all_so_path)}: nvcc_link {objs_str}\n\n")
+ 
+     # Plan kernel
+     if need_plan:
+@@ -229,8 +236,8 @@ def main():
+         plan_o = build_dir / "fmha_sm100_plan.o"
+         plan_so = plan_dir / "fmha_sm100_plan.so"
+ 
+-        ninja_lines.append(f"build {plan_o}: nvcc_compile_other {plan_cu}\n")
+-        ninja_lines.append(f"build {plan_so}: nvcc_link {plan_o}\n\n")
++        ninja_lines.append(f"build {ninja_path(plan_o)}: nvcc_compile_other {ninja_path(plan_cu)}\n")
++        ninja_lines.append(f"build {ninja_path(plan_so)}: nvcc_link {ninja_path(plan_o)}\n\n")
+ 
+     # Sparse topk kernel
+     if need_sparse_topk:
+@@ -247,8 +254,8 @@ def main():
+                          topk_dir / "tvm_ffi_utils.h")
+             topk_o = build_dir / "sparse_topk_select.o"
+             topk_so = topk_dir / "sparse_topk_select.so"
+-            ninja_lines.append(f"build {topk_o}: nvcc_compile_other {topk_cu}\n")
+-            ninja_lines.append(f"build {topk_so}: nvcc_link {topk_o}\n\n")
++            ninja_lines.append(f"build {ninja_path(topk_o)}: nvcc_compile_other {ninja_path(topk_cu)}\n")
++            ninja_lines.append(f"build {ninja_path(topk_so)}: nvcc_link {ninja_path(topk_o)}\n\n")
+ 
+     # Split-KV reduction kernel
+     if need_reduction:
+@@ -260,8 +267,8 @@ def main():
+             shutil.copy2(red_cu_src, red_cu)
+             red_o = build_dir / "fmha_sm100_reduction.o"
+             red_so = red_dir / "fmha_sm100_reduction.so"
+-            ninja_lines.append(f"build {red_o}: nvcc_compile_other {red_cu}\n")
+-            ninja_lines.append(f"build {red_so}: nvcc_link {red_o}\n\n")
++            ninja_lines.append(f"build {ninja_path(red_o)}: nvcc_compile_other {ninja_path(red_cu)}\n")
++            ninja_lines.append(f"build {ninja_path(red_so)}: nvcc_link {ninja_path(red_o)}\n\n")
+ 
+     (build_dir / "build.ninja").write_text("".join(ninja_lines))
+ 

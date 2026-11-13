@@ -13,6 +13,7 @@ reconfigure when the fingerprint changes.
 
 import importlib.util
 import sys
+from argparse import ArgumentParser
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,15 @@ def build_wheel():
     spec.loader.exec_module(module)
     yield module
     sys.modules.pop(spec.name, None)
+
+
+@pytest.mark.parametrize("option", ["--job_count", "-j"])
+def test_job_count_cli_is_an_integer_for_fmha_build(build_wheel, option):
+    parser = ArgumentParser()
+    build_wheel.add_arguments(parser)
+    jobs = parser.parse_args([option, "48"]).job_count
+    assert isinstance(jobs, int)
+    assert max(1, min(jobs, 8)) == 8
 
 
 def test_fingerprint_ignores_argument_order(build_wheel):
