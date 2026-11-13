@@ -3,9 +3,10 @@
 """DEP_REJ_MC_FI on an SM107 GPU: ``rej_mc_fi``'s gathered and slot-indexed forms return FlashInfer's
 ``chain_speculative_sampling(deterministic=True)`` tokens and emitted + 1 counts bit for bit (as
 ``rejection_sampling_one_model`` calls it, per-request int64 seed / offset), on served-like rows at DEP's batches, at
-every rejection position and the bonus row, on padding rows, on denormal probabilities, at every ctas_per_row and under
-CUDA-graph replay. A rejected row whose residual has no mass gets token 0 (FlashInfer reads an uninitialized shared
-slot there, so that case is not compared)."""
+every rejection position and the bonus row, on padding rows, on denormal probabilities, on rejected rows without
+residual mass (token -1), at every ctas_per_row and under CUDA-graph replay. FlashInfer adds each thread's residual
+across the vocabulary tiles before one block reduction for the resampling total; uniform padding rows are where a
+different summation order shows."""
 
 import pytest
 import torch
@@ -162,8 +163,10 @@ def test_the_output_does_not_depend_on_ctas_per_row():
     op = rej_mc_fi.mc_fi_op()
     s, o = _seeds(12, 5)
     ref = _flashinfer(c, s, o)
-    for ctas in (1, 2, 4, 8, 16, 32, 64):
+    for ctas in (1, 2, 4, 8, 16, 32):
         _assert_same(ref, op(c["draft"], c["ids"], c["target"], s, o, ws, ctas))
+    with pytest.raises(RuntimeError):
+        op(c["draft"], c["ids"], c["target"], s, o, ws, 64)
 
 
 def test_the_slot_form_replays_inside_a_cuda_graph():
@@ -190,7 +193,7 @@ def test_the_slot_form_replays_inside_a_cuda_graph():
         _assert_same(_flashinfer(new, ns, no), out)
 
 
-def test_a_rejected_row_without_residual_mass_gets_token_0():
+def test_a_rejected_row_without_residual_mass_gets_flashinfers_token():
     c = _case(12, 555)
     rows = torch.arange(12, device="cuda")
     r = 2
@@ -201,6 +204,8 @@ def test_a_rejected_row_without_residual_mass_gets_token_0():
     t[:, r] = c["draft"][:, r] * 0.5
     t[rows, r, c["ids"][:, r].long()] = 0.0
     s, o = _seeds(12, 8)
+    ref = _flashinfer(c, s, o, target=t)
+    assert bool((ref[0][:, r] == -1).all())
     for got in _both_forms(c, s, o, target=t):
         assert bool((got[1] == r + 1).all())
-        assert bool((got[0][:, r] == 0).all())
+        _assert_same(ref, got)
