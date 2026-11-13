@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@feature/TRTLLMINF-382-agent-loss-retry']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
