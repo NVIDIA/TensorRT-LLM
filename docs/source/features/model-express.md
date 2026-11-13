@@ -616,28 +616,31 @@ path.
   dense, Phi3 dense, Qwen3.5 dense vision-language, Qwen3 MoE, and DeepSeek-V3
   MoE profiles above. Other roots and variants that do not match the documented
   identity and runtime envelope safely fall back to Hugging Face loading until
-  explicitly qualified. - Mistral checkpoints served through the native
-  `mistral` checkpoint format (`mistral_common` model type), sliding-window or
-  Ministral `layer_types` variants, YaRN variants, Mistral3 vision-language
-  roots, and Mistral Large 3 are not qualified and use the Hugging Face
-  fallback. - Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and
-  Phi-4-mini), tied-embedding variants, and the Phi-3-small, vision, MoE, and
-  Phi4MM multimodal roots are not qualified and use the Hugging Face fallback. -
-  Qwen3.5 vision-language checkpoints fall back when they run with speculative
+  explicitly qualified.
+- Mistral checkpoints served through the native `mistral` checkpoint format
+  (`mistral_common` model type), sliding-window or Ministral `layer_types`
+  variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
+  are not qualified and use the Hugging Face fallback.
+- Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and Phi-4-mini),
+  tied-embedding variants, and the Phi-3-small, vision, MoE, and Phi4MM
+  multimodal roots are not qualified and use the Hugging Face fallback.
+- Qwen3.5 vision-language checkpoints fall back when they run with speculative
   decoding (MTP or DFlash), without a local vision encoder (`disable_mm_encoder`
   or multimodal encoder/prefill disaggregation), as encoder-only workers, with
-  tied embeddings, or with quantized weights. - DeepSeek-V3 checkpoints fall
-  back when they run with MTP or other speculative decoding, context
-  parallelism, attention DP, FP8 or other quantized weights, a quantized KV
-  cache, YaRN scaling (the full DeepSeek-V3, R1, and V3.1 checkpoints), a
-  layer layout other than a dense first layer followed by MoE layers, TP
-  greater than 2, or an explicitly requested MoE backend other than CUTLASS.
-  Kimi K2, DeepSeek-V3.2, GLM-5, and Mistral Large 3 use the Hugging Face
-  fallback. - The MX server and Redis lifecycle is external to TensorRT LLM.
-  Every TensorRT LLM instance must be able to reach the configured MX server
-  URL. - The MX server coordinates source discovery but does not store model
-  weights. A source TensorRT LLM process must remain running and
-  network-reachable until receiver transfers finish. - The first worker may
-  still load weights from disk if no compatible MX source is already registered.
-  - This page describes the MX checkpoint-loading path only. GPU Memory Service
+  tied embeddings, or with quantized weights.
+- DeepSeek-V3 checkpoints fall back when they run with MTP or other
+  speculative decoding, context parallelism, attention DP, FP8 or other
+  quantized weights, a quantized KV cache, YaRN scaling (the full DeepSeek-V3,
+  R1, and V3.1 checkpoints), a layer layout other than a dense first layer
+  followed by MoE layers, TP greater than 2, or an explicitly requested MoE
+  backend other than CUTLASS. Kimi K2, DeepSeek-V3.2, GLM-5, and
+  Mistral Large 3 use the Hugging Face fallback.
+- The MX server and Redis lifecycle is external to TensorRT LLM. Every
+  TensorRT LLM instance must be able to reach the configured MX server URL.
+- The MX server coordinates source discovery but does not store model weights.
+  A source TensorRT LLM process must remain running and network-reachable until
+  receiver transfers finish.
+- The first worker may still load weights from disk if no compatible MX source
+  is already registered.
+- This page describes the MX checkpoint-loading path only. GPU Memory Service
   (GMS) integration is configured separately.
