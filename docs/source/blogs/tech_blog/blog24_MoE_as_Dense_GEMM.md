@@ -298,9 +298,9 @@ range.
 
 DENSEGEMM consists of two CuTe DSL kernels, both registered as `torch.library.custom_op`. The Python-side
 entry is `cutedsl/dense_gemm.py:run_moe_nvfp4`, with kernel bodies under
-`cute_dsl_kernels/blackwell/moe_as_dense_gemm/{fc1,fc2}.py`. Both share
-`Sm100BlockScaledPersistentDenseGemmKernel`, a dense GEMM template using persistent CTA, TMA load, and
-tcgen05 MMA, on top of which expert-aware alpha fusion is implemented separately.
+`moe/kernels/blackwell/moe_as_dense_gemm/{fc1,fc2}.py`. Each defines its own
+`Sm100BlockScaledPersistentDenseGemmKernel`, a dense GEMM using persistent CTA, TMA load, and
+tcgen05 MMA, with its expert-aware alpha fusion built in.
 
 | | FC1 | FC2 |
 |---|---|---|

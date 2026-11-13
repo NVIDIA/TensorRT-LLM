@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import enum
 import os
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -80,15 +80,19 @@ def registered_routes() -> Dict[str, Callable[..., type]]:
 #: construction, and a check that can only ever hold is a check whose failure
 #: mode is its own bug taking down a working deployment.
 #:
-#: An environment variable rather than an LLM arg while modeling_v2 is
-#: experimental; it has to reach the ranks, so a test passes it through
+#: Beam additionally enables checkpoint digests, per-layer metadata rechecks and per-step
+#: routing agreement (device-to-host copies, hashing and collectives). Keep it off for
+#: performance measurements; all Beam ranks must use the same setting.
+#:
+#: An environment variable while modeling_v2 is experimental. It must reach all ranks,
+#: so a test passes it through
 #: ``env_overrides``. When this stops being experimental it belongs in the
 #: LLM args, where a caller can set it per engine rather than per process.
 MODELING_V2_VALIDATE_ENV = "TRTLLM_MODELING_V2_VALIDATE"
 
 
 def step_contract_enabled() -> bool:
-    """Whether targets should check their step contract on the first forward.
+    """Whether contract diagnostics are enabled (Beam also checks every step).
 
     Read once per model instance at construction rather than per forward: the
     answer cannot change within a process, and the forward is the hot path.
@@ -113,13 +117,49 @@ class ModelingV2Mode(str, enum.Enum):
         return cls(llm_args.modeling_v2)
 
 
-class NoTarget(Exception):
-    """Raised by a family's ``route`` when no target fits.
+class NoTarget(ValueError):
+    """Raised by a family's ``route`` when no target fits, or by a target at construction when the runtime
+    the engine arguments set is not the one it is written for.
 
     The message says, in words, which fact ruled the targets out. Under
-    ``auto`` the resolver logs it and falls back to the built-in implementation;
+    ``auto`` the resolver logs it and falls back to the built-in implementation
+    (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
     under ``require`` it becomes the error the user sees.
     """
+
+
+# Targets a deployment builds only when it sets ``modeling_v2`` itself, filled by ``@disable_v2_by_default``.
+_V2_DISABLED_BY_DEFAULT: Set[type] = set()
+
+
+def disable_v2_by_default(target: type) -> type:
+    """Keep the built-in implementation for the deployments ``target`` claims unless ``modeling_v2`` is set.
+
+    Under the default ``modeling_v2`` the resolver declines the decorated
+    target and the engine builds the built-in implementation. A deployment that
+    sets ``modeling_v2`` to ``auto`` or ``require`` itself gets the target as
+    the ``route`` decides.
+    """
+    _V2_DISABLED_BY_DEFAULT.add(target)
+    return target
+
+
+def _modeling_v2_set_explicitly(llm_args: "TorchLlmArgs") -> bool:
+    return "modeling_v2" in llm_args.model_fields_set
+
+
+# The mode each target class was last resolved under (the loader builds the class right after resolving it).
+_RESOLVED_MODES: Dict[type, ModelingV2Mode] = {}
+
+
+def resolved_mode(target: type) -> ModelingV2Mode:
+    """The mode ``modeling_v2_resolve`` returned ``target`` under; ``auto`` for a class built without it.
+
+    A target reads it at construction: under ``require`` its in-target dispatch
+    raises where it would otherwise fall back to a built-in path inside the
+    shapes it claims.
+    """
+    return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
 
 
 def tp_reaches_across_nodes(mapping) -> bool:
@@ -182,6 +222,9 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+    It also returns None for a ``@disable_v2_by_default`` target when
+    ``modeling_v2`` was left at its default.
+
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -197,7 +240,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         if route is None:
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(config, llm_args, _device_compute_capability())
+        target = route(config, llm_args, _device_compute_capability())
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
@@ -205,3 +248,66 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
+    if target in _V2_DISABLED_BY_DEFAULT and not _modeling_v2_set_explicitly(llm_args):
+        logger.info(
+            f"modeling_v2: {target.__name__} fits {arch!r} but is built only when modeling_v2 "
+            "is set; using the built-in implementation"
+        )
+        return None
+    if target is not None:
+        _RESOLVED_MODES[target] = mode
+    return target
+
+
+def _qualified(target: Optional[type]) -> Optional[str]:
+    return None if target is None else f"{target.__module__}.{target.__qualname__}"
+
+
+def modeling_v2_resolve_on_all_ranks(
+    config: "ModelConfig", llm_args: "TorchLlmArgs"
+) -> Optional[type]:
+    """:func:`modeling_v2_resolve`, agreed by every rank of the engine.
+
+    Each rank routes on its own facts -- its device, and whether this
+    installation built the target's native code -- so one rank can land on the
+    built-in model while its peers build the target, and the first collective
+    then hangs instead of failing. Every rank therefore reports its outcome, and
+    all of them raise unless the outcomes agree. A rank's error is reported
+    after the exchange, not before, so its peers are never left waiting in it.
+
+    ``off`` returns before any exchange: nothing in this package runs then.
+    """
+    if ModelingV2Mode.of(llm_args) is ModelingV2Mode.OFF:
+        return None
+
+    target = error = None
+    try:
+        target = modeling_v2_resolve(config, llm_args)
+    except Exception as caught:  # noqa: BLE001 -- re-raised below, after every rank has reported
+        error = caught
+    outcome = (_qualified(target), None if error is None else f"{type(error).__name__}: {error}")
+
+    mapping = config.mapping
+    outcomes = [outcome]
+    if mapping.world_size > 1:
+        from tensorrt_llm._torch.distributed.communicator import Distributed
+
+        outcomes = Distributed.get(mapping).allgather(outcome)
+
+    if error is not None:
+        raise error
+    failed = {rank: why for rank, (_, why) in enumerate(outcomes) if why is not None}
+    if failed:
+        detail = "; ".join(f"rank {rank}: {why}" for rank, why in sorted(failed.items()))
+        raise RuntimeError(f"modeling_v2: other ranks failed to resolve a target ({detail})")
+    if len({built for built, _ in outcomes}) > 1:
+        detail = "; ".join(
+            f"rank {rank}: {built or 'built-in'}" for rank, (built, _) in enumerate(outcomes)
+        )
+        raise RuntimeError(
+            f"modeling_v2: ranks disagree on the implementation to build ({detail}); "
+            "every rank has to run the same code"
+        )
+    if target is not None and mapping.rank == 0:
+        logger.warning(f"modeling_v2: building {_qualified(target)} on all {len(outcomes)} rank(s)")
+    return target

@@ -155,15 +155,51 @@ cache_transceiver_config:
 
 `max_tokens_in_buffer` is best left unset. It bounds how many KV transfers a generation worker admits concurrently, and the built-in default is derived from the model's maximum sequence length, so a small hand-written value only throttles the transfer path.
 
-`kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
+`kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
+
+```{warning}
+The C++ cache transceiver (`transceiver_runtime: CPP`, or `null`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use the Python transceiver, the default, with `backend: NIXL` and KV cache manager V2 on both the context and the generation worker.
+
+Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep that configuration while the feature is required, or disable the flag when migrating to Python. The existing startup validation remains in effect.
+```
 
 The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, set `use_kv_cache_manager_v2: false` and select `transceiver_runtime: CPP` for a model that supports V1.
 
-`kv_cache_bounce_size_mb` is `0` by default, which sends each KV block separately. Setting it to a positive size enables a bounce buffer, which helps when a request's blocks are scattered. With the default Python implementation this is one contiguous buffer of that many MiB per direction and a single NIXL write per request; the C++ implementation (next paragraph) instead uses one buffer shared by both directions and chunked writes. The default Python implementation is designed for fabric (MNNVL) memory; the C++ implementation falls back to `cudaMalloc` where fabric memory is unavailable.
+`kv_cache_bounce_size_mb` (default `0`) sets the size, in MiB, of the KV-cache bounce buffer; `0` turns it off. Without the buffer, each KV fragment is a separate descriptor in the NIXL write. With it, the sender gathers an eligible write's fragments into the buffer and sends them in chunks, and the receiver scatters them into its KV cache. This helps when a write consists of many small fragments, which is typical when context and generation split attention heads differently (for example, context TP != generation TP, or attention DP).
 
-`agent_bounce_buffer_enable` (default `false`) switches to the C++ transfer-agent bounce implementation, which uses one buffer of `kv_cache_bounce_size_mb` MiB shared by send and receive (prefer a power of two; the usable capacity rounds down to one). By default it engages only for KV writes with many small descriptors (at least 1024, averaging at most 16 KiB), i.e. head-mismatch layouts such as context TP != generation TP or DP; head-matched layouts (MLA, symmetric TP) stay on the standard NIXL path unless `agent_bounce_params` relaxes the gate (lower `min_descriptor_count`, where `0` means no minimum; raise `max_average_descriptor_size`, e.g. `4MB`; `max_average_descriptor_size: 0` routes every outbound write to standard NIXL, acting as an outbound gate off switch — it disables outbound routing only: the arena is still allocated, the handshake still advertised and inbound transfers still served; set `agent_bounce_buffer_enable: false` to turn the feature off). Set it consistently on the context and generation workers; in particular `request_timeout_ms` and the effective chunk cap must match on both sides, otherwise the pair falls back to standard NIXL with a WARNING when the peer is loaded (transfers are then routed silently). The compared chunk cap is the effective one, min(`max_chunk_size`, the arena's usable capacity): `kv_cache_bounce_size_mb` matters only when its usable capacity (rounded down to a power of two) is below `max_chunk_size`; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL.
+- The buffer lives in the C++ NIXL agent: one buffer per rank, shared by send and receive. It uses fabric (MNNVL) memory where available and `cudaMalloc` otherwise. Use a power of two such as `256`, `512` or `1024`; for other values only the largest power of two that fits is used.
+- It requires the Python transceiver with the C++ NIXL agent. On a build without bounce support (libzmq), a positive value fails at worker startup. The C++ transceiver and the pure-Python NIXL agent ignore it with a warning.
+- Set it on both the context and the generation workers. If either side has `0`, the pair uses standard NIXL.
 
-For example, you could launch two context servers and one generation server as follows:
+By default, only writes with at least 1024 descriptors averaging at most 16 KiB use the bounce buffer, so head-matched layouts (MLA, symmetric TP) stay on standard NIXL. To change this, set `agent_bounce_params`: lower `min_descriptor_count` (`0` means no minimum) or raise `max_average_descriptor_size` (for example `4MB`). Setting `max_average_descriptor_size: 0` stops this worker from sending through the bounce buffer; it still allocates the buffer and still receives bounced writes from peers. To turn the feature off entirely, set `kv_cache_bounce_size_mb: 0`.
+
+The two sides must also agree on `request_timeout_ms` (an `agent_bounce_params` key) and on the effective chunk size, `min(max_chunk_size, buffer size rounded down to a power of two)`. With the default `max_chunk_size` (32 MiB), the chunk sizes can only differ when a buffer is smaller than 32 MiB. If either value differs, the worker logs a WARNING when it first loads the peer's metadata, and then uses standard NIXL for that peer without further messages.
+
+`agent_bounce_buffer_enable` is deprecated and ignored. Remove it from existing configs.
+
+#### KV transfer lifecycle enforcement (PACT)
+
+Set `TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT=1` on every CTX and GEN executor rank to request PACT protection. It is off by default; `TRTLLM_DISAGG_NO_RETRY=1` alone does not enable it. Explicit enablement rejects unsupported local configurations during startup rather than silently running without protection.
+
+For context-first, protection applies to requests with an explicit context-first scheduling style and a non-negative integer `disagg_request_id` when **all** of these conditions hold on both endpoints:
+
+- Full-context BF16 MHA/GQA K/V in KV cache manager V2, ordinary HND page views, symmetric TP1 or TP2, attention-DP disabled, PP1 and CP1.
+- `transceiver_runtime: PYTHON`, `backend: NIXL`, the C++ agent binding (`TRTLLM_USE_PY_NIXL_KVCACHE=0`), and `TRTLLM_NIXL_KVCACHE_BACKEND=UCX`.
+- Direct asynchronous transfer with a finite timeout: no Python/agent bounce buffer, pipelined or layerwise transfer, or disabled transfer overlap.
+- `TRTLLM_DISAGG_NO_RETRY=1` on the coordinator and every worker; no rerouting/replay of a published pairing ID.
+- MPI executor workers with a matching rank/world mapping and `MPI_THREAD_MULTIPLE`, so the existing fatal policy can stop the executor.
+
+Use identical images and effective BF16 configuration on all participants. Before any rank publishes transfer metadata, every executor rank must agree on the selected protection profile. Rank zero then logs an initialization WARNING that enforcement is enabled and fail-stop can affect the entire MPI launcher job. Each rank also logs `Context-first BF16 KV ownership ENABLED` on its first protected request.
+
+Protected context-first transfers require both endpoints to advertise activation and compatible geometry before destination publication or source submission. Incompatible peers fail the request without publishing its destination; the generation worker caches this rejection until restart. This is not dtype or version negotiation. Mixed-version protected transfers remain unsupported, and an explicitly protected transfer never falls back to unprotected operation. Without opt-in, legacy behavior is unchanged; omitted scheduling style and unsupported request paths do not gain protection from this flag.
+
+The same flag can select the existing no-retry FP4 MLA generation-first bridge within its existing supported profile. `TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE=1` remains a compatibility opt-in when the new flag is unset or `1`; combining it with the new flag set to `0` is a startup error. The FP4 bridge still requires matching configuration and enablement on all CTX/GEN participants as a deployment invariant; the new context-first peer check does not add FP4 peer negotiation.
+
+The sender and receiver retain resources until access is proven safe. An unresolved failure, cancellation or timeout starts the existing non-resettable quiescence grace (also `kv_transfer_timeout_ms`); expiry retains those resources and fail-stops the executor, potentially the entire shared MPI launcher job. This does not provide automatic replacement or generalized in-flight cancellation delivery.
+
+#### Basic serving example
+
+The following example illustrates general serving setup, not the ownership-enabled profile above. You could launch two context servers and one generation server as follows:
 
 ```bash
 
@@ -385,9 +421,58 @@ requests that bypass the handoff retain the configured retry policy. With
 remote-tail replay disabled, ordinary disaggregated requests retain their
 configured retry policy, including the transient TCP retry budget.
 
+### Generation slot preemption (prototype)
+
+GEN slot preemption pauses a resident decode request when all batch slots are
+occupied and a waiter risks missing its TTFT target. Configure exactly one bound
+(neither: disabled):
+
+```yaml
+scheduler_config:
+  gen_preemption:
+    tpot_budget: 0.10          # up to +10% mean TPOT from pauses
+    # target_output_tps: 35.0  # alternative: output-rate floor for ~80% of requests
+```
+
+Preemption requires the auto GEN admission policy
+(`0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99`) and the V2 KV scheduler.
+Pipeline parallelism and attention DP are rejected. Startup checks these
+prerequisites before reserving paused-request headroom.
+
+Pauses free batch slots while retaining KV, recurrent, and drafter state. Cache
+sizing must cover active plus paused requests: SWA and NVFP4-MLA HP-ring
+reservations include the paused cap; full-attention demand depends on sequence
+lengths. Paused requests are excluded from KV eviction. Disaggregated GEN cannot
+recompute context locally, and Helix CP raises on decode allocation failure.
+Reduce concurrency or increase the KV budget when both slots and pages are full.
+
+Pool headroom belongs to each executor. Configuring preemption on a context
+worker also reserves headroom. `target_output_tps` has simulation coverage only;
+GPU validation is limited to `tpot_budget`.
+
+### Bounding the graceful stop of a server
+
+A server can still have request handlers running when it is told to stop, for
+example when a benchmark client leaves while its last requests are in flight. By
+default the OpenAI HTTP server waits for every one of them. The prototype setting
+`serve_graceful_shutdown_timeout_s: N` bounds that wait: after a shutdown signal,
+the server waits at most `N` seconds for running request handlers (uvicorn's
+`timeout_graceful_shutdown`), then cancels them and shuts down as usual. It
+applies to the LLM, embedding and multimodal-encoder servers of `trtllm-serve`,
+in every frontend process; the disaggregated router keeps its own
+`--request_timeout` for the requests it forwards. It is off by default.
+[Bounding the Graceful Stop](../commands/trtllm-serve/trtllm-serve.rst#bounding-the-graceful-stop)
+in the `trtllm-serve` reference describes it for every server.
+
+```yaml
+serve_graceful_shutdown_timeout_s: 30
+```
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
+
+* `TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT`: Set to `1` to request [PACT protection](#kv-transfer-lifecycle-enforcement-pact) for a supported Python/NIXL profile. Unset or `0` leaves context-first protection off; the existing FP4 bridge opt-in remains supported as described above. This setting is fixed at executor startup and does not release outstanding ownership claims.
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
@@ -405,6 +490,52 @@ There are some other useful environment variables that may help when encounterin
   [NCCL_GRAPH_MIXING_SUPPORT documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-graph-mixing-support).
 
 * `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
+
+### Opt-in transfer lifecycle diagnostics
+
+For a targeted native Python-transceiver/Scheduler V2 debugging run, set
+`TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS=1` before starting the workers. Diagnostics
+are disabled by default; leave them disabled for throughput comparisons.
+Existing `RequestPerfMetrics` and native `perf_logger` remain the sources for
+aggregate request latency, transfer bytes, and bandwidth.
+
+Generate one fresh UUID for the launch and set
+`TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID` to that same value on all CTX and
+GEN workers. Preserve each worker's stdout, which contains JSON records prefixed
+with `[DISAGG_TRANSFER_DIAG]`. From a source checkout, produce a timing report:
+
+```bash
+python scripts/disagg_transfer_diagnostics.py ctx-worker.log gen-worker.log -o timing.json
+```
+
+The events record actual admission, receiver readiness, queue/submission,
+completion, cancellation, and resource-release boundaries, including unfinished
+requests. Explicit disaggregated request IDs support cross-worker correlation;
+fallback IDs stay process-local. Durations never subtract clocks from different
+processes. Submission-to-completion measures backend residence, not necessarily
+on-wire service. CTX handoff-to-release starts at the final chunk's handoff and
+excludes earlier prefill KV retention. Executor timeouts and native blocking-wait
+deadlines are separate observations; neither proves that memory is reusable.
+Transceiver settlement records confirm session retirement, not physical resource
+drain; diagnostics do not add lifecycle polling to establish that stronger claim.
+KV-capacity deferral is recorded only on the first failed preparation per local
+request. `kv_deferral_count` counts failed KV preparation attempts, not every
+scheduler pass. Successful KV preparation is tentative: `outcome=admitted` is
+recorded only after transfer-window selection, PP/CP reconciliation, and executor
+resource preparation succeed. This admission boundary precedes receive
+publication, which can still wait for destination readiness.
+Rollback records are emitted once per request and reason. Final admission carries
+the cumulative `transfer_window_rollback_count`, `pp_reconciliation_rollback_count`,
+and `cp_reconciliation_rollback_count`,
+along with `kv_deferral_count`; tentative successes do not reset these counts.
+Requests cancelled before admission have no completed admission-wait interval.
+
+Buffering is bounded; output is asynchronous and best-effort. Overflow, broken stdout, or
+process exit can lose records. The report exposes malformed, unmatched, and
+ambiguous evidence; it is not an end-to-end health or completeness verdict.
+Unsupported profiles are unassessed. Enabled collection can perturb timings;
+disabled mode avoids diagnostic recording and I/O, but is not a claim of
+measured zero overhead. Diagnostics do not change admission or timeout policy.
 
 ## Troubleshooting and FAQ
 
@@ -441,7 +572,7 @@ A. Each worker logs the outcome at INFO level, which `trtllm-serve` enables by d
 grep -E "Using KvCacheTransceiverV2|cache_transceiver is disabled" log_ctx_0 log_gen_0
 ```
 
-Check the context and the generation worker separately, and configure the two together — nothing negotiates the transfer settings across workers, so a mismatch is not reported as a configuration error.
+Check the context and the generation worker separately, and configure the two together. There is no general negotiation of transfer settings across workers; the opt-in PACT path adds the specific activation and geometry checks described above.
 
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 

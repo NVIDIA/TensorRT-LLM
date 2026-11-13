@@ -561,6 +561,83 @@ class TestExtensions:
             != render_chat(chat_request(), harmony_resources()).token_ids
         )
 
+    @pytest.mark.parametrize(
+        ("kwargs", "template", "expected"),
+        [
+            ({"reasoning_effort": "LOW"}, "{{ thinking_effort }}", "low"),
+            ({"reasoning_effort": "none"}, "{{ thinking }}", "False"),
+            ({"enable_thinking": False}, "{{ thinking }}", "False"),
+            (
+                {"reasoning_effort": "low", "thinking_effort": "high"},
+                "{{ thinking_effort }}",
+                "high",
+            ),
+            (
+                {"reasoning_effort": "low"},
+                "{{ reasoning_effort }}:{{ thinking_effort }}",
+                "low:low",
+            ),
+        ],
+    )
+    def test_kimi_generic_effort_is_consumed_before_jinja_validation(
+        self, tokenizer, monkeypatch, kwargs, template, expected
+    ) -> None:
+        monkeypatch.delenv("TRTLLM_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", raising=False)
+        request = chat_request(chat_template=template, chat_template_kwargs=kwargs)
+        res = RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3")
+
+        assert render_chat(request, res, tokenize=False).text == expected
+
+    def test_kimi_unrecognized_generic_effort_still_requires_a_template_consumer(
+        self, tokenizer, monkeypatch
+    ) -> None:
+        from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
+
+        monkeypatch.delenv("TRTLLM_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", raising=False)
+        request = chat_request(
+            chat_template="{{ thinking_effort | default('max') }}",
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+        res = RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3")
+
+        with pytest.raises(UnusedChatTemplateKwargsError, match="reasoning_effort"):
+            render_chat(request, res, tokenize=False)
+
+    def test_the_generic_thinking_kwargs_reach_the_kimi_k3_prompt(self) -> None:
+        # K3's template reads `thinking` / `thinking_effort`; the extension derives them from the
+        # `enable_thinking` / `reasoning_effort` that other templates read and the Anthropic
+        # adapter sends.
+        res = RenderResources.from_tokenizer(make_tokenizer(name=KIMI_K3), model_type="kimi_k3")
+
+        def render(**chat_template_kwargs) -> str:
+            request = chat_request(
+                messages=[{"role": "user", "content": "hi"}],
+                chat_template_kwargs=chat_template_kwargs or None,
+            )
+            return render_chat(request, res, tokenize=False).text
+
+        default = render()
+        assert default.startswith('<|open|>message role="system" type="thinking-effort"<|sep|>')
+        assert "`thinking_effort=max`" in default
+        assert default.endswith("<|open|>think<|sep|>")
+
+        # Thinking off: the prompt opens with the user turn and ends in the answer channel.
+        off = render(enable_thinking=False)
+        assert off.startswith('<|open|>message role="user"<|sep|>hi')
+        assert off.endswith("<|open|>response<|sep|>")
+
+        low = render(reasoning_effort="low")
+        assert low == default.replace("`thinking_effort=max`", "`thinking_effort=low`")
+
+        # A native effort is passed through while thinking is off, and the template ignores it.
+        native = chat_request(
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"thinking_effort": "high", "reasoning_effort": "none"},
+        )
+        assert render_chat(native, res, tokenize=False).text == off
+        assert native.chat_template_kwargs["thinking"] is False
+        assert native.chat_template_kwargs["thinking_effort"] == "high"
+
 
 class TestRenderConversation:
     def test_matches_render_chat_for_a_parsed_conversation(self, tokenizer) -> None:
@@ -653,6 +730,22 @@ class TestRenderConversation:
 
 
 class TestFingerprint:
+    @pytest.mark.parametrize("model_type", [None, ""])
+    def test_unknown_worker_model_type_matches_the_router(self, tokenizer, model_type) -> None:
+        worker = self._worker_resources(
+            tokenizer, model_config=SimpleNamespace(model_type=model_type)
+        )
+        router = RenderResources.from_tokenizer(tokenizer)
+        assert fingerprints_match(worker.fingerprint(), router.fingerprint())
+
+    @pytest.mark.parametrize("local,remote", [(None, "qwen3"), ("", "qwen3"), ("qwen2", "qwen3")])
+    def test_known_model_types_remain_distinct(self, tokenizer, local, remote) -> None:
+        base = resources(tokenizer)
+        assert not fingerprints_match(
+            dataclasses.replace(base, model_type=local).fingerprint(),
+            dataclasses.replace(base, model_type=remote).fingerprint(),
+        )
+
     def test_a_different_server_template_changes_the_digest(self, tokenizer) -> None:
         plain = compute_fingerprint(resources(tokenizer))
         with_template = compute_fingerprint(
@@ -964,6 +1057,59 @@ class TestPreparationContext:
         context = render_chat(chat_request(add_generation_prompt=False), res).context
 
         assert context["resolved_thinking"] == {}
+
+    @staticmethod
+    def _usage_extension(asked: list) -> ServingExtension:
+        """An extension that leaves 3 tokens out of usage and records what it was asked."""
+
+        class UsageExtension(ServingExtension):
+            def prompt_tokens_excluded_from_usage(self, **facts) -> int:
+                asked.append(facts)
+                return 3
+
+        return UsageExtension()
+
+    @pytest.mark.parametrize(
+        ("overrides", "add_generation_prompt", "request_chat_template"),
+        [
+            pytest.param({}, True, None, id="generation_prompt"),
+            pytest.param({"add_generation_prompt": False}, False, None, id="no_generation_prompt"),
+            pytest.param(
+                {"chat_template": REQUEST_TEMPLATE}, True, REQUEST_TEMPLATE, id="request_template"
+            ),
+        ],
+    )
+    def test_the_usage_offset_is_asked_with_the_rendering_facts(
+        self, tokenizer, overrides, add_generation_prompt, request_chat_template
+    ) -> None:
+        asked: list = []
+        res = resources(
+            tokenizer, extension=self._usage_extension(asked), allow_request_chat_template=True
+        )
+
+        context = render_chat(chat_request(**overrides), res).context
+
+        assert context["prompt_tokens_excluded_from_usage"] == 3
+        assert asked == [
+            {
+                "add_generation_prompt": add_generation_prompt,
+                "pre_tokenized": False,
+                "request_chat_template": request_chat_template,
+            }
+        ]
+
+    def test_a_server_template_keeps_the_whole_prompt_in_usage(self, tokenizer) -> None:
+        asked: list = []
+        res = resources(
+            tokenizer,
+            extension=self._usage_extension(asked),
+            default_chat_template=SERVER_TEMPLATE,
+        )
+
+        context = render_chat(chat_request(), res).context
+
+        assert context["prompt_tokens_excluded_from_usage"] == 0
+        assert asked == []
 
     def test_only_a_context_without_decisions_is_trivial(self) -> None:
         from tensorrt_llm.serve.render import PreparedContext

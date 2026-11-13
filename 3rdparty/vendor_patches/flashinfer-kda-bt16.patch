@@ -1,5 +1,5 @@
 diff --git a/kda_chunked_bt16_small_bh.py b/kda_chunked_bt16_small_bh.py
-index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b074971f38c 100644
+index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..65daa2b606343382b7b9e66a4997215b6aaa0e44 100644
 --- a/kda_chunked_bt16_small_bh.py
 +++ b/kda_chunked_bt16_small_bh.py
 @@ -1,3 +1,4 @@
@@ -7,7 +7,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -12,6 +13,16 @@
+@@ -12,6 +13,18 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  
@@ -17,14 +17,16 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
 +b8e81a7dae6c2aa5c9aa19c06e81e9a729271493,
 +flashinfer/kda_kernels/kda_chunked_bt16_small_bh.py (Apache-2.0).
 +Local changes add state-slot indirection and padded pool-row strides, reject
-+unwarmed graph specializations, and use the active device SM count for scheduling.
++unwarmed graph specializations, use the active device SM count for
++scheduling, and fence K1's gate-stage shared-memory writes for the async
++proxy before the MMA warp TMA-stores them.
 +The K1/K2 arithmetic and layouts are retained from upstream.
 +"""
 +
  import functools
  from typing import Optional
  
-@@ -24,7 +35,6 @@ from cutlass._mlir.dialects import llvm
+@@ -24,7 +37,6 @@ from cutlass._mlir.dialects import llvm
  from cutlass.cute.core import _pack_shape
  from cutlass.cute.nvgpu import cpasync, warp
  from cutlass.cutlass_dsl import dsl_user_op
@@ -32,7 +34,34 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
  
  
  RCP_LN2 = 1.4426950408889634
-@@ -1803,6 +1813,7 @@ class ChunkKdaFwdK2:
+@@ -1293,6 +1305,16 @@ class ChunkKdaFwdK1:
+         chunk_offset: Optional[cutlass.Int32] = None,
+         valid_tokens: Optional[cutlass.Int32] = None,
+     ):
++        """Compute one tile's gate decay and hand its stage to the MMA warpgroup.
++
++        Consumes one loaded stage (sQ, sK, sG, sDtBias, sAlog) of the tile at
++        (t_idx, h_idx, b_idx), computes the sigmoid-gated decay, writes the
++        decayed q/k fragments into the shared-memory sQd/sKd/sKi stage that
++        the MMA warpgroup consumes, and writes Kr and Gk directly to global
++        memory. The shared-memory stores are fenced for the async proxy
++        before the stage is committed, so the TMA store reads this tile
++        rather than whichever tile last used the stage.
++        """
+         alog = sAlog[h_idx]
+ 
+         tma_full = tma_consumer.wait_and_advance()
+@@ -1652,6 +1674,9 @@ class ChunkKdaFwdK1:
+                 )
+ 
+         tma_full.release()
++        # The MMA warpgroup TMA-stores sQd and sKd as soon as this stage is
++        # committed; make these shared-memory writes visible to the async proxy.
++        cute.arch.fence_view_async_shared()
+         mma_empty.commit()
+         return tma_consumer, gate_mma_producer
+ 
+@@ -1803,6 +1828,7 @@ class ChunkKdaFwdK2:
          mS_in: Optional[cute.Tensor] = None,  # (B, H, D, D)
          mS_out: Optional[cute.Tensor] = None,  # (B, H, D, D)
          mCuSeqlens: Optional[cute.Tensor] = None,  # (B + 1,)
@@ -40,7 +69,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
          stream=None,
      ):
          if cutlass.const_expr(mCuSeqlens is not None):
-@@ -2076,6 +2087,7 @@ class ChunkKdaFwdK2:
+@@ -2076,6 +2102,7 @@ class ChunkKdaFwdK2:
              mS_in,
              mS_out,
              mCuSeqlens,
@@ -48,7 +77,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
              sQK_layout_staged,
              sQKt_layout_staged,
              sV_layout_staged,
-@@ -2123,6 +2135,7 @@ class ChunkKdaFwdK2:
+@@ -2123,6 +2150,7 @@ class ChunkKdaFwdK2:
          mS_in: Optional[cute.Tensor],
          mS_out: Optional[cute.Tensor],
          mCuSeqlens: Optional[cute.Tensor],
@@ -56,7 +85,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
          sQK_layout_staged: cute.ComposedLayout,
          sQKt_layout_staged: cute.ComposedLayout,
          sV_layout_staged: cute.ComposedLayout,
-@@ -2148,6 +2161,9 @@ class ChunkKdaFwdK2:
+@@ -2148,6 +2176,9 @@ class ChunkKdaFwdK2:
          warpgroup_idx = cute.arch.make_warp_uniform(tidx // self.warpgroup_threads)
  
          v_idx, h_idx, b_idx = cute.arch.block_idx()
@@ -66,7 +95,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
  
          seq_len = cute.size(tma_tensor_Q, mode=[0])
          seq_offset = 0
-@@ -2475,11 +2491,11 @@ class ChunkKdaFwdK2:
+@@ -2475,11 +2506,11 @@ class ChunkKdaFwdK2:
              if cutlass.const_expr(mS_in is not None):
                  if cutlass.const_expr(self.transpose_S):
                      gS_in = cute.local_tile(
@@ -80,7 +109,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
                      )
                      gS_in = cute.make_tensor(
                          gS_in.iterator, cute.select(gS_in.layout, mode=[1, 0])
-@@ -2763,11 +2779,11 @@ class ChunkKdaFwdK2:
+@@ -2763,11 +2794,11 @@ class ChunkKdaFwdK2:
              if cutlass.const_expr(mS_out is not None):
                  if cutlass.const_expr(self.transpose_S):
                      gS_out = cute.local_tile(
@@ -94,7 +123,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
                      )
                      gS_out = cute.make_tensor(
                          gS_out.iterator, cute.select(gS_out.layout, mode=[1, 0])
-@@ -2808,12 +2824,12 @@ def _cute_dtype(dtype: torch.dtype):
+@@ -2808,12 +2839,12 @@ def _cute_dtype(dtype: torch.dtype):
      raise ValueError(f"unsupported dtype: {dtype}")
  
  
@@ -109,7 +138,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      )
  
  
-@@ -2838,6 +2854,8 @@ def _compile_k1(
+@@ -2838,6 +2869,8 @@ def _compile_k1(
      is_varlen: bool,
      max_active_clusters: int,
  ):
@@ -118,11 +147,10 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      cu_dtype = _cute_dtype(dtype)
      b, t, tp, nt = (cute.sym_int() for _ in range(4))
      feature: tuple[object, ...]
-@@ -2904,7 +2922,11 @@ def _compile_k2(
+@@ -2904,7 +2937,10 @@ def _compile_k2(
      has_state_output: bool,
      transpose_state: bool,
      is_varlen: bool,
-+    state_row_stride: int | None,
 +    has_state_indices: bool,
  ):
 +    if torch.cuda.is_current_stream_capturing():
@@ -130,22 +158,25 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      cu_dtype = _cute_dtype(dtype)
      b, bs, t, tp, h, nt = (cute.sym_int() for _ in range(6))
      feature: tuple[object, ...]
-@@ -2925,6 +2947,14 @@ def _compile_k2(
+@@ -2925,6 +2961,17 @@ def _compile_k2(
          cu_seqlens = None
      state = (b, h, d, d)
  
 +    def fake_state():
-+        if state_row_stride is None:
++        if not has_state_indices:
 +            return _fake(_cute_dtype(state_dtype), state)
++        # An indexed row may start beyond 2**31 elements into the pool (a strided
++        # view of the KV-cache memory), so the row stride is a 64-bit runtime value.
 +        return cute.runtime.make_fake_tensor(
 +            _cute_dtype(state_dtype), state,
-+            stride=(state_row_stride, d * d, d, 1), assumed_align=16,
++            stride=(cute.sym_int64(divisibility=16 // state_dtype.itemsize), d * d, d, 1),
++            assumed_align=16,
 +        )
 +
      q, k, kr = [_fake(cu_dtype, feature) for _ in range(3)]
      kernel = ChunkKdaFwdK2(D=d, BT=_BT, BV=bv, transpose_S=transpose_state)
      stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-@@ -2938,9 +2968,10 @@ def _compile_k2(
+@@ -2938,9 +2985,10 @@ def _compile_k2(
          _fake(cu_dtype, matrix),
          _fake(cutlass.Float32, gate),
          _fake(cu_dtype, output),
@@ -158,7 +189,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
          stream,
          options="--enable-tvm-ffi",
      )
-@@ -3040,6 +3071,7 @@ def chunk_kda_fwd_k2(
+@@ -3040,6 +3088,7 @@ def chunk_kda_fwd_k2(
      output: torch.Tensor | None = None,
      state_input: torch.Tensor | None = None,
      state_output: torch.Tensor | None = None,
@@ -166,16 +197,15 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      max_active_clusters: int = 152,
  ) -> tuple[torch.Tensor, torch.Tensor | None]:
      is_varlen = cu_seqlens is not None
-@@ -3072,6 +3104,8 @@ def chunk_kda_fwd_k2(
+@@ -3072,6 +3121,7 @@ def chunk_kda_fwd_k2(
          has_output,
          transpose_state,
          is_varlen,
-+        state_input.stride(0) if state_indices is not None else None,
 +        state_indices is not None,
      )
      compiled(
          q,
-@@ -3085,6 +3119,7 @@ def chunk_kda_fwd_k2(
+@@ -3085,6 +3135,7 @@ def chunk_kda_fwd_k2(
          state_input,
          state_output,
          cu_seqlens,
@@ -183,7 +213,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      )
      return output, state_output
  
-@@ -3108,11 +3143,12 @@ def chunk_kda_fwd(
+@@ -3108,11 +3159,12 @@ def chunk_kda_fwd(
      output: torch.Tensor | None = None,
      state_input: torch.Tensor | None = None,
      state_output: torch.Tensor | None = None,
@@ -197,7 +227,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      qd, kd, kr, mqk, mkk, gk = chunk_kda_fwd_k1(
          q,
          k,
-@@ -3142,6 +3178,7 @@ def chunk_kda_fwd(
+@@ -3142,6 +3194,7 @@ def chunk_kda_fwd(
          output=output,
          state_input=state_input,
          state_output=state_output,

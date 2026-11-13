@@ -38,6 +38,8 @@ class Qwen3Attention(QKNormRoPEAttention):
         disable_deep_gemm: bool = False,
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
+        use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -83,6 +85,8 @@ class Qwen3Attention(QKNormRoPEAttention):
             disable_deep_gemm=disable_deep_gemm,
             reduce_output=reduce_output,
             mapping_with_cp=mapping_with_cp,
+            use_gqa_decode_fmha=use_gqa_decode_fmha,
+            cache_context_plan=cache_context_plan,
         )
 
 
@@ -208,14 +212,24 @@ class Qwen3Model(DecoderModel):
         config = self.model_config
         self.mapping_with_cp = mapping_with_cp
 
-        self.embed_tokens = Embedding(
-            config.pretrained_config.vocab_size,
-            config.pretrained_config.hidden_size,
-            dtype=config.pretrained_config.torch_dtype,
-            mapping=config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        # Under attention DP each rank embeds its own tokens, so the embedding
+        # is replicated like the attention-DP lm_head it may be tied to.
+        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
+            self.embed_tokens = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+            )
+        else:
+            self.embed_tokens = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+                allreduce_strategy=config.allreduce_strategy,
+            )
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 model_config,
@@ -359,7 +373,8 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         # packed [total_tokens, hidden] tensor; take each sequence's final token.
         # Normalize in fp32 (matching sentence-transformers / the HF reference)
         # then cast back, so the unit-norm is precise even for bf16/fp16 weights.
-        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        end_indices = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         pooled = hidden_states[end_indices]
         normalized = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)
         return normalized.to(pooled.dtype)

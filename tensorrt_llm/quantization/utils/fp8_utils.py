@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional, Tuple
 
 import torch
@@ -197,6 +200,76 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     assert tma_alignment_bytes % element_size == 0
     alignment = tma_alignment_bytes // element_size
     return align(x, alignment)
+
+
+def slice_fp8_blockscale_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    start: int,
+    end: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Select output rows while retaining the original 128-row scale grid.
+
+    Returns the weight slice, its scales and the leading output rows to crop.
+    Supports raw FP32, DeepGEMM packed int32 and CuTe R128c4 uint8 scales.
+    """
+    if not 0 <= start < end <= weight.shape[0]:
+        raise ValueError(f"Invalid output feature range [{start}, {end})")
+    block_size = 128
+    first = start // block_size * block_size
+    last = min(ceil_div(end, block_size) * block_size, weight.shape[0])
+    if weight_scale.dtype == torch.float32:
+        scale = weight_scale[first // block_size:ceil_div(last, block_size)]
+    elif weight_scale.dtype == torch.int32:
+        # A row slice keeps the original leading dimension. Repack the small
+        # scale tensor to the column-major TMA layout for this GEMM's N.
+        rows = last - first
+        aligned_rows = get_tma_aligned_size(rows, weight_scale.element_size())
+        scale = weight_scale.new_empty(
+            (weight_scale.shape[1], aligned_rows)).t()[:rows]
+        scale.copy_(weight_scale[first:last])
+    elif weight_scale.dtype == torch.uint8:
+        # R128c4 stores each 128-row tile contiguously across padded K32
+        # columns. The rounded weight slice selects whole scale tiles.
+        if weight_scale.dim() != 1 or weight.shape[1] % 128:
+            raise ValueError(
+                "R128c4 scales require a flat tensor and K divisible by 128")
+        scale_cols = align(weight.shape[1] // 32, 4)
+        expected_size = align(weight.shape[0], 128) * scale_cols
+        if weight_scale.numel() != expected_size:
+            raise ValueError(f"Expected {expected_size} R128c4 scale bytes")
+        scale = weight_scale.narrow(0, first * scale_cols,
+                                    align(last - first, 128) * scale_cols)
+    else:
+        raise NotImplementedError(
+            "Sliced FP8 projections require FP32, packed int32 or R128c4 uint8 scales"
+        )
+    return weight[first:last], scale, start - first
+
+
+class Fp8BlockScaleWeightSliceCache(torch.nn.Module):
+    """Retain prepared output-slice scales as movable, nonpersistent buffers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._ranges: dict[tuple[int, int], tuple[int, int, int]] = {}
+
+    def prepare(self, weight: torch.Tensor, weight_scale: torch.Tensor,
+                start: int, end: int) -> None:
+        """Prepare a fixed slice after the source weights are transformed."""
+        if (start, end) in self._ranges:
+            return
+        sliced_weight, scale, crop = slice_fp8_blockscale_weight(
+            weight, weight_scale, start, end)
+        first = start - crop
+        self.register_buffer(f"scale_{start}_{end}", scale, persistent=False)
+        self._ranges[start, end] = (first, first + sliced_weight.shape[0], crop)
+
+    def get(self, weight: torch.Tensor, start: int,
+            end: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Return a view of live weights and the prepared scale buffer."""
+        first, last, crop = self._ranges[start, end]
+        return weight[first:last], self.get_buffer(f"scale_{start}_{end}"), crop
 
 
 def get_col_major_tma_aligned_packed_tensor(x: torch.Tensor) -> torch.Tensor:

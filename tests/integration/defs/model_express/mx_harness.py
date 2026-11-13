@@ -25,6 +25,7 @@ launching, transfer evidence, and weight-manifest comparison.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -48,6 +49,7 @@ from defs.model_express.mx_evidence import (
     DONOR_PROCESS_FAILURE_MARKERS,
     DONOR_PROCESS_FAILURE_OVERLAP,
     check_receiver_log,
+    rdma_transfers_by_rank,
 )
 from defs.trt_test_alternative import cleanup_process_tree, popen
 from tensorrt_llm._torch.weight_sharing import (
@@ -101,6 +103,11 @@ MIN_PROBE_NEW_TOKENS = 32
 # also byte-identical at the boundary.
 TRANSFER_TIER_KINDS = ("param",)
 FINAL_TIER_PAIRS = (("baseline", "donor"), ("baseline", "receiver"), ("donor", "receiver"))
+# Behavioral probes a row can request from `mx_e2e_worker.py`. The image probe
+# asks fixed questions about these images under
+# `<models root>/multimodals/test_data`.
+PROBES = ("text", "image")
+IMAGE_PROBE_FILES = ("seashore.png", "inpaint.png")
 
 ManifestKey = tuple[str, str, int]
 
@@ -112,7 +119,17 @@ class MxE2ECase:
     `final_manifest_exempt_patterns` lists `fnmatch` patterns of tensor names
     whose final-tier digest may legitimately differ between roles (never a
     numeric tolerance, never at the transfer tier). Every pattern needs a code
-    comment explaining why; the qualified BF16 dense families use none.
+    comment explaining why; the current rows use none.
+
+    `probe` selects the worker's behavioral probe: `text` sends token-ID
+    prompts, and `image` sends image prompts so that vision-language rows also
+    exercise the vision encoder on every role.
+
+    `moe_ep_size` selects the MoE expert-parallel size of a MoE row; MoE TP
+    takes the rest of TP. `moe_disable_finalize_fusion` disables the CUTLASS
+    MoE FC2+finalize fusion in every role, because the fused finalize is not
+    deterministic for top-k greater than 2 and the roles must produce
+    identical greedy tokens.
     """
 
     model_env: str
@@ -120,6 +137,18 @@ class MxE2ECase:
     repository_cache_prefix: str
     tp_size: int
     final_manifest_exempt_patterns: tuple[str, ...] = ()
+    probe: str = "text"
+    moe_ep_size: int = 1
+    moe_disable_finalize_fusion: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject a probe that `mx_e2e_worker.py` does not implement, or an impossible MoE split."""
+        if self.probe not in PROBES:
+            raise ValueError(f"Unknown MX E2E probe {self.probe!r}; expected one of {PROBES}")
+        if self.moe_ep_size < 1 or self.tp_size % self.moe_ep_size != 0:
+            raise ValueError(
+                f"MoE EP size {self.moe_ep_size} does not divide TP size {self.tp_size}"
+            )
 
 
 @dataclass(frozen=True)
@@ -169,23 +198,45 @@ def skip_or_fail(message: str) -> NoReturn:
     pytest.skip(message)
 
 
+def models_root() -> Path:
+    """Return `LLM_MODELS_ROOT`, or the first existing well-known models root."""
+    models_root_env = os.environ.get("LLM_MODELS_ROOT")
+    if models_root_env:
+        return Path(models_root_env).expanduser()
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models")
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models")
+    return root
+
+
 def resolve_model_path(case: MxE2ECase) -> Path:
     configured = os.environ.get(case.model_env)
     if configured:
         model_path = Path(configured).expanduser()
     else:
-        models_root_env = os.environ.get("LLM_MODELS_ROOT")
-        if models_root_env:
-            models_root = Path(models_root_env).expanduser()
-        else:
-            models_root = Path("/home/scratch.trt_llm_data_ci/llm-models")
-            if not models_root.exists():
-                models_root = Path("/scratch.trt_llm_data/llm-models")
-        model_path = models_root / case.default_model_subdir
+        model_path = models_root() / case.default_model_subdir
 
     if not model_path.is_dir():
         skip_or_fail(f"MX E2E model directory does not exist: {model_path}. Set {case.model_env}.")
     return model_path.absolute()
+
+
+def probe_worker_args(case: MxE2ECase) -> tuple[str, ...]:
+    """Return the `mx_e2e_worker.py` arguments that select the row's probe.
+
+    Every role of a row gets the same arguments, so all roles use the same
+    prompts and engine limits.
+    """
+    if case.probe == "text":
+        return ()
+    args = ["--probe", case.probe]
+    test_data = models_root() / "multimodals" / "test_data"
+    for file_name in IMAGE_PROBE_FILES:
+        image_path = test_data / file_name
+        if not image_path.is_file():
+            skip_or_fail(f"MX E2E probe image does not exist: {image_path}. Set LLM_MODELS_ROOT.")
+        args.extend(("--image", str(image_path.absolute())))
+    return tuple(args)
 
 
 def require_mx_environment(required_gpus: int) -> tuple[str, tuple[str, ...]]:
@@ -264,6 +315,21 @@ def checkpoint_files(model_path: Path) -> tuple[Path, ...]:
     return tuple(sorted(path for path in model_path.rglob("*") if path.is_file()))
 
 
+@functools.cache
+def _checkpoint_identity(
+    model_path: Path, file_stats: tuple[tuple[str, int, int], ...]
+) -> ArtifactIdentity:
+    """Hash a local checkpoint once per session.
+
+    `ArtifactIdentity.from_checkpoint` reads every byte of a local checkpoint,
+    and several rows can share one, such as the Qwen3 MoE rows of one stage.
+    `file_stats` holds the relative path, size, and modification time of every
+    file, so the cached identity is reused only for unchanged files.
+    """
+    del file_stats  # Only part of the cache key.
+    return ArtifactIdentity.from_checkpoint(model_path)
+
+
 def build_canonical_snapshot(case: MxE2ECase, model_path: Path, run_dir: Path) -> Path:
     """Symlink the checkpoint into an HF-cache-shaped snapshot keyed by its `ArtifactIdentity`."""
     files = checkpoint_files(model_path)
@@ -272,7 +338,11 @@ def build_canonical_snapshot(case: MxE2ECase, model_path: Path, run_dir: Path) -
     if not any(path.suffix.lower() in WEIGHT_SUFFIXES for path in files):
         pytest.fail(f"MX E2E donor checkpoint contains no recognized weight files: {model_path}")
 
-    source_identity = ArtifactIdentity.from_checkpoint(model_path)
+    file_stats = tuple(
+        (str(path.relative_to(model_path)), path.stat().st_size, path.stat().st_mtime_ns)
+        for path in files
+    )
+    source_identity = _checkpoint_identity(model_path, file_stats)
     run_id = uuid.uuid4().hex[:12]
     repository_cache_name = f"{case.repository_cache_prefix}-{run_id}"
     snapshot = (
@@ -351,6 +421,16 @@ def worker_command(
         command.extend(("--max-serve-seconds", str(max_serve_seconds)))
     command.extend(extra_args)
     return command
+
+
+def moe_worker_args(case: MxE2ECase) -> tuple[str, ...]:
+    """Worker flags that apply a row's MoE settings identically to every role."""
+    args: list[str] = []
+    if case.moe_ep_size != 1:
+        args.extend(("--moe-ep-size", str(case.moe_ep_size)))
+    if case.moe_disable_finalize_fusion:
+        args.append("--moe-disable-finalize-fusion")
+    return tuple(args)
 
 
 def mx_metadata_ports(tp_size: int) -> tuple[int, int]:
@@ -603,6 +683,62 @@ def assert_transfer_evidence(case: MxE2ECase, receiver_log_path: Path) -> None:
         )
 
 
+def mx_transfer_upper_bound(manifest: WeightManifest) -> tuple[int, int]:
+    """Return the most tensors and bytes ModelExpress can move for one rank's manifest.
+
+    ModelExpress registers one tensor per distinct parameter data pointer and
+    no buffers. Non-empty parameters that view one storage at the same offset,
+    such as a tied LM head and its token-embedding table, are one view and
+    count once, at the largest of their sizes, because ModelExpress registers
+    whichever of them comes first in module order. Two cases can count more
+    than ModelExpress registers, so the result bounds the transfer from above:
+    empty parameters, which count once each but can share the null data
+    pointer, and parameters of different dtypes that start at one address,
+    which count once per dtype.
+    """
+    storage_of = {fqn: index for index, group in enumerate(manifest.alias_groups) for fqn in group}
+    views: dict[tuple[object, ...], int] = {}
+    for entry in manifest.entries:
+        if entry.kind != "param":
+            continue
+        storage = storage_of.get(entry.fqn, entry.fqn) if entry.nbytes else entry.fqn
+        view = (storage, entry.dtype, entry.storage_offset)
+        views[view] = max(views.get(view, 0), entry.nbytes)
+    return len(views), sum(views.values())
+
+
+def assert_transfer_within_manifests(
+    case: MxE2ECase,
+    receiver_log_path: Path,
+    manifests: Mapping[ManifestKey, WeightManifest],
+) -> None:
+    """Require no receiver rank's RDMA record to move more than its distinct parameter views.
+
+    Run after `assert_transfer_evidence`, which guarantees one record per rank.
+    A storage that several parameters share must cross the wire once.
+    """
+    transfers = rdma_transfers_by_rank(
+        receiver_log_path.read_text(encoding="utf-8", errors="replace")
+    )
+    problems = []
+    for rank in range(case.tp_size):
+        tensor_count, total_bytes = mx_transfer_upper_bound(
+            manifests[("transfer", "receiver", rank)]
+        )
+        (record,) = transfers[rank]
+        # ModelExpress logs the size in GB rounded to two decimals.
+        if record.tensor_count > tensor_count or record.size_gb > total_bytes / 1e9 + 0.0051:
+            problems.append(
+                f"rank {rank} moved {record.tensor_count} tensors, {record.size_gb} GB; its "
+                f"transfer manifest has at most {tensor_count} distinct parameter views, "
+                f"{total_bytes / 1e9:.4f} GB"
+            )
+    if problems:
+        pytest.fail(
+            "MX receiver moved more than its transfer manifest holds:\n- " + "\n- ".join(problems)
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Weight manifests
 # --------------------------------------------------------------------------- #
@@ -764,6 +900,89 @@ def assert_weight_manifests(
             )
 
 
+# Routed-expert tensors of the unquantized CUTLASS MoE backend, the only MoE
+# layout that `assert_moe_partition` knows: `[experts, rows, columns]`.
+_ROUTED_EXPERT_SUFFIXES = (".w3_w1_weight", ".w2_weight")
+
+
+def assert_moe_partition(
+    case: MxE2ECase,
+    manifests: Mapping[ManifestKey, WeightManifest],
+    model_path: Path,
+    roles: Sequence[str] = ROLES,
+) -> None:
+    """Check from the final manifests that every rank realized the row's MoE partition.
+
+    The output and manifest comparisons hold for any partition that all roles
+    share, so a MoE row whose `moe_ep_size` never reached the model would still
+    pass them. With MoE EP size `ep` and MoE TP size `tp_size // ep`, each rank
+    holds `num_experts // ep` routed experts; `w3_w1_weight` stacks
+    `2 * moe_intermediate_size // (tp_size // ep)` rows of `hidden_size`, and
+    `w2_weight` holds `moe_intermediate_size // (tp_size // ep)` columns. A
+    checkpoint without `num_experts` whose manifests hold no routed-expert
+    tensors is dense and needs no check. Any other MoE config or routed-expert
+    layout fails with a request to extend this check rather than with a
+    partition mismatch.
+    """
+    roles = _validated_roles(roles)
+    realized = {
+        (role, rank): {
+            fqn: entry.shape
+            for fqn, entry in manifests[("final", role, rank)].entries_by_fqn().items()
+            if fqn.endswith(_ROUTED_EXPERT_SUFFIXES)
+        }
+        for role in roles
+        for rank in range(case.tp_size)
+    }
+    config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    if "num_experts" not in config:
+        assert not any(realized.values()), (
+            "The final manifests hold routed-expert tensors, but the checkpoint config has no "
+            "`num_experts`; teach `assert_moe_partition` this MoE config"
+        )
+        return
+    # The expected shapes come from these Qwen3 MoE config keys.
+    missing_keys = [key for key in ("moe_intermediate_size", "hidden_size") if key not in config]
+    assert not missing_keys, (
+        f"The MoE checkpoint config has no {missing_keys}; teach `assert_moe_partition` this "
+        "MoE config"
+    )
+    unknown_layout = sorted(
+        fqn for shapes in realized.values() for fqn, shape in shapes.items() if len(shape) != 3
+    )
+    assert not unknown_layout, (
+        f"`{unknown_layout[0]}` is not a 3-D `[experts, rows, columns]` tensor of the "
+        "unquantized CUTLASS MoE backend; teach `assert_moe_partition` this MoE layout"
+    )
+
+    moe_tp_size = case.tp_size // case.moe_ep_size
+    num_experts = config["num_experts"]
+    intermediate_size = config["moe_intermediate_size"]
+    assert num_experts % case.moe_ep_size == 0 and intermediate_size % moe_tp_size == 0, (
+        f"MoE EP {case.moe_ep_size} x MoE TP {moe_tp_size} does not divide {num_experts} experts "
+        f"of intermediate size {intermediate_size}"
+    )
+    local_experts = num_experts // case.moe_ep_size
+    local_intermediate = intermediate_size // moe_tp_size
+    hidden_size = config["hidden_size"]
+    w3_w1_suffix, w2_suffix = _ROUTED_EXPERT_SUFFIXES
+    expected_shapes = {
+        w3_w1_suffix: (local_experts, 2 * local_intermediate, hidden_size),
+        w2_suffix: (local_experts, hidden_size, local_intermediate),
+    }
+    for (role, rank), shapes in realized.items():
+        for suffix, expected_shape in expected_shapes.items():
+            found = {fqn: shape for fqn, shape in shapes.items() if fqn.endswith(suffix)}
+            assert found, (
+                f"{role} rank {rank}: the final manifest holds no routed-expert `{suffix[1:]}` tensor"
+            )
+            wrong = sorted(fqn for fqn, shape in found.items() if shape != expected_shape)
+            assert not wrong, (
+                f"{role} rank {rank} did not realize MoE EP {case.moe_ep_size} x MoE TP "
+                f"{moe_tp_size}: `{wrong[0]}` has shape {found[wrong[0]]}, expected {expected_shape}"
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Artifacts and timing
 # --------------------------------------------------------------------------- #
@@ -836,11 +1055,13 @@ def archive_run_artifacts(
 __all__ = [
     "DEFAULT_MX_METADATA_PORT",
     "FINAL_TIER_PAIRS",
+    "IMAGE_PROBE_FILES",
     "MIN_PROBE_NEW_TOKENS",
     "MIN_PROBE_PROMPTS",
     "MINIMUM_MODELEXPRESS_VERSION",
     "MX_PREFLIGHT_SCRIPT",
     "MX_ROLES",
+    "PROBES",
     "ROLES",
     "SELF_CHECK_FAILED_EXIT_CODE",
     "TRANSFER_TIER_KINDS",
@@ -851,8 +1072,10 @@ __all__ = [
     "MxE2ECase",
     "MxRunLayout",
     "archive_run_artifacts",
+    "assert_moe_partition",
     "assert_probe_payload",
     "assert_transfer_evidence",
+    "assert_transfer_within_manifests",
     "assert_weight_manifests",
     "build_canonical_snapshot",
     "build_metadata_only_snapshot",
@@ -863,7 +1086,11 @@ __all__ = [
     "donor_session",
     "load_payload",
     "log_tail",
+    "models_root",
+    "moe_worker_args",
     "mx_metadata_ports",
+    "mx_transfer_upper_bound",
+    "probe_worker_args",
     "qualification_required",
     "report_timings",
     "require_mx_environment",

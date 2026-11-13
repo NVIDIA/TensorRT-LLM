@@ -37,6 +37,9 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
+    apply_minimax_h3_qk_norm_rope_bf16,
+)
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -44,6 +47,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .vsa import get_h3_vsa_context, h3_vsa_attention
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -75,7 +79,7 @@ def apply_minimax_h3_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]``."""
+    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]`` (eager path)."""
 
     rotary_dim = cos.shape[-1]
     if rotary_dim > hidden_states.shape[-1] or rotary_dim % 2:
@@ -91,6 +95,19 @@ def apply_minimax_h3_rotary_emb(
     hidden_states_rotated = torch.cat((-x2, x1), dim=-1)
     hidden_states_rotary = hidden_states_rotary * cos + hidden_states_rotated * sin
     return torch.cat((hidden_states_rotary, hidden_states_pass), dim=-1).contiguous()
+
+
+def _dense_attention_model_config(model_config: DiffusionModelConfig) -> DiffusionModelConfig:
+    """Return a shallow config copy with VSA disabled for non-video attention."""
+
+    sparse_config = getattr(model_config.attention, "sparse_attention_config", None)
+    if sparse_config is None or getattr(sparse_config, "algorithm", None) != "vsa":
+        return model_config
+
+    dense_config = model_config.model_copy(deep=False)
+    dense_config.attention = model_config.attention.model_copy(deep=True)
+    dense_config.attention.sparse_attention_config = None
+    return dense_config
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -144,17 +161,72 @@ class MiniMaxH3Attention(Attention):
             qk_norm_mode="per_head",
             eps=qk_norm_eps,
             bias=False,
-            # H3 rotates a leading split-half region and passes the tail through.
-            # The shared fused kernel currently implements a different layout.
-            fuse_qk_norm_rope=False,
+            # H3 rotates a leading split-half region and passes the tail through, which
+            # the shared fused kernel does not implement; the flag drives H3's own kernel
+            # (fused_rope.py) through the override of forward() below.
+            fuse_qk_norm_rope=True,
             interleave=False,
-            config=model_config,
+            config=_dense_attention_model_config(model_config),
             layer_idx=layer_idx,
             module_name=module_name,
             async_ulysses=use_async_ulysses,
             separate_qkv_is_self_attention=True,
         )
         self.use_async_ulysses = use_async_ulysses
+        sparse = model_config.attention.sparse_attention_config
+        self.to_gate_compress = None
+        self._vsa_backend = model_config.attention.backend
+        if sparse is not None and sparse.algorithm == "vsa":
+            if self._vsa_backend not in ("TRTLLM", "CUTEDSL"):
+                raise ValueError("MiniMax-H3 VSA requires the TRTLLM or CUTEDSL backend.")
+            if model_config.mapping.world_size != 1:
+                raise ValueError("MiniMax-H3 VSA currently supports a single GPU.")
+            self.to_gate_compress = Linear(
+                hidden_size,
+                num_attention_heads * attention_head_dim,
+                bias=False,
+                dtype=model_config.torch_dtype,
+                mapping=model_config.mapping,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+
+    def _use_fused_qk_norm_rope(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Decide between the fused per-head RMSNorm + RoPE kernel and the eager path.
+
+        Only what selects the path is checked here: the per-instance flag, the packed-QKV
+        layout the kernel reads (equal Q/K head counts, head dimension 128), an un-sharded
+        plain RMSNorm with BF16 weights, CUDA BF16 activations, a rotary width that is a
+        multiple of 32 and no autograd. ``apply_minimax_h3_qk_norm_rope_bf16`` raises on
+        anything else.
+        """
+        if not self.fuse_qk_norm_rope or not self.qk_norm or self.qkv_mode != QKVMode.FUSE_QKV:
+            return False
+        if self.local_num_attention_heads != self.local_num_key_value_heads or self.head_dim != 128:
+            return False
+        for norm in (self.norm_q, self.norm_k):
+            if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
+                return False
+        cos, sin = rotary_emb
+        if (
+            not hidden_states.is_cuda
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.ndim != 3
+            or cos.shape != (hidden_states.shape[1], cos.shape[-1])
+            or sin.shape != cos.shape
+            or cos.shape[-1] % 32
+            or cos.shape[-1] > self.head_dim
+        ):
+            return False
+        if torch.is_grad_enabled() and any(
+            t.requires_grad
+            for t in (hidden_states, cos, sin, self.norm_q.weight, self.norm_k.weight)
+        ):
+            return False
+        return True
 
     def forward(
         self,
@@ -162,30 +234,73 @@ class MiniMaxH3Attention(Attention):
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         if self.use_async_ulysses:
             return self.forward_async(
-                hidden_states, rotary_emb, key_padding_mask=key_padding_mask, timestep=timestep
+                hidden_states,
+                rotary_emb,
+                key_padding_mask=key_padding_mask,
+                timestep=timestep,
+                valid_seq_len=valid_seq_len,
             )
         batch_size, sequence_length = hidden_states.shape[:2]
-        query, key, value = self.get_qkv(hidden_states)
-        query = query.view(
-            batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
-        )
-        key = key.view(batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim)
-        query, key = self.apply_qk_norm(query, key)
+        if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
+            # One launch normalizes and rotates Q and K from the packed projection
+            # output; V stays a view of the same buffer.
+            qkv = self.qkv_proj(hidden_states)
+            value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
+            cos, sin = rotary_emb
+            query, key = apply_minimax_h3_qk_norm_rope_bf16(
+                qkv,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos,
+                sin,
+                self.norm_q.variance_epsilon,
+                self.local_num_attention_heads,
+                self.head_dim,
+            )
+        else:
+            query, key, value = self.get_qkv(hidden_states)
+            query = query.view(
+                batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
+            )
+            key = key.view(
+                batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim
+            )
+            query, key = self.apply_qk_norm(query, key)
+            if rotary_emb is not None:
+                query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
+                key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
+            query = query.flatten(2)
+            key = key.flatten(2)
 
-        if rotary_emb is not None:
-            query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
-            key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
+        if self.to_gate_compress is not None:
+            query = query.view(
+                batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
+            )
+            key = key.view_as(query)
+            metadata = get_h3_vsa_context()
+            gate = self.to_gate_compress(hidden_states).view_as(query)
+            output = h3_vsa_attention(
+                query,
+                key,
+                value.view_as(query),
+                gate,
+                metadata,
+                self._attn_impl,
+                backend=self._vsa_backend,
+            )
+            return self.to_out[0](output.flatten(2))
 
-        query = query.flatten(2)
-        key = key.flatten(2)
         hidden_states = self._attn_impl(
             query,
             key,
             value,
             key_padding_mask=key_padding_mask,
+            discard_padded_queries=True,
+            valid_seq_len=valid_seq_len,
             timestep=timestep,
         )
         return self.to_out[0](hidden_states)
@@ -196,6 +311,7 @@ class MiniMaxH3Attention(Attention):
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """``forward`` with each projection pushed to the peers as soon as it is
         computed: V, then Q and K with their per-head norm and RoPE, run on the
@@ -226,6 +342,8 @@ class MiniMaxH3Attention(Attention):
             compute_k,
             compute_v,
             key_padding_mask=key_padding_mask,
+            discard_padded_queries=True,
+            valid_seq_len=valid_seq_len,
             timestep=timestep,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
@@ -284,6 +402,7 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
             quant_config=model_config.quant_config,
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
+            tensor_parallel_mode=None,
             reduce_output=False,
         )
 
@@ -323,6 +442,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
             quant_config=model_config.quant_config,
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
+            tensor_parallel_mode=None,
             reduce_output=False,
         )
 
@@ -362,7 +482,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             qk_norm_eps=qk_norm_eps,
-            model_config=model_config,
+            model_config=_dense_attention_model_config(model_config),
             layer_idx=layer_idx,
             module_name=f"token_refiner.refiner_blocks.{layer_idx}.attn",
         )
@@ -384,10 +504,12 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             _norm_2d(self.norm1, hidden_states),
             key_padding_mask=key_padding_mask,
+            valid_seq_len=valid_seq_len,
         )
         residual = hidden_states
         hidden_states = _norm_2d(self.norm2, hidden_states)
@@ -413,9 +535,12 @@ class MiniMaxH3TokenRefiner(nn.Module):
         fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self._supports_key_padding_mask = model_config.attention.backend.upper() in (
+        self._attn_backend = model_config.attention.backend.upper()
+        self._supports_key_padding_mask = self._attn_backend in (
             "VANILLA",
             "FA4",
+            "TRTLLM",
+            "FLASHINFER",
         )
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
@@ -451,14 +576,24 @@ class MiniMaxH3TokenRefiner(nn.Module):
         if pad:
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
-                    "Padded token-refiner sequences require key_padding_mask support; use VANILLA or FA4."
+                    "Padded token-refiner sequences require key_padding_mask support; "
+                    "use VANILLA, FA4, TRTLLM or FLASHINFER."
                 )
-            valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
-            key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
+            if self._attn_backend != "TRTLLM":
+                # Attention caches use the mask version to detect changes.
+                with torch.inference_mode(False):
+                    valid = hidden_states.new_ones(
+                        (hidden_states.shape[0], seq_len), dtype=torch.bool
+                    )
+                    key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
             hidden_states = _pad_tensor_dim(hidden_states, 1, pad)
         hidden_states = self.sharder.shard(hidden_states, dim=1)
         for block in self.refiner_blocks:
-            hidden_states = block(hidden_states, key_padding_mask=key_padding_mask)
+            hidden_states = block(
+                hidden_states,
+                key_padding_mask=key_padding_mask,
+                valid_seq_len=seq_len if pad else None,
+            )
         hidden_states = _norm_2d(self.final_norm, hidden_states)
         return self.sharder.gather(hidden_states, dim=1, unpad_to=seq_len)
 
@@ -531,10 +666,17 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
             return self._forward_fused_adaln(
-                hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+                hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len,
             )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
@@ -548,6 +690,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             rotary_emb,
             key_padding_mask,
             timestep,
+            valid_seq_len,
         )
 
         residual = hidden_states
@@ -568,13 +711,16 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         key_padding_mask: Optional[torch.Tensor],
         timestep: Optional[torch.Tensor],
+        valid_seq_len: Optional[int],
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
-        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
+        attn_output = self.attn(
+            norm_hidden_states, rotary_emb, key_padding_mask, timestep, valid_seq_len
+        )
         hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
             hidden_states,
             attn_output,
@@ -603,14 +749,14 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
-        if model_config.mapping.tp_size != 1:
-            raise NotImplementedError(
-                "MiniMax-H3 initial support is TP=1 only. AdaLN tensor-parallel "
-                "sharding requires a model-specific gather contract."
-            )
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         # Only VANILLA supports arbitrary padding between packed modalities.
-        self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
+        self._supports_key_padding_mask = self._attn_backend in (
+            "VANILLA",
+            "FA4",
+            "TRTLLM",
+            "FLASHINFER",
+        )
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
@@ -714,6 +860,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             "quant_config": model_config.quant_config,
             "skip_create_weights_in_init": model_config.skip_create_weights_in_init,
             "force_dynamic_quantization": model_config.force_dynamic_quantization,
+            "tensor_parallel_mode": None,
             "reduce_output": False,
         }
         bf16_linear_kwargs = {
@@ -722,6 +869,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             "quant_config": model_config.quant_config,
             "skip_create_weights_in_init": model_config.skip_create_weights_in_init,
             "force_dynamic_quantization": model_config.force_dynamic_quantization,
+            "tensor_parallel_mode": None,
             "reduce_output": False,
         }
 
@@ -924,6 +1072,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         timestep_indices_for_norm = timestep_indices
         rotary_emb = static_context.rotary_emb
         pad = _padding_to_multiple(sequence_length, self.sharder.size)
+        has_existing_padding = bool((token_tags < 0).any())
+        valid_seq_len = None
+        if self._attn_backend == "TRTLLM" and (pad or has_existing_padding):
+            valid_seq_len = sequence_length
+            if has_existing_padding:
+                valid_seq_len = int((token_tags >= 0).sum().item())
         token_tags_for_mask = token_tags
         if pad:
             packed_hidden_states = _pad_tensor_dim(packed_hidden_states, 1, pad)
@@ -933,25 +1087,30 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             rotary_emb = _pad_rotary_emb(rotary_emb, pad)
 
         key_padding_mask = None
-        if bool((token_tags_for_mask < 0).any()):
+        if pad or has_existing_padding:
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
                     f"{self._attn_backend} backend cannot express it. Use "
-                    "VANILLA or FA4."
+                    "VANILLA, FA4, TRTLLM or FLASHINFER."
                 )
-            # FA4 expresses padding through seqused_k, which requires valid
-            # tokens to form a prefix. Ulysses appends padding in this layout.
-            if self._attn_backend == "FA4" and bool(
+            # FA4 seqused_k and TRTLLM prefix trimming require trailing padding.
+            # Ulysses appends padding in this layout.
+            if self._attn_backend in ("FA4", "TRTLLM") and bool(
                 ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
             ):
                 raise NotImplementedError(
-                    "FA4 requires trailing packed-row padding; use VANILLA for interior padding."
+                    f"{self._attn_backend} requires trailing packed-row padding; use VANILLA for interior padding."
                 )
-            key_padding_mask = (
-                (token_tags_for_mask >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
-            )
+            if self._attn_backend != "TRTLLM":
+                # Attention caches use the mask version to detect changes.
+                with torch.inference_mode(False):
+                    key_padding_mask = (
+                        (token_tags_for_mask >= 0)
+                        .unsqueeze(0)
+                        .expand(packed_hidden_states.shape[0], -1)
+                    )
 
         padded_sequence_length = packed_hidden_states.shape[1]
         packed_hidden_states = self.sharder.shard(packed_hidden_states, dim=1)
@@ -971,6 +1130,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 rotary_emb,
                 key_padding_mask,
                 timestep,
+                valid_seq_len=valid_seq_len,
             )
 
         packed_hidden_states = self.norm_out(

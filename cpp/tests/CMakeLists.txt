@@ -66,7 +66,7 @@ function(tllm_assert_test_is_component_local target)
 endfunction()
 
 function(add_tllm_gtest test_name)
-  set(options FULL_STACK NO_GTEST_MAIN REQUIRES_GPU)
+  set(options FULL_STACK NO_GTEST_MAIN)
   set(one_value_args TIMEOUT OWNER TEST_PREFIX)
   set(multi_value_args SOURCES LINK_LIBRARIES LABELS)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "${options}" "${one_value_args}"
@@ -114,9 +114,6 @@ function(add_tllm_gtest test_name)
                              PRIVATE TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
   set(test_properties ENVIRONMENT "CUDA_MODULE_LOADING=LAZY")
-  if(ARG_REQUIRES_GPU)
-    list(APPEND test_properties RESOURCE_LOCK gpu)
-  endif()
   if(ARG_TIMEOUT)
     list(APPEND test_properties TIMEOUT "${ARG_TIMEOUT}")
   endif()

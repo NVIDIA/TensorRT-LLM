@@ -67,20 +67,23 @@ TensorRT LLM supports two strategies for attention modules:
 
 #### How to Enable Attention Parallelism
 
-To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, create a YAML configuration file named `parallel_config.yaml`:
+To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, choose one of the following configurations and save it as `parallel_config.yaml`.
 
-```bash
-cat <<EOF > parallel_config.yaml
-# TP-8
+**TP-8:**
+
+```yaml
 tensor_parallel_size: 8
 enable_attention_dp: false    # default
-# DP-8
-tensor_parallel_size: 8
-enable_attention_dp: true
-EOF
 ```
 
-then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
+**DP-8:**
+
+```yaml
+tensor_parallel_size: 8
+enable_attention_dp: true
+```
+
+Then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
 
 ### FFN Module
 
@@ -100,24 +103,34 @@ TensorRT LLM supports three execution patterns for MoE:
 
 #### How to Enable MoE Parallelism
 
-To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, create a YAML configuration file named `parallel_config.yaml` as follows:
+To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, choose one of the following configurations and save it as `parallel_config.yaml`.
 
-```bash
-cat <<EOF > parallel_config.yaml
-# TP only
+**TP only:**
+
+```yaml
 tensor_parallel_size: 8
 moe_tensor_parallel_size: 8
+moe_expert_parallel_size: 1
+```
 
-# EP only
+**EP only:**
+
+```yaml
 tensor_parallel_size: 8
+moe_tensor_parallel_size: 1
 moe_expert_parallel_size: 8
+```
 
-# Hybrid (TP-4 × EP-2)
+**Hybrid (TP-4 × EP-2):**
+
+```yaml
 tensor_parallel_size: 8      # 4 × 2
 moe_tensor_parallel_size: 4
 moe_expert_parallel_size: 2
-EOF
 ```
+
+Then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
+
 ```{note}
 The product of `moe_tensor_parallel_size` and `moe_expert_parallel_size` must equal `tensor_parallel_size`.
 ```
@@ -141,7 +154,7 @@ Large-scale MoE models like DeepSeek-V3/R1, LLaMA4, and Qwen3 use fine-grained e
 Wide-EP introduces the concept of **expert slots** that are decoupled from specific experts. This allows:
 - Multiple replicas of hot experts across different GPUs
 - Dynamic expert placement based on workload patterns
-- Both offline and online load balancing strategies
+- Offline, online, and per-layer dynamic load balancing strategies
 
 #### 2. Custom EP Communication Kernels
 - Optimized for NVIDIA GB200 Multi-Node NVLink (MNNVL)
@@ -151,6 +164,7 @@ Wide-EP introduces the concept of **expert slots** that are decoupled from speci
 #### 3. Expert Parallelism Load Balancer (EPLB)
 - **Offline EPLB**: Pre-computed expert placement based on historical workload statistics
 - **Online EPLB**: Dynamic expert placement that adapts to real-time traffic patterns
+- **Per-layer dynamic EPLB**: Expert placement re-planned for every MoE layer on every forward pass, with hot-expert weights copied into helper slots on the GPU (`MEGAMOE_CUTEDSL` backend only)
 - Layer-wise weight redistribution to minimize inference disruption
 
 ### Architecture Overview
@@ -166,9 +180,10 @@ The system maintains a routing table that maps Expert IDs to Slot IDs, which can
 
 1. **Start with offline EPLB** for production deployments with known workload patterns
 2. **Use online EPLB** for dynamic workloads or when traffic patterns change frequently
-3. **Monitor expert statistics** to understand workload distribution
-4. **Tune max_num_tokens** based on your memory constraints and EP size
-5. **Test with representative datasets** to validate load balancing effectiveness
+3. **Use per-layer dynamic EPLB** for context-heavy (prefill) serving on the `MEGAMOE_CUTEDSL` backend when the hot experts change from one batch to the next. Online EPLB refreshes a few layers per iteration from decayed statistics, so it follows the recent average load; per-layer dynamic EPLB re-plans each layer from the routing of the current forward pass. It runs without CUDA graphs, so prefer online EPLB for generation-heavy deployments that rely on them. See [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) for its requirements.
+4. **Monitor expert statistics** to understand workload distribution
+5. **Tune max_num_tokens** based on your memory constraints and EP size
+6. **Test with representative datasets** to validate load balancing effectiveness
 
 ### References
 

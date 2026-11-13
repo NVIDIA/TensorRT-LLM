@@ -56,6 +56,7 @@ _COLLECTIVE_COORDINATOR_CALLS = {
     "prepare_context_schedulable",  # transceiver.prepare_context_requests consensus
     "poll_gen_transfers",  # gen transfer status consensus
     "poll_progress_when_idle",  # ctx transfer status consensus
+    "align_gen_admission_across_cp",  # cp_allgather of the admitted gen-init ids
     "receive_gen_init",  # async receive polls gen status consensus
     "reap_context_sends",  # ctx transfer status consensus
     "handle_timeouts_synced",  # tp_allgather_int64 under ADP
@@ -91,7 +92,12 @@ def _recording_coordinator(calls: list) -> DisaggTransferCoordinator:
         calls.append(("admit", fitting))
         return fitting, False
 
+    def align_gen_admission_across_cp(admitted):
+        calls.append(("align_gen_admission_across_cp", admitted))
+        return admitted
+
     coordinator.admit = admit
+    coordinator.align_gen_admission_across_cp = align_gen_admission_across_cp
     return coordinator
 
 
@@ -132,9 +138,11 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor._mm_encoder_item_scheduling_enabled = False
     executor.enable_early_first_token_response = False
     executor.drafter = None
+    executor.capturable_guided_decoder = None
     executor.model_engine = None
     executor.previous_batch = None
     executor.active_requests = []
+    executor.canceled_req_ids = []
     executor.waiting_queue = []
     executor.inflight_req_ids = set()
     executor.is_shutdown = False
@@ -216,6 +224,7 @@ _SCHEDULE_HEAD = [
     ("poll_gen_transfers",),
     ("check_transfer_timeouts",),
     ("admit", []),
+    ("align_gen_admission_across_cp", []),
     ("receive_gen_init", []),
     ("poll_progress_when_idle",),
 ]
@@ -324,7 +333,10 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
         executor.resource_manager.update_resources.side_effect = update_resources
         if state != "absent":
             executor.previous_batch = SimpleNamespace(
-                scheduled_requests=ScheduledRequests(), sample_state=Mock()
+                scheduled_requests=ScheduledRequests(),
+                sample_state=Mock(),
+                guided_batch_id=None,
+                guided_failures=None,
             )
         # A locally ready rank defers its previous batch while a peer cannot queue.
         executor._can_queue.return_value = (False, state == "deferred")
@@ -459,7 +471,7 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
     one running against a quiet transceiver."""
     executor = _idle_executor(monkeypatch, calls)
     executor.enable_attention_dp = True
-    executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
+    executor.dist = Mock(rank=rank, tp_size=2, cp_size=1, world_size=2)
     executor.dist.tp_allgather_int64.return_value = Mock(any=lambda: False)
     # The real error vote iterates the gathered votes; echo this rank's twice.
     executor.dist.tp_allgather.side_effect = lambda obj: [obj, obj]
@@ -474,7 +486,6 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             effects=PyExecutorEffects(executor),
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
-            force_terminate_ctx_for_partial_reuse=False,
         )
     return executor
 

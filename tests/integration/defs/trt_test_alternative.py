@@ -287,6 +287,51 @@ elif is_windows():
         p.kill()
 
 
+def _append_output(message: str, stdout, stderr):
+    for name, stream in (("stdout", stdout), ("stderr", stderr)):
+        if stream is None:
+            continue
+        if isinstance(stream, bytes):
+            stream = stream.decode(errors="replace")
+        message += f"\n{name}:\n{stream}"
+    return message
+
+
+class CalledProcessErrorWithOutput(subprocess.CalledProcessError):
+    """``CalledProcessError`` whose message includes the captured output."""
+
+    def __str__(self):
+        return _append_output(super().__str__(), self.stdout, self.stderr)
+
+
+class TimeoutExpiredWithOutput(subprocess.TimeoutExpired):
+    """``TimeoutExpired`` whose message includes the captured output."""
+
+    def __str__(self):
+        return _append_output(super().__str__(), self.stdout, self.stderr)
+
+
+# Bounds collecting a killed process's output, in case a process outside the
+# cleaned-up tree still holds its pipes open.
+_OUTPUT_DRAIN_TIMEOUT = 10
+
+
+def _timeout_with_output(p: subprocess.Popen, exc: subprocess.TimeoutExpired):
+    """Returns ``exc`` as a ``TimeoutExpiredWithOutput``.
+
+    The returned exception holds all of ``p``'s output, including what an
+     earlier timed-out ``communicate`` read. ``p`` must already be killed.
+    """
+    try:
+        stdout, stderr = p.communicate(timeout=_OUTPUT_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired as drain_exc:
+        stdout, stderr = drain_exc.stdout, drain_exc.stderr
+    return TimeoutExpiredWithOutput(exc.cmd,
+                                    exc.timeout,
+                                    output=stdout,
+                                    stderr=stderr)
+
+
 @contextlib.contextmanager
 def popen(*popenargs,
           start_new_session=True,
@@ -308,11 +353,11 @@ def popen(*popenargs,
                 print(
                     f"cleanup_process_tree failed while handling exception: {''.join(traceback.format_exception(ee))}"
                 )
-            if isinstance(e, subprocess.TimeoutExpired):
+            if (isinstance(e, subprocess.TimeoutExpired)
+                    and not isinstance(e, TimeoutExpiredWithOutput)
+                    and e.cmd == p.args):
                 print("Process timed out.")
-                stdout, stderr = p.communicate()
-                e.output = stdout
-                e.stderr = stderr
+                raise _timeout_with_output(p, e) from e
             raise
 
 
@@ -354,7 +399,7 @@ def check_call(*popenargs, **kwargs):
         cmd = kwargs.get("args")
         if cmd is None:
             cmd = popenargs[0]
-        raise subprocess.CalledProcessError(retcode, cmd)
+        raise CalledProcessErrorWithOutput(retcode, cmd)
     return 0
 
 
@@ -369,11 +414,7 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
             stdout, stderr = process.communicate(None, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             cleanup_process_tree(process, start_new_session)
-            if is_windows():
-                exc.stdout, exc.stderr = process.communicate()
-            else:
-                process.wait()
-            raise
+            raise _timeout_with_output(process, exc) from None
         except:
             cleanup_process_tree(process, start_new_session)
             raise
@@ -381,10 +422,10 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
         if start_new_session:
             cleanup_process_tree(process, True, True)
         if retcode:
-            raise subprocess.CalledProcessError(retcode,
-                                                process.args,
-                                                output=stdout,
-                                                stderr=stderr)
+            raise CalledProcessErrorWithOutput(retcode,
+                                               process.args,
+                                               output=stdout,
+                                               stderr=stderr)
     return stdout.decode()
 
 

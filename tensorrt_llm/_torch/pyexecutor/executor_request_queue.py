@@ -9,6 +9,7 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -58,6 +59,11 @@ class RequestQueueItem:
     # original arrival on the same clock.
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        # Normalize bound inputs before any queue, ADP, or broadcast handoff.
+        if isinstance(self.request, Request):
+            self.request = ExecutorRequest.adapt(self.request)
 
     @property
     def is_shutdown_request(self):
@@ -275,6 +281,14 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
+    def pending_cancellation_ids(self) -> set[int]:
+        """Inspect cancellation sentinels without consuming queued requests."""
+        with self.request_queue.mutex:
+            return {
+                item.id
+                for item in self.request_queue.queue if item.is_canceled_request
+            }
+
     def enqueue_control_request(self,
                                 drain: bool = True,
                                 control_id: Optional[str] = None):
@@ -316,11 +330,14 @@ class ExecutorRequestQueue:
 
     def get_from_request_queue(
             self,
-            timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
+            timeout: Optional[datetime.timedelta],
+            *,
+            wait_for_batch: bool = True) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
 
         Args:
             timeout: Optional timeout for waiting on queue.
+            wait_for_batch: Whether to wait for additional items to fill a batch.
 
         Returns:
             List of RequestQueueItem fetched from the queue.
@@ -341,7 +358,7 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
 
-        if self.batch_wait_timeout_ms == 0:
+        if not wait_for_batch or self.batch_wait_timeout_ms == 0:
             return items
 
         if len(items) >= self.max_batch_size:

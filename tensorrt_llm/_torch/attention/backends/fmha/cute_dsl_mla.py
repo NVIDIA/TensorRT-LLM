@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
@@ -56,6 +57,12 @@ _SPLIT_PLAN_MIN_TILES = 4
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
 # optimum within 5%.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# ``assumed_align`` the decode runner compiles the page table and the KV
+# lengths with; their runtime pointers must keep it.
+_KERNEL_INPUT_ALIGN_BYTES = 16
+# Page size of the fallback thop op's precompiled TRTLLM-Gen MLA generation
+# kernels.
+_FALLBACK_MLA_GENERATION_TOKENS_PER_BLOCK = 32
 
 
 @triton.jit(
@@ -261,6 +268,33 @@ class CuteDslMlaFmha(PhasedFmha):
         return True
 
     @staticmethod
+    def _page_size_exclusive_to_cute_dsl(meta: "TrtllmAttentionMetadata") -> bool:
+        """Whether this layer's FP4 MLA 128-token KV pages are read by no other MLA generation library.
+
+        Only ``FP4_MLA_TOKENS_PER_BLOCK`` can count as exclusive; every other
+        page size keeps the default routing. The fallback thop op has
+        TRTLLM-Gen MLA generation kernels for 32-token pages only. FlashInfer
+        TRTLLM-Gen reads 128-token pages only when the KV cache manager lists
+        them in ``trtllm_gen_extra_tokens_per_block``. PrimTS reads them on its
+        SMs from an FP8 or BF16 KV cache manager; it is opt-in, but it counts
+        whether or not it is enabled.
+        """
+        from ..fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
+        from .prims_ts import PrimsTSFmha
+
+        tokens_per_block = meta.tokens_per_block
+        if tokens_per_block != FP4_MLA_TOKENS_PER_BLOCK:
+            return False
+        kv_cache_manager = meta.kv_cache_manager
+        if tokens_per_block in getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()):
+            return False
+        return not (
+            get_sm_version() in PrimsTSFmha.SUPPORTED_MLA_SMS
+            and tokens_per_block in PrimsTSFmha.SUPPORTED_PAGE_SIZES
+            and getattr(kv_cache_manager, "dtype", None) in (DataType.FP8, DataType.BF16)
+        )
+
+    @staticmethod
     def _get_kernel_dtype(attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
         if getattr(attn, "has_fp8_kv_cache", False):
             return torch.float8_e4m3fn
@@ -445,9 +479,27 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
-        # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        if meta.num_generations <= 0:
+            return False, "CuTe DSL MLA FMHA only supports decode-only batches."
+        seq_len_q = q.shape[0] // meta.num_generations
+        batch_size = meta.num_generations
+        helix_verify_group = seq_len_q > 1 and meta.helix_position_offsets is not None
+        # Under Helix the only other MLA generation library is the fallback
+        # thop op, since FlashInfer TRTLLM-Gen and PrimTS do not support Helix.
+        # Its TRTLLM-Gen generation pads 33 to 63 heads to a 64-row Q tile whose
+        # kernels exist only precompiled, for 32-token pages.
+        helix_decode_without_fallback_kernel = (
+            meta.helix_position_offsets is not None
+            and 32 < attn.num_heads < 64
+            and meta.tokens_per_block != _FALLBACK_MLA_GENERATION_TOKENS_PER_BLOCK
+        )
+        # Keep the mixed-batch performance restriction unless the generation
+        # sub-batch has no supported fallback. PhasedFmha slices generation
+        # lengths, and _run_mla_decode offsets the page table past contexts.
+        exclusive_page_size = self._page_size_exclusive_to_cute_dsl(meta)
+        if meta.num_contexts != 0 and not (
+            exclusive_page_size or helix_verify_group or helix_decode_without_fallback_kernel
+        ):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -463,8 +515,6 @@ class CuteDslMlaFmha(PhasedFmha):
             or getattr(meta, "is_spec_dec_dynamic_tree", False)
         ):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
-        seq_len_q = q.shape[0] // meta.num_generations
-        batch_size = meta.num_generations
         if meta.helix_position_offsets is not None:
             if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
                 # Multi-token decode under helix needs the per-token bound /
@@ -487,36 +537,35 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # A multi-token verify group at H=96 has nowhere else to go: TRTLLM-Gen
-        # rejects 64 < num_heads_q < 128 outright, so falling through the perf
-        # gate does not reach a faster kernel, it reaches an executor-init
-        # failure. That makes this a correctness carve-out rather than a perf
-        # tradeoff, so it is decided here instead of being folded into
-        # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
-        # Single-token H=96 is already a measured table entry and still goes
-        # through the gate. Helix with seq_len_q > 1 implies
-        # _helix_spec_tokens_valid -- the helix block above returns False
-        # otherwise.
-        helix_h96_verify_group = (
-            attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
-        )
+        # No fallback library supports a multi-token Helix verify group.
+        # Keep its correctness admission separate from the measured-win table;
+        # the metadata checks above and kernel can_implement below still apply.
+        # Other single-token Helix shapes retain the performance gate unless
+        # the fallback has no kernel for them.
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
-        # FlashInfer TRTLLM-Gen, which rejects these head counts. The kernel
-        # packs (token, head) rows into 128-row M tiles, so any H <= 128 with a
+        # FlashInfer TRTLLM-Gen, which rejects these head counts. SM107 has no
+        # TRTLLM-Gen FMHA, so there the next library is the generic fallback,
+        # which is several times slower on these groups. The kernel packs
+        # (token, head) rows into 128-row M tiles, so any H <= 128 with a
         # linear-chain causal verify is valid (can_implement below still has the
-        # final say). SM107 is left out on purpose: TRTLLM-Gen FMHA is
-        # unavailable there and such a request already reaches the default
-        # TRTLLM path.
+        # final say).
         fp8_wide_head_verify_group = (
             64 < attn.num_heads < 128
             and seq_len_q > 1
             and meta.helix_position_offsets is None
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
-            and get_sm_version() in (100, 103)
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group):
+        # Single-token Helix decode without a fallback kernel is another
+        # coverage case kept out of the measured-win table; can_implement
+        # remains authoritative.
+        if not (
+            helix_verify_group
+            or fp8_wide_head_verify_group
+            or helix_decode_without_fallback_kernel
+            or exclusive_page_size
+        ):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,
@@ -569,6 +618,12 @@ class CuteDslMlaFmha(PhasedFmha):
         params: FmhaParams,
         kernel_dtype: torch.dtype,
     ) -> None:
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            KVCacheManagerV2,
+            Role,
+        )
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
         attn = params.attn
         meta = params.meta
 
@@ -640,15 +695,26 @@ class CuteDslMlaFmha(PhasedFmha):
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        cache_seqs_base = self._decode_kv_lengths(meta, params.sequence_lengths)
         # The page-table batch dimension determines the kernel launch batch.
-        page_table = (
-            page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
-            .transpose(0, 1)
-            .to(torch.int32)
+        page_table = self._generation_page_table(
+            page_table_layer, meta.num_contexts, batch_size, layer_in_pool
         )
-        if layers_in_pool > 1:
-            page_table = page_table + layer_in_pool
+        if (
+            layers_in_pool == 1
+            and isinstance(meta.kv_cache_manager, KVCacheManagerV2)
+            and meta.kv_cache_manager._use_per_layer_page_tables
+        ):
+            # V2 per-layer indices include the layer offset, but get_buffers()
+            # already starts at this layer's KEY buffer. Apply the offset once.
+            converter = meta.kv_cache_manager.impl.get_page_index_converter(
+                local_layer_idx, Role.KEY
+            )
+            layer_offset = int(converter.layer_offset)
+            if layer_offset:
+                page_table = torch.where(
+                    page_table == BAD_PAGE_INDEX, page_table, page_table - layer_offset
+                )
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
         # The CuTe DSL kernel consumes a paged [page_size, dim, num_pages] view
@@ -708,6 +774,71 @@ class CuteDslMlaFmha(PhasedFmha):
             ),
             block_split_kvs,
         )
+
+    @staticmethod
+    def _aligned_kernel_input(tensor: torch.Tensor) -> torch.Tensor:
+        """Return ``tensor``, or a contiguous copy when its pointer breaks ``assumed_align``.
+
+        The decode runner compiles the page table and the KV lengths with a
+        16-byte ``assumed_align``, which the runtime pointer itself must keep.
+        Slicing past the context requests of a mixed batch, or into a
+        non-first pool of ``kv_cache_block_offsets``, can leave a 4- or 8-byte
+        aligned view of an aligned buffer. Aligned views (every decode-only
+        batch whose pool offset is aligned) pass through without a copy; the
+        copy otherwise comes from the caching allocator and, under CUDA graph
+        capture, replays with the graph.
+        """
+        if tensor.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
+            return tensor
+        return tensor.clone(memory_format=torch.contiguous_format)
+
+    @classmethod
+    def _decode_kv_lengths(
+        cls,
+        meta: "TrtllmAttentionMetadata",
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """This step's int32 KV lengths with the kernel's pointer alignment.
+
+        A misaligned view (the generation rows of a mixed batch) is copied
+        into a staging buffer kept on ``meta``, so every layer of the step
+        passes the same pointer and ``_split_kv_plan`` plans once per step
+        instead of once per layer. Under CUDA graph capture without that
+        buffer it falls back to ``_aligned_kernel_input``.
+        """
+        lengths = sequence_lengths.to(torch.int32)
+        if lengths.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
+            return lengths
+        num_lengths = lengths.numel()
+        staging = getattr(meta, "_cute_dsl_mla_kv_lens_staging", None)
+        if staging is None or staging.numel() < num_lengths or staging.device != lengths.device:
+            if lengths.is_cuda and torch.cuda.is_current_stream_capturing():
+                return cls._aligned_kernel_input(lengths)
+            capacity = max(int(getattr(meta, "max_num_requests", 0) or 0), num_lengths)
+            staging = torch.empty(capacity, dtype=torch.int32, device=lengths.device)
+            meta._cute_dsl_mla_kv_lens_staging = staging
+        staged = staging[:num_lengths].view(lengths.shape)
+        staged.copy_(lengths)
+        return staged
+
+    @classmethod
+    def _generation_page_table(
+        cls,
+        page_table_layer: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        layer_in_pool: int,
+    ) -> torch.Tensor:
+        """This step's ``[max_blocks, batch]`` int32 page table for the generation requests.
+
+        ``page_table_layer`` is one pool's ``[num_seqs, max_blocks]`` view of
+        ``kv_cache_block_offsets``; ``layer_in_pool`` folds a KVCacheManagerV1
+        layer slot into the page indices.
+        """
+        rows = page_table_layer[num_contexts : num_contexts + batch_size].to(torch.int32)
+        if layer_in_pool:
+            rows = rows + layer_in_pool
+        return cls._aligned_kernel_input(rows).transpose(0, 1)
 
     @staticmethod
     def _split_kv_plan(

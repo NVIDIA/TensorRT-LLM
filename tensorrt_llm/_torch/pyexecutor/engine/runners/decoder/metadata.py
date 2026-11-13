@@ -18,7 +18,15 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    MsaRuntimePolicy,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
+from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sampling
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...metadata import build_attention_metadata
@@ -33,6 +41,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .inputs import DecoderInputBuffers
 
@@ -44,6 +53,9 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
 
 class DecoderMetadata:
     """Attention and speculative metadata reused across decoder iterations."""
+
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
 
     def __init__(
         self,
@@ -57,6 +69,7 @@ class DecoderMetadata:
         self._config = config
         self.mapping = mapping
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(model)
         self._buffers = buffers
         self._attention_runtime_features = attention_runtime_features
         # This field is initialized lazily on the first forward pass.
@@ -96,14 +109,42 @@ class DecoderMetadata:
             else None,
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            enable_ragged_verification=self._ragged_verification_enabled,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
             self.attn_metadata.mamba_chunk_size = getattr(
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
         self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        self._arm_msa_policy(kv_cache_manager)
 
         return self.attn_metadata
+
+    def _arm_msa_policy(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None) -> None:
+        """Hand the model's MiniMax-M3 MSA preparation choices to the metadata and the KV cache."""
+        msa = self.runtime_hooks.msa
+        if msa == MsaRuntimePolicy():
+            return
+        # Imported here: only a model that armed an MSA policy needs the sparse backend.
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+            MiniMaxM3KVCacheManagerV2,
+        )
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+            MiniMaxM3MsaSparseAttentionMetadata,
+        )
+
+        if not isinstance(
+            self.attn_metadata, MiniMaxM3MsaSparseAttentionMetadata
+        ) or not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+            raise ValueError(
+                "RuntimeHooks.msa requires the MiniMax-M3 MSA sparse attention backend and KV cache, "
+                f"got {type(self.attn_metadata).__name__} and {type(kv_cache_manager).__name__}"
+            )
+        self.attn_metadata.msa_policy = msa
+        kv_cache_manager.configure_decode_shortcuts(
+            skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
+            reuse_pool_views=msa.reuse_pool_views,
+        )
 
     def setup_speculative(
         self, spec_resource_manager: BaseResourceManager | None
@@ -111,9 +152,157 @@ class DecoderMetadata:
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = create_spec_metadata(
-            self._config, self.model.config, spec_resource_manager
+            self._config, self.model.config, spec_resource_manager, self.mapping
         )
+        self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
+        self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        if self.runtime_hooks.pack_spec_rng_uploads:
+            logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
+        if self.runtime_hooks.spec_small_h2d:
+            logger.info(
+                "[M3 host] spec step small uploads off the boundary (accepted counts packed, static slot ids)"
+            )
         return self.spec_metadata
+
+    @property
+    def _ragged_verification_enabled(self) -> bool:
+        spec_config = self._config.spec_config
+        return bool(
+            spec_config is not None and getattr(spec_config, "enable_confidence_scheduling", False)
+        )
+
+    @torch.inference_mode()
+    def _warmup_dspark_ragged_compressor_metadata(self) -> None:
+        """Compile the DSv4 compressor metadata helpers before the hang detector starts.
+
+        ``_compute_gen_compressed_position_ids`` and ``_compute_compressed_mask``
+        read the batch composition from device tensors, so each compiles once and
+        that graph serves every batch mix. The one compile must not land on the
+        first mixed attention-DP iteration: it runs right before a TP collective,
+        and ranks without generation work reach the collective first and can trip
+        the executor hang detector while their peers compile.
+
+        This probe calls both helpers once during engine warmup, with a number of
+        generation requests outside the CUDA-graph batch sizes. It uses the
+        metadata's real persistent buffers so the tensor shape and stride guards
+        match serving, and restores them afterwards. Those buffers are created
+        under inference mode, so all probe and cleanup mutations must run under
+        the same mode.
+        """
+        if not self._ragged_verification_enabled:
+            return
+
+        metadata = getattr(self, "attn_metadata", None)
+        required_attributes = (
+            "_compute_compressed_mask",
+            "_compute_gen_compressed_position_ids",
+            "_compress_ratios_sorted",
+            "compressed_mask_cuda",
+            "compressed_position_ids_cuda",
+            "cu_new_comp_kv_cuda",
+            "batch_size_cuda",
+            "gen_position_params_cuda",
+            "max_draft_tokens",
+            "new_comp_kv_lens_cuda",
+            "past_kv_lens_cuda",
+        )
+        missing_attributes = [
+            name for name in required_attributes if metadata is None or not hasattr(metadata, name)
+        ]
+        if missing_attributes:
+            raise RuntimeError(
+                "DSpark ragged metadata warmup requires the DSv4 compressor "
+                "contract; missing " + ", ".join(missing_attributes)
+            )
+
+        graph_batch_sizes = {int(batch_size) for batch_size in self._config.cuda_graph_batch_sizes}
+        num_generations = next(
+            (
+                candidate
+                for candidate in range(int(self._config.max_batch_size) - 1, 0, -1)
+                if candidate not in graph_batch_sizes
+            ),
+            None,
+        )
+        if num_generations is None:
+            return
+
+        compress_ratios = [int(ratio) for ratio in metadata._compress_ratios_sorted]
+        tokens_per_generation = 1 + int(metadata.max_draft_tokens)
+        total_compressed_tokens = {}
+        prepared_ratios = []
+        original_batch_size = metadata.batch_size_cuda.clone()
+        original_gen_params = metadata.gen_position_params_cuda.clone()
+        try:
+            for ratio in compress_ratios:
+                compressed_tokens_per_generation = (tokens_per_generation + ratio - 1) // ratio
+                total_tokens = num_generations * compressed_tokens_per_generation
+                past_kv_lens = metadata.past_kv_lens_cuda[ratio]
+                cu_new_comp = metadata.cu_new_comp_kv_cuda[ratio]
+                new_comp = metadata.new_comp_kv_lens_cuda[ratio]
+                compressed_positions = metadata.compressed_position_ids_cuda[ratio]
+                compressed_mask = metadata.compressed_mask_cuda[ratio]
+                if (
+                    past_kv_lens.numel() < num_generations
+                    or cu_new_comp.numel() < num_generations + 1
+                    or new_comp.numel() < num_generations
+                    or compressed_positions.numel() < total_tokens
+                    or compressed_mask.numel() < total_tokens
+                ):
+                    raise RuntimeError(
+                        "DSpark ragged compressor metadata buffers cannot "
+                        f"hold the compile probe with {num_generations} "
+                        "generation requests and compression ratio "
+                        f"{ratio}"
+                    )
+
+                total_compressed_tokens[ratio] = total_tokens
+                prepared_ratios.append(ratio)
+                past_kv_lens[:num_generations].zero_()
+                new_comp[:num_generations].fill_(compressed_tokens_per_generation)
+                cu_new_comp[: num_generations + 1].copy_(
+                    torch.arange(
+                        num_generations + 1, dtype=cu_new_comp.dtype, device=cu_new_comp.device
+                    )
+                )
+                cu_new_comp[: num_generations + 1].mul_(compressed_tokens_per_generation)
+
+            logger.info(
+                "DSpark ragged metadata warmup: compiling the compressor metadata "
+                f"helpers with {num_generations} generation requests"
+            )
+            gen_params = metadata.gen_position_params_cuda
+            gen_params[0].fill_(0)
+            gen_params[1].fill_(num_generations)
+            gen_params[2].fill_(tokens_per_generation)
+            metadata._compute_gen_compressed_position_ids(
+                metadata.past_kv_lens_cuda,
+                metadata.cu_new_comp_kv_cuda,
+                metadata.compressed_position_ids_cuda,
+                gen_params,
+                compress_ratios,
+            )
+            metadata.batch_size_cuda.fill_(num_generations)
+            metadata._compute_compressed_mask(
+                metadata.new_comp_kv_lens_cuda,
+                metadata.cu_new_comp_kv_cuda,
+                metadata.compressed_mask_cuda,
+                metadata.batch_size_cuda,
+                compress_ratios,
+            )
+            torch.cuda.synchronize()
+        finally:
+            metadata.batch_size_cuda.copy_(original_batch_size)
+            metadata.gen_position_params_cuda.copy_(original_gen_params)
+            for ratio in prepared_ratios:
+                total_tokens = total_compressed_tokens[ratio]
+                metadata.past_kv_lens_cuda[ratio][:num_generations].zero_()
+                metadata.new_comp_kv_lens_cuda[ratio][:num_generations].zero_()
+                metadata.cu_new_comp_kv_cuda[ratio][: num_generations + 1].zero_()
+                metadata.compressed_position_ids_cuda[ratio][:total_tokens].zero_()
+                metadata.compressed_mask_cuda[ratio][:total_tokens].zero_()
+            torch.cuda.synchronize()
+        logger.info("DSpark ragged metadata warmup complete")
 
 
 def get_spec_managers(
@@ -130,6 +319,7 @@ def create_spec_metadata(
     config: DecoderRunnerConfig,
     pretrained_config: object,
     spec_resource_manager: BaseResourceManager | None,
+    mapping: Mapping | None = None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
     return get_spec_metadata(
@@ -140,6 +330,14 @@ def create_spec_metadata(
         spec_resource_manager=spec_resource_manager,
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
+        # The decode CUDA graphs then capture the temperature-only variant. It draws the
+        # sampled rows on vocabulary-sharded logits without the watermark, so a watermark
+        # configuration keeps the ordinary sampler.
+        temperature_only_graphs=config.cuda_graph_config is not None
+        and config.spec_decode_fast_paths
+        and config.watermark_config is None
+        and supports_sharded_target_sampling(config.spec_config, mapping),
+        watermark_config=config.watermark_config,
     )
 
 
@@ -190,7 +388,11 @@ def update_spec_metadata(
 
 
 def sync_group_all_greedy_sample(
-    spec_metadata: SpecMetadata, mapping: Mapping, dist: Distributed | None
+    spec_metadata: SpecMetadata,
+    mapping: Mapping,
+    dist: Distributed | None,
+    *,
+    confidence_enabled: bool = False,
 ) -> None:
     """All-gather the per-rank greedy flags and store the group AND.
 
@@ -205,18 +407,45 @@ def sync_group_all_greedy_sample(
     ``all_rank_num_tokens`` exchange, which runs in ``prepare_inputs`` --
     after the graph key, too late for the key to see the synced value.
     """
-    # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
-    # Mapping.__init__), so ADP needs no separate check here.
-    if not (mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
+    # Confidence needs the same group-uniform rejection decision even without
+    # LM-head TP. Feature-off execution retains the existing gate.
+    if not (
+        spec_metadata.use_rejection_sampling
+        and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+    ):
         return
     local_flag = bool(spec_metadata.is_all_greedy_sample)
-    all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
-    spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    if mapping.tp_size > 1:
+        all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
+        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    else:
+        spec_metadata.group_all_greedy_sample = local_flag
     # Also overwrite the live flag directly: this iteration's scan already
     # ran (update_is_all_greedy_sample just returned) and the CUDA graph
     # key reads the flag next -- the stored override only takes effect on
     # the NEXT rescan (populate), which is after key selection.
     spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
+
+def supports_advanced_draft_sampling(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether the engine may capture an advanced draft-sampling variant."""
+    return not (
+        getattr(spec_config, "enable_confidence_scheduling", False)
+        and spec_config.use_rejection_sampling
+    )
+
+
+def validate_dspark_draft_sampling(
+    spec_metadata: SpecMetadata,
+    *,
+    confidence_enabled: bool,
+) -> None:
+    """Reject unsupported group-uniform sampling before graph lookup."""
+    if confidence_enabled and spec_metadata.wants_advanced_draft_sampling:
+        raise ValueError(
+            "DSpark confidence scheduling does not support advanced rejection "
+            "draft sampling: confidence is conditioned on the greedy proposal prefix"
+        )
 
 
 def set_spec_metadata_all_rank_num_tokens(

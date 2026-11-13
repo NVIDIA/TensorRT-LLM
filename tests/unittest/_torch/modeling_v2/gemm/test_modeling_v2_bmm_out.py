@@ -7,11 +7,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import (  # noqa: E501
     bmm_out as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "bmm_out requires a CUDA device"
@@ -60,7 +62,29 @@ def _build(spec, seed):
     return a, w, out, parent
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek default at attention TP8, decode absorb: 16 heads per rank",
+            spec=dict(batch=16, m=1, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
+        ),
+        Cell(
+            why="deepseek default at attention TP4, decode expand: 32 heads per rank",
+            spec=dict(batch=32, m=1, k=512, n=128, dtype=torch.bfloat16, transposed_out=True),
+        ),
+        Cell(
+            why="deepseek default at attention TP2, prefill-height absorb: 64 heads per rank",
+            spec=dict(batch=64, m=2048, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     a, w, out, parent = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     parent_ptr = parent.data_ptr()

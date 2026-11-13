@@ -354,6 +354,102 @@ def test_whole_text_parser_calls_are_streamed_once_and_repeated_in_the_snapshot(
         assert [i for i in items if i.type == "function_call"] == calls
 
 
+def _codex_tools():
+    """Tools as the Codex CLI declares them: every one under a namespace."""
+    exec_tool = SimpleNamespace(name="exec", type="custom", description="run code")
+    spawn_agent = SimpleNamespace(
+        name="spawn_agent",
+        type="function",
+        description="start a sub-agent",
+        parameters={"type": "object", "properties": {"task": {"type": "string"}}},
+    )
+    return [
+        SimpleNamespace(name="functions", type="namespace", description="", tools=[exec_tool]),
+        SimpleNamespace(
+            name="collaboration", type="namespace", description="", tools=[spawn_agent]
+        ),
+    ]
+
+
+def _deepseek_v41_calls(*calls):
+    invokes = "".join(
+        f'<｜DSML｜ invoke name="{name}">\n'
+        f'<｜DSML｜ parameter name="{parameter}" string="true">{value}</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        for name, parameter, value in calls
+    )
+    return f"<｜DSML｜ calls>\n{invokes}</｜DSML｜ calls>"
+
+
+def _qwen3_calls(*calls):
+    return "".join(
+        f"<tool_call>\n{json.dumps({'name': name, 'arguments': {parameter: value}})}\n</tool_call>\n"
+        for name, parameter, value in calls
+    )
+
+
+def _call_view(item):
+    payload = item.input if item.type == "custom_tool_call" else json.loads(item.arguments)
+    return item.type, item.namespace, item.name, payload
+
+
+@pytest.mark.parametrize(
+    "render, parser_id",
+    [(_deepseek_v41_calls, "deepseek_v41"), (_qwen3_calls, "qwen3")],
+    ids=["deepseek_v41", "qwen3"],
+)
+@pytest.mark.parametrize(
+    "exec_name, spawn_name",
+    [
+        ("functions.exec", "collaboration.spawn_agent"),
+        ("exec", "spawn_agent"),
+        ("functions::exec", "collaboration::spawn_agent"),
+    ],
+    ids=["qualified", "bare", "double_colon"],
+)
+def test_every_name_spelling_reaches_the_declared_tool_in_stream_and_snapshot(
+    render, parser_id, exec_name, spawn_name
+):
+    """The client routes a call by its namespace and name, and runs exec as a custom tool."""
+    text = "Running it.\n\n" + render(
+        (exec_name, "input", "ls -la"), (spawn_name, "task", "review")
+    )
+    tools = _codex_tools()
+    expected = [
+        ("custom_tool_call", "functions", "exec", "ls -la"),
+        ("function_call", "collaboration", "spawn_agent", {"task": "review"}),
+    ]
+    final_res = SimpleNamespace(outputs=[SimpleNamespace(index=0, text=text)])
+
+    for size in (1, 5, len(text)):
+        helper = ResponsesStreamingEventsHelper()
+        frames = [text[i : i + size] for i in range(0, len(text), size)]
+        events = _drive(
+            frames, tools=tools, tool_parser_id=parser_id, reasoning_parser_id=None, helper=helper
+        )
+        streamed = [
+            e.item
+            for e in events
+            if e.type == "response.output_item.done" and e.item.type != "message"
+        ]
+        assert [_call_view(item) for item in streamed] == expected, size
+
+        items, _messages, _reasoning = _create_output_content(
+            final_res,
+            tool_parser=parser_id,
+            tools=tools,
+            streamed_tool_calls=helper.emitted_tool_call_items,
+            streamed_item_ids=helper.emitted_item_ids,
+        )
+        assert [item for item in items if item.type != "message"] == streamed, size
+
+    # A response that was not streamed derives the same calls from the text.
+    items, _messages, _reasoning = _create_output_content(
+        final_res, tool_parser=parser_id, tools=tools
+    )
+    assert [_call_view(item) for item in items if item.type != "message"] == expected
+
+
 class TestFragmentAssembly:
     def test_fragments_concatenate_in_order_under_the_first_name(self):
         fragments = {}

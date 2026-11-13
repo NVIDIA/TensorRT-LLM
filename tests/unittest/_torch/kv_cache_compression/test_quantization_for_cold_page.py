@@ -3,6 +3,7 @@
 """Control-plane tests for NVFP4 cold-page compression."""
 
 import json
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -70,6 +71,8 @@ def _factory_model_engine(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(has_cp_helix=lambda: helix),
+        cuda_graph_batch_sizes=[],
+        cuda_graph_padding_enabled=False,
         spec_config=None,
         model=SimpleNamespace(
             model_config=SimpleNamespace(
@@ -1264,7 +1267,7 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
 
 def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> None:
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: False)
-    with pytest.raises(RuntimeError, match="requires an SM100-family device"):
+    with pytest.raises(ValueError, match="requires an SM100-family device"):
         util_mod.create_kv_cache_compression_manager(
             ColdPageQuantizationCompressionConfig(),
             model_engine=_factory_model_engine(),
@@ -1310,36 +1313,39 @@ def test_qwen35_mtp3_resolves_to_supported_one_model_mode() -> None:
         )
 
 
-def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -> None:
-    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
+def _build_cold_creator(
+    compression_config: ColdPageQuantizationCompressionConfig,
+    *,
+    estimating: bool = False,
+    skip_est: bool = False,
+    active_kv_quant: object | None = None,
+) -> tuple[dict, util_mod.KvCacheCreator]:
+    creator = object.__new__(util_mod.KvCacheCreator)
+    creator._skip_est = skip_est
+    creator._cold_page_codec_provider = None
+    creator._cold_page_codec_provider_built = False
+    creator._max_seq_len = 1024
+    creator._kv_cache_config = SimpleNamespace(
+        host_cache_size=None,
+        disk_cache_size=None,
+        enable_block_reuse=False,
+    )
+    creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
+    creator._model_engine = _factory_model_engine(active_kv_quant=active_kv_quant)
+    creator._kv_connector_manager = None
+    creator._fp8_ctx_mla_kv_len_cap = None
+    creator._is_encoder_decoder = MagicMock(return_value=False)
+    creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
+    creator._create_kv_cache_manager = MagicMock(return_value=SimpleNamespace())
+    creator.configure_kv_cache_capacity = MagicMock()
+    resources = {}
+    creator.build_managers(resources, estimating_kv_cache=estimating)
+    return resources, creator
 
-    def build(
-        *,
-        estimating: bool = False,
-        skip_est: bool = False,
-        active_kv_quant: object | None = None,
-    ) -> tuple[dict, util_mod.KvCacheCreator]:
-        creator = object.__new__(util_mod.KvCacheCreator)
-        creator._skip_est = skip_est
-        creator._max_seq_len = 1024
-        creator._kv_cache_config = SimpleNamespace(
-            host_cache_size=None,
-            disk_cache_size=None,
-            enable_block_reuse=False,
-        )
-        creator._llm_args = SimpleNamespace(
-            kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
-        )
-        creator._model_engine = _factory_model_engine(active_kv_quant=active_kv_quant)
-        creator._kv_connector_manager = None
-        creator._fp8_ctx_mla_kv_len_cap = None
-        creator._is_encoder_decoder = MagicMock(return_value=False)
-        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
-        creator._create_kv_cache_manager = MagicMock(return_value=SimpleNamespace())
-        creator.configure_kv_cache_capacity = MagicMock()
-        resources = {}
-        creator.build_managers(resources, estimating_kv_cache=estimating)
-        return resources, creator
+
+def test_cold_provider_is_kept_for_estimation_and_dropped_for_active_nvfp4(monkeypatch) -> None:
+    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
+    build = partial(_build_cold_creator, ColdPageQuantizationCompressionConfig())
 
     resources, creator = build()
     manager = creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
@@ -1348,10 +1354,17 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
     assert manager.provides_cold_page_codec
     assert not manager.uses_iteration_lifecycle
     assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
+    # The estimation KVCM gets the provider too: it reads the window and builds no codec.
     _, estimation_creator = build(estimating=True)
+    estimation_provider = estimation_creator._create_kv_cache_manager.call_args.kwargs[
+        "cold_page_codec_provider"
+    ]
+    assert isinstance(estimation_provider, Nvfp4ColdPageQuantizationCompression)
+    # The real build that follows takes the same provider instead of loading the scales again.
+    estimation_creator.build_managers({}, estimating_kv_cache=False)
     assert (
         estimation_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
-        is None
+        is estimation_provider
     )
     _, skip_est_creator = build(estimating=True, skip_est=True)
     assert isinstance(
@@ -1367,6 +1380,17 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         active_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"] is None
     )
     log.assert_called_once()
+
+
+def test_mixed_precision_high_window_comes_from_the_config() -> None:
+    assert _manager().mixed_precision_high_window is None
+    config = ColdPageQuantizationCompressionConfig(mixed_precision_first_n=64)
+    provider = Nvfp4ColdPageQuantizationCompression(
+        config, pretrained_config=SimpleNamespace(model_type="qwen3")
+    )
+    assert provider.mixed_precision_high_window == (64, 0)
+    assert config.mixed_precision_high_window == (64, 0)
+    assert ColdPageQuantizationCompressionConfig().mixed_precision_high_window is None
 
 
 # --- skip_rope_quantization ---------------------------------------------------------------------

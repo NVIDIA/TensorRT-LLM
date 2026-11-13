@@ -32,6 +32,7 @@ from typing import (
     Type,
     TypeVar,
 )
+from urllib.parse import urlsplit
 
 import aiohttp
 import msgspec
@@ -41,11 +42,13 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
     build_subagent_affinity_headers,
     request_requires_internal_disagg_auth,
 )
+from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -118,6 +121,23 @@ _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
 
 def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
+
+
+# Failures that leave a generation leg undelivered: the connection could not be
+# opened (ClientConnectorError), or the connection closed before the whole
+# request was written (aiohttp's ClientConnectionResetError, a
+# ConnectionResetError). Any other failure may happen after the generation
+# server accepted the request. Once the connection is open, a server-side close
+# or reset before the response surfaces as ServerDisconnectedError or as
+# ClientOSError (ECONNRESET) whether or not the server read the request first.
+_GENERATION_LEG_RETRYABLE_ERRORS = (
+    aiohttp.ClientConnectorError,
+    ConnectionResetError,
+)
+
+# How long a context frontend affinity port that refused a connection is
+# bypassed in favor of the server's shared port.
+_REFUSED_AFFINITY_PORT_BYPASS_SECS = 10.0
 
 
 class OpenAIClient(ABC):
@@ -212,6 +232,18 @@ class OpenAIClient(ABC):
         ...
 
 
+def _server_base_url(server: str) -> str:
+    """Return the base URL of a router server entry, with or without a scheme."""
+    if server.startswith(("http://", "https://")):
+        return server.rstrip("/")
+    return f"http://{server}".rstrip("/")
+
+
+def _server_netloc(server_or_url: str) -> str:
+    """Return host:port of a router server entry or of a URL built from one."""
+    return urlsplit(_server_base_url(server_or_url)).netloc
+
+
 class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
@@ -225,6 +257,7 @@ class OpenAIHttpClient(OpenAIClient):
         request_perf_metrics: bool = False,
         internal_disagg_auth_key: Optional[str] = None,
         bounded_replay_on_generation: bool = False,
+        frontend_affinity: Optional[Tuple[int, int]] = None,
     ):
         self._router = router
         self._role = role
@@ -252,6 +285,44 @@ class OpenAIHttpClient(OpenAIClient):
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._bounded_replay_on_generation = bounded_replay_on_generation
+        # (num_frontends, port_stride) of context servers whose frontend i also listens on
+        # port + port_stride * (i + 1) (serve_frontend_affinity_port_stride).
+        self._frontend_affinity = frontend_affinity if role == ServerRole.CONTEXT else None
+        if self._frontend_affinity is not None:
+            num_frontends, stride = self._frontend_affinity
+            logger.info(
+                "Context requests with a conversation id go to per-conversation "
+                f"frontend ports ({num_frontends} frontends, port stride {stride})"
+            )
+        # Affinity host:port -> steady-clock time it last refused a connection.
+        self._refused_affinity_ports: dict[str, float] = {}
+
+    def _url_server(self, server: str, request: UCompletionRequest) -> str:
+        """Server entry to send a request routed to server to, with the scheme of server kept.
+
+        With frontend affinity, a request carrying a conversation id goes to
+        the affinity port of the frontend picked by crc32(conversation_id) % K;
+        every orchestrator process picks the same frontend for a conversation.
+        An affinity port that refused a connection is bypassed for
+        _REFUSED_AFFINITY_PORT_BYPASS_SECS: its conversations use the shared
+        port meanwhile.
+        """
+        if self._frontend_affinity is None:
+            return server
+        conversation_id = get_request_conversation_id(request)
+        if not conversation_id:
+            return server
+        num_frontends, stride = self._frontend_affinity
+        host, _, port = server.rstrip("/").rpartition(":")
+        frontend = frontend_of_conversation(conversation_id, num_frontends)
+        affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
+        refused_key = _server_netloc(affinity_server)
+        refused_at = self._refused_affinity_ports.get(refused_key)
+        if refused_at is not None:
+            if get_steady_clock_now_in_seconds() - refused_at < _REFUSED_AFFINITY_PORT_BYPASS_SECS:
+                return server
+            del self._refused_affinity_ports[refused_key]
+        return affinity_server
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
         headers = build_subagent_affinity_headers(
@@ -270,8 +341,7 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        server_url = server if server.startswith("http") else f"http://{server}"
-        url = f"{server_url.rstrip('/')}/{endpoint}"
+        url = f"{_server_base_url(server)}/{endpoint}"
         # A count-tokens body carries the whole conversation, so it is as large
         # as a chat body and encoding it costs the orchestrator's event loop the
         # same way -- hence the same msgpack transport as _send_request. The
@@ -297,8 +367,7 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        server_url = server if server.startswith("http") else f"http://{server}"
-        url = f"{server_url.rstrip('/')}/{endpoint}"
+        url = f"{_server_base_url(server)}/{endpoint}"
         async with self._session.get(url) as response:
             if response.status >= 400:
                 error_body = await response.text()
@@ -340,14 +409,19 @@ class OpenAIHttpClient(OpenAIClient):
             pinned_dp = request.disaggregated_params
             if pinned_dp is not None:
                 req_id = pinned_dp.disagg_request_id
-        url = f"http://{server}/{endpoint}"
+        url_server = self._url_server(server, request)
+        url = f"{_server_base_url(url_server)}/{endpoint}"
+        # The routed server's shared port, used if the affinity port refuses.
+        fallback_url = f"{_server_base_url(server)}/{endpoint}" if url_server != server else None
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
         self._metrics_collector.total_requests.inc()
         if request.stream:
-            resp_generator = self._stream_with_cleanup(server, url, request, hooks, req_id)
+            resp_generator = self._stream_with_cleanup(
+                server, url, request, hooks, req_id, fallback_url
+            )
             # Enter its cleanup scope before returning: aclose() on an unstarted
             # async generator would otherwise leave the router reservation live.
             await resp_generator.__anext__()
@@ -356,7 +430,7 @@ class OpenAIHttpClient(OpenAIClient):
         try:
             response = None
             async with aclosing(
-                self._post_with_retry(server, url, request, hooks, req_id)
+                self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
             ) as response_generator:
                 async for resp_json in response_generator:
                     response = response_type(**resp_json)
@@ -380,13 +454,14 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
+        fallback_url: Optional[str] = None,
     ) -> AsyncGenerator[Any, None]:
         success = False
         try:
             # Consumed by _send_request, before the caller sees this generator.
             yield None
             async with aclosing(
-                self._post_with_retry(server, url, request, hooks, req_id)
+                self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
             ) as response_generator:
                 async for chunk in response_generator:
                     yield chunk
@@ -405,7 +480,14 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
+        fallback_url: Optional[str] = None,
     ) -> AsyncGenerator[Any, None]:
+        """POST request to url, retrying within the retry budget.
+
+        If url is a context frontend affinity port that refuses the connection,
+        the request moves to fallback_url, the shared port, without using the
+        retry budget: it never reached a server.
+        """
         is_stream = request.stream
         disagg_params = request.disaggregated_params
         is_remote_tail_handoff = disagg_params is not None and (
@@ -439,11 +521,22 @@ class OpenAIHttpClient(OpenAIClient):
         # attempt that reaches self._max_retries.
         _TRANSIENT_TCP_BUDGET = 0 if self._no_retry or is_remote_tail_handoff else 5
         loop_max = max(max_retries, _TRANSIENT_TCP_BUDGET) + 1
-        for attempt in range(loop_max):
-            if attempt > 0:
+        # A generation leg takes its prompt KV cache from the context server's
+        # send session named by disagg_request_id.
+        is_generation_leg = (
+            self._role == ServerRole.GENERATION
+            and disagg_params is not None
+            and disagg_params.request_type == "generation_only"
+        )
+        affinity_refusals = 0
+        for attempt in range(loop_max + (fallback_url is not None)):
+            retry = attempt - affinity_refusals
+            if retry > 0:
                 await self._router.renew_request(request, req_id=req_id)
-            # Regenerate disagg_request_id on retry to avoid ID collision on workers
-            if attempt > 0 and self._disagg_id_generator is not None:
+            # A retried request gets a new disagg_request_id so it cannot collide
+            # with the abandoned attempt on the worker. A generation leg keeps its
+            # id: a new one could never be paired with the context KV cache.
+            if retry > 0 and self._disagg_id_generator is not None and not is_generation_leg:
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = await self._disagg_id_generator()
@@ -457,6 +550,8 @@ class OpenAIHttpClient(OpenAIClient):
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
+            response_started = False
+            streaming_status_rejected = False
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
@@ -465,6 +560,7 @@ class OpenAIHttpClient(OpenAIClient):
                     data=body,
                     headers=headers,
                 ) as http_response:
+                    response_started = True
                     response_clock = AdjustedSteadyClock()
                     if self._request_perf_metrics:
                         destination_time = get_steady_clock_now_in_seconds()
@@ -494,6 +590,28 @@ class OpenAIHttpClient(OpenAIClient):
                                 role,
                                 response_metrics,
                             )
+                    if http_response.status >= 400:
+                        if is_stream:
+                            # Preserve no-replay semantics even if reading the
+                            # rejected response's diagnostics fails.
+                            streaming_status_rejected = True
+                            # Error diagnostics must not buffer an unbounded worker response.
+                            error_prefix = bytearray()
+                            while len(error_prefix) < 2048:
+                                chunk = await http_response.content.read(2048 - len(error_prefix))
+                                if not chunk:
+                                    break
+                                error_prefix.extend(chunk)
+                            error_body = error_prefix.decode("utf-8", errors="replace")
+                        else:
+                            error_body = await http_response.text()
+                        raise aiohttp.ClientResponseError(
+                            http_response.request_info,
+                            http_response.history,
+                            status=http_response.status,
+                            message=f"{http_response.reason}: {error_body[:2048]}",
+                            headers=http_response.headers,
+                        )
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
@@ -516,15 +634,6 @@ class OpenAIHttpClient(OpenAIClient):
                                 lines_yielded += 1
                                 yield line
                     else:
-                        if http_response.status >= 400:
-                            error_body = await http_response.text()
-                            raise aiohttp.ClientResponseError(
-                                http_response.request_info,
-                                http_response.history,
-                                status=http_response.status,
-                                message=f"{http_response.reason}: {error_body[:2048]}",
-                                headers=http_response.headers,
-                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
@@ -533,9 +642,36 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if fallback_url is not None and isinstance(e, aiohttp.ClientConnectorError):
+                    logger.warning(
+                        f"Context frontend affinity port of {url} refused the connection: "
+                        f"{e} - sending to the shared port {fallback_url}"
+                    )
+                    self._refused_affinity_ports[_server_netloc(url)] = (
+                        get_steady_clock_now_in_seconds()
+                    )
+                    url, fallback_url = fallback_url, None
+                    affinity_refusals = 1
+                    continue
+                if streaming_status_rejected:
+                    raise
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
+                        traceback.format_exc(),
+                    )
+                    raise
+                # Once the generation server may have accepted a generation leg,
+                # that attempt owns the context KV cache: the transfer either went
+                # to it or failed and was released on the context server. A re-post
+                # would reuse its disagg_request_id and collide with the original
+                # on the worker, or wait for KV cache that is never sent.
+                if is_generation_leg and (
+                    response_started or not isinstance(e, _GENERATION_LEG_RETRYABLE_ERRORS)
+                ):
+                    logger.error(
+                        f"Client error to {url}: {e} - not retrying a generation request "
+                        "the generation server may have accepted",
                         traceback.format_exc(),
                     )
                     raise
@@ -552,15 +688,14 @@ class OpenAIHttpClient(OpenAIClient):
                 effective_max = max_retries
                 if is_transient_tcp:
                     effective_max = max(max_retries, _TRANSIENT_TCP_BUDGET)
-                if attempt >= effective_max:
+                if retry >= effective_max:
                     logger.error(
-                        f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"
-                        "failed",
+                        f"Client error to {url}: {e} - last retry {retry} of {effective_max}failed",
                         traceback.format_exc(),
                     )
                     raise
                 logger.error(
-                    f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
+                    f"{self._role} client error to {url}: {e} - retry {retry} of {effective_max}",
                     traceback.format_exc(),
                 )
                 await self._router.renew_request(request, req_id=req_id)
@@ -697,11 +832,7 @@ class OpenAIHttpClient(OpenAIClient):
     ) -> Tuple[List[str], List[str]]:
         async def check_server_ready(server: str) -> bool:
             try:
-                url = (
-                    f"{server}/health"
-                    if server.startswith("http://")
-                    else f"http://{server}/health"
-                )
+                url = f"{_server_base_url(server)}/health"
                 async with session.get(url) as response:
                     return response.status == 200
             except Exception:

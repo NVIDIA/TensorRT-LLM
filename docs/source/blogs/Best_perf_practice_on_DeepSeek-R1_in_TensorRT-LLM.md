@@ -92,9 +92,9 @@ Here we set `LOCAL_USER=1` argument to set up the local user instead of root acc
 Here we compile the source inside the container:
 
 ``` bash
-python3 ./scripts/build_wheel.py --cuda_architectures "90-real;100-real" --clean
+python3 ./scripts/build_wheel.py --cuda_architectures "90;100" --clean
 ```
-You can set the cuda_architectures to "100-real" if targeting Blackwell only, and "90-real" to target Hopper only to save some build time.
+You can set the cuda_architectures to "100" if targeting B200/GB200 only ("103" for B300/GB300), and "90" to target Hopper only to save some build time.
 
 Install and set environment variables:
 

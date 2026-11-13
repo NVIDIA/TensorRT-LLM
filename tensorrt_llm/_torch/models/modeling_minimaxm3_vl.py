@@ -13,6 +13,8 @@ features produced by the tower.
 
 from __future__ import annotations
 
+import math
+import numbers
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -2014,10 +2016,10 @@ class MiniMaxM3VLInputProcessor:
         The HF processor expands one ``]<]video[>[`` marker into one bracket
         per temporal patch, ``VISION_START + VIDEO_TOKEN * (grid_h*grid_w /
         merge^2) + VISION_END`` repeated ``grid_t`` times, so the count is
-        ``grid_t * (grid_h*grid_w / merge^2 + 2)``. The brackets are
-        adjacent: the processor prefixes a timestamp only when the video
-        carries fps metadata, and the frame lists handed over here carry
-        none.
+        ``grid_t * (grid_h*grid_w / merge^2 + 2)``. A video with timing
+        also gets a timestamp before each bracket (see
+        :meth:`_video_timestamp_ids`); those are plain text tokens, outside
+        the multimodal mask, so they are not counted here.
 
         ``video_grid_thw`` is the processor's grid for this video,
         computed by the dummy-text pass of :func:`find_mm_token_lengths`
@@ -2049,6 +2051,88 @@ class MiniMaxM3VLInputProcessor:
         if hasattr(video, "frames"):
             return list(video.frames)
         return list(video) if isinstance(video, (list, tuple)) else [video]
+
+    @staticmethod
+    def _video_metadata(video: Any, num_frames: int) -> Dict[str, Any]:
+        """Timing of one raw video item, in the form the HF video processor takes.
+
+        ``VideoData.metadata`` carries the source ``fps`` and the indices of
+        the sampled frames. With both, the processor writes a
+        ``]<]{t} seconds[>[`` timestamp before each temporal group. A video
+        without usable timing (no metadata, ``fps`` missing or not a finite
+        positive number, or not one non-negative integer frame index per
+        delivered frame) gets ``fps=None`` and no timestamps, with a debug log
+        when metadata was given. Frame indices may be a list, a tensor, an
+        array, or a list of 0-d tensors or numpy scalars. Only the keys
+        transformers' ``VideoMetadata`` accepts are passed, and
+        ``total_num_frames`` is the number of frames delivered, because the
+        media loader has already sampled them.
+        """
+        metadata = getattr(video, "metadata", None)
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        fps = metadata.get("fps")
+        indices = metadata.get("frames_indices")
+        # Check the values of a tensor or array, and of 0-d tensors or numpy scalars in a list.
+        frames_indices = indices.tolist() if hasattr(indices, "tolist") else indices
+        if isinstance(frames_indices, Sequence):
+            frames_indices = [i.tolist() if hasattr(i, "tolist") else i for i in frames_indices]
+        if (
+            not isinstance(fps, numbers.Real)
+            or isinstance(fps, bool)
+            or not math.isfinite(fps)
+            or fps <= 0
+            or not isinstance(frames_indices, Sequence)
+            or len(frames_indices) != num_frames
+            or not all(
+                isinstance(i, numbers.Integral) and not isinstance(i, bool) and i >= 0
+                for i in frames_indices
+            )
+        ):
+            if metadata:
+                from tensorrt_llm.logger import logger
+
+                logger.debug(
+                    f"MiniMax-M3 video metadata has no usable timing (fps={fps!r}, "
+                    f"frames_indices of type {type(indices).__name__} for "
+                    f"{num_frames} frames); the video gets no timestamps."
+                )
+            fps, frames_indices = None, range(num_frames)
+        return {
+            "total_num_frames": num_frames,
+            "fps": None if fps is None else float(fps),
+            "duration": metadata.get("duration"),
+            "frames_indices": [int(i) for i in frames_indices],
+        }
+
+    def _video_timestamp_ids(self, video: Any, brackets: int) -> List[List[int]]:
+        """Token ids of the timestamp the processor writes before each bracket of a video.
+
+        For a video with timing (see :meth:`_video_metadata`), bracket ``b``
+        gets ``]<]{t:.1f} seconds[>[``, where
+        ``t = frames_indices[min(b * temporal_patch_size, n - 1)] / fps``, as
+        the checkpoint's processor writes it; a video without timing gets none.
+
+        Each timestamp is encoded on its own. That gives the processor's ids
+        after a VISION_END, where the tokenizer splits the processor's text at
+        the special token. Before the first bracket the processor's text
+        continues the prompt text before the marker: when that text ends in,
+        for example, a space or a period, the tokenizer merges it with the
+        timestamp, which prompt ids tokenized around the marker cannot
+        reproduce, and the first timestamp's ids differ. A newline before the
+        marker, as in trtllm-serve's rendered prompts, gives the same ids.
+        """
+        metadata = self._video_metadata(video, len(self._video_frames(video)))
+        if metadata["fps"] is None:
+            return [[] for _ in range(brackets)]
+        temporal = int(self.processor.video_processor.temporal_patch_size)
+        indices = metadata["frames_indices"]
+        times = [
+            indices[min(b * temporal, len(indices) - 1)] / metadata["fps"] for b in range(brackets)
+        ]
+        return [
+            self._tokenizer.encode(f"]<]{t:.1f} seconds[>[", add_special_tokens=False)
+            for t in times
+        ]
 
     def _video_bracket_count(self, video: Any) -> int:
         """Temporal patches of a video item: one framed bracket each.
@@ -2082,7 +2166,9 @@ class MiniMaxM3VLInputProcessor:
         (which already accounts for the +2 framing per bracket). An image is
         one bracket; a video is one bracket per temporal patch, as the
         processor lays it out (see :meth:`get_num_tokens_per_video`), so the
-        placeholder runs line up with the vision rows at merge time.
+        placeholder runs line up with the vision rows at merge time. A video
+        with timing gets the processor's timestamp before each bracket (see
+        :meth:`_video_timestamp_ids`); one without keeps adjacent brackets.
         """
         mm_data = mm_data or {}
         has_image = bool(mm_data.get("image"))
@@ -2108,6 +2194,7 @@ class MiniMaxM3VLInputProcessor:
                     f"num_mm_tokens entries ({expected})."
                 )
             brackets = self._video_bracket_count(items[consumed]) if has_video else 1
+            stamps = self._video_timestamp_ids(items[consumed], brackets) if has_video else [[]]
             total = int(num_mm_tokens_per_placeholder[consumed])
             inner, remainder = divmod(total - 2 * brackets, brackets)
             if inner < 1 or remainder:
@@ -2115,7 +2202,8 @@ class MiniMaxM3VLInputProcessor:
                     f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={total} must be "
                     f"{brackets} x (VISION_START + >=1 placeholder + VISION_END)."
                 )
-            for _ in range(brackets):
+            for stamp in stamps:
+                expanded.extend(stamp)
                 expanded.append(self._vision_start_token_id)
                 expanded.extend([placeholder_id] * inner)
                 expanded.append(self._vision_end_token_id)
@@ -2273,6 +2361,16 @@ class MiniMaxM3VLInputProcessor:
             frame_iter = iter(flat_frames)
             videos = [[next(frame_iter) for _ in frames] for frames in videos]
             processor_kwargs["videos_kwargs"] = {"do_resize": True, **video_kwargs}
+            # Frame timing goes in only when some video has it; the others get
+            # fps=None, so the processor gives timestamps to exactly the videos
+            # with timing. ``expand_prompt_token_ids_for_mm`` writes the same
+            # timestamps on the token-ID fast path.
+            video_metadata = [
+                self._video_metadata(video, len(frames))
+                for video, frames in zip(video_inputs, videos)
+            ]
+            if any(m["fps"] is not None for m in video_metadata):
+                processor_kwargs["videos_kwargs"]["video_metadata"] = video_metadata
         processed = self.processor(
             text=[templated_text],
             images=images if images else None,

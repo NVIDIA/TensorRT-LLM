@@ -7,11 +7,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (  # noqa: E501
     mxfp8_quantize as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxfp8_quantize requires a CUDA device"
@@ -36,7 +38,21 @@ def _build(spec, seed):
     return torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="gpt-oss hidden 2880, linear scales, aligned to 512 -> padded 3072",
+            spec=dict(shape=(16, 2880), dtype=torch.bfloat16, swizzled=False, alignment=512),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     x = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     swizzled, alignment = cell.spec["swizzled"], cell.spec["alignment"]
@@ -87,3 +103,21 @@ def test_guard_refuses_a_non_contiguous_input() -> None:
     with pytest.raises(AssertionError, match="contiguous"):
         with validating(op):
             op(x, False, 512)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_routed_hidden() -> None:
+    torch.manual_seed(13)
+    for t in (1, 8, 64, 65, 1024, 8192):
+        x = torch.randn(t, 3584, dtype=torch.bfloat16, device="cuda")
+        data, sf = op(x, False, 512)
+        ref_data, ref_sf = op.reference(x, False, 512)
+        assert data.shape == (t, 3584) and data.dtype == torch.float8_e4m3fn
+        assert sf.shape == (t * 112,) and sf.dtype == torch.uint8
+        assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
+        assert torch.equal(sf, ref_sf)
+        tight_data, tight_sf = op(x, False, 32)
+        assert torch.equal(tight_data.view(torch.uint8), data.view(torch.uint8))
+        assert torch.equal(tight_sf, sf)

@@ -26,7 +26,8 @@
 #    - Replace <account> with your SLURM account name
 #    - Replace <partition> with your SLURM partition name
 #    - Adjust -N, --ntasks-per-node, and --gpus-per-node to match your config
-#    - Total GPUs must equal: cfg_size * ulysses_size (set in SERVER_CONFIG)
+#    - Total GPUs must equal: cfg_size * tp_size * ulysses_size * cp_size, where cp_size
+#      is attn2d_size[0] * attn2d_size[1] or ring_size (all set in SERVER_CONFIG)
 #
 # 2. Environment Variables (set before running sbatch, or edit defaults below):
 #    - CONTAINER_IMAGE: Docker image or enroot .sqsh image with TensorRT-LLM installed
@@ -34,8 +35,8 @@
 #    - MOUNT_DEST:      mount destination path inside the container (default: $HOME)
 #    - PROJECT_ROOT:    path to TensorRT-LLM source on the shared filesystem
 #    - MODEL:           HuggingFace Hub model ID or local path (default: Wan-AI/Wan2.2-T2V-A14B-Diffusers)
-#    - SERVER_CONFIG:   YAML config for trtllm-serve; set cfg_size * ulysses_size
-#                       to match total allocated GPUs (default: examples/visual_gen/serve/configs/wan.yml inside PROJECT_ROOT)
+#    - SERVER_CONFIG:   YAML config for trtllm-serve; its parallel_config must multiply
+#                       out to the total allocated GPUs (default: examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml inside PROJECT_ROOT)
 #    - BACKEND:         benchmark backend (default: openai-videos)
 #    - SERVER_PORT:     HTTP port for trtllm-serve (default: 8000)
 #    - SERVER_TIMEOUT:  seconds to wait for server readiness (default: 3600)
@@ -49,7 +50,7 @@
 #   export CONTAINER_IMAGE="/path/to/tensorrt-llm.sqsh"
 #   export PROJECT_ROOT="/path/to/TensorRT-LLM"
 #   export MODEL="Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-#   export SERVER_CONFIG="/path/to/wan.yml"
+#   export SERVER_CONFIG="${PROJECT_ROOT}/examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml"
 #   sbatch benchmark_visual_gen_mgmn_distributed.sh
 #
 ##############################################################################
@@ -64,7 +65,7 @@ export MOUNT_DIR="${MOUNT_DIR:-$HOME}"
 export MOUNT_DEST="${MOUNT_DEST:-$HOME}"
 
 export MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
-export SERVER_CONFIG="${SERVER_CONFIG:-${PROJECT_ROOT}/examples/visual_gen/serve/configs/wan.yml}"
+export SERVER_CONFIG="${SERVER_CONFIG:-${PROJECT_ROOT}/examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml}"
 export BACKEND="${BACKEND:-openai-videos}"
 export SERVER_PORT="${SERVER_PORT:-8000}"
 
@@ -108,6 +109,11 @@ wait_for_server() {
         if curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | grep -q "200"; then
             echo "Server is ready (took ${elapsed}s)"
             return 0
+        fi
+        # A dead server never answers /health; stop once its srun has exited.
+        if [ -n "${SERVER_PID:-}" ] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            echo "ERROR: server srun (PID ${SERVER_PID}) exited before becoming ready" >&2
+            return 1
         fi
         sleep $interval
         elapsed=$((elapsed + interval))
@@ -178,7 +184,7 @@ SERVER_PID=$!
 trap cleanup EXIT
 echo "  Server srun PID: ${SERVER_PID}"
 
-wait_for_server
+wait_for_server || exit 1
 
 # ---------------------------------------------------------------------------
 # Step 2: Run benchmark (rank-0 node only)
@@ -231,7 +237,7 @@ srun -l \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_ROOT}" \
     --container-mounts=${MOUNT_DIR}:${MOUNT_DEST} \
-    sh -c 'eval "${BENCHMARK_CMD}"'
+    sh -c 'eval "${BENCHMARK_CMD}"' || exit 1
 
 echo ""
 echo "============================================"

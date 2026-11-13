@@ -64,8 +64,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   bufferIndexHolderTest
@@ -76,8 +75,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   capacitySchedulerTest
@@ -88,8 +86,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::batch_scheduler
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   contextProgressTest
@@ -100,10 +97,18 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::batch_scheduler
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
-add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
+add_tllm_gtest(
+  contextTransferCoordinatorTest
+  OWNER
+  batch-manager
+  SOURCES
+  contextTransferCoordinatorTest.cpp
+  LINK_LIBRARIES
+  tllm::context_transfer_consensus
+  LABELS
+  "unit;batch-manager;host")
 
 add_tllm_gtest(
   evictionPolicyTest
@@ -125,8 +130,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 # GDS partial-copy cases load the NIXL wrapper at runtime.
 if(TARGET tensorrt_llm_nixl_wrapper)
@@ -146,8 +150,31 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
+
+add_tllm_gtest(
+  kvCacheManagerV2StreamingEventTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2StreamingEventTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerV2CudaContextScopeTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2CudaContextScopeTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2ConfigTest
@@ -171,8 +198,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2ColdPageTest
@@ -184,8 +210,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   coldPageCodecTest
@@ -196,8 +221,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2TypedIndexTest
@@ -221,8 +245,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2HostMemBackingTest
@@ -234,8 +257,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2StagingBufferTest
@@ -247,8 +269,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2StatsTest
@@ -260,8 +281,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2SlotAllocatorTest
@@ -297,8 +317,19 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
+
+add_tllm_gtest(
+  kvCacheManagerV2GeneratorTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2GeneratorTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
 
 add_tllm_gtest(
   kvCacheManagerV2DigestPoolTest
@@ -321,8 +352,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   llmRequestTest
@@ -333,8 +363,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   microBatchSchedulerTest
@@ -345,12 +374,22 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::batch_scheduler
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
-add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
+add_tllm_gtest(
+  peftCacheManagerTest
+  OWNER
+  batch-manager
+  SOURCES
+  peftCacheManagerTest.cpp
+  LINK_LIBRARIES
+  tllm::peft_cache
+  tllm::runtime_numpy
+  LABELS
+  "unit;batch-manager;gpu")
 
-add_gtest(rnnCacheFormatterTest rnnCacheFormatterTest.cpp)
+add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
+               FULL_STACK LABELS "unit;full-stack;host")
 
 add_tllm_gtest(
   agentTreeTest
@@ -372,5 +411,4 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")

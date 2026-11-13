@@ -220,8 +220,8 @@ def test_configured_sts_is_loaded_on_the_resolved_head_and_planner(tmp_path):
     worker = _worker(1)
     path = tmp_path / "sts.json"
     path.write_text(json.dumps({"sts_temperatures": [0.5, 1.0, 2.0]}), encoding="utf-8")
-    worker.spec_config.confidence_sts_path = str(path)
-    worker.spec_config.confidence_sps_table_path = None
+    worker.spec_config.confidence_calibration_path = str(path)
+    worker.spec_config.confidence_cost_table_path = None
     worker.spec_config.enable_fused_confidence_scheduler = False
     head = DSparkConfidenceHead(hidden_size=2, block_size=3)
     model = SimpleNamespace(
@@ -244,16 +244,51 @@ def test_configured_sts_is_loaded_on_the_resolved_head_and_planner(tmp_path):
 
 def test_configured_sts_without_a_confidence_head_is_rejected_before_loading(tmp_path):
     worker = _worker(1)
-    worker.spec_config.confidence_sts_path = str(tmp_path / "must-not-be-opened.json")
-    worker.spec_config.confidence_sps_table_path = None
+    worker.spec_config.confidence_calibration_path = str(tmp_path / "must-not-be-opened.json")
+    worker.spec_config.confidence_cost_table_path = None
     worker.spec_config.enable_fused_confidence_scheduler = False
 
     with pytest.raises(
-        ValueError, match="confidence_sts_path is set but no confidence head was found"
+        ValueError, match="confidence_calibration_path is set but no confidence head was found"
     ):
         worker._build_verify_planner(SimpleNamespace(), block_size=3)
 
     assert not hasattr(worker, "verify_planner")
+
+
+def _model_with_head(block_size):
+    head = DSparkConfidenceHead(hidden_size=2, block_size=block_size)
+    model = SimpleNamespace(
+        dspark_model=SimpleNamespace(mtp_layers=[SimpleNamespace(confidence_head=head)])
+    )
+    return head, model
+
+
+def test_calibration_fitted_at_a_larger_k_serves_a_smaller_k(tmp_path):
+    worker = _worker(1)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps({"sts_temperatures": [0.5, 1.0, 2.0, 3.0, 4.0]}), encoding="utf-8")
+    worker.spec_config.confidence_calibration_path = str(path)
+    worker.spec_config.confidence_cost_table_path = None
+    worker.spec_config.enable_fused_confidence_scheduler = False
+    head, model = _model_with_head(block_size=3)
+
+    worker._build_verify_planner(model, block_size=3)
+
+    assert torch.equal(head.sts_temperatures, torch.tensor([0.5, 1.0, 2.0]))
+
+
+def test_calibration_shorter_than_k_is_rejected(tmp_path):
+    worker = _worker(1)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps({"sts_temperatures": [0.5, 1.0]}), encoding="utf-8")
+    worker.spec_config.confidence_calibration_path = str(path)
+    worker.spec_config.confidence_cost_table_path = None
+    worker.spec_config.enable_fused_confidence_scheduler = False
+    _, model = _model_with_head(block_size=3)
+
+    with pytest.raises(ValueError, match="has 2 temperatures but the confidence head scores 3"):
+        worker._build_verify_planner(model, block_size=3)
 
 
 @pytest.mark.parametrize("bias", [False, True])
@@ -265,7 +300,7 @@ def test_embedded_checkpoint_load_preserves_optional_confidence_bias(monkeypatch
     draft.mtp_layers = nn.ModuleList([stage])
     draft.num_stages = 1
     draft.post_load_weights = Mock()
-    draft.cache_attn_weights_from_state_dict = Mock()
+    draft._use_bf16_linear = False
     wrapper = modeling_dspark.DSv4DSparkForCausalLM.__new__(modeling_dspark.DSv4DSparkForCausalLM)
     nn.Module.__init__(wrapper)
     wrapper.dspark_model = draft

@@ -169,10 +169,9 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
         assert call.kwargs == {}
 
 
-def test_request_admission_reserves_score_high_watermark():
+def test_request_admission_does_not_grow_workspace():
     manager = _make_triattention(budget=128, beta=64)
     assert manager._selection_width_capacity == 256
-    manager._phase = mock.Mock()
     manager._selection_width_capacity = 260
     manager._score_token_capacity = 0
     manager._launch_score = None
@@ -193,20 +192,33 @@ def test_request_admission_reserves_score_high_watermark():
     for request in requests:
         manager.on_request_init(request)
 
-    assert manager._build_score_runtime.call_args_list == [
-        mock.call(score_token_capacity=1024),
-        mock.call(score_token_capacity=2048),
-    ]
-    manager._compaction_done_event.synchronize.assert_called_once_with()
-    assert manager._phase.reserve.call_args_list == [
-        mock.call(10101),
-        mock.call(1101),
-    ]
+    manager._build_score_runtime.assert_not_called()
+    manager._compaction_done_event.synchronize.assert_not_called()
+
+    # The largest phase offset must still fit the inclusive FP32 integer bound.
+    limit = (1 << 24) - (1 << 16)
+    manager.kv_cache_manager.max_seq_len = 1 << 24
+    for request_id, position in enumerate((limit - 1, limit), start=4):
+        manager.on_request_init(
+            _make_request(request_id, py_prompt_len=100, py_max_new_tokens=position - 100)
+        )
+    for position in (limit + 1, (1 << 24) - 1):
+        with pytest.raises(ValueError, match="exact-FP32"):
+            manager.on_request_init(
+                _make_request(6, py_prompt_len=100, py_max_new_tokens=position - 100)
+            )
+    # Apply max_seq_len before checking the phase range, including the boundary.
+    for sequence_limit in (limit - 1, limit):
+        manager.kv_cache_manager.max_seq_len = sequence_limit
+        manager.on_request_init(_make_request(7, py_prompt_len=100, py_max_new_tokens=1 << 25))
+    manager.kv_cache_manager.max_seq_len = limit + 1
+    with pytest.raises(ValueError, match="exact-FP32"):
+        manager.on_request_init(_make_request(8, py_prompt_len=100, py_max_new_tokens=1 << 25))
+    manager._build_score_runtime.assert_not_called()
 
 
-def test_request_admission_aligns_clamped_score_bucket_to_tile():
+def test_request_admission_accepts_unaligned_sequence_limit_without_growth():
     manager = _make_triattention(budget=128, beta=64)
-    manager._phase = mock.Mock()
     manager._selection_width_capacity = 256
     manager._score_token_capacity = 0
     manager._launch_score = None
@@ -216,7 +228,7 @@ def test_request_admission_aligns_clamped_score_bucket_to_tile():
 
     manager.on_request_init(_make_request(1, py_prompt_len=850, py_max_new_tokens=200))
 
-    manager._build_score_runtime.assert_called_once_with(score_token_capacity=1152)
+    manager._build_score_runtime.assert_not_called()
     manager._compaction_done_event.synchronize.assert_not_called()
 
 
@@ -230,6 +242,7 @@ def test_block_offset_snapshot_width_is_aligned_and_capped():
         num_pools=1,
         tokens_per_block=32,
         max_blocks_per_seq=4,
+        uses_device_page_table=False,
     )
     host, device_table = _allocate_block_offset_snapshot(
         manager,
@@ -246,3 +259,87 @@ def test_block_offset_snapshot_width_is_aligned_and_capped():
         token_capacity=129,
     )
     assert host.shape[-1] == 8 and device_table.shape[-1] == 8
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_serial_eviction_publishes_each_completed_request(fail_second):
+    """A later failure cannot hide target/draft compaction already completed."""
+    manager = _make_triattention(budget=4, beta=4)
+    requests = [_make_request(i, py_prompt_len=2) for i in range(2)]
+    target_caches = [
+        SimpleNamespace(
+            capacity=10, history_length=10, is_active=True, resize=mock.Mock(return_value=True)
+        )
+        for _ in requests
+    ]
+    draft_caches = [
+        SimpleNamespace(is_active=True, resize=mock.Mock(return_value=True)) for _ in requests
+    ]
+    manager.kv_cache_manager.kv_cache_map = dict(enumerate(target_caches))
+    manager.draft_kv_cache_manager = _make_fake_v2(is_draft=True)
+    manager.draft_kv_cache_manager.kv_cache_map = dict(enumerate(draft_caches))
+    manager._draft_protected_tail_capacity = 1
+    completed = []
+
+    def execute(items):
+        request = items[0].request
+        assert len(items) == 1
+        if request.py_request_id == 1:
+            assert requests[0].py_num_compressed_tokens == 4
+            target_caches[0].resize.assert_called_once_with(6, None)
+            draft_caches[0].resize.assert_called_once_with(7, None)
+            if fail_second:
+                raise RuntimeError("second request failed")
+        completed.append(request.py_request_id)
+
+    with (
+        mock.patch.object(manager, "_try_score_workspace", return_value=None),
+        mock.patch.object(manager, "_execute_eviction_round", side_effect=execute),
+    ):
+        batch = SimpleNamespace(generation_requests=requests)
+        if fail_second:
+            with pytest.raises(RuntimeError, match="second request failed"):
+                manager._evict_due_requests(batch)
+        else:
+            manager._evict_due_requests(batch)
+    assert completed == ([0] if fail_second else [0, 1])
+    assert requests[1].py_num_compressed_tokens == (0 if fail_second else 4)
+    assert target_caches[1].resize.call_count == (0 if fail_second else 1)
+    assert draft_caches[1].resize.call_count == (0 if fail_second else 1)
+
+
+def test_batch_workspace_reuses_allocator_and_reports_oom():
+    """Cached allocations bypass driver queries; only allocation OOM is recovered."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import logger
+
+    manager = _make_triattention()
+    manager._request_capacity = 2
+    manager._union_tp_mapping = None
+    manager._score_scratch = torch.empty(16, dtype=torch.float32)
+    workspace = torch.empty(32, dtype=torch.float32)
+    with (
+        mock.patch.object(torch.cuda, "mem_get_info", side_effect=AssertionError("driver query")),
+        mock.patch.object(
+            torch,
+            "empty",
+            side_effect=[
+                workspace,
+                workspace,
+                torch.OutOfMemoryError,
+                RuntimeError("unexpected allocation error"),
+            ],
+        ),
+        mock.patch.object(logger, "warning_once") as warning,
+    ):
+        assert manager._try_score_workspace(2) is workspace
+        assert manager._try_score_workspace(2) is workspace
+        assert manager._try_score_workspace(2) is None
+        assert manager._batch_workspace_attempts == 3
+        assert manager._batch_workspace_ooms == 1
+        warning.assert_called_once()
+        assert "2 requests" in warning.call_args.args[0]
+        assert "required bytes: 128" in warning.call_args.args[0]
+        with pytest.raises(RuntimeError, match="unexpected allocation error"):
+            manager._try_score_workspace(2)
+    assert manager._batch_workspace_attempts == 4
+    assert manager._batch_workspace_ooms == 1

@@ -531,7 +531,7 @@ class GMSBackend:
         in upstream `client.close()` or `evict_gms_client_memory_manager`
         is logged (warning for the outer error, debug for `close()`)
         and swallowed so callers — including `__del__` paths in
-        `ModelLoader` and `PyTorchModelEngine` — never raise from
+        `ModelLoader` and `ModelEngine` — never raise from
         teardown.
 
         After return:

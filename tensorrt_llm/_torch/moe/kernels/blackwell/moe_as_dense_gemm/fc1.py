@@ -1424,8 +1424,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
 
             ### core code to get alpha_scale (pre-SwiGLU)
-            unroll_scale_idx = work_tile.tile_idx[1] // (
-                self.weight_per_expert // self.cta_tile_shape_mnk[1]
+            # A cluster can run past the last N tile, i.e. past the last expert: clamp the alpha
+            # index there and skip the tile's direct global accesses below.
+            num_experts = alpha_scale.shape[0]
+            n_tiles_per_expert = self.weight_per_expert // self.cta_tile_shape_mnk[1]
+            unroll_scale_idx = cutlass.min(
+                work_tile.tile_idx[1] // n_tiles_per_expert, num_experts - 1
             )
             current_alpha_scale = alpha_scale[unroll_scale_idx, work_tile.tile_idx[2]]
 
@@ -1614,13 +1618,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         m_start = cur_tile_coord[0] * self.epi_tile[0]
                         if m_start < m_total:
                             if epi_tidx < (m_total - m_start):
-                                current_alpha_scale_post = tTR_gAlphaPost[
-                                    epi_tidx, cur_tile_coord[0], expert_idx, batch_idx
-                                ]
-                                for i in cutlass.range_constexpr(cute.size(tCompute)):
-                                    tCompute[i] = tCompute[i] * cutlass.Float32(
-                                        current_alpha_scale_post
-                                    )
+                                if expert_idx < num_experts:
+                                    current_alpha_scale_post = tTR_gAlphaPost[
+                                        epi_tidx, cur_tile_coord[0], expert_idx, batch_idx
+                                    ]
+                                    for i in cutlass.range_constexpr(cute.size(tCompute)):
+                                        tCompute[i] = tCompute[i] * cutlass.Float32(
+                                            current_alpha_scale_post
+                                        )
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
@@ -1701,10 +1706,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                         #
-                        # Store SFC to global memory (guarded for M boundary)
+                        # Store SFC to global memory (guarded for the M and N boundaries)
                         #
                         if m_tile_in_bounds:
-                            cute.autovec_copy(tCrSFC, tCgSFC)
+                            if expert_idx < num_experts:
+                                cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type
@@ -1803,8 +1809,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # then we don't need to update alpha_scale,
                 # otherwise we need to update alpha_scale with ldg
                 if work_tile.is_valid_tile and prev_work_tile_tile_idx_n != work_tile.tile_idx[1]:
-                    unroll_scale_idx = work_tile.tile_idx[1] // (
-                        self.weight_per_expert // self.cta_tile_shape_mnk[1]
+                    unroll_scale_idx = cutlass.min(
+                        work_tile.tile_idx[1] // n_tiles_per_expert, num_experts - 1
                     )
                     current_alpha_scale = alpha_scale[unroll_scale_idx, work_tile.tile_idx[2]]
 

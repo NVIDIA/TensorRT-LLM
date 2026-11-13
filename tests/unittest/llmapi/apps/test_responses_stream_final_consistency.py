@@ -32,6 +32,7 @@ from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingProcessor,
     StreamedItem,
     _create_output_content,
+    _parse_output_message_harmony,
     _whole_text_tool_calls,
     create_response_non_store,
 )
@@ -251,6 +252,32 @@ def test_final_tool_calls_are_the_streamed_ones(parsers, chunks):
     assert _message_texts(final) == _message_texts(_done_items(frames, "message"))
 
 
+def test_a_namespace_double_colon_call_is_the_declared_custom_tool_in_both_views():
+    """DeepSeek-V4.1 writes "namespace::tool"; the client declared exec under a namespace."""
+    functions = {
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [{"type": "custom", "name": "exec", "description": "Run code."}],
+    }
+    call = (
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="functions::exec">\n'
+        '<｜DSML｜ parameter name="input" string="true">ls -la</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+    processor = _processor(tools=[functions], reasoning_parser=None, tool_parser="deepseek_v41")
+    frames, result = _stream(processor, ["Running it.\n\n", call])
+    streamed_calls = _done_items(frames, "custom_tool_call")
+    assert [(c["namespace"], c["name"], c["input"]) for c in streamed_calls] == [
+        ("functions", "exec", "ls -la")
+    ]
+
+    final = _final_output(processor, result)
+    assert [i for i in final if i["type"] == "custom_tool_call"] == streamed_calls
+
+
 def test_an_unterminated_call_is_text_in_both_views():
     unterminated = "<tool_call>exec<arg_key>input</arg_key><arg_value>const cmd = `cat m.json`"
     processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
@@ -359,3 +386,67 @@ def test_the_stream_releases_what_the_whole_text_parse_reads_beyond_it(
             SimpleNamespace(index=0, text=whole), request, helper, None, "qwen3", []
         )
     assert (released, calls, logger.warning.called) == (owed, [], warned)
+
+
+# ---------------------------------------------------------------------------
+# Item status: the snapshot reports what the stream closed each item with
+# ---------------------------------------------------------------------------
+
+
+def test_final_items_report_the_status_the_stream_closed_them_with():
+    """Reasoning and function-call items stay `completed` in the snapshot.
+
+    Their done events say `completed`; a snapshot that built them without a
+    status read `null` for the same items, so a consumer that filters items by
+    status reconstructed a different turn from each view.
+    """
+    processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _EXEC_CALL])
+
+    streamed = {item["type"]: item.get("status") for item in _done_items(frames)}
+    final = {item["type"]: item.get("status") for item in _final_output(processor, result)}
+
+    assert streamed == {
+        "reasoning": "completed",
+        "message": "completed",
+        "function_call": "completed",
+    }
+    assert final == streamed
+
+
+def test_non_streaming_items_are_completed_too():
+    """No stream ran; the body is the only account, and it says completed."""
+    items, _messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="Plan it.</think>" + _EXEC_CALL)]),
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        tools=[_tool()],
+        streamed_item_ids=None,
+    )
+    assert [(item.type, item.status) for item in items] == [
+        ("reasoning", "completed"),
+        ("function_call", "completed"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "channel, recipient, item_type",
+    [
+        ("analysis", None, "reasoning"),
+        ("commentary", "functions.get_weather", "function_call"),
+        ("commentary", "python", "reasoning"),
+    ],
+    ids=["analysis", "function_call", "python_commentary"],
+)
+def test_harmony_reasoning_and_function_call_items_are_completed(channel, recipient, item_type):
+    openai_harmony = pytest.importorskip("openai_harmony")
+    message = openai_harmony.Message.from_role_and_content(
+        openai_harmony.Role.ASSISTANT, '{"city": "Rome"}'
+    ).with_channel(channel)
+    if recipient is not None:
+        message = message.with_recipient(recipient)
+
+    (item,) = _parse_output_message_harmony(message)
+
+    assert item.type == item_type
+    assert item.status == "completed"

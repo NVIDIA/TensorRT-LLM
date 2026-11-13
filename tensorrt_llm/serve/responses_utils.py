@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
                     Union)
 
+import anyio
+from fastapi.responses import StreamingResponse
 from jinja2.exceptions import TemplateError
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -58,8 +60,11 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
+from tensorrt_llm.inputs.chat_template_guard import \
+    unreferenced_chat_template_kwargs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.utils import resolve_hf_chat_template
+from tensorrt_llm.inputs.utils import (rendered_hf_chat_template_source,
+                                       resolve_hf_chat_template)
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -77,6 +82,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
                                                 InputTokensDetails,
+                                                NamespacedFunctionToolParam,
                                                 OpenAIBaseModel,
                                                 OutputTokensDetails,
                                                 ReasoningAssistantMessage,
@@ -90,6 +96,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
+from tensorrt_llm.serve.serving_extensions import normalize_reasoning_effort
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -119,6 +126,10 @@ ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.
 CUSTOM_TOOL_INPUT_ARG = "input"
+
+# Each spelling of a declared tool's name -> (namespace, bare name, custom);
+# see _tool_resolution.
+_ToolResolution = dict[str, Tuple[Optional[str], str, bool]]
 
 
 @dataclass
@@ -655,7 +666,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                 summary=[],
                 type="reasoning",
                 content=[Content(text=content.text, type="reasoning_text")],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
@@ -670,6 +681,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     type="function_call",
                     name=function_name,
                     id=f"fc_{_random_uuid()}",
+                    status="completed",
                 )
                 output_items.append(response_item)
         elif message.recipient.startswith(
@@ -680,7 +692,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     summary=[],
                     type="reasoning",
                     content=[Content(text=content.text, type="reasoning_text")],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
         else:
@@ -765,16 +777,29 @@ def _warn_once(message: str) -> None:
         logger.warning(message)
 
 
-def _qualified_tool_name(item: dict) -> str:
+def _qualified_tool_name(item: dict,
+                         tool_resolution: Optional[_ToolResolution] = None
+                         ) -> str:
     """The name a replayed tool call is known by.
 
     A namespaced call is reported with its namespace in a separate field,
     but the model was offered the qualified name. Replaying the bare name
     shows it a tool that was never on its list, so it cannot match the call
     to the result that follows.
+
+    A client may echo a call back without its namespace. The namespace is then
+    taken from ``tool_resolution``, the request's declared tools, when exactly
+    one namespaced tool and no top-level tool has that bare name; otherwise
+    the name is replayed as received.
     """
     name = item.get("name") or ""
     namespace = item.get("namespace")
+    if not namespace and tool_resolution:
+        declared_namespace, bare, _ = tool_resolution.get(
+            name, (None, name, False))
+        # Any other spelling already names the tool in full.
+        if bare == name:
+            namespace = declared_namespace
     return f"{namespace}.{name}" if namespace else name
 
 
@@ -953,8 +978,14 @@ def _template_renders(template: str, role: str) -> bool:
 
 
 def _response_output_item_to_chat_completion_message(
-    item: Union[dict, ResponseInputOutputItem]
+    item: Union[dict, ResponseInputOutputItem],
+    tool_resolution: Optional[_ToolResolution] = None,
 ) -> Optional[ChatCompletionMessageParam]:
+    """Convert one Responses input item to a chat message.
+
+    ``tool_resolution`` holds the request's declared tools; a tool call is
+    replayed under the name they offered the model (see _qualified_tool_name).
+    """
     if not isinstance(item, dict):
         item = item.model_dump()
 
@@ -1025,7 +1056,7 @@ def _response_output_item_to_chat_completion_message(
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": _qualified_tool_name(item),
+                        "name": _qualified_tool_name(item, tool_resolution),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -1053,7 +1084,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        _qualified_tool_name(item),
+                        _qualified_tool_name(item, tool_resolution),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1166,8 +1197,10 @@ def chat_messages_from_responses_input(
         messages.append({"role": "user", "content": request.input})
     else:
         turn_start = len(messages)
+        tool_resolution = _tool_resolution(request.tools)
         for inp in request.input:
-            message = _response_output_item_to_chat_completion_message(inp)
+            message = _response_output_item_to_chat_completion_message(
+                inp, tool_resolution)
             if message is None:
                 continue
             if _fold_tool_calls_into_open_assistant_turn(
@@ -1263,50 +1296,54 @@ def _create_output_messages(
     return messages
 
 
+def _custom_tool_parameters() -> dict[str, Any]:
+    # A custom tool takes one freeform string rather than JSON arguments -
+    # apply_patch is the common case, whose payload is a patch, not an
+    # object. The chat template can only describe functions, so it is
+    # described as a single named string parameter and the call is turned
+    # back into a custom tool call on the way out; see
+    # _tool_call_output_item. Without the named parameter the model invents
+    # its own argument name and the client rejects the call as an
+    # incompatible payload.
+    return {
+        "type": "object",
+        "properties": {
+            CUSTOM_TOOL_INPUT_ARG: {
+                "type":
+                "string",
+                "description":
+                "The complete freeform input for this tool, "
+                "passed through verbatim.",
+            },
+        },
+        "required": [CUSTOM_TOOL_INPUT_ARG],
+    }
+
+
 def _get_chat_completion_function_tools(
         tools: Optional[list[Tool]]) -> list[ChatCompletionToolsParam]:
     function_tools: list[ChatCompletionToolsParam] = []
     if tools is None:
         return function_tools
 
-    def as_function(name: str, description: Optional[str],
-                    parameters: Optional[Any]) -> ChatCompletionToolsParam:
-        return ChatCompletionToolsParam(
-            type="function",
-            function=FunctionDefinition(
-                name=name,
-                description=description,
-                # A tool with no schema still has to present an object schema,
-                # or the chat template renders a call the model cannot fill in.
-                parameters=parameters if parameters is not None else {
-                    "type": "object",
-                    "properties": {},
-                },
-            ),
+    def definition(name: str, description: Optional[str],
+                   parameters: Optional[Any]) -> FunctionDefinition:
+        return FunctionDefinition(
+            name=name,
+            description=description,
+            # A tool with no schema still has to present an object schema,
+            # or the chat template renders a call the model cannot fill in.
+            parameters=parameters if parameters is not None else {
+                "type": "object",
+                "properties": {},
+            },
         )
 
-    def custom_parameters() -> dict[str, Any]:
-        # A custom tool takes one freeform string rather than JSON arguments -
-        # apply_patch is the common case, whose payload is a patch, not an
-        # object. The chat template can only describe functions, so it is
-        # described as a single named string parameter and the call is turned
-        # back into a custom tool call on the way out; see
-        # _tool_call_output_item. Without the named parameter the model invents
-        # its own argument name and the client rejects the call as an
-        # incompatible payload.
-        return {
-            "type": "object",
-            "properties": {
-                CUSTOM_TOOL_INPUT_ARG: {
-                    "type":
-                    "string",
-                    "description":
-                    "The complete freeform input for this tool, "
-                    "passed through verbatim.",
-                },
-            },
-            "required": [CUSTOM_TOOL_INPUT_ARG],
-        }
+    def as_function(name: str, description: Optional[str],
+                    parameters: Optional[Any]) -> ChatCompletionToolsParam:
+        return ChatCompletionToolsParam(type="function",
+                                        function=definition(
+                                            name, description, parameters))
 
     for tool in tools:
         tool_type = getattr(tool, "type", None)
@@ -1318,7 +1355,9 @@ def _get_chat_completion_function_tools(
             # Skipping it drops every tool inside, which is most of an agentic
             # client's toolset: the model then has nothing to call, announces
             # an action and does nothing. Names are qualified with the
-            # namespace so two namespaces can define the same tool name.
+            # namespace so two namespaces can define the same tool name. The
+            # declaration is kept beside the flattened function, for a model
+            # whose renderer shows namespaces itself.
             for inner in getattr(tool, "tools", None) or []:
                 inner_name = getattr(inner, "name", None)
                 if not inner_name:
@@ -1330,19 +1369,26 @@ def _get_chat_completion_function_tools(
                 # tool as custom, so the output path goes looking for
                 # CUSTOM_TOOL_INPUT_ARG the prompt never mentioned.
                 if getattr(inner, "type", None) == "custom":
-                    inner_parameters = custom_parameters()
+                    inner_parameters = _custom_tool_parameters()
                 else:
                     inner_parameters = getattr(inner, "parameters", None)
+                inner_description = getattr(inner, "description", None)
                 function_tools.append(
-                    as_function(
-                        f"{tool.name}.{inner_name}",
-                        getattr(inner, "description", None) or tool.description,
-                        inner_parameters,
+                    NamespacedFunctionToolParam(
+                        function=definition(
+                            f"{tool.name}.{inner_name}",
+                            inner_description or tool.description,
+                            inner_parameters,
+                        ),
+                        namespace=tool.name,
+                        namespace_description=tool.description,
+                        declared_name=inner_name,
+                        declared_description=inner_description,
                     ))
         elif tool_type in ("custom", ):
             function_tools.append(
                 as_function(tool.name, getattr(tool, "description", None),
-                            custom_parameters()))
+                            _custom_tool_parameters()))
         elif is_web_search_tool(tool):
             # Web search is a *server* tool: the client sends the definition
             # and expects the server to run the query and feed the results
@@ -1353,15 +1399,14 @@ def _get_chat_completion_function_tools(
             # chat template cannot describe anything else, and the call is
             # intercepted server-side rather than returned to the client.
             #
-            # A request that reaches here still carrying web_search should
-            # already have been refused by the endpoint - see
-            # web_search_rejection_reason and its caller in openai_server.py -
-            # because answering without the search the client asked for is a
-            # wrong answer the client cannot detect. This branch is the
-            # fallback for any other caller of this function: drop the tool
-            # rather than describe it, since nothing on this path executes the
-            # call yet and the model would emit one the client has no
-            # implementation for ("unsupported call: web_search").
+            # Unless TRTLLM_WEB_SEARCH_UNAVAILABLE=reject makes the endpoint
+            # refuse it (see web_search_rejection_reason and its caller in
+            # openai_server.py), a request whose web_search the server cannot
+            # honour is served, and this is where the tool is dropped for a
+            # chat-template model; other callers of this function drop it the
+            # same way. It is dropped rather than described because nothing on
+            # this path executes the call yet, and the model would emit one the
+            # client has no implementation for ("unsupported call: web_search").
             #
             # Warn once per process rather than per request: what it reports is
             # a server-configuration fact, not a property of the request, so
@@ -1380,6 +1425,148 @@ def _get_chat_completion_function_tools(
             )
 
     return function_tools
+
+
+def _template_supports_deferred_tools(template_source: Optional[str]) -> bool:
+    """Whether the active template renders namespace/deferred tools natively.
+
+    Keyed on the template reading `deferred_render_mode`: the template
+    revision that introduced that variable is the one that renders
+    `{"type": "namespace"}` tools and `defer_loading` flags itself.
+    `None` (a renderer with no analyzable Jinja source) and templates the
+    reference analysis cannot see into stay on the flattened rendering,
+    which every template understands.
+    """
+    if not isinstance(template_source, str):
+        return False
+    return not unreferenced_chat_template_kwargs(template_source,
+                                                 ("deferred_render_mode", ))
+
+
+def _explicit_defer_flag(tool) -> Optional[bool]:
+    """The tool's `defer_loading` only when the client set it.
+
+    Tri-state matters: the template reads an absent flag on a namespace
+    member as "inherit the namespace's deferral", while explicit flags can
+    carve members out (a member set `false` renders eagerly when other
+    members are explicitly `true`). A pydantic default of `None` must
+    therefore not be serialized as `false`.
+    """
+    flag = getattr(tool, "defer_loading", None)
+    return flag if isinstance(flag, bool) else None
+
+
+def _wants_native_tool_rendering(tools: Optional[list[Tool]]) -> bool:
+    """True when the request carries structure only the native form keeps."""
+    for tool in tools or []:
+        if getattr(tool, "type", None) == "namespace":
+            return True
+        if _explicit_defer_flag(tool):
+            return True
+    return False
+
+
+def _native_function_tool_dict(name: str, description: Optional[str],
+                               parameters: Optional[Any],
+                               defer_flag: Optional[bool]) -> dict[str, Any]:
+    function: dict[str, Any] = {
+        "name": name,
+        "description": description or "",
+        "parameters": parameters if parameters is not None else {
+            "type": "object",
+            "properties": {},
+        },
+    }
+    if defer_flag is not None:
+        function["defer_loading"] = defer_flag
+    return {"type": "function", "function": function}
+
+
+def _native_tools_for_chat_template(tools: list[Tool]) -> list[dict[str, Any]]:
+    """Tool dicts in the shape the native template rendering expects.
+
+    Function and custom tools keep the chat-completions wrapping (with the
+    same freeform schema a flattened custom tool gets); a namespace passes
+    through as `{"type": "namespace", ...}` with flat member entries, so
+    the template itself qualifies the names, writes the namespace metadata
+    line and recipient pattern, and applies `defer_loading`. Tools the
+    template cannot describe (web_search and unknown types) are dropped
+    exactly as the flattened conversion drops them; the flattened pass over
+    the same request already warned about them.
+    """
+    native: list[dict[str, Any]] = []
+    for tool in tools:
+        tool_type = getattr(tool, "type", None)
+        if isinstance(tool, FunctionTool) or tool_type == "function":
+            native.append(
+                _native_function_tool_dict(tool.name,
+                                           getattr(tool, "description", None),
+                                           getattr(tool, "parameters", None),
+                                           _explicit_defer_flag(tool)))
+        elif tool_type == "namespace":
+            members: list[dict[str, Any]] = []
+            for inner in getattr(tool, "tools", None) or []:
+                inner_name = getattr(inner, "name", None)
+                if not inner_name:
+                    continue
+                if getattr(inner, "type", None) == "custom":
+                    inner_parameters = _custom_tool_parameters()
+                else:
+                    inner_parameters = getattr(inner, "parameters", None)
+                member: dict[str, Any] = {
+                    "name":
+                    inner_name,
+                    "description":
+                    getattr(inner, "description", None)
+                    or getattr(tool, "description", None) or "",
+                    "parameters":
+                    inner_parameters if inner_parameters is not None else {
+                        "type": "object",
+                        "properties": {},
+                    },
+                }
+                member_flag = _explicit_defer_flag(inner)
+                if member_flag is not None:
+                    member["defer_loading"] = member_flag
+                members.append(member)
+            entry: dict[str, Any] = {
+                "type": "namespace",
+                "name": tool.name,
+                "description": getattr(tool, "description", None) or "",
+                "tools": members,
+            }
+            ns_flag = _explicit_defer_flag(tool)
+            if ns_flag is not None:
+                entry["defer_loading"] = ns_flag
+            native.append(entry)
+        elif tool_type in ("custom", ):
+            native.append(
+                _native_function_tool_dict(tool.name,
+                                           getattr(tool, "description", None),
+                                           _custom_tool_parameters(),
+                                           _explicit_defer_flag(tool)))
+    return native
+
+
+def _tools_for_chat_template(
+        tools: Optional[list[Tool]], flat_tool_dicts: list[dict[str, Any]],
+        template_source: Optional[str]) -> list[dict[str, Any]]:
+    """The tool dicts handed to `apply_chat_template`.
+
+    Default is the flattened function-tool view every template understands.
+    A request carrying namespace tools or explicit `defer_loading` flags
+    switches to the native structures when the active template renders them
+    (see _template_supports_deferred_tools): the model was trained on the
+    native rendering, and flattening erases the deferral, so every tool
+    arrives eagerly with its full schema. On an older template the flattened
+    view keeps today's eager rendering rather than handing the template
+    structures it would mis-render.
+    """
+    if not _wants_native_tool_rendering(tools):
+        return flat_tool_dicts
+    if not _template_supports_deferred_tools(template_source):
+        return flat_tool_dicts
+    return _native_tools_for_chat_template(tools)
 
 
 async def _create_input_tokens(
@@ -1414,23 +1601,37 @@ async def _create_input_tokens(
         await conversation_store.store_messages(request.request_id, messages,
                                                 request.previous_response_id)
 
+    model_type = resolve_top_level_model_type(model_config)
     # Same pipeline as the chat route: the server template and the model
     # extension's tool serialization apply here too.
     render_resources = RenderResources.from_parts(
         tokenizer=tokenizer,
-        model_type=resolve_top_level_model_type(model_config),
+        model_type=model_type,
         hf_config=model_config,
         processor=processor,
         default_chat_template=chat_template)
-    tools_dict = [
+    flat_tool_dicts = [
         render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
     messages = _render_developer_as_system(messages, tokenizer, processor,
-                                           tools_dict, chat_template)
+                                           flat_tool_dicts, chat_template)
     conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
         messages, model_config, multimodal_server_config)
     has_media = any(message.get("media") for message in conversation)
+    # Resolved before the tool-form decision: the same source drives both
+    # the native-vs-flattened choice and the reasoning-kwargs injection.
+    # Template resolution only uses tools for variant selection, which the
+    # flattened view serves as well as the native one.
+    template_source = rendered_hf_chat_template_source(
+        tokenizer=tokenizer,
+        processor=processor,
+        chat_template=chat_template,
+        tools=flat_tool_dicts,
+        model_type=model_type,
+    )
+    tools_dict = _tools_for_chat_template(request.tools, flat_tool_dicts,
+                                          template_source)
     # Carry the request's reasoning configuration into the chat template.
     #
     # Chat templates that support thinking are opt-in: DeepSeek-V4's custom
@@ -1444,7 +1645,19 @@ async def _create_input_tokens(
     # It matters beyond effort level: when thinking is not enabled the model
     # can still emit a stray closing think tag, and the reasoning parser -
     # which expects the thinking-mode framing - leaves it in the visible text.
-    chat_template_kwargs = reasoning_chat_template_kwargs(request)
+    #
+    # The injection is template-aware: templates differ in which reasoning
+    # kwargs they implement (some read reasoning_effort but have no thinking
+    # toggle), so injected keys the active template never reads are dropped
+    # rather than handed to it. Kwargs the client sent are forwarded
+    # untouched and stay subject to the render-site guard. A serve-derived
+    # effort also goes through the model's normalizer (see
+    # ServingExtension.normalize_reasoning_effort).
+    chat_template_kwargs = reasoning_chat_template_kwargs(
+        request,
+        template_source=template_source,
+        model_type=model_type,
+    )
 
     render_task = render_conversation(
         render_resources,
@@ -1579,7 +1792,9 @@ async def request_preprocess(
 
 
 # TODO(JunyiXu-nv): move to use the same function in postprocess_handlers after multiple post processors are supported
-def reasoning_chat_template_kwargs(request) -> dict:
+def reasoning_chat_template_kwargs(request,
+                                   template_source: Optional[str] = None,
+                                   model_type: Optional[str] = None) -> dict:
     """Chat-template kwargs implied by a request's reasoning configuration.
 
     Both the prompt and the reasoning parser need these. DeepSeek-V4's
@@ -1588,6 +1803,19 @@ def reasoning_chat_template_kwargs(request) -> dict:
     constructed with the same flag - otherwise it falls back to an identity
     parser and the reasoning, plus its closing tag, stays in the visible
     answer. Deriving both from one place keeps them from drifting apart.
+
+    `template_source` (the Jinja source about to be rendered, from
+    `rendered_hf_chat_template_source`) makes the injection template-aware:
+    templates differ in which reasoning kwargs they implement, so injected
+    keys the template never reads are dropped instead of being handed to it.
+    Only injected keys are filtered: kwargs the client sent are returned
+    untouched and keep their render-site guard semantics. Callers with no
+    template to render (the reasoning-parser sites, custom non-Jinja
+    tokenizers) pass no source and get the full injection.
+
+    `model_type` selects the model's effort normalizer (see
+    `ServingExtension.normalize_reasoning_effort`) for an effort derived
+    from `reasoning.effort`; without it the effort is forwarded unchanged.
     """
     # Check the type rather than the truthiness of each attribute. A caller
     # that passes a stand-in object - a Mock in a unit test, say - hands back a
@@ -1595,12 +1823,30 @@ def reasoning_chat_template_kwargs(request) -> dict:
     # `attr.keys()` and fail with a TypeError instead of falling back.
     raw = getattr(request, "chat_template_kwargs", None)
     kwargs = dict(raw) if isinstance(raw, Mapping) else {}
+    client_keys = frozenset(kwargs)
     reasoning = getattr(request, "reasoning", None)
-    effort = getattr(reasoning, "effort",
-                     None) if reasoning is not None else None
+    if reasoning is None:
+        return kwargs
+    effort = getattr(reasoning, "effort", None)
     if isinstance(effort, str) and effort:
+        # Serve-derived, so it goes through the model's normalizer (identity
+        # unless the model registers one). None means "leave the template
+        # default"; a model whose template cannot turn reasoning off maps
+        # `none` to one of its levels instead.
+        effort = normalize_reasoning_effort(effort, model_type)
+    if effort == "none":
+        kwargs.setdefault("thinking", False)
+        return kwargs
+    if isinstance(effort, str) and effort:
+        # A kwarg the client wrote stays verbatim.
         kwargs.setdefault("reasoning_effort", effort)
-        kwargs.setdefault("thinking", True)
+    # A `reasoning` object asks a reasoning model to reason; without an
+    # effort it reasons at the model's default effort.
+    kwargs.setdefault("thinking", True)
+    if template_source is not None:
+        injected = [key for key in kwargs if key not in client_keys]
+        for key in unreferenced_chat_template_kwargs(template_source, injected):
+            del kwargs[key]
     return kwargs
 
 
@@ -1849,7 +2095,9 @@ def _create_output_content(
                             content=[
                                 Content(text=record.text, type="reasoning_text")
                             ],
-                            status=None,
+                            # The stream closed this item as completed; the
+                            # snapshot reports the same status.
+                            status="completed",
                         ))
                 else:
                     output_items.append(
@@ -1882,7 +2130,7 @@ def _create_output_content(
                         content=[
                             Content(text=reasoning_text, type="reasoning_text")
                         ],
-                        status=None,
+                        status="completed",
                     ))
                 stored_reasoning = reasoning_text
 
@@ -1909,8 +2157,12 @@ def _create_output_content(
             tool_calls_item = list(streamed_tool_calls)
         else:
             tool_resolution = _tool_resolution(tools)
+            # As streamed: the stream delivers every call it announces as
+            # completed.
             tool_calls_item = [
-                _tool_call_output_item(call, tool_resolution) for call in calls
+                _tool_call_output_item(call,
+                                       tool_resolution,
+                                       status="completed") for call in calls
             ]
         output_items.extend(tool_calls_item)
 
@@ -1951,25 +2203,29 @@ def _create_output_content_harmony(
     return output_content, output_messages
 
 
-def _tool_resolution(
-        tools: Optional[list[Tool]]
-) -> dict[str, Tuple[Optional[str], str, bool]]:
+def _tool_resolution(tools: Optional[list[Tool]]) -> _ToolResolution:
     """Every spelling a parsed call may carry -> (namespace, bare name, custom).
 
     A chat template can only describe a flat list of functions, so a namespaced
     tool is offered to the model as "namespace.tool" and has to be reported back
     with the two parts separated again - that is how the client identifies it.
-    Models write the name back both ways, so the bare name resolves too, but
-    only when exactly one declared tool answers to it.
+    Models write the name back in other spellings too. "namespace::tool", the
+    separator some models are trained on (DeepSeek-V4.1), names the same tool
+    as the dotted spelling. The bare name resolves as well, but only when
+    exactly one declared tool answers to it. Neither spelling displaces a name
+    a tool was declared under.
     """
-    resolved: dict[str, Tuple[Optional[str], str, bool]] = {}
+    resolved: _ToolResolution = {}
     bare_claims: dict[str, list[str]] = {}
+    # "namespace::tool" -> the dotted name it stands for.
+    separator_spellings: dict[str, str] = {}
 
     def claim(exposed: str, namespace: Optional[str], bare: str,
               is_custom: bool) -> None:
         resolved[exposed] = (namespace, bare, is_custom)
         if exposed != bare:
             bare_claims.setdefault(bare, []).append(exposed)
+            separator_spellings[f"{namespace}::{bare}"] = exposed
 
     for tool in tools or []:
         tool_type = getattr(tool, "type", None)
@@ -1992,12 +2248,14 @@ def _tool_resolution(
             continue
         if len(exposed_names) == 1:
             resolved[bare] = resolved[exposed_names[0]]
+    for spelling, exposed in separator_spellings.items():
+        resolved.setdefault(spelling, resolved[exposed])
     return resolved
 
 
 def _tool_call_output_item(
     call,
-    tool_resolution: dict[str, Tuple[Optional[str], str, bool]],
+    tool_resolution: _ToolResolution,
     item_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
@@ -2108,6 +2366,9 @@ def _create_usage(
     originating request, so its prompt tokens are only reachable that way.
     """
     if num_prompt_tokens is None:
+        # Unadjusted: counts the whole rendered prompt, ignoring
+        # num_prompt_tokens_offset. Callers that want chat parity pass
+        # ResponsesAPIPostprocArgs.usage_num_prompt_tokens().
         prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
         if prompt_token_ids is None:
             return None
@@ -2126,6 +2387,10 @@ def _create_usage(
     if ctx_prompt_tokens is not None:
         input_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    # The engine counts cached tokens over the whole rendered prompt, which can
+    # be longer than the prompt usage reports (see
+    # PostprocArgs.num_prompt_tokens_offset).
+    cached_tokens = min(cached_tokens, input_tokens)
 
     return ResponseUsage(
         input_tokens=input_tokens,
@@ -3233,6 +3498,194 @@ async def guard_responses_stream(
         for frame in frames:
             yield frame
         raise
+
+
+# --------------------------------------------------------------------------
+# Keepalive while a stream is silent
+# --------------------------------------------------------------------------
+
+# Seconds a stream may stay silent before its response.in_progress event is
+# sent again. Clients and proxies cut a stream that sends nothing for long
+# enough, and a stream is silent until its first token (queueing and prefill)
+# and for as long as the model writes a tool call, which is sent only once
+# complete.
+RESPONSES_STREAM_KEEPALIVE_INTERVAL_S = 15.0
+
+_IN_PROGRESS_FRAME_START = "event: response.in_progress\n"
+# The response is over once one of these has gone out.
+_FINAL_FRAME_STARTS = ("event: error\n", "event: response.completed\n",
+                       "event: response.incomplete\n",
+                       "event: response.failed\n")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _top_level_member(payload: str, key: str) -> Optional[Tuple[int, int, Any]]:
+    """Where the value of ``key`` starts and ends in a compact JSON object, and the value.
+
+    Only a member of the object itself counts: each member is decoded to find
+    where it ends, so the same key nested in a value, or written inside a
+    string, is passed over. None when ``key`` is not a member.
+    """
+    if not payload.startswith("{"):
+        return None
+    pos = 1
+    try:
+        while True:
+            name, pos = _JSON_DECODER.raw_decode(payload, pos)
+            if payload[pos] != ":":
+                return None
+            start = pos + 1
+            value, pos = _JSON_DECODER.raw_decode(payload, start)
+            if name == key:
+                return start, pos, value
+            if payload[pos] != ",":
+                return None
+            pos += 1
+    except (ValueError, IndexError):
+        return None
+
+
+def _stamp_sequence_number(frame: str, sequence_number: int) -> str:
+    """``frame`` with ``sequence_number`` as its event's sequence number.
+
+    Only the digits of the event's own number change: the payload is not
+    serialized again, and a ``sequence_number`` inside the response or the
+    model's output is left alone. A frame without a number of its own is
+    returned unchanged.
+    """
+    head, sep, rest = frame.partition("\ndata: ")
+    payload, newline, tail = rest.partition("\n")
+    member = _top_level_member(payload, "sequence_number") if sep else None
+    if member is None or type(member[2]) is not int:
+        return frame
+    start, end, _ = member
+    return (f"{head}{sep}{payload[:start]}{sequence_number}{payload[end:]}"
+            f"{newline}{tail}")
+
+
+async def _with_ticks(
+        source: AsyncGenerator[Any, None],
+        timeout: Callable[[], Optional[float]]) -> AsyncGenerator[Any, None]:
+    """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
+
+    ``timeout()`` is asked before every wait; None waits for the next item. One
+    task reads ``source`` to its end, so a tick never interrupts a read and the
+    source is never resumed from another task; that task is cancelled, and the
+    source closed, when the consumer stops.
+    """
+    # One item at a time: the reader waits for the consumer, so a slow client
+    # holds back the source as reading it directly would.
+    items: asyncio.Queue = asyncio.Queue(maxsize=1)
+    end = object()
+    consumer_stopped = False
+
+    async def read_all() -> None:
+        try:
+            async for item in source:
+                await items.put(item)
+        except asyncio.CancelledError:
+            # Stopped while handing over an item, the reader leaves the source
+            # suspended at its yield, so it closes the source itself.
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            if not consumer_stopped:
+                # Not stopped by the consumer, which still waits for the end.
+                await items.put(end)
+            raise
+        except Exception:
+            await items.put(end)
+            raise
+        await items.put(end)
+
+    reader = asyncio.create_task(read_all())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(items.get(), timeout())
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            if item is end:
+                # Raises what reading the source raised.
+                await reader
+                return
+            yield item
+    finally:
+        consumer_stopped = True
+        reader.cancel()
+        # Return only once the reader has stopped and closed the source.
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that closes its body iterator however it ends.
+
+    A client that disconnects while a frame is being sent leaves the iterator
+    suspended at its yield: on ASGI 2.3 the send is cancelled, on 2.4 it raises
+    and Starlette raises ``ClientDisconnect``, skipping any background task. The
+    iterator, and the generation stream it reads, would then be closed only when
+    garbage-collected.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
+async def keep_responses_stream_alive(
+        frames: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+    """Send ``frames``, repeating ``response.in_progress`` while they are silent.
+
+    ``frames`` yields one SSE event per item, numbered from 0, the first two
+    being ``response.created`` and ``response.in_progress``. Until the response
+    ends, the ``response.in_progress`` event is sent again whenever no event has
+    gone out for ``RESPONSES_STREAM_KEEPALIVE_INTERVAL_S`` seconds, before the
+    first token too. It is part of the stream format and carries the same
+    response as at the start, which clients already hold.
+
+    Events are numbered here, where they leave the server. The processor that
+    makes them cannot do it: postprocess workers each format events with their
+    own copy of it, and when a keepalive is due the reader may already hold the
+    next numbered event. A repeated event takes the next number, and every event
+    after it is renumbered to its place in the stream. Until then each event
+    already carries its place and goes out as it came.
+    """
+    in_progress: Optional[str] = None
+    ended = False
+    renumber = False
+    sent = 0
+    loop = asyncio.get_running_loop()
+    last_sent = loop.time()
+
+    def until_keepalive() -> Optional[float]:
+        if in_progress is None or ended:
+            return None
+        return max(
+            0.0,
+            RESPONSES_STREAM_KEEPALIVE_INTERVAL_S - (loop.time() - last_sent))
+
+    items = _with_ticks(frames, until_keepalive)
+    try:
+        async for frame in items:
+            if frame is None:
+                frame = in_progress
+                renumber = True
+            elif in_progress is None and frame.startswith(
+                    _IN_PROGRESS_FRAME_START):
+                in_progress = frame
+            if renumber:
+                frame = _stamp_sequence_number(frame, sent)
+            ended = ended or frame.startswith(_FINAL_FRAME_STARTS)
+            yield frame
+            sent += 1
+            last_sent = loop.time()
+    finally:
+        # Stops the task reading ``frames`` when this stream ends early.
+        await items.aclose()
 
 
 class ServerArrivalTimeMiddleware:

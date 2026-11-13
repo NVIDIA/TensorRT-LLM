@@ -15,6 +15,7 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include <list>
@@ -207,7 +208,7 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
-    if (SM != kSM_120)
+    if (!tensorrt_llm::common::isSM120Family(SM))
     {
         return false;
     }
