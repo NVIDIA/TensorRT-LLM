@@ -705,8 +705,7 @@ def test_idle_legacy_gen_timeout_defers_adp_failure_to_existing_error_vote(monke
     # tp_gather only runs when a response is enqueued; none is here.
     ranks[0].dist.mapping = SimpleNamespace(tp_group=[0, 1])
     ranks[0].dist.tp_gather = Mock(return_value=[[], []])
-    executor.responses = {}
-    executor.response_cv = threading.Condition()
+    executor._response_channel = ResponseChannel()
     executor._pending_transfer_responses = []
     executor._is_preemption_pending = lambda request: False
     executor._disagg_coordinator = ranks[0].coordinator
