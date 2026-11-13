@@ -316,8 +316,8 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         ("_run_mamba_hybrid_warmup", not enabled),
         ("_run_cuda_graph_warmup", True),
         ("_run_cuda_graph_warmup", True),
-        ("_general_warmup", not enabled),
         ("_prims_ts_dense_mla_warmup", True),
+        ("_general_warmup", not enabled),
     ]
     assert not model._bypass_active
     warmup._prims_ts_dense_mla_warmup.run.assert_called_once_with(
