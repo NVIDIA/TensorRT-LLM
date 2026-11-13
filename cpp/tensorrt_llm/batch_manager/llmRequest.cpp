@@ -106,17 +106,22 @@ std::optional<executor::Result> LlmRequest::createResult()
         {
             firstGenTokens.push_back(getTokens().at(beam).back());
         }
-        if (!hasDraftTokens())
+        auto draftTokens = hasDraftTokens() ? std::optional<VecTokens>(*getDraftTokens()) : std::nullopt;
+        if (mContextPhaseParams.has_value())
         {
+            auto& contextPhaseParams = mContextPhaseParams.value();
             result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
-                mContextPhaseParams.value().releaseState(), std::nullopt, mContextPhaseParams.value().getCtxDpRank(),
-                mContextPhaseParams.value().getDisaggInfoEndpoint()};
+                contextPhaseParams.releaseState(), std::move(draftTokens), contextPhaseParams.getCtxDpRank(),
+                contextPhaseParams.getDisaggInfoEndpoint()};
         }
         else
         {
-            result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
-                mContextPhaseParams.value().releaseState(), *getDraftTokens(),
-                mContextPhaseParams.value().getCtxDpRank(), mContextPhaseParams.value().getDisaggInfoEndpoint()};
+            // A request cancelled before its KV transfer was set up has no params; its result carries no
+            // transfer state.
+            TLLM_LOG_WARNING("Context-only request %lu has no context phase params in state %d", mRequestId,
+                static_cast<int>(mState));
+            result.contextPhaseParams
+                = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId, std::move(draftTokens)};
         }
     }
 

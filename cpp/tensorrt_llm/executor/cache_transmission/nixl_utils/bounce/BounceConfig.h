@@ -192,6 +192,35 @@ struct BounceConfig
     // memory instead of staging them in device scratch first. Faster at every plan size (same
     // bytes over the bus, but no H2D-then-kernel serialization), so on by default.
     bool useZeroCopyArguments{true};
+    // scatter_on_order_stream: once the owner hands the transport the stream its model forwards run
+    // on (BounceTransport::setScatterOrderStream), receive-side scatters are enqueued on THAT stream
+    // instead of a private copy stream. Each scatter then runs strictly between two forwards: it
+    // never shares SMs with a forward that assumes it owns the whole GPU (persistent cross-rank
+    // kernels with an SM-count grid), and it never writes KV pages while a forward reads them. The
+    // RDMA transfer itself still overlaps the forward; only the device-side copy is serialized.
+    // Without a registered stream (or with this off) scatters keep the private-stream path.
+    bool scatterOnOrderStream{true};
+    // scatter_copy_engine: receive-side scatters with NO registered order stream run on the GPU copy
+    // engines (one cudaMemcpy3DBatchAsync per chunk, one 2D copy per coalesced run) instead of the SM copy
+    // kernel, on the private copy stream. Copy engines use no SMs, so such a scatter can never take an SM
+    // from a forward whose persistent grid needs every SM (cross-rank kernels with an SM-count grid). With
+    // a registered order stream the kernel scatter stays on it (between forwards, and faster than the copy
+    // engines on small pieces). A chunk the copy engines reject falls back to the kernel path. Off
+    // restores the kernel path everywhere.
+    bool scatterCopyEngine{true};
+    // copy_stream_priority: priority of the private gather/scatter copy streams. "default" (default)
+    // queues copy blocks with model work; "greatest" lets copy blocks take any SM that frees up first
+    // (it starved persistent SM-count grids of their SMs in tensor-parallel disagg serving); "least" queues them last.
+    enum class StreamPriority : std::uint8_t
+    {
+        kGreatest = 0,
+        kLeast,
+        kDefault,
+    };
+    StreamPriority copyStreamPriority{StreamPriority::kDefault};
+    // max_copy_blocks: upper bound on the gather/scatter kernel grid (each block then loops over
+    // several pieces). 0 (default) launches one block per piece.
+    std::uint32_t maxCopyBlocks{0};
 
     /// Re-derive the lease/quarantine values from the one user-visible timeout (see the field
     /// comments): the lease must exceed the peers' request timeout, and time is the only write
@@ -209,6 +238,41 @@ struct BounceConfig
                                     std::int64_t{2} * requestTimeoutMs, std::numeric_limits<int>::max()))
                                                      : 0;
         quarantineMs = requestTimeoutMs;
+    }
+
+    /// Case-insensitive greatest/least/default -> StreamPriority, anything else -> nullopt.
+    [[nodiscard]] static std::optional<StreamPriority> parseStreamPriority(std::string const& raw)
+    {
+        std::string s;
+        s.reserve(raw.size());
+        for (char c : raw)
+        {
+            s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        if (s == "greatest")
+        {
+            return StreamPriority::kGreatest;
+        }
+        if (s == "least")
+        {
+            return StreamPriority::kLeast;
+        }
+        if (s == "default")
+        {
+            return StreamPriority::kDefault;
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] static char const* toString(StreamPriority p)
+    {
+        switch (p)
+        {
+        case StreamPriority::kGreatest: return "greatest";
+        case StreamPriority::kLeast: return "least";
+        case StreamPriority::kDefault: return "default";
+        }
+        return "?";
     }
 
     /// Apply one knob given as a (key, value) string pair. Returns false when the key is unknown.
@@ -328,6 +392,29 @@ struct BounceConfig
         {
             setBool(cfg.useZeroCopyArguments);
         }
+        else if (key == "scatter_on_order_stream")
+        {
+            setBool(cfg.scatterOnOrderStream);
+        }
+        else if (key == "scatter_copy_engine")
+        {
+            setBool(cfg.scatterCopyEngine);
+        }
+        else if (key == "copy_stream_priority")
+        {
+            if (auto p = parseStreamPriority(value))
+            {
+                cfg.copyStreamPriority = *p;
+            }
+            else
+            {
+                warnBad();
+            }
+        }
+        else if (key == "max_copy_blocks")
+        {
+            setU32(cfg.maxCopyBlocks, /*allowZero=*/true);
+        }
         else
         {
             return false;
@@ -344,7 +431,7 @@ struct BounceConfig
         // KEEP IN SYNC with AGENT_BOUNCE_PARAM_KEYS in
         // tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py, which the llm_args validator
         // uses to reject unknown agent_bounce_params keys upfront.
-        static constexpr std::array<std::pair<char const*, char const*>, 11> kEnvKnobs{{
+        static constexpr std::array<std::pair<char const*, char const*>, 15> kEnvKnobs{{
             {"max_chunk_size", "TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES"},
             {"arena_allocation_granularity", "TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES"},
             {"max_average_descriptor_size", "TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES"},
@@ -356,6 +443,10 @@ struct BounceConfig
             {"disable_fabric_memory", "TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY"},
             {"enable_eager_gather", "TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER"},
             {"use_zero_copy_arguments", "TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS"},
+            {"scatter_on_order_stream", "TRTLLM_NIXL_BOUNCE_SCATTER_ON_ORDER_STREAM"},
+            {"scatter_copy_engine", "TRTLLM_NIXL_BOUNCE_SCATTER_COPY_ENGINE"},
+            {"copy_stream_priority", "TRTLLM_NIXL_BOUNCE_COPY_STREAM_PRIORITY"},
+            {"max_copy_blocks", "TRTLLM_NIXL_BOUNCE_MAX_COPY_BLOCKS"},
         }};
         BounceConfig cfg;
         for (auto const& [paramKey, envName] : kEnvKnobs)

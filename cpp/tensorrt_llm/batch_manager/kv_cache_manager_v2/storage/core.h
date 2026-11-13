@@ -188,10 +188,16 @@ public:
 
     void synchronize();
 
+    // Lazy scrub (default ON): release() does not poll the recycled slots' events, and allocate() polls them only
+    // when no ready recycled slot is counted, so every allocation picks the slot an eager scrub would pick.
+    // TRTLLM_KVCM2_DISABLE_LAZY_SCRUB=1 (read once per process) polls on every allocate() and release().
+    [[nodiscard]] static bool lazyScrubEnabled() noexcept;
+
 private:
     void scrubEvents();
     [[nodiscard]] bool check() const noexcept;
 
+    bool const mLazyScrub;
     SlotCount mCapacity;
     SlotCount mTargetCapacity;
     SlotCount mNumActiveSlots;

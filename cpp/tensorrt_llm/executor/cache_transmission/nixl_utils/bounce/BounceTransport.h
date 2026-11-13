@@ -207,6 +207,31 @@ public:
         return !mScattering.empty();
     }
 
+    /// Order every later scatter on `stream` (BounceConfig::scatterOnOrderStream): the copy is
+    /// enqueued on that stream, so it runs strictly between the work queued there before and after
+    /// it. nullptr restores the private copy streams. Returns false (and changes nothing) when the
+    /// knob is off or the stream belongs to another device. When it returns, no worker can still
+    /// enqueue on the previously set stream, so the caller may then begin a stream capture on it.
+    /// Thread-safe.
+    bool setOrderStream(cudaStream_t stream);
+
+    /// Scatters that ran on the order stream / on a private copy stream (observability and tests).
+    [[nodiscard]] std::uint64_t orderedScatterCount() const noexcept
+    {
+        return mOrderedScatters.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::uint64_t privateScatterCount() const noexcept
+    {
+        return mPrivateScatters.load(std::memory_order_relaxed);
+    }
+
+    /// Chunks scattered by the copy engines (scatter_copy_engine).
+    [[nodiscard]] std::uint64_t copyEngineScatterCount() const noexcept
+    {
+        return mCopyEngineScatters.load(std::memory_order_relaxed);
+    }
+
 private:
     struct ScatterJob
     {
@@ -236,10 +261,20 @@ private:
         std::function<std::vector<Grant>(std::unordered_set<std::uint64_t> const&, std::vector<std::uint64_t>&)> const&
             reclaim);
     void scatterWorkerLoop();
-    /// Exception recovery for one scatter job (worker thread): release a still-held exec context,
-    /// NACK unless an ACK or NACK was already attempted, and push the ScatterDone unless already pushed.
-    void recoverScatterJob(
-        ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed, char const* what);
+    /// Launch a prepared scatter plan (worker thread). Enqueues on the order stream when one is set,
+    /// the knob is on and the stream is not capturing, then records ctx->event there (`eventRecorded`);
+    /// otherwise launches on ctx->stream. `launchStream` reports the stream used. On a failure after
+    /// work may have been enqueued on the order stream, that stream is drained before returning so
+    /// the caller can release the region and plan buffers. With `orderUnavailable`, a scatter that finds
+    /// no usable order stream launches nothing: it sets `*orderUnavailable` and returns cudaErrorNotReady
+    /// so the caller can take the copy engines instead of a kernel on ctx->stream.
+    [[nodiscard]] cudaError_t launchScatter(
+        ExecCtx* ctx, std::size_t n, cudaStream_t& launchStream, bool& eventRecorded, bool* orderUnavailable = nullptr);
+    /// Exception recovery for one scatter job (worker thread): drain the launched copy, release a
+    /// still-held exec context, NACK unless an ACK or NACK was already attempted, and push the
+    /// ScatterDone unless already pushed.
+    void recoverScatterJob(ScatterJob const& job, ExecCtx* ctx, cudaStream_t launchStream, bool eventRecorded,
+        bool acked, bool nackSent, bool donePushed, char const* what);
 
     BounceContext& mCtx;
     std::vector<std::thread> mWorkers;
@@ -262,6 +297,15 @@ private:
     std::unordered_map<std::uint64_t, bool> mScattering;
 
     std::chrono::steady_clock::time_point mNextSweep{}; // checkTimeouts() throttle (IO-thread-only)
+    // Order stream for scatters (setOrderStream). mOrderMu is held across the capture check, the
+    // launch and the event record, so clearing the stream waits for any enqueue in progress.
+    std::mutex mOrderMu;
+    cudaStream_t mOrderStream{nullptr};
+    std::atomic<bool> mWarnedCaptureFallback{false};
+    std::atomic<std::uint64_t> mOrderedScatters{0};
+    std::atomic<std::uint64_t> mPrivateScatters{0};
+    std::atomic<std::uint64_t> mCopyEngineScatters{0};
+    std::atomic<bool> mWarnedCopyEngineFallback{false};
 };
 
 /// Sender role ([S]): submit() announces a WRITE via WANT; GRANT -> gather into a local arena region
@@ -529,6 +573,27 @@ public:
     [[nodiscard]] std::size_t maxChunkSizeBytes() const
     {
         return mCtx.cfg.maxChunkSizeBytes;
+    }
+
+    /// Enqueue receive scatters on `stream` (see BounceReceiver::setOrderStream). Thread-safe.
+    bool setScatterOrderStream(cudaStream_t stream)
+    {
+        return mReceiver.setOrderStream(stream);
+    }
+
+    [[nodiscard]] std::uint64_t orderedScatterCount() const noexcept
+    {
+        return mReceiver.orderedScatterCount();
+    }
+
+    [[nodiscard]] std::uint64_t privateScatterCount() const noexcept
+    {
+        return mReceiver.privateScatterCount();
+    }
+
+    [[nodiscard]] std::uint64_t copyEngineScatterCount() const noexcept
+    {
+        return mReceiver.copyEngineScatterCount();
     }
 
     /// Stop threads, fail any in-flight requests, and join. Idempotent.

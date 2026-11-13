@@ -560,6 +560,13 @@ public:
         return mApiMutex.lockShared();
     }
 
+    //! Exclusive lock if it is free now, without waiting (see ReentrantSharedMutex::TryExclusiveGuard).
+    //! For bindings that keep the GIL across a short call when nothing contends for the lock.
+    [[nodiscard]] ReentrantSharedMutex::TryExclusiveGuard tryLockExclusive() const
+    {
+        return mApiMutex.tryLockExclusive();
+    }
+
     // White-box introspection (incl. test-only auto-tuner state mutation) reaches
     // private members directly rather than widening the public API.
     friend class KvCacheIntrospection;
