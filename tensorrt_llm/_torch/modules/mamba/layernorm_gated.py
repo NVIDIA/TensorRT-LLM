@@ -138,7 +138,9 @@ def _layer_norm_fwd_1pass_kernel(
 # reduction order (bitwise-identical output) at ~2x the throughput.
 # From _MULTIROW_LARGE_TILE_MIN_ROWS rows, each program takes enough rows for
 # every thread to load whole 16-byte vectors of x and z; the reduction order
-# then differs from the 4-row launch, so outputs may differ by rounding.
+# then differs from the 4-row launch, so outputs may differ by rounding. As the
+# tile depends on the launch's total row count, a row's output can depend on
+# the batch size; FORCE_DETERMINISTIC=1 keeps the 4-row tile.
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
@@ -148,6 +150,8 @@ _MULTIROW_LARGE_TILE_MIN_ROWS = 32768
 def _multirow_rows(M: int, N: int, element_size: int) -> int:
     """Rows per program of the multi-row kernel for an [M, N] input."""
     if M < _MULTIROW_LARGE_TILE_MIN_ROWS:
+        return _MULTIROW_ROWS
+    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         return _MULTIROW_ROWS
     num_threads = 32 * _MULTIROW_NUM_WARPS
     return max(_MULTIROW_ROWS, num_threads * (16 // element_size) // N)

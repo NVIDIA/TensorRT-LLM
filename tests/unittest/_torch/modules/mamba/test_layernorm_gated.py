@@ -353,6 +353,27 @@ class TestRMSNormBasic:
         else:
             assert max_ulp_distance(output, four_row_output) <= 1
 
+    def test_force_deterministic_output_does_not_depend_on_batch_size(self, monkeypatch):
+        """With FORCE_DETERMINISTIC=1, a row's output is the same whether or
+        not the launch is large enough for the large tile."""
+        monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+        device = "cuda"
+        dtype = torch.bfloat16
+        N = 128
+        num_rows = layernorm_gated._MULTIROW_LARGE_TILE_MIN_ROWS + 4
+        num_prefix_rows = layernorm_gated._MULTIROW_LARGE_TILE_MIN_ROWS - 4
+
+        torch.manual_seed(6)
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        z = torch.randn(num_rows, 1, N, device=device, dtype=dtype)
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+
+        output = layernorm_gated.rms_norm_gated_token_major(x, z, weight, 1e-6)
+        prefix_output = layernorm_gated.rms_norm_gated_token_major(
+            x[:num_prefix_rows], z[:num_prefix_rows], weight, 1e-6
+        )
+        assert torch.equal(output[:num_prefix_rows], prefix_output)
+
     @pytest.mark.skipif(getSMVersion() < 90, reason="PDL requires SM90+")
     @pytest.mark.parametrize("num_tokens,heads,N", [(1, 47, 128), (7, 8, 256), (2048, 48, 128)])
     def test_token_major_pdl_launch_is_bitwise_invariant(
