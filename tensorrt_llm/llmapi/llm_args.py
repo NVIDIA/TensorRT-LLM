@@ -1043,8 +1043,8 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Whether to enable the Guess-Verify-Refine (GVR) Top-K for the QSA "
         "indexer instead of the exact radix Top-K. QSA dispatches only the "
-        "hint-free self-sampling engine, which requires Hopper (SM90) or "
-        "datacenter Blackwell (SM100/103), the CUTLASS DSL, a compressed-group budget "
+        "hint-free self-sampling engine, which requires Blackwell (SM100/103), "
+        "the CUTLASS DSL, a compressed-group budget "
         "(indexer_budget / indexer_compress_ratio) in {512, 1024, 2048}, and "
         "an indexer_compress_ratio of 4. Falls back to the exact radix "
         "Top-K with a one-time warning when the prerequisites are not met.")
@@ -1419,9 +1419,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
         "indexer instead of the exact insertion/radix Top-K path. Currently "
-        "supported for index_topk ∈ {512, 1024, 2048} on Blackwell (SM100+) "
-        "and, with the self-sampling engine, on Hopper (SM90), with "
-        "compress_ratio ∈ {1, 4} (DSv3.2 + DSv4 indexers). Falls back to "
+        "supported for index_topk ∈ {512, 1024, 2048} on Blackwell (SM100+), "
+        "with compress_ratio ∈ {1, 4} (DSv3.2 + DSv4 indexers). Falls back to "
         "the production insertion/radix Top-K path when prerequisites are not "
         "met. `use_self_sampling_topk` selects the GVR engine generation.")
     use_self_sampling_topk: bool = Field(

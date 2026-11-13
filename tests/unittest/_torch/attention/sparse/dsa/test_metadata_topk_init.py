@@ -40,18 +40,14 @@ def test_topk_flags_initialized_before_buffer_allocation(
         get_cache_indices=Mock(),
     )
     metadata.is_cuda_graph = False
-    # The self-sampling engine runs on Hopper and datacenter Blackwell, the
-    # temporal-hint engine on datacenter Blackwell only.
-    self_sampling = (
-        enable_heuristic and use_self_sampling and dsl_available and sm_version in (90, 100, 103)
-    )
-    enabled = enable_heuristic and (sm_version >= 100 or self_sampling)
+    enabled = enable_heuristic and sm_version >= 100
+    self_sampling_supported = enabled and dsl_available and sm_version in (100, 103)
     temporal_supported = enabled and dsl_available and sm_version in (100, 103)
 
     def check_flags(*, capture_graph: bool) -> None:
         assert capture_graph is False
         assert metadata.enable_gvr_topk is enabled
-        assert metadata.use_self_sampling_topk is self_sampling
+        assert metadata.use_self_sampling_topk is (self_sampling_supported and use_self_sampling)
         assert metadata.needs_gvr_prior is (temporal_supported and not use_self_sampling)
 
     metadata.create_buffers_for_mla_rope_append = Mock(side_effect=check_flags)
