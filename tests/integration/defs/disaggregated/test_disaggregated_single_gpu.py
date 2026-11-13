@@ -923,6 +923,7 @@ def test_disaggregated_cancel_gen_requests(model):
             raise e
 
         intercomm = None
+        test_error = None
         try:
             print("Launched all workers.", flush=True)
             intercomm = mpi_initialize_intercomm(port_name)
@@ -968,14 +969,22 @@ def test_disaggregated_cancel_gen_requests(model):
 
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
+            test_error = e
         finally:
             print("Sending termination request", flush=True)
             mpi_send_termination_request(intercomm)
 
             print("Waiting for all workers to terminate.", flush=True)
             for future in futures:
-                future.result()
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Worker failed: {e}", flush=True)
+                    if test_error is None:
+                        test_error = e
             print("All workers terminated.")
+        if test_error is not None:
+            raise test_error
 
 
 @pytest.mark.parametrize("model", ["Qwen3-0.6B"])
