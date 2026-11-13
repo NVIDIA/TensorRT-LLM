@@ -150,6 +150,14 @@ struct MlaParams
     // `quant_q_buf`. Context preprocessing must still rotate/cache K.
     bool q_rope_applied = false;
 
+    // Non-absorption context MLA: `k_buf` / `v_buf` point to contiguous FP8 E4M3 K
+    // [total_kv_len, head_num * (qk_nope_head_dim + qk_rope_head_dim)] and V
+    // [total_kv_len, head_num * v_head_dim], which the FMHA reads as they are.
+    bool fp8_kv_input = false;
+    // With `fp8_kv_input`: `quant_q_buf` already holds the FP8 Q, so the context
+    // quantization only writes the BMM scales.
+    bool fp8_q_input = false;
+
     // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
     Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
 
@@ -191,7 +199,13 @@ template <typename T, typename TCache>
 void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_scale_cache, T* q_ptr,
     T* latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
     int const max_input_uncached_seq_len, float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size,
-    int lora_size, KvCacheDataType cache_type, float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+    int lora_size, KvCacheDataType cache_type, float const* kv_scale_orig_quant_ptr, int32_t const* kvCacheLocalSlots,
+    cudaStream_t stream);
+
+template <typename T>
+void invokeReorderHelixMlaKV(T const* gathered, T* compressedKv, T* kPe, int64_t const* cuGlobal,
+    int64_t const* globalOffsets, int64_t const* cuLocal, int64_t const* localOffsets, int64_t const* rankOffsets,
+    int numTokens, int numContexts, int cpSize, int tokensPerBlock, int loraSize, int ropeSize, cudaStream_t stream);
 
 // Apply neox-style RoPE in-place to only the last rope_dim elements of each head,
 // leaving the first nope_dim elements untouched.

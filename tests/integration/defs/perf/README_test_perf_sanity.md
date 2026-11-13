@@ -238,7 +238,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 **File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
-**Example**: `gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL.yaml`
+**Example**: `gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL.yaml`
 
 **Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
 

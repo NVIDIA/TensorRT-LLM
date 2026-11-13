@@ -31,6 +31,7 @@ import torch
 import tqdm
 from mpi4py import MPI as _MPI
 
+from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
@@ -46,16 +47,17 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
                                  local_mpi_comm, local_mpi_rank, local_mpi_size,
                                  mpi_comm, mpi_disabled)
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
-_AUTO_IO_POLICY = "auto"
-_NATIVE_IO_POLICY = "native"
-_RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
-_SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
-_SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
+_SUPPORTED_IO_POLICIES = (CheckpointIOPolicy.NATIVE,
+                          CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD)
+_SUPPORTED_REQUESTED_IO_POLICIES = (
+    CheckpointIOPolicy.AUTO, ) + _SUPPORTED_IO_POLICIES
 # Model families whose checkpoints are too large to materialize in host RAM;
 # their models stream rank-local slices out of the lazy mmapped handles. The
 # gate reads the raw config.json, so it names the checkpoint's own model_type.
@@ -96,17 +98,17 @@ class _LazySafetensorsWeights(ConsumableWeightsDict):
 
 @dataclass
 class _CheckpointIOStatus:
-    requested: str
-    selected: str
+    requested: CheckpointIOPolicy
+    selected: CheckpointIOPolicy
     activated: bool = False
     effective: str = "none"
     fallback_reason: str | None = None
 
 
-@register_checkpoint_weight_loader("MX")
-@register_checkpoint_weight_loader("mistral")
-@register_checkpoint_weight_loader("mistral_large_3")
-@register_checkpoint_weight_loader("HF")
+@register_checkpoint_weight_loader(CheckpointFormat.MX)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL_LARGE_3)
+@register_checkpoint_weight_loader(CheckpointFormat.HF)
 class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
@@ -114,19 +116,21 @@ class HfWeightLoader(BaseWeightLoader):
 
     # Compatibility defaults for subclasses written before this class gained
     # checkpoint I/O state. Their constructors may not call super().__init__().
-    _checkpoint_io_policy = _NATIVE_IO_POLICY
-    _requested_checkpoint_io_policy = _NATIVE_IO_POLICY
+    _checkpoint_io_policy = CheckpointIOPolicy.NATIVE
+    _requested_checkpoint_io_policy = CheckpointIOPolicy.NATIVE
     _selection_fallback_reason: str | None = None
     _partial_model_loading = False
     _last_checkpoint_io_status = _CheckpointIOStatus(
-        requested=_NATIVE_IO_POLICY,
-        selected=_NATIVE_IO_POLICY,
+        requested=CheckpointIOPolicy.NATIVE,
+        selected=CheckpointIOPolicy.NATIVE,
     )
 
     def __init__(self,
-                 checkpoint_io_policy: str = _NATIVE_IO_POLICY,
+                 checkpoint_io_policy: CheckpointIOPolicy
+                 | str = CheckpointIOPolicy.NATIVE,
                  *,
-                 requested_checkpoint_io_policy: str | None = None,
+                 requested_checkpoint_io_policy: CheckpointIOPolicy | str
+                 | None = None,
                  selection_fallback_reason: str | None = None,
                  partial_model_loading: bool = False) -> None:
         self._partial_model_loading = partial_model_loading
@@ -138,22 +142,25 @@ class HfWeightLoader(BaseWeightLoader):
 
     def _configure_checkpoint_io_policy(
         self,
-        checkpoint_io_policy: str,
+        checkpoint_io_policy: CheckpointIOPolicy | str,
         *,
-        requested_checkpoint_io_policy: str | None = None,
+        requested_checkpoint_io_policy: CheckpointIOPolicy | str | None = None,
         selection_fallback_reason: str | None = None,
     ) -> None:
         """Apply a pre-materialization policy selection."""
+        checkpoint_io_policy = CheckpointIOPolicy(checkpoint_io_policy)
         if checkpoint_io_policy not in _SUPPORTED_IO_POLICIES:
+            supported = tuple(policy.value for policy in _SUPPORTED_IO_POLICIES)
             raise ValueError("checkpoint_io_policy must be one of "
-                             f"{_SUPPORTED_IO_POLICIES}, got "
-                             f"{checkpoint_io_policy!r}")
-        requested_checkpoint_io_policy = (requested_checkpoint_io_policy
-                                          or checkpoint_io_policy)
+                             f"{supported}, got {checkpoint_io_policy.value!r}")
+        requested_checkpoint_io_policy = CheckpointIOPolicy(
+            requested_checkpoint_io_policy or checkpoint_io_policy)
         if requested_checkpoint_io_policy not in _SUPPORTED_REQUESTED_IO_POLICIES:
+            supported = tuple(policy.value
+                              for policy in _SUPPORTED_REQUESTED_IO_POLICIES)
             raise ValueError("requested_checkpoint_io_policy must be one of "
-                             f"{_SUPPORTED_REQUESTED_IO_POLICIES}, got "
-                             f"{requested_checkpoint_io_policy!r}")
+                             f"{supported}, got "
+                             f"{requested_checkpoint_io_policy.value!r}")
         self._checkpoint_io_policy = checkpoint_io_policy
         self._requested_checkpoint_io_policy = requested_checkpoint_io_policy
         self._selection_fallback_reason = selection_fallback_reason
@@ -163,7 +170,7 @@ class HfWeightLoader(BaseWeightLoader):
             fallback_reason=selection_fallback_reason)
 
     @property
-    def checkpoint_io_policy(self) -> str:
+    def checkpoint_io_policy(self) -> CheckpointIOPolicy:
         return self._checkpoint_io_policy
 
     @property
@@ -205,6 +212,32 @@ class HfWeightLoader(BaseWeightLoader):
                 f"Invalid {_WEIGHT_CACHE_MAX_ENTRIES_ENV} value; disabling HF weight cache."
             )
             return 0
+
+    @staticmethod
+    def _can_cache_weights(weight_files: List[str]) -> bool:
+        """Whether host memory can keep these checkpoint files resident.
+
+        SafeTensors weights are read from the file pages when a tensor is
+        first accessed, so a cache entry does not keep a copy of them in RAM.
+        Storing an entry and checking it on a hit both sample every tensor,
+        which reads any page that is not resident from storage. For a
+        checkpoint that does not fit in host memory, each store and each hit
+        therefore reads most of the checkpoint from storage.
+
+        Each rank applies the rank-striped read-ahead's ``memory_admission``
+        to its own available host memory. Ranks near the limit may decide
+        differently; they stay in step because a load that skips the cache
+        runs the same collectives as a miss.
+        """
+        checkpoint_bytes = sum(os.path.getsize(f) for f in weight_files)
+        available_bytes = effective_available_host_memory()
+        admitted, headroom = memory_admission(checkpoint_bytes, available_bytes)
+        if not admitted:
+            logger.warning(
+                "Not using the raw HF weight cache for this load: checkpoint "
+                f"bytes ({checkpoint_bytes}) exceed available host memory "
+                f"({available_bytes}) after startup headroom ({headroom}).")
+        return admitted
 
     @staticmethod
     def _weight_files_cache_key(weight_files: List[str],
@@ -333,10 +366,16 @@ class HfWeightLoader(BaseWeightLoader):
         Key -> hit (optionally joining the local barrier the miss path is
         about to enter) -> evict-before-load (so CPU never holds the old
         cached and the new loading weights at once) -> load -> store.
+        A checkpoint that host memory cannot keep resident is loaded like a
+        miss, without the lookup and the store.
         """
-        cache_key = self._weight_files_cache_key(
-            weight_files,
-            use_consolidated) if self._is_weight_cache_enabled() else None
+        cache_key = None
+        if self._is_weight_cache_enabled():
+            if self._can_cache_weights(weight_files):
+                cache_key = self._weight_files_cache_key(
+                    weight_files, use_consolidated)
+            else:
+                self._evict_to_make_room()
         if cache_key is not None:
             cached_weights = self._get_cached_weights(cache_key)
             if cached_weights is not None:
@@ -397,7 +436,7 @@ class HfWeightLoader(BaseWeightLoader):
         """
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
         if not weight_files:
-            raise RuntimeError(f"No safetensors files in {checkpoint_dir}.")
+            raise ModelLoadError(f"No safetensors files in {checkpoint_dir}.")
         # Same sharded-vs-consolidated selection as the eager path below:
         # when both flavors are present, keep only the requested one.
         filtered_weight_files = [
@@ -437,9 +476,9 @@ class HfWeightLoader(BaseWeightLoader):
                      **kwargs) -> dict[str, Any]:
         """Load synchronously without activating session-scoped read-ahead."""
         self._reset_checkpoint_io_status()
-        if self._checkpoint_io_policy != _NATIVE_IO_POLICY:
+        if self._checkpoint_io_policy != CheckpointIOPolicy.NATIVE:
             status = self._last_checkpoint_io_status
-            status.selected = _NATIVE_IO_POLICY
+            status.selected = CheckpointIOPolicy.NATIVE
             status.fallback_reason = (
                 "rank-striped read-ahead requires open_weight_session() to "
                 "overlap I/O with model materialization")
@@ -450,7 +489,7 @@ class HfWeightLoader(BaseWeightLoader):
             logger.info(message)
         weights = self._load_weights_native(checkpoint_dir, mapping,
                                             use_consolidated, **kwargs)
-        self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+        self._last_checkpoint_io_status.effective = CheckpointIOPolicy.NATIVE
         self._log_checkpoint_io_status()
         return weights
 
@@ -462,10 +501,10 @@ class HfWeightLoader(BaseWeightLoader):
                             **kwargs) -> Iterator[dict[str, Any]]:
         """Keep opt-in read-ahead alive through model materialization."""
         self._reset_checkpoint_io_status()
-        if self._checkpoint_io_policy == _NATIVE_IO_POLICY:
+        if self._checkpoint_io_policy == CheckpointIOPolicy.NATIVE:
             weights = self._load_weights_native(checkpoint_dir, mapping,
                                                 use_consolidated, **kwargs)
-            self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.effective = CheckpointIOPolicy.NATIVE
             self._log_checkpoint_io_status()
             yield weights
             return
@@ -486,7 +525,7 @@ class HfWeightLoader(BaseWeightLoader):
             mapping_error,
         )
         if coordinated_mapping_error is not None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             weights = self._fallback_to_native(
                 checkpoint_dir,
                 mapping,
@@ -499,7 +538,7 @@ class HfWeightLoader(BaseWeightLoader):
             yield weights
             return
         if mapping.world_size > 1 and active_communicator is None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             weights = self._fallback_to_native(
                 checkpoint_dir,
                 mapping,
@@ -553,11 +592,11 @@ class HfWeightLoader(BaseWeightLoader):
             else:
                 status = self._last_checkpoint_io_status
                 if read_error is None:
-                    status.effective = _RANK_STRIPED_IO_POLICY
+                    status.effective = CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
                 else:
                     # Read-ahead is advisory. The native mmap/materialization
                     # path succeeded, so never retry a partially mutated model.
-                    status.effective = _NATIVE_IO_POLICY
+                    status.effective = CheckpointIOPolicy.NATIVE
                     status.fallback_reason = str(read_error)
                     logger.warning(
                         "Rank-striped read-ahead degraded after activation; "
@@ -638,7 +677,7 @@ class HfWeightLoader(BaseWeightLoader):
         message = ("Checkpoint I/O policy is falling back before model "
                    f"materialization: requested={status.requested}, "
                    f"selected={status.selected}, reason={reason}.")
-        if status.requested == _RANK_STRIPED_IO_POLICY:
+        if status.requested == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
             logger.warning(message)
         else:
             logger.info(message)
@@ -714,7 +753,7 @@ class HfWeightLoader(BaseWeightLoader):
             self._log_checkpoint_io_status()
             raise coordinated_close_error
         assert weights is not None
-        status.effective = _NATIVE_IO_POLICY
+        status.effective = CheckpointIOPolicy.NATIVE
         self._log_checkpoint_io_status()
         return weights
 
@@ -743,7 +782,7 @@ class HfWeightLoader(BaseWeightLoader):
             self._close_unactivated_session(
                 None, node_communicator, active_communicator,
                 "rank-striped node communicator cleanup")
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_split_error),
@@ -777,7 +816,7 @@ class HfWeightLoader(BaseWeightLoader):
         coordinated_preflight_error = coordinate_error(
             active_communicator, "rank-striped preflight", preflight_error)
         if coordinated_preflight_error is not None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_preflight_error),
@@ -811,7 +850,7 @@ class HfWeightLoader(BaseWeightLoader):
             self._close_unactivated_session(
                 None, node_communicator, active_communicator,
                 "rank-striped node preflight cleanup")
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_node_error),
@@ -846,14 +885,14 @@ class HfWeightLoader(BaseWeightLoader):
                             if selection[1] is not None]
         if fallback_reasons:
             rank, reason = fallback_reasons[0]
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             f"rank {rank}: {reason}",
                                             active_communicator,
                                             node_communicator, **kwargs), None
 
-        self._last_checkpoint_io_status.selected = _RANK_STRIPED_IO_POLICY
+        self._last_checkpoint_io_status.selected = CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
         session = None
         setup_error = None
         try:
@@ -960,7 +999,7 @@ class HfWeightLoader(BaseWeightLoader):
                     weight_files, self._load_bin_or_path_file,
                     "Loading bin weights in parallel"))
 
-        raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
+        raise ModelLoadError(f"No weight files found in {checkpoint_dir}.")
 
     def _prefetch_and_load(
             self,

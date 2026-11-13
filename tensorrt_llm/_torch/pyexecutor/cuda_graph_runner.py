@@ -252,6 +252,8 @@ class CUDAGraphRunner:
     WARMUP_STEPS = 1
     # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
     _configured_seq_len_threshold: Optional[int] = None
+    # Default for runners built without __init__ (test stubs).
+    _adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -284,6 +286,8 @@ class CUDAGraphRunner:
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        # Graphs captured with a step-input pack's prologue, and that pack (step_inputs.capture_prologue).
+        self._step_input_prologue_keys: Dict[KeyType, Any] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
@@ -303,6 +307,17 @@ class CUDAGraphRunner:
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
         self.is_warmup_only = False
+
+        # Attention-DP padding hint: the per-rank ``(can_run_cuda_graph,
+        # batch_size, sample_tier)`` rows that ``_get_padded_batch`` otherwise
+        # gathers itself. The executor stashes them when its packed
+        # post-schedule exchange (enable_packed_sync) already carried the
+        # values; the next ``_get_padded_batch`` pops the hint instead of
+        # gathering. Set and cleared only by rank-uniform executor code, so on
+        # any rank the runner either has a hint or gathers -- never a mix.
+        # Callers outside the executor loop (warmup, KV-cache estimation,
+        # drafters) never see one and gather exactly as before.
+        self._adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -911,6 +926,11 @@ class CUDAGraphRunner:
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
             with nccl_window_graph_capture(graph, graph_pool):
+                # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
+                prologue_pack = (None if self._pre_replay_hooks else
+                                 step_inputs.capture_prologue())
+                if prologue_pack is not None:
+                    self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
             # The addresses the graph baked in, for the strict buffer check.
             self._record_strict_buffer_snapshot(key)
@@ -1039,8 +1059,15 @@ class CUDAGraphRunner:
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
         # Issue the step's packed input copies (no-op without an open pack) before
-        # anything below reads the static inputs on the device.
-        step_inputs.flush()
+        # anything below reads the static inputs on the device; a graph captured
+        # with the pack's prologue issues them itself at the start of the replay.
+        prologue_pack = self._step_input_prologue_keys.get(key)
+        captured_pack_active = (prologue_pack is not None
+                                and step_inputs.is_active(prologue_pack))
+        step_inputs.flush(in_graph=captured_pack_active)
+        if prologue_pack is not None and not captured_pack_active:
+            # Replayed outside the pack's context: nothing filled its window.
+            prologue_pack.quiesce_graph_window()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if position_id_offsets is not None:
@@ -1059,7 +1086,11 @@ class CUDAGraphRunner:
             for hook in self._pre_replay_hooks:
                 hook(key, seqlen, hook_tensors, current_inputs)
 
-        self.graphs[key].replay()
+        try:
+            self.graphs[key].replay()
+        finally:
+            if prologue_pack is not None:
+                prologue_pack.on_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref
@@ -1162,6 +1193,19 @@ class CUDAGraphRunner:
         # configured batch size; that sum is just padded_bs.
         return padded_bs <= self.config.batch_size
 
+    def set_adp_graph_batch_hint(self, hint: List[Tuple[bool, int,
+                                                        int]]) -> None:
+        """Stash the per-rank ``(can_run_cuda_graph, batch_size, tier)`` rows.
+
+        Overwrites any previous hint. Must be called identically on every
+        attention-DP rank (see ``_adp_graph_batch_hint``).
+        """
+        self._adp_graph_batch_hint = hint
+
+    def clear_adp_graph_batch_hint(self) -> None:
+        """Drop an unconsumed hint (no-op when none is set)."""
+        self._adp_graph_batch_hint = None
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
@@ -1236,8 +1280,14 @@ class CUDAGraphRunner:
         new_batch_size = batch.batch_size
         if (self.enabled and self.config.enable_attention_dp
                 and self.config.mapping.tp_size > 1):
-            graph_batch_info = self._gather_adp_graph_batch_info(
-                batch, can_run_cuda_graph, SampleType.FULL)
+            # Stash contract (enable_packed_sync): use the executor's hint if
+            # present, otherwise perform the gather. The hint is popped so it
+            # can never be reused by a later forward.
+            graph_batch_info = self._adp_graph_batch_hint
+            self._adp_graph_batch_hint = None
+            if graph_batch_info is None:
+                graph_batch_info = self._gather_adp_graph_batch_info(
+                    batch, can_run_cuda_graph, SampleType.FULL)
             if all(rank_info[0] for rank_info in graph_batch_info):
                 new_batch_size = max(rank_info[1]
                                      for rank_info in graph_batch_info)
@@ -1579,6 +1629,7 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self._pre_replay_position_ids = None
+        self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()
         del self.memory_pool
         self.memory_pool = None
@@ -1598,7 +1649,28 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         # The decoder publishes the fitted bucket before graph lookup.
         self.agreed_ragged_bucket: Optional[int] = None
         self.adp_shape_agreement: Optional[ADPShapeAgreement] = None
+        self._policy_iteration: Optional[int] = None
         self.secondary_padding_dummy_requests: Dict[int, LlmRequest] = {}
+
+    def set_policy_iteration(self, iteration: int) -> None:
+        """Advance the executor-owned epoch before publishing this step's vote."""
+        iteration = int(iteration)
+        if getattr(self, "_policy_iteration", None) != iteration:
+            self.adp_shape_agreement = None
+        self._policy_iteration = iteration
+
+    @contextlib.contextmanager
+    def pad_batch(self,
+                  scheduled_requests: ScheduledRequests,
+                  resource_manager: ResourceManager,
+                  runtime_draft_len: int = 0):
+        """Consume the shape vote once, including an exceptional forward exit."""
+        try:
+            with super().pad_batch(scheduled_requests, resource_manager,
+                                   runtime_draft_len) as padded_requests:
+                yield padded_requests
+        finally:
+            self.adp_shape_agreement = None
 
     def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
         """Return the agreed token bucket only when every row has a window."""
@@ -1626,7 +1698,8 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         reuse_agreement = bool(
             agreement is not None and agreement.reuse_graph_shape
             and not self.enable_in_graph_sampling
-            and agreement.matches(batch, agreement.iteration, padded=True))
+            and getattr(self, "_policy_iteration", None) is not None
+            and agreement.matches(batch, self._policy_iteration, padded=True))
         if reuse_agreement:
             if (not can_run_cuda_graph
                     or batch.batch_size != agreement.graph_batch_size or
@@ -1675,8 +1748,9 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     def _reusable_padding_agreement(
             self, batch: ScheduledRequests) -> Optional[ADPShapeAgreement]:
         agreement = self.adp_shape_agreement
-        if (agreement is not None and agreement.reuse_graph_shape and
-                agreement.matches(batch, agreement.iteration, padded=False)):
+        if (agreement is not None and agreement.reuse_graph_shape
+                and getattr(self, "_policy_iteration", None) is not None and
+                agreement.matches(batch, self._policy_iteration, padded=False)):
             return agreement
         return None
 
@@ -1760,6 +1834,7 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         self.secondary_padding_dummy_requests = {}
         self.ragged_zero_real_high_rows = 0
         self.adp_shape_agreement = None
+        self._policy_iteration = None
 
     def _on_padding_dummy_release(self) -> None:
         # Releasing a dummy invalidates the agreement that certified it.
@@ -1768,7 +1843,7 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     def _preallocate_extra_padding_dummy(self,
                                          resource_manager: ResourceManager,
                                          draft_len: int) -> None:
-        if not getattr(self.spec_config, "confidence_sps_table_path", None):
+        if not getattr(self.spec_config, "confidence_cost_table_path", None):
             return
         if self._get_or_create_padding_dummy(resource_manager,
                                              draft_len,

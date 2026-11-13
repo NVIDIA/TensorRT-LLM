@@ -19,9 +19,11 @@ import enum
 import importlib
 import traceback
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import (Any, Callable, ClassVar, Dict, List, Mapping, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, Iterator, List, Mapping,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -30,8 +32,12 @@ from torch import Tensor, nn
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
+from .._errors import ConfigInputError, UnsupportedError
 from ..logger import logger
 from ..sampling_params import SamplingParams
+from . import multimodal
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .model_config import resolve_top_level_model_type
@@ -47,7 +53,8 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
-from .prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
+from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
+                                 create_prefix_token_cache)
 from .tokenization import tokenize_prompt
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -135,6 +142,13 @@ class DefaultInputProcessor(InputProcessor):
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
 
+    def get_prefix_token_cache(
+            self) -> Optional[Tuple[PrefixTokenCache, OffsetTokenizer]]:
+        """This processor's prefix-tokenization cache and the tokenizer it caches, if enabled."""
+        if self._prefix_token_cache is None:
+            return None
+        return self._prefix_token_cache, self.tokenizer
+
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -146,6 +160,18 @@ class DefaultInputProcessor(InputProcessor):
             truncate_prompt_tokens=sampling_params.truncate_prompt_tokens,
             prefix_token_cache=self._prefix_token_cache)
         return token_ids, None
+
+
+def prefix_token_cache_of(
+    input_processor: object
+) -> Optional[Tuple[PrefixTokenCache, OffsetTokenizer]]:
+    """The prefix-tokenization cache of ``input_processor`` and its tokenizer.
+
+    None when the processor has no cache: it is disabled, or the processor
+    does not support one.
+    """
+    get_cache = getattr(input_processor, "get_prefix_token_cache", None)
+    return None if get_cache is None else get_cache()
 
 
 class BaseMultimodalInputProcessor(ABC):
@@ -196,9 +222,56 @@ class BaseMultimodalInputProcessor(ABC):
     _prefix_token_cache: Optional[PrefixTokenCache] = None
     _prefix_token_cache_tokenizer: Optional[PreTrainedTokenizerBase] = None
 
+    _decode_state_capture: ClassVar[ContextVar] = ContextVar(
+        "multimodal_decode_state_capture", default=None)
+
+    @contextmanager
+    def capture_decode_state(self) -> Iterator[Dict[str, Any]]:
+        """Collect portable decode metadata before tensor transport exports."""
+        capture = {}
+        token = self._decode_state_capture.set((self, capture))
+        try:
+            yield capture
+        finally:
+            self._decode_state_capture.reset(token)
+
+    def export_decode_state(
+            self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return portable model metadata, or None when preparation cannot be reused."""
+        return None
+
+    def restore_decode_state(
+            self,
+            state: Dict[str, Any],
+            prompt_length: int,
+            max_length: Optional[int] = None) -> Dict[str, Any]:
+        """Restore metadata, validating positions through max_length tokens if set."""
+        raise ValueError(
+            "This processor does not support prepared decode inputs")
+
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
         """Return per-modality decode defaults, below server and request overrides."""
         return {}
+
+    def get_disagg_prefill_inputs(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_params: multimodal.MultimodalParams,
+    ) -> Optional[multimodal.MultimodalInputLayout]:
+        """Export exact encoder-side prompt layout for models that preserve it.
+
+        Returning None keeps the model's existing prefill reconstruction path.
+        Models that return a layout accept it as ``encoder_inputs`` in their
+        ``build_disagg_prefill_multimodal_inputs`` method.
+
+        Args:
+            prompt_token_ids: Fully expanded prompt produced by preprocessing.
+            multimodal_params: Processed media and layout metadata for the prompt.
+
+        Returns:
+            Encoder layout to carry to prefill, or None to use reconstruction.
+        """
+        return None
 
     def get_mm_item_metadata(
         self,
@@ -218,6 +291,7 @@ class BaseMultimodalInputProcessor(ABC):
                  config,
                  tokenizer,
                  trust_remote_code: bool = True,
+                 vision_gpu_normalize: bool = False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self._config = config
@@ -225,6 +299,7 @@ class BaseMultimodalInputProcessor(ABC):
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._trust_remote_code = trust_remote_code
+        self._vision_gpu_normalize = vision_gpu_normalize
         self._multimodal_hashing_supported: Optional[bool] = None
 
     def _init_tokenization_cache(self, enable_tokenization_cache: bool,
@@ -237,6 +312,13 @@ class BaseMultimodalInputProcessor(ABC):
         self._prefix_token_cache_tokenizer = tokenizer
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
+
+    def get_prefix_token_cache(
+            self) -> Optional[Tuple[PrefixTokenCache, OffsetTokenizer]]:
+        """This processor's prefix-tokenization cache and the tokenizer it caches, if enabled."""
+        if self._prefix_token_cache is None:
+            return None
+        return self._prefix_token_cache, self._prefix_token_cache_tokenizer
 
     def _encode_with_tokenization_cache(
         self,
@@ -361,11 +443,24 @@ class BaseMultimodalInputProcessor(ABC):
                 and inputs.get("multi_modal_data") is not None
                 and inputs.get("prompt") is None):
             if self.supports_token_id_mm_expansion:
-                return self.call_with_token_ids(inputs, sampling_params)
+                result = self.call_with_token_ids(inputs, sampling_params)
+                return self._capture_prepared_decode(result)
             # Fast path not supported by this VLM — detokenize and fall through
             # to the text-prompt path.
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
-        return self.call_with_text_prompt(inputs, sampling_params)
+        return self._capture_prepared_decode(
+            self.call_with_text_prompt(inputs, sampling_params))
+
+    def _capture_prepared_decode(
+        self, result: Tuple[List[int], Optional[ExtraProcessedInputs]]
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        capture = self._decode_state_capture.get()
+        if capture is not None and capture[0] is self and result[1] is not None:
+            state = self.export_decode_state(result[1].get(
+                "multimodal_data", {}))
+            if state is not None:
+                capture[1].update(prompt_token_ids=list(result[0]), state=state)
+        return result
 
     @abstractmethod
     def call_with_text_prompt(
@@ -1114,7 +1209,7 @@ def register_input_processor(
 def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
-    checkpoint_format: Optional[str] = "HF",
+    checkpoint_format: CheckpointFormat | str | None = CheckpointFormat.HF,
     trust_remote_code: bool = True,
     enable_tokenization_cache: bool = False,
     **kwargs,
@@ -1146,7 +1241,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format in ("HF", "MX"):
+    if checkpoint_format in (CheckpointFormat.HF, CheckpointFormat.MX):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)
@@ -1155,7 +1250,8 @@ def create_input_processor(
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
             )
-    elif checkpoint_format in ("mistral", "mistral_large_3"):
+    elif checkpoint_format in (CheckpointFormat.MISTRAL,
+                               CheckpointFormat.MISTRAL_LARGE_3):
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
@@ -1177,10 +1273,15 @@ def create_input_processor(
             model_cls, _ = get_model_architecture(config)
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
-        except RuntimeError:  # unregistered model
+        except (RuntimeError, ConfigInputError,
+                UnsupportedError):  # unregistered model
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
+            if "vision_gpu_normalize" in kwargs:
+                kwargs["vision_gpu_normalize"] = kwargs[
+                    "vision_gpu_normalize"] and getattr(
+                        model_cls, "supports_vision_gpu_normalize", False)
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache

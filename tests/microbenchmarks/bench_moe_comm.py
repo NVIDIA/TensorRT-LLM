@@ -494,6 +494,7 @@ def _time_dispatch_and_combine(
         l2_flush_size = (l2_size * 2) // 4
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
+    cupti = cupti_kernels = cupti_events = None
     if cupti_ctx is not None:
         cupti, cupti_kernels, cupti_events = cupti_ctx
 
@@ -605,6 +606,7 @@ def _time_dispatch_and_combine(
             backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
             _record_event(c_ends[i])
 
+    big_graph = None
     if use_cuda_graph:
         # Keep warmup and timed iterations in one replay to avoid a host-side gap.
         big_graph = torch.cuda.CUDAGraph()
@@ -986,7 +988,6 @@ def _run_benchmark_worker_under_current_mpi(
                 experts_per_rank,
                 payload_in_workspace=not bool(args.no_payload_in_workspace),
                 alltoall_result_do_sum=True,
-                use_flashinfer=False,
             )
 
             if backend is None:

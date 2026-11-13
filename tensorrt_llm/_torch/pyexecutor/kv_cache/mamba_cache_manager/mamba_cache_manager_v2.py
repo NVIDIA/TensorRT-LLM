@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import sys
 from dataclasses import replace
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -45,8 +46,21 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+    _compute_index_mapper_capacity,
+    _read_guard_page_setting,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
+    AllocationUnit,
+    HandOff,
+    Plane,
+    Region,
+    RegionLayer,
+    RegionLifeCycle,
+    RegionProvider,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -63,6 +77,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -80,12 +95,16 @@ from .common import (
     MambaAcceptanceBatch,
     MambaHybridCacheManager,
     MambaLayerCache,
+    MambaReplayState,
     MambaRole,
     MambaState,
     MambaStateLayout,
+    ReplayLayout,
     _estimate_mamba_hybrid_cache_cost,
     _get_local_mamba_cache_layout,
     _get_num_cuda_graph_padding_dummy_slots,
+    _host_slots_to_device,
+    _is_disagg_context_server,
     _mamba_effective_tp_size,
     _mamba_regular_snapshot_interval,
     _mamba_snapshot_rule_counts,
@@ -93,7 +112,7 @@ from .common import (
 )
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
@@ -110,6 +129,39 @@ _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
 
 
+def _insert_draft_pool_ratio(
+    target_ratio: Sequence[float],
+    life_cycle_block_bytes: Sequence[int],
+    full_history: Sequence[bool],
+    draft_life_cycle: int,
+) -> list[float]:
+    """Pool ratio per lifecycle with the drafter's share inserted.
+
+    ``target_ratio`` lists the other lifecycles' shares in registration order.
+    The drafter keeps one context entry per target token, so its share is
+    solved for as many blocks as the scarcest full-history target lifecycle
+    holds: ``d / B_draft == (1 - d) * min_i(r_i / B_i)``. The target shares
+    keep their split of ``1 - d``.
+    """
+    target_ids = [i for i in range(len(life_cycle_block_bytes)) if i != draft_life_cycle]
+    if len(target_ratio) != len(target_ids):
+        raise ValueError(
+            f"pool_ratio has {len(target_ratio)} entries for {len(target_ids)} target layer groups"
+        )
+    blocks_per_byte = [
+        ratio / life_cycle_block_bytes[i]
+        for ratio, i in zip(target_ratio, target_ids)
+        if full_history[i]
+    ]
+    if not blocks_per_byte:
+        raise ValueError("the drafter's pool share needs a full-history target layer group")
+    draft_blocks = life_cycle_block_bytes[draft_life_cycle] * min(blocks_per_byte)
+    draft_share = draft_blocks / (1 + draft_blocks)
+    ratio = [share * (1 - draft_share) for share in target_ratio]
+    ratio.insert(draft_life_cycle, draft_share)
+    return ratio
+
+
 class InforwardSnapshotEntry(NamedTuple):
     """One request's in-forward snapshot in this step's context chunk."""
 
@@ -117,6 +169,13 @@ class InforwardSnapshotEntry(NamedTuple):
     point: int  # snapshot point P
     num_before: int  # chunk tokens before P
     num_after: int  # chunk tokens from P to the prompt end
+
+
+# The region a hybrid manager declares for the replay buffers of the replay
+# state it manages (see MambaHybridCacheManagerV2.declare_regions). Replay
+# state never leaves its request.
+REPLAY_STATE_REGION = "replay_state"
+_REPLAY_STATE_LIFE_CYCLE = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER)
 
 
 def _uses_fp4_mla_cache_layout(
@@ -160,11 +219,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Recurrent snapshots use their own commit/history endpoints without draft backoff.
     _supports_reuse_match_backoff = False
 
+    @classmethod
+    @override
+    def accepts_appended_draft_layers(cls) -> bool:
+        """Hybrid managers lay out their own target layers; subclasses
+        validated with a standalone drafter override this to append its layers."""
+        return False
+
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
+    # Mixed-precision high layers are appended like any attention layer group.
+    _supports_mixed_precision_kv = True
     # Set per instance when the MLA latent cache uses the FP4 MLA layout.
     _attention_cache_layout_policy = None
     # Set per instance once the FP4 MLA layout has logged a snapshot move.
@@ -172,6 +240,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Set per instance by the FP4 MLA layout on a disaggregated context
     # worker, which keeps no generation-only V scales or packed V.
     fp4_mla_context_only_cache = False
+    # A disaggregated context server never decodes and keeps no replay buffers.
+    _disagg_context_only = False
+    # Replay buffers of the managed replay state, by global layer; see
+    # _managed_replay_state.
+    _replay_layouts = MappingProxyType({})
+    # Layer group of the replay-state region this manager declares; None when
+    # the replay buffers, if any, share the recurrent-state slots.
+    _replay_group_id: Optional[int] = None
 
     # Construction and cache configuration
 
@@ -212,6 +288,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Args:
             gdn_fused_verify: Whether the GDN layers verify drafts with the
                 fused kernels (see gdn_replay_partitioned).
+            layer_specs: Draft-owned attention layers a standalone drafter
+                keeps in this manager, appended after the target layers that
+                the mask arguments describe (see ``_append_draft_layers``).
         """
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(f"Unsupported convolution state layout: {conv_state_layout!r}")
@@ -224,6 +303,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"(got {kwargs['model_type']!r}); pass "
                 "conv_state_layout='x_b_c' or 'q_k_v' instead"
             )
+        draft_layer_specs = tuple(kwargs.pop("layer_specs", None) or ())
+        mamba_layer_mask, layer_mask, num_kv_heads = self._append_draft_layers(
+            draft_layer_specs,
+            mamba_layer_mask,
+            layer_mask,
+            num_kv_heads,
+            k_only=kv_cache_type == CacheTypeCpp.SELFKONLY,
+        )
+        num_layers += len(draft_layer_specs)
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers
@@ -242,6 +330,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_layer_mask = list(mamba_layer_mask)
         self.spec_config = spec_config
         self.gdn_fused_verify = gdn_fused_verify
+        self._disagg_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._recurrent_evicted_blocks_total = 0
         self._recurrent_onboarded_blocks_total = 0
         self._recurrent_dropped_blocks_total = 0
@@ -276,6 +365,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layer_idx for layer_idx in self.pp_layers if mamba_layer_mask[layer_idx]
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        local_ids = {layer_idx: offset for offset, layer_idx in enumerate(self.pp_layers)}
+        self._appended_draft_layer_specs = {
+            local_ids[layer.global_layer_id]: layer
+            for layer in draft_layer_specs
+            if layer.global_layer_id in local_ids
+        }
 
         if self.local_num_mamba_layers > 0:
             tp_size = _mamba_effective_tp_size(mapping)
@@ -340,7 +435,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_state_layout=conv_state_layout,
         )
         self._speculative_state: MambaState | None = self._initialize_spec_state()
-
+        # The managed replay state's buffers, keyed by global layer; declare_regions
+        # or _get_recurrent_buffer_configs declares their bytes.
+        replay_state = self._managed_replay_state()
+        self._replay_layouts: Dict[int, ReplayLayout] = (
+            {
+                layer_id: layout
+                for layer_id in self.mamba_pp_layers
+                if (layout := replay_state.replay_layout(self._state_layout, layer_id))
+            }
+            if replay_state is not None
+            else {}
+        )
         if isinstance(num_kv_heads, int):
             per_layer_kv_heads = [num_kv_heads] * total_layers
         else:
@@ -411,6 +517,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._setup_state_pool()
 
+    @staticmethod
+    def _append_draft_layers(
+        draft_layer_specs: Sequence[KVCacheLayerSpec],
+        mamba_layer_mask: list[bool],
+        layer_mask: list[bool] | None,
+        num_kv_heads: int | list[int | None],
+        *,
+        k_only: bool,
+    ) -> tuple[list[bool], list[bool] | None, int | list[int | None]]:
+        """Masks and KV heads with a standalone drafter's layers appended.
+
+        The masks describe this manager's recurrent and target attention
+        layers; the drafter's layers follow them in global layer id order and
+        keep the storage of their specs.
+        """
+        if not draft_layer_specs:
+            return mamba_layer_mask, layer_mask, num_kv_heads
+        num_target_layers = len(mamba_layer_mask)
+        expected_ids = list(range(num_target_layers, num_target_layers + len(draft_layer_specs)))
+        if [layer.global_layer_id for layer in draft_layer_specs] != expected_ids:
+            raise ValueError(
+                "MambaHybridCacheManagerV2 layer_specs must be the drafter's layers "
+                f"{expected_ids} after the target layers"
+            )
+        for layer in draft_layer_specs:
+            if layer.owner is not KVCacheLayerOwner.DRAFT:
+                raise ValueError(
+                    "MambaHybridCacheManagerV2 describes its target layers itself; "
+                    f"layer_specs may add only draft-owned layers (layer {layer.global_layer_id})"
+                )
+            if layer.kv_factor != (1 if k_only else 2):
+                raise ValueError(
+                    f"draft layer {layer.global_layer_id} has kv_factor {layer.kv_factor}, "
+                    "unlike the target cache type"
+                )
+        if layer_mask is None:
+            layer_mask = [False] * num_target_layers
+        if isinstance(num_kv_heads, int):
+            num_kv_heads = [num_kv_heads] * num_target_layers
+        num_draft = len(draft_layer_specs)
+        return (
+            list(mamba_layer_mask) + [False] * num_draft,
+            list(layer_mask) + [True] * num_draft,
+            # Placeholders: the base manager takes the rank-local heads from the specs.
+            list(num_kv_heads) + [layer.num_kv_heads for layer in draft_layer_specs],
+        )
+
     @override
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # A transferred recurrent state summarizes and overwrites the whole prefix.
@@ -442,6 +595,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         **kwargs,
     ):
         spec_config = kwargs.get("spec_config")
+        # Appended draft layers grow with every token like the target's pages.
+        draft_layer_specs = kwargs.pop("layer_specs", None) or ()
+        kwargs.pop("shared_draft_block_width", None)
+        draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
         num_reserved_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size
         ) + int(mapping.enable_attention_dp)
@@ -503,10 +660,71 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             attention_page_bytes_override=attention_page_bytes_override,
             **kwargs,
         )
-        return slope, intercept + attention_intercept
+        fixed_region_bytes = cls._estimate_fixed_region_bytes(
+            model_config,
+            mapping,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            **kwargs,
+        )
+        return slope + draft_slope, intercept + attention_intercept + fixed_region_bytes
+
+    @classmethod
+    @override
+    def _get_per_request_layer_tokens(cls, *args, layer_specs=None, **kwargs):
+        # ``layer_specs`` holds only the appended draft layers here; the
+        # recurrent and target layers keep the base estimate (None for hybrids).
+        return super()._get_per_request_layer_tokens(*args, layer_specs=None, **kwargs)
 
     @classmethod
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        return 0
+
+    @classmethod
+    def _estimate_fixed_region_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        **kwargs,
+    ) -> int:
+        """Estimated ``_fixed_region_quota()`` of a manager not yet built.
+
+        By default, the replay-state region this class declares (see
+        ``declare_regions``): ``ceil(IndexMapper capacity / max_util_for_resume)``
+        slots of ``_estimate_private_replay_bytes_per_slot`` bytes. A model
+        manager whose own providers declare fixed-size regions returns the bytes
+        those regions will take. The cost estimate adds them to its fixed cost
+        as they are, like the quota does.
+        """
+        is_disagg = kwargs.get("is_disagg", False)
+        bytes_per_slot = cls._estimate_private_replay_bytes_per_slot(
+            model_config, mapping, **kwargs
+        )
+        if not bytes_per_slot or _is_disagg_context_server(is_disagg):
+            return 0
+        num_reserved_index_slots = _get_num_cuda_graph_padding_dummy_slots(
+            kwargs.get("spec_config"), max_batch_size
+        ) + int(mapping.enable_attention_dp)
+        _, capacity = _compute_index_mapper_capacity(
+            max_batch_size,
+            mapping,
+            is_disagg=is_disagg,
+            disable_overlap_scheduler=kwargs.get("disable_overlap_scheduler", False),
+            num_reserved_index_slots=num_reserved_index_slots,
+            has_guard_page=_read_guard_page_setting()[1] is not None,
+            gen_preemption_headroom=kwargs.get("gen_preemption_headroom", 0),
+        )
+        num_slots = math.ceil(capacity / kv_cache_config.max_util_for_resume)
+        return num_slots * bytes_per_slot
+
+    @classmethod
+    def _estimate_private_replay_bytes_per_slot(
+        cls, model_config, mapping: Mapping, **kwargs
+    ) -> int:
+        """Estimate the per-slot bytes of the replay-state region this class declares."""
         return 0
 
     @override
@@ -537,8 +755,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """
         layout_policy = self._attention_cache_layout_policy
         result = []
-        for layer_id in self.impl.layer_grouping[layer_group_id]:
-            internal_layer = int(layer_id)
+        # A recurrent layer split by buffer reuse policies is listed once per group.
+        layer_ids = dict.fromkeys(
+            int(buffer.layer_id) for buffer in self.impl.buffer_grouping[layer_group_id]
+        )
+        for internal_layer in layer_ids:
             if layout_policy is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
@@ -552,15 +773,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        """Keep FP4 MLA V scales and packed V out of disaggregated transfers.
+        """Exclude buffers rebuilt by the receiving worker.
 
-        The generation worker rebuilds them from the transferred K and K
-        scales.
+        That is the FP4 MLA V scales and packed V, rebuilt from the transferred
+        K and K scales, and the managed replay state's buffers, which the
+        generation worker starts afresh.
         """
         roles = super().get_disagg_ignored_roles()
         layout_policy = self._attention_cache_layout_policy
         if layout_policy is not None:
             roles |= frozenset(layout_policy.DISAGG_IGNORED_ROLES)
+        roles |= frozenset(role for layout in self._replay_layouts.values() for role in layout)
         return roles
 
     @override
@@ -570,7 +793,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         With the FP4 MLA cache layout, the policy's HP ring geometry joins
         them.
         """
-        layouts = {}
+        layouts = super().get_disagg_role_layouts()
         if self._attention_cache_layout_policy is not None:
             layouts.update(self._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
@@ -606,40 +829,119 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return ((pages + scale - 1) // scale) * bytes_per_slot
 
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        """Declare all buffers sharing one recurrent layer's slot lifecycle."""
-        return [
+        """Declare all buffers sharing one recurrent layer's slot lifecycle.
+
+        Replay buffers that the kernels address by the recurrent-state slot
+        (``replay_shares_state_slot``) share it too.
+        """
+        buffers = [
             BufferConfig(role=MambaRole.SSM_STATE, size=self.ssm_bytes),
             BufferConfig(role=MambaRole.CONV_STATE, size=self.conv_bytes),
         ]
+        if self._replay_layouts and self._speculative_state.replay_shares_state_slot:
+            buffers += [
+                BufferConfig(role=role, size=dtype.itemsize * math.prod(shape))
+                for role, (dtype, shape) in self._replay_layouts.get(global_layer_id, {}).items()
+            ]
+        return buffers
+
+    def _managed_replay_state(self) -> MambaReplayState | None:
+        """The replay state whose buffers and slots this manager lays out and tracks.
+
+        A model manager that declares its replay state as a region of its own,
+        and binds and indexes it itself, returns None. A disaggregated context
+        server never decodes, so it keeps no replay buffers.
+        """
+        state = self._speculative_state
+        if isinstance(state, MambaReplayState) and not self._disagg_context_only:
+            return state
+        return None
+
+    def _declares_replay_region(self) -> bool:
+        """Whether the managed replay buffers have slots of their own (``REPLAY_STATE_REGION``)."""
+        return bool(self._replay_layouts) and not self._speculative_state.replay_shares_state_slot
+
+    @override
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        providers = super()._region_providers()
+        if self._declares_replay_region():
+            return (*providers, self)
+        return providers
+
+    def declare_regions(self) -> List[Region]:
+        """Declare the managed replay buffers as ``REPLAY_STATE_REGION``.
+
+        The region never leaves its request and holds one slot per living cache,
+        suspended ones included, with the headroom ``KvCache.resume`` needs:
+        ``ceil(IndexMapper capacity / max_util_for_resume)`` slots. The
+        IndexMapper capacity bounds the living caches, reserved dummies
+        included; hybrid models run at beam width 1.
+        """
+        return [
+            Region(
+                REPLAY_STATE_REGION,
+                _REPLAY_STATE_LIFE_CYCLE,
+                tuple(
+                    RegionLayer(
+                        self.layer_offsets[layer_id],
+                        tuple(
+                            Plane(role, dtype.itemsize * math.prod(shape))
+                            for role, (dtype, shape) in layout.items()
+                        ),
+                    )
+                    for layer_id, layout in self._replay_layouts.items()
+                ),
+                fixed_slot_count=math.ceil(
+                    self._index_mapper_capacity / self.kv_cache_config.max_util_for_resume
+                ),
+            )
+        ]
+
+    @property
+    def replay_layer_group_id(self) -> Optional[int]:
+        """Layer group of the replay buffers' own slots; None when they share the recurrent-state slots."""
+        return self._replay_group_id
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         if local_layer_idx >= len(self.pp_layers):
-            # Virtual layers past the model's own (the FP4 MLA HP ring) are
-            # attention layers.
+            # Virtual layers past the model's own (the FP4 MLA HP ring and the mixed-precision
+            # high layers) are attention layers.
             return False
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
     @override
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
-        layer_id = int(self.impl.layer_grouping[pool_id][0])
+        buffers = self.impl.buffer_grouping[pool_id]
+        layer_id = int(buffers[0].layer_id)
         if layer_id >= self.num_local_layers:
-            # Virtual layers past the model's own exist only for the FP4 MLA
-            # HP ring.
             if (
                 self._attention_cache_layout_policy is not None
                 and LayerId(layer_id) in self._hp_manager_layer_ids
             ):
                 return Role.MLA_HP_TAIL, None
+            if layer_id in self.mixed_precision_high_layers.values():
+                return super()._get_pool_roles(pool_id)
             raise ValueError(f"Unknown hybrid V2 virtual layer {layer_id}.")
-        if self._is_local_mamba_layer(layer_id):
-            return MambaRole.SSM_STATE, None
-        return super()._get_pool_roles(pool_id)
+        if not self._is_local_mamba_layer(layer_id):
+            return super()._get_pool_roles(pool_id)
+        roles = [buffer.role for buffer in buffers]
+        # A recurrent layer can span several groups when its buffers use
+        # different reuse policies. A group without SSM_STATE is described by
+        # one of its own roles.
+        return (MambaRole.SSM_STATE if MambaRole.SSM_STATE in roles else roles[0]), None
+
+    @override
+    def _get_layer_execution_group(self, layer_id: int) -> int:
+        if self._is_local_mamba_layer(int(layer_id)):
+            return int(self.impl.get_buffer_group_id(LayerId(layer_id), MambaRole.SSM_STATE))
+        return super()._get_layer_execution_group(layer_id)
 
     def _max_resident_sequences(self) -> int:
-        return self.max_batch_size * self.mapping.pp_size
+        # Plus the requests paused in place by GEN slot preemption.
+        return self.max_batch_size * self.mapping.pp_size + self.gen_preemption_headroom
 
     def _mamba_state_bytes_per_slot(self) -> int:
-        """Return persistent bytes per slot allocated by the native pools."""
+        """Return persistent bytes per recurrent-state slot allocated by the native pools."""
         return sum(
             buffer.size
             for layer_id in self.mamba_pp_layers
@@ -798,14 +1100,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return low
 
     def _minimum_live_gpu_quota(self) -> int:
-        """Return the minimum quota for live states and one attention page."""
+        """Return the minimum quota for live states, one attention page and the fixed regions."""
         attention_block_quota = self._attention_cache_bytes_per_token() * self.tokens_per_block
         num_state_slots = self._max_resident_sequences() + self._num_reserved_dummy_slots
         state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
-        return max(
+        live_quota = max(
             self._get_quota_from_max_tokens(0),
             state_quota + attention_block_quota,
         )
+        return live_quota + self._fixed_region_quota()
 
     @override
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -835,6 +1138,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     layer_id=layer_id,
                     buffers=buffers,
                 )
+        # The declared regions' buffers are bound the same way.
+        for region in self.region_layout.regions:
+            for region_layer in region.layers:
+                for plane in region_layer.planes:
+                    self._recurrent_buffers[region_layer.model_layer, plane.role] = None
 
         dummy_requests = [
             KVCacheDesc(capacity=0, history_length=0) for _ in range(self._num_reserved_dummy_slots)
@@ -886,7 +1194,61 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # Adds the FP4 MLA HP-ring virtual layers and the fallback-layer
             # lifecycle; SSM layers are left unchanged.
             result = layout_policy._build_cache_config(self, result)
-        return result
+        return self._with_draft_pool_ratio(result)
+
+    def _with_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Give appended draft layers of their own lifecycle a pool share.
+
+        A configured ``pool_ratio`` lists the target's lifecycles; the draft
+        lifecycle's share is inserted for token parity (see
+        ``_insert_draft_pool_ratio``). Native lifecycles are registered in
+        layer and buffer order.
+        """
+        ratio = config.initial_pool_ratio
+        if ratio is None or not self._appended_draft_layer_specs:
+            return config
+        keys: List[tuple] = []
+        block_bytes: List[int] = []
+        draft_keys = set()
+        target_keys = set()
+        for layer in config.layers:
+            # Empty buffers are dropped before the native manager sees them.
+            for buffer in (buffer for buffer in layer.buffers if buffer.size):
+                policy = (
+                    buffer.reuse_policy if buffer.reuse_policy is not None else layer.reuse_policy
+                )
+                if isinstance(layer, SsmLayerConfig):
+                    key = ("ssm", policy)
+                else:
+                    life_cycle = AttnLifeCycle.make(
+                        layer.sliding_window_size,
+                        layer.num_sink_tokens,
+                        config.tokens_per_block,
+                        policy,
+                    )
+                    key = (life_cycle.window_size, life_cycle.num_sink_blocks, policy)
+                if key not in keys:
+                    keys.append(key)
+                    block_bytes.append(0)
+                block_bytes[keys.index(key)] += buffer.size
+                is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
+                (draft_keys if is_draft else target_keys).add(key)
+        if len(ratio) == len(keys):
+            return config
+        if len(draft_keys) != 1 or draft_keys & target_keys or len(ratio) != len(keys) - 1:
+            raise ValueError(
+                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
+                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)})"
+            )
+        full_history = [
+            key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
+        ]
+        return replace(
+            config,
+            initial_pool_ratio=_insert_draft_pool_ratio(
+                ratio, block_bytes, full_history, keys.index(draft_keys.pop())
+            ),
+        )
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""
@@ -895,11 +1257,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         }
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
-        # (request ids, SSM base blocks, dummy flags) of the last upload while
-        # it is known to be current.
+        # (request ids, SSM base blocks, replay base blocks, dummy flags) of the
+        # last upload while it is known to be current.
         self._steady_state_index_key: (
-            Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[bool, ...]] | None
+            Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], Tuple[bool, ...]] | None
         ) = None
+        self._request_id_to_replay_index: Dict[int, int] = {}
+        # Requests whose replay slot has been reset. A suspended request keeps
+        # its entry because its replay pages, and their contents, follow it.
+        self._initialized_replay_requests: set[int] = set()
 
         state_index_capacity = self.max_batch_size + self._num_reserved_dummy_slots
         self._state_indices_buffer = DeviceCopyBuffer(
@@ -909,6 +1275,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._host_state_indices = torch.zeros(
             [state_index_capacity], dtype=torch.int32, pin_memory=prefer_pinned()
         )
+        self._replay_indices_buffer: DeviceCopyBuffer | None = None
+        self._host_replay_indices: torch.Tensor | None = None
+        if self._declares_replay_region():
+            self._replay_indices_buffer = DeviceCopyBuffer(
+                torch.zeros([state_index_capacity], dtype=torch.int32, device="cuda"),
+                pin_memory=prefer_pinned(),
+            )
+            self._host_replay_indices = torch.zeros(
+                [state_index_capacity], dtype=torch.int32, pin_memory=prefer_pinned()
+            )
 
         self._dummy_request_mask_buffer = DeviceCopyBuffer(
             torch.zeros(state_index_capacity, dtype=torch.bool, device="cuda"),
@@ -923,7 +1299,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         if self.local_num_mamba_layers > 0:
             first_mamba_local_layer = self.layer_offsets[self.mamba_pp_layers[0]]
-            self.ssm_layer_group_id = self.impl.get_layer_group_id(LayerId(first_mamba_local_layer))
+            self.ssm_layer_group_id = self.impl.get_buffer_group_id(
+                LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
+            )
+            if self._declares_replay_region():
+                (self._replay_group_id,) = self.get_region_group_ids(REPLAY_STATE_REGION)
             self._ssm_page_index_scale = self.impl.get_page_index_scale(
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
             )
@@ -1153,9 +1533,28 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _setup_model_state(self) -> None:
         """Bind views only after layout, pool and slot capacity are final."""
         if self._speculative_state is not None:
+            if self._replay_layouts:
+                self._speculative_state.bind_replay_pool(self._get_replay_views())
             self._speculative_state.bind(
                 self._state_layout, self.all_ssm_states, self.all_conv_states
             )
+
+    def _get_replay_views(self) -> list[dict[DataRole, torch.Tensor]]:
+        """Typed per-slot views of each local recurrent layer's managed replay buffers."""
+        return [
+            {
+                role: self._get_state_buffer(self.layer_offsets[layer_id], role, dtype, list(shape))
+                for role, (dtype, shape) in self._replay_layouts.get(layer_id, {}).items()
+            }
+            for layer_id in self.mamba_pp_layers
+        ]
+
+    @property
+    def cuda_replay_state_indices(self) -> torch.Tensor:
+        """Replay slots in the order of the last state-index setup."""
+        if self._replay_indices_buffer is None:
+            return self.cuda_state_indices
+        return self._replay_indices_buffer.tensor
 
     @property
     def intermediate_state_indices(self) -> torch.Tensor | None:
@@ -1241,11 +1640,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return 0
 
     @override
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_buffers(
+        self, layer_idx: int, kv_layout: str = "NHD", **kwargs
+    ) -> Optional[torch.Tensor]:
         local_layer_idx = self.layer_offsets[layer_idx]
         if self._is_local_mamba_layer(local_layer_idx):
             return None
-        return super().get_buffers(layer_idx, kv_layout)
+        return super().get_buffers(layer_idx, kv_layout, **kwargs)
 
     @override
     def _create_kv_cache(
@@ -1361,6 +1762,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if n > 0 and self._is_steady_state_index_batch(requests):
                 return
         self._host_state_indices.zero_()
+        replay_group = self._replay_group_id
+        if replay_group is not None:
+            self._host_replay_indices.zero_()
         if n > 0:
             for i, req in enumerate(requests):
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
@@ -1373,6 +1777,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"request {req.py_request_id}"
                     )
                 self._host_state_indices[i] = base_index
+                if replay_group is not None:
+                    replay_index = kv_cache.get_ssm_block_base_index(replay_group)
+                    if replay_index < 0:
+                        raise RuntimeError(
+                            f"Invalid replay block index {replay_index} for "
+                            f"request {req.py_request_id}"
+                        )
+                    self._host_replay_indices[i] = replay_index
 
         self._state_indices_buffer.update(self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
@@ -1381,6 +1793,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
+        if replay_group is not None:
+            self._replay_indices_buffer.update(self._host_replay_indices)
+            replay_values = self._host_replay_indices[:n].tolist()
+            for req, value in zip(requests, replay_values):
+                self._request_id_to_replay_index[req.py_request_id] = value
+        else:
+            replay_values = state_values
+        if self._replay_layouts:
+            self._reset_fresh_replay_slots(requests[num_contexts:], replay_values[num_contexts:])
+            # _reset_context_mamba_slots resets every context request's slot.
+            self._initialized_replay_requests.update(req.py_request_id for req in requests)
 
         new_state_values = [
             self._request_id_to_state_index[request.py_request_id]
@@ -1392,23 +1815,30 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Allow model-owned scratch state to follow the updated slot mapping."""
 
     def _is_steady_state_index_batch(self, requests: List[LlmRequest]) -> bool:
-        """Whether the last upload (same requests, SSM base blocks and dummy flags) still holds.
+        """Whether the last upload (same requests, SSM and replay base blocks and dummy flags) still holds.
 
-        Records the batch as the new reference otherwise.
+        A replay page can move without the SSM page (suspend and resume), so
+        its base block is part of the key. Records the batch as the new
+        reference otherwise.
         """
+        replay_group = self._replay_group_id
         base_indices = []
+        replay_indices = []
         for req in requests:
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
                 self._steady_state_index_key = None
                 return False
             base_indices.append(kv_cache.get_ssm_block_base_index(self.ssm_layer_group_id))
-        if min(base_indices) < 0:
+            if replay_group is not None:
+                replay_indices.append(kv_cache.get_ssm_block_base_index(replay_group))
+        if min(base_indices) < 0 or min(replay_indices, default=0) < 0:
             self._steady_state_index_key = None
             return False
         key = (
             tuple(req.py_request_id for req in requests),
             tuple(base_indices),
+            tuple(replay_indices),
             tuple(req.is_dummy for req in requests),
         )
         # Request ids recur (warmup and CUDA-graph dummies are freed and re-added
@@ -1419,15 +1849,42 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self._request_id_to_is_dummy.get(req.py_request_id) == req.is_dummy
             for req, base in zip(requests, base_indices)
         ):
-            return True
+            if replay_group is None or all(
+                self._request_id_to_replay_index.get(req.py_request_id) == replay
+                for req, replay in zip(requests, replay_indices)
+            ):
+                return True
         self._steady_state_index_key = key
         return False
 
+    def _reset_fresh_replay_slots(
+        self, generation_requests: List[LlmRequest], replay_slots: list[int]
+    ) -> None:
+        """Reset the replay buffers a generation request gets for the first time.
+
+        A newly acquired page holds arbitrary bytes. Context requests are reset
+        by _reset_context_mamba_slots; this covers requests that start in
+        generation, such as CUDA-graph padding, warmup and attention-DP dummies.
+        """
+        fresh = [
+            slot
+            for request, slot in zip(generation_requests, replay_slots)
+            if request.py_request_id not in self._initialized_replay_requests
+        ]
+        if fresh:
+            self._speculative_state.reset_replay_slots(
+                _host_slots_to_device(fresh, self.cuda_replay_state_indices.device)
+            )
+
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts and self._speculative_state is not None:
+            replay_kwargs = {}
+            if self._replay_group_id is not None:
+                replay_kwargs["replay_slots"] = self.cuda_replay_state_indices[:num_contexts].long()
             self._speculative_state.reset_slots(
                 self.cuda_state_indices[:num_contexts].long(),
                 self._host_state_indices[:num_contexts].tolist(),
+                **replay_kwargs,
             )
 
     def _refresh_dummy_request_mask(self, is_dummy: list[bool]) -> None:
@@ -1463,6 +1920,23 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return indices
         return self.cuda_state_indices
 
+    def get_replay_state_indices(self, request_ids: Optional[List[int]] = None):
+        """Return replay-buffer slots like get_state_indices(), without touching the dummy mask.
+
+        They are the recurrent-state slots unless the replay buffers have a
+        region of their own.
+        """
+        if request_ids is None:
+            return self.cuda_replay_state_indices
+        if self.local_num_mamba_layers == 0:
+            return [0] * len(request_ids)
+        index_map = (
+            self._request_id_to_state_index
+            if self._replay_group_id is None
+            else self._request_id_to_replay_index
+        )
+        return [index_map[rid] for rid in request_ids]
+
     @override
     def get_max_resource_count(self) -> int:
         return self.max_batch_size
@@ -1474,6 +1948,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.try_commit_blocks(request, kv_cache)
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
+        self._request_id_to_replay_index.pop(request.py_request_id, None)
+        # Preemption also frees: the next cache of this request gets new pages.
+        self._initialized_replay_requests.discard(request.py_request_id)
         self._branch_snapshot_points.pop(request.py_request_id, None)
         # A freed request ends any steady decode run.
         self._steady_state_index_key = None
@@ -1502,12 +1979,27 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
         if state_indices is None:
             state_indices = self.get_state_indices()
+            replay_indices = self.cuda_replay_state_indices
+        else:
+            # Callers pass the static metadata slots, whose replay slots share
+            # the same request order.
+            replay_indices = getattr(
+                getattr(attn_metadata, "mamba_metadata", None), "replay_state_indices", None
+            )
+            if replay_indices is None:
+                if self._replay_group_id is not None:
+                    raise RuntimeError(
+                        "Replay buffers with slots of their own need "
+                        "mamba_metadata.replay_state_indices"
+                    )
+                replay_indices = state_indices
         state_indices_d = state_indices[num_contexts : num_contexts + num_gens].to(torch.int32)
+        replay_indices_d = replay_indices[num_contexts : num_contexts + num_gens].to(torch.int32)
         src_state_indices = self._generation_state_indices[:num_gens]
         is_dummy_request = self._dummy_request_mask[num_contexts : num_contexts + num_gens]
         if self._speculative_state is None:
             raise NotImplementedError("The model manager must provide speculative state")
-        self._speculative_state.update(
+        self._update_model_state(
             MambaAcceptanceBatch(
                 attention_metadata=attn_metadata,
                 num_contexts=num_contexts,
@@ -1517,8 +2009,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 source_state_indices=src_state_indices,
                 destination_state_indices=state_indices_d,
                 is_dummy_request=is_dummy_request,
+                replay_indices=replay_indices_d,
             ),
         )
+
+    def _update_model_state(self, batch: MambaAcceptanceBatch) -> None:
+        """Apply acceptance to the selected model state."""
+        self._speculative_state.update(batch)
 
     @override
     def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
@@ -1792,11 +2289,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if report is None:
             return None
 
+        region_groups = {
+            group
+            for region in self.region_layout.regions
+            for group in self.get_region_group_ids(region.name)
+        }
         pool_group_ids = sorted(
             {
                 pool_group_id
-                for pool_group_id, _, kind in self._stats_life_cycle_metadata().values()
-                if kind == "ssm"
+                for life_cycle_id, (
+                    pool_group_id,
+                    _,
+                    kind,
+                ) in self._stats_life_cycle_metadata().items()
+                if kind == "ssm" and life_cycle_id not in region_groups
             }
         )
         if not pool_group_ids:
@@ -1888,8 +2394,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self._generation_state_indices = None
+        self._replay_indices_buffer = None
+        self._host_replay_indices = None
+        self._request_id_to_replay_index = {}
+        self._initialized_replay_requests = set()
         self._branch_snapshot_points.clear()
         super().shutdown()
 
 
-__all__ = ["InforwardSnapshotEntry", "MambaHybridCacheManagerV2"]
+__all__ = [
+    "InforwardSnapshotEntry",
+    "MambaHybridCacheManagerV2",
+    "REPLAY_STATE_REGION",
+    "ReplayLayout",
+]

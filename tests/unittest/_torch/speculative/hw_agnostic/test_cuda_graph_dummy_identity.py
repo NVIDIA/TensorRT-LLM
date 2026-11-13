@@ -14,6 +14,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 from tensorrt_llm._torch.speculative import dspark as dspark_module
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSv4DSparkWorker
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("mode", ["Eagle", "MTP"])
 def test_tree_speculation_keeps_native_dummy_identity(mode):
@@ -48,6 +50,8 @@ def test_target_only_dummy_identity_is_unchanged():
 
 @pytest.mark.parametrize("physical_k", [1, 3, 8])
 def test_padding_families_never_consume_real_worker_slots(monkeypatch, physical_k):
+    dummy_id = None
+
     def cpu_allocator(original):
         def allocate(*args, **kwargs):
             kwargs["device"] = "cpu"
@@ -64,6 +68,8 @@ def test_padding_families_never_consume_real_worker_slots(monkeypatch, physical_
     worker._attention_warmup_attempted = True
     worker.return_confidence = False
     worker._confidence_logits = None
+    worker._mixed_confidence_tracking = False
+    worker._confidence_incarnations = {}
     draft = SimpleNamespace(
         block_size=physical_k,
         num_stages=1,

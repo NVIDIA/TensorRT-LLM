@@ -1073,15 +1073,20 @@ def test_shared_topk_lifecycle(monkeypatch):
 
     context_topk = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int32)
     generation_topk = torch.tensor([[2, 1, 0], [3, 2, 1]], dtype=torch.int32)
+    # Offload off: sparse_attn_predict routes decode batches to the arena when it is on,
+    # which is a different path from the topk sharing under test.
+    sparse_params = SimpleNamespace(enable_kv_cache_offload=False)
     full_backend = SimpleNamespace(
         indexer=SimpleNamespace(
             forward_from_projected=Mock(side_effect=[context_topk, generation_topk])
         ),
         get_local_layer_idx=Mock(return_value=0),
+        sparse_params=sparse_params,
     )
     shared_backend = SimpleNamespace(
         indexer=None,
         get_local_layer_idx=Mock(return_value=1),
+        sparse_params=sparse_params,
     )
     # sparse_attn_predict dispatches the local->global remap through the
     # backend's own _remap_topk_to_global; bind the real method onto the stubs.
@@ -1274,6 +1279,52 @@ def test_indexer_two_level_gvr_dispatch(
         TopKImplementation.CUTE_DSL_GVR if use_self_sampling else TopKImplementation.CUDA_RADIX
     )
     assert indexer.top_k.prefill_implementation == expected_prefill
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("hidden_size", [6144, 7168])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize(
+    "deterministic_flag", ["FORCE_DETERMINISTIC", "FORCE_ATTENTION_KERNEL_DETERMINISTIC"]
+)
+def test_indexer_projection_is_batch_invariant(
+    monkeypatch, hidden_size, weight_dtype, deterministic_flag
+):
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
+    monkeypatch.setenv(deterministic_flag, "1")
+    if weight_dtype == torch.bfloat16:
+        monkeypatch.setenv("TRTLLM_DSA_INDEXER_BF16", "1")
+    torch.manual_seed(32)
+    indexer = create_indexer(
+        DeepSeekSparseAttentionConfig(index_head_dim=128, index_n_heads=32, index_topk=128)
+    )
+    weight = (torch.randn(160, hidden_size, device="cuda") / hidden_size**0.5).bfloat16()
+    weight = weight.to(weight_dtype)
+    indexer._fused_wk_wp_weight = weight
+    # A strided row view also covers hidden states sharing a larger activation buffer.
+    hidden = torch.randn(34, hidden_size, dtype=torch.bfloat16, device="cuda")[::2]
+    expected = (hidden.double() @ weight.double().T).to(weight_dtype)
+    actual = indexer._project_k_and_weights(hidden)
+    for batch_size in (1, 2, 3, 8):
+        chunks = [
+            indexer._project_k_and_weights(hidden[start : start + batch_size])
+            for start in range(0, hidden.shape[0], batch_size)
+        ]
+        torch.testing.assert_close(torch.cat(chunks), actual, atol=0, rtol=0)
+    permutation = torch.randperm(hidden.shape[0], device="cuda")
+    reordered = indexer._project_k_and_weights(hidden[permutation])
+    torch.testing.assert_close(reordered, actual[permutation], atol=0, rtol=0)
+    tolerance = (1e-6, 1e-5) if weight_dtype == torch.float32 else (1e-3, 1e-2)
+    torch.testing.assert_close(actual, expected, atol=tolerance[0], rtol=tolerance[1])
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = indexer._project_k_and_weights(hidden)
+    hidden.neg_()
+    graph.replay()
+    torch.testing.assert_close(replayed, indexer._project_k_and_weights(hidden), atol=0, rtol=0)
 
 
 @skip_pre_hopper
@@ -4508,6 +4559,7 @@ def test_indexer_decode_custom_vs_fallback(
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,
@@ -4570,6 +4622,10 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size, dsa_cache_manager
     step. Covers both step-0 shapes: "gen" (steady state, next_n > 1) and
     "context" (the first gen round after prefill, which runs the context path).
     Step-0 Top-K correctness is covered by test_indexer_decode_custom_vs_fallback.
+
+    The reuse steps run with the MQA-logits schedule marked stale and poisoned,
+    as the draft loop leaves it before an index-shared step; reuse must not read
+    it, and a step that computes Top-K on it must raise instead.
     """
     torch.manual_seed(7)
     heads, head_dim, block_size = 32, 128, 64
@@ -4709,12 +4765,19 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size, dsa_cache_manager
         meta.in_mtp_draft_loop = True
         meta.shared_topk_indices = stash
         meta.indexer_skip_topk = True
+        meta.indexer_schedule_stale = True
+        meta.scheduler_metadata_buffer.fill_(-1)
+        meta.scheduler_metadata_buffer_full_next_n.fill_(-1)
+        meta.kv_lens_cuda_2d.fill_(-1)
         hs, qs, ks_fp8, ks_scale, ws = make_inputs(batch_size)
         indexer._update_k_cache(ks_fp8, ks_scale, meta)
         topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
         assert torch.equal(topk, stash[:batch_size, :]), (
             f"{step0_mode} draft reuse step {step} should copy the stash 1:1 (next_n=1)"
         )
+        meta.indexer_skip_topk = False
+        with pytest.raises(RuntimeError, match="stale"):
+            indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -5099,6 +5162,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, ds
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,

@@ -92,6 +92,18 @@ At high concurrency a single serving process is host-bound: one asyncio event lo
    * ``SO_REUSEPORT`` would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.
    * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
 
+.. _bounding-the-graceful-stop:
+
+Bounding the Graceful Stop
+--------------------------
+
+A server can still have request handlers running when it is told to stop, for example when a benchmark client leaves while its last requests are in flight. By default the OpenAI HTTP server waits for every one of them. The prototype setting ``serve_graceful_shutdown_timeout_s: N`` in the ``--config`` YAML bounds that wait: after a shutdown signal, the server waits at most ``N`` seconds for running request handlers (uvicorn's ``timeout_graceful_shutdown``), then cancels them and shuts down as usual. It is off by default.
+
+.. note::
+
+   * It applies to the LLM, embedding and multimodal-encoder servers of ``trtllm-serve``, in every frontend process.
+   * The gRPC servers (``--grpc``) and the VisualGen server do not use it, and the disaggregated router keeps its own ``--request_timeout`` for the requests it forwards.
+
 Inference Endpoints
 -------------------
 
@@ -238,6 +250,16 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
          {"type": "text", "text": "What's in this image?"},
          {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_base64}"}}
      ]}
+
+.. note::
+   Media URLs may be ``http(s)`` URLs or base64 ``data:`` URLs. A ``file://``
+   URI or a bare filesystem path is read from the server's own filesystem, so it
+   is refused unless the server is started with
+   ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=<directory>``; then only regular files whose
+   resolved path is inside that directory are read. This applies to
+   ``image_url``, ``video_url`` and ``audio_url`` parts. A deployment whose
+   clients send local paths today must set the variable to the directory
+   that holds those files.
 
 .. note::
    To convert images to base64-encoded format, use the utility function

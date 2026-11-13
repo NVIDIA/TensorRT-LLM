@@ -211,7 +211,7 @@ HostMemBacking::HostMemBacking(size_t vmSize, HostMemBackingOptions const& optio
 
     //! Applied once over the whole mapping. Per-chunk page-mode advice would
     //! change VMA flags and split the mapping into one VMA per chunk.
-    hostMadvisePageMode(mAddr, mSize, hostUseThp());
+    hostMadvisePageMode(mAddr, mSize, hostUseThp(options.useThp));
     bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
 
     // Nothing is reachable until a step opens it, so a read that runs ahead of

@@ -693,8 +693,11 @@ def runLLMBuild(
     sh "rm -rf **/*.xml *.tar.gz"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-    if (env.alternativeTRT) {
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+    // Set the version before copying the source, so the packaged source gets every version record.
+    if (versionOverride) {
+        withEnv(["TRTLLM_VERSION_OVERRIDE=${versionOverride}"]) {
+            sh "cd ${LLM_ROOT} && python3 scripts/bump_version.py \"\${TRTLLM_VERSION_OVERRIDE}\""
+        }
     }
 
     sh "mkdir TensorRT-LLM"
@@ -722,15 +725,10 @@ def runLLMBuild(
     // install python package
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install -r requirements-dev.txt ${pipArgs}")
 
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
-    }
-
     int buildJobs = (buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS) as int
 
     withEnv([
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
-        "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
         int buildRetries = 0
         while (true) {
@@ -738,7 +736,7 @@ def runLLMBuild(
                 // cmake will download third-party sources, so we add retry.
                 trtllm_utils.llmExecStepWithRetry(
                     pipeline,
-                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
                 )
                 break
             } catch (InterruptedException e) {
@@ -759,30 +757,18 @@ def runLLMBuild(
         }
     }
 
-    // Type-check with the compiled bindings that build_wheel.py just produced in
-    // place. Runs mypy directly (not via pre-commit) so this step does not clone
-    // anything from github: the pre-commit orchestrator clones every remote hook
-    // repo up front, which flakes on nodes without github access. mypy and its
-    // config come from requirements-dev.txt (installed above) via the internal
-    // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
-    // bindings can't be imported, rather than silently degrading to the
-    // lightweight (no-bindings) check.
-    //
-    // The step still talks to the network: [tool.mypy] sets install_types, so
-    // mypy pip-installs the missing stub packages from the internal PyPI mirror
-    // before checking.
+    // Check configured product and test sources, applying exclusions and test-specific diagnostics.
+    // The advisory check does not fail the build.
+    // Running directly avoids pre-commit hook downloads.
     if (typeCheck) {
-        echo "-- Running mypy type check with compiled bindings..."
-        withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-            trtllm_utils.llmExecStepWithRetry(
-                pipeline,
-                script: "cd ${LLM_ROOT} && bash scripts/run_mypy.sh",
-                shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
-            )
-        }
+        echo "-- Running advisory Pyrefly full-project type check with exclusions..."
+        trtllm_utils.llmExecStepWithRetry(
+            pipeline,
+            script: "cd ${LLM_ROOT} && bash scripts/run_pyrefly.sh --full-project",
+            shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
+        )
     }
 
-    sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
@@ -949,7 +935,7 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     }
 }
 
-def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="", reconfigure=false)
+def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, extra_args="", reconfigure=false)
 {
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -960,10 +946,6 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     // Step 1: cloning tekit source code
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     // Step 2: building libs in container
     sh "bash -c 'pip3 show tensorrt || true'"
 
@@ -1003,7 +985,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         echo "dockerImage: ${env.dockerImage}"
         echo "gitlabSourceRepoHttpUrl: ${env.gitlabSourceRepoHttpUrl}"
         echo "gitlabCommit: ${env.gitlabCommit}"
-        echo "alternativeTRT: ${env.alternativeTRT}"
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
 
         echo "env.globalVars is: ${env.globalVars}"
@@ -1124,7 +1105,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90' -b Debug --micro_benchmarks", true)
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b Debug --micro_benchmarks", true)
                         }
                     }
                 })

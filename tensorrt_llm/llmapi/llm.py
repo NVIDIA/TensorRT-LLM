@@ -20,7 +20,7 @@ import threading
 import time
 import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
                     cast)
@@ -31,11 +31,16 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
+from .._errors import ConfigInputError
+from .._startup_errors import (classify_startup_error, log_startup_error,
+                               mark_llm_initialized)
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
@@ -63,11 +68,14 @@ from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .startup_checks import (check_architecture_registered,
+                             check_quantization_compute_capability,
+                             check_visible_gpus)
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (append_docstring, exception_handler, get_device_count,
-                    logger_debug, set_api_status)
+from .utils import (append_docstring, exception_handler, logger_debug,
+                    set_api_status)
 
 _RUNTIME_MEMORY_TYPES = tuple(
     memory_type for memory_type in ExecutorMemoryType
@@ -412,7 +420,7 @@ class BaseLLM:
                     kwargs["orchestrator_type"] = "ray"
 
             else:
-                raise ValueError(
+                raise ConfigInputError(
                     f"Unknown backend: {backend!r}. Supported backends are "
                     "'pytorch'.")
 
@@ -485,11 +493,14 @@ class BaseLLM:
         self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
         if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
-            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
-            ) < self.args.parallel_config.world_size_per_node:
-                raise RuntimeError(
-                    f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
-                )
+            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None:
+                # An LLM that creates its own MPI pool spawns every rank on this
+                # node; Ray and external launches may spread them over nodes.
+                check_visible_gpus(
+                    self.args.parallel_config,
+                    all_ranks_local=self.args.orchestrator_type != "ray"
+                    and self.mpi_session is None
+                    and not get_spawn_proxy_process_env())
 
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
@@ -571,8 +582,7 @@ class BaseLLM:
             if getattr(self, "_encoder_executor", None) is not None:
                 try:
                     runtime_pretrained_config = (
-                        self._encoder_executor.model_engine.model.model_config.
-                        pretrained_config)
+                        self._encoder_executor.pretrained_config)
                     if runtime_pretrained_config is not None:
                         pretrained_config = runtime_pretrained_config
                 except AttributeError:
@@ -722,6 +732,8 @@ class BaseLLM:
                                             List[ConversationParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
         priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[Union[KvHintsInput,
+                                 List[Optional[KvHintsInput]]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -746,6 +758,7 @@ class BaseLLM:
                 Conversation parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            kv_hints (tensorrt_llm.kv_hints.protocol.KvHintsInput, List[Optional[tensorrt_llm.kv_hints.protocol.KvHintsInput]], optional): Prototype typed or raw JSON KV hint metadata. A scalar repeats the same envelope and message_id for every prompt; an aligned list supplies per-prompt hints. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Transporting hints does not execute actions. Defaults to None.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.
@@ -762,6 +775,11 @@ class BaseLLM:
             request_inputs_list = [None]
         else:
             request_inputs_list = [prompt_inputs(i) for i in inputs]
+
+        if isinstance(kv_hints,
+                      list) and len(kv_hints) != len(request_inputs_list):
+            raise ValueError(
+                "kv_hints list length must match the number of prompts")
 
         if isinstance(priority, list):
             if len(priority) != len(request_inputs_list):
@@ -791,6 +809,7 @@ class BaseLLM:
                 conversation_params=self._item_at(conversation_params, i),
                 cache_salt=self._item_at(cache_salt, i),
                 priority=self._item_at(priority, i),
+                kv_hints=self._item_at(kv_hints, i),
                 streaming=False,
             )
             futures.append(future)
@@ -822,6 +841,7 @@ class BaseLLM:
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -840,6 +860,7 @@ class BaseLLM:
             conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            kv_hints (tensorrt_llm.kv_hints.protocol.KvHintsInput, optional): Prototype typed or raw JSON KV hint metadata from a trusted caller. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Payloads are transported without executing actions or selecting a source. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
@@ -886,6 +907,22 @@ class BaseLLM:
                  disaggregated_params,
              )
 
+        if (not self.args.mm_encoder_only and disaggregated_params is not None
+                and disaggregated_params.multimodal_input_layout is not None):
+            disaggregated_params = replace(disaggregated_params,
+                                           multimodal_input_layout=None)
+
+        if (self.args.mm_encoder_only
+                and multimodal_params is not None and isinstance(
+                    self.input_processor, BaseMultimodalInputProcessor)):
+            encoder_layout = self.input_processor.get_disagg_prefill_inputs(
+                prompt_token_ids, multimodal_params)
+            if encoder_layout is not None:
+                disaggregated_params = replace(
+                    disaggregated_params or
+                    DisaggregatedParams(request_type="context_and_generation"),
+                    multimodal_input_layout=encoder_layout)
+
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
 
@@ -912,6 +949,7 @@ class BaseLLM:
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
+            kv_hints=kv_hints,
         )
 
         if sampling_params.return_perf_metrics:
@@ -989,14 +1027,16 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            # TODO(TRTLLM-12869): Pass encoder-side MM layout through
-            # DisaggregatedParams so prefill does not rebuild prompt tokens,
-            # positions, lengths, runs, special offsets, and cumsum here.
+            layout_kwargs = {}
+            if disaggregated_params.multimodal_input_layout is not None:
+                layout_kwargs[
+                    "encoder_inputs"] = disaggregated_params.multimodal_input_layout
             prompt_token_ids, multimodal_params = (
                 self.input_processor.build_disagg_prefill_multimodal_inputs(
                     inputs,
                     mm_handles,
-                    mm_hashes=disaggregated_params.multimodal_hashes))
+                    mm_hashes=disaggregated_params.multimodal_hashes,
+                    **layout_kwargs))
             if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
@@ -1010,8 +1050,16 @@ class BaseLLM:
                 # BaseWorker resolves embedding handles to local tensor views.
                 multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
-                    # NOTE: `ModelEngine` assumes both are present when using mrope.
-                    assert disaggregated_params.mrope_position_deltas_handle is not None
+                    if disaggregated_params.mrope_position_deltas_handle is None:
+                        raise ValueError(
+                            "mRoPE position IDs require position deltas")
+                    shape = disaggregated_params.mrope_position_ids_handle[
+                        "tensor_size"]
+                    if tuple(shape) != (3, 1, len(prompt_token_ids)):
+                        raise ValueError(
+                            f"Encoder mRoPE shape {shape} does not match prefill prompt "
+                            f"length {len(prompt_token_ids)}; preserve the encoder prompt layout"
+                        )
                     mrope_config = {}
                     mrope_config[
                         "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
@@ -1229,10 +1277,10 @@ class BaseLLM:
         if unbatched:
             inputs = [inputs]
 
-        engine = self._encoder_executor.model_engine
-        max_seq_len = engine.max_seq_len
-        max_num_tokens = engine.max_num_tokens
-        max_batch_size = engine.batch_size
+        executor = self._encoder_executor
+        max_seq_len = executor.max_seq_len
+        max_num_tokens = executor.max_num_tokens
+        max_batch_size = executor.max_batch_size
 
         if len(inputs) > max_batch_size:
             raise ValueError(
@@ -1499,6 +1547,21 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
+            elif (sampling_params.stop is not None
+                  or sampling_params.bad is not None):
+                # An explicit end_id skips the end_id/pad_id/EOS defaults of
+                # _setup, but the stop and bad strings still have to be
+                # tokenized before the request is built.
+                # A bare string needs the tokenizer even when it is empty;
+                # an empty list does not.
+                if self.tokenizer is None and any(
+                        isinstance(words, str) or words
+                        for words in (sampling_params.stop,
+                                      sampling_params.bad)):
+                    raise ValueError(
+                        "tokenizer is required to tokenize the stop and bad strings of sampling_params"
+                    )
+                sampling_params._setup_word_ids(self.tokenizer)
             self._configure_bart_decoder_prefix(sampling_params)
             self._add_whisper_suppress_tokens_logits_processor(sampling_params)
             add_thinking_budget_logits_processor(
@@ -1885,10 +1948,14 @@ class _TorchLLM(BaseLLM):
                              tokenizer_revision,
                              backend=backend,
                              **kwargs)
-        except Exception:
+        except Exception as exc:
+            info = log_startup_error(exc, "LLM initialization failed")
             if self._usage_attempt_tracked and _usage is not None:
-                _usage.record_llm_initialization_failure()
+                # An already logged failure (e.g. by the proxy) classifies the same.
+                _usage.record_llm_initialization_failure(
+                    (info or classify_startup_error(exc)).category)
             raise
+        mark_llm_initialized()
 
         try:
             if not self._usage_attempt_tracked and _usage is not None:
@@ -2065,8 +2132,8 @@ class _TorchLLM(BaseLLM):
         # "consumes packed tokens" wording would only confuse there.
         if (config is None or not self._is_encoder_decoder_model()
                 or self.args.model_kwargs is not None
-                or self.args.checkpoint_loader is not None
-                or self.args.checkpoint_format not in (None, "HF")):
+                or self.args.checkpoint_loader is not None or
+                self.args.checkpoint_format not in (None, CheckpointFormat.HF)):
             return
         bucket_config_error = validate_token_encoder_bucket_config(
             config.num_tokens, config.seq_lens)
@@ -2097,6 +2164,10 @@ class _TorchLLM(BaseLLM):
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
         )
+        # The checkpoint's quantization config is merged by now; fail before
+        # any worker loads weights.
+        check_quantization_compute_capability(self.args)
+        check_architecture_registered(self.args, self._hf_model_config)
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
@@ -2106,6 +2177,8 @@ class _TorchLLM(BaseLLM):
         video_pruning_rate = self.args.multimodal_config.video_pruning_rate
         if video_pruning_rate is not None:
             input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
+        if self.args.multimodal_config.vision_gpu_normalize:
+            input_processor_kwargs['vision_gpu_normalize'] = True
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
@@ -2133,7 +2206,7 @@ class _TorchLLM(BaseLLM):
             return  # Skip _executor creation
 
         # Hint: if this looks like an encoder model, suggest encode()
-        if self.args.encode_only is None and not self.args.mm_encoder_only:
+        if not self.args.encode_only and not self.args.mm_encoder_only:
             from tensorrt_llm._torch.model_config import ModelConfig
             architectures = getattr(self._hf_model_config, 'architectures',
                                     None) if self._hf_model_config else None
@@ -2179,7 +2252,7 @@ class _TorchLLM(BaseLLM):
         unsupported_args = [key for key in kwargs if key not in accepted_keys]
 
         if unsupported_args:
-            raise ValueError(
+            raise ConfigInputError(
                 f"The following arguments are not supported by the PyTorch backend: {unsupported_args}."
             )
 

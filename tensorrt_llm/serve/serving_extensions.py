@@ -94,8 +94,25 @@ class ServingExtension:
         """Tool declarations carried on messages rather than on the request."""
         return []
 
-    def prompt_tokens_excluded_from_usage(self, request: "ChatCompletionRequest") -> int:
-        """Number of trailing rendered prompt tokens not reported as prompt usage."""
+    def prompt_tokens_excluded_from_usage(
+        self,
+        *,
+        add_generation_prompt: bool,
+        pre_tokenized: bool,
+        request_chat_template: Optional[str],
+    ) -> int:
+        """Number of trailing rendered prompt tokens not reported as prompt usage.
+
+        Routes ask through ``RenderResources.prompt_tokens_excluded_from_usage``,
+        which answers zero without asking when the server has a ``--chat_template``.
+
+        Args:
+            add_generation_prompt: Whether the prompt ends in the template's
+                generation prompt.
+            pre_tokenized: Whether the client supplied the prompt token ids, so
+                that no prompt is rendered.
+            request_chat_template: The request-level chat template, if any.
+        """
         return 0
 
     def apply_chat_extensions(self, request) -> None:
@@ -109,6 +126,17 @@ class ServingExtension:
     def required_tool_choice_mode(self) -> Optional[RequiredToolChoiceMode]:
         """Return the required-tool policy; boolean permission selects template enforcement."""
         return "template" if self.allows_required_tool_choice() else None
+
+    def normalize_reasoning_effort(self, effort: str) -> Optional[str]:
+        """Map a protocol-level effort onto what this model's template accepts.
+
+        Applied to efforts the serve itself derives from API fields (a
+        top-level `reasoning_effort`, Anthropic `output_config.effort`,
+        Responses `reasoning.effort`), never to a `chat_template_kwargs`
+        value the client wrote. Returning `None` drops the kwarg so the
+        template default applies. The default forwards the value unchanged.
+        """
+        return effort
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]
@@ -187,6 +215,13 @@ def apply_model_chat_extensions(request, model_type: Optional[str]) -> None:
     extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
     if extension is not None:
         extension.apply_chat_extensions(request)
+
+
+def normalize_reasoning_effort(effort: str, model_type: Optional[str]) -> Optional[str]:
+    """Run the effort normalizer registered for `model_type`; identity if none."""
+    _load_builtin_extensions()
+    extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
+    return effort if extension is None else extension.normalize_reasoning_effort(effort)
 
 
 def structured_output_format_for(

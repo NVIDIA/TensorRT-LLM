@@ -1,22 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import abc
 import asyncio
 import importlib.metadata as importlib_metadata
 import importlib.util
 import ipaddress
+import json
+import os
 import sys
 import time
 from dataclasses import dataclass
 from enum import IntEnum
-from functools import wraps
-from typing import Callable, Dict, List, Optional
+from functools import partial, wraps
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
+import grpc
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.record_signing import (RECORD_SIGNATURE_FIELD,
+                                               sign_record, signature_matches)
 
 
 def is_loopback_host(host: Optional[str]) -> bool:
@@ -177,7 +184,7 @@ def create_cluster_storage(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageServer(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
+        return _create_etcd_storage(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
@@ -185,8 +192,24 @@ def create_cluster_storage_client(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageClient(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
+        return _create_etcd_storage(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
+
+
+def _create_etcd_storage(cluster_uri: str, cluster_name: str,
+                         **kwargs) -> "Etcd3ClusterStorage":
+    """Create an etcd storage once its TLS files are readable.
+
+    The storage reads the files when it connects, on its first call; checking them here
+    reports a wrong path when the server starts.
+    """
+    for name in ("ca_cert", "cert_key", "cert_cert"):
+        path = kwargs.get(name)
+        if path is not None and not (os.path.isfile(path)
+                                     and os.access(path, os.R_OK)):
+            raise ValueError(
+                f"disagg_cluster {name} is not a readable file: {path!r}")
+    return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
 
 
 # All Http endpoints return {"result": <result>} and status code 400
@@ -524,42 +547,170 @@ class HttpClusterStorageClient(ClusterStorage):
             "Unwatch functionality not implemented for HTTP client")
 
 
-class Etcd3WatchEventQueue(WatchEventQueue):
+def _ignore_record(key: object, reason: str) -> None:
+    """Warn, once per record and reason, that a record is skipped."""
+    message = f"Ignoring cluster record {key!r}: {reason}"
+    logger.warning_once(message, key=message)
 
-    def __init__(self,
-                 key_prefix: str,
-                 cancel_event: Callable[[], None] = None):
+
+def _decode_key(raw_key: bytes) -> Optional[str]:
+    """The key of a stored record, or None if it is not valid UTF-8."""
+    try:
+        return raw_key.decode("utf-8")
+    except UnicodeDecodeError:
+        _ignore_record(raw_key, "its key is not valid UTF-8")
+        return None
+
+
+# Returns the value of the record stored under a key, or None if it is not valid.
+_DecodeRecord = Callable[[str, bytes], Optional[str]]
+
+
+class Etcd3WatchEventQueue(WatchEventQueue):
+    """Events of an etcd watch, queued on the event loop that created the queue.
+
+    The queue outlives the watch stream that fills it: when a stream ends, the
+    storage watches on a new stream and queues the changes made meanwhile. Only
+    changes that the consumer has not seen are queued.
+    """
+
+    def __init__(self, key_prefix: str, decode_record: _DecodeRecord,
+                 on_stream_end: Callable[["Etcd3WatchEventQueue", int], None],
+                 loop: asyncio.AbstractEventLoop) -> None:
         self.key_prefix = key_prefix
         self.events = asyncio.Queue()
-        self._cancel_event = cancel_event
+        # Number of the watch stream that fills the queue; events and the end
+        # of an earlier stream are ignored.
+        self.stream = 0
+        self.stream_ended = False
+        self.restart_task: Optional[asyncio.Task] = None
+        self._cancel_event: Optional[Callable[[], None]] = None
+        self._decode_record = decode_record
+        self._on_stream_end = on_stream_end
+        self._loop = loop
+        # Value of each key as last queued for the consumer.
+        self._values: Dict[str, str] = {}
 
-    def cancel_event(self):
-        if self._cancel_event:
-            self._cancel_event()
+    def cancel_event(self) -> None:
+        """Cancel the current watch stream on the client that owns it."""
+        cancel, self._cancel_event = self._cancel_event, None
+        if cancel is None:
+            return
+        try:
+            cancel()
+        except (etcd3.Etcd3Exception, grpc.RpcError, ValueError) as e:
+            logger.debug(f"Could not cancel the etcd watch of "
+                         f"{self.key_prefix!r}: {_describe_error(e)}")
 
-    def set_cancel_event(self, cancel_event: Callable[[], None]):
+    def set_cancel_event(self, cancel_event: Callable[[], None]) -> None:
         self._cancel_event = cancel_event
 
     def __del__(self):
         self.cancel_event()
 
-    def add_events_from_resp(self, watch_resp):
+    def add_events_from_resp(self, stream: int, watch_resp) -> None:
+        """Watch callback of stream ``stream``, run on the etcd watch thread.
+
+        The etcd client passes an exception or None instead of a response when
+        the stream ends. Records that are not valid are skipped.
+        """
+        if watch_resp is None or isinstance(watch_resp, Exception):
+            self._call_soon(self._on_stream_end, self, stream)
+            return
+        events = []
+        for event in watch_resp.events:
+            # Event type is not in public interface of etcd3
+            event_type = WatchEventType.SET if "Put" in event.__class__.__name__ else WatchEventType.DELETE
+            key = _decode_key(event.key)
+            if key is None:
+                continue
+            value = ""
+            if event_type == WatchEventType.SET:
+                value = self._decode_record(key, event.value)
+                if value is None:
+                    continue
+            events.append(
+                WatchEvent(storage_item=StorageItem(key=key, value=value),
+                           event_type=event_type))
+        self._call_soon(self._queue_stream_events, stream, events)
+
+    async def add_events(self, events: List[WatchEvent]) -> None:
+        """Queue events that the caller read itself, such as the records present when watching starts."""
+        self._queue(events)
+
+    def resync(self, records: Dict[str, str]) -> None:
+        """Queue the changes from what the consumer has seen to ``records``, the current records.
+
+        Removals come first: when a worker came back on the same address under a new key, a
+        consumer that keys workers by address then removes the old record before adding the new.
+        """
+        events = [
+            WatchEvent(storage_item=StorageItem(key=key),
+                       event_type=WatchEventType.DELETE)
+            for key in self._values if key not in records
+        ] + [
+            WatchEvent(storage_item=StorageItem(key=key, value=value),
+                       event_type=WatchEventType.SET)
+            for key, value in records.items()
+        ]
+        self._queue(events)
+
+    def _call_soon(self, callback: Callable[..., None], *args: object) -> None:
+        """Run ``callback`` on the event loop of the queue; called on the etcd watch thread."""
         try:
-            for event in watch_resp.events:
-                # Event type is not in public interface of etcd3
-                event_type = WatchEventType.SET if "Put" in event.__class__.__name__ else WatchEventType.DELETE
-                self.events.put_nowait(
-                    WatchEvent(
-                        storage_item=StorageItem(
-                            key=event.key.decode("utf-8"),
-                            value=event.value.decode("utf-8")),
-                        event_type=event_type,
-                    ))
-            if self.events._loop:
-                self.events._loop.call_soon_threadsafe(lambda: None)
-        except Exception as e:
-            logger.error(f"Error adding event: {e}")
-            self.cancel_event()
+            self._loop.call_soon_threadsafe(callback, *args)
+        except RuntimeError:
+            # The event loop is closed, so nobody reads this queue any more.
+            pass
+
+    def _queue_stream_events(self, stream: int,
+                             events: List[WatchEvent]) -> None:
+        """Queue the events of watch stream ``stream`` unless a later stream replaced it."""
+        if stream == self.stream:
+            self._queue(events)
+
+    def _queue(self, events: List[WatchEvent]) -> None:
+        """Queue the events that change what the consumer has seen; runs on the event loop."""
+        for event in events:
+            key, value = event.storage_item.key, event.storage_item.value
+            if event.event_type == WatchEventType.SET:
+                if self._values.get(key) == value:
+                    continue
+                self._values[key] = value
+            elif self._values.pop(key, None) is None:
+                # A record that was never queued, for example one without a
+                # valid signature, has nothing to remove.
+                continue
+            self.events.put_nowait(event)
+
+
+# Details of the INVALID_ARGUMENT errors with which etcd rejects a login token
+# that was valid before; the etcd Go client logs in again on these as well.
+_REJECTED_TOKEN_DETAILS = frozenset({
+    "etcdserver: revision of auth store is old",
+    "etcdserver: user name is empty",
+})
+
+
+def _rejects_token(error: grpc.RpcError) -> bool:
+    """Whether etcd answered with ``error`` because it no longer accepts the login token."""
+    code = error.code()
+    return code == grpc.StatusCode.UNAUTHENTICATED or (
+        code == grpc.StatusCode.INVALID_ARGUMENT
+        and error.details() in _REJECTED_TOKEN_DETAILS)
+
+
+def _describe_error(error: Exception) -> str:
+    """Describe ``error`` for a log message.
+
+    A gRPC error is described by its status and details, and an OS error by its message,
+    which names the file.
+    """
+    if isinstance(error, grpc.RpcError):
+        return f"{error.code().name}: {error.details()}"
+    if isinstance(error, OSError):
+        return f"{type(error).__name__}: {error}"
+    return repr(error)
 
 
 def handle_etcd_error(return_on_error: bool | None):
@@ -569,6 +720,13 @@ def handle_etcd_error(return_on_error: bool | None):
         async def wrap(*args, **kwargs):
             storage = args[0]
             try:
+                await storage.connect()
+            except (etcd3.Etcd3Exception, grpc.RpcError, OSError) as e:
+                logger.warning(
+                    f"Could not connect to etcd in {f.__name__}, trying again "
+                    f"on the next call: {_describe_error(e)}")
+                return return_on_error
+            try:
                 return await f(*args, **kwargs)
             except etcd3.Etcd3Exception as e:
                 logger.error(f"Etcd3 error in {f.__name__}: {e}")
@@ -577,33 +735,72 @@ def handle_etcd_error(return_on_error: bool | None):
                 logger.error(f"Etcd client value error in {f.__name__}")
                 storage.reconnect()
                 return return_on_error
+            except grpc.RpcError as e:
+                if not storage.logs_in or not _rejects_token(e):
+                    raise
+                logger.warning(
+                    f"Etcd rejected the login token in {f.__name__}, logging "
+                    f"in again on the next call: {_describe_error(e)}")
+                storage.reconnect()
+                return return_on_error
 
         return wrap
 
     return decorator
 
 
+# Delay before watching again after a failed attempt, doubled up to the maximum.
+_WATCH_RETRY_MIN_SEC = 1
+_WATCH_RETRY_MAX_SEC = 10
+
+
 class Etcd3ClusterStorage(ClusterStorage):
 
     @staticmethod
-    def _connect(cluster_uri: str) -> etcd3.MultiEndpointEtcd3Client:
+    def _connect(
+            cluster_uri: str,
+            user: Optional[str] = None,
+            password: Optional[str] = None,
+            ca_cert: Optional[str] = None,
+            cert_key: Optional[str] = None,
+            cert_cert: Optional[str] = None) -> etcd3.MultiEndpointEtcd3Client:
         logger.info(f"Connecting to {cluster_uri}")
+        credentials = None if ca_cert is None else etcd3.Etcd3Client.get_secure_creds(
+            ca_cert, cert_key, cert_cert)
         endpoints = []
         for url in cluster_uri.split(","):
             parsed_url = urlparse(url)
             endpoints.append(
                 etcd3.Endpoint(parsed_url.hostname,
                                parsed_url.port,
-                               secure=False))
-        return etcd3.MultiEndpointEtcd3Client(endpoints, timeout=10)
+                               secure=credentials is not None,
+                               creds=credentials))
+        return etcd3.MultiEndpointEtcd3Client(endpoints,
+                                              timeout=10,
+                                              user=user,
+                                              password=password)
 
     def __init__(self,
                  cluster_uri: str,
                  cluster_name: str,
                  one_single_lease: bool = False,
-                 **kwargs):
+                 user: Optional[str] = None,
+                 password: Optional[str] = None,
+                 ca_cert: Optional[str] = None,
+                 cert_key: Optional[str] = None,
+                 cert_cert: Optional[str] = None,
+                 record_auth_key: Optional[str] = None,
+                 **kwargs) -> None:
+        """Keep the connection settings; the first storage call connects to etcd."""
         self._cluster_uri = cluster_uri
-        self._client = self._connect(self._cluster_uri)
+        self._client_options = dict(user=user,
+                                    password=password,
+                                    ca_cert=ca_cert,
+                                    cert_key=cert_key,
+                                    cert_cert=cert_cert)
+        self._record_auth_key = record_auth_key
+        self._client: Optional[etcd3.MultiEndpointEtcd3Client] = None
+        self._connect_lock = asyncio.Lock()
         self._leases = {}
         self._instance_lease = None
         self._watch_handles = {}
@@ -611,7 +808,8 @@ class Etcd3ClusterStorage(ClusterStorage):
 
     def __del__(self):
         self._watch_handles.clear()
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
     def _get_lease(self, key: str, ttl: int = -1) -> etcd3.Lease:
         if ttl <= 0:
@@ -623,11 +821,78 @@ class Etcd3ClusterStorage(ClusterStorage):
         return self._leases[key]
 
     @property
-    def client(self):
+    def client(self) -> Optional[etcd3.MultiEndpointEtcd3Client]:
+        """The etcd client, or None until a storage call connects."""
         return self._client
 
-    def reconnect(self):
-        self._client = self._connect(self._cluster_uri)
+    @property
+    def logs_in(self) -> bool:
+        """Whether the storage logs in to etcd with a user name and password."""
+        return self._client_options["user"] is not None
+
+    async def connect(self) -> None:
+        """Connect to etcd unless connected.
+
+        With a user name and password, connecting includes a login request, so it
+        runs on a worker thread instead of the event loop.
+        """
+        async with self._connect_lock:
+            if self._client is None:
+                self._client = await asyncio.to_thread(self._connect,
+                                                       self._cluster_uri,
+                                                       **self._client_options)
+
+    def reconnect(self) -> None:
+        """Close the current connection; the next storage call connects again."""
+        client, self._client = self._client, None
+        if client is not None:
+            client.close()
+
+    def _encode_record(self, key: str, value: str) -> str:
+        """The record to store: with record_auth_key, the value and its signature as JSON."""
+        if self._record_auth_key is None:
+            return value
+        return json.dumps({
+            "value":
+            value,
+            RECORD_SIGNATURE_FIELD:
+            sign_record(self._record_auth_key, key, value)
+        })
+
+    def _decode_record(self, key: str, stored: bytes) -> Optional[str]:
+        """The value of the record stored under ``key``, or None if it is not a valid record."""
+        try:
+            stored = stored.decode("utf-8")
+        except UnicodeDecodeError:
+            return _ignore_record(key, "its value is not valid UTF-8")
+        if self._record_auth_key is None:
+            return stored
+        try:
+            record = json.loads(stored)
+        except (ValueError, RecursionError):
+            record = None
+        if not isinstance(record, dict) or not isinstance(
+                record.get("value"), str):
+            return _ignore_record(
+                key, "it is not a signed record; check that every server and "
+                "worker of the cluster sets record_auth_key")
+        if not signature_matches(self._record_auth_key, key, record["value"],
+                                 record.get(RECORD_SIGNATURE_FIELD)):
+            return _ignore_record(
+                key, "its signature does not match; check that every server "
+                "and worker of the cluster uses the same record_auth_key")
+        return record["value"]
+
+    def _read_prefix(self, key_prefix: str) -> Tuple[Dict[str, str], int]:
+        """The valid records under ``key_prefix`` and the etcd revision of the read."""
+        response = self.client.get_prefix_response(key_prefix)
+        records = {}
+        for kv in response.kvs:
+            key = _decode_key(kv.key)
+            value = None if key is None else self._decode_record(key, kv.value)
+            if value is not None:
+                records[key] = value
+        return records, response.header.revision
 
     async def start(self):
         # nothing to do
@@ -644,6 +909,7 @@ class Etcd3ClusterStorage(ClusterStorage):
                   overwrite_if_exists: bool = False,
                   ttl: int = -1) -> bool:
         lease = self._get_lease(key, ttl)
+        value = self._encode_record(key, value)
         if not overwrite_if_exists:
             return self.client.put_if_not_exists(key, value, lease=lease)
         else:
@@ -653,7 +919,7 @@ class Etcd3ClusterStorage(ClusterStorage):
     @handle_etcd_error(return_on_error=None)
     async def get(self, key: str) -> str:
         data, meta = self.client.get(key)
-        return data.decode('utf-8') if data else None
+        return self._decode_record(key, data) if data else None
 
     @handle_etcd_error(return_on_error=False)
     async def delete(self, key: str) -> bool:
@@ -674,23 +940,93 @@ class Etcd3ClusterStorage(ClusterStorage):
     async def get_prefix(self,
                          key_prefix: str,
                          keys_only: bool = False) -> Dict[str, str]:
-        resp = self.client.get_prefix(key_prefix)
-        return {
-            metadata.key.decode("utf-8"): "" if keys_only else v.decode("utf-8")
-            for v, metadata in resp
-        }
+        records, _ = self._read_prefix(key_prefix)
+        return {key: "" for key in records} if keys_only else records
 
     @handle_etcd_error(return_on_error=None)
     async def watch(self, key_prefix: str) -> WatchEventQueue:
         if key_prefix in self._watch_handles:
             return self._watch_handles[key_prefix]
-        watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix)
-        watch_id = self.client.add_watch_prefix_callback(
-            key_prefix, watch_handle.add_events_from_resp)
-        watch_handle.set_cancel_event(
-            lambda: self.client.cancel_watch(watch_id))
+        watch_handle = Etcd3WatchEventQueue(key_prefix, self._decode_record,
+                                            self._on_watch_stream_end,
+                                            asyncio.get_running_loop())
+        await self._start_watch(watch_handle)
         self._watch_handles[key_prefix] = watch_handle
+        if watch_handle.stream_ended:
+            # The stream ended before the handle was cached.
+            self._on_watch_stream_end(watch_handle, watch_handle.stream)
         return watch_handle
+
+    async def _start_watch(self,
+                           handle: Etcd3WatchEventQueue,
+                           start_revision: Optional[int] = None) -> None:
+        """Fill ``handle`` from a new watch stream on the current client.
+
+        The stream reports the changes from etcd revision ``start_revision`` on, or from now on
+        if it is None.
+        """
+        handle.cancel_event()
+        handle.stream += 1
+        client = self.client
+        watch_id = await asyncio.to_thread(client.add_watch_prefix_callback,
+                                           handle.key_prefix,
+                                           partial(handle.add_events_from_resp,
+                                                   handle.stream),
+                                           start_revision=start_revision)
+        # Cancel on the client that owns the watch, also after a reconnect.
+        handle.set_cancel_event(partial(client.cancel_watch, watch_id))
+
+    def _on_watch_stream_end(self, handle: Etcd3WatchEventQueue,
+                             stream: int) -> None:
+        """Watch again when the current stream of a watched prefix ends.
+
+        A handle that ``watch()`` has not cached yet only keeps ``stream_ended`` set;
+        ``watch()`` restarts it once cached.
+        """
+        if stream != handle.stream:
+            return
+        handle.stream_ended = True
+        if self._watch_handles.get(handle.key_prefix) is not handle:
+            return
+        if handle.restart_task is None or handle.restart_task.done():
+            logger.warning(
+                f"The etcd watch of {handle.key_prefix!r} ended, watching again"
+            )
+            handle.restart_task = asyncio.create_task(
+                self._restart_watch(handle))
+
+    async def _restart_watch(self, handle: Etcd3WatchEventQueue) -> None:
+        """Queue what changed meanwhile, then watch on a new stream from there until one starts."""
+        delay = _WATCH_RETRY_MIN_SEC
+        while self._watch_handles.get(handle.key_prefix) is handle:
+            handle.stream_ended = False
+            try:
+                await self.connect()
+                client = self.client
+                records, revision = self._read_prefix(handle.key_prefix)
+                # The new stream reports the changes made after the read, so
+                # the consumer gets them after the resync, in etcd's order.
+                handle.resync(records)
+                await self._start_watch(handle, start_revision=revision + 1)
+                if self._watch_handles.get(handle.key_prefix) is not handle:
+                    # unwatch() ran while the stream started; nothing reads it.
+                    handle.cancel_event()
+                    return
+                # etcd does not report a watch that it did not start because
+                # it rejected the login token; a read with the same login does.
+                client.get(handle.key_prefix)
+            except (etcd3.Etcd3Exception, grpc.RpcError, OSError,
+                    ValueError) as e:
+                handle.stream_ended = True
+                logger.warning(
+                    f"Could not watch {handle.key_prefix!r} again, trying "
+                    f"again in {delay} seconds: {_describe_error(e)}")
+                self.reconnect()
+            if not handle.stream_ended:
+                logger.info(f"Watching {handle.key_prefix!r} again")
+                return
+            await asyncio.sleep(delay)
+            delay = min(2 * delay, _WATCH_RETRY_MAX_SEC)
 
     async def unwatch(self, key_prefix: str) -> None:
         handle = self._watch_handles.pop(key_prefix)

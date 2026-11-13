@@ -49,7 +49,12 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -175,6 +180,7 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+    enable_kv_pool_rebalance: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -334,13 +340,34 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    num_draft_layers: int = 0,
 ) -> "KVCacheManagerV2":
-    """Create a KVCacheManagerV2 for the given mapping."""
+    """Create a KVCacheManagerV2 for the given mapping.
+
+    ``num_draft_layers`` K-only draft-owned layers follow the target's (MLA, pp 1),
+    as a standalone MLA drafter's unified draft KV cache lays them out.
+    """
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
 
     if max_attention_window_vec is None:
         max_attention_window_vec = [MAX_SEQ_LEN]
+    layer_specs = None
+    if num_draft_layers:
+        assert is_mla and mapping.pp_size == 1
+        layer_specs = tuple(
+            KVCacheLayerSpec(
+                global_layer_id=layer_id,
+                owner=(
+                    KVCacheLayerOwner.TARGET if layer_id < num_layers else KVCacheLayerOwner.DRAFT
+                ),
+                dtype=DataType.FLOAT,
+                num_kv_heads=1,
+                head_dim=HEAD_DIM,
+                buffer_roles=(Role.KEY,),
+            )
+            for layer_id in range(num_layers + num_draft_layers)
+        )
 
     return KVCacheManagerV2(
         KvCacheConfigV2(
@@ -358,6 +385,8 @@ def _create_cache_manager(
         mapping=mapping,
         dtype=DataType.FLOAT,
         vocab_size=VOCAB_SIZE,
+        is_disagg=True,
+        layer_specs=layer_specs,
     )
 
 
@@ -371,6 +400,7 @@ def _create_managers_for_instance(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     cp_size: int = 1,
+    num_draft_layers: int = 0,
 ) -> list[KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance.
 
@@ -402,6 +432,7 @@ def _create_managers_for_instance(
                         max_attention_window_vec,
                         num_layers,
                         max_batch_size,
+                        num_draft_layers,
                     )
                 )
     return managers
@@ -952,6 +983,23 @@ def verify_all_requests_helix(
 # ---------------------------------------------------------------------------
 # Main test orchestrator
 # ---------------------------------------------------------------------------
+def _send_prefill_in_pieces(transceiver, req: LlmRequest, piece_tokens: int) -> int:
+    """Send the prompt's KV in pieces of piece_tokens and return the number of pieces sent.
+
+    One context chunk per piece, as the executor does with enable_pipelined_transfer.
+    """
+    # A non-final piece without a complete block is not sent, which would break the count.
+    assert piece_tokens % TOKENS_PER_BLOCK == 0
+    pieces = 0
+    for start in range(0, req.prompt_len, piece_tokens):
+        end = min(start + piece_tokens, req.prompt_len)
+        req.py_last_context_chunk = (start, end)
+        req.context_current_position = end
+        transceiver.respond_and_send_async(req)
+        pieces += 1
+    return pieces
+
+
 def run_transfer_test(
     ctx_tp: int,
     ctx_pp: int,
@@ -967,8 +1015,16 @@ def run_transfer_test(
     expect_cpp_bounce: bool = False,
     gen_scratch_tokens: int = 0,
     gen_cp: int = 1,
+    pipelined_piece_tokens: Optional[int] = None,
+    num_draft_layers: int = 0,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2.
+
+    num_draft_layers > 0 adds K-only draft-owned layers after the target's on
+    both sides (a unified draft KV cache); they must transfer like the target's.
+
+    pipelined_piece_tokens enables enable_pipelined_transfer: the context sends each prompt in
+    pieces of that many tokens instead of whole.
 
     gen_scratch_tokens > 0 sizes the generation cache to
     prompt_len + gen_scratch_tokens (history still prompt_len), materialising an
@@ -1004,6 +1060,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        num_draft_layers=num_draft_layers,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -1015,6 +1072,7 @@ def run_transfer_test(
         num_layers,
         max_batch_size,
         cp_size=gen_cp,
+        num_draft_layers=num_draft_layers,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -1028,18 +1086,17 @@ def run_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
-        # Keep the Python-native bounce layer disabled by default (size 0).
-        # Dedicated C++ bounce coverage enables the NIXL agent's bounce v2 via
-        # agent_bounce_buffer_enable + kv_cache_bounce_size_mb plus
-        # agent_bounce_params, which exercises the config plumbing end-to-end.
+        # Bounce is off unless expect_cpp_bounce. Then a positive kv_cache_bounce_size_mb
+        # enables the C++ agent bounce, and agent_bounce_params (a loose gate) exercises
+        # the config plumbing end to end.
         kv_cache_bounce_size_mb=64 if expect_cpp_bounce else 0,
-        agent_bounce_buffer_enable=expect_cpp_bounce,
         agent_bounce_params={
             "min_descriptor_count": "1",
             "max_average_descriptor_size": "1MB",
         }
         if expect_cpp_bounce
         else None,
+        enable_pipelined_transfer=pipelined_piece_tokens is not None,
     )
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
@@ -1164,12 +1221,18 @@ def run_transfer_test(
                 gen_tcs[rank].request_and_receive_async(req)
 
         # 6. ctx send after
+        pieces_sent = 0
         for rank in range(ctx_world):
             for req_idx, req in ctx_handle_map[rank]:
                 kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len, use_v2)
                 if kv is not None:
                     ctx_kv_caches[rank].append(kv)
-                ctx_tcs[rank].respond_and_send_async(req)
+                if pipelined_piece_tokens is None:
+                    ctx_tcs[rank].respond_and_send_async(req)
+                else:
+                    pieces_sent += _send_prefill_in_pieces(
+                        ctx_tcs[rank], req, pipelined_piece_tokens
+                    )
 
         # 7. Wait for completion (threaded, dist calls inside)
         run_concurrent(
@@ -1188,7 +1251,7 @@ def run_transfer_test(
                 is_mla=is_mla,
                 gen_cp=gen_cp,
                 max_attention_window_vec=max_attention_window_vec,
-                num_layers=num_layers,
+                num_layers=num_layers + num_draft_layers,
             )
         else:
             verify_all_requests(
@@ -1206,7 +1269,9 @@ def run_transfer_test(
                 is_mla=is_mla,
                 use_v2=use_v2,
                 max_attention_window_vec=max_attention_window_vec,
-                num_layers=num_layers,
+                # Draft-owned layers appended after the target's must move like
+                # the target's; verify their contents outside helix too.
+                num_layers=num_layers + num_draft_layers,
                 gen_scratch_tokens=gen_scratch_tokens,
             )
 
@@ -1214,17 +1279,21 @@ def run_transfer_test(
         # bounce v2 transport active, and at least one transfer must have been routed
         # through it (only KV senders submit WRITEs, so we assert on the total).
         if expect_cpp_bounce:
-            # The shared capacity must be routed to exactly one implementation: with
-            # agent_bounce_buffer_enable the Python-native bounce stays off.
-            assert all(tc._transfer_worker._config.bounce is None for tc in ctx_tcs + gen_tcs), (
-                "Python-native bounce must stay disabled when the C++ agent bounce is selected"
-            )
             agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
             assert all(getattr(agent, "bounce_enabled", False) for agent in agents), (
                 "C++ bounce v2 transport is not active on every NIXL agent"
             )
             total_bounce_submits = sum(agent.bounce_submit_count for agent in agents)
             assert total_bounce_submits > 0, "no transfer was routed through the bounce fast path"
+            if pipelined_piece_tokens is not None:
+                # Exact for one context rank writing one generation rank: each piece is one
+                # transfer request, and every one of them must take the bounce.
+                assert len(ctx_tcs) == len(gen_tcs) == 1
+                ctx_agents = [tc._transfer_worker._agent for tc in ctx_tcs]
+                assert all(agent.bounce_reject_count == 0 for agent in ctx_agents), [
+                    agent.bounce_reject_counts for agent in ctx_agents
+                ]
+                assert sum(agent.bounce_submit_count for agent in ctx_agents) == pieces_sent
 
     finally:
         # Teardown must run on the failure path too, in this order:
@@ -1514,6 +1583,52 @@ def test_cache_transceiver_helix_cp(gen_cp, is_mla):
     print("PASSED")
 
 
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("gen_cp", [2, 4, 8], ids=["cp2", "cp4", "cp8"])
+def test_cache_transceiver_helix_cp_with_draft_layers(gen_cp):
+    """Unified draft KV cache under helix: draft pages move like the target's.
+
+    K-only draft layers after the MLA target's on both sides transfer with the
+    target's block stride, so each generation CP rank holds the drafter's
+    context pages [cp_rank::cp_size].
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=True,
+        max_attention_window_vec=None,
+        gen_cp=gen_cp,
+        num_draft_layers=2,
+    )
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_with_draft_layers():
+    """Unified draft KV cache without helix: draft layers move like the target's.
+
+    K-only draft layers appended after the MLA target's on both sides transfer
+    with the target's blocks, and the verifier checks their contents at
+    gen_cp==1 (the only case the helix tests leave uncovered).
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=True,
+        max_attention_window_vec=None,
+        num_draft_layers=2,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Boundary request-length tests
 # ---------------------------------------------------------------------------
@@ -1636,11 +1751,13 @@ def test_cache_transceiver_boundary_lengths(
         "gen_pp",
         "is_mla",
         "use_v2",
+        "pipelined_piece_tokens",
     ),
     [
-        pytest.param(1, 1, 1, 1, False, True, id="v2_mha"),
-        pytest.param(2, 1, 2, 1, True, True, id="v2_mla_tp2"),
-        pytest.param(2, 1, 1, 2, False, True, id="v2_ctx_tp2_gen_pp2"),
+        pytest.param(1, 1, 1, 1, False, True, None, id="v2_mha"),
+        pytest.param(2, 1, 2, 1, True, True, None, id="v2_mla_tp2"),
+        pytest.param(2, 1, 1, 2, False, True, None, id="v2_ctx_tp2_gen_pp2"),
+        pytest.param(1, 1, 1, 1, False, True, 2 * TOKENS_PER_BLOCK, id="v2_mha_pipelined"),
     ],
 )
 def test_python_nixl_cache_transceiver_uses_cpp_bounce(
@@ -1650,13 +1767,13 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     gen_pp: int,
     is_mla: bool,
     use_v2: bool,
+    pipelined_piece_tokens: Optional[int],
 ) -> None:
     """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
 
-    Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb) and tuned
-    (agent_bounce_params) via CacheTransceiverConfig inside run_transfer_test, covering
-    the config plumbing end-to-end; engagement is asserted programmatically there
-    (agent.bounce_enabled / bounce_submit_count).
+    Bounce is enabled by kv_cache_bounce_size_mb and tuned by agent_bounce_params via
+    CacheTransceiverConfig inside run_transfer_test, which covers the config plumbing end to
+    end and asserts engagement (agent.bounce_enabled / bounce_submit_count).
     """
     # BindingsNixlTransferStatus.last_status_str() resolves this exact attribute on the C++
     # status; if the binding name drifts, failure details silently degrade to "<unavailable>".
@@ -1675,4 +1792,5 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         use_v2=use_v2,
         request_lengths=[30, 60],
         expect_cpp_bounce=True,
+        pipelined_piece_tokens=pipelined_piece_tokens,
     )

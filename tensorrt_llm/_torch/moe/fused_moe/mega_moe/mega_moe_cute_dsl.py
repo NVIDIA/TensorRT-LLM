@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import functools
 import os
-import socket
 import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -661,6 +660,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # time would be collective on a non-synchronous call stack and
         # deadlock under PP / layer-skip. Construction is globally
         # synchronous across ranks during model build.
+        #
+        # The bootstrap stays OUTSIDE the single-rank fallback below. Every
+        # torch.distributed error is a RuntimeError, and swallowing a failed
+        # ``init_process_group`` makes the next MegaMoE layer retry it on the
+        # failing rank alone. ``init_process_group`` names the default group
+        # from a counter it bumps before the rendezvous, so the retrying rank
+        # exchanges gloo addresses under different store keys than its peers
+        # and every rank hangs until the process-group timeout.
+        self._maybe_init_torch_dist_under_mpi()
         try:
             self._ep_pg = self._resolve_ep_pg()
         except RuntimeError as e:
@@ -696,14 +704,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._weights_loaded = False
         self._weights_created = False
         self.quant_method = None
-        # Per-instance staging cache (key -> {tensor name: tensor}) and
-        # last-staged-T tracker; together they implement the always-pad-
-        # to-max_T launch contract by refreshing only the rows that
-        # changed between calls. ``_last_staged_T`` is keyed by bucket max_T:
-        # each bucket's staging buffer has its own row-reset history (a shared
-        # scalar would reset the wrong buffer when buckets alternate).
+        # Per-instance staging cache (key -> {tensor name: tensor}); see
+        # ``_stage_inputs`` for the always-pad-to-max_T launch contract.
         self._local_staging_cache: Dict[Tuple, Dict[str, torch.Tensor]] = {}
-        self._last_staged_T: Dict[int, int] = {}
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -866,88 +869,20 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         The MPI orchestrator (trtllm-bench / mpirun) never calls
         ``init_process_group``, but the symmetric-memory rendezvous needs a
         ProcessGroup; for pure DEP a node-local NCCL WORLD suffices. No-op
-        under Ray or single-rank.
+        under Ray or single-rank. Failures propagate: a rank that retried
+        ``init_process_group`` alone would never rendezvous with its peers.
         """
-        if not dist.is_available() or dist.is_initialized():
-            return
-        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+        from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
 
-        try:
-            world = mpi_world_size()
-            rank = mpi_rank()
-        except Exception as e:  # not under MPI either -> leave uninitialized
-            logger.debug(
-                f"[MegaMoECuteDsl] MPI rank query failed ({e!r}); "
-                "skipping torch.distributed bootstrap."
-            )
-            return
-        if world <= 1:
-            return
-        # Check pure DEP BEFORE any collective: under PP/CP hybrids some ranks
-        # never construct a MegaMoE module, so the bcast/init below would hang
-        # instead of failing loud. Rank-identical inputs -> lockstep raise.
-        if world != self.ep_size:
-            raise ValueError(
-                f"MegaMoECuteDsl requires pure DEP (MPI WORLD == EP) to "
-                f"bootstrap torch.distributed: got MPI world={world}, "
-                f"EP={self.ep_size}."
-            )
-
-        # Rank 0 draws a free port (a fixed one collides across same-node
-        # jobs). The bcast is UNCONDITIONAL and rank 0 alone decides
-        # (honoring ITS pre-set MASTER_* env): gating the collective on
-        # per-rank env presence would desync the communicator when the vars
-        # are exported on only a subset of ranks. No bind-race retry: a sound
-        # one needs cross-rank failure agreement, and the close()->bind()
-        # window is negligible next to the fixed-port collision this replaces.
-        def _pick_rendezvous():
-            addr = os.environ.get("MASTER_ADDR")
-            port = os.environ.get("MASTER_PORT")
-            if addr and port:
-                return (addr, port)
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("", 0))
-                port = sock.getsockname()[1]
-            try:
-                addr = socket.gethostbyname(socket.gethostname())
-            except OSError:
-                # Unresolvable hostname (minimal containers / broken DNS):
-                # this bootstrap is documented single-node, loopback works.
-                addr = "127.0.0.1"
-            return (addr, str(port))
-
-        host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
-        os.environ["MASTER_ADDR"] = str(host)
-        os.environ["MASTER_PORT"] = str(port)
-        # The executor already bound this rank's device before the model was
-        # built (base_worker: global_mpi_rank() % device_count). Re-deriving it
-        # here could pick a different GPU (e.g. a disagg ctx/gen pair sharing a
-        # node) and would move only the layers built after this point, so bind
-        # NCCL to the current device instead of selecting one.
-        device_id = None
-        if torch.cuda.is_available():
-            device_id = torch.device("cuda", torch.cuda.current_device())
-        logger.info(
-            f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
-            f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
-            f"device={device_id}, "
-            f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
-            f"EP rendezvous."
-        )
-        dist.init_process_group(
-            backend="cuda:nccl,cpu:gloo",
-            rank=rank,
-            world_size=world,
-            device_id=device_id,
-        )
+        ensure_cutedsl_torch_distributed(self.ep_size)
 
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.
 
         Mirrors :meth:`MegaMoEDeepGemm._resolve_ep_pg` so the two MegaMoE
-        backends share the same fallback chain.
+        backends share the same fallback chain. The caller runs
+        :meth:`_maybe_init_torch_dist_under_mpi` first.
         """
-        self._maybe_init_torch_dist_under_mpi()
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError(
                 "MegaMoECuteDsl requires torch.distributed to be initialized "
@@ -1599,11 +1534,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         Tail policy:
 
-          * ``topk_idx_local``: always ``-1`` outside live rows.
-            Allocated as ``-1`` once in ``_ensure_local_staging``;
-            only the rows we previously wrote (``[num_tokens,
-            last_T)``) need resetting. New tail rows
-            ``[last_T, max_T)`` already hold ``-1`` from prior calls.
+          * ``topk_idx_local``: always ``-1`` outside live rows, reset
+            over the whole tail on every call. A host-side record of the
+            rows a previous call wrote cannot be trusted: a CUDA graph
+            replays the reset range recorded at capture, after any other
+            graph or eager call. A valid route left in the tail is
+            dispatched, and the SM107 polled top-k reduce, whose grid
+            covers only the live rows, never consumes its combine cells;
+            a later call then reads them as already arrived.
           * ``topk_weights``: always ``0.0`` outside live rows. The
             combine kernel writes one cell per
             ``(token, k in [0, top_k))`` regardless of the
@@ -1613,9 +1551,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             it.
         """
         max_T = bufs.topk_idx_local.shape[0]
-        last_T = self._last_staged_T.get(max_T)
-        if last_T is not None and last_T > num_tokens:
-            bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
+        if num_tokens < max_T:
+            bufs.topk_idx_local[num_tokens:].fill_(-1)
         if num_tokens > 0:
             if stage_activation:
                 bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
@@ -1626,7 +1563,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if num_tokens > 0:
             self._wait_rebalance_routes(replica_plan)
             bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
-        self._last_staged_T[max_T] = num_tokens
 
     def _launch_megamoe_kernel(
         self,

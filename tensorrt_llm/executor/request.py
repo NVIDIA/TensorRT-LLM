@@ -23,6 +23,8 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.kv_hints import KvHintsInput
+from tensorrt_llm.kv_hints.protocol import snapshot_kv_hints
 
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -129,6 +131,7 @@ class GenerationRequest:
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ):
         if prompt_adapter_request is not None:
             warnings.warn(
@@ -173,6 +176,7 @@ class GenerationRequest:
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
         self.conversation_params = conversation_params
+        self.kv_hints = snapshot_kv_hints(kv_hints)
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(
@@ -253,6 +257,19 @@ class GenerationRequest:
         # replaced prompt must not leave the old tokens behind in it.
         self._prompt_token_ids_i32 = None
 
+    @property
+    def num_prompt_tokens(self) -> int:
+        """Prompt length, read off the int32 buffer when the list was never built.
+
+        Metrics and tracing need only the length; going through
+        `prompt_token_ids` would materialize the O(ISL) list the buffer avoids.
+        """
+        ptids = self.__dict__.get("_prompt_token_ids")
+        if ptids is not None:
+            return len(ptids)
+        buf = self.__dict__.get("_prompt_token_ids_i32")
+        return 0 if buf is None else len(buf)
+
     @staticmethod
     def _enc_tokens(v):
         # flat list[int] -> (_I32, int32 bytes); leave None / list[list[int]] /
@@ -274,6 +291,7 @@ class GenerationRequest:
         return state
 
     def __setstate__(self, state):
+        state.setdefault("kv_hints", None)
         buf = None
         pt = state.get("_prompt_token_ids")
         if type(pt) is tuple and len(

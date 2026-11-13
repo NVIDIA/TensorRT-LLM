@@ -627,6 +627,7 @@ def test_packed_helper_skips_bf16_staging(extra_width, monkeypatch):
         extra_valid[1] = False
     sink = torch.randn(heads, device="cuda")
     args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+    records = None
     if extra is not None:
         packed = args.sparse_backend_args.main_pool
         records = torch.full((packed.shape[0], 356), 73, dtype=torch.uint8, device="cuda")
@@ -641,7 +642,7 @@ def test_packed_helper_skips_bf16_staging(extra_width, monkeypatch):
     torch.testing.assert_close(
         output, _decoded_reference(q, args, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
     )
-    if extra is not None:
+    if records is not None:
         assert bool((records[:, 288:] == 73).all())
     # Reusing the selected library must revalidate unsupported output options.
     args.out_scale = torch.ones(1, device="cuda")
@@ -1045,6 +1046,7 @@ def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, 
         output = run()
     assert calls and all(p == args.attention_input_type for p in calls)
     graph = None
+    pointers = None
     if phase == "captured_context":
         pointers = (
             metadata.swa_pool.data_ptr(),
