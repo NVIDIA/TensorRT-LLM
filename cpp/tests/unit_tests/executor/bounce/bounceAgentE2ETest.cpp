@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -421,4 +422,64 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     {
         freeXferBufs(x);
     }
+}
+
+// setScatterOrderStream / getBounceOrderedScatterCount racing shutdown(): both hold the agent's shared lock
+// across their bounce-state check and the transport call, so neither reads a transport shutdown() is
+// destroying; after shutdown both report bounce gone.
+TEST(BounceAgentE2E, OrderStreamCallsRaceShutdown)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeBounceConfig("bAgentRace"), skipMsg);
+    if (!a)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> calls{0};
+    std::vector<std::thread> callers;
+    for (int i = 0; i < 4; ++i)
+    {
+        callers.emplace_back(
+            [&, i]
+            {
+                while (!stop.load())
+                {
+                    if (i % 2 == 0)
+                    {
+                        (void) a->setScatterOrderStream(reinterpret_cast<std::uintptr_t>(stream));
+                        (void) a->setScatterOrderStream(0);
+                    }
+                    else
+                    {
+                        (void) a->getBounceOrderedScatterCount();
+                    }
+                    calls.fetch_add(1);
+                }
+            });
+    }
+    while (calls.load() < 1000)
+    {
+        std::this_thread::yield();
+    }
+    a->shutdown();
+    auto const atShutdown = calls.load();
+    while (calls.load() < atShutdown + 1000)
+    {
+        std::this_thread::yield();
+    }
+    stop.store(true);
+    for (auto& t : callers)
+    {
+        t.join();
+    }
+    EXPECT_FALSE(a->setScatterOrderStream(reinterpret_cast<std::uintptr_t>(stream)));
+    EXPECT_EQ(a->getBounceOrderedScatterCount(), 0u);
+    cudaStreamDestroy(stream);
 }

@@ -551,6 +551,80 @@ def test_dspark_device_reranking_field(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [("standard", True), ("block", True), ("tree", False), (True, False), (None, False)],
+)
+def test_rejection_sample_method_field(
+    schemas: dict[str, dict], filename: str, value: object, valid: bool
+) -> None:
+    for decoding_type in ("MTP", "DSpark"):
+        name = "MTPDecodingConfig" if decoding_type == "MTP" else "DSparkDecodingConfig"
+        field = schemas[filename]["$defs"][name]["properties"]["rejection_sample_method"]
+        assert field["default"] == "standard"
+        config = {
+            "speculative_config": {
+                "decoding_type": decoding_type,
+                "max_draft_len": 3,
+                "use_rejection_sampling": True,
+                "rejection_sample_method": value,
+            }
+        }
+        errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+        assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(("value", "valid"), [("standard", True), ("block", True), ("tree", False)])
+def test_rejection_sample_method_runtime_matches_schema(value: str, valid: bool) -> None:
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    if valid:
+        config = MTPDecodingConfig(max_draft_len=3, rejection_sample_method=value)
+        assert config.rejection_sample_method == value
+    else:
+        with pytest.raises(ValidationError):
+            MTPDecodingConfig(max_draft_len=3, rejection_sample_method=value)
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"), [(True, True), (False, True), ("invalid", False), (None, False)]
+)
+def test_disagg_completion_reservation_field(
+    schemas: dict[str, dict], filename: str, value: object, valid: bool
+) -> None:
+    field = schemas[filename]["$defs"]["KvCacheConfig"]["properties"][
+        "enable_disagg_completion_reservation"
+    ]
+    assert field["default"] is False
+    config = {"kv_cache_config": {"enable_disagg_completion_reservation": value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
+def test_disagg_completion_reservation_runtime_matches_schema(value: object, valid: bool) -> None:
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    if valid:
+        assert (
+            KvCacheConfig(
+                enable_disagg_completion_reservation=value
+            ).enable_disagg_completion_reservation
+            is value
+        )
+    else:
+        with pytest.raises(ValidationError):
+            KvCacheConfig(enable_disagg_completion_reservation=value)
+
+
 @pytest.mark.parametrize(
     ("load_balancer", "valid"),
     [

@@ -71,8 +71,43 @@ def test_every_field_defaults_to_off():
             assert all(
                 getattr(value, item.name) in (False, None) for item in dataclasses.fields(value)
             )
+        elif field.name == "prefill_capture_extra_num_tokens":
+            assert value == ()
         else:
             assert value in (False, None), field.name
+
+
+_ENGINE_OPT_IN_FIELDS = (
+    "pack_cpp_scatter",
+    "persist_flashinfer_mxfp8_tactics",
+    "spec_tail_bookkeep",
+    "draft_pool_fixes",
+    "draft_kv_reserve_guard",
+    "skip_unchanged_draft_block_offsets",
+    "patch_unchanged_draft_block_offsets",
+    "disagg_draft_kv",
+    "defer_gen_reuse_commit",
+)
+
+
+@pytest.mark.parametrize("field", _ENGINE_OPT_IN_FIELDS)
+def test_each_engine_opt_in_defaults_off_and_is_a_plain_bool(field):
+    default = next(f for f in dataclasses.fields(RuntimeHooks) if f.name == field)
+    assert default.default is False
+    assert getattr(RuntimeHooks(**{field: True}), field) is True
+
+
+@pytest.mark.parametrize(
+    "hooks, skips",
+    [
+        (RuntimeHooks(), False),
+        (RuntimeHooks(skip_unchanged_draft_block_offsets=True), True),
+        (RuntimeHooks(patch_unchanged_draft_block_offsets=True), False),
+    ],
+    ids=["default", "draft_block_offset_skip", "patch_alone"],
+)
+def test_the_draft_block_offset_skip_asks_for_private_metadata_buffers(hooks, skips):
+    assert hooks.skips_unchanged_metadata_uploads is skips
 
 
 def test_hooks_declared_as_none_mean_the_default():

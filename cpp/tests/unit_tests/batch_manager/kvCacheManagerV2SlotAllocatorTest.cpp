@@ -22,7 +22,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -99,6 +101,49 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ShrinkTouchedPool)
 
     // Leave the allocator quiescent so the debug-build destructor checks pass.
     releaseSlots(allocator, slots, 0, 8);
+}
+
+// The lazy scrub must keep the eager scrub's choice: allocate() hands out recycled slots from the
+// front, in release order, and only then never-issued ids.
+TEST(KvCacheManagerV2SlotAllocatorTest, ReusesReleasedSlotsInReleaseOrder)
+{
+    SlotAllocator allocator{SlotCount{8}};
+    auto slots = allocateSlots(allocator, 4);
+    std::vector<Slot> reordered;
+    for (std::size_t const i : {std::size_t{2}, std::size_t{0}, std::size_t{3}, std::size_t{1}})
+    {
+        reordered.emplace_back();
+        reordered.back().setSlot(slots[i]);
+    }
+    releaseSlots(allocator, reordered);
+
+    auto again = allocateSlots(allocator, 5);
+    std::vector<SlotId::ValueType> ids;
+    for (auto const& slot : again)
+    {
+        ids.push_back(slot.slotId().value());
+    }
+    EXPECT_EQ(ids, (std::vector<SlotId::ValueType>{2, 0, 3, 1, 4}));
+
+    releaseSlots(allocator, again);
+}
+
+// TRTLLM_KVCM2_DISABLE_LAZY_SCRUB=1 is the only way to turn the lazy scrub off.
+TEST(KvCacheManagerV2SlotAllocatorTest, LazyScrubFollowsItsKillSwitch)
+{
+    char const* env = std::getenv("TRTLLM_KVCM2_DISABLE_LAZY_SCRUB");
+    bool const disabled = env != nullptr && std::string_view{env} == "1";
+    EXPECT_EQ(SlotAllocator::lazyScrubEnabled(), !disabled);
+}
+
+// An allocator destroyed right after its slots come back, with no synchronize() in between, must pass
+// the debug-build destructor checks: the released slots carry no pending event.
+TEST(KvCacheManagerV2SlotAllocatorTest, DestroyedRightAfterRelease)
+{
+    SlotAllocator allocator{SlotCount{4}};
+    auto slots = allocateSlots(allocator, 4);
+    releaseSlots(allocator, slots);
+    EXPECT_EQ(allocator.numFreeSlots(), 4);
 }
 
 // SlotId is signed, so an upper-bound-only test admits negative ids, which convert to a huge

@@ -108,3 +108,31 @@ TEST(ExecPool, StreamScratchAreUsable)
     EXPECT_EQ(in, out);
     pool.release(c);
 }
+
+TEST(ExecPool, CopyStreamPriorityClass)
+{
+    if (!hasCuda())
+        GTEST_SKIP();
+    int least = 0;
+    int greatest = 0;
+    ASSERT_EQ(cudaDeviceGetStreamPriorityRange(&least, &greatest), cudaSuccess);
+
+    struct Case
+    {
+        b::BounceConfig::StreamPriority cls;
+        int want;
+    };
+
+    for (auto const& c : {Case{b::BounceConfig::StreamPriority::kGreatest, greatest},
+             Case{b::BounceConfig::StreamPriority::kLeast, least}, Case{b::BounceConfig::StreamPriority::kDefault, 0}})
+    {
+        b::ExecPool pool(2, 64, 0, /*useZeroCopyArguments=*/true, c.cls);
+        EXPECT_EQ(pool.streamPriority(), c.want);
+        auto* ctx = pool.tryAcquire();
+        ASSERT_NE(ctx, nullptr);
+        int got = 12345;
+        ASSERT_EQ(cudaStreamGetPriority(ctx->stream, &got), cudaSuccess);
+        EXPECT_EQ(got, c.want);
+        pool.release(ctx);
+    }
+}

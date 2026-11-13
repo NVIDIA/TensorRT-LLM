@@ -294,3 +294,52 @@ TEST(BounceConfig, ParamsWithoutRequestTimeoutLeaveLeaseAlone)
     EXPECT_EQ(cfgDirect.receiverFlowTimeoutMs, 123456);
     EXPECT_EQ(cfgDirect.quarantineMs, 654321);
 }
+
+TEST(BounceConfig, ScatterOrderingKnobsDefaults)
+{
+    b::BounceConfig const cfg{};
+    EXPECT_TRUE(cfg.scatterOnOrderStream);
+    EXPECT_TRUE(cfg.scatterCopyEngine);
+    EXPECT_EQ(cfg.copyStreamPriority, b::BounceConfig::StreamPriority::kDefault);
+    EXPECT_EQ(cfg.maxCopyBlocks, 0u);
+}
+
+TEST(BounceConfig, ScatterOrderingKnobsParseFromParams)
+{
+    std::unordered_map<std::string, std::string> const params{{"scatter_on_order_stream", "off"},
+        {"copy_stream_priority", "LEAST"}, {"max_copy_blocks", "296"}, {"scatter_copy_engine", "off"}};
+    auto const cfg = b::BounceConfig::fromParams(params, b::BounceConfig{});
+    EXPECT_FALSE(cfg.scatterOnOrderStream);
+    EXPECT_FALSE(cfg.scatterCopyEngine);
+    EXPECT_EQ(cfg.copyStreamPriority, b::BounceConfig::StreamPriority::kLeast);
+    EXPECT_EQ(cfg.maxCopyBlocks, 296u);
+
+    std::unordered_map<std::string, std::string> const params2{{"copy_stream_priority", "greatest"}};
+    EXPECT_EQ(b::BounceConfig::fromParams(params2, b::BounceConfig{}).copyStreamPriority,
+        b::BounceConfig::StreamPriority::kGreatest);
+}
+
+TEST(BounceConfig, ScatterOrderingKnobsParseFromEnv)
+{
+    ScopedEnv env;
+    env.set("TRTLLM_NIXL_BOUNCE_SCATTER_ON_ORDER_STREAM", "0");
+    env.set("TRTLLM_NIXL_BOUNCE_COPY_STREAM_PRIORITY", "least");
+    env.set("TRTLLM_NIXL_BOUNCE_MAX_COPY_BLOCKS", "64");
+    env.set("TRTLLM_NIXL_BOUNCE_SCATTER_COPY_ENGINE", "0");
+    auto const cfg = b::BounceConfig::fromEnv();
+    EXPECT_FALSE(cfg.scatterOnOrderStream);
+    EXPECT_FALSE(cfg.scatterCopyEngine);
+    EXPECT_EQ(cfg.copyStreamPriority, b::BounceConfig::StreamPriority::kLeast);
+    EXPECT_EQ(cfg.maxCopyBlocks, 64u);
+}
+
+TEST(BounceConfig, ScatterOrderingKnobsGarbageKeepsDefaults)
+{
+    std::unordered_map<std::string, std::string> const params{{"scatter_on_order_stream", "maybe"},
+        {"copy_stream_priority", "highest"}, {"max_copy_blocks", "-1"}, {"scatter_copy_engine", "perhaps"}};
+    auto const cfg = b::BounceConfig::fromParams(params, b::BounceConfig{});
+    EXPECT_TRUE(cfg.scatterOnOrderStream);
+    EXPECT_TRUE(cfg.scatterCopyEngine);
+    EXPECT_EQ(cfg.copyStreamPriority, b::BounceConfig::StreamPriority::kDefault);
+    EXPECT_EQ(cfg.maxCopyBlocks, 0u);
+}
