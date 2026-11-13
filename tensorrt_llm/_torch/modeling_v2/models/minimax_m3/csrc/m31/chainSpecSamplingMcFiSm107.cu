@@ -24,6 +24,7 @@
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <cuda/atomic>
+#include <cuda/std/functional>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
@@ -47,13 +48,19 @@ constexpr int32_t kBlockSize = 1024;
 constexpr int32_t kVecSize = 4;
 constexpr int32_t kTileSize = kBlockSize * kVecSize;
 constexpr int32_t kMaxTiles = kChainSpecMcMaxVocab / kTileSize;
+constexpr int32_t kWarpSize = 32;
+constexpr int32_t kWarps = kBlockSize / kWarpSize;
+//! Each CTA owns kBlockSize / ctasPerRow of FlashInfer's thread lanes, so it holds whole warps of them.
+constexpr int32_t kMaxCtasPerRow = kWarps;
 
-//! One request's cross-CTA state: each chunk's residual sum and its last index with mass (-1 if none), and the
-//! arrival counter (each launch adds kBlockSize in total, whatever its ctasPerRow, so it needs no reset).
+//! One request's cross-CTA state: per chunk and per FlashInfer warp, the warp's residual sum and its last index with
+//! mass (-1 if none); per FlashInfer thread lane, its residual sum over all chunks; and the arrival counter (each
+//! launch adds kBlockSize in total, whatever its ctasPerRow, so it needs no reset).
 struct RowWorkspace
 {
-    float tileSum[kMaxTiles];
-    int32_t tileLast[kMaxTiles];
+    float warpSum[kMaxTiles][kWarps];
+    int32_t warpLast[kMaxTiles][kWarps];
+    float laneSum[kBlockSize];
     unsigned arrive;
     int32_t pad[3];
 };
@@ -90,7 +97,7 @@ __device__ __forceinline__ void loadResidual(
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh, FlashInfer v0.7.2). Copyright (c) 2024 by
+// FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh, FlashInfer v0.7.3). Copyright (c) 2024 by
 // FlashInfer team, licensed under the Apache License, Version 2.0. Copied with its template parameters fixed
 // (VEC_SIZE 4, BLOCK_THREADS 1024) and its shared array passed in; formatting kept. FlashInfer's headers are not on
 // the TensorRT-LLM C++ include path.
@@ -182,6 +189,7 @@ __global__ void __launch_bounds__(kBlockSize, 1)
     chainSpecSamplingMcFiKernel(ChainSpeculativeSamplingParams params, RowWorkspace* ws, ChainSpecMcDraftRows rows)
 {
     using BlockReduce = cub::BlockReduce<float, kBlockSize, cub::BLOCK_REDUCE_WARP_REDUCTIONS>;
+    using WarpReduce = cub::WarpReduce<float, kWarpSize>;
 
     __shared__ union
     {
@@ -189,11 +197,13 @@ __global__ void __launch_bounds__(kBlockSize, 1)
         float scan[kBlockSize / 32];
     } tempStorage;
 
+    __shared__ typename WarpReduce::TempStorage warpStorage[kWarps];
+    __shared__ float4 sStage[kBlockSize];
+
     __shared__ float sTarget[kChainSpecMcMaxDraft];
     __shared__ float sDraft[kChainSpecMcMaxDraft];
     __shared__ int32_t sPos;
     __shared__ float sU;
-    __shared__ int32_t sTileLast;
     __shared__ int32_t sIsLast;
     __shared__ float sTileSum[kMaxTiles];
     __shared__ int32_t sTileLastOf[kMaxTiles];
@@ -248,43 +258,68 @@ __global__ void __launch_bounds__(kBlockSize, 1)
     float const* draft = pos < numDraft ? draftRow(params, rows, row, pos, numDraft, vocabSize) : nullptr;
     int32_t const numTiles = static_cast<int32_t>((vocabSize + kTileSize - 1) / kTileSize);
 
-    // 2. This CTA's chunks: FlashInfer's per-chunk sum and the chunk's last index with mass.
-    for (int32_t tile = cta; tile < numTiles; tile += G)
+    // 2. This CTA's thread lanes over every chunk. FlashInfer sums the residual per thread lane across the chunks in
+    //    chunk order and reduces the 1024 lane sums once (the total); its scan reduces each chunk with a block Sum,
+    //    i.e. per warp a cub warp Sum of the thread's ThreadReduce, then the 32 warp sums in warp order. Both orders
+    //    are kept: every CTA writes the warp sums of its lanes per chunk and each lane's chunk-ordered sum, and the
+    //    tail finishes both reductions.
+    int32_t const lanesPerCta = kBlockSize / G;
+    int32_t const laneInCta = tid % lanesPerCta;
+    int32_t const sub = tid / lanesPerCta;
+    int32_t const lane = cta * lanesPerCta + laneInCta;
+    float laneSum = 0.0f;
+    for (int32_t first = 0; first < numTiles; first += G)
     {
-        if (tid == 0)
+        int32_t const tile = first + sub;
+        float relu[kVecSize] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (tile < numTiles)
         {
-            sTileLast = -1;
-        }
-        __syncthreads();
-        uint32_t const base = static_cast<uint32_t>(tile) * kTileSize + static_cast<uint32_t>(tid) * kVecSize;
-        float relu[kVecSize];
-        loadResidual(target, draft, base, vocabSize, relu);
-        int32_t localLast = -1;
+            uint32_t const base = static_cast<uint32_t>(tile) * kTileSize + static_cast<uint32_t>(lane) * kVecSize;
+            loadResidual(target, draft, base, vocabSize, relu);
+            int32_t localLast = -1;
 #pragma unroll
-        for (int32_t j = 0; j < kVecSize; ++j)
-        {
-            if (relu[j] > 0.0f && base + j < vocabSize)
+            for (int32_t j = 0; j < kVecSize; ++j)
             {
-                localLast = static_cast<int32_t>(base + j);
+                if (relu[j] > 0.0f && base + j < vocabSize)
+                {
+                    localLast = static_cast<int32_t>(base + j);
+                }
+            }
+            float const warpSum
+                = WarpReduce(warpStorage[tid / kWarpSize]).Sum(cub::ThreadReduce(relu, ::cuda::std::plus<>{}));
+            int32_t const warpLast = __reduce_max_sync(0xffffffffu, localLast);
+            if (tid % kWarpSize == 0)
+            {
+                w->warpSum[tile][lane / kWarpSize] = warpSum;
+                w->warpLast[tile][lane / kWarpSize] = warpLast;
             }
         }
-        if (localLast >= 0)
-        {
-            atomicMax(&sTileLast, localLast);
-        }
-        float const tileSum = BlockReduce(tempStorage.reduce).Sum(relu);
+        sStage[tid] = make_float4(relu[0], relu[1], relu[2], relu[3]);
         __syncthreads();
-        if (tid == 0)
+        if (sub == 0)
         {
-            w->tileSum[tile] = tileSum;
-            w->tileLast[tile] = sTileLast;
+            for (int32_t s = 0; s < G && first + s < numTiles; ++s)
+            {
+                float4 const r = sStage[s * lanesPerCta + laneInCta];
+                laneSum += r.x;
+                laneSum += r.y;
+                laneSum += r.z;
+                laneSum += r.w;
+            }
         }
+        __syncthreads();
     }
+    if (sub == 0)
+    {
+        w->laneSum[lane] = laneSum;
+    }
+    __syncthreads();
 
     // 3. Arrival; the last CTA of the request runs FlashInfer's tail.
     if (tid == 0)
     {
         unsigned const add = static_cast<unsigned>(kBlockSize / G);
+        __threadfence();
         unsigned const prev = cuda::atomic_ref<unsigned, cuda::thread_scope_device>(w->arrive).fetch_add(
             add, cuda::memory_order_acq_rel);
         sIsLast = ((prev + add) % static_cast<unsigned>(kBlockSize)) == 0;
@@ -294,19 +329,22 @@ __global__ void __launch_bounds__(kBlockSize, 1)
     {
         return;
     }
+    float const total = BlockReduce(tempStorage.reduce).Sum(__ldcg(&w->laneSum[tid]));
     if (tid < numTiles)
     {
-        sTileSum[tid] = __ldcg(&w->tileSum[tid]);
-        sTileLastOf[tid] = __ldcg(&w->tileLast[tid]);
+        float tileSum = __ldcg(&w->warpSum[tid][0]);
+        int32_t tileLast = __ldcg(&w->warpLast[tid][0]);
+        for (int32_t k = 1; k < kWarps; ++k)
+        {
+            tileSum = tileSum + __ldcg(&w->warpSum[tid][k]);
+            tileLast = max(tileLast, __ldcg(&w->warpLast[tid][k]));
+        }
+        sTileSum[tid] = tileSum;
+        sTileLastOf[tid] = tileLast;
     }
     __syncthreads();
     if (tid == 0)
     {
-        float total = 0.0f;
-        for (int32_t tile = 0; tile < numTiles; ++tile)
-        {
-            total += sTileSum[tile];
-        }
         float const u = sU * total;
         float aggregate = 0.0f;
         int32_t chunk = -1;
@@ -368,7 +406,7 @@ __global__ void __launch_bounds__(kBlockSize, 1)
         int32_t token = sWinner;
         if (token == static_cast<int32_t>(vocabSize))
         {
-            token = sLastValid >= 0 ? sLastValid : 0;
+            token = sLastValid;
         }
         int32_t* out = params.outputTokenIds + row * (numDraft + 1);
         for (int32_t i = 0; i < pos; ++i)
@@ -395,7 +433,7 @@ cudaError_t invokeChainSpecSamplingMcFi(ChainSpeculativeSamplingParams const& pa
     }
     if (params.batchSize > 65535 || params.numDraftTokens < 0 || params.numDraftTokens > kChainSpecMcMaxDraft
         || params.vocabSize < 1 || params.vocabSize % 4 != 0 || params.vocabSize > kChainSpecMcMaxVocab
-        || ctasPerRow < 1 || kBlockSize % ctasPerRow != 0 || workspace == nullptr
+        || ctasPerRow < 1 || ctasPerRow > kMaxCtasPerRow || kMaxCtasPerRow % ctasPerRow != 0 || workspace == nullptr
         || (rows.rowIds != nullptr && (rows.rowStride % 4 != 0 || rows.posStride % 4 != 0)))
     {
         return cudaErrorInvalidValue;

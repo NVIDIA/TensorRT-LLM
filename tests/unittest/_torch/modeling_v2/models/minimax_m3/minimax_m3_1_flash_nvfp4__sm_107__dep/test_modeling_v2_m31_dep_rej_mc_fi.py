@@ -49,7 +49,8 @@ def test_the_engagement_line_names_the_switch(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "batch, ctas", [(1, 64), (8, 16), (12, 16), (16, 8), (24, 8), (48, 4), (212, 1), (300, 1)]
+    "batch, ctas",
+    [(1, 32), (6, 32), (8, 16), (12, 16), (16, 8), (24, 8), (48, 4), (212, 1), (300, 1)],
 )
 def test_ctas_per_row_is_rej_mcs_rule(batch, ctas):
     assert rej_mc_fi.ctas_per_row(batch, 212) == ctas

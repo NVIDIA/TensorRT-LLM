@@ -313,8 +313,8 @@ int64_t checkChainSpecMcFiInputs(char const* name, torch::Tensor const& draftTok
         TRTLLM_MV2_NS::kernels::minimaxM31::kChainSpecMcMaxVocab);
     TORCH_CHECK(numDraft >= 0 && numDraft <= TRTLLM_MV2_NS::kernels::minimaxM31::kChainSpecMcMaxDraft, name,
         ": num_draft must be at most ", TRTLLM_MV2_NS::kernels::minimaxM31::kChainSpecMcMaxDraft);
-    TORCH_CHECK(batchSize <= 65535 && ctasPerRow >= 1 && ctasPerRow <= 1024 && 1024 % ctasPerRow == 0, name,
-        ": batch <= 65535; ctas_per_row must divide 1024");
+    TORCH_CHECK(batchSize <= 65535 && ctasPerRow >= 1 && ctasPerRow <= 32 && 32 % ctasPerRow == 0, name,
+        ": batch <= 65535; ctas_per_row must divide 32");
     auto const wsBytesPerRow
         = static_cast<int64_t>(TRTLLM_MV2_NS::kernels::minimaxM31::chainSpecSamplingMcFiWorkspaceBytesPerRow());
     TORCH_CHECK(workspace.is_cuda() && workspace.is_contiguous() && workspace.get_device() == device
@@ -360,7 +360,7 @@ std::tuple<torch::Tensor, torch::Tensor> launchChainSpecMcFi(char const* name, f
 //! REJ_MC_FI (see csrc/m31/chainSpecSamplingMcFiSm107.h): flashinfer.sampling.chain_speculative_sampling's
 //! outputs (deterministic, tensor seed / offset; tokens [batch, numDraft + 1] and num_tokens = emitted + 1 [batch]),
 //! bitwise, on batch x ctas_per_row CTAs. workspace: a zero-initialized byte buffer of at least batch x
-//! minimax_m31_chain_speculative_sampling_mc_fi_ws_bytes(), reused across calls; ctas_per_row divides 1024 (no
+//! minimax_m31_chain_speculative_sampling_mc_fi_ws_bytes(), reused across calls; ctas_per_row divides 32 (no
 //! co-residency limit).
 std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMcFi(torch::Tensor const& draftProbs,
     torch::Tensor const& draftTokenIds, torch::Tensor const& targetProbs, torch::Tensor const& seed,

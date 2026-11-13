@@ -9,8 +9,7 @@
 ``mv2_minimax_m3::minimax_m31_chain_speculative_sampling_mc_fi`` (kernels/minimaxM31/chainSpecSamplingMcFiSm107.cu) on
 ``ctas_per_row`` CTAs per request (FlashInfer: one CTA per request). The slot-indexed form reads the draft rows in place
 from the spec metadata's [slots, maxDraft, vocab] buffer, so the gather the stock path copies first is skipped (the
-same floats). The one input it does not match: a rejected row whose residual has no mass at all, where FlashInfer
-reads an uninitialized shared slot and this op returns token 0.
+same floats). A rejected row whose residual has no mass at all gets token -1, as FlashInfer (0.7.3) returns.
 
 The overrides return None, and the sampler keeps the stock gather and FlashInfer call, on a build without the op, past
 MAX_BATCH requests, for an input outside the kernel's contract, or when the workspace is first needed inside a
@@ -37,8 +36,9 @@ DEP_REJ_MC_FI = not m31_disabled("DEP_REJ_MC_FI")
 
 #: The most requests one call takes: DEP8's widest CUDA-graph bucket per rank.
 MAX_BATCH = 48  # capacity: fixed: DEP8's top graph bucket
-#: The largest CTA count per request (the grid is batch x ctas_per_row 1024-thread CTAs).
-MAX_CTAS_PER_ROW = 64
+#: The largest CTA count per request (the grid is batch x ctas_per_row 1024-thread CTAs; each CTA owns whole warps of
+#: FlashInfer's 1024 thread lanes, so at most 32).
+MAX_CTAS_PER_ROW = 32
 MAX_VOCAB = 64 * 4096
 MAX_DRAFT = 32
 
