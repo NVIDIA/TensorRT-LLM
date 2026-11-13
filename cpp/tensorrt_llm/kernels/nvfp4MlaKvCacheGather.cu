@@ -819,6 +819,57 @@ __global__ void remapContextTopKKernel(int32_t const* __restrict__ localTopKIndi
     }
 }
 
+//! One warp per row: each grid row is a layer, whose rows stride over the grid columns.
+__global__ __launch_bounds__(kThreadsPerBlock) void nvFp4MlaKvCacheRestoreKernel(
+    NvFp4MlaKvCacheRestoreLayer const* __restrict__ layers, int32_t const* __restrict__ pageTables, int32_t maxPages,
+    int32_t tokenBegin, int32_t tokenEnd, int32_t headDim, int32_t residualDim, float dequantScale)
+{
+    NvFp4MlaKvCacheRestoreLayer const layer = layers[blockIdx.y];
+    int32_t const warp = threadIdx.x / kWarpSize;
+    int32_t const lane = threadIdx.x % kWarpSize;
+    int32_t const packedHeadDim = (headDim + residualDim) / 2;
+    int32_t const scalesPerToken = (headDim + residualDim) / 16;
+    auto const* dataPool = reinterpret_cast<uint8_t const*>(layer.dataPool);
+    auto const* scalePool = reinterpret_cast<__nv_fp8_e4m3 const*>(layer.scalePool);
+    auto* high = reinterpret_cast<__nv_fp8_e4m3*>(layer.high);
+    // A compact pool keeps each row's scales after its data in one padded row, detected as the gather does.
+    bool const compactLayout = reinterpret_cast<uint8_t const*>(scalePool) == dataPool + packedHeadDim;
+    int64_t const dataStride = compactLayout
+        ? (packedHeadDim + scalesPerToken + kAsyncCopyBytes - 1) / kAsyncCopyBytes * kAsyncCopyBytes
+        : packedHeadDim;
+    int64_t const rowEnd = tokenEnd / layer.tokensPerRow;
+    int64_t const rowStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
+    for (int64_t row = tokenBegin / layer.tokensPerRow + static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+         row < rowEnd; row += rowStride)
+    {
+        int64_t const page = row / layer.rowsPerPage;
+        int64_t const within = row % layer.rowsPerPage;
+        if (page >= maxPages)
+        {
+            break;
+        }
+        int32_t const sourcePage = pageTables[layer.sourceTable * maxPages + page];
+        int32_t const highPage = pageTables[layer.highTable * maxPages + page];
+        int64_t const source = sourcePage * layer.sourceRowsPerPage + layer.sourceRowOffset + within;
+        if (sourcePage < 0 || highPage < 0 || source >= layer.numPoolTokens)
+        {
+            continue;
+        }
+        auto const* dataRow = dataPool + source * dataStride;
+        auto const* scaleRow = compactLayout ? reinterpret_cast<__nv_fp8_e4m3 const*>(dataRow + packedHeadDim)
+                                             : scalePool + source * scalesPerToken;
+        auto const target = static_cast<int32_t>(highPage * layer.rowsPerPage + within);
+        if (dequantScale == 1.F)
+        {
+            dequantizeRow<true>(dataRow, scaleRow, high, 0, target, headDim, residualDim, 1.F, lane);
+        }
+        else
+        {
+            dequantizeRow<false>(dataRow, scaleRow, high, 0, target, headDim, residualDim, dequantScale, lane);
+        }
+    }
+}
+
 int32_t getPersistentBlockCount(int64_t workItems, int32_t blocksPerSm = kBlocksPerSm)
 {
     int32_t const workBlocks = static_cast<int32_t>((workItems + kWarpsPerBlock - 1) / kWarpsPerBlock);
@@ -1060,6 +1111,25 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
         tensorrt_llm::common::getMultiProcessorCount() * kBlocksPerSm);
     remapContextTopKKernel<<<remapBlocks, kThreadsPerBlock, 0, stream>>>(localTopKIndices, queryReqIndices, cuKvLengths,
         selectedFlags, selectedOffsets, compactIndices, numPairs, topK, numRequests, totalKvTokens);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeNvFp4MlaKvCacheRestore(NvFp4MlaKvCacheRestoreLayer const* layers, int32_t numLayers,
+    int32_t const* pageTables, int32_t maxPages, int32_t tokenBegin, int32_t tokenEnd, int32_t headDim,
+    int32_t residualDim, float dequantScale, cudaStream_t stream)
+{
+    if (numLayers == 0 || tokenEnd <= tokenBegin)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
+        "NVFP4 MLA restore requires head_dim to be a positive multiple of 16, got %d", headDim);
+    TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
+        "NVFP4 MLA restore residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
+    // A layer of one-token rows has the most rows.
+    dim3 const grid((tokenEnd - tokenBegin + kWarpsPerBlock - 1) / kWarpsPerBlock, numLayers);
+    nvFp4MlaKvCacheRestoreKernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+        layers, pageTables, maxPages, tokenBegin, tokenEnd, headDim, residualDim, dequantScale);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

@@ -15,6 +15,7 @@
 
 from collections import defaultdict
 from dataclasses import replace
+from functools import cached_property
 from math import ceil, gcd
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
     KVCacheManagerV2,
+    Role,
     _fill_kv_pages,
     _get_generation_kv_capacity,
     get_scratch_entry,
@@ -1138,63 +1140,71 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         ]
         return int(layer_id), DeepseekV4AttentionType.COMPRESS.role
 
-    def _decode_mixed_precision_window(self, request_id: int, start: int, end: int) -> None:
-        """Decode the whole compressed rows of tokens `[start, end)` from the NVFP4 COMPRESS pool
-        into the FP8 high rows, as the read decodes them."""
-        from ..dsa.backend import (
-            _NVFP4_MAX_BLOCK_SCALE,
-            _NVFP4_MAX_VALUE,
-            _get_nvfp4_mla_kv_cache_amax,
-        )
-
-        amax = _get_nvfp4_mla_kv_cache_amax()
-        scale = torch.full((1,), amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE), device="cuda")
+    @cached_property
+    def _nvfp4_restore_plan(self) -> Tuple[torch.Tensor, List[Tuple[int, DataRole]]]:
+        """`nvfp4_mla_kv_cache_restore`'s row for every high layer, and the page tables the rows
+        name: the COMPRESS pages of the high layers, then their high pages. The pools do not move,
+        so this is built once."""
         row_bytes = (self.head_dim + self.nvfp4_residual_dim) // 2
-        layers = list(self.mixed_precision_high_layers.items())
-        tables = torch.full(
-            (len(layers), 2, self.max_blocks_per_seq),
-            -1,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
+        high_layers = self.mixed_precision_high_layers
+        tables, which = self._distinct_page_tables(
+            [self._mixed_precision_layer_page(local) for local in high_layers]
+            + [(high_layer, Role.KEY) for high_layer in high_layers.values()]
         )
-        for index, (local, high_layer) in enumerate(layers):
-            compress_layer, role = self._mixed_precision_layer_page(local)
-            self._fill_page_table(compress_layer, [request_id], tables[index, :1].numpy(), role)
-            self._fill_page_table(high_layer, [request_id], tables[index, 1:].numpy())
-        tables = tables.cuda(non_blocking=True).long()
-        for index, (local, _) in enumerate(layers):
+        rows = []
+        for index, local in enumerate(high_layers):
             layer_idx = self.pp_layers[local]
             ratio = self._compress_ratios[layer_idx]
-            if end // ratio <= start // ratio:
-                continue
-            rows = torch.arange(start // ratio, end // ratio, device="cuda")
             rows_per_page = self.compressed_block_sizes[layer_idx]
-            pages = rows // rows_per_page
             data_pool, scale_pool = self.get_compress_pool_buffers(ratio)
             # Pool rows as deepseek_v4_local_to_global_indices computes them.
             layer_rows = (
                 self.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
                 - self.compress_pool_ptrs[ratio]
             ) // row_bytes
-            pool_rows = layer_rows + tables[index, 0][pages] * rows_per_page + rows % rows_per_page
-            decoded = torch.empty(
-                (end // ratio - start // ratio, 1, self.head_dim),
-                dtype=torch.float8_e4m3fn,
-                device="cuda",
-            )
-            # The gather rewrites its index tensor in place, so it gets a temporary one.
-            torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
-                data_pool,
-                scale_pool,
-                pool_rows.to(torch.int32).view(-1, 1),
-                decoded,
-                scale,
-                self.nvfp4_residual_dim,
-                data_pool.numel() // row_bytes,
-            )
             high = self._get_mixed_precision_buffers(local, "NHD", "high")
-            high = high.view(high.shape[0], rows_per_page, -1)
-            high[tables[index, 1][pages], rows % rows_per_page] = decoded.view(len(rows), -1)
+            rows.append(
+                [
+                    data_pool.data_ptr(),
+                    scale_pool.data_ptr(),
+                    high.data_ptr(),
+                    data_pool.numel() // row_bytes,
+                    which[index],
+                    which[len(high_layers) + index],
+                    rows_per_page,
+                    layer_rows,
+                    rows_per_page,
+                    ratio,
+                ]
+            )
+        return torch.tensor(rows, dtype=torch.int64, device="cuda"), tables
+
+    def _decode_mixed_precision_window(self, request_id: int, start: int, end: int) -> None:
+        """Decode the whole compressed rows of tokens `[start, end)` from the NVFP4 COMPRESS pool
+        into the FP8 high rows of every high layer in one launch, as the read decodes them."""
+        from ..dsa.backend import (
+            _NVFP4_MAX_BLOCK_SCALE,
+            _NVFP4_MAX_VALUE,
+            _get_nvfp4_mla_kv_cache_amax,
+        )
+
+        layers, tables = self._nvfp4_restore_plan
+        pages = torch.full(
+            (len(tables), self.max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+        self._fill_page_tables(request_id, tables, pages.numpy())
+        torch.ops.trtllm.nvfp4_mla_kv_cache_restore(
+            layers,
+            pages.cuda(non_blocking=True),
+            start,
+            end,
+            self.head_dim,
+            self.nvfp4_residual_dim,
+            _get_nvfp4_mla_kv_cache_amax() / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE),
+        )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """

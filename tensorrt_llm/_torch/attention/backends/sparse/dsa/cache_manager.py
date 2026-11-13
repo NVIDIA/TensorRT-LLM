@@ -8,6 +8,7 @@ import math
 import os
 from collections import Counter
 from dataclasses import replace
+from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -603,19 +604,48 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         """Return the formal V2 page scale and layer offset for sparse MLA."""
         return self._primary_pool_page_index_params[local_layer_idx]
 
+    @cached_property
+    def _nvfp4_restore_plan(self) -> Tuple[torch.Tensor, List[Tuple[int, DataRole]]]:
+        """`nvfp4_mla_kv_cache_restore`'s row for every high layer, and the high page tables the
+        rows name after the request's pool slots (table 0). The pools do not move, so this is
+        built once."""
+        block = self.tokens_per_block
+        pool = self.get_unique_primary_pool()
+        tables, which = self._distinct_page_tables(
+            [(high_layer, Role.KEY) for high_layer in self.mixed_precision_high_layers.values()]
+        )
+        rows = []
+        for local, table in zip(self.mixed_precision_high_layers, which):
+            pool_index = int(self.kv_cache_pool_mapping[local, 0])
+            data, scales = self.kv_cache_pool_pointers[pool_index, 0].tolist()
+            page_index_scale, layer_offset = self.get_primary_pool_page_index_params(local)
+            high = self._get_mixed_precision_buffers(local, "NHD", "high")
+            # Pool rows as convert_req_index_to_global maps the layer's tokens.
+            rows.append(
+                [
+                    data,
+                    scales,
+                    high.data_ptr(),
+                    pool.shape[0] * pool.shape[1] * block,
+                    0,
+                    1 + table,
+                    page_index_scale * block,
+                    layer_offset * block,
+                    block,
+                    1,
+                ]
+            )
+        return torch.tensor(rows, dtype=torch.int64, device="cuda"), tables
+
     def _decode_mixed_precision_window(self, request_id: int, start: int, end: int) -> None:
-        """Decode tokens `[start, end)` of the NVFP4 pool into the FP8 high rows, as the sparse read
-        decodes them."""
+        """Decode tokens `[start, end)` of the NVFP4 pool into the FP8 high rows of every high
+        layer in one launch, as the sparse read decodes them."""
         from .backend import _NVFP4_MAX_BLOCK_SCALE, _NVFP4_MAX_VALUE, _get_nvfp4_mla_kv_cache_amax
 
-        amax = _get_nvfp4_mla_kv_cache_amax()
-        scale = torch.full((1,), amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE), device="cuda")
-        block = self.tokens_per_block
-        positions = torch.arange(start, end, dtype=torch.int32, device="cuda")
-        layers = list(self.mixed_precision_high_layers.items())
-        # The request's pool slots, as the DSA metadata takes them, then each high layer's pages.
+        layers, high_tables = self._nvfp4_restore_plan
+        # The request's pool slots, as the DSA metadata takes them, then its high pages.
         tables = torch.full(
-            (1 + len(layers), self.max_blocks_per_seq),
+            (1 + len(high_tables), self.max_blocks_per_seq),
             -1,
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
@@ -624,39 +654,16 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             1, request_ids=[request_id], num_contexts=1, beam_width=1
         )
         tables[0, : slots.shape[1]] = slots[0]
-        for index, (_, high_layer) in enumerate(layers, start=1):
-            self._fill_page_table(high_layer, [request_id], tables[index : index + 1].numpy())
-        tables = tables.cuda(non_blocking=True)
-        pages, offsets = (positions // block).long(), (positions % block).long()
-        pool = self.get_unique_primary_pool()
-        for index, (local, _) in enumerate(layers, start=1):
-            page_index_scale, layer_offset = self.get_primary_pool_page_index_params(local)
-            pool_rows = torch.ops.trtllm.convert_req_index_to_global(
-                torch.zeros_like(positions),
-                tables[:1],
-                positions.view(-1, 1),
-                block,
-                1,
-                page_index_scale * block,
-                layer_offset,
-            )
-            rows = torch.empty(
-                (end - start, 1, self.head_dim), dtype=torch.float8_e4m3fn, device="cuda"
-            )
-            torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
-                self.kv_cache_pool_pointers,
-                self.kv_cache_pool_mapping,
-                pool_rows,
-                rows,
-                torch.empty_like(pool_rows),
-                scale,
-                local,
-                self.mla_kv_cache_residual_dim,
-                pool.shape[0] * pool.shape[1] * block,
-            )
-            high = self._get_mixed_precision_buffers(local, "NHD", "high")
-            high = high.view(high.shape[0], high.shape[2], -1)
-            high[tables[index].long()[pages], offsets] = rows.view(end - start, -1)
+        self._fill_page_tables(request_id, high_tables, tables[1:].numpy())
+        torch.ops.trtllm.nvfp4_mla_kv_cache_restore(
+            layers,
+            tables.cuda(non_blocking=True),
+            start,
+            end,
+            self.head_dim,
+            self.mla_kv_cache_residual_dim,
+            _get_nvfp4_mla_kv_cache_amax() / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE),
+        )
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {

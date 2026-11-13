@@ -6043,62 +6043,153 @@ class KVCacheManagerV2(BaseResourceManager):
             else:
                 self._decode_mixed_precision_window(request_id, start, end)
 
+    @cached_property
+    def _mixed_precision_restore_plan(
+        self,
+    ) -> tuple[
+        list[tuple[int, DataRole]], list[tuple[torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]]
+    ]:
+        """What a window restore reads and writes. The pools do not move, so it is built once.
+
+        Returns the distinct page tables a restore fills, then one run for each pair of source and
+        high pools: views of both whole pools, the indices of each layer's source and high tables,
+        and the pages before each layer's own in either pool (both `[2, layers]`).
+        """
+
+        def pool_pages(view: torch.Tensor, layer: int, role: DataRole) -> tuple[int, int]:
+            # The pool's base address, and the pages of `view` before the layer's own.
+            pool = int(self.impl.get_mem_pool_base_address(layer, role, PageIndexMode.PER_LAYER))
+            pages, rest = divmod(view.data_ptr() - pool, view.stride(0) * view.element_size())
+            assert rest == 0, "A layer's pages start on a page of its pool"
+            return pool, pages
+
+        layers = list(self.mixed_precision_high_layers.items())
+        cold_page = self.mixed_precision_low_dtype == self.mixed_precision_high_dtype
+        sources = [
+            self._mixed_precision_layer_page(local) if cold_page else (local, Role.KEY)
+            for local, _ in layers
+        ]
+        tables, which = self._distinct_page_tables(
+            sources + [(high_layer, Role.KEY) for _, high_layer in layers]
+        )
+        runs = defaultdict(list)
+        for index, ((local, high_layer), (source_layer, role)) in enumerate(zip(layers, sources)):
+            high = self._get_mixed_precision_buffers(local, "NHD", "high")
+            if cold_page:
+                # The mirrored page has the high page's layout.
+                address = self.impl.get_mem_pool_base_address(
+                    source_layer, role, PageIndexMode.SHARED
+                )
+                source = convert_to_torch_tensor(
+                    TensorWrapper(address, high.dtype, list(high.shape))
+                )
+            else:
+                source = self._get_mixed_precision_buffers(local, "NHD", "low")
+            source_pool, source_pages = pool_pages(source, source_layer, role)
+            high_pool, high_pages = pool_pages(high, high_layer, Role.KEY)
+            run = (
+                (source_pool, source.dtype, tuple(source.shape)),
+                (high_pool, high.dtype, tuple(high.shape)),
+            )
+            runs[run].append((which[index], which[len(layers) + index], source_pages, high_pages))
+        plan = []
+        for run, members in runs.items():
+            members = np.array(members).T
+            # Each whole-pool view reaches the pages of the layer furthest into the pool.
+            views = [
+                convert_to_torch_tensor(
+                    TensorWrapper(pool, dtype, [shape[0] + int(pages.max()), *shape[1:]])
+                )
+                for (pool, dtype, shape), pages in zip(run, members[2:])
+            ]
+            plan.append((*views, members[:2], members[2:]))
+        return tables, plan
+
+    def _distinct_page_tables(
+        self, pages: Sequence[tuple[int, DataRole]]
+    ) -> tuple[list[tuple[int, DataRole]], list[int]]:
+        """The distinct page tables among `pages` (manager layer, role), and which of them each
+        entry reads: an equal buffer group and page index scale make an equal table."""
+        keys: dict[tuple[int, int], int] = {}
+        tables, which = [], []
+        for layer, role in pages:
+            key = (
+                int(self.impl.get_buffer_group_id(layer, role)),
+                int(self.impl.get_page_index_converter(layer, role).scale),
+            )
+            if key not in keys:
+                keys[key] = len(tables)
+                tables.append((layer, role))
+            which.append(keys[key])
+        return tables, which
+
+    def _fill_page_tables(
+        self, request_id: int, tables: Sequence[tuple[int, DataRole]], out: np.ndarray
+    ) -> None:
+        """Write the page table of each (manager layer, role) of `tables` into a row of `out`."""
+        for row, (layer, role) in zip(out, tables):
+            self._fill_page_table(layer, [request_id], row[None], role)
+
+    def _restore_pages(
+        self, request_id: int, first: int, last: int
+    ) -> Iterable[tuple[torch.Tensor, torch.Tensor, np.ndarray]]:
+        """For each run of the restore plan: its two whole-pool views, and the source and high page
+        of each layer's pages `[first, last)` in them (`[2, layers, pages]`, -1 where absent)."""
+        tables, runs = self._mixed_precision_restore_plan
+        pages = np.full((len(tables), last), BAD_PAGE_INDEX, dtype=np.int32)
+        self._fill_page_tables(request_id, tables, pages)
+        pages = pages[:, first:]
+        for source, high, which, offsets in runs:
+            run_pages = pages[which]
+            yield (
+                source,
+                high,
+                np.where(run_pages >= 0, run_pages + offsets[:, :, None], BAD_PAGE_INDEX),
+            )
+
     def _copy_cold_page_window(self, request_id: int, start: int, end: int) -> None:
         """Cold-page window: copy the high pages of tokens `[start, end)` from the pages they
-        mirror, which share their pool and page layout (checked at init)."""
-        pages = slice(start // self.tokens_per_block, -(-end // self.tokens_per_block))
-        layers = list(self.mixed_precision_high_layers.items())
-        tables = torch.full(
-            (len(layers), 2, self.max_blocks_per_seq),
-            -1,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
-        for index, (local, high_layer) in enumerate(layers):
-            source_layer, role = self._mixed_precision_layer_page(local)
-            self._fill_page_table(source_layer, [request_id], tables[index, :1].numpy(), role)
-            self._fill_page_table(high_layer, [request_id], tables[index, 1:].numpy())
-        tables = tables.cuda(non_blocking=True)[:, :, pages].long()
-        for index, (local, _) in enumerate(layers):
-            high = self._get_mixed_precision_buffers(local, "NHD", "high")
-            source_layer, role = self._mixed_precision_layer_page(local)
-            address = self.impl.get_mem_pool_base_address(source_layer, role, PageIndexMode.SHARED)
-            source = convert_to_torch_tensor(
-                TensorWrapper(address, self.mixed_precision_high_dtype, list(high.shape))
-            )
-            high[tables[index, 1]] = source[tables[index, 0]]
+        mirror, which share their pool and page layout (checked at init), every layer in one copy
+        per pair of pools."""
+        block = self.tokens_per_block
+        for source, high, pages in self._restore_pages(
+            request_id, start // block, -(-end // block)
+        ):
+            pairs = pages[:, (pages >= 0).all(axis=0)]
+            index = torch.empty(pairs.shape, dtype=torch.int64, pin_memory=prefer_pinned())
+            index.numpy()[:] = pairs
+            index = index.cuda(non_blocking=True)
+            high[index[1]] = source[index[0]]
 
     def _decode_mixed_precision_window(self, request_id: int, start: int, end: int) -> None:
         """Mixed dtype: decode the low pool of the pages holding tokens `[start, end)` into their
-        high pages. Whole pages: both pools lay a page out alike, so the decode needs no attention
-        layout, and the tokens past `end` are written before they are read."""
+        high pages, every layer in one launch per pair of pools. Whole pages: both pools lay a page
+        out alike, so the decode needs no attention layout, and the tokens past `end` are written
+        before they are read."""
         from ...attention.kernels.blackwell.mixed_precision_kv import convert_mixed_precision_kv
 
-        end = -(-end // self.tokens_per_block) * self.tokens_per_block
-        layers = list(self.mixed_precision_high_layers.items())
-        tables = torch.full(
-            (len(layers), 2, 1, self.max_blocks_per_seq),
-            -1,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
-        for index, (local, high_layer) in enumerate(layers):
-            self._fill_page_table(local, [request_id], tables[index, 0].numpy())
-            self._fill_page_table(high_layer, [request_id], tables[index, 1].numpy())
-        tables = tables.cuda(non_blocking=True)
-        lengths = torch.tensor(
-            [[start], [end]], dtype=torch.int32, pin_memory=prefer_pinned()
-        ).cuda(non_blocking=True)
-        for index, (local, _) in enumerate(layers):
-            high = self._get_mixed_precision_buffers(local, "NHD", "high")
+        block = self.tokens_per_block
+        first, last = start // block, -(-end // block)
+        # Each layer is one request of the launch, which covers the window's pages only.
+        start, end = start - first * block, (last - first) * block
+        for low, high, pages in self._restore_pages(request_id, first, last):
+            # The page tables, then each layer's token range in the last column.
+            host = torch.empty(
+                (2, pages.shape[1], pages.shape[2] + 1),
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
+            host[:, :, :-1] = torch.from_numpy(pages)
+            host[0, :, -1], host[1, :, -1] = start, end
+            device = host.cuda(non_blocking=True)
             convert_mixed_precision_kv(
                 False,
                 end - start,
                 high,
-                self._get_mixed_precision_buffers(local, "NHD", "low"),
+                low,
                 high,
-                tables[index],
-                lengths,
+                device[:, :, :-1],
+                device[:, :, -1],
                 "NHD",
                 low_dtype=self.mixed_precision_low_dtype,
                 restore=True,

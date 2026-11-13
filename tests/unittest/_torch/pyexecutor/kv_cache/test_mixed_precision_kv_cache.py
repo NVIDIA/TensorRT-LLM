@@ -3,6 +3,7 @@
 """GPU tests for mixed-precision KV allocation, pool sizing, reuse and transfer."""
 
 from contextlib import closing
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1141,7 +1142,16 @@ def test_sparse_managers_decode_the_window_from_the_nvfp4_pool(backend, residual
         # This DeepSeek-V4 layer's rows start 2 rows into its ratio's pool.
         get_buffers=lambda *args: SimpleNamespace(data_ptr=lambda: 4096 + 2 * row_bytes),
         compress_pool_ptrs={4: 4096},
+        impl=SimpleNamespace(
+            get_buffer_group_id=lambda layer, role: layer,
+            get_page_index_converter=lambda layer, role: SimpleNamespace(scale=1),
+        ),
     )
+    manager._distinct_page_tables = partial(KVCacheManagerV2._distinct_page_tables, manager)
+    manager._fill_page_tables = partial(KVCacheManagerV2._fill_page_tables, manager)
+    # The launch reads the per-layer plan, built here from the stubs above.
+    restore = DSACacheManagerV2 if backend == "dsa" else DeepseekV4CacheManager
+    manager._nvfp4_restore_plan = restore._nvfp4_restore_plan.func(manager)
     if backend == "dsa":
         DSACacheManagerV2._decode_mixed_precision_window(manager, 7, 2, 5)
         # Tokens 2, 3 -> pool rows 0, 1; token 4 -> pool row 6.
