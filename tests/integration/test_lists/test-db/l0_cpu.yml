@@ -188,6 +188,7 @@ l0_cpu:
   # leaves the checkpoint-backed tests out.
   - unittest/_torch/models/test_minimax_m3_vl.py
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
+  - unittest/_torch/models/test_minimax_mixed_media_fastpath.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
   # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
   # what runs it.

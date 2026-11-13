@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import numbers
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -880,11 +880,9 @@ def extract_multimodal_items_in_request_order(
     Where :func:`extract_multimodal_data_from_params` concatenates all
     image rows together and all video rows together (image-first
     bucketing), this helper keeps the natural left-to-right request
-    order. Each MultimodalParams contributes at most one image item and
-    at most one video item — within a single request the M3 processor
-    expands all image placeholders first, then all video placeholders,
-    so a request that carries both modalities still emits image then
-    video in left-to-right order.
+    order. For one image plus one video, the request's common item
+    metadata preserves the actual placeholder order. Single-modality
+    payloads retain their existing grouped row order.
 
     Returned list element schema:
         {
@@ -893,6 +891,8 @@ def extract_multimodal_items_in_request_order(
             "grid_thw":     Tensor [n_grids, 3],
         }
     """
+    from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
+
     items: List[Dict[str, Any]] = []
     for params in multimodal_params:
         if params is None:
@@ -900,12 +900,13 @@ def extract_multimodal_items_in_request_order(
         data = getattr(params, "multimodal_data", None)
         if not data:
             continue
+        request_items: Dict[str, Dict[str, Any]] = {}
         img = data.get("image") if isinstance(data, Mapping) else None
         if isinstance(img, Mapping):
             pv = img.get("pixel_values")
             gthw = img.get("image_grid_thw")
             if pv is not None and gthw is not None:
-                items.append({"modality": "image", "pixel_values": pv, "grid_thw": gthw})
+                request_items["image"] = {"modality": "image", "pixel_values": pv, "grid_thw": gthw}
         vid = data.get("video") if isinstance(data, Mapping) else None
         if isinstance(vid, Mapping):
             pv = vid.get("pixel_values_videos")
@@ -913,7 +914,19 @@ def extract_multimodal_items_in_request_order(
                 pv = vid.get("pixel_values")
             gthw = vid.get("video_grid_thw")
             if pv is not None and gthw is not None:
-                items.append({"modality": "video", "pixel_values": pv, "grid_thw": gthw})
+                request_items["video"] = {"modality": "video", "pixel_values": pv, "grid_thw": gthw}
+        metadata = get_multimodal_item_metadata(data)
+        if metadata is not None:
+            metadata.validate()
+        if len(request_items) == 2 and metadata is not None and len(metadata.item_refs) == 2:
+            if set(metadata.item_refs) != {("image", 0), ("video", 0)}:
+                raise ValueError(
+                    "MiniMaxM3VL mixed item metadata does not match its encoded payload."
+                )
+            items.extend(request_items[modality] for modality, _ in metadata.item_refs)
+        else:
+            # Existing grouped and multi-item paths retain their bucket order.
+            items.extend(request_items.values())
     return items
 
 
@@ -2215,7 +2228,138 @@ class MiniMaxM3VLInputProcessor:
             )
         return expanded, None
 
+    @staticmethod
+    def _mixed_item_refs(order: Any) -> tuple[tuple[str, int], ...]:
+        """Read item identities while allowing optional placeholder text."""
+        if not isinstance(order, list):
+            raise ValueError("MiniMaxM3VL mixed item order must be a list.")
+        refs = []
+        for entry in order:
+            if (
+                not isinstance(entry, Mapping)
+                or not isinstance(entry.get("modality"), str)
+                or type(entry.get("index")) is not int
+                or entry["index"] < 0
+            ):
+                raise ValueError("MiniMaxM3VL mixed item order contains a malformed entry.")
+            refs.append((entry["modality"], entry["index"]))
+        if len(refs) != len(set(refs)):
+            raise ValueError("MiniMaxM3VL mixed item order contains duplicate entries.")
+        return tuple(refs)
+
     # ----- main entry point -----------------------------------------------
+    def call_with_token_ids(
+        self,
+        inputs: Dict[str, Any],
+        sampling_params: Any = None,
+    ) -> Tuple[List[int], Optional[Dict[str, Any]]]:
+        """Keep one image and one video in their actual token-placeholder order.
+
+        The base token-ID path asks for the first modality's token lengths.
+        That is insufficient for mixed media: each modality has a distinct
+        length and the video includes temporal brackets/timestamps. Process
+        both once, then expand each real placeholder with its own length.
+        """
+        from tensorrt_llm.inputs.multimodal import (
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+            MultimodalItemMetadata,
+            find_mm_token_lengths,
+            get_multimodal_item_metadata,
+        )
+        from tensorrt_llm.inputs.registry import (
+            BaseMultimodalInputProcessor,
+            _process_multimodal_with_dummy_placeholders,
+        )
+
+        mm_data = inputs.get("multi_modal_data") or {}
+        images = self._coerce_to_list(mm_data.get("image"))
+        videos = self._coerce_to_list(mm_data.get("video"))
+        if not (images and videos):
+            return BaseMultimodalInputProcessor.call_with_token_ids(self, inputs, sampling_params)
+        # Without per-video grid boundaries the processor's concatenated
+        # video_grid_thw cannot safely be split between multiple videos.
+        if len(images) != 1 or len(videos) != 1:
+            raise ValueError(
+                "MiniMaxM3VL mixed token-ID requests require exactly one image and one video."
+            )
+        if self._image_token_id == self._video_token_id:
+            raise ValueError("MiniMaxM3VL mixed media requires distinct image and video token IDs.")
+        mm_data = dict(mm_data)
+        mm_data.update(image=images, video=videos)
+        ids = list(inputs["prompt_token_ids"])
+        token_modalities = {self._image_token_id: "image", self._video_token_id: "video"}
+        order = [
+            {"modality": token_modalities[token], "index": 0}
+            for token in ids
+            if token in token_modalities
+        ]
+        if len(order) != 2 or {entry["modality"] for entry in order} != {"image", "video"}:
+            raise ValueError(
+                "MiniMaxM3VL mixed prompt must contain one placeholder for each supplied modality."
+            )
+        if inputs.get("mm_item_order") and self._mixed_item_refs(
+            inputs["mm_item_order"]
+        ) != self._mixed_item_refs(order):
+            raise ValueError(
+                "MiniMaxM3VL incoming media order conflicts with its actual prompt placeholders."
+            )
+        extra = _process_multimodal_with_dummy_placeholders(
+            self,
+            mm_data,
+            {"image": 1, "video": 1},
+            inputs.get("mm_processor_kwargs"),
+            sampling_params,
+        )
+        multimodal_data = extra.get("multimodal_data")
+        if not isinstance(multimodal_data, dict):
+            raise ValueError("MiniMaxM3VL mixed processor returned no encoded media payload.")
+        lengths = find_mm_token_lengths(mm_data, self, multimodal_data=multimodal_data)
+        if set(lengths) != {"image", "video"} or any(
+            len(lengths[modality]) != 1 for modality in lengths
+        ):
+            raise ValueError(
+                "MiniMaxM3VL mixed processor returned ambiguous per-modality token lengths."
+            )
+        expanded: List[int] = []
+        embedding_rows: dict[str, int] = {}
+        for token in ids:
+            modality = token_modalities.get(token)
+            if modality is None:
+                expanded.append(int(token))
+                continue
+            # Reuse the existing single-modality framing/timestamp contract.
+            item_ids, updates = self.expand_prompt_token_ids_for_mm(
+                [token],
+                lengths[modality],
+                hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
+                mm_data={modality: mm_data[modality]},
+            )
+            if updates:
+                raise ValueError(
+                    "MiniMaxM3VL mixed expansion returned unexpected auxiliary updates."
+                )
+            expanded.extend(item_ids)
+            embedding_rows[modality] = item_ids.count(token)
+        # Hashing and full-request feature assembly share the common record.
+        refs = self._mixed_item_refs(order)
+        metadata = get_multimodal_item_metadata(multimodal_data)
+        rows = tuple(embedding_rows[modality] for modality, _ in refs)
+        if metadata is None:
+            metadata = MultimodalItemMetadata(item_refs=refs, output_embedding_lengths=rows)
+        elif metadata.item_refs != refs:
+            raise ValueError(
+                "MiniMaxM3VL processed media order conflicts with its prompt placeholders."
+            )
+        elif metadata.output_embedding_lengths is None:
+            metadata = replace(metadata, output_embedding_lengths=rows)
+        elif metadata.output_embedding_lengths != rows:
+            raise ValueError(
+                "MiniMaxM3VL processed media rows conflict with its expanded placeholders."
+            )
+        metadata.validate()
+        multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+        return expanded, extra
+
     # Implements the ``call_with_text_prompt`` hook required by
     # :class:`BaseMultimodalInputProcessor`. The base class's ``__call__``
     # dispatches text-prompt (with or without MM data) requests here and
