@@ -704,14 +704,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._weights_loaded = False
         self._weights_created = False
         self.quant_method = None
-        # Per-instance staging cache (key -> {tensor name: tensor}) and
-        # last-staged-T tracker; together they implement the always-pad-
-        # to-max_T launch contract by refreshing only the rows that
-        # changed between calls. ``_last_staged_T`` is keyed by bucket max_T:
-        # each bucket's staging buffer has its own row-reset history (a shared
-        # scalar would reset the wrong buffer when buckets alternate).
+        # Per-instance staging cache (key -> {tensor name: tensor}); see
+        # ``_stage_inputs`` for the always-pad-to-max_T launch contract.
         self._local_staging_cache: Dict[Tuple, Dict[str, torch.Tensor]] = {}
-        self._last_staged_T: Dict[int, int] = {}
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -1539,11 +1534,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         Tail policy:
 
-          * ``topk_idx_local``: always ``-1`` outside live rows.
-            Allocated as ``-1`` once in ``_ensure_local_staging``;
-            only the rows we previously wrote (``[num_tokens,
-            last_T)``) need resetting. New tail rows
-            ``[last_T, max_T)`` already hold ``-1`` from prior calls.
+          * ``topk_idx_local``: always ``-1`` outside live rows, reset
+            over the whole tail on every call. A host-side record of the
+            rows a previous call wrote cannot be trusted: a CUDA graph
+            replays the reset range recorded at capture, after any other
+            graph or eager call. A valid route left in the tail is
+            dispatched, and the SM107 polled top-k reduce, whose grid
+            covers only the live rows, never consumes its combine cells;
+            a later call then reads them as already arrived.
           * ``topk_weights``: always ``0.0`` outside live rows. The
             combine kernel writes one cell per
             ``(token, k in [0, top_k))`` regardless of the
@@ -1553,9 +1551,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             it.
         """
         max_T = bufs.topk_idx_local.shape[0]
-        last_T = self._last_staged_T.get(max_T)
-        if last_T is not None and last_T > num_tokens:
-            bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
+        if num_tokens < max_T:
+            bufs.topk_idx_local[num_tokens:].fill_(-1)
         if num_tokens > 0:
             if stage_activation:
                 bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
@@ -1566,7 +1563,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if num_tokens > 0:
             self._wait_rebalance_routes(replica_plan)
             bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
-        self._last_staged_T[max_T] = num_tokens
 
     def _launch_megamoe_kernel(
         self,

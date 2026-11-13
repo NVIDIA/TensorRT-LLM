@@ -787,9 +787,7 @@ def scatter_fp4_mla_kv_cache(
     and ``positions[token_offset : token_offset + N]``. Callers must pass a
     latent_cache pre-sliced to the current phase (context or generation) so
     that ``shape[0]`` matches the number of index entries they intend to
-    consume. ``MLA.forward_impl`` (tensorrt_llm/_torch/modules/attention.py)
-    slices ``latent_cache[:num_ctx_tokens]`` for context and
-    ``latent_cache[num_ctx_tokens:]`` for generation before dispatching.
+    consume.
 
     Callers must pass ``phase``, ``local_layer``, and ``v_head_dim``. Context
     scatter writes the final FP4 tile representation directly. Dimensions

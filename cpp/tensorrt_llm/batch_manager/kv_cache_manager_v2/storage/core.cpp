@@ -1089,11 +1089,74 @@ SlotCount freeRunOnQuota(
 TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
     TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<SecondaryPoolBudget> const& secondBudget)
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<SecondaryPoolBudget> const& secondBudget,
+    FixedSlotCounts const& fixedSlots)
 {
     PoolGroupIndex const numPg = slotSizeLists.size();
     TLLM_CHECK_DEBUG(ratioList.size() == numPg);
     TLLM_CHECK_WITH_INFO(granularity > 0, "Cache storage granularity must be positive");
+    TLLM_CHECK_WITH_INFO(fixedSlots.empty() || fixedSlots.size() == numPg,
+        "ratioToSlotCountList: fixed slot counts must be empty or cover every pool group");
+
+    if (std::ranges::any_of(fixedSlots, [](auto const& fixed) { return fixed.has_value(); }))
+    {
+        // Fixed groups take their exact slot count out of both budgets before anything is
+        // shared; the elastic groups then divide what is left among themselves.
+        auto const paid = poolsPaidByQuota(slotSizeLists, secondBudget);
+        TypedVec<PoolGroupIndex, SlotCount> slotCntList(numPg, 0);
+        size_t fixedQuotaBytes = 0;
+        size_t fixedSecondBytes = 0;
+        std::vector<PoolGroupIndex> elasticPgs;
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> elasticSizes;
+        TypedVec<PoolGroupIndex, float> elasticRatios;
+        TypedVec<PoolGroupIndex, SlotCount> elasticMinSlots;
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> elasticSecondPools;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+        {
+            if (auto const fixed = fixedSlots[pgIdx])
+            {
+                slotCntList[pgIdx] = *fixed;
+                fixedQuotaBytes += grainsForSlots(*fixed, slotSizeLists[pgIdx], paid[pgIdx], granularity) * granularity;
+                if (secondBudget.has_value())
+                {
+                    fixedSecondBytes += grainsForSlots(*fixed, slotSizeLists[pgIdx], secondBudget->pools[pgIdx],
+                                            secondBudget->granularity)
+                        * secondBudget->granularity;
+                }
+                continue;
+            }
+            elasticPgs.push_back(pgIdx);
+            elasticSizes.push_back(slotSizeLists[pgIdx]);
+            elasticRatios.push_back(ratioList[pgIdx]);
+            elasticMinSlots.push_back(minSlots[pgIdx]);
+            elasticSecondPools.push_back(
+                secondBudget.has_value() ? secondBudget->pools[pgIdx] : std::vector<PoolIndex>{});
+        }
+        TLLM_CHECK_WITH_INFO(fixedQuotaBytes <= quota, "Insufficient quota for fixed-capacity pool groups");
+        std::optional<SecondaryPoolBudget> elasticSecond;
+        if (std::ranges::any_of(elasticSecondPools, [](auto const& pools) { return !pools.empty(); }))
+        {
+            elasticSecond = SecondaryPoolBudget{};
+            elasticSecond->granularity = secondBudget->granularity;
+            elasticSecond->pools = std::move(elasticSecondPools);
+            if (secondBudget->quota.has_value())
+            {
+                TLLM_CHECK_WITH_INFO(fixedSecondBytes <= *secondBudget->quota,
+                    "Insufficient second memory budget for fixed-capacity pool groups");
+                elasticSecond->quota = *secondBudget->quota - fixedSecondBytes;
+            }
+        }
+        if (!elasticPgs.empty())
+        {
+            auto const elastic = ratioToSlotCountList(
+                quota - fixedQuotaBytes, elasticSizes, elasticRatios, granularity, elasticMinSlots, elasticSecond);
+            for (size_t i = 0; i < elasticPgs.size(); ++i)
+            {
+                slotCntList[elasticPgs[i]] = elastic[PoolGroupIndex{static_cast<int>(i)}];
+            }
+        }
+        return slotCntList;
+    }
 
     bool const hasSecond = secondBudget.has_value();
     bool const bounded = hasSecond && secondBudget->quota.has_value();

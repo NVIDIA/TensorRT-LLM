@@ -4752,6 +4752,7 @@ class PerfSanityTestConfig:
         model_name = metadata.get("model_name", "")
         assert model_name, "model_name is required in metadata section"
 
+        gen_server_config = None
         # Use self.benchmark_mode instead of reading from config file
         benchmark_mode = self.benchmark_mode
         # The mode segments of the test id, reused verbatim as the config name so

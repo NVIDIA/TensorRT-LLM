@@ -9,7 +9,7 @@ from cutlass.cutlass_dsl import Boolean, Int32, Integer, extract_mlir_values, ne
 
 from ...api import ImplDesc, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ...helpers.device_workspace import DeviceWorkspace
-from ...helpers.dsl_helpers import spin_peek, spin_wait
+from ...helpers.dsl_helpers import spin_wait
 from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div
 from .base import SchedulerBase, SchedulerWorkTileBase, WorkIdAcquisitionMode
@@ -900,12 +900,13 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         """Wait until the static FC1 watermark or the smaller runtime stream end is claimed."""
         if not fc1_exhausted:
             fc1_counter_pointer = work_id_worker.get_atomic_counter_pointer(Int32(0))
-            minimum_claim_count = Int32(self.minimum_global_fc1_claims)
-            if not spin_peek(fc1_counter_pointer, lambda value: value >= minimum_claim_count):
-                claim_target, stream_ends_before_target = resolve_phase_interleaved_fc1_claim_target(
-                    minimum_claim_count, task_mapping_state
-                )
-                spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
+            claim_target, stream_ends_before_target = resolve_phase_interleaved_fc1_claim_target(
+                Int32(self.minimum_global_fc1_claims), task_mapping_state
+            )
+            spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
+            # Exhaustion comes from the mapping, not the live counter, so every CTA of a cluster agrees on it.
+            if stream_ends_before_target:
+                fc1_exhausted = Boolean(True)
         return fc1_exhausted
 
     @cute.jit

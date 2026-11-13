@@ -222,6 +222,7 @@ def test_chunk_construction():
 
     # Everything a reader cannot recompute has to be stated.
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         Chunk(
             block_ids_per_layer_groups=[],
             kind_per_layer_group=[],
@@ -850,6 +851,7 @@ def add_and_verify_request(
     setup, ctx_request_id, gen_request_id, request_len, send_first: bool = True
 ):
     """Helper function to add and verify a request transfer."""
+    send_aux_tasks = []
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
@@ -1056,7 +1058,6 @@ def add_and_verify_request(
         ]
         for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
             sender_session.send(send_kv_slice)
-        send_aux_tasks = []
         for sender_session in sender_sessions:
             sender_session.pack_aux(ctx_request)
             send_aux_tasks.append(sender_session.send_aux())

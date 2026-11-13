@@ -3709,6 +3709,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             )
 
         if self._uses_external_shared_target_kv:
+            next_new_tokens = None
             next_draft_tokens = self._forward_external_shared_target_kv_draft_loop(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -3721,6 +3722,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size=batch_size,
             )
         else:
+            # Retain the sequence lengths before draft preparation replaces them.
+            pre_draft_seq_lens = attn_metadata._seq_lens_cuda
             # Save the old attn_metadata and spec_metadata
             self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
@@ -3743,7 +3746,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             # Get the draft KV cache manager if using separate layouts
             draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-            next_draft_tokens = self._forward_draft_loop(
+            next_draft_tokens, next_new_tokens = self._forward_draft_loop(
                 inputs,
                 attn_metadata,
                 spec_metadata,
@@ -3755,6 +3758,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 num_accepted_tokens,
                 original_all_rank_num_tokens,
                 resource_manager,
+                accepted_tokens=accepted_tokens,
+                pre_draft_seq_lens=pre_draft_seq_lens,
             )
             # restore attn_metadata to support cuda graph
             self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -3763,10 +3768,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
-        if self._m3_next_new_tokens is not None:
-            # Filled in place by the fused verify or the seed (column 0) and the fused draft passes (columns 1..).
-            next_new_tokens = self._m3_next_new_tokens
-        else:
+        if next_new_tokens is None:
             next_new_tokens = self._prepare_next_new_tokens(
                 accepted_tokens,
                 next_draft_tokens,
@@ -4290,10 +4292,17 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         num_accepted_tokens,
         original_all_rank_num_tokens,
         resource_manager,
+        accepted_tokens,
+        pre_draft_seq_lens,
     ):
-        """The fused draft loop on a step it covers (``_m3_fused_loop_ok``), else the in-tree loop."""
+        """Run the fused draft loop on a covered step, otherwise the in-tree loop.
+
+        Returns:
+            (next_draft_tokens, next_new_tokens): the fused loop's draft and next-input
+            buffers, or the in-tree loop's pair. A None next-input buffer is built by the caller.
+        """
         if self._m3_fused_loop_ok(attn_metadata, spec_metadata, batch_size, draft_model):
-            return self._m3_fused_draft_loop(
+            next_draft_tokens = self._m3_fused_draft_loop(
                 inputs,
                 attn_metadata,
                 spec_metadata,
@@ -4302,6 +4311,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size,
                 num_accepted_tokens,
             )
+            return next_draft_tokens, self._m3_next_new_tokens
         return super()._forward_draft_loop(
             inputs,
             attn_metadata,
@@ -4314,6 +4324,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             num_accepted_tokens,
             original_all_rank_num_tokens,
             resource_manager,
+            accepted_tokens=accepted_tokens,
+            pre_draft_seq_lens=pre_draft_seq_lens,
         )
 
     def _m3_fused_draft_loop(

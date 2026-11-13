@@ -26,13 +26,18 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
-from .....communication.token_protocol import TokenSrcMetadata
+from .....communication.token_protocol import (
+    RELAY_RECORD_SLOT_MASK,
+    RELAY_RECORD_SLOT_SHIFT,
+    RELAY_RECORD_TOPK_MASK,
+    TokenSrcMetadata,
+)
 from .....quant_def import CombineFormat, QuantKind
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....helpers.constants import Nvfp4E2M1RcpLimit, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Fp32Max
 from .....helpers.cute_py_helpers import tcgen05_block_scaled_acc_dtype
 from .....helpers.dsl_helpers import mark_alignment
-from .....helpers.flag_batch import make_flag_batch_tracker
+from .....helpers.flag_batch import SysReleaseFlagBatchTracker, make_flag_batch_tracker
 from .....helpers.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
@@ -42,7 +47,8 @@ from .....helpers.ptx_helpers import (
 )
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from ....function_mapping import CoordinateSpace, FunctionMapping
-from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
+from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+from ....schedulers.base import SchedulerConsumer
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 
 
@@ -968,8 +974,6 @@ class SwapABGatedActEpilogue(KernelComponent):
             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
             "combine_format": CombineFormat,
             "gate_up_clamp": Optional[float],
-            "swiglu_alpha": OptionalRequirement(Optional[float]),
-            "swiglu_beta": OptionalRequirement(Optional[float]),
             # SiTU (Kimi K3) selects a different gated-activation core; optional so
             # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
             "situ_beta": OptionalRequirement(Optional[float]),
@@ -980,6 +984,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             # Whether run() will receive the per-token FC1 activation scale. Absent means False:
             # the SMEM scratch it needs is reserved only for descriptors that enable it.
             "fc1_activation_per_token_scale": OptionalRequirement(bool),
+            "swiglu_alpha": OptionalRequirement(Optional[float]),
+            "swiglu_beta": OptionalRequirement(Optional[float]),
         }
 
     _supported_gate_activations: ClassVar[Tuple[str, ...]] = ("swiglu", "quick_geglu")
@@ -999,30 +1005,29 @@ class SwapABGatedActEpilogue(KernelComponent):
             "reduce_topk_in_kernel": OptionalRequirement(bool),
             "epi_async_release": OptionalRequirement(bool),
             "token_back_push_data": OptionalRequirement(bool),
+            # Pool records whose top-k field is at or above this value denote relay tokens (internode
+            # component); their FC2 rows stay on this rank for the combine stage instead of being pushed.
+            "relay_record_topk_marker": OptionalRequirement(int),
+            # Publish fc2_done even without token-back (the internode rail peers gather relay rows after it).
+            "publish_fc2_done": OptionalRequirement(bool),
         }
 
     @staticmethod
     def _resolve_situ_betas(problem_desc: ProblemDesc) -> Tuple[Optional[float], Optional[float]]:
-        """Resolve the SiTU (Kimi K3) betas from the ProblemDesc; ``(None, None)`` means SwiGLU.
-
-        Both betas must be given together, and SiTU excludes ``gate_up_clamp`` -- matching DeepGEMM's
-        ``DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value())``. They are baked in at
-        codegen time exactly like ``gate_up_clamp``, so the enclosing KernelClass must also fold them
-        into its ``name()`` cache key.
-        """
+        """Resolve SiTU constants; an absent linear beta leaves the up branch unbounded."""
         beta = problem_desc.get("situ_beta")
         linear_beta = problem_desc.get("situ_linear_beta")
-        if (beta is None) != (linear_beta is None):
-            raise ValueError(f"situ_beta and situ_linear_beta must be set together, got {beta} and {linear_beta}.")
         if beta is None:
+            if linear_beta is not None:
+                raise ValueError("situ_linear_beta requires situ_beta.")
             return None, None
-        if beta <= 0 or linear_beta <= 0:
-            raise ValueError(f"SiTU beta parameters must be positive, got {beta} and {linear_beta}.")
+        if not math.isfinite(beta) or beta <= 0 or (
+            linear_beta is not None and (not math.isfinite(linear_beta) or linear_beta <= 0)
+        ):
+            raise ValueError("SiTU beta parameters must be positive and finite.")
         if problem_desc["gate_up_clamp"] is not None:
             raise ValueError("SiTU does not support gate_up_clamp; the two activation variants are exclusive.")
-        if problem_desc.get("swiglu_alpha") is not None:
-            raise ValueError("SiTU does not support SwiGLUBias constants.")
-        return float(beta), float(linear_beta)
+        return float(beta), None if linear_beta is None else float(linear_beta)
 
     @classmethod
     def _resolve_gate_activation(cls, problem_desc: ProblemDesc) -> str:
@@ -1041,8 +1046,6 @@ class SwapABGatedActEpilogue(KernelComponent):
             )
         if gate_activation != "swiglu" and problem_desc.get("situ_beta") is not None:
             raise ValueError(f"gate_activation={gate_activation!r} cannot be combined with SiTU betas.")
-        if gate_activation != "swiglu" and problem_desc.get("swiglu_alpha") is not None:
-            raise ValueError(f"gate_activation={gate_activation!r} cannot be combined with SwiGLUBias constants.")
         return gate_activation
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1054,18 +1057,22 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.combine_format = problem_desc["combine_format"]
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
-        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
-        self.swiglu_beta = problem_desc.get("swiglu_beta")
-        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
-            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
-        if self.swiglu_alpha is not None:
-            self.swiglu_alpha = float(self.swiglu_alpha)
-            self.swiglu_beta = float(self.swiglu_beta)
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
         self.gate_activation = self._resolve_gate_activation(problem_desc)
         # The scratch costs mainloop SMEM budget, so only a descriptor that enables the scale
         # reserves it; passing the tensor without the flag is rejected in run().
         self.act_scale_scratch_enabled = bool(problem_desc.get("fc1_activation_per_token_scale", False))
+        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
+        self.swiglu_beta = problem_desc.get("swiglu_beta")
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
+        if self.swiglu_alpha is not None:
+            if not math.isfinite(self.swiglu_alpha) or not math.isfinite(self.swiglu_beta):
+                raise ValueError("SwiGLU constants must be finite.")
+            if self.situ_beta is not None:
+                raise ValueError("SiTU excludes SwiGLU alpha/beta constants.")
+            if self.gate_activation != "swiglu":
+                raise ValueError("QuickGeGLU excludes SwiGLU alpha/beta constants.")
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -1075,6 +1082,12 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.communication_enabled = impl_desc["communication_enabled"]
         self.fc1_epi_flag_batch = impl_desc["fc1_epi_flag_batch"]
         self.fc2_epi_flag_batch = impl_desc["fc2_epi_flag_batch"]
+        # Release scope of the fc2_done publication: "gpu" for same-GPU consumers (the NVLink
+        # token-back warps acquire at GPU scope), "sys" when another rank acquires the counter
+        # (internode combine, design invariant I9).
+        self.fc2_done_release_scope = impl_desc.get("fc2_done_release_scope", "gpu")
+        if self.fc2_done_release_scope not in ("gpu", "sys"):
+            raise ValueError(f"fc2_done_release_scope must be 'gpu' or 'sys', got {self.fc2_done_release_scope!r}.")
 
         if self.communication_enabled:
             for field_name in ("reduce_topk_in_kernel", "token_back_push_data"):
@@ -1082,6 +1095,8 @@ class SwapABGatedActEpilogue(KernelComponent):
                     raise KeyError(f"Communication-enabled Epilogue requires ImplDesc field {field_name!r}.")
         self.reduce_topk_in_kernel = impl_desc.get("reduce_topk_in_kernel", False)
         self.token_back_push_data = impl_desc.get("token_back_push_data", False)
+        # Component attributes may not be None: the sentinel means "no relay records" (every record pushes).
+        self.relay_record_topk_marker = impl_desc.get("relay_record_topk_marker", NO_RELAY_RECORDS_MARKER)
         if not self.communication_enabled and (self.reduce_topk_in_kernel or self.token_back_push_data):
             raise ValueError("A communication-disabled Epilogue cannot enable communication policies.")
 
@@ -1093,6 +1108,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.needs_pair_amax_exchange = self.sf_vec_size > self._EpilogueFc1IntermediateDownPerWarp
         self.token_back_push_sf = self.communication_enabled and self.combine_format.is_quantized
         self.token_back_enabled = self.token_back_push_data or self.token_back_push_sf
+        self.publish_fc2_done = impl_desc.get("publish_fc2_done", self.token_back_enabled)
         self.fc2_output_is_local = not self.communication_enabled or self.token_back_push_data
         self.fc2_use_tma = self.fc2_use_bulk and self.fc2_output_is_local
         self.fc2_use_ublk = self.fc2_use_bulk and not self.fc2_output_is_local
@@ -1348,6 +1364,8 @@ class SwapABGatedActEpilogue(KernelComponent):
         fc2_output_sf: Optional[cute.Tensor],
         peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
         optional_epi_args: Optional[GatedActEpilogueArgs] = None,
+        relay_landing: Optional[cute.Tensor] = None,  # (slot, message, k, hidden) BF16 landing on the rail peer (internode)
+        fc2_done_fanout=None,  # internode: fans the fc2_done increments out to the node peers' mirrors (make_tracker)
     ):
         if cutlass.const_expr(not smem_workspace.finalized):
             raise RuntimeError("SwapABGatedActEpilogue.run requires a finalized SmemWorkspace.")
@@ -1375,8 +1393,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             self.communication_enabled and (token_src_metadata is None or peer_rank_ptr_mapper is None)
         ):
             raise ValueError("Communication-enabled Epilogue requires token metadata and a peer pointer mapper.")
-        if cutlass.const_expr(self.token_back_enabled and fc2_done_counter is None):
-            raise ValueError("Token-back requires an FC2 done counter.")
+        if cutlass.const_expr(self.publish_fc2_done and fc2_done_counter is None):
+            raise ValueError("fc2_done publication requires an FC2 done counter.")
         if cutlass.const_expr(self.token_back_push_sf and fc2_output_sf is None):
             raise ValueError("Quantized token-back requires an FC2 output scale tensor.")
         tmem_acc = cute.make_tensor(
@@ -1408,6 +1426,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             fc2_output_sf,
             peer_rank_ptr_mapper,
             optional_epi_args,
+            relay_landing,
         )
 
         acc_consumer_state = pipeline.make_pipeline_state(
@@ -1428,13 +1447,30 @@ class SwapABGatedActEpilogue(KernelComponent):
         act_scales_prefetched = cutlass.Int32(0)
         loop_iteration = cutlass.Int32(0)
 
-        flag_tracker = make_flag_batch_tracker(
-            self.epi_async_release,
-            flag_address=Int64(0),
-            accumulated_flags=cutlass.Int32(0),
-            phase=cutlass.Int32(work_tile_info.phase),
-            thread_idx=tidx % (self._EpilogueWarpCnt * 32),
-        )
+        if cutlass.const_expr(fc2_done_fanout is not None):
+            # Internode: the tracker also increments the node peers' fc2_done mirrors (component-defined).
+            flag_tracker = fc2_done_fanout.make_tracker(
+                peer_rank_ptr_mapper,
+                phase=cutlass.Int32(work_tile_info.phase),
+                thread_idx=tidx % (self._EpilogueWarpCnt * 32),
+            )
+        elif cutlass.const_expr(self.fc2_done_release_scope == "sys"):
+            # fc2_done is acquired by other ranks at system scope (internode without fanout): lane-batched
+            # red.release.sys; the warp-batched async publisher only exists at gpu scope.
+            flag_tracker = SysReleaseFlagBatchTracker(
+                flag_address=Int64(0),
+                accumulated_flags=cutlass.Int32(0),
+                phase=cutlass.Int32(work_tile_info.phase),
+                thread_idx=tidx % (self._EpilogueWarpCnt * 32),
+            )
+        else:
+            flag_tracker = make_flag_batch_tracker(
+                self.epi_async_release,
+                flag_address=Int64(0),
+                accumulated_flags=cutlass.Int32(0),
+                phase=cutlass.Int32(work_tile_info.phase),
+                thread_idx=tidx % (self._EpilogueWarpCnt * 32),
+            )
 
         while work_tile_info.is_valid_tile:
             if cutlass.const_expr(prefetch_act_scales):
@@ -2034,8 +2070,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         #        gate = min(gate, +limit)           (upper bound only)
         #        up   = clamp(up, -limit, +limit)   (symmetric)
         #   3. gated activation, either SwiGLU or SiTU (mutually exclusive; SiTU has no clamp):
-        #        SwiGLU: out = (up + swiglu_beta) * gate * sigmoid(swiglu_alpha * gate)
-        #                Standard SwiGLU uses swiglu_alpha=1 and swiglu_beta=0.
+        #        SwiGLU: out = up * gate * sigmoid(gate)
         #        SiTU:   out = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
         #                sigmoid(x) = rcp(1 + exp2(-x * log2e))
         #
@@ -2047,16 +2082,21 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         out = cute.make_rmem_tensor((n,), cutlass.Float32)
         log2_e = 1.4426950408889634
 
-        # quick_geglu: out = up * gate * sigmoid(1.702 * gate). The 1.702 folds into the exp2 constant
-        # (one Python-side double product, rounded once to fp32), so the SwiGLU instruction sequence
-        # is reused unchanged. SiTU never reaches here with quick_geglu (_resolve_gate_activation).
-        sigmoid_scale = self._quick_geglu_sigmoid_scale if self.gate_activation == "quick_geglu" else 1.0
-        if cutlass.const_expr(self.swiglu_alpha is not None):
-            sigmoid_scale = self.swiglu_alpha
-        neg_log2e_pair = (cutlass.Float32(-sigmoid_scale * log2_e), cutlass.Float32(-sigmoid_scale * log2_e))
-        one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+        sigmoid_scale = (
+            self._quick_geglu_sigmoid_scale
+            if self.gate_activation == "quick_geglu"
+            else 1.0
+        )
+        activation_alpha = (
+            sigmoid_scale if self.swiglu_alpha is None else self.swiglu_alpha
+        )
+        neg_log2e_pair = (
+            cutlass.Float32(-activation_alpha * log2_e),
+            cutlass.Float32(-activation_alpha * log2_e),
+        )
         if cutlass.const_expr(self.swiglu_beta is not None):
             beta_pair = (cutlass.Float32(self.swiglu_beta), cutlass.Float32(self.swiglu_beta))
+        one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
         if cutlass.const_expr(self.gate_up_clamp is not None):
             limit = cutlass.Float32(self.gate_up_clamp)
         if cutlass.const_expr(dequant_scale is not None and dequant_scales is not None):
@@ -2149,8 +2189,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             sigmoid_pair = _sigmoid(g0, g1)
 
             if cutlass.const_expr(self.situ_beta is None):
-                # SwiGLU: out = (up + swiglu_beta) * gate * sigmoid(swiglu_alpha * gate)
-                # The SwiGLUBias offset follows the up clamp.
+                # Add beta after clamping; alpha scales only the sigmoid argument.
                 if cutlass.const_expr(self.swiglu_beta is not None):
                     u0, u1 = cute.arch.add_packed_f32x2((u0, u1), beta_pair)
                 ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
@@ -2169,19 +2208,22 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 inv_2beta = cutlass.Float32(2.0 / self.situ_beta)
                 two_beta = cutlass.Float32(2.0 * self.situ_beta)
                 neg_beta = cutlass.Float32(-self.situ_beta)
-                inv_2lbeta = cutlass.Float32(2.0 / self.situ_linear_beta)
-                two_lbeta = cutlass.Float32(2.0 * self.situ_linear_beta)
-                neg_lbeta = cutlass.Float32(-self.situ_linear_beta)
 
                 gs = _sigmoid(*cute.arch.mul_packed_f32x2((g0, g1), (inv_2beta, inv_2beta)))
                 tanh_g = cute.arch.add_packed_f32x2(
                     cute.arch.mul_packed_f32x2(gs, (two_beta, two_beta)), (neg_beta, neg_beta)
                 )
 
-                us = _sigmoid(*cute.arch.mul_packed_f32x2((u0, u1), (inv_2lbeta, inv_2lbeta)))
-                tanh_u = cute.arch.add_packed_f32x2(
-                    cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)), (neg_lbeta, neg_lbeta)
-                )
+                if cutlass.const_expr(self.situ_linear_beta is not None):
+                    inv_2lbeta = cutlass.Float32(2.0 / self.situ_linear_beta)
+                    two_lbeta = cutlass.Float32(2.0 * self.situ_linear_beta)
+                    neg_lbeta = cutlass.Float32(-self.situ_linear_beta)
+                    us = _sigmoid(*cute.arch.mul_packed_f32x2((u0, u1), (inv_2lbeta, inv_2lbeta)))
+                    tanh_u = cute.arch.add_packed_f32x2(
+                        cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)), (neg_lbeta, neg_lbeta)
+                    )
+                else:
+                    tanh_u = (u0, u1)
 
                 situ_gate = cute.arch.mul_packed_f32x2(tanh_g, sigmoid_pair)
                 out_pair = cute.arch.mul_packed_f32x2(situ_gate, tanh_u)
@@ -2348,8 +2390,10 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         fc2_output_sf: Optional[cute.Tensor],
         peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
         optional_epi_args: GatedActEpilogueArgs,
+        relay_landing: Optional[cute.Tensor] = None,
     ):
         self.base = base
+        self.relay_landing = relay_landing
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
@@ -2407,7 +2451,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
     @cute.jit
     def signal_fc2_done(self, work_tile_info, next_work_tile_info, flag_tracker):
-        publish: cutlass.Constexpr = self.token_back_enabled
+        publish: cutlass.Constexpr = self.publish_fc2_done
         flag_address = Int64(0)
         if cutlass.const_expr(publish):
             flag_address = (self.fc2_done_counter.iterator + work_tile_info.expert_idx).toint()
@@ -2455,6 +2499,8 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             output_mappings=output_mappings,
             epi_tid=self.tidx,
             combine_format=self.combine_format,
+            relay_record_topk_marker=self.relay_record_topk_marker,
+            relay_landing=self.relay_landing,
         ).prefetch()
 
     @cute.jit
@@ -2605,6 +2651,11 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         )
 
 
+# ``relay_record_topk_marker`` value meaning "no relay records": the top-k field of a record is a
+# non-negative 16-bit value, so every record compares below it.
+NO_RELAY_RECORDS_MARKER: int = 0x7FFFFFFF
+
+
 @dataclasses.dataclass(frozen=True)
 class Fc2OutputRouter:
     # One packed i64 TokenSrcMetadata record per pool token. None means a local write.
@@ -2625,6 +2676,13 @@ class Fc2OutputRouter:
     # After metadata prefetch
     dst_ptrs: Optional[cute.Tensor] = None  # i64 x (copy_iters_this_thread_cta_tile), fundamentally the pointers.
     valid: Optional[cute.Tensor] = None  # (copy_iters_this_thread_cta_tile)
+    # Records with src_topk >= marker are relay tokens: their FC2 row is pushed into the landing region
+    # of the rail peer named by src_rank at cell (source slot, message, top-k slot); the sentinel
+    # disables the distinction (every record pushes to its source rank's pre-reduced buffer).
+    relay_record_topk_marker: int = NO_RELAY_RECORDS_MARKER
+    # (source slot, message, top-k slot, hidden) BF16 landing region, symmetric on every rank of the
+    # node (same window offset); None keeps relay rows unwritten (dispatch-only configurations).
+    relay_landing: Optional[cute.Tensor] = None
 
     @property
     def data_output(self) -> cute.Tensor:
@@ -2695,22 +2753,49 @@ class Fc2OutputRouter:
 
                 else:
                     md = TokenSrcMetadata.load(
-                        self.metadata.iterator.toint() + Int64(token_in_tile) * Int64(TokenSrcMetadata.nbytes)
+                        self.metadata.iterator.toint() + Int64(token_in_tile) * Int64(TokenSrcMetadata.nbytes),
+                        # 16-bit top-k decode only when relay records can appear (internode kernel).
+                        wide_topk=self.relay_record_topk_marker < NO_RELAY_RECORDS_MARKER,
                     )
-                    dst_rank = md.src_rank
-                    dst_token = md.src_token
+                    # Hoisted out of the dynamic `if pushes` below: both arms use
+                    # the same hidden coordinate, and when relay_landing is None the
+                    # else arm assigns nothing, which would leave `dst_hidden` typed
+                    # None on one path and Int32 on the other at the join.
                     dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
-                    if cutlass.const_expr(not self.reduce_topk_in_epilogue):
-                        dst_topk = md.src_topk
+                    pushes = cutlass.Boolean(True)
+                    if cutlass.const_expr(self.relay_record_topk_marker < NO_RELAY_RECORDS_MARKER):
+                        pushes = md.src_topk < cutlass.Int32(self.relay_record_topk_marker)
+                    if pushes:
+                        dst_rank = md.src_rank
+                        dst_token = md.src_token
+                        if cutlass.const_expr(not self.reduce_topk_in_epilogue):
+                            dst_topk = md.src_topk
+                        else:
+                            dst_topk = 0
+                        # Int64 token coord: domain_offset on (token, topk, hidden)
+                        # computes dst_token*K*H, which overflows int32 once T*K*H > 2^31.
+                        dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.map_pointer(
+                            cute.domain_offset((Int64(dst_token), dst_topk, dst_hidden), self.data_output).iterator,
+                            dst_rank,
+                            byte_alignment=32,
+                        ).toint()
                     else:
-                        dst_topk = 0
-                    # Int64 token coord: domain_offset on (token, topk, hidden)
-                    # computes dst_token*K*H, which overflows int32 once T*K*H > 2^31.
-                    dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.map_pointer(
-                        cute.domain_offset((Int64(dst_token), dst_topk, dst_hidden), self.data_output).iterator,
-                        dst_rank,
-                        byte_alignment=32,
-                    ).toint()
+                        if cutlass.const_expr(self.relay_landing is not None):
+                            # Relay record: push the row to the rail peer (src_rank) that landed the message,
+                            # cell (source slot, message, top-k slot) of its landing region; the owner's
+                            # fc2_done release (system scope) publishes it (I9). Int64 coordinates: the
+                            # landing region exceeds 2^31 elements at large T.
+                            relay_slot = (md.src_topk >> cutlass.Int32(RELAY_RECORD_SLOT_SHIFT)) & cutlass.Int32(RELAY_RECORD_SLOT_MASK)
+                            relay_topk = md.src_topk & cutlass.Int32(RELAY_RECORD_TOPK_MASK)
+                            dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.map_pointer(
+                                cute.domain_offset(
+                                    (Int64(relay_slot), Int64(md.src_token), Int64(relay_topk), dst_hidden), self.relay_landing
+                                ).iterator,
+                                md.src_rank,
+                                byte_alignment=32,
+                            ).toint()
+                        else:
+                            valid[iter_idx] = cutlass.Int32(0)
 
         return dataclasses.replace(self, dst_ptrs=dst_ptrs, valid=valid)
 

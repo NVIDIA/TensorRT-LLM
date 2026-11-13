@@ -23,7 +23,9 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -50,6 +52,52 @@ void BufferConfig::validate() const
         "BufferConfig: tokensPerBlockOverride is not supported on a sparse buffer; use the layer's "
         "sparse_cache.unit_tokens");
     TLLM_CHECK_WITH_INFO(sparseUnitChunks > 0, "BufferConfig: sparseUnitChunks must be positive");
+}
+
+void RegionConfig::validate() const
+{
+    if (name.empty())
+    {
+        throw std::invalid_argument("RegionConfig: name must not be empty");
+    }
+    auto const fail
+        = [this](std::string const& what) { throw std::invalid_argument("RegionConfig '" + name + "': " + what); };
+    if (allocationUnit != RegionAllocationUnit::kRequest)
+    {
+        fail("only request regions are supported");
+    }
+    // A request region with any other policy would be a second snapshotted per-request life
+    // cycle beside the SSM layers' own, and reuse matching assumes there is one.
+    if (reusePolicy != ReusePolicy::PRIVATE)
+    {
+        fail("a request region must use the PRIVATE reuse policy");
+    }
+    if (buffers.empty())
+    {
+        fail("must declare at least one buffer");
+    }
+    if (fixedSlotCount.has_value() && *fixedSlotCount <= 0)
+    {
+        fail("fixed_slot_count must be positive when set");
+    }
+    std::set<std::pair<LayerId, DataRole>> seen;
+    for (auto const& [layerId, buf] : buffers)
+    {
+        buf.validate();
+        if (!seen.emplace(layerId, buf.role).second)
+        {
+            fail("declares buffer '" + buf.role + "' of layer " + std::to_string(layerId) + " twice");
+        }
+        if (buf.reusePolicy.has_value())
+        {
+            fail("buffer '" + buf.role + "' sets its own reuse policy; a region's buffers use the region's");
+        }
+        if (buf.tokensPerBlockOverride.has_value() || buf.isSparse)
+        {
+            fail("buffer '" + buf.role + "' sets tokensPerBlockOverride or isSparse, which request regions do not "
+                "support");
+        }
+    }
 }
 
 void SparseCacheConfig::validate(int tokensPerBlock) const
@@ -179,6 +227,54 @@ void _validateSelectionIds(std::vector<LayerConfig> const& layers)
     }
 }
 
+//! Region checks that need the layers: every region buffer sits on an SSM layer, and each
+//! (layer, role) pair belongs to one layer config or one region.
+void _validateRegions(std::vector<LayerConfig> const& layers, std::vector<RegionConfig> const& regions)
+{
+    std::set<LayerId> ssmLayerIds;
+    std::set<std::pair<LayerId, DataRole>> owned;
+    for (auto const& layer : layers)
+    {
+        std::visit(
+            [&](auto const& cfg)
+            {
+                if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>, SsmLayerConfig>)
+                {
+                    ssmLayerIds.insert(cfg.layerId);
+                }
+                for (auto const& buf : cfg.buffers)
+                {
+                    owned.emplace(cfg.layerId, buf.role);
+                }
+            },
+            layer);
+    }
+    std::set<std::string> names;
+    for (auto const& region : regions)
+    {
+        region.validate();
+        if (!names.insert(region.name).second)
+        {
+            throw std::invalid_argument("KVCacheManagerConfig: region name '" + region.name + "' is declared twice");
+        }
+        for (auto const& [layerId, buf] : region.buffers)
+        {
+            if (ssmLayerIds.count(layerId) == 0)
+            {
+                throw std::invalid_argument("KVCacheManagerConfig: region '" + region.name + "' places buffer '"
+                    + buf.role + "' on layer " + std::to_string(layerId)
+                    + ", which has no SsmLayerConfig; request regions need one");
+            }
+            if (!owned.emplace(layerId, buf.role).second)
+            {
+                throw std::invalid_argument("KVCacheManagerConfig: buffer '" + buf.role + "' of layer "
+                    + std::to_string(layerId) + " belongs to region '" + region.name
+                    + "' and to a layer config or another region");
+            }
+        }
+    }
+}
+
 } // namespace
 
 void KVCacheManagerConfig::validate() const
@@ -279,6 +375,8 @@ void KVCacheManagerConfig::validate() const
         if (!commitMinSnapshot)
             throw AssertionError("KVCacheManagerConfig: commit_min_snapshot must be True when SSM layers are present");
     }
+
+    _validateRegions(layers, regions);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

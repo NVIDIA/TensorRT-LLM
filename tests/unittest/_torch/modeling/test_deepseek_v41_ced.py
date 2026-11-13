@@ -41,6 +41,7 @@ def independent_window_reference(model, metadata, ids, window=128, chunks=None):
     body = model.model
     positions = torch.arange(len(ids), device=ids.device, dtype=torch.int32).view(1, -1)
     offset = 0
+    state = None
     residuals, pre_mix = [], []
     for length in chunks or (len(ids),):
         end = offset + length
@@ -424,6 +425,7 @@ def test_chunked_ced_matches_independent_window_reference(
             with patch.object(
                 owner.self_attn.compressor, "forward", wraps=owner.self_attn.compressor.forward
             ) as production:
+                out = None
                 for j, n in enumerate(chunks):
                     final = j == len(chunks) - 1
                     # Exercise actual history reclamation between chunks.

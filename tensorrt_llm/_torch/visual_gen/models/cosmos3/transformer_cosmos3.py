@@ -1651,6 +1651,58 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
 
+    def _run_gen_stack(
+        self,
+        hidden_gen: torch.Tensor,
+        freqs_gen: Tuple[torch.Tensor, torch.Tensor],
+        *,
+        timestep: torch.Tensor,
+        layer_text_lens: Any,
+        offload_context: Callable[[str], ContextManager],
+    ) -> torch.Tensor:
+        """Run the generator decoder stack and its final norm on the packed sequence.
+
+        Maps the full generation sequence ``[B, S_gen, D]`` (after the time
+        embedding and any extra-modality tokens) to the normalized sequence of
+        the same shape that the output projections read. Sequence-parallel
+        sharding and gathering happen inside, so input and output are always
+        the full sequence. Step-caching accelerators replace this method on the
+        instance to skip the stack.
+        """
+        S_gen = hidden_gen.shape[1]
+        hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
+        cos, sin = freqs_gen
+        cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
+        sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
+        sharded_freqs_gen = (cos, sin)
+
+        with offload_context("generator"):
+            for i, layer in enumerate(self.gen_layers):
+                k_und, v_und = self.cached_kv[i]
+                if not self.sharder.is_active:
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        sharded_freqs_gen,
+                        timestep=timestep,
+                        real_text_lens=layer_text_lens,
+                    )
+                else:
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        sharded_freqs_gen,
+                        timestep=timestep,
+                        real_text_lens=layer_text_lens,
+                        global_generated_seq_len=S_gen,
+                    )
+
+        hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
+
+        return self.norm_moe_gen(hidden_gen)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1922,39 +1974,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             freqs_gen_combined = self.cached_freqs_gen
         # --------------------------------------------------------------------------
 
-        S_gen = hidden_gen.shape[1]
-        hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
-        cos, sin = freqs_gen_combined
-        cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
-        sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
-        freqs_gen = (cos, sin)
-
-        with offload_context("generator"):
-            for i, layer in enumerate(self.gen_layers):
-                k_und, v_und = self.cached_kv[i]
-                if not self.sharder.is_active:
-                    hidden_gen = layer(
-                        hidden_gen,
-                        k_und,
-                        v_und,
-                        freqs_gen,
-                        timestep=timestep,
-                        real_text_lens=layer_text_lens,
-                    )
-                else:
-                    hidden_gen = layer(
-                        hidden_gen,
-                        k_und,
-                        v_und,
-                        freqs_gen,
-                        timestep=timestep,
-                        real_text_lens=layer_text_lens,
-                        global_generated_seq_len=S_gen,
-                    )
-
-        hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
-
-        hidden_gen = self.norm_moe_gen(hidden_gen)
+        hidden_gen = self._run_gen_stack(
+            hidden_gen,
+            freqs_gen_combined,
+            timestep=timestep,
+            layer_text_lens=layer_text_lens,
+            offload_context=offload_context,
+        )
 
         # --- Decode video velocity ------------------------------------------------
         video_vel = self.unpatchify(

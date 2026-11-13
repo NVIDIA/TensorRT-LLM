@@ -31,6 +31,7 @@ import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -38,7 +39,11 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "comm"))
 import _kimi_k3_decode_comm_checks as dc  # noqa: E402
-import _lockstep as ls  # noqa: E402
+
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 from _kimi_k3_decode_comm_checks import LATENT, MOE_LAYERS, TAIL_ACT, H, _gen, _normal  # noqa: E402
 
 DEADLINE_S = dc.DEADLINE_S

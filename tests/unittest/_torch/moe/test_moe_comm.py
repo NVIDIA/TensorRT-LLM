@@ -2587,6 +2587,7 @@ def _run_rank_mask_one_rank_masked_test(
 def _exercise_mnnvl_checkpoint_graph_replay(
     config: CommTestConfig, rank: int, communication
 ) -> bool:
+    any_allocation_is_mapped = None
     worker_inputs = _prepare_worker_inputs(rank, config)
     _, local_slot_start, local_slot_end = _compute_ep_partition(
         config.num_experts, config.ep_size, rank

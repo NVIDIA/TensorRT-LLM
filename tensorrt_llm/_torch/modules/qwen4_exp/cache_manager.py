@@ -30,6 +30,7 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     ReplayStateUpdateMetadata,
     create_gdn_state,
+    estimate_gdn_replay_bytes_per_slot,
     validate_gdn_layout,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
@@ -715,6 +716,13 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             buffers.extend(self._ple_buffer_configs())
         return buffers
 
+    @classmethod
+    @override
+    def _estimate_private_replay_bytes_per_slot(cls, model_config, mapping, **kwargs) -> int:
+        return estimate_gdn_replay_bytes_per_slot(
+            model_config, mapping, flashinfer_ring=False, **kwargs
+        )
+
     @override
     def _setup_model_state(self) -> None:
         super()._setup_model_state()
@@ -724,8 +732,12 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping, **kwargs) -> int:
+        # FlashInfer rings share every recurrent-state slot.
+        ring_bytes = estimate_gdn_replay_bytes_per_slot(
+            model_config, mapping, flashinfer_ring=True, **kwargs
+        )
         if kwargs.get("is_draft", False):
-            return 0
+            return ring_bytes
         params, _, _ = _get_local_mamba_cache_layout(
             model_config,
             mapping,
@@ -733,7 +745,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             is_draft=False,
             use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
         )
-        return _qwen4_exp_ple_state_bytes_per_rank(
+        return ring_bytes + _qwen4_exp_ple_state_bytes_per_rank(
             model_config,
             params,
             mapping,

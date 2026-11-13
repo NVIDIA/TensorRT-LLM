@@ -22,10 +22,12 @@
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -145,6 +147,18 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
             bufferGroups[lcId][{buf.coalescingGroup, expandedSize, buf.isSparse}].push_back(bid);
         }
     }
+    // Region buffers join their region's lifecycle. Regions admit no tokensPerBlockOverride
+    // and no sparse buffer, so the expansion is 1 and the pool dense.
+    for (int regionIndex = 0; regionIndex < registry.numRegions(); ++regionIndex)
+    {
+        LifeCycleId const lcId = registry.regionLifeCycleId(regionIndex);
+        for (auto const& [layerId, buf] : config.regions[static_cast<size_t>(regionIndex)].buffers)
+        {
+            BufferId bid{layerId, buf.role};
+            expansionMap[bid] = 1;
+            bufferGroups[lcId][{buf.coalescingGroup, buf.size, false}].push_back(bid);
+        }
+    }
 
     // Build one SlotDescVariant per life cycle.
     // Each variant: coalesced buffers sorted by size descending.
@@ -173,33 +187,46 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
     // Distinct reuse policies need separate GPU pools and eviction queues, except that SINK_REQUIRED_ONLY shares the
     // REQUIRED ones (effectivePoolReusePolicy explains why). Keying on per-pool sparsity too keeps a shared pool
-    // uniformly host-backed or device-backed.
+    // uniformly host-backed or device-backed. A region with a fixed slot count gets a pool group of its own:
+    // KvCache::resume() gates on each pool group's utilization, so a count that leaves resume headroom for the
+    // region's owners holds only while no other lifecycle shares its slots.
     struct PoolGroupKey
     {
         ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         std::vector<bool> sparsity;
+        std::optional<int> fixedRegionIndex;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(reusePolicy, slotSizes, sparsity)
-                < std::tie(other.reusePolicy, other.slotSizes, other.sparsity);
+            return std::tie(reusePolicy, slotSizes, sparsity, fixedRegionIndex)
+                < std::tie(other.reusePolicy, other.slotSizes, other.sparsity, other.fixedRegionIndex);
         }
     };
 
     std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroups;
     for (auto& sg : slotGroups)
     {
+        auto const& lifeCycle = registry.getLifeCycle(sg.lifeCycleId);
         auto const sizes = sg.slotSizeList();
-        auto const policy = effectivePoolReusePolicy(registry.getLifeCycle(sg.lifeCycleId));
+        auto const policy = effectivePoolReusePolicy(lifeCycle);
         TypedVec<PoolIndex, bool> sparsity;
         sparsity.reserve(sizes.size());
         for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
         {
             sparsity.push_back(sg.isSparse(pool));
         }
-        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .sparsity = sparsity.raw()}].push_back(
-            std::move(sg));
+        std::optional<int> fixedRegionIndex;
+        if (auto const* ssm = std::get_if<SsmLifeCycle>(&lifeCycle); ssm != nullptr && ssm->regionIndex.has_value()
+            && config.regions[static_cast<size_t>(*ssm->regionIndex)].fixedSlotCount.has_value())
+        {
+            fixedRegionIndex = ssm->regionIndex;
+        }
+        poolGroups[{.reusePolicy = policy,
+                       .slotSizes = sizes.raw(),
+                       .sparsity = sparsity.raw(),
+                       .fixedRegionIndex = fixedRegionIndex}]
+            .push_back(std::move(sg));
     }
 
     StorageConfig out;
@@ -212,6 +239,9 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         SlotDesc sd;
         sd.variants = std::move(variants);
         out.slotDescList.push_back(std::move(sd));
+        out.fixedSlotCounts.push_back(key.fixedRegionIndex.has_value()
+                ? config.regions[static_cast<size_t>(*key.fixedRegionIndex)].fixedSlotCount
+                : std::nullopt);
     }
 
     // A21: Assert all life_cycle_ids across all SlotDescVariants are unique.

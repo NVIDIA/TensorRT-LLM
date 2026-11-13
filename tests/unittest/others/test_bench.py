@@ -383,6 +383,8 @@ def test_acceptance_length_weighted_by_iterations():
 
 def _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype, dtype):
     """trtllm-bench model config with the NVIDIA-Nemotron-Nano-12B-v2 geometry."""
+    # Pydantic accepts ssm_state_size and conv_kernel as validation aliases.
+    # pyrefly: ignore [missing-argument]
     return NemotronHybridConfig(
         name="nvidia/NVIDIA-Nemotron-Nano-12B-v2",
         model_type="nemotron_h",

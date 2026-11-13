@@ -30,10 +30,10 @@ import torch.nn.functional as F
 import tensorrt_llm._torch.models.modeling_dspark as modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import (
     DSv4DSparkDraftModel,
-    _dspark_attention_forward_legacy,
     _output_projection,
     _qkv_projections,
     apply_dspark_rotary,
+    dspark_attention_forward,
     dspark_sparse_attn,
     get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
@@ -487,7 +487,7 @@ def _make_attn_inputs(seed=0):
 
 
 def _run(g):
-    return _dspark_attention_forward_legacy(
+    return dspark_attention_forward(
         g["x"],
         g["main_x"],
         g["start_pos"],
@@ -559,6 +559,34 @@ def test_use_dspark_bf16_linear_rejects_sharded_fp8(monkeypatch):
     mapping = types.SimpleNamespace(tp_size=2, enable_attention_dp=False)
     with pytest.raises(ValueError, match="requires TP=1 or attention DP"):
         modeling_dspark._use_dspark_bf16_linear(mapping)
+
+
+_DSPARK_MAPPINGS = [(1, False), (2, True), (2, False)]
+
+
+@pytest.mark.parametrize("tp_size,enable_attention_dp", _DSPARK_MAPPINGS)
+@pytest.mark.parametrize("value", [None, "bf16"])
+def test_use_dspark_bf16_linear_without_fp8_support(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, tp_size: int, enable_attention_dp: bool
+) -> None:
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
+    if value is None:
+        monkeypatch.delenv("TRTLLM_DSPARK_LINEAR_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", value)
+    mapping = types.SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
+    assert modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False) is True
+
+
+@pytest.mark.parametrize("tp_size,enable_attention_dp", _DSPARK_MAPPINGS)
+def test_use_dspark_bf16_linear_without_fp8_support_rejects_fp8(
+    monkeypatch: pytest.MonkeyPatch, tp_size: int, enable_attention_dp: bool
+) -> None:
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
+    monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "fp8")
+    mapping = types.SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
+    with pytest.raises(ValueError, match="not supported by this DSpark drafter"):
+        modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False)
 
 
 def test_use_dspark_bf16_linear_rejects_invalid_backend(monkeypatch):
@@ -822,6 +850,7 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
 
     qkv_proj = Mock()
     qkv_proj.in_features = 4
+    qkv_proj.out_features = 14
     q_b_proj = Mock()
     q_b_proj.in_features = 6
     o_b_proj = Mock()
@@ -918,6 +947,10 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
     assert model._context_wkv_fp8 is context_wkv
     assert stage._dspark_context_wkv_slice is None
 
+    qkv_proj.out_features = 15
+    with pytest.raises(ValueError, match="q_lora_rank \\+ head_dim"):
+        DSv4DSparkDraftModel._bind_attn_projections(model)
+
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
@@ -1006,38 +1039,38 @@ def test_post_load_weights_preserves_linear_backend_before_transform(
     assert events == ["transform", "bind"]
 
 
-def test_bind_bf16_attn_projections_disables_every_fp8_projection():
+@pytest.mark.parametrize("block", [128, 32])
+def test_bind_bf16_attn_projections_disables_every_fp8_projection(block: int) -> None:
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     torch.nn.Module.__init__(model)
+    model.checkpoint_fp8_block_size = block
     model._context_wkv_fp8 = object()
     stage = types.SimpleNamespace(input_layernorm=types.SimpleNamespace(weight=torch.ones(1)))
     model.mtp_layers = [stage]
     prefix = "mtp.0.attn."
-    shapes = {
-        "wq_a": (2, 4),
-        "wq_b": (6, 2),
-        "wkv": (3, 4),
-        "wo_a": (8, 3),
-        "wo_b": (4, 8),
-    }
+    generator = torch.Generator().manual_seed(block)
     weights = {
         f"{prefix}q_norm.weight": torch.ones(2),
         f"{prefix}kv_norm.weight": torch.ones(3),
         f"{prefix}attn_sink": torch.zeros(6),
     }
-    for index, (name, shape) in enumerate(shapes.items(), start=1):
-        weights[f"{prefix}{name}.weight"] = torch.full(shape, index, dtype=torch.float8_e4m3fn)
-        weights[f"{prefix}{name}.scale"] = torch.full((1, 1), index + 0.5)
+    for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+        weights[f"{prefix}{name}.weight"] = torch.randn(128, 128, generator=generator).to(
+            torch.float8_e4m3fn
+        )
+        weights[f"{prefix}{name}.scale"] = torch.rand(
+            128 // block, 128 // block, generator=generator
+        )
 
     model._bind_bf16_attn_projections(weights)
 
     bound = stage._dspark_attn
     for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
-        expected = model._block_dequant(
-            weights[f"{prefix}{name}.weight"], weights[f"{prefix}{name}.scale"]
-        )
+        weight = weights[f"{prefix}{name}.weight"].float()
+        scale = weights[f"{prefix}{name}.scale"]
+        expected = weight * scale.repeat_interleave(block, 0).repeat_interleave(block, 1)
         assert bound[name].dtype == torch.bfloat16
-        torch.testing.assert_close(bound[name], expected)
+        torch.testing.assert_close(bound[name], expected.to(torch.bfloat16))
     assert bound["qkv_proj"] is None
     assert bound["o_a_proj"] is None
     assert bound["o_a_scale"] is None
@@ -1045,6 +1078,7 @@ def test_bind_bf16_attn_projections_disables_every_fp8_projection():
     assert bound["use_fused_output_projection"] is False
     assert bound["use_fused_qkv_input_projection"] is False
     assert bound["use_fused_q_input_projection"] is False
+    assert stage._dspark_context_wkv_slice is None
     assert model._context_wkv_fp8 is None
 
 
@@ -1195,7 +1229,7 @@ def test_rolling_attention_uses_projection_modules(monkeypatch, batched):
         args = (torch.full((g["b"],), g["start_pos"]),)
         tail = (torch.arange(g["b"]),)
     else:
-        fn = _dspark_attention_forward_legacy
+        fn = dspark_attention_forward
         args = (g["start_pos"],)
         tail = ()
     expected = fn(g["x"], g["main_x"], *args, expected_cache, *tail, **weights)

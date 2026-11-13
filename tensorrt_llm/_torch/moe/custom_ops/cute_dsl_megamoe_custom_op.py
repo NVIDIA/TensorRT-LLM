@@ -500,6 +500,51 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
 }
 
 
+# Static default for the SM107 Kimi K3 NVFP4 generation-phase shape at EP4. The full runner
+# key matches only a runner whose max_tokens_per_rank is exactly 512 (the 512 rung of the
+# default ladder); a per-rank cap of 385-511 keeps the generic table because it was not
+# measured. With this tactic the 128, 192, 256, 384 and 1024 buckets measured no faster
+# than the generic table; 32 and 64 were not measured. K3 applies top-k after FC2, and the
+# full key keeps this tactic from reaching other shapes, EP sizes, combine formats,
+# helper-expert counts or top-k placements.
+_SM107_KIMI_K3_GENPHASE_TACTICS: dict[Tuple, Tuple] = {
+    (
+        107,
+        4,
+        16,
+        896 // 4,
+        3584,
+        3072,
+        6144,
+        max_tokens_per_rank,
+        str(torch.bfloat16),
+        False,
+        None,
+        4.0,
+        25.0,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    ): (
+        [256, 128, 256],
+        [4, 1, 1],
+        None,
+        ("phase_interleave", phase_hint),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        epi_flag_batch,
+    )
+    for max_tokens_per_rank, (phase_hint, epi_flag_batch) in {
+        512: (16, (2, 2)),
+    }.items()
+}
+
+
 # ---------------------------------------------------------------------------
 # Curated tuning space with staged-store and mixed-CGA candidates, filtered through
 # ``validate_megamoe_tactic``. MUST be identical on every EP rank: the MERGE
@@ -725,6 +770,7 @@ def _default_megamoe_tactic_for_problem(
     in_kernel_fc2_reduce: bool,
     combine_format: str,
     shape_tuned_tactic: Optional[Tuple] = None,
+    genphase_shape_tuned_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
         return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
@@ -735,6 +781,8 @@ def _default_megamoe_tactic_for_problem(
         )
         if in_kernel_fc2_reduce != expected_in_kernel_fc2_reduce:
             return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+        if genphase_shape_tuned_tactic is not None:
+            return _unpack_tactic(genphase_shape_tuned_tactic)
         return _unpack_tactic(_SM107_GENPHASE_TACTICS[bucket])
     if in_kernel_fc2_reduce:
         return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
@@ -752,6 +800,7 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
         shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
+        genphase_shape_tuned_tactic=_SM107_KIMI_K3_GENPHASE_TACTICS.get(problem_key),
     )
 
 
@@ -960,11 +1009,30 @@ def _construct_megamoe_kernel(
             raise NotImplementedError(f"{kernel_cls.__name__} does not support swiglu_alpha.")
         return kernel_cls(problem_desc, impl_desc)
 
+    def construct_genphase():
+        kernel = construct(RubinInferenceGenphaseMegaMoE)
+        # The gen kernel addresses activation rows by its padded strides, while the backend
+        # stages compact rows (megamoe_activation_sf_bytes_per_row); with dynamic layouts a
+        # mismatch is only caught by a trap at launch, so reject it here (e.g. hidden 2880).
+        token_comm = kernel.token_comm
+        sf_row_bytes = megamoe_activation_sf_bytes_per_row(int(hidden_size))
+        if (
+            token_comm.plain_activation_row_elements != int(hidden_size)
+            or token_comm.plain_activation_sf_row_elements != sf_row_bytes
+        ):
+            raise ValueError(
+                f"hidden_size {hidden_size}: the generation-phase kernel needs activation rows of "
+                f"{token_comm.plain_activation_row_elements} elements and SF rows of "
+                f"{token_comm.plain_activation_sf_row_elements} bytes, but the backend stages "
+                f"{hidden_size} and {sf_row_bytes}."
+            )
+        return kernel
+
     bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     rejection = None
     if bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS:
         try:
-            return construct(RubinInferenceGenphaseMegaMoE), None
+            return construct_genphase(), None
         except (ValueError, TypeError, NotImplementedError) as exc:
             rejection = exc
     kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
@@ -2389,11 +2457,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            default_tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
-            if default_tactic is not None:
-                default_tactic = _unpack_tactic(default_tactic)
-                if default_tactic not in candidates:
-                    candidates.append(default_tactic)
+            for table in (_SM107_DSV4_PRO_DEFAULT_TACTICS, _SM107_KIMI_K3_GENPHASE_TACTICS):
+                default_tactic = table.get(self.unique_id())
+                if default_tactic is not None:
+                    default_tactic = _unpack_tactic(default_tactic)
+                    if default_tactic not in candidates:
+                        candidates.append(default_tactic)
             choices = _token_back_ready_granularity_choices(
                 load_balance=self.helper_expert_count > 0
             )

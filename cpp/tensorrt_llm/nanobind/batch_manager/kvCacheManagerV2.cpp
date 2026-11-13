@@ -1561,6 +1561,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::SsmLifeCycle>(m, "SsmLifeCycle")
         .def(nb::init<kv::ReusePolicy>(), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
         .def_ro("reuse_policy", &kv::SsmLifeCycle::reusePolicy)
+        .def_prop_ro(
+            "region_index", [](kv::SsmLifeCycle const& self) { return self.regionIndex; },
+            "Index into KVCacheManagerConfig.regions of the region this life cycle belongs to; None for SSM layer "
+            "buffers.")
         .def(
             "get_stale_range", &kv::SsmLifeCycle::getStaleRange, nb::arg("history_length"), nb::arg("tokens_per_block"))
         .def("__eq__", &kv::SsmLifeCycle::operator==);
@@ -1809,6 +1813,43 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("layer_id", &kv::SsmLayerConfig::layerId)
         .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
 
+    nb::enum_<kv::RegionAllocationUnit>(m, "RegionAllocationUnit")
+        .value("REQUEST", kv::RegionAllocationUnit::kRequest)
+        .value("TOKEN_BLOCK", kv::RegionAllocationUnit::kTokenBlock);
+
+    nb::class_<kv::RegionBuffer>(m, "RegionBuffer")
+        .def(nb::init<kv::LayerId, kv::BufferConfig>(), nb::arg("layer_id"), nb::arg("buffer"))
+        .def_rw("layer_id", &kv::RegionBuffer::layerId)
+        .def_rw("buffer", &kv::RegionBuffer::buffer) DEF_COPY(kv::RegionBuffer);
+
+    nb::class_<kv::RegionConfig>(m, "RegionConfig",
+        "Buffers that share a life cycle of the region's own, never merged with another life cycle. Only "
+        "REQUEST regions with the PRIVATE reuse policy are supported, on layers that have an SsmLayerConfig.")
+        .def(
+            "__init__",
+            [](kv::RegionConfig* cfg, std::string name, std::vector<kv::RegionBuffer> buffers,
+                kv::RegionAllocationUnit allocationUnit, kv::ReusePolicy reusePolicy,
+                std::optional<std::int64_t> fixedSlotCount)
+            {
+                new (cfg) kv::RegionConfig();
+                cfg->name = std::move(name);
+                cfg->buffers = std::move(buffers);
+                cfg->allocationUnit = allocationUnit;
+                cfg->reusePolicy = reusePolicy;
+                cfg->fixedSlotCount = fixedSlotCount;
+            },
+            nb::arg("name"), nb::arg("buffers"), nb::arg("allocation_unit") = kv::RegionAllocationUnit::kRequest,
+            nb::arg("reuse_policy") = kv::ReusePolicy::PRIVATE, nb::arg("fixed_slot_count").none() = std::nullopt)
+        .def_rw("name", &kv::RegionConfig::name)
+        .def_rw("buffers", &kv::RegionConfig::buffers)
+        .def_rw("allocation_unit", &kv::RegionConfig::allocationUnit)
+        .def_rw("reuse_policy", &kv::RegionConfig::reusePolicy)
+        .def_rw("fixed_slot_count", &kv::RegionConfig::fixedSlotCount, nb::for_setter(nb::arg("value").none()),
+            "GPU slot count of the region's pool group. When set, the region gets a pool group of its own with "
+            "exactly this many hot-tier slots, which ratio-based sizing (construction, resize(), adjust() and the "
+            "tuner) leaves alone; a GPU quota too small to hold it is raised. None sizes the region by ratio.")
+        .def("validate", &kv::RegionConfig::validate) DEF_COPY(kv::RegionConfig);
+
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
         .def(nb::init<int, int, int, int>(), nb::arg("capacity"), nb::arg("history_length"), nb::arg("beam_width") = 1,
             nb::arg("prompt_length") = 0)
@@ -1916,7 +1957,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
-                kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota)
+                kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
+                std::vector<kv::RegionConfig> regions)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1943,6 +1985,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->poolRebalance = std::move(poolRebalance);
                 cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
+                cfg->regions = std::move(regions);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1955,10 +1998,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
-            nb::arg("host_sparse_pool_quota").none() = std::nullopt)
+            nb::arg("host_sparse_pool_quota").none() = std::nullopt,
+            nb::arg("regions") = std::vector<kv::RegionConfig>{})
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
+        .def_rw("regions", &kv::KVCacheManagerConfig::regions,
+            "Regions, each with a life cycle of its own, numbered after every layer life cycle in declaration "
+            "order. A (layer, role) pair belongs to one layer config or one region.")
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
@@ -3694,6 +3741,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager const& self, kv::LayerId layerId, kv::DataRole const& role)
             { return self.getBufferGroupId(layerId, role).value(); },
             nb::arg("layer_id"), nb::arg("role"), "CacheGroupId of one buffer of the layer.")
+        .def(
+            "get_region_group_id",
+            [](kv::KvCacheManager const& self, std::string const& name) { return self.getRegionGroupId(name).value(); },
+            nb::arg("name"), "CacheGroupId of the region named `name`; raises IndexError for an unknown name.")
         .def(
             "get_sparse_cache_max_units",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)

@@ -505,7 +505,7 @@
    "accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_prefix_cache": 904.0571428571428,
    "accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload": 690.0651202531645,
    "accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload": 427.0257848101266,
-   "accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload": 438.4012215189873,
+   "accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm": 438.4012215189873,
    "accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype": 552.3427058823529,
    "accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_step3p7_mtp": 325.6583,
    "accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[tinyllama-1.1b]": 15.013406576980568,

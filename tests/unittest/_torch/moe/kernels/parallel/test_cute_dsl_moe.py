@@ -4183,8 +4183,8 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
         assert execution_order == ["tune", "launch"]
         assert not memset_calls
     if quantized:
-        assert leaf_calls[0][1]["weight_scale"] is weight_scale_0
-        assert leaf_calls[1][1]["weight_scale"] is weight_scale_1
+        assert leaf_calls[0][1]["weight_scale"] is call_kwargs["weight_scale_0"]
+        assert leaf_calls[1][1]["weight_scale"] is call_kwargs["weight_scale_1"]
         assert all(kwargs["input_scale"] is call_kwargs["input_scale"] for _, kwargs in leaf_calls)
         assert all(kwargs["alpha"] is alpha for _, kwargs in leaf_calls)
         assert all(kwargs["scaling_vector_size"] == 16 for _, kwargs in leaf_calls)

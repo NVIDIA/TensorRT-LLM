@@ -535,7 +535,8 @@ class Fp4MlaV2CacheLayoutPolicy:
             if fp8_pool_id in (cache_pool_id, hp_pool_id):
                 raise RuntimeError("FP4 MLA, FP8 MLA, and HP state must use distinct lifecycles.")
 
-        num_pools = len(self.impl.layer_grouping)
+        # The hybrid manager can split a recurrent layer across groups by buffer reuse policy.
+        num_pools = len(self.impl.buffer_grouping)
         pool_pointers = [[[0, 0], [0, 0]] for _ in range(num_pools)]
         pool_pointers[cache_pool_id] = [
             [

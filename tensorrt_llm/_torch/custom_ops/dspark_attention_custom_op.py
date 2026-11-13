@@ -21,17 +21,15 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..kernels.blackwell.utils import make_ptr
 from ..utils import next_positive_power_of_2
 from .dspark_rmsnorm_rope_custom_op import (
+    _DSV4_DSPARK_BLOCK_SIZES,
+    _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
+    _DSV4_DSPARK_HEAD_DIM,
+    _DSV4_DSPARK_ROPE_DIM,
+    _DSV4_DSPARK_WINDOW_SIZE,
     _get_dspark_arch_str,
     cute_dsl_dspark_rmsnorm_rope_cache_write,
     cute_dsl_dspark_rmsnorm_rope_draft_block,
 )
-
-_DSPARK_NUM_HEADS = 128
-_DSPARK_HEAD_DIM = 512
-_DSPARK_WINDOW_SIZE = 128
-_DSPARK_PAGE_SIZE = 8
-_DSPARK_BLOCK_SIZES = (5, 6)
-_DSPARK_ROPE_DIM = 64
 
 _DSPARK_CONTEXT_WKV_MIN_M_BUCKET = 128
 
@@ -51,17 +49,13 @@ def _gen_dspark_context_wkv_m_profiles(max_m: int) -> Tuple[int, ...]:
     return tuple(buckets)
 
 
-_DSV4_DSPARK_NUM_HEADS = (64, 128)
-_DSV4_DSPARK_HEAD_DIM = 512
-_DSV4_DSPARK_WINDOW_SIZE = 128
-_DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
-_DSV4_DSPARK_ROPE_DIM = 64
+# Attention-only limits; the shared DSpark shape contract (head and RoPE dims, window,
+# draft block sizes and storage) comes from dspark_rmsnorm_rope_custom_op.
+_DSV4_DSPARK_SUPPORTED_NUM_HEADS = (64, 128)
+_DSV4_DSPARK_PAGE_SIZES = (16, 32, 64, 128, 256)
 
 
-_dspark_attention_kernel_cache: dict[
-    tuple[int, int, int, str, int | None], Callable[..., None]
-] = {}
+_dspark_attention_kernel_cache: dict[tuple[int, int, int, str], Callable[..., None]] = {}
 
 
 def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Pointer:
@@ -78,7 +72,6 @@ def _compile_dspark_attention(
     block_size: int,
     arch_str: str,
     page_size: int,
-    output_groups: int | None,
     num_heads: int,
 ) -> Callable[..., None]:
     """Compile the pointer host wrapper without runtime tensor specimens."""
@@ -90,22 +83,6 @@ def _compile_dspark_attention(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    output_scale_fake = None
-    if output_groups is not None:
-        group_dim = num_heads * head_dim // output_groups
-        rows = batch * block_size
-        output_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float8E4M3FN,
-            (output_groups, rows, group_dim),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-        output_scale_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (output_groups, group_dim // 128, cute.sym_int(divisibility=4)),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Real tensor specimens used to make PyTorch's primary CUDA context current
@@ -127,7 +104,6 @@ def _compile_dspark_attention(
         inverse_rope_dim=_DSV4_DSPARK_ROPE_DIM,
         arch_str=arch_str,
         history_page_size=page_size,
-        output_groups=output_groups,
         num_heads=num_heads,
     )
     # Scalars and typed, aligned compile-only pointers define the runtime ABI.
@@ -150,7 +126,6 @@ def _compile_dspark_attention(
         _make_compile_gmem_pointer(cutlass.Float32, 4),
         _make_compile_gmem_pointer(cutlass.Float32, 4),
         output_fake,
-        output_scale_fake,
         cutlass.Float32(1.0),
         stream_fake,
         options="--opt-level 2 --enable-tvm-ffi",
@@ -162,7 +137,10 @@ def _compile_dspark_attention(
     return compiled
 
 
-def _run_paged_dspark_attention(
+@torch.library.custom_op(
+    "trtllm::fused_dsv4_dspark_attention", mutates_args=(), device_types="cuda"
+)
+def fused_dsv4_dspark_attention(
     q: torch.Tensor,
     draft_block: torch.Tensor,
     kv_pages: torch.Tensor,
@@ -173,51 +151,80 @@ def _run_paged_dspark_attention(
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
-    output_groups: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> torch.Tensor:
     """Attend to a 128-token context window and fuse the inverse-RoPE epilogue."""
     arch_str = _get_dspark_arch_str()
     if arch_str is None:
         raise RuntimeError("Embedded DSpark attention requires SM100, SM103, or SM107")
-    if output_groups is not None and arch_str != "sm_107":
-        raise RuntimeError("DSpark fused FP8 output requires SM107")
     batch, block, heads, dim = q.shape
-    page_size = kv_pages.shape[1]
-    if (
-        block not in _DSV4_DSPARK_BLOCK_SIZES
-        or heads not in _DSV4_DSPARK_NUM_HEADS
-        or dim != _DSV4_DSPARK_HEAD_DIM
-        or page_size not in (16, 32, 64, 128, 256)
-    ):
+    if block not in _DSV4_DSPARK_BLOCK_SIZES:
         raise ValueError(
-            "DSpark requires block 5/6, 64/128 heads, head_dim 512 and 16/32/64/128/256-token pages"
+            f"DSpark block size must be one of {_DSV4_DSPARK_BLOCK_SIZES}, got {block}"
         )
-    if q.dtype != torch.bfloat16 or draft_block.dtype != q.dtype or kv_pages.dtype != q.dtype:
-        raise ValueError("DSpark Q, draft KV and pages must use BF16")
-    if draft_block.shape != (batch, 8, dim) or kv_pages.shape[2] != dim:
-        raise ValueError("DSpark draft KV must have shape [batch, 8, 512]")
-    if (
-        block_tables.dtype != torch.int32
-        or block_tables.shape[0] != batch
-        or block_tables.stride(1) != 1
+    if heads not in _DSV4_DSPARK_SUPPORTED_NUM_HEADS:
+        raise ValueError(
+            f"DSpark num_heads must be one of {_DSV4_DSPARK_SUPPORTED_NUM_HEADS}, got {heads}"
+        )
+    if dim != _DSV4_DSPARK_HEAD_DIM:
+        raise ValueError(f"DSpark head_dim must be {_DSV4_DSPARK_HEAD_DIM}, got {dim}")
+    if kv_pages.ndim != 3 or kv_pages.shape[2] != dim:
+        raise ValueError(
+            f"DSpark pages must have shape [pages, page_size, {dim}], got {tuple(kv_pages.shape)}"
+        )
+    page_size = kv_pages.shape[1]
+    if page_size not in _DSV4_DSPARK_PAGE_SIZES:
+        raise ValueError(
+            f"DSpark page size must be one of {_DSV4_DSPARK_PAGE_SIZES}, got {page_size}"
+        )
+    for name, value in (("Q", q), ("draft KV", draft_block), ("pages", kv_pages)):
+        if value.dtype != torch.bfloat16:
+            raise ValueError(f"DSpark {name} must use BF16, got {value.dtype}")
+    expected_draft_shape = (batch, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, dim)
+    if draft_block.shape != expected_draft_shape:
+        raise ValueError(
+            f"DSpark draft KV must have shape {expected_draft_shape}, got {tuple(draft_block.shape)}"
+        )
+    if block_tables.dtype != torch.int32 or block_tables.stride(1) != 1:
+        raise ValueError(
+            "DSpark page tables must have contiguous INT32 rows, got "
+            f"{block_tables.dtype} with strides {block_tables.stride()}"
+        )
+    if block_tables.shape[0] != batch:
+        raise ValueError(f"DSpark page tables must have {batch} rows, got {block_tables.shape[0]}")
+    for name, value in (
+        ("positions", positions),
+        ("valid lengths", valid_lengths),
+        ("capacities", capacities),
     ):
-        raise ValueError("DSpark page tables must have contiguous INT32 rows")
-    for value in (positions, valid_lengths, capacities):
         if value.dtype != torch.int64 or value.shape != (batch,) or not value.is_contiguous():
             raise ValueError(
-                "DSpark positions, lengths and capacities must be contiguous INT64 batch vectors"
+                f"DSpark {name} must be a contiguous INT64 [{batch}] vector, got "
+                f"{value.dtype} {tuple(value.shape)} with strides {value.stride()}"
             )
     if attn_sink.dtype != torch.float32 or attn_sink.shape != (heads,):
-        raise ValueError("DSpark attention sink must be FP32 with one entry per head")
-    if inverse_rope_freqs.dtype != torch.float32 or inverse_rope_freqs.shape != (
-        batch,
-        block,
-        32,
-        2,
+        raise ValueError(
+            f"DSpark attention sink must be FP32 [{heads}], got "
+            f"{attn_sink.dtype} {tuple(attn_sink.shape)}"
+        )
+    expected_freqs_shape = (batch, block, _DSV4_DSPARK_ROPE_DIM // 2, 2)
+    if (
+        inverse_rope_freqs.dtype != torch.float32
+        or inverse_rope_freqs.shape != expected_freqs_shape
     ):
-        raise ValueError("DSpark inverse RoPE frequencies must be FP32 [batch, block, 32, 2]")
-    if kv_pages.stride(1) != dim or kv_pages.stride(2) != 1 or kv_pages.stride(0) % 8:
-        raise ValueError("DSpark pages require contiguous tokens and an aligned page stride")
+        raise ValueError(
+            f"DSpark inverse RoPE frequencies must be FP32 {list(expected_freqs_shape)}, got "
+            f"{inverse_rope_freqs.dtype} {tuple(inverse_rope_freqs.shape)}"
+        )
+    if (
+        kv_pages.stride(0) <= 0
+        or kv_pages.stride(0) % 8
+        or kv_pages.stride(1) != dim
+        or kv_pages.stride(2) != 1
+    ):
+        raise ValueError(
+            "DSpark pages require contiguous tokens and a positive 16-byte-aligned page "
+            f"stride, got strides {kv_pages.stride()}"
+        )
     for value in (q, draft_block, attn_sink, inverse_rope_freqs):
         if not value.is_contiguous():
             raise ValueError("DSpark query, draft, sink and frequencies must be contiguous")
@@ -236,26 +243,14 @@ def _run_paged_dspark_attention(
         )
     ):
         raise ValueError("All DSpark attention inputs must be on the same CUDA device")
-    cache_key = (block, heads, page_size, arch_str, output_groups)
+    cache_key = (block, heads, page_size, arch_str)
     compiled = _dspark_attention_kernel_cache.get(cache_key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("DSpark paged attention must run eagerly before graph capture")
-        compiled = _compile_dspark_attention(block, arch_str, page_size, output_groups, heads)
+        compiled = _compile_dspark_attention(block, arch_str, page_size, heads)
         _dspark_attention_kernel_cache[cache_key] = compiled
     output = torch.empty_like(q)
-    output_scale = None
-    if output_groups is not None:
-        rows = batch * block
-        group_dim = heads * dim // output_groups
-        output = torch.empty(
-            (output_groups, rows, group_dim), dtype=torch.float8_e4m3fn, device=q.device
-        )
-        output_scale = torch.empty(
-            (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
-            dtype=torch.float32,
-            device=q.device,
-        )
     compiled(
         batch,
         kv_pages.shape[0],
@@ -272,39 +267,9 @@ def _run_paged_dspark_attention(
         attn_sink.data_ptr(),
         inverse_rope_freqs.data_ptr(),
         output,
-        output_scale,
         softmax_scale,
     )
-    return output, output_scale
-
-
-@torch.library.custom_op(
-    "trtllm::fused_dsv4_dspark_attention", mutates_args=(), device_types="cuda"
-)
-def fused_dsv4_dspark_attention(
-    q: torch.Tensor,
-    draft_block: torch.Tensor,
-    kv_pages: torch.Tensor,
-    block_tables: torch.Tensor,
-    positions: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    capacities: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    return _run_paged_dspark_attention(
-        q,
-        draft_block,
-        kv_pages,
-        block_tables,
-        positions,
-        valid_lengths,
-        capacities,
-        attn_sink,
-        inverse_rope_freqs,
-        softmax_scale,
-    )[0]
+    return output
 
 
 @torch.library.register_fake("trtllm::fused_dsv4_dspark_attention")
@@ -321,65 +286,6 @@ def _(
     softmax_scale: float,
 ) -> torch.Tensor:
     return torch.empty_like(q)
-
-
-@torch.library.custom_op(
-    "trtllm::fused_dsv4_dspark_attention_fp8", mutates_args=(), device_types="cuda"
-)
-def fused_dsv4_dspark_attention_fp8(
-    q: torch.Tensor,
-    draft_block: torch.Tensor,
-    kv_pages: torch.Tensor,
-    block_tables: torch.Tensor,
-    positions: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    capacities: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-    output_groups: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    output, scales = _run_paged_dspark_attention(
-        q,
-        draft_block,
-        kv_pages,
-        block_tables,
-        positions,
-        valid_lengths,
-        capacities,
-        attn_sink,
-        inverse_rope_freqs,
-        softmax_scale,
-        output_groups,
-    )
-    assert scales is not None
-    return output, scales
-
-
-@torch.library.register_fake("trtllm::fused_dsv4_dspark_attention_fp8")
-def _(
-    q: torch.Tensor,
-    draft_block: torch.Tensor,
-    kv_pages: torch.Tensor,
-    block_tables: torch.Tensor,
-    positions: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    capacities: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-    output_groups: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = q.shape[0] * q.shape[1]
-    group_dim = q.shape[2] * q.shape[3] // output_groups
-    return (
-        torch.empty((output_groups, rows, group_dim), dtype=torch.float8_e4m3fn, device=q.device),
-        torch.empty(
-            (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
-            dtype=torch.float32,
-            device=q.device,
-        ),
-    )
 
 
 if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
@@ -459,7 +365,7 @@ def is_dsv4_dspark_attention_config_supported(
     """Return whether static model geometry matches the DSV4 specialization."""
     return (
         block_size in _DSV4_DSPARK_BLOCK_SIZES
-        and num_heads in _DSV4_DSPARK_NUM_HEADS
+        and num_heads in _DSV4_DSPARK_SUPPORTED_NUM_HEADS
         and head_dim == _DSV4_DSPARK_HEAD_DIM
         and window_size == _DSV4_DSPARK_WINDOW_SIZE
     )
@@ -501,9 +407,9 @@ def is_fused_dsv4_dspark_attention_supported(
         )
     if q.shape[1] not in _DSV4_DSPARK_BLOCK_SIZES:
         return _log_unsupported(f"draft block size must be 5 or 6, got {q.shape[1]}", "block_size")
-    if q.shape[2] not in _DSV4_DSPARK_NUM_HEADS or q.shape[3] != _DSV4_DSPARK_HEAD_DIM:
+    if q.shape[2] not in _DSV4_DSPARK_SUPPORTED_NUM_HEADS or q.shape[3] != _DSV4_DSPARK_HEAD_DIM:
         return _log_unsupported(
-            "q must have 128 heads and head_dim 512; "
+            f"q must have {_DSV4_DSPARK_SUPPORTED_NUM_HEADS} heads and head_dim 512; "
             f"got {q.shape[2]} heads and head_dim {q.shape[3]}",
             "q_shape",
         )

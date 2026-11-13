@@ -459,6 +459,39 @@ class SsmLayerConfig:
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
+class RegionAllocationUnit(enum.IntEnum):
+    # One slot per KV cache and beam, held for the cache's lifetime.
+    REQUEST = 0
+    # One page per token block. Not supported yet.
+    TOKEN_BLOCK = 1
+
+@dataclass(slots=True)
+class RegionBuffer:
+    """One buffer of a region; the layer id places it in the per-layer address space."""
+
+    layer_id: LayerId
+    buffer: BufferConfig
+
+@dataclass(slots=True)
+class RegionConfig:
+    """Buffers that share a life cycle of the region's own, never merged with another one.
+
+    Only REQUEST regions with the PRIVATE reuse policy are supported: one slot per living
+    KV cache and beam, never published for reuse, returned when the cache closes. Each
+    buffer sits on a layer that has an SsmLayerConfig and sets no reuse policy of its own.
+
+    ``fixed_slot_count`` set gives the region a pool group of its own with exactly that many
+    GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)
+    leaves alone; a GPU quota too small to hold it is raised. None sizes it by ratio.
+    """
+
+    name: str
+    buffers: list[RegionBuffer]
+    allocation_unit: RegionAllocationUnit = RegionAllocationUnit.REQUEST
+    reuse_policy: ReusePolicy = ReusePolicy.PRIVATE
+    fixed_slot_count: int | None = None
+    def validate(self) -> None: ...
+
 @dataclass(slots=True)
 class KVCacheDesc:
     capacity: int
@@ -515,6 +548,9 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    # Regions, each with a life cycle of its own, numbered after every layer life cycle in
+    # declaration order. A (layer, role) pair belongs to one layer config or one region.
+    regions: list[RegionConfig] = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -1883,6 +1919,8 @@ class KVCacheManager:
     # Deprecated: use get_buffer_group_id. Raises RuntimeError for a split layer.
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
     def get_buffer_group_id(self, layer_id: LayerId, role: DataRole) -> CacheGroupId: ...
+    # Raises IndexError for a name no region declares.
+    def get_region_group_id(self, name: str) -> CacheGroupId: ...
     # Deprecated: use buffer_grouping. Raises RuntimeError if any layer is split.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...

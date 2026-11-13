@@ -17,6 +17,7 @@ import array
 import os
 import sys
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
@@ -46,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     SPARSE_ARENA_ALIGNMENT,
     HostHistoryReservations,
@@ -57,6 +59,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestSta
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -66,6 +69,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheT
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
+    CapacitySchedulerPolicy,
     DecodingBaseConfig,
     DFlashDecodingConfig,
     DraftTargetDecodingConfig,
@@ -88,6 +92,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     Batch,
     BatchDesc,
     BufferConfig,
+    BufferId,
     CacheLevel,
     CacheTier,
     CudaStream,
@@ -449,7 +454,7 @@ def _make_manager_for_cache_tier_test(
         None,
     )
     if fake_impl is not None:
-        fake_impl.layer_grouping = [[0]]
+        fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
         fake_impl.pool_group_descs = []
         fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -683,6 +688,107 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
             assert torch.all(buffer[0] == global_layer_id)
     finally:
         manager.shutdown()
+
+
+def _layer_api_snapshot(manager: KVCacheManagerV2) -> dict:
+    """A manager's built cache config and layer-based API, with pool addresses as (pool, offset)."""
+    impl = manager.impl
+    config = manager.kv_cache_manager_py_config
+    pools = {
+        int(pool.base_address): (int(group.pool_group_index), int(pool.pool_index))
+        for group in impl.pool_group_descs
+        for pool in group.pools
+    }
+
+    def pool_offset(address: int):
+        if address == 0:
+            return None
+        base = max(base for base in pools if base <= address)
+        return pools[base], address - base
+
+    return {
+        "layers": [
+            (
+                type(layer).__name__,
+                int(layer.layer_id),
+                [
+                    (str(buffer.role), buffer.size, buffer.coalescing_group, buffer.reuse_policy)
+                    for buffer in layer.buffers
+                ],
+                getattr(layer, "sliding_window_size", None),
+                layer.reuse_policy,
+            )
+            for layer in config.layers
+        ],
+        "commit_min_snapshot": config.commit_min_snapshot,
+        "regions": [region.name for region in config.regions],
+        "initial_pool_ratio": config.initial_pool_ratio,
+        "pool_groups": [
+            (int(group.num_slots), list(group.slot_desc.slot_size_list), len(group.pools))
+            for group in impl.pool_group_descs
+        ],
+        "layer_grouping": [[int(layer_id) for layer_id in group] for group in impl.layer_grouping],
+        "layer_group_ids": [
+            int(impl.get_layer_group_id(LayerId(layer_id)))
+            for layer_id in range(manager.num_local_layers)
+        ],
+        "layer_to_pool_mapping_dict": dict(manager.layer_to_pool_mapping_dict),
+        "pool_pointers": [
+            pool_offset(int(address))
+            for address in manager.kv_cache_pool_pointers.flatten().tolist()
+        ],
+        "pool_mapping": manager.kv_cache_pool_mapping.tolist(),
+        "index_scales": manager.index_scales.tolist(),
+        "block_offsets_shape": tuple(manager.host_kv_cache_block_offsets.shape),
+    }
+
+
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_manager_without_regions_builds_as_before(monkeypatch, enable_block_reuse: bool) -> None:
+    """Without regions, the region hooks change neither the built cache nor the layer-based API."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+
+    def build() -> KVCacheManagerV2:
+        return KVCacheManagerV2(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+                enable_block_reuse=enable_block_reuse,
+                max_attention_window=[MAX_SEQ_LEN, 8],
+                pool_ratio=[0.5, 0.5],
+            ),
+            CacheType.SELF,
+            num_layers=4,
+            num_kv_heads=2,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )
+
+    manager = build()
+    try:
+        assert manager.region_layout == RegionLayout()
+        assert manager.get_region_group_ids("recurrent_state") == ()
+        with_hooks = _layer_api_snapshot(manager)
+    finally:
+        manager.shutdown()
+    with monkeypatch.context() as patch:
+        patch.setattr(KVCacheManagerV2, "_declare_regions", lambda self: None)
+        patch.setattr(KVCacheManagerV2, "_lay_out_regions", lambda self, config: config)
+        manager = build()
+        try:
+            without_hooks = _layer_api_snapshot(manager)
+        finally:
+            manager.shutdown()
+
+    assert with_hooks == without_hooks
+    assert len(with_hooks["layer_grouping"]) == 2
 
 
 @pytest.mark.parametrize("kv_first", [False, True], ids=["key-first", "kv-first"])
@@ -1169,6 +1275,67 @@ def test_zero_size_filter_preserves_layer_and_buffer_reuse_policies() -> None:
     assert private_layer.reuse_policy == ReusePolicy.PRIVATE
 
 
+def test_layer_group_helpers_describe_split_ssm_layers() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=4096)],
+                sliding_window_size=8,
+            ),
+            *[
+                SsmLayerConfig(
+                    layer_id=LayerId(layer_id),
+                    buffers=[
+                        BufferConfig(role=DataRole("ssm_state"), size=4096),
+                        BufferConfig(
+                            role=DataRole("old_x"), size=2048, reuse_policy=ReusePolicy.PRIVATE
+                        ),
+                    ],
+                )
+                for layer_id in (1, 2)
+            ],
+        ],
+        commit_min_snapshot=True,
+    )
+    impl = KVCacheManager(config)
+    try:
+        manager = object.__new__(KVCacheManagerV2)
+        manager.max_seq_len = MAX_SEQ_LEN
+        manager.tokens_per_block = TOKENS_PER_BLOCK
+        manager.kv_cache_manager_py_config = config
+        manager.impl = impl
+        manager._layer_group_life_cycles = None
+
+        attention = impl.get_layer_group_id(LayerId(0))
+        required = impl.get_buffer_group_id(LayerId(1), DataRole("ssm_state"))
+        private = impl.get_buffer_group_id(LayerId(1), DataRole("old_x"))
+        assert len({attention, required, private}) == 3
+        assert sorted({buffer.layer_id for buffer in impl.buffer_grouping[private]}) == [1, 2]
+
+        assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {attention: 8}
+        assert manager._get_event_window_sizes_by_layer_group() == {
+            attention: 8,
+            required: MAX_SEQ_LEN,
+            private: MAX_SEQ_LEN,
+        }
+        life_cycles = manager._life_cycle_by_layer_group()
+        assert life_cycles[attention].window_size == 8
+        assert life_cycles[required].window_size is None
+        assert life_cycles[private].window_size is None
+        metadata = manager._stats_life_cycle_metadata()
+        assert metadata[attention][1:] == (8, "attention")
+        assert metadata[required][1:] == (None, "ssm")
+        assert metadata[private][1:] == (None, "ssm")
+        assert len({metadata[group][0] for group in (attention, required, private)}) == 3
+    finally:
+        impl.shutdown()
+
+
 @pytest.mark.parametrize("sliding_window_size", [None, 8])
 @pytest.mark.parametrize("attention_first", [False, True])
 def test_event_window_sizes_filter_attention_without_backend_internals(
@@ -1191,7 +1358,11 @@ def test_event_window_sizes_filter_attention_without_backend_internals(
     )
     # Match the C++ binding surface: layer_grouping is public, while the
     # Python implementation's private _life_cycles registry is absent.
-    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]] if attention_first else [[1], [0]])
+    manager.impl = SimpleNamespace(
+        buffer_grouping=[
+            [BufferId(LayerId(i), Role.KEY)] for i in ([0, 1] if attention_first else [1, 0])
+        ]
+    )
 
     attention_group_id = 0 if attention_first else 1
     window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
@@ -1795,7 +1966,7 @@ def test_host_init_failure_propagates_with_disk_tier(tmp_path) -> None:
 @pytest.mark.cpu_only
 def test_cold_codec_provider_receives_draft_role() -> None:
     impl = Mock()
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     codec_provider.create_cold_page_codec.return_value = object()
     _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20),
@@ -1819,7 +1990,7 @@ def test_cold_codec_provider_receives_draft_role() -> None:
 def test_cold_codec_provider_receives_layer_spec_dtype(
     manager_dtype: DataType, layer_dtype: DataType
 ) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     layer = KVCacheLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
@@ -1844,7 +2015,7 @@ def test_cold_codec_provider_receives_layer_spec_dtype(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("manager_dtype", [DataType.HALF, DataType.BF16])
 def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataType) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20),
         [Mock()],
@@ -1863,7 +2034,7 @@ def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataTy
 def test_cold_codec_provider_rejects_mixed_layer_spec_dtypes(
     layer_dtypes: tuple[DataType, DataType],
 ) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     layer_specs = [
         KVCacheLayerSpec(
             global_layer_id=layer_id,
@@ -3349,6 +3520,276 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
         manager.shutdown()
 
 
+def _adp_dummy_executor(
+    cleanup: ExitStack,
+    spec: DFlashDecodingConfig,
+    *,
+    joint_reuse: bool,
+    transactional: bool,
+) -> tuple[PyExecutor, dict[ResourceManagerType, KVCacheManagerV2]]:
+    """An attention-DP executor over real target and draft KV pools.
+
+    ``joint_reuse`` pairs the two pools (block reuse on both); without it the
+    draft pool is an unpaired mirror of the target pool.
+    """
+    managers = {}
+    for resource_type, is_draft in (
+        (ResourceManagerType.KV_CACHE_MANAGER, False),
+        (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, True),
+    ):
+        manager = KVCacheManagerV2(
+            KvCacheConfig(enable_block_reuse=joint_reuse, max_gpu_total_bytes=4 << 20),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=128,
+            max_batch_size=4,
+            max_num_tokens=128,
+            mapping=Mapping(),
+            spec_config=spec,
+            is_draft=is_draft,
+            joint_kv_cache_reuse=joint_reuse,
+        )
+        cleanup.callback(manager.shutdown)
+        managers[resource_type] = manager
+
+    executor = object.__new__(PyExecutor)
+    executor.resource_manager = ResourceManager(managers)
+    executor.kv_cache_manager = managers[ResourceManagerType.KV_CACHE_MANAGER]
+    executor.draft_kv_cache_manager = managers[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
+    executor.scheduler = KVCacheV2Scheduler(
+        max_batch_size=4,
+        max_num_tokens=128,
+        kv_cache_manager=executor.kv_cache_manager,
+        draft_kv_cache_manager=executor.draft_kv_cache_manager,
+        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+    )
+    executor.enable_attention_dp = True
+    # Two attention-DP ranks: a single-rank group skips dummy padding.
+    executor.dist = SimpleNamespace(tp_size=2)
+    executor.kv_cache_transceiver = object() if transactional else None
+    executor.adp_router = SimpleNamespace(exclude_retiring_requests=False)
+    executor.active_requests = []
+    executor.expected_num_active_requests = 1
+    executor.max_num_active_requests = 4
+    executor.max_total_draft_tokens = spec.max_draft_len
+    executor._adp_dummy_is_gen = True
+    executor._pending_adp_dummy_request = None
+    executor._enable_adp_dummy_fixes = True
+    executor._enable_scheduler_aware_adp_dummy = False
+    executor._enable_non_overlap_adp_forward_intent = False
+    executor._benchmark_fill_phase_active = False
+    executor._is_kv_manager_v2 = True
+    executor.enable_joint_kv_cache_reuse = joint_reuse
+    return executor, managers
+
+
+@pytest.mark.parametrize("draft_len", [3, 8])
+@pytest.mark.parametrize("path", ["plain", "transactional", "empty_batch"])
+def test_adp_dummy_holds_paired_draft_kv(path: str, draft_len: int) -> None:
+    """An idle attention-DP rank's dummy needs a cache in both paired pools.
+
+    Under joint KV cache reuse the scheduler admits a generation request in
+    the target and the draft pool together, so a dummy holding only a target
+    cache is never scheduled and the fleet cannot run a forward. Each padding
+    path must allocate the dummy in both pools, and a vetoed iteration must
+    release both so the singleton dummy ID can be allocated again.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=draft_len, speculative_model="draft")
+    with ExitStack() as cleanup:
+        executor, managers = _adp_dummy_executor(
+            cleanup, spec, joint_reuse=True, transactional=path == "transactional"
+        )
+
+        def assert_dummy_in_both_pools(dummy: LlmRequest) -> None:
+            for manager in managers.values():
+                assert manager.kv_cache_map[dummy.py_request_id].is_active
+
+        def assert_dummy_released(dummy: LlmRequest) -> None:
+            assert executor.active_requests == []
+            for manager in managers.values():
+                assert dummy.py_request_id not in manager.kv_cache_map
+                assert dummy.py_request_id not in manager._allocated_draft_lens
+                assert dummy.py_request_id not in manager._inflight_draft_lens
+
+        def prepare_without_growing(scheduled: ScheduledRequests, dummy: LlmRequest) -> None:
+            capacities = {
+                key: manager.kv_cache_map[dummy.py_request_id].capacity
+                for key, manager in managers.items()
+            }
+            executor.resource_manager.prepare_resources(scheduled)
+            for key, manager in managers.items():
+                assert manager.kv_cache_map[dummy.py_request_id].capacity == capacities[key]
+
+        if path == "empty_batch":
+            # The dummy joins the already scheduled batch directly; a vetoed
+            # iteration rolls it back, and the next one pads again.
+            for can_queue in (False, True):
+                scheduled = ScheduledRequests()
+                executor._pad_empty_attention_dp_batch(scheduled)
+                (dummy,) = scheduled.generation_requests
+                assert executor.active_requests == [dummy]
+                assert_dummy_in_both_pools(dummy)
+                executor._finalize_adp_dummy_allocation(can_queue)
+                if not can_queue:
+                    assert_dummy_released(dummy)
+                else:
+                    prepare_without_growing(scheduled, dummy)
+            executor.resource_manager.free_resources(dummy)
+            for manager in managers.values():
+                assert dummy.py_request_id not in manager.kv_cache_map
+            return
+
+        # A rejected fleet vote must release both pools and permit the same
+        # singleton dummy ID to be allocated and admitted on the next pass.
+        for attempt in range(2 if path == "transactional" else 1):
+            executor._pad_attention_dp_dummy_request()
+            (dummy,) = executor.active_requests
+            scheduled = executor.scheduler.schedule_request(executor.active_requests, set())
+            assert scheduled.generation_requests == [dummy]
+            assert scheduled.paused_requests == []
+            assert_dummy_in_both_pools(dummy)
+            if path == "transactional" and attempt == 0:
+                executor._revert_gen_alloc(scheduled)
+                executor._finalize_adp_dummy_allocation(False)
+                assert_dummy_released(dummy)
+            else:
+                executor._finalize_adp_dummy_allocation(True)
+                prepare_without_growing(scheduled, dummy)
+                executor.resource_manager.free_resources(dummy)
+                for manager in managers.values():
+                    assert dummy.py_request_id not in manager.kv_cache_map
+
+
+@pytest.mark.parametrize("path", ["plain", "transactional", "empty_batch"])
+def test_adp_dummy_grows_unpaired_draft_mirror(path: str) -> None:
+    """An unpaired draft pool sizes the attention-DP dummy's mirror in prepare_resources.
+
+    The dummy is created in the target pool only. The scheduler admits the
+    draft mirror while it schedules the dummy but leaves it empty, and the
+    empty-batch path leaves no mirror at all, so the draft manager has to grow
+    it by one generation step. An empty mirror cannot take the history of the
+    previous iteration's finished dummy, which shares its ID and which the
+    overlap loop applies once this iteration is prepared.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=8, speculative_model="draft")
+    with ExitStack() as cleanup:
+        executor, managers = _adp_dummy_executor(
+            cleanup, spec, joint_reuse=False, transactional=path == "transactional"
+        )
+        draft = executor.draft_kv_cache_manager
+        assert executor.scheduler._joint_draft_manager is None
+
+        previous_batch = None
+        for _ in range(2):
+            batch = ScheduledRequests()
+            if path == "empty_batch":
+                executor._pad_empty_attention_dp_batch(batch)
+                (dummy,) = batch.generation_requests
+                assert dummy.py_request_id not in draft.kv_cache_map
+            else:
+                executor._pad_attention_dp_dummy_request()
+                (dummy,) = executor.active_requests
+                scheduled = executor.scheduler.schedule_request(executor.active_requests, set())
+                assert scheduled.generation_requests == [dummy]
+                batch.generation_requests.append(dummy)
+                # Admitted by the scheduler, not sized.
+                assert draft.kv_cache_map[dummy.py_request_id].capacity == 0
+            executor._finalize_adp_dummy_allocation(True)
+
+            executor.resource_manager.prepare_resources(batch)
+            draft_cache = draft.kv_cache_map[dummy.py_request_id]
+            assert draft_cache.capacity == draft._required_gen_capacity(dummy, 0)
+
+            if previous_batch is not None:
+                # _process_previous_batch: the deferred batch still holds the
+                # finished dummy, whose ID now maps to this iteration's mirror.
+                executor.resource_manager.update_resources(
+                    previous_batch, skip_kv_cache_manager=True
+                )
+            # _terminate_attention_dp_dummy_requests.
+            dummy.state = LlmRequestState.GENERATION_COMPLETE
+            executor.resource_manager.free_resources(dummy)
+            executor.active_requests.remove(dummy)
+            previous_batch = batch
+
+        for manager in managers.values():
+            assert dummy.py_request_id not in manager.kv_cache_map
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "joint_reuse,is_dummy,mirror_capacity,grows",
+    [
+        # Paired pool: add_dummy_requests sized the dummy's mirror with the dummy.
+        pytest.param(True, True, 24, False, id="paired-dummy-preallocated"),
+        # Unpaired pool: the scheduler admitted the dummy's mirror, still empty.
+        pytest.param(False, True, 0, True, id="unpaired-dummy-admitted-empty"),
+        # Unpaired pool, empty-batch padding: the dummy has no mirror yet.
+        pytest.param(False, True, None, True, id="unpaired-dummy-no-mirror"),
+        # Real requests are a control: they grow by one step in either pool.
+        pytest.param(True, False, 24, True, id="paired-request"),
+        pytest.param(False, False, 24, True, id="unpaired-request"),
+        pytest.param(False, False, None, True, id="unpaired-request-no-mirror"),
+    ],
+)
+def test_draft_mirror_preserves_preallocated_dummy_capacity(
+    joint_reuse: bool, is_dummy: bool, mirror_capacity: int | None, grows: bool
+) -> None:
+    """A paired pool's preallocated dummy fits one page; charging another step would need two.
+
+    Every other mirror, an unpaired pool's dummy included, is sized here.
+    """
+    request = LlmRequest(
+        request_id=100,
+        max_new_tokens=1,
+        input_tokens=[1] * 9,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * 8,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.is_dummy_request = is_dummy
+    capacity = mirror_capacity or 0
+    cache = Mock(capacity=capacity, is_active=True)
+    # Dummies have only one 32-token page available. Real requests are a
+    # control: unlike fixed-shape dummies they still need per-step growth.
+    cache.resize.side_effect = lambda capacity: capacity <= (32 if is_dummy else 64)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = joint_reuse
+    manager._mirror_uses_draft_view = False
+    manager._kv_reserve_draft_tokens = 8
+    manager._allocated_draft_lens = {}
+    manager.kv_cache_map = {} if mirror_capacity is None else {request.py_request_id: cache}
+    manager._mirror_draft_kv_cache = Mock(return_value=cache)
+    manager._resume_and_restore = Mock(return_value=True)
+    manager._ensure_generation_beam_width = Mock(return_value=True)
+    manager._mirror_resize_error = Mock(return_value=RuntimeError("draft pool exhausted"))
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+
+    manager._prepare_draft_resources(batch)
+
+    manager._resume_and_restore.assert_called_once_with(request.py_request_id, cache)
+    if grows:
+        # One generation step: the token itself and the eight draft slots.
+        cache.resize.assert_called_once_with(capacity + 9)
+    else:
+        cache.resize.assert_not_called()
+    # Recognizing a preallocated dummy must not fabricate scheduler rollback
+    # bookkeeping; the dummy is freed as a whole after the iteration.
+    assert manager._allocated_draft_lens == {}
+
+
 def test_generation_dummy_does_not_reuse_real_request_prefix() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -4412,7 +4853,7 @@ def _index_mapper_capacity_for(
     """
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -4815,7 +5256,7 @@ def _native_config_with_sparse_arena(
         ]
     )
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -5929,7 +6370,7 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
 
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -6973,3 +7414,41 @@ def test_try_commit_generation_blocks_honors_guards(
     manager.try_commit_generation_blocks(request)
 
     assert kv_cache.committed_tokens is None
+
+
+@pytest.mark.parametrize("role", [Role.VALUE, Role.KEY_BLOCK_SCALE])
+def test_default_attention_rejects_split_coupled_buffers(monkeypatch, role):
+    original = KVCacheManagerV2._build_cache_config
+
+    def build_config(self, config):
+        config = original(self, config)
+        layers = list(config.layers)
+        layer = layers[0]
+        buffers = [
+            BufferConfig(
+                role=buffer.role,
+                size=buffer.size,
+                reuse_policy=ReusePolicy.PRIVATE if buffer.role == role else None,
+            )
+            for buffer in layer.buffers
+        ]
+        if role == Role.KEY_BLOCK_SCALE:
+            buffers.append(BufferConfig(role=role, size=128, reuse_policy=ReusePolicy.PRIVATE))
+        layers[0] = AttentionLayerConfig(layer_id=layer.layer_id, buffers=buffers)
+        return replace(config, layers=layers)
+
+    monkeypatch.setattr(KVCacheManagerV2, "_build_cache_config", build_config)
+    with pytest.raises(ValueError, match="requires one shared page-index table"):
+        KVCacheManagerV2(
+            KvCacheConfig(max_gpu_total_bytes=4 << 20, host_cache_size=0),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )

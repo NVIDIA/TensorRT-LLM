@@ -183,16 +183,17 @@ def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, in
     "invalid_case,reason",
     [
         ("q_dtype", "must use BF16"),
-        ("block_size", "requires block 5/6"),
-        ("heads", "64/128 heads"),
-        ("page_size", "16/32/64/128/256-token pages"),
+        ("block_size", "block size must be one of"),
+        ("heads", r"num_heads must be one of \(64, 128\), got 24"),
+        ("page_size", "page size must be one of"),
+        ("page_stride", "positive 16-byte-aligned page stride"),
         ("draft_shape", "draft KV must have shape"),
         ("draft_layout", "must be contiguous"),
         ("table_dtype", "contiguous INT32 rows"),
         ("table_layout", "contiguous INT32 rows"),
-        ("positions", "contiguous INT64 batch vectors"),
-        ("valid_lengths", "contiguous INT64 batch vectors"),
-        ("capacities", "contiguous INT64 batch vectors"),
+        ("positions", "positions must be a contiguous INT64"),
+        ("valid_lengths", "valid lengths must be a contiguous INT64"),
+        ("capacities", "capacities must be a contiguous INT64"),
         ("sink_dtype", "sink must be FP32"),
         ("freqs_shape", "inverse RoPE frequencies must be FP32"),
     ],
@@ -209,6 +210,8 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         inputs["q"] = inputs["q"][:, :, :24].contiguous()
     elif invalid_case == "page_size":
         inputs["kv_pages"] = inputs["kv_pages"][:, :24]
+    elif invalid_case == "page_stride":
+        inputs["kv_pages"] = inputs["kv_pages"][:1].expand_as(inputs["kv_pages"])
     elif invalid_case == "draft_shape":
         inputs["draft_block"] = inputs["draft_block"][:, :7].contiguous()
     elif invalid_case == "draft_layout":
@@ -228,7 +231,7 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         pytest.fail("invalid inputs reached compilation or a kernel launch")
 
     monkeypatch.setattr(attention_op, "_get_dspark_arch_str", lambda: "sm_100")
-    key = (6, 128, 32, attention_op._get_dspark_arch_str(), None)
+    key = (6, 128, 32, attention_op._get_dspark_arch_str())
     monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {key: unexpected_launch})
     monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_launch)
     with pytest.raises(ValueError, match=reason):
@@ -360,11 +363,11 @@ def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypa
         patch.setattr(torch, "empty", unexpected_compile_op)
         patch.setattr(torch, "empty_like", unexpected_compile_op)
         patch.setattr(attention_op.cute.runtime, "from_dlpack", unexpected_compile_op)
-        compiled = attention_op._compile_dspark_attention(5, arch_str, 32, None, 128)
+        compiled = attention_op._compile_dspark_attention(5, arch_str, 32, 128)
     monkeypatch.setattr(
         attention_op,
         "_dspark_attention_kernel_cache",
-        {(5, 128, 32, arch_str, None): compiled},
+        {(5, 128, 32, arch_str): compiled},
     )
     inputs = _make_inputs(41, block=5, positions=[257, 9])
 
@@ -397,7 +400,6 @@ def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
 def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
     preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
     preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
-    device = torch.cuda.current_device()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     def unexpected_compile(*args, **kwargs):
@@ -407,7 +409,7 @@ def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
     with pytest.raises(RuntimeError, match="cache-write must be warmed up"):
         preparation_op._compile_dspark_rmsnorm_rope_cache_write(1e-6)
     with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
-        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6, device)
+        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6)
 
 
 def test_preparation_self_jit_covers_dynamic_batches():
@@ -532,68 +534,6 @@ def test_batched_attention_respects_partial_window_valid_len():
 
 
 @pytest.mark.skipif(
-    get_sm_version() != 107,
-    reason="The fused DSpark FP8 output projection is a Rubin specialization",
-)
-def test_fused_dsv4_dspark_attention_fp8_matches_separate_quant_and_replays_graph():
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        fused_dsv4_dspark_attention,
-        fused_dsv4_dspark_attention_fp8,
-    )
-
-    groups = 16
-    inputs = _make_inputs(47, page_size=256, positions=[257, 390], valid_lengths=[3, 5])
-    q = inputs["q"]
-    block = q.shape[1]
-
-    def separate_quantize():
-        bf16 = fused_dsv4_dspark_attention(**inputs)
-        rows = q.shape[0] * block
-        grouped = bf16.reshape(rows, groups, -1).permute(1, 0, 2).contiguous()
-        quant_blocks = grouped.view(groups, rows, -1, 128)
-        amax = quant_blocks.abs().amax(dim=-1).float().clamp_min(1e-10)
-        quant_scale = 448.0 / amax
-        quantized = (quant_blocks.float() * quant_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-        scale_rows = (rows + 3) // 4 * 4
-        scales = torch.zeros(
-            groups,
-            quant_blocks.shape[2],
-            scale_rows,
-            device=q.device,
-            dtype=torch.float32,
-        )
-        scales[..., :rows] = (1.0 / quant_scale).transpose(1, 2)
-        return quantized.view_as(grouped), scales
-
-    def assert_quantized_close(actual_fp8, actual_scale, expected_fp8, expected_scale):
-        rows = q.shape[0] * block
-        torch.testing.assert_close(
-            actual_scale[..., :rows], expected_scale[..., :rows], rtol=1e-6, atol=0
-        )
-        actual = actual_fp8.float()
-        expected = expected_fp8.float()
-        mismatch_rate = torch.count_nonzero(actual != expected) / actual.numel()
-        assert mismatch_rate <= 1e-3
-        # CuTe and Torch can choose neighboring E4M3 values at a rounding tie.
-        torch.testing.assert_close(actual, expected, rtol=0.125, atol=0.015625)
-
-    actual_fp8, actual_scale = fused_dsv4_dspark_attention_fp8(**inputs, output_groups=groups)
-    expected_fp8, expected_scale = separate_quantize()
-    assert_quantized_close(actual_fp8, actual_scale, expected_fp8, expected_scale)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_fp8, captured_scale = fused_dsv4_dspark_attention_fp8(
-            **inputs, output_groups=groups
-        )
-    q.copy_(torch.randn_like(q))
-    inputs["valid_lengths"].copy_(torch.tensor([7, 2], device=q.device))
-    graph.replay()
-    expected_fp8, expected_scale = separate_quantize()
-    assert_quantized_close(captured_fp8, captured_scale, expected_fp8, expected_scale)
-
-
-@pytest.mark.skipif(
     get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The fused DSpark FP8 input producers require SM107 Rubin CuTe DSL",
 )
@@ -686,6 +626,53 @@ def test_dspark_fp8_input_producers_match_reference_and_reuse_dynamic_m_compile(
             rtol=0,
             atol=0,
         )
+
+    # A block amax of exactly 448 * 2**k keeps the scale 2**k (byte 127 + k); 1e3 rounds up to
+    # 4 (byte 129). One block per amax, the rest of each block at most half of it.
+    boundary_amax = (448.0 * 2.0, 448.0 * 2.0**8, 448.0 * 2.0**40, 1.0e3)
+    boundary_bytes = torch.tensor([128, 135, 167, 129], dtype=torch.uint8)
+    boundary_blocks = torch.empty(len(boundary_amax), 128)
+    for index, amax in enumerate(boundary_amax):
+        boundary_blocks[index] = (torch.rand(128) - 0.5) * amax
+        boundary_blocks[index, 7 * index + 3] = amax if index % 2 else -amax
+    boundary_blocks = boundary_blocks.to(device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(
+        boundary_blocks.float().abs().amax(dim=1),
+        torch.tensor(boundary_amax, device="cuda").to(torch.bfloat16).float(),
+    )
+    rows = len(boundary_amax)
+
+    # Concat producer: row r carries the boundary block in its quant block r.
+    boundary_input = torch.randn(rows, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    for index in range(rows):
+        boundary_input[index, index * 128 : (index + 1) * 128] = boundary_blocks[index]
+    expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(boundary_input)
+    actual_fp8, actual_scale = cute_dsl_dspark_concat_fp8_quant(
+        boundary_input[:1], boundary_input[1:]
+    )
+    torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+    actual_active = active_scales(actual_scale, rows)
+    torch.testing.assert_close(actual_active, active_scales(expected_scale, rows), rtol=0, atol=0)
+    quant_blocks = hidden_dim // 128
+    for index in range(rows):
+        offset = (index * quant_blocks + index) * 4
+        assert torch.all(actual_active[offset : offset + 4].cpu() == boundary_bytes[index])
+
+    # RMSNorm producer: +-1 inputs have an RMS of 1, so the weight sets each block amax.
+    signs = torch.randint(0, 2, (rows, hidden_dim), device="cuda", dtype=torch.int32)
+    norm_input = (signs * 2 - 1).to(torch.bfloat16)
+    boundary_weight = torch.randn(hidden_dim, device="cuda", dtype=torch.bfloat16)
+    boundary_weight[: rows * 128] = boundary_blocks.abs().flatten()
+    expected_norm = _rmsnorm(norm_input, boundary_weight, eps)
+    expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(expected_norm)
+    actual_fp8, actual_scale = cute_dsl_dspark_rmsnorm_fp8_quant(norm_input, boundary_weight, eps)
+    torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+    actual_active = active_scales(actual_scale, rows)
+    torch.testing.assert_close(actual_active, active_scales(expected_scale, rows), rtol=0, atol=0)
+    for row in range(rows):
+        for index in range(rows):
+            offset = (row * quant_blocks + index) * 4
+            assert torch.all(actual_active[offset : offset + 4].cpu() == boundary_bytes[index])
 
     # Runtime row counts and row strides reuse the two initialization artifacts.
     assert _compile_dspark_concat_fp8_quant.cache_info().misses == 1

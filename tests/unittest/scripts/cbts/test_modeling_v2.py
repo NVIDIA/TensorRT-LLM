@@ -447,6 +447,48 @@ def test_ci_selection_check_reads_imports_with_the_rule_parser() -> None:
     assert modeling_v2.routed_targets is modeling_v2_source.routed_targets
 
 
+@pytest.mark.parametrize(
+    ("component_only", "routing", "imported", "accuracy", "error"),
+    [
+        (True, False, False, False, None),
+        (False, False, False, False, "missing"),
+        (True, True, False, False, "component-only exemption"),
+        (True, False, True, False, "component-only exemption"),
+        (False, True, True, False, "has no"),
+        (False, True, True, True, None),
+    ],
+)
+def test_component_only_exemption_preserves_registered_accuracy_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component_only: bool,
+    routing: bool,
+    imported: bool,
+    accuracy: bool,
+    error: str | None,
+) -> None:
+    """Only an explicitly unregistered component family can omit its accuracy gate."""
+    repo = Path(__file__).resolve().parents[4]
+    path = repo / "tests/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py"
+    spec = importlib.util.spec_from_file_location("modeling_v2_ci_selection", path)
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+    monkeypatch.setattr(check, "_COMPONENT_ONLY_FAMILIES", {"fam"} if component_only else set())
+    family = tmp_path / _SRC / "models/fam"
+    family.mkdir(parents=True)
+    (family / "__init__.py").write_text("")
+    (family.parent / "__init__.py").write_text("from .fam import routing\n" if imported else "")
+    if routing:
+        (family / "routing.py").write_text(_routing("a"))
+    if accuracy:
+        (tmp_path / "tests/integration/defs" / _ACC / "fam/a").mkdir(parents=True)
+    if error:
+        with pytest.raises(AssertionError, match=error):
+            check.test_every_routed_target_has_accuracy_tests(tmp_path)
+    else:
+        check.test_every_routed_target_has_accuracy_tests(tmp_path)
+
+
 def test_docs_are_not_claimed(tmp_path: Path) -> None:
     rule = _rule(tmp_path)
     assert rule.apply(PRInputs(changed_files=[f"{_SRC}/models/fam/a/README.md"], diffs={})) is None
@@ -492,7 +534,7 @@ def repository_cpu_rule() -> ModelingV2Rule:
 
 
 @pytest.mark.parametrize(
-    "family", ["deepseek_v3", "gpt_oss", "glm_moe_dsa", "kimi_k3_vl", "qwen4_exp"]
+    "family", ["deepseek_v3", "gpt_oss", "glm_moe_dsa", "kimi_k3_vl", "qwen4_exp", "beam"]
 )
 def test_repository_cpu_selection_keeps_model_tests_in_their_family(
     repository_cpu_rule: ModelingV2Rule, family: str
@@ -538,3 +580,26 @@ def test_repository_catalog_change_runs_unit_tests_importing_it(
         f"{_UNIT}/quantization",
         f"{_UNIT}/gemm/test_modeling_v2_nvfp4_gemm.py",
     } <= selected
+
+
+@pytest.mark.parametrize(
+    ("category", "op", "test_path"),
+    [
+        ("gemm", "cublas_mm", "test_modeling_v2_beam_cublas_mm.py"),
+        ("gemm", "nvfp4_gemm", "test_modeling_v2_beam_nvfp4_gemm.py"),
+        ("quantization", "fp4_quantize", "test_modeling_v2_beam_fp4_quantize.py"),
+        ("norm", "flashinfer_rmsnorm", "ops/norm/test_modeling_v2_beam_flashinfer_rmsnorm.py"),
+        (
+            "activation",
+            "flashinfer_silu_and_mul",
+            "ops/activation/test_modeling_v2_beam_flashinfer_silu_and_mul.py",
+        ),
+        ("attention", "thop_attention", "ops/attention/test_modeling_v2_beam_thop_attention.py"),
+    ],
+)
+def test_shared_kernel_change_selects_beam_workload_shapes(
+    repository_cpu_rule: ModelingV2Rule, category: str, op: str, test_path: str
+) -> None:
+    selected = repository_cpu_rule._prefixes_for(f"{_SRC}/catalog/{category}/{op}.py")
+    path = f"{_UNIT}/models/beam/{test_path}"
+    assert any(path == prefix or path.startswith(prefix + "/") for prefix in selected)

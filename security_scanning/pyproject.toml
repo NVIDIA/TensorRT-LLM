@@ -8,6 +8,7 @@ authors = [
 license = "Apache-2.0"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "filelock (==3.20.3)",
     "accelerate (>=1.7.0)",
     "build (>=1.6.1,<2.0.0)",
     "colored (>=2.3.2,<3.0.0)",
@@ -20,7 +21,7 @@ dependencies = [
     "mpi4py (>=4.1.2,<5.0.0)",
     "numpy (>=2.0.0,<2.4)",
     "graphviz (>=0.21,<0.22)",
-    "openai (>=3.49.0,<4.0.0)",
+    "openai (>=3.50.0,<4.0.0)",
     "polygraphy (>=0.53.6,<0.54.0)",
     "psutil (>=7.2.2,<8.0.0)",
     "nvidia-ml-py (>=13)",
@@ -56,7 +57,7 @@ dependencies = [
     "patchelf (>=0.19.3.0,<0.20.0.0)",
     "einops (>=0.8.2,<0.9.0)",
     "fla-core (==0.5.2)",
-    "flashinfer-python (==0.7.2)",
+    "flashinfer-python (==0.7.3)",
     "xgrammar (==0.2.8)",
     "llguidance (==0.7.29)",
     "jsonschema (>=4.26.0,<5.0.0)",
@@ -80,7 +81,6 @@ dependencies = [
     "flash-attn-4 (==4.0.0b19)",
     "mistral-common (>=1.10.0)",
     "torchao (>=0.14.1,<0.16.0)",
-    "llist (>=0.7.1,<0.8.0)",
     "cuda-tile (>=1.0.1)",
     "nvidia-cuda-tileiras (>=13.1,<13.2)",
     "etcd-sdk-python (==0.0.7)",

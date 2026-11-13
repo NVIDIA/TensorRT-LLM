@@ -1214,6 +1214,7 @@ def _register_fake():
         old_g: torch.Tensor,
         cache_buf_idx: torch.Tensor,
         prev_num_accepted_tokens: torch.Tensor,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
         return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),

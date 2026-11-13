@@ -62,7 +62,9 @@
       "git_repository": "https://github.com/deepseek-ai/FlashMLA.git",
       "git_tag": "15f13e5030374295491c5ce31b02d7e63a7772c6",
       "git_submodules_recurse": true,
-      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/flashmla_release_gil.patch",
+      "_comment": "When changing git_tag, check the conditions for releasing the GIL that the comment in patches/flashmla_release_gil.patch lists against the new sources; the patch still applying does not show that they hold."
     },
     {
       "name": "fmt",

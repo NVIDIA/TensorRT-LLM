@@ -12,11 +12,12 @@ from tensorrt_llm.bindings.executor import (
     IterationStats,
     KvCacheStats,
     RequestStats,
+    SpecDecodingStats,
 )
 from tensorrt_llm.logger import logger
 
 from .scheduler.adp_router import RankIterStatsPayload, RankState
-from .scheduler.rank_state import RankKvCacheStats
+from .scheduler.rank_state import RankKvCacheStats, RankSpecDecodingStats
 
 _ITERATION_STATS_SCALAR_FIELDS = (
     "timestamp",
@@ -33,10 +34,7 @@ _ITERATION_STATS_SCALAR_FIELDS = (
     "pinned_mem_usage",
 )
 
-_ITERATION_STATS_OPTIONAL_FIELDS = (
-    "static_batching_stats",
-    "specdec_stats",
-)
+_ITERATION_STATS_OPTIONAL_FIELDS = ("static_batching_stats",)
 
 
 def _snapshot_kv_cache_stats(stats: KvCacheStats | None) -> RankKvCacheStats | None:
@@ -75,6 +73,51 @@ def _restore_kv_cache_stats(snapshot: RankKvCacheStats) -> KvCacheStats:
     stats = KvCacheStats()
     for name, value in zip(snapshot._fields, snapshot):
         setattr(stats, name, value)
+    return stats
+
+
+def _snapshot_specdec_stats(stats: SpecDecodingStats | None) -> RankSpecDecodingStats | None:
+    """Capture a rank's speculative-decoding counters.
+
+    Args:
+        stats: Local speculative-decoding stats, or None when they are unavailable.
+
+    Returns:
+        Immutable counter snapshot, or None when unavailable.
+    """
+    if stats is None:
+        return None
+    return RankSpecDecodingStats(
+        num_draft_tokens=stats.num_draft_tokens,
+        num_accepted_tokens=stats.num_accepted_tokens,
+        num_requests_with_draft_tokens=stats.num_requests_with_draft_tokens,
+    )
+
+
+def _restore_specdec_stats(
+    snapshot: RankSpecDecodingStats, rank0_stats: SpecDecodingStats | None
+) -> SpecDecodingStats:
+    """Create a native speculative-decoding stats object for one rank's row.
+
+    The counters and the acceptance length derived from them are the rank's
+    own. The draft timings keep rank 0's values, like the row's other timings.
+
+    Args:
+        snapshot: Counters captured with the rank's iteration payload.
+        rank0_stats: Rank 0's speculative-decoding stats for the same iteration.
+
+    Returns:
+        A fresh native stats object.
+    """
+    stats = SpecDecodingStats()
+    for name, value in zip(snapshot._fields, snapshot):
+        setattr(stats, name, value)
+    num_requests = snapshot.num_requests_with_draft_tokens
+    stats.acceptance_length = (
+        (snapshot.num_accepted_tokens + num_requests) / num_requests if num_requests else 0.0
+    )
+    stats.iter_latency_ms = rank0_stats.iter_latency_ms if rank0_stats is not None else 0.0
+    stats.draft_overhead = rank0_stats.draft_overhead if rank0_stats is not None else 0.0
     return stats
 
 
@@ -141,6 +184,7 @@ class ADPIterStatsBuffer:
             num_paused_kv_tokens=ifb.num_paused_kv_tokens,
             kv_cache_stats=_snapshot_kv_cache_stats(stats.kv_cache_stats),
             cross_kv_cache_stats=_snapshot_kv_cache_stats(stats.cross_kv_cache_stats),
+            specdec_stats=_snapshot_specdec_stats(stats.specdec_stats),
         )
 
     def queue(
@@ -265,6 +309,11 @@ class ADPIterStatsBuffer:
             nested_stats = getattr(rank0_stats, attr)
             if nested_stats is not None:
                 setattr(stats, attr, nested_stats)
+
+        if payload.specdec_stats is not None:
+            stats.specdec_stats = _restore_specdec_stats(
+                payload.specdec_stats, rank0_stats.specdec_stats
+            )
 
         ifb = InflightBatchingStats()
         ifb.num_context_requests = payload.num_context_requests

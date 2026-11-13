@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import copy
 import random
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
-import _lockstep as ls
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls
 import torch
 
 H = 7168

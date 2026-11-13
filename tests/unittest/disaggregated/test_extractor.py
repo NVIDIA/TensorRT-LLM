@@ -312,7 +312,9 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
     )
 
     impl = SimpleNamespace(
-        layer_grouping=((0, 1),),
+        buffer_grouping=(
+            [buffer for coalesced in coalesced_buffers for buffer in coalesced.buffer_ids],
+        ),
         init_config=SimpleNamespace(
             tokens_per_block=16,
             layers=[SimpleNamespace(window_size=None), SimpleNamespace(window_size=None)],
@@ -513,7 +515,7 @@ def test_v2_builder_resolves_mixed_precision_high_layer_heads(virtual_layers: bo
     }
     manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
     manager.layer_specs = None
-    manager.impl.layer_grouping = (high_layers,)
+    manager._layer_ids_by_group = [list(high_layers)]
     manager.impl.init_config.layers.extend(
         [SimpleNamespace(window_size=128), SimpleNamespace(window_size=128)]
     )
@@ -959,7 +961,15 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
 
     manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.impl = SimpleNamespace(
-        layer_grouping=((0, 1), (2,)),
+        buffer_grouping=tuple(
+            [
+                buffer
+                for variant in pg.slot_desc.variants
+                for coalesced in variant.coalesced_buffers
+                for buffer in coalesced.buffer_ids
+            ]
+            for pg in (recurrent_pg, attention_pg)
+        ),
         init_config=SimpleNamespace(
             tokens_per_block=16,
             layers=[SimpleNamespace(window_size=None) for _ in range(3)],

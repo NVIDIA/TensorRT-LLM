@@ -22,13 +22,18 @@ counters). The collected entry point is ``test_modeling_v2_k3_sandwich_tail_op_m
 import sys
 import zlib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
 import _k3_sandwich_common as cm  # noqa: E402
-import _lockstep as ls  # noqa: E402
+
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 
 assert torch.cuda.is_available(), "k3_sandwich_tail requires CUDA devices"
 

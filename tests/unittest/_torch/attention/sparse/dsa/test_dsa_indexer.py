@@ -4559,6 +4559,7 @@ def test_indexer_decode_custom_vs_fallback(
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,
@@ -5161,6 +5162,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, ds
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,
