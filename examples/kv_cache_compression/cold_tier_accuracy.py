@@ -60,6 +60,9 @@ SPLIT = "@@SPLIT@@"
 EMPTY_THINK = "<think>\n\n</think>\n\n"
 # An inherited MPI launch context breaks the MPI worker spawn of the LLM API in a child process.
 MPI_ENV_PREFIXES = ("PMIX_", "PMI_", "OMPI_COMM_WORLD_", "OMPI_MCA_")
+# LLM(...) arguments that name what a run measures; --extra-llm-args may not replace them (a
+# replaced codec would still reuse cold pages and be reported as the requested format).
+MEASURED_LLM_ARGS = ("model", "kv_cache_compression_config")
 MOVED = ("iterOffloadBytes", "iterOffloadBlocks", "iterOnboardBytes", "iterOnboardBlocks")
 FIRST = """Aaron Abigail Adrian Agnes Albert Alice Amelia Andrea Angela Anton Arthur Astrid Bianca
 Boris Brenda Bruno Camille Carlos Cecilia Cedric Clara Colin Damian Daniela Dennis Diana Dmitri
@@ -339,7 +342,7 @@ def run_worker(args: argparse.Namespace) -> int:
     with open(os.path.join(args.model, "config.json")) as f:
         if "vision_config" in json.load(f):
             llm_kwargs["disable_mm_encoder"] = True
-    llm_kwargs.update(json.loads(args.extra_llm_args or "{}"))
+    llm_kwargs.update(extra_llm_args(args.extra_llm_args))
     log(f"kv_cache_config = {llm_kwargs['kv_cache_config']!r}")
 
     t0 = time.time()
@@ -400,7 +403,8 @@ def run_worker(args: argparse.Namespace) -> int:
         result.update(phases=phases, answers=answers, correct=correct, texts=texts)
         result.update(accuracy=sum(correct) / len(correct), num_correct=sum(correct))
         result.update(num_questions=len(correct), cold_reused_blocks=cold_blocks)
-        result["coverage"] = cold_blocks / expected
+        # Reuse events summed over attention lifecycles, not distinct prefix blocks.
+        result["cold_reuse_per_prefix_block"] = cold_blocks / expected
         result["attn_onboard_mib"] = q["attn"]["iterOnboardBytes"] / 2**20
         cold_bytes = flush["cold_bytes"] or q["cold_bytes"]
         result["cold_hot_ratio"] = cold_bytes / max(1, flush["hot_bytes"])
@@ -417,7 +421,8 @@ def run_worker(args: argparse.Namespace) -> int:
         log(
             f"accuracy {sum(correct)}/{len(correct)} = {100 * result['accuracy']:.2f}%; "
             f"first wrong answers {wrong[:3]}; cold-tier reuse {cold_blocks} attention blocks "
-            f"({100 * result['coverage']:.0f}% of {expected} prefix blocks); cold/hot page bytes "
+            f"({result['cold_reuse_per_prefix_block']:.2f} per prefix block, {expected} prefix "
+            "blocks); cold/hot page bytes "
             f"{flush['cold_bytes']}/{flush['hot_bytes']}; cold tier holds "
             f"{flush['cold_attn_blocks']} blocks; requests that recomputed part of the prefix: "
             f"{result['requests_below_prefix']}; MTP acceptance length "
@@ -430,6 +435,22 @@ def run_worker(args: argparse.Namespace) -> int:
                 "codec; raise --flush-factor or --host-gib"
             )
     return 0 if valid else 5
+
+
+def extra_llm_args(text: Optional[str]) -> Dict[str, Any]:
+    """The --extra-llm-args JSON object; it may not replace the arguments a run measures."""
+    try:
+        extra = json.loads(text or "{}")
+    except json.JSONDecodeError as error:
+        raise ValueError(f"--extra-llm-args is not valid JSON: {error}") from None
+    if not isinstance(extra, dict):
+        raise ValueError("--extra-llm-args must be a JSON object")
+    replaced = sorted(set(extra) & set(MEASURED_LLM_ARGS))
+    if replaced:
+        raise ValueError(
+            f"--extra-llm-args may not set {', '.join(replaced)}: use --model and --formats"
+        )
+    return extra
 
 
 # Driver: one process per format
@@ -507,7 +528,7 @@ def run_driver(args: argparse.Namespace) -> int:
             lost = sum(a and not b for a, b in zip(base["correct"], r["correct"]))
             vs = f"{same}/{lost}"
         accuracy = f"{100 * r['accuracy']:.2f}% ({r['num_correct']}/{r['num_questions']})"
-        cold = f"{r['cold_reused_blocks']} ({100 * r['coverage']:.0f}%)"
+        cold = f"{r['cold_reused_blocks']} ({r['cold_reuse_per_prefix_block']:.2f}/block)"
         cells = [name, r["status"].upper(), accuracy, vs, cold, f"{r['attn_onboard_mib']:.1f}"]
         cells += [f"{r['cold_hot_ratio']:.3f}", f"{r['load_s']:.0f}", f"{r['wall_s']:.0f}"]
         print("".join(f"{c:<{w}}" for c, w in zip(cells, widths)), flush=True)
@@ -547,6 +568,12 @@ def main() -> int:
         parser.error("--prefix-tokens must be a positive multiple of 128")
     if args.num_prefixes <= 0 or args.questions_per_prefix <= 0:
         parser.error("--num-prefixes and --questions-per-prefix must be positive")
+    if not args.worker and not [name for name in args.formats.split(",") if name.strip()]:
+        parser.error("--formats must name at least one format")
+    try:
+        extra_llm_args(args.extra_llm_args)
+    except ValueError as error:  # json.JSONDecodeError is a ValueError
+        parser.error(str(error))
     return run_worker(args) if args.worker else run_driver(args)
 
 

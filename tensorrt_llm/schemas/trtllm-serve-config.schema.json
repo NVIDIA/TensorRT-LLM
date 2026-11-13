@@ -587,6 +587,80 @@
     },
     "ColdPageQuantizationCompressionConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "turboquant_bits"
+                  ]
+                },
+                {
+                  "required": [
+                    "turboquant_mode"
+                  ]
+                },
+                {
+                  "required": [
+                    "turboquant_seed"
+                  ]
+                }
+              ]
+            }
+          },
+          "if": {
+            "properties": {
+              "quant": {
+                "const": "turboquant"
+              }
+            },
+            "required": [
+              "quant"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "nvfp4_residual_dim"
+                  ]
+                },
+                {
+                  "required": [
+                    "scale_checkpoint_path"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "turboquant_mode": {
+                "const": "prod"
+              }
+            },
+            "required": [
+              "turboquant_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "turboquant_bits": {
+                "enum": [
+                  2,
+                  3,
+                  4
+                ]
+              }
+            }
+          }
+        }
+      ],
       "description": "Quantize Host and Disk KV pages without changing the active GPU cache.",
       "properties": {
         "algorithm": {

@@ -60,6 +60,26 @@ def _turboquant_cold_pages(**options: object) -> dict:
     }
 
 
+def _nvfp4_cold_pages(**options: object) -> dict:
+    return {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page", **options}}
+
+
+# (config, valid) pairs that the runtime model accepts or rejects for its cross-field rules: the
+# options of the format not selected, and prod with fractional bits.
+_COLD_PAGE_FORMAT_CASES = [
+    (_turboquant_cold_pages(turboquant_mode="prod", turboquant_bits=2.5), False),
+    (_turboquant_cold_pages(turboquant_mode="prod", turboquant_bits=3.5), False),
+    (_turboquant_cold_pages(turboquant_mode="prod"), True),
+    (_turboquant_cold_pages(turboquant_bits=3.5, turboquant_mode="mse"), True),
+    (_turboquant_cold_pages(nvfp4_residual_dim=0), False),
+    (_turboquant_cold_pages(scale_checkpoint_path="/ckpt"), False),
+    (_nvfp4_cold_pages(quant="nvfp4", nvfp4_residual_dim=0, scale_checkpoint_path="/ckpt"), True),
+    (_nvfp4_cold_pages(quant="nvfp4", turboquant_bits=4), False),
+    (_nvfp4_cold_pages(turboquant_mode="mse"), False),  # quant defaults to nvfp4
+    (_nvfp4_cold_pages(turboquant_seed=1), False),
+]
+
+
 @pytest.mark.parametrize(
     ("filename", "config", "valid"),
     [
@@ -215,6 +235,12 @@ def _turboquant_cold_pages(**options: object) -> dict:
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits="4"), False),
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_mode="lloyd"), False),
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_seed=-1), False),
+        # Cross-field rules of ColdPageQuantizationCompressionConfig, in both serving schemas.
+        *(
+            (filename, config, valid)
+            for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA)
+            for config, valid in _COLD_PAGE_FORMAT_CASES
+        ),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
@@ -432,6 +458,20 @@ def test_config_validation(
 ) -> None:
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(("config", "valid"), _COLD_PAGE_FORMAT_CASES)
+def test_cold_page_format_rules_match_runtime(config: dict, valid: bool) -> None:
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
+
+    try:
+        ColdPageQuantizationCompressionConfig(**config["kv_cache_compression_config"])
+    except ValidationError:
+        assert not valid
+    else:
+        assert valid
 
 
 def _tagged_unions(node: object):

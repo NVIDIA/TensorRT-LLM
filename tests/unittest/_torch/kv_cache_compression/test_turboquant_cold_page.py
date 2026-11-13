@@ -8,6 +8,8 @@ indices, exactly as KVCacheManagerV2 calls it.
 """
 
 import math
+import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -267,6 +269,25 @@ def test_zero_tiny_and_huge_vectors_stay_finite(runtime):
                 assert _nmse(original, restored[key]) < 1.2 * PAPER_MSE[4] + (
                     0.003 if runtime == "fp8" else 0
                 )
+
+
+@requires_cuda
+def test_fp16_decode_saturates_at_the_fp16_range():
+    """Values at the FP16 limit reconstruct above it; decode stores +-65504, not inf."""
+    codec = _kv_codec(_provider(4), runtime="fp16")
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    limit = torch.finfo(torch.float16).max
+    values = {
+        key: torch.randint(0, 2, (4, 2, 32, 128), generator=generator, device="cuda") * 2.0 - 1.0
+        for key in codec.hot
+    }
+    values = {key: value * limit for key, value in values.items()}
+    restored = _round_trip(codec, values)
+    for value in restored.values():
+        value = value.float()
+        assert torch.isfinite(value).all()
+        # Some reconstructions exceeded the range: they saturate at its limit.
+        assert value.abs().max() == limit
 
 
 @requires_cuda
@@ -590,16 +611,60 @@ def test_writes_only_target_pages_and_slots():
         assert changed == [1, 7]
 
 
+@contextmanager
+def _held(stream, watchdog_seconds=60.0):
+    """Hold ``stream`` on a pinned host flag until the block ends; work queued on it waits.
+
+    A watchdog opens the flag after ``watchdog_seconds`` and the block then fails, so a host wait
+    on the held stream cannot hang the test or pass unnoticed.
+    """
+    from cuda.bindings import driver
+
+    flag = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+    (error,) = driver.cuStreamWaitValue32(
+        driver.CUstream(stream.cuda_stream),
+        driver.CUdeviceptr(flag.data_ptr()),
+        1,
+        driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ,
+    )
+    if error == driver.CUresult.CUDA_ERROR_NOT_SUPPORTED:
+        pytest.skip("this device cannot hold a stream on a host flag")
+    assert error == driver.CUresult.CUDA_SUCCESS, error
+    tripped = []
+
+    def open_flag(by_watchdog=False):
+        if by_watchdog:
+            tripped.append(True)
+        flag.numpy()[0] = 1
+
+    watchdog = threading.Timer(watchdog_seconds, open_flag, kwargs={"by_watchdog": True})
+    watchdog.start()
+    try:
+        yield
+    finally:
+        open_flag()
+        watchdog.cancel()
+        watchdog.join()
+        stream.synchronize()
+    assert not tripped, "the held stream was waited on from the host"
+
+
 @requires_cuda
 def test_codec_enqueues_on_the_given_stream_without_host_synchronization():
     codec = _kv_codec(_provider(4))
     assert codec.location == type(codec.location).DEVICE  # no host index array is read
+    generator = torch.Generator(device="cuda").manual_seed(15)
+    for value in codec.hot.values():
+        value.copy_(torch.randn(value.shape, generator=generator, device="cuda"))
     pairs = codec._pairs([0, 1], [0, 1])
     torch.cuda.synchronize()
-    with torch.cuda.stream(codec.stream):
-        torch.cuda._sleep(200_000_000)  # keep the stream busy far longer than the call takes
+    current = torch.cuda.current_stream()
+    assert current != codec.stream  # the requested stream is not the current one
+    with _held(codec.stream):
         codec.provider.encode_cold_pages(
             codec.state, 0, codec.cold.data_ptr(), pairs.data_ptr(), 2, codec.stream.cuda_stream
         )
+        current.synchronize()  # the current stream is not held: the encode must not be on it
         assert not codec.stream.query()
-    codec.stream.synchronize()
+        assert torch.count_nonzero(codec.cold) == 0  # queued behind the held flag, not run
+    assert torch.count_nonzero(codec.cold.view(-1, codec.cold_page_bytes)[:2]) > 0
