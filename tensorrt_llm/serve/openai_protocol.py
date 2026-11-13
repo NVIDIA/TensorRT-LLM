@@ -762,6 +762,8 @@ class CompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
                 )
+            elif self.logprobs == 0:
+                sampling_logprobs = 0
 
         sampling_params = SamplingParams(
             best_of=self.best_of,

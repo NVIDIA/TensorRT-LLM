@@ -60,6 +60,22 @@ def test_request_passes_logprobs_through_to_sampling_params(logprobs):
     assert request.to_sampling_params(backend="pytorch").logprobs == logprobs
 
 
+def test_zero_logprobs_kept_without_generation_logits_on_non_pytorch_backend():
+    request = CompletionRequest(model="m", prompt="hi", logprobs=0)
+
+    sampling_params = request.to_sampling_params(backend="tensorrt", gather_generation_logits=False)
+
+    assert sampling_params.logprobs == 0
+    assert sampling_params._get_output_config().return_log_probs
+
+
+def test_logprobs_above_one_still_rejected_without_generation_logits():
+    request = CompletionRequest(model="m", prompt="hi", logprobs=2)
+
+    with pytest.raises(ValueError, match="logprobs"):
+        request.to_sampling_params(backend="tensorrt", gather_generation_logits=False)
+
+
 @pytest.mark.parametrize("logprobs", [None, 0, 2])
 def test_non_streaming_response_carries_logprobs_unless_absent(logprobs):
     token_ids = [3, 4]
