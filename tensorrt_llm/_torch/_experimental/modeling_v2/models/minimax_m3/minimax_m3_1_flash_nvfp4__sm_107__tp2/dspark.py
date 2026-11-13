@@ -804,7 +804,9 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         boundary's updated residual is kept by reference instead, and written (the same bytes) before the drafter reads
         the buffer; such a capture does not reach the capture-stream fork."""
 
-        st = self._dc
+        st = getattr(
+            self, "_dc", None
+        )  # None off the opt-in (also on a worker built without this mixin's state)
         if (
             st is not None
             and residual is None
