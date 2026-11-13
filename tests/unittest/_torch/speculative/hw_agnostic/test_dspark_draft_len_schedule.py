@@ -89,14 +89,17 @@ def _metadata(captured, **overrides):
     return SimpleNamespace(**values)
 
 
-def _forward(worker, model, metadata, batch_size, positions):
+def _forward(worker, model, metadata, batch_size, positions, num_contexts=0, num_ctx_tokens=0):
     worker.skip_drafting = Mock(return_value=_skip_outputs(batch_size))
+    num_tokens = num_ctx_tokens + batch_size - num_contexts
     return worker._forward_impl(
-        torch.zeros(batch_size, dtype=torch.long),
+        torch.zeros(num_tokens, dtype=torch.long),
         positions,
         None,
         torch.zeros(batch_size, 4),
-        SimpleNamespace(num_seqs=batch_size, num_contexts=0, num_ctx_tokens=0),
+        SimpleNamespace(
+            num_seqs=batch_size, num_contexts=num_contexts, num_ctx_tokens=num_ctx_tokens
+        ),
         metadata,
         model,
     )
@@ -158,6 +161,32 @@ def test_step_without_speculation_follows_the_target_in_the_windows():
     assert worker._valid_len[:2].tolist() == [3, WINDOW]
 
 
+def test_step_without_speculation_reads_generation_rows_past_the_context_tokens():
+    """In a mixed batch the generation rows start after every context token."""
+    worker = _worker(num_rows=3)
+    worker._seed_context_windows = Mock()
+    model = _draft_model()
+    # One context request of three tokens, then one row per generation request.
+    captured = torch.arange(5, dtype=torch.float).unsqueeze(1).expand(5, 2)
+    positions = torch.tensor([[0, 1, 2, 10, 20]])
+
+    outputs = _forward(
+        worker, model, _metadata(captured), 3, positions, num_contexts=1, num_ctx_tokens=3
+    )
+
+    worker._seed_context_windows.assert_called_once()
+    model.forward_batched.assert_not_called()
+    assert outputs["next_draft_tokens"].shape == (3, 0)
+    hidden, window_positions, slots, mask, _windows = (
+        model.write_context_windows_batched.call_args.args
+    )
+    assert torch.equal(hidden, captured[3:5].unsqueeze(1))
+    assert window_positions.tolist() == [[11], [21]]
+    assert slots.tolist() == [1, 2]
+    assert mask.tolist() == [[True], [True]]
+    assert worker._ctx_len[1:3].tolist() == [11, 21]
+
+
 def test_step_without_speculation_bootstraps_a_new_slot_from_its_input_position():
     worker = _worker()
     model = _draft_model()
@@ -207,12 +236,14 @@ def test_step_without_speculation_keeps_the_draft_moe_in_lockstep():
     """Ranks sharing the draft MoE barrier make the same calls as a drafting peer."""
     worker = _worker()
     model = _draft_model()
-    metadata = _metadata(torch.zeros(2, 2), all_rank_num_gens=[2, 0])
+    metadata = _metadata(
+        torch.zeros(2, 2), all_rank_num_gens=[2, 1], all_rank_draft_lens=[0, BLOCK]
+    )
 
     outputs = _forward(worker, model, metadata, 2, torch.tensor([[10, 20]]))
 
     model.forward_batched.assert_called_once()
-    assert model.forward_batched.call_args.kwargs["all_rank_num_tokens"] == [2 * BLOCK, 1]
+    assert model.forward_batched.call_args.kwargs["all_rank_num_tokens"] == [2 * BLOCK, BLOCK]
     # The block ran for the barrier only; its proposal is dropped.
     assert outputs["next_draft_tokens"].shape == (2, 0)
     assert worker._ctx_len[:2].tolist() == [11, 21]
@@ -221,10 +252,34 @@ def test_step_without_speculation_keeps_the_draft_moe_in_lockstep():
 def test_idle_rank_without_speculation_still_crosses_the_draft_moe_barrier():
     worker = _worker()
     model = _draft_model()
-    metadata = _metadata(torch.zeros(0, 2), all_rank_num_gens=[0, 2])
+    metadata = _metadata(
+        torch.zeros(0, 2), all_rank_num_gens=[0, 2], all_rank_draft_lens=[0, BLOCK]
+    )
 
     _forward(worker, model, metadata, 0, torch.zeros((1, 0), dtype=torch.long))
 
     model.forward_batched.assert_not_called()
     model.run_moe_lockstep_noop.assert_called_once()
     assert model.run_moe_lockstep_noop.call_args.args[0] == [1, 2 * BLOCK]
+
+
+@pytest.mark.parametrize("num_gens", [2, 0])
+def test_step_without_speculation_skips_the_draft_moe_when_no_rank_drafts(num_gens):
+    """With every rank at draft length zero, none of them crosses the barrier."""
+    worker = _worker()
+    worker._ctx_len[:2] = torch.tensor([10, 20])
+    worker._position_initialized[:2] = True
+    model = _draft_model()
+    metadata = _metadata(
+        torch.zeros(num_gens, 2), all_rank_num_gens=[num_gens, 2], all_rank_draft_lens=[0, 0]
+    )
+    positions = torch.tensor([[10, 20]])[:, :num_gens]
+
+    outputs = _forward(worker, model, metadata, num_gens, positions)
+
+    model.forward_batched.assert_not_called()
+    model.run_moe_lockstep_noop.assert_not_called()
+    assert outputs["next_draft_tokens"].shape == (num_gens, 0)
+    # The windows still follow the target, as they do without a barrier.
+    assert model.write_context_windows_batched.call_count == (1 if num_gens else 0)
+    assert worker._ctx_len[:2].tolist() == ([11, 21] if num_gens else [10, 20])

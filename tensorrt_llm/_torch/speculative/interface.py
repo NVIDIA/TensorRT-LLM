@@ -583,6 +583,9 @@ class SpecMetadata:
     # whose draft forward processes only generation requests and must size a
     # FUSED_COMM MoE (DeepGEMM MegaMoE) chunk loop identically across EP ranks.
     all_rank_num_gens: Optional[List[int]] = None
+    # The draft length each rank runs this step with. Attention-DP ranks pick
+    # it from their own batch, so it can differ across ranks.
+    all_rank_draft_lens: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the

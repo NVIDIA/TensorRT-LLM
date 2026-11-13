@@ -453,6 +453,7 @@ def set_spec_metadata_all_rank_num_tokens(
     spec_all_rank_num_tokens: list[int],
     all_rank_num_seqs: list[int],
     all_rank_num_gens: list[int] | None = None,
+    all_rank_draft_lens: list[int] | None = None,
 ) -> None:
     # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
     # draft loop iterations i>0 (per-sequence counts, since each
@@ -469,6 +470,10 @@ def set_spec_metadata_all_rank_num_tokens(
     # chunk loop identical across EP ranks.
     if all_rank_num_gens is not None:
         spec_metadata.all_rank_num_gens = all_rank_num_gens
+    # Each rank picks its draft length from its own batch, so a rank whose
+    # schedule turned speculation off still has to know whether a peer drafts.
+    if all_rank_draft_lens is not None:
+        spec_metadata.all_rank_draft_lens = all_rank_draft_lens
     if (
         spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
         or spec_metadata.spec_dec_mode.is_eagle3_one_model()

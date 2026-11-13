@@ -2505,6 +2505,57 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp{tp_size}]",
                 acceptance_length)
 
+    @DEEPSEEKV4_PARALLELISM
+    def test_gsm8k_megamoe_deepgemm_draft_len_schedule(self, tp_size,
+                                                       attention_dp):
+        """GSM8K under a schedule that trims, then turns off, verified drafts.
+
+        The evaluation submits every sample up front, so each attention-DP
+        rank first runs full batches without speculation and then passes
+        through the shorter and the full draft length as it drains, out of
+        step with its peers.
+        """
+        _skip_unless_deepseekv4_4gpu_memory(
+            tp_size,
+            min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        schedule = {32: 5, 96: 3}
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           draft_len_schedule=schedule,
+                                           speculative_model=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=tp_size,
+                 enable_attention_dp=attention_dp,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            # The schedule decides how many steps speculate, so the acceptance
+            # length has no fixed floor; this still requires that some did.
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] draft_len_schedule[dp{tp_size}] "
+                  f"acceptance_length = {acceptance_length:.3f}")
+
     @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_dep4_megamoe_cutedsl(self):

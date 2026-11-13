@@ -540,6 +540,10 @@ class DecoderInputPreparer:
         ``spec_metadata.num_tokens``, ``num_generations`` and ``seq_lens`` for
         this batch before calling this. ``num_generations`` counts every
         generation request, CUDA-graph dummies included.
+
+        The step's draft length rides along: each rank picks it from its own
+        batch, and a drafter that crosses a cross-rank barrier has to know
+        whether any peer drafts this step.
         """
         if not self._config.enable_attention_dp:
             return None, None
@@ -547,6 +551,7 @@ class DecoderInputPreparer:
             spec_metadata.dp_num_tokens(),
             len(spec_metadata.seq_lens),
             spec_metadata.num_generations,
+            spec_metadata.runtime_draft_len,
         )
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the

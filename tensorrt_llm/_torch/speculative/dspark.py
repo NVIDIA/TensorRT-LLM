@@ -1093,9 +1093,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         the right absolute positions.
 
         Ranks that share the draft MoE's cross-rank barrier still run the
-        block and drop its proposal. Attention-DP ranks pick the draft length
-        from their own batch size, so a peer may be drafting this step, and
-        every rank has to make the same draft MoE calls.
+        block and drop its proposal while a peer drafts. Attention-DP ranks
+        pick the draft length from their own batch size, so a peer may be
+        drafting this step, and every rank has to make the same draft MoE calls.
         """
         outputs = self.skip_drafting(
             input_ids,
@@ -1129,7 +1129,18 @@ class DSv4DSparkWorker(SpecWorkerBase):
             )
 
         all_rank_draft_tokens = self._all_rank_draft_tokens(spec_metadata, draft_model)
+        # A captured graph freezes this choice. Graphs exist only for the
+        # schedule's own (batch size, draft length) pairs and replay only when
+        # every rank runs the same batch size, so the ranks replaying one
+        # share a draft length.
         if all_rank_draft_tokens is None:
+            peer_drafts = False
+        else:
+            assert spec_metadata.all_rank_draft_lens is not None, (
+                "per-rank draft lengths are gathered together with the per-rank gen counts"
+            )
+            peer_drafts = max(spec_metadata.all_rank_draft_lens) > 0
+        if not peer_drafts:
             if num_gens > 0:
                 self._follow_target_step(
                     draft_model,
