@@ -251,7 +251,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(client.saved), 2)
         self.assertIsNone(client.cm)
 
-    def test_shared_configmap_preserves_other_dashboards_and_labels(self) -> None:
+    def test_shared_configmap_preserves_other_dashboards_binary_data_and_labels(self) -> None:
         c = config()
         c["grafana"]["publication"] = "configmap-v2"
         ds, cm, s = app.render(c)
@@ -263,9 +263,11 @@ class DashboardTests(unittest.TestCase):
                 "annotations": {"folder": "keep"},
             },
             "data": {"unrelated.json": "untouched"},
+            "binaryData": {"unrelated.bin": "AP8="},
         }
         app.deploy(c, ds, cm, s, client)
         self.assertEqual(client.cm["data"]["unrelated.json"], "untouched")
+        self.assertEqual(client.cm["binaryData"], {"unrelated.bin": "AP8="})
         self.assertEqual(client.cm["metadata"]["labels"]["keep"], "yes")
         self.assertEqual(client.cm["metadata"]["annotations"]["folder"], "keep")
 
