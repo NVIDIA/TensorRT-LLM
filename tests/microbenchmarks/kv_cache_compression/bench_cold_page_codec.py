@@ -48,9 +48,13 @@ read, cold bytes / host write); decode SOL = max(cold bytes / host read, hot byt
 cold bytes are N x the format's own ``cold_page_bytes``.
 
 Correctness. After timing, each decoded slot is compared with its source slot: nMSE is
-||x - x_hat||^2 / ||x||^2, averaged over the K/V vectors. TurboQuant mse FAILS when its nMSE is
-not finite or above twice the paper's distortion (0.0094, 0.034, 0.117 at 4, 3, 2 bits); prod
-mode and NVFP4 only need a finite nMSE. Results that fail do not count.
+||x - x_hat||^2 / ||x||^2, averaged over the K/V vectors of the case and of each (layer, buffer).
+A format FAILS when an nMSE is not finite or one buffer's nMSE is above four times the case-wide
+nMSE (a layer that decodes to zeros has nMSE 1, which a case-wide mean over many layers would
+hide); TurboQuant mse also FAILS when its case-wide nMSE is above twice the paper's distortion
+(0.0094, 0.034, 0.117 at 4, 3, 2 bits). Results that fail do not count. Cases with an FP8
+active KV cache are skipped on GPUs below compute capability 8.9, where TurboQuant does not admit
+it. Non-finite values are written to --json as null.
 
 Run on one GPU, from the repository root::
 
@@ -92,6 +96,7 @@ PAPER_MSE = {2: 0.117, 3: 0.034, 4: 0.0094}  # TurboQuant Theorem 1 distortion, 
 SOL_BYTES = 1 << 30
 COPY_BLOCK = 4096
 RUNTIMES = {"bf16": (torch.bfloat16, DataType.BF16), "fp8": (torch.float8_e4m3fn, DataType.FP8)}
+WORST_BUFFER_FACTOR = 4.0  # no (layer, buffer) may exceed this multiple of the case-wide nMSE
 
 
 @dataclass(frozen=True)
@@ -295,7 +300,11 @@ def _build_codec(case: Case, fmt: str, source: dict, perm: torch.Tensor) -> _Cod
             **(options if fmt == "turboquant" else {}),
         ),
         model_engine=_model_engine(case),
-        kv_cache_config=KvCacheConfig(enable_block_reuse=True, host_cache_size=1 << 30),
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=True,
+            host_cache_size=1 << 30,
+            dtype="fp8" if case.runtime == "fp8" else "auto",  # admission sees the measured dtype
+        ),
     )
     if not getattr(manager, "provides_cold_page_codec", False):
         raise RuntimeError(f"the factory returned {manager!r}, not a cold-page codec provider")
@@ -404,18 +413,37 @@ def _measure_bandwidth(stream: torch.cuda.Stream, warmup: int, reps: int) -> dic
     return {"hbm_read": hbm, "hbm_write": hbm, "host_read": host_read, "host_write": host_write}
 
 
-def _nmse(codec: _Codec, source: dict, perm: torch.Tensor, pages: int) -> float:
-    """Mean over K/V vectors of ||x - x_hat||^2 / ||x||^2, x_hat being x after the round trip."""
+def _nmse(
+    codec: _Codec, source: dict, perm: torch.Tensor, pages: int
+) -> tuple[float, dict[str, float]]:
+    """Mean over K/V vectors of ||x - x_hat||^2 / ||x||^2, for the case and per buffer.
+
+    x_hat is x after the round trip; the per-buffer means are keyed ``"layer/buffer"``.
+    """
     total = torch.zeros((), dtype=torch.float64, device="cuda")
     count = torch.zeros((), dtype=torch.int64, device="cuda")
-    for key, values in source.items():
+    per_buffer = {}
+    for (layer, role), values in source.items():
         reference = values.float()[perm].flatten(0, -2)
-        decoded = codec.hot[key][pages:].float().flatten(0, -2)
+        decoded = codec.hot[(layer, role)][pages:].float().flatten(0, -2)
         errors, norms = (decoded - reference).square().sum(-1), reference.square().sum(-1)
         keep = norms > 0
-        total += (errors[keep] / norms[keep]).sum(dtype=torch.float64)
+        buffer_total = (errors[keep] / norms[keep]).sum(dtype=torch.float64)
+        total += buffer_total
         count += keep.sum()
-    return float(total / count)
+        per_buffer[f"{layer}/{role}"] = buffer_total / keep.sum().clamp(min=1)
+    return float(total / count), {key: float(value) for key, value in per_buffer.items()}
+
+
+def _json_safe(value: object) -> object:
+    """``value`` with every non-finite float replaced by None, so the report stays valid JSON."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _gpu_activities(fn: Callable[[], None]) -> list[str]:
@@ -481,15 +509,25 @@ def _run_case(
             "encode": max(hot_bytes / bandwidth["hbm_read"], cold_bytes / bandwidth["host_write"]),
             "decode": max(cold_bytes / bandwidth["host_read"], hot_bytes / bandwidth["hbm_write"]),
         }
-        nmse = _nmse(codec, source, perm_device, case.pages)
+        nmse, per_buffer = _nmse(codec, source, perm_device, case.pages)
         bound = 2 * PAPER_MSE[case.bits] if fmt == "turboquant" and case.mode == "mse" else None
+        finite = all(math.isfinite(value) for value in (nmse, *per_buffer.values()))
+        worst = max(  # a non-finite buffer first
+            per_buffer,
+            key=lambda key: per_buffer[key] if math.isfinite(per_buffer[key]) else math.inf,
+        )
         result = results[fmt] = {
             "cold_page_bytes": codec.cold_page_bytes,
             "bits_per_element": 8 * codec.cold_page_bytes / case.page_elements,
             "page_index_location": codec.index_location,
             "nmse": nmse,
             "nmse_bound": bound,
-            "passed": math.isfinite(nmse) and (bound is None or nmse <= bound),
+            "worst_buffer": worst,
+            "worst_buffer_nmse": per_buffer[worst],
+            # One corrupted layer barely moves the case-wide mean; check every buffer.
+            "passed": finite
+            and (bound is None or nmse <= bound)
+            and per_buffer[worst] <= WORST_BUFFER_FACTOR * nmse,
         }
         for op in OPS:
             median, sol_us = statistics.median(samples[fmt][op]), sol_ns[op] / 1e3
@@ -599,6 +637,15 @@ def main() -> int:
     args = parser.parse_args()
     if args.warmup < 0 or args.reps < 1:
         parser.error("--warmup must be >= 0 and --reps >= 1")
+    # TurboQuant admits an FP8 active KV cache from compute capability 8.9 (Triton FP8) only.
+    skipped = [
+        name
+        for name in args.cases
+        if CASES[name].runtime == "fp8" and torch.cuda.get_device_capability() < (8, 9)
+    ]
+    for name in skipped:
+        print(f"Skipping {name}: an FP8 active KV cache needs compute capability 8.9 or newer")
+    args.cases = [name for name in args.cases if name not in skipped]
 
     properties = torch.cuda.get_device_properties()
     gpu = f"{properties.name}, sm_{properties.major}{properties.minor}"
@@ -632,10 +679,11 @@ def main() -> int:
             "warmup": args.warmup,
             "reps": args.reps,
             "bandwidth_gbps": bandwidth,
+            "skipped_cases": skipped,
             "cases": reports,
         }
         with open(args.json, "w") as file:
-            json.dump(summary, file, indent=2)
+            json.dump(_json_safe(summary), file, indent=2, allow_nan=False)
     return 1 if problems else 0
 
 
