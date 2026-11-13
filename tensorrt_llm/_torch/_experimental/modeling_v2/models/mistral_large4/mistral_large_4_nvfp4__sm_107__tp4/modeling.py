@@ -159,7 +159,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allredu
     cute_dsl_allreduce_add_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import (
+    low_m_cublas_mm as cublas_mm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
     cute_dsl_fp8_block_scale_linear,
     prepare_weight_scale,
