@@ -434,7 +434,7 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
     forces the call by:
 
     1. Asking the caller to prepend ``begin_prefix`` (e.g.
-       ``<tool_call>\n{"name":"X", "arguments":``) to the rendered prompt
+       ``<tool_call>\n{"name": "X", "arguments":``) to the rendered prompt
        so the model starts generation *already inside* the tool call. It is
        the parser's `forced_call_prefix` followed by its `begin`.
     2. Constraining what follows with a plain JSON-schema (or json-object)
@@ -480,8 +480,11 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
             f"not present in `tools`. Available functions: {available}.")
 
     info = parser.structure_info()(forced_tool.function.name)
-    begin_prefix = parser.forced_call_prefix(
-        forced_tool.function.name) + info.begin
+    # The JSON grammar below does not accept leading whitespace, and
+    # tokenizers usually merge a space with the text after it, so a prompt
+    # that ends in a space would leave the model mid-token.
+    begin_prefix = (parser.forced_call_prefix(forced_tool.function.name) +
+                    info.begin).rstrip(" ")
 
     if forced_tool.function.parameters:
         guided = GuidedDecodingParams(json=forced_tool.function.parameters)

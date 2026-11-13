@@ -1222,9 +1222,27 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         info = func("test_function")
 
         assert isinstance(info, StructureInfo)
-        assert info.begin == '<tool_call>\n{"name":"test_function", "arguments":'
+        assert info.begin == '<tool_call>\n{"name": "test_function", "arguments": '
         assert info.end == "}\n</tool_call>"
         assert info.trigger == "<tool_call>"
+
+    def test_structure_info_matches_chat_template_format(self):
+        """The tag's begin + arguments + end must match Qwen3's chat template.
+
+        The template renders ``{"name": "<name>", "arguments": <args|tojson>}``,
+        with the same spacing as ``json.dumps``. The strict-tools structural
+        tag forces ``begin`` verbatim, so any spacing difference forces the
+        model off the format it was trained on.
+        """
+        info = Qwen3ToolParser().structure_info()("get_weather")
+        arguments = {"location": "Tokyo", "unit": "celsius"}
+
+        template_call = ("<tool_call>\n" + json.dumps({
+            "name": "get_weather",
+            "arguments": arguments
+        }) + "\n</tool_call>")
+
+        assert info.begin + json.dumps(arguments) + info.end == template_call
 
     def test_structure_info_different_names(self):
         """Test structure_info works with different function names."""
@@ -1242,7 +1260,7 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         """Test that Qwen3ToolParser follows the documented format structure."""
 
         # Test the exact format from the docstring
-        text = '<tool_call>\n{"name":"get_weather", "arguments":{"location":"Tokyo"}}\n</tool_call>'
+        text = '<tool_call>\n{"name": "get_weather", "arguments": {"location": "Tokyo"}}\n</tool_call>'
 
         result = parser.detect_and_parse(text, sample_tools)
 
@@ -6092,16 +6110,32 @@ class TestBuildForcedToolCallDecoding:
         begin_prefix, guided = _build_forced_tool_call_decoding(
             tools, parser_name, "get_weather")
 
-        # ``begin_prefix`` is exactly the parser's tool-call begin string.
+        # ``begin_prefix`` is the parser's tool-call begin string, without
+        # trailing spaces.
         parser = ToolParserFactory.parsers[parser_name.lower()]()
         expected_begin = parser.structure_info()("get_weather").begin
-        assert begin_prefix == expected_begin
+        assert begin_prefix == expected_begin.rstrip(" ")
         assert "get_weather" in begin_prefix
 
         assert isinstance(guided, GuidedDecodingParams)
         assert guided.json == _SCHEMA_LOCATION
         assert guided.json_object is False
         assert guided.structural_tag is None
+
+    def test_forced_prefix_has_no_trailing_space(self):
+        """The prompt prefix must not end in a space.
+
+        The JSON grammar that follows the prefix does not accept leading
+        whitespace, so a trailing space in the prompt would be a lone token
+        the model never sees in its chat template's output.
+        """
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        begin_prefix, _ = _build_forced_tool_call_decoding(
+            tools, "qwen3", "get_weather")
+        assert begin_prefix == '<tool_call>\n{"name": "get_weather", "arguments":'
 
     def test_forced_name_no_parameters_uses_json_object(self):
         """Forced-name path falls back to ``json_object`` when no schema.
