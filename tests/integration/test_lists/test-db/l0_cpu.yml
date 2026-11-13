@@ -158,6 +158,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
+  - unittest/_torch/models/test_qwen3_next_eager_fusion.py::test_sparse_moe_keeps_shared_expert_tokens_unpadded
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
