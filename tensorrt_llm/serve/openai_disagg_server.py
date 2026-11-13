@@ -21,8 +21,9 @@ import signal
 import socket
 import traceback
 import uuid
-from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from contextlib import aclosing, asynccontextmanager
+from types import AsyncGeneratorType
+from typing import AsyncGenerator, Awaitable, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -70,7 +71,9 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
+                                                ServerArrivalTimeMiddleware,
+                                                UCompletionResponseOrGenerator,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
                                                 stream_error_event)
@@ -427,6 +430,69 @@ class OpenAIDisaggServer:
                 conversation_id=f"subagent:{uuid.uuid4()}")
         req.conversation_params.subagent_affinity_id = parent
 
+    @staticmethod
+    async def _await_context_request(
+        entry_point: Callable[[UCompletionRequest, Optional[ResponseHooks]],
+                              Awaitable[UCompletionResponseOrGenerator]],
+        req: UCompletionRequest, hooks: Optional[ResponseHooks], raw_req: Request,
+    ) -> UCompletionResponseOrGenerator:
+        """Observe disconnects before the response has started listening.
+
+        Cancellation drains the service's bounded control delivery, not physical retirement.
+        A stream that completed concurrently is closed rather than abandoned before its first read.
+
+        Args:
+            entry_point: Context-first service entry point.
+            req: Original client request.
+            hooks: Optional response/timing callbacks.
+            raw_req: Connection whose disconnect cancels the request.
+
+        Returns:
+            The service response or a stream whose cleanup is already active.
+
+        Raises:
+            asyncio.CancelledError: The client disconnected or the caller cancelled.
+        """
+        stop_watching = False
+
+        async def watch_disconnect() -> None:
+            while not stop_watching:
+                if await raw_req.is_disconnected() or stop_watching:
+                    return
+                await asyncio.sleep(0.1)
+
+        work = asyncio.create_task(entry_point(req, hooks))
+        disconnected = asyncio.create_task(watch_disconnect())
+        returned = False
+        try:
+            await asyncio.wait((work, disconnected), return_when=asyncio.FIRST_COMPLETED)
+            if disconnected.done():
+                disconnected.result()
+                raise asyncio.CancelledError
+            result = work.result()
+            returned = True
+            return result
+        finally:
+            # Request.is_disconnected() can consume task cancellation in its cancel scope.
+            stop_watching = True
+            disconnected.cancel()
+            if not returned:
+                work.cancel()
+            settled = asyncio.gather(work, disconnected, return_exceptions=True)
+            cancelled_during_cleanup = False
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    cancelled_during_cleanup = True
+                    returned = False
+            if not returned and not work.cancelled() and work.exception() is None:
+                result = work.result()
+                if isinstance(result, AsyncGeneratorType):
+                    await result.aclose()
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
+
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
@@ -451,16 +517,22 @@ class OpenAIDisaggServer:
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
-                response_or_generator = await entry_point(req, hooks)
+                protected_context = self._service.context_cancellation_enabled
+                if protected_context:
+                    response_or_generator = await self._await_context_request(
+                        entry_point, req, hooks, raw_req)
+                else:
+                    response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     stream = response_or_generator
-                    if isinstance(req, ResponsesRequest):
+                    if isinstance(req, ResponsesRequest) and not protected_context:
                         # A relayed Responses stream that fails early ends with
                         # an `error` event; other protocols end on a sentinel.
                         stream = guard_responses_stream(stream,
                                                         stream_error_event)
-                    return StreamingResponse(
+                    response_type = ClosingStreamingResponse if protected_context else StreamingResponse
+                    return response_type(
                         content=stream,
                         media_type="text/event-stream")
                 # by_alias: e.g. text.format.schema goes out under its wire name.
@@ -471,6 +543,25 @@ class OpenAIDisaggServer:
                 # carry a machine-readable code (context_length_exceeded).
                 return self._handle_exception(e)
         return wrapper
+
+    @staticmethod
+    async def _close_adapted_context_stream(
+        source: AsyncGenerator[str | bytes | None, None],
+        adapted: AsyncGenerator[str, None],
+    ) -> AsyncGenerator[str | None, None]:
+        """Retain source cleanup even before an adapter's first frame is consumed.
+
+        Args:
+            source: Protected OpenAI stream that owns CTX cancellation.
+            adapted: Anthropic framing of that same stream.
+
+        Yields:
+            An initial private sentinel, then unchanged Anthropic frames.
+        """
+        async with aclosing(source), aclosing(adapted):
+            yield None
+            async for frame in adapted:
+                yield frame
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -495,10 +586,17 @@ class OpenAIDisaggServer:
         disagg_request_id = getattr(raw_request.state, "disagg_request_id",
                                     None)
         if isinstance(openai_response, StreamingResponse):
+            adapted = reframe_openai_stream(openai_response.body_iterator,
+                                           model=request.model,
+                                           request_id=disagg_request_id)
+            if isinstance(openai_response, ClosingStreamingResponse):
+                adapted = self._close_adapted_context_stream(
+                    openai_response.body_iterator, adapted)
+                await adapted.__anext__()
+                return ClosingStreamingResponse(content=adapted,
+                                                 media_type="text/event-stream")
             return StreamingResponse(
-                content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model,
-                                              request_id=disagg_request_id),
+                content=adapted,
                 media_type="text/event-stream",
             )
 

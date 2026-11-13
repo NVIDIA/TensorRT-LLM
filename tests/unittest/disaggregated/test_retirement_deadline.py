@@ -28,6 +28,48 @@ pytestmark = pytest.mark.cpu_only
 _KV_RESULT_REPORT_TOKEN = b"report-token-123"
 
 
+@pytest.mark.parametrize("preexisting", [False, True], ids=["handoff-first", "deadline-first"])
+@pytest.mark.parametrize("callback_raises", [False, True])
+def test_ownership_handoff_failure_preserves_first_fatal_once(
+    preexisting: bool, callback_raises: bool, request: pytest.FixtureRequest
+) -> None:
+    """Immediate containment uses the same sticky outcome and once-only callback."""
+    clock = Mock(return_value=0.0)
+    callback = Mock(side_effect=RuntimeError("containment returned") if callback_raises else None)
+    watchdog = RetirementWatchdog(callback, clock=clock)
+
+    def clean_up_test_thread() -> None:
+        """Release only the controlled test's intentionally parked fatal thread."""
+        watchdog._stopped.set()
+        watchdog.wake.set()
+        if watchdog._thread is not None:
+            watchdog._thread.join(timeout=1)
+            assert not watchdog._thread.is_alive()
+
+    request.addfinalizer(clean_up_test_thread)
+    if preexisting:
+        owner = watchdog.create_owner(4, "receive", 1.0)
+        owner.retain_unproven(object(), "original cancellation")
+        clock.return_value = 1.0
+        watchdog.progress()
+    previous = watchdog.fatal
+    watchdog.fail_closed(7, "receive", "unpublished CUDA ownership handoff refused")
+    first = watchdog.fatal
+    assert first is not None
+    if previous is not None:
+        assert first is previous
+        assert first.failure_kind == "deadline"
+    else:
+        assert first.failure_kind == "ownership_handoff"
+    clock.return_value = 100.0
+    watchdog.fail_closed(8, "send", "duplicate failure")
+    watchdog.progress()
+    assert watchdog.fatal is first
+    callback.assert_called_once_with(first)
+    with pytest.raises(RuntimeError, match="admission is closed"):
+        watchdog.create_owner(9, "receive", 1.0)
+
+
 def _publish_report_tokens(session, ranks=range(16)):
     """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
     for task in getattr(session, "_kv_tasks", []):

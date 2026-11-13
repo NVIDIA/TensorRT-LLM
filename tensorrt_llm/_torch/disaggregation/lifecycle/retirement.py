@@ -15,7 +15,7 @@ from tensorrt_llm import logger
 
 @dataclass(frozen=True)
 class QuiescenceFatalEvent:
-    """Immutable evidence that an exposed owner missed its retirement deadline."""
+    """Immutable evidence that safe physical retirement cannot continue."""
 
     request_id: int
     direction: Literal["send", "receive"]
@@ -23,6 +23,7 @@ class QuiescenceFatalEvent:
     started_at: float
     deadline: float
     expired_at: float
+    failure_kind: Literal["deadline", "ownership_handoff"] = "deadline"
 
 
 class RetirementDeadline:
@@ -321,6 +322,42 @@ class RetirementWatchdog:
                 # The containment boundary is external. Failure cannot erase its
                 # fatal decision or destroy the owners that still retain memory.
                 logger.error(f"KV retirement containment callback failed; owners retained: {error}")
+
+    def fail_closed(
+        self, request_id: int, direction: Literal["send", "receive"], reason: str
+    ) -> None:
+        """Contain an admitted access that cannot join bounded ownership tracking.
+
+        Args:
+            request_id: Exact request whose roots the caller must retain.
+            direction: Source or destination access that cannot be tracked.
+            reason: Description of the failed ownership handoff.
+        """
+        with self.lock:
+            if self.fatal is None:
+                now = self.clock()
+                self.fatal = QuiescenceFatalEvent(
+                    request_id,
+                    direction,
+                    reason,
+                    now,
+                    now,
+                    now,
+                    failure_kind="ownership_handoff",
+                )
+            self.wake.set()
+        # Reuse the existing once-only callback outside the lock, including
+        # when the background progress thread has already stopped.
+        try:
+            self.progress()
+        finally:
+            with self.lock:
+                if self._stopped.is_set() or self._thread is None or not self._thread.is_alive():
+                    # Fatal admission stays closed. Reuse the persistent progress
+                    # thread to root the callback graph if containment returns.
+                    self._stopped.clear()
+                    self._thread = None
+                    self.start()
 
     def request_shutdown(self) -> None:
         """Start drain on every tracked owner before any resource teardown."""

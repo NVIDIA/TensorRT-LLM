@@ -16,7 +16,8 @@ import asyncio
 import json
 import os
 import re
-from typing import Callable, Optional
+from contextlib import aclosing
+from typing import AsyncGenerator, Callable, Optional
 
 from fastapi import HTTPException
 
@@ -49,7 +50,9 @@ from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
     done_generator,
+    guard_responses_stream,
     responses_done_generator,
+    stream_error_event,
 )
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
 
@@ -150,6 +153,110 @@ class _SseErrorObserver:
         return found_error
 
 
+class _ContextCancellation:
+    """Keep the CTX cancellation address across HTTP completion and GEN placement."""
+
+    def __init__(self, client: OpenAIClient) -> None:
+        """Retain the control client without creating another resource owner.
+
+        Args:
+            client: Native HTTP context client with bounded control requests.
+        """
+        self._client = client
+        self._server: str | None = None
+        self._token: str | None = None
+
+    async def reserve(self, server: str, request_id: int) -> str:
+        """Obtain a submission identity, including a response racing with cancellation.
+
+        Args:
+            server: Selected context worker's shared HTTP address.
+            request_id: Immutable context-first pairing ID.
+
+        Returns:
+            Single-use admission token, retained here for later cancellation.
+        """
+        self._server = server
+        reservation = asyncio.create_task(
+            self._client.reserve_context_cancellation(server, request_id)
+        )
+        try:
+            self._token = await asyncio.shield(reservation)
+        except asyncio.CancelledError:
+            # Do not lose a late reservation response when cancellation wins the race.
+            settled = asyncio.gather(reservation, return_exceptions=True)
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    pass
+            if not reservation.cancelled() and reservation.exception() is None:
+                self._token = reservation.result()
+            raise
+        return self._token
+
+    async def cancel(self) -> None:
+        """Deliver cancellation once, waiting only for the bounded control request.
+
+        Delivery failures remain unknown and leave the worker's existing deadline in force.
+        This neither waits for nor reports physical retirement.
+        """
+        if self._token is None:
+            return
+        token, self._token = self._token, None
+        delivery = asyncio.create_task(
+            self._client.cancel_context_cancellation(self._server, token)
+        )
+        settled = asyncio.gather(delivery, return_exceptions=True)
+        while not settled.done():
+            try:
+                await asyncio.shield(settled)
+            except asyncio.CancelledError:
+                pass
+        error = settled.result()[0]
+        if isinstance(error, BaseException):
+            # Delivery failure is unknown, not a worker cancellation acknowledgement.
+            logger.warning(
+                f"Context cancellation delivery failed ({type(error).__name__}); "
+                "worker deadline remains active"
+            )
+
+    async def stream(
+        self,
+        response: AsyncGenerator[str | bytes, None],
+        responses_api: bool,
+    ) -> AsyncGenerator[str | bytes | None, None]:
+        """Own CTX cancellation until a returned stream completes or closes.
+
+        Args:
+            response: Existing GEN stream, which may not yet have sent its POST.
+            responses_api: Whether to preserve Responses terminal-error framing.
+
+        Yields:
+            An initial private sentinel, then unchanged response frames.
+        """
+        success = False
+        observer = _SseErrorObserver(responses_api=responses_api)
+        failed = False
+        try:
+            async with aclosing(response):
+                # Prime cleanup before returning even when GEN has not sent its POST.
+                yield None
+                guarded = (
+                    guard_responses_stream(response, stream_error_event)
+                    if responses_api
+                    else response
+                )
+                async with aclosing(guarded):
+                    async for chunk in guarded:
+                        failed = observer.feed(chunk) or failed
+                        yield chunk
+            success = not failed
+        finally:
+            if not success:
+                await self.cancel()
+
+
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
         self,
@@ -176,6 +283,15 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._ctx_client = None
         self._gen_client = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        self.context_cancellation_enabled = (
+            config.schedule_style != "generation_first"
+            and os.getenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", "0") == "1"
+        )
+        if self.context_cancellation_enabled:
+            if os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") != "1":
+                raise ValueError("Context cancellation requires TRTLLM_DISAGG_NO_RETRY=1")
+            if not config.internal_request_auth_key:
+                raise ValueError("Context cancellation requires internal_request_auth_key")
         # Token counting is stateless and cheap, so it is spread over the
         # context workers round-robin rather than going through the router,
         # which would charge the pick against KV-cache-aware load accounting.
@@ -290,6 +406,37 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        cancellation = (
+            _ContextCancellation(self._ctx_client) if self.context_cancellation_enabled else None
+        )
+        success = False
+        try:
+            response = await self._send_disagg_request_ctx_first_impl(request, hooks, cancellation)
+            if cancellation is not None and request.stream:
+                response = cancellation.stream(response, isinstance(request, ResponsesRequest))
+                await response.__anext__()
+            success = True
+            return response
+        finally:
+            if not success and cancellation is not None:
+                await cancellation.cancel()
+
+    async def _send_disagg_request_ctx_first_impl(
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks],
+        cancellation: "_ContextCancellation | None",
+    ) -> UCompletionResponseOrGenerator:
+        """Run the existing context-first path with optional cancellation routing.
+
+        Args:
+            request: Original client request.
+            hooks: Optional request timing/response callbacks.
+            cancellation: Protected CTX control identity, or None for legacy behavior.
+
+        Returns:
+            Original CTX completion or existing GEN response/stream.
+        """
         # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
 
         arrival_time = self._get_arrival_time(hooks)
@@ -321,6 +468,17 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
+                if cancellation is not None:
+                    try:
+                        ctx_req.disaggregated_params.context_cancellation_token = (
+                            await cancellation.reserve(ctx_server, disagg_request_id)
+                        )
+                    except (Exception, asyncio.CancelledError):
+                        # The HTTP client owns router cleanup only once send_request starts.
+                        await self._ctx_router.finish_request(
+                            ctx_req, success=False, req_id=disagg_request_id
+                        )
+                        raise
                 ctx_response = await self._ctx_client.send_request(
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
@@ -333,7 +491,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 if gen_server:
                     await self._gen_router.finish_request(
                         request, success=False, req_id=gen_reservation_id
@@ -433,6 +591,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     ) -> UCompletionRequest:
         if ctx_response:
             request.disaggregated_params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params
+            request.disaggregated_params.context_cancellation_token = None
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.ctx_usage = _ctx_usage_info(ctx_response)
