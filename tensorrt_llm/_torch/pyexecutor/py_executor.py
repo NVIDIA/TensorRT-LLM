@@ -1077,9 +1077,13 @@ class PyExecutor:
                 f"first-content emission engaged: emit on decoding iters "
                 f"<= {self.first_content_emit_iters} (stream_interval "
                 f"{self.stream_interval}), rank {self.dist.rank}")
-        self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
-        self._kv_gpu_prefetch = _kv_gpu_prefetch_enabled(model_hooks)
-        self._defer_gen_reuse_commit = model_hooks.defer_gen_reuse_commit
+        self._late_compile_detect = False
+        if model_hooks.mxfp8_pinned_tactics or model_hooks.late_compile_detect:
+            self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
+        if model_hooks.kv_gpu_prefetch:
+            self._kv_gpu_prefetch = _kv_gpu_prefetch_enabled(model_hooks)
+        if model_hooks.defer_gen_reuse_commit:
+            self._defer_gen_reuse_commit = True
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
         self.attention_dp_enable_balance = (
