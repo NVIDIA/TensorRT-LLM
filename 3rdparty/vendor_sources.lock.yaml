@@ -23,6 +23,41 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:5e19fc304c3152e940fa1a6b29b4e6a2ca10c0a73770f2648fbdda7576a8a73c
     digest: sha256-tree-v1:493689d123c87688d53549d97ce18a70e58ebc46c0b0d4b6a3ac05305bd6762a
+  msa-m31-fmha-sm100:
+    url: https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa.git
+    branch: main
+    commit: e2ebe7656649f619af0ad1d457b534283034655e
+    source: python/fmha_sm100
+    destination: tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100
+    include:
+    - LICENSE
+    - NOTICE
+    - __init__.py
+    - api.py
+    - jit.py
+    - sparse.py
+    - sparse_fmha_adapter.py
+    - csrc/**/*
+    - cute/__init__.py
+    - cute/fp4_indexer_interface.py
+    - cute/interface.py
+    - cute/quantize.py
+    - cute/sparse_index_utils.py
+    - cute/src/**/*
+    patch: 3rdparty/vendor_patches/msa-m31-fmha-sm100.patch
+    patch_digest: sha256:dc4d259100554b08080473558236ebb2085cb36e112dd0104abfabf6efb1e2e1
+    digest: sha256-tree-v1:b2a420d10664bea40cb2fe36e23a49a87e515f04b1bf9d7de70dfd6a4f2c8106
+  msa-m31-prefill-bf16x:
+    url: https://github.com/vllm-project/MSA.git
+    branch: dev
+    commit: 25c144700f727b638067e98066a60507081b63ad
+    source: python/fmha_sm100/prefill_q8kv4
+    destination: tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/prefill_bf16x
+    include:
+    - '**/*'
+    patch: 3rdparty/vendor_patches/msa-m31-prefill-bf16x.patch
+    patch_digest: sha256:b27a3a7f312547ec7425660de211b4267fcd7db949e896baa797316943f8e9a7
+    digest: sha256-tree-v1:a583379d01b922efe99e1b9200d36a36df5687a92a3c0f819b52bc28caae42ee
   msa-m31-q8kv8-indexer:
     url: https://github.com/vllm-project/MSA.git
     branch: dev

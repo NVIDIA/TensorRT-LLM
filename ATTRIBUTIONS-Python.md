@@ -64298,10 +64298,14 @@ SOFTWARE.
 Source files with NVIDIA modifications, compiled at run time, in
 `tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/`:
 
+  - `fmha_sm100`: `python/fmha_sm100` of https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa
+    at commit `e2ebe7656649f619af0ad1d457b534283034655e`.
   - `fmha_sm100_q8kv8`: `python/fmha_sm100/cute` of https://github.com/vllm-project/MSA at commit
     `25c144700f727b638067e98066a60507081b63ad`.
+  - `prefill_bf16x`: `python/fmha_sm100/prefill_q8kv4` of https://github.com/vllm-project/MSA at commit
+    `25c144700f727b638067e98066a60507081b63ad`.
 
-The `NOTICE` file of the tree lists the third-party code the sources derive from (NVIDIA CUTLASS,
+The `NOTICE` file of each tree lists the third-party code the sources derive from (NVIDIA CUTLASS,
 BSD-3-Clause; FlashInfer, Apache-2.0). `fmha_sm100_q8kv8/src/sm100/q8kv4_indexer_decode.py` is
 licensed under the Apache License, Version 2.0, Copyright contributors to the vLLM project.
 

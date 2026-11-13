@@ -634,24 +634,51 @@ python scripts/vendor/manage.py check flashinfer-prims-ts
 ## MiniMax-M3.1 MSA kernels
 
 The MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3` family use their
-own copy of the MSA Q8KV4 and Q8KV8 index scorers, in
+own copy of the MiniMax sparse attention (MSA) kernels, in
 `tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/`.
-They compile at run time (JIT); no prebuilt objects are checked in. Every other
-MSA kernel these targets run comes from the top-level `fmha_sm100` package that
-`3rdparty/fetch_content.json` builds.
+They compile at run time (JIT); no prebuilt objects are checked in. The copy is
+separate from the top-level `fmha_sm100` package that `3rdparty/fetch_content.json`
+builds for the other MiniMax-M3 targets, so changing one never changes the other.
 
 | Entry | Upstream source | Destination (under `msa_kernels/`) |
 |-------|-----------------|------------------------------------|
+| `msa-m31-fmha-sm100` | `oss-components/msa` `python/fmha_sm100` | `fmha_sm100` |
 | `msa-m31-q8kv8-indexer` | `vllm-project/MSA` `python/fmha_sm100/cute` | `fmha_sm100_q8kv8` |
+| `msa-m31-prefill-bf16x` | `vllm-project/MSA` `python/fmha_sm100/prefill_q8kv4` | `prefill_bf16x` |
+
+`msa-m31-fmha-sm100` pins the commit that `fetch_content.json` fetches for the
+top-level package and selects its modules, `csrc` and the `cute` sources; the
+CUTLASS submodule, the tests and the example under `python/fmha_sm100/cute` are
+not selected. Its persistent patch contains the changes of
+`3rdparty/patches/msa_strided_paged_kv.patch` and `msa_jit_device_arch.patch`, the
+MiniMax-M3.1 kernel changes (k2q CSR schedule and plan, split combine with the
+MXFP8 output, NVFP4 KV forward) and the TensorRT-LLM adaptations: `cute` is a
+regular package with relative imports (it never edits `sys.path` or registers
+top-level `src` or `interface` modules), `jit.py` loads no prebuilt modules and
+compiles against `CUTLASS_ROOT`, or else against the CUTLASS headers packaged with
+the top-level `fmha_sm100`, the package registers no global TVM-FFI functions, the
+CuTe DSL object cache uses its own directory, and the k2q CSR extension builds
+under its own name. `LICENSE` and `NOTICE` are verbatim copies of the upstream
+repository's root files, which lie outside the selected source directory.
 
 The `msa-m31-q8kv8-indexer` patch carries the MiniMax-M3.1 indexer changes and
 makes the package imports relative. It also adds `LICENSE` and `NOTICE`, verbatim
 copies of the upstream repository's root files, which lie outside the selected
 source directory, and the package `__init__.py`.
 
-Check or refresh the entry with the normal commands:
+The `msa-m31-prefill-bf16x` patch carries the BF16 data path and the E4M3X data
+path of the paged sparse prefill, the memory locality-domain split workspace, and
+the TensorRT-LLM adaptations: package-relative imports of the family
+`fmha_sm100` combine and k2q CSR builder, and `_jit_cache.py` and
+`_build_utils.py`, verbatim copies of `python/fmha_sm100/_jit_cache.py` and
+`python/fmha_sm100/decode_q8kv4/_build_utils.py` of the same commit (CUTLASS from
+`CUTLASS_ROOT`, else the headers packaged with the top-level `fmha_sm100`). It also
+adds `LICENSE` and `NOTICE`.
+
+Check or refresh the entries with the normal commands, for example:
 
 ```bash
-python scripts/vendor/manage.py check msa-m31-q8kv8-indexer
-python scripts/vendor/manage.py patch msa-m31-q8kv8-indexer refresh --repo /path/to/MSA
+python scripts/vendor/manage.py check msa-m31-fmha-sm100
+python scripts/vendor/manage.py patch msa-m31-fmha-sm100 refresh --repo /path/to/msa
+python scripts/vendor/manage.py patch msa-m31-prefill-bf16x refresh --repo /path/to/MSA
 ```

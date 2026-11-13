@@ -1,11 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax sparse attention (MSA) index scorers for the MiniMax-M3.1-Flash targets, vendored from upstream.
+"""MiniMax sparse attention (MSA) kernels for the MiniMax-M3.1-Flash targets, vendored from upstream.
 
-``fmha_sm100_q8kv8`` is ``python/fmha_sm100/cute`` of https://github.com/vllm-project/MSA (the Q8KV4 and
-Q8KV8 index scorers), vendor lock entry ``msa-m31-q8kv8-indexer``. It is MIT, Copyright (c) 2026 MiniMax
-(see its LICENSE and NOTICE), and compiles at run time (JIT). ``3rdparty/vendor-sources.md`` describes the
-entry and its persistent patch.
+* ``fmha_sm100``: ``python/fmha_sm100`` of https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa, vendor lock
+  entry ``msa-m31-fmha-sm100`` (its CUTLASS submodule, tests and example are not selected).
+* ``fmha_sm100_q8kv8``: ``python/fmha_sm100/cute`` of https://github.com/vllm-project/MSA (the Q8KV4 and Q8KV8
+  index scorers), vendor lock entry ``msa-m31-q8kv8-indexer``.
+* ``prefill_bf16x``: ``python/fmha_sm100/prefill_q8kv4`` of https://github.com/vllm-project/MSA (the BF16 / E4M3
+  paged sparse prefill), vendor lock entry ``msa-m31-prefill-bf16x``.
+
+All are MIT, Copyright (c) 2026 MiniMax (see each tree's LICENSE and NOTICE), and all compile at run time (JIT).
+``3rdparty/vendor-sources.md`` describes the entries and their persistent patches.
 """
 
 
