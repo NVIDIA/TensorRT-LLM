@@ -13,8 +13,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ..blackwell.cute_ptx_utils import mma_sync
-from ..blackwell.utils import (
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.cute_ptx_utils import mma_sync
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import (
     TRTLLM_ENABLE_PDL,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,

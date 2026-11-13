@@ -164,9 +164,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
     cute_dsl_fp8_block_scale_linear,
     prepare_weight_scale,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fused_fp8_block_scale_linear import (
-    cute_dsl_fused_fp8_block_scale_linear,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
 )
@@ -206,6 +203,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -1526,10 +1524,9 @@ class DecodeTarget:
         return step
 
     def _linear_fp8(self, x, w, w_s):
-        """K128-quantized FP8 linear through the Rubin MXFP8 kernel."""
-        if self.core.tp_size == 8 and x.shape[0] == 4:
-            return cute_dsl_fused_fp8_block_scale_linear(x, w, w_s)
-        return cute_dsl_fp8_block_scale_linear(x, w, w_s)
+        """K128-quantized FP8 linear: activation quantization fused into the GEMM at the
+        (M, N, K) shapes the entry has tuned, the Rubin MXFP8 kernel at every other."""
+        return cute_dsl_fused_fp8_block_scale_linear(x, w, w_s)
 
     def _latent(self, x, L, nope_lat):
         """`[RMSNorm(c_kv) | k_pe]`, 576 wide: a RoPE owner's kv_a row, normalized in place; a

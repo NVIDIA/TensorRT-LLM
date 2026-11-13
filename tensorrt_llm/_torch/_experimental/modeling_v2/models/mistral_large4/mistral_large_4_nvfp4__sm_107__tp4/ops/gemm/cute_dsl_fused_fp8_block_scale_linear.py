@@ -4,8 +4,10 @@
 
 import torch
 
-from .._op import Arch, Cell, OpWrapper
-from .cute_dsl_fp8_block_scale_linear import cute_dsl_fp8_block_scale_linear as baseline
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
+    cute_dsl_fp8_block_scale_linear as baseline,
+)
 
 # (M, N, K) -> (Split-K slices, warps per CTA).
 _TACTICS = {
@@ -18,7 +20,7 @@ _TACTICS = {
 
 @torch.library.custom_op("trtllm::cute_dsl_fused_fp8_block_scale_linear", mutates_args=())
 def _fused(input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import fused_fp8_quant_gemv
+    from ._fused_fp8_quant_gemv import fused_fp8_quant_gemv
 
     if input.data_ptr() % 16 or input.stride(0) % 8:
         return baseline(input.contiguous(), weight, weight_scale)

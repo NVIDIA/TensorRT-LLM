@@ -5,11 +5,11 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fused_fp8_block_scale_linear import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.gemm.cute_dsl_fused_fp8_block_scale_linear import (  # noqa: E501
     cute_dsl_fused_fp8_block_scale_linear as op,
 )
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
@@ -41,7 +41,9 @@ def _weights(n, k, seed):
 def test_fused_matches_k128_reference(m, k, seed):
     weight, scale = _weights(128, k, seed + 1)
     x = _input(m, k, seed)
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import fused_fp8_quant_gemv
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+        fused_fp8_quant_gemv,
+    )
 
     actual = fused_fp8_quant_gemv(x, weight, scale)
     expected = op.reference(x, weight, scale)
@@ -52,7 +54,9 @@ def test_fused_matches_k128_reference(m, k, seed):
 def test_fused_changing_input_graph(m, k):
     weight, scale = _weights(128, k, 23)
     x = _input(m, k, 11)
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import fused_fp8_quant_gemv
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+        fused_fp8_quant_gemv,
+    )
 
     for _ in range(3):
         fused_fp8_quant_gemv(x, weight, scale)
@@ -70,7 +74,9 @@ def test_fused_changing_input_graph(m, k):
 @pytest.mark.parametrize("k", (768, 1024, 1536, 2048, 3072, 6144))
 @pytest.mark.parametrize("seed", (11, 23, 47))
 def test_fused_quantization_byte_contract(m, k, seed):
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import debug_quantization
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+        debug_quantization,
+    )
 
     x = _input(m, k, seed)
     codes, scale = debug_quantization(x)
@@ -87,7 +93,9 @@ def test_fused_quantization_byte_contract(m, k, seed):
 
 
 def test_fused_quantization_finite_extremes():
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import debug_quantization
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+        debug_quantization,
+    )
 
     values = torch.tensor(
         [
@@ -118,7 +126,9 @@ def test_fused_opposite_scale_exponents():
     logical = torch.full((128, 24), 17, device="cuda", dtype=torch.uint8)
     scale = torch.ops.trtllm.block_scale_interleave(logical)
     x = torch.full((4, 768), 2.0**118, device="cuda", dtype=torch.bfloat16)
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.fused_fp8_quant_gemv import fused_fp8_quant_gemv
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+        fused_fp8_quant_gemv,
+    )
 
     actual = fused_fp8_quant_gemv(x, weight, scale)
     expected = op.reference(x, weight, scale)
@@ -164,10 +174,11 @@ def test_fused_catalog_changing_input_graph(n, k):
         assert_within_ulp(output, expected, element_ulp=4, rms_ulp=2)
 
 
-@pytest.mark.parametrize("tp_size", (4, 8))
-def test_decode_target_dispatch(tp_size):
+# The wq projection's per-rank width: 1024 under TP8, a tuned cell at M=4, and 2048 under TP4,
+# which the entry leaves to the MXFP8 kernel.
+@pytest.mark.parametrize("n,fused", ((1024, True), (2048, False)), ids=("tp8", "tp4"))
+def test_decode_target_dispatch(n, fused):
     from importlib import import_module
-    from types import SimpleNamespace
 
     from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -186,14 +197,13 @@ def test_decode_target_dispatch(tp_size):
             return func(*args, **(kwargs or {}))
 
     target = object.__new__(modeling.DecodeTarget)
-    target.core = SimpleNamespace(tp_size=tp_size)
-    weight, scale = _weights(1024, 6144, 23)
+    weight, scale = _weights(n, 6144, 23)
     x = _input(4, 6144, 11).contiguous()
     with Operations() as operations:
         actual = target._linear_fp8(x, weight, scale)
-    fused = any("trtllm.cute_dsl_fused_fp8_block_scale_linear" in name for name in operations.seen)
-    assert fused == (tp_size == 8), operations.seen
-    if tp_size == 4:
+    seen = any("trtllm.cute_dsl_fused_fp8_block_scale_linear" in name for name in operations.seen)
+    assert seen == fused, operations.seen
+    if not fused:
         assert any("trtllm.cute_dsl_mxfp8_gemm_rubin" in name for name in operations.seen)
     expected = op.reference(x, weight, scale)
     assert_within_ulp(actual, expected, element_ulp=4, rms_ulp=2)
