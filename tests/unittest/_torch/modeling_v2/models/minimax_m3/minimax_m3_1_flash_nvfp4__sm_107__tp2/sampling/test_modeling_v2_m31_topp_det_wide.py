@@ -152,6 +152,9 @@ def test_wide_graph_replay_equals_eager():
     ref = entry.top_p_renorm_det(probs, tp)
     assert ref is not None, "96 rows are within the v3 cap"
     stream = torch.cuda.Stream()
+    # The eager warm-up on the side stream shares the persistent workspace with the default-stream
+    # calls above (and reads their inputs): order it after them.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         entry.top_p_renorm_det(probs, tp)
         torch.cuda.synchronize()
