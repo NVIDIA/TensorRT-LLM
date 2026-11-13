@@ -25,6 +25,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_family_library_gate.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_lc2_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_cute_aot.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_opt_ins_registry.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/gemm/test_router_half_pin.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_add_rmsnorm_l2pf.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_bcg_ptr_guard.py
