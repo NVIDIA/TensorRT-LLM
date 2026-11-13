@@ -20,7 +20,8 @@ would quietly fall back to the built-in implementation, pass, and report the
 built-in's numbers as the target's.
 
 ``TestModelingV2Glm52Nvfp4Sm103Tep4``: identity and MTP1 GSM8K, paired in one
-session, and MTP1 acceptance for the SM103 tep4 target.
+session, and MTP1 acceptance for the SM103 tep4 target; GSM8K and acceptance
+at MTP3.
 """
 
 import pytest
@@ -41,7 +42,7 @@ from .._common import skip_not_sm103
 
 
 class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
-    """glm-5.2-nvfp4 / sm_103 / tep4: identity, the mtp1 variant and its acceptance."""
+    """glm-5.2-nvfp4 / sm_103 / tep4: identity, the mtp1 and mtp3 variants and their acceptance."""
 
     MODEL_NAME = "zai-org/GLM-5.2"
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
@@ -72,6 +73,11 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
     # the one-model MTP-Eagle loop, the only draft path the target implements;
     # its specialised rope kernel is built for that two-token width.
     MTP1 = MTPDecodingConfig(max_draft_len=1)
+    # Three drafts chain that one layer three times per step: the target's
+    # wide decode path (4 rows per sequence, the union sparse-MLA decode, the
+    # wide router and all-reduce) and its draft-chain glue, none of which the
+    # mtp1 variant runs.
+    MTP3 = MTPDecodingConfig(max_draft_len=3)
 
     # The kv-cache fractions are run requirements rather than tuning choices.
     # The MTP module and its separate draft pool take several GiB per rank, and
@@ -85,6 +91,7 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
     # measured on stock modeling (modeling_v2="off") under the same
     # speculative_config, so the gate is not read against the target's own number.
     ACCEPTANCE_KEY = "ModelingV2Glm52Nvfp4Sm103Tep4::mtp1"
+    MTP3_ACCEPTANCE_KEY = "ModelingV2Glm52Nvfp4Sm103Tep4::mtp3"
 
     # There is deliberately one test. It evaluates the identity config as its
     # first leg and the mtp1 config as its second, and ``task.evaluate``
@@ -176,3 +183,38 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
         )
         print(f"[AL] mtp1 acceptance_length = {acceptance_length:.3f}")
         assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_mtp3_gsm8k_and_acceptance(self):
+        """gsm8k and acceptance length at three drafts.
+
+        The draft chain is where mtp3 differs from mtp1: each step runs the
+        one MTP layer three times, every pass reading the hidden state and KV
+        the previous one wrote. A pass that reads stale state is the failure
+        only this gate sees -- the drafts it produces are rejected, the text
+        stays correct and gsm8k stays green, and the acceptance length drops.
+
+        ``task.evaluate`` gates the score against the registered reference.
+        The acceptance anchor ``MTP3_ACCEPTANCE_KEY`` was measured on stock
+        modeling under the same ``speculative_config``, as the mtp1 one was.
+        """
+        env_overrides = {MODELING_V2_VALIDATE_ENV: "1"}
+        with (
+            scoped_env_overrides(env_overrides),
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                kv_cache_config=self.MTP1_KV,
+                enable_iter_perf_stats=True,
+                modeling_v2="require",
+                env_overrides=env_overrides,
+                **self.TEP4,
+                **self.BOUNDS,
+            ) as llm,
+        ):
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            acceptance_length = compute_acceptance_length(llm)
+        print(f"[AL] mtp3 acceptance_length = {acceptance_length:.3f}")
+        assert_acceptance_length(self.MTP3_ACCEPTANCE_KEY, acceptance_length)
