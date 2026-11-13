@@ -387,7 +387,7 @@ def test_the_extract_switch_keeps_the_bits(monkeypatch) -> None:
     """The dequant's fewer-move byte extraction (LC8_EXTRACT, on by default) and the instance its kill switch selects
     (the op's extract=False) write the same rows and hand-offs at both softmax recurrences and both staging variants,
     and each setting launches the instance it names."""
-    case = build_step((165521,), 4, identity=False, seed=20261031)
+    case = build_step((165521,), 4, identity=False, seed=4242)
     on, on_templates, on_launches = _lc8_extract_rows(monkeypatch, True, case)
     off, off_templates, off_launches = _lc8_extract_rows(monkeypatch, False, case)
     assert on_templates == ["true"] and on_launches == 4, (on_templates, on_launches)
