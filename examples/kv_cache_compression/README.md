@@ -13,6 +13,7 @@ cache compression method can be enabled for each LLM instance.
 | Method | Use it to | Example |
 | --- | --- | --- |
 | Cold-page quantization | Store supported Attention KV in NVFP4 while its Pages reside in Host or Disk cache | [NVFP4 cold-page compression](nvfp4_cold_page.md) |
+| Cold-page quantization (prototype) | Store supported Attention KV with TurboQuant at 2 to 4 bits per value while its Pages reside in Host or Disk cache | [TurboQuant cold-page compression](turboquant_cold_page.md) |
 | TriAttention | Periodically evict lower-importance generation tokens and compact the GPU KV cache | [TriAttention](triattention.md) |
 
 For a feature overview and configuration guidance, see

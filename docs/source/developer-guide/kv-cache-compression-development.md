@@ -54,7 +54,7 @@ paths through class attributes.
 | Integration path | Manager attribute | Execution point | Example |
 |---|---|---|---|
 | Iteration-driven | `uses_iteration_lifecycle = True` | PyExecutor resource-manager callbacks around model iterations | TriAttention periodic token eviction |
-| Storage-bound | `provides_cold_page_codec = True` | KVCM hot/cold migration | NVFP4 cold-page quantization |
+| Storage-bound | `provides_cold_page_codec = True` | KVCM hot/cold migration | NVFP4 and TurboQuant cold-page quantization |
 
 An iteration-driven method runs compression logic at request or model-iteration
 lifecycle boundaries. A storage-bound method runs when KVCM moves Pages across
@@ -330,6 +330,74 @@ model to the supported-model list. RoPE widths come from rotary-width fields or 
 rotary factors, never from theta or `rotary_emb_base`.
 
 Draft-model cold pages ignore both RoPE options and use single NVFP4.
+
+#### TurboQuant cold pages
+
+TurboQuant (`quant: turboquant`) is a second format on the same provider
+contract. `TurboQuantColdPageQuantizationCompression` shares the cold-page base
+class with the NVFP4 provider, including its row geometry and RoPE placement
+rules, and differs in what it stores for each quantized piece and in where it
+receives Page indices.
+
+- Which numbers are quantized: each buffer layout records the piece as
+  `quantized_range_start` and `quantized_range_elements`, as for NVFP4. With
+  `skip_rope_quantization: false` the piece is the whole K or V vector,
+  including widths that are not a power of two, such as the 576-number MLA
+  latent. With `true` the RoPE part is located by the same rules and the same
+  `_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` as for NVFP4 and copied unchanged. The
+  codec refuses a piece whose length is not a multiple of 16 numbers, or of 32
+  with fractional bit widths.
+- DeepSeek-V4 compressed (CSA) rows always quantize the 448 NoPE numbers and
+  copy the 64 RoPE numbers and the indexer cache unchanged, whatever
+  `skip_rope_quantization` says; `nvfp4_residual_dim` has no TurboQuant
+  counterpart and is rejected. An HCA cache co-located with the CSA cache in one
+  lifecycle is stored unchanged by the provider; the other DeepSeek-V4
+  lifecycles keep the lossless fallback.
+- Draft KVCMs ignore `skip_rope_quantization` and quantize whole vectors, as
+  for NVFP4. Every KVCM still gets its own codec state; the seed-determined
+  rotations, QJL projections, and codebooks are shared by the KVCMs of one
+  provider.
+- Each vector carries one BF16 scale with `mse`, and two BF16 values with
+  `prod` (scale and residual norm) or with fractional bits (one scale per
+  channel half). Fractional bits also store one channel mask per Page, layer,
+  buffer, and KV head. All of it is computed while encoding, from the Page
+  itself: the format needs no calibration artifact or checkpoint metadata.
+- The provider reports `ColdPageIndexLocation.DEVICE`, so KVCM stages each
+  batch's Page-index pairs in device memory and the kernels read them on the
+  supplied stream; the NVFP4 provider uses `HOST`.
+- `validate_kv_cache_compression_compatibility()` requires compute capability
+  8.0 or newer, because the kernels are Triton and use `tl.dot`.
+  `create_kv_cache_compression_manager()` rejects an active NVFP4 KV cache,
+  where the NVFP4 format instead skips cold-page quantization and lets KVCM
+  migrate NVFP4 KV losslessly.
+
+The cold page of a lifecycle is the concatenation, in layer and buffer order, of
+one 16-byte aligned section per hot buffer. A buffer stored unchanged takes its
+raw bytes. A quantized buffer with `R` rows (KV heads times tokens of the Page)
+holds these regions, each padded to 16 bytes:
+
+| Region | Contents |
+|---|---|
+| Code planes | Codes of `b` bits split into 4-, 2- and 1-bit planes (3 bits = 2 + 1). Each plane is chunk-major, `[chunks of C coordinates][R rows][C * w / 8 bytes]`, so every tile of rows writes and reads contiguous bytes. Fractional bit widths have one set of planes per channel group. |
+| QJL signs | `prod` only: one bit per projection, chunk-major like a 1-bit plane. |
+| Scalars | BF16 per row: the least-squares scale; `prod` adds the residual norm; fractional bits store one scale per group. |
+| Channel masks | Fractional bits only: one `N`-bit outlier mask per KV head. |
+| Raw elements | The elements of each row outside the quantized range (RoPE), unchanged. |
+
+Rows whose width is not a power of two (448 = 256 + 128 + 64) are loaded as
+power-of-two pieces and rotated by one full `N x N` matrix: one TurboQuant
+instance per vector. Rows wider than 512 (the 576-value MLA latent) hold
+several instances (`mse`: 256 + 256 + 64; `prod`: 512 + 64; fractional bits
+keep their two halves, 288 + 288, as the instances), because decoding
+accumulates every output value of an instance in tensor memory (512 fp32
+columns, shared with the staged operand); each instance decodes in its own
+launch over its own chunks of the code planes. A single 512-value `mse` instance
+accumulates its output columns in two blocks of 256 on SM100-family GPUs, so that
+128-row tiles fit tensor memory; the second block reads the codes again. All buffers of a
+lifecycle with the same geometry and dtype share one kernel launch, driven by
+a device table of hot base addresses, Slot strides and cold offsets; buffers
+stored unchanged share one copy launch. Kernels are compiled in `configure()`
+and launched without the JIT dispatcher, directly on the KVCM stream.
 
 ### 4. Add method-specific kernels
 

@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-335 captured fields.
+337 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -134,8 +134,10 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_compression_config.eviction_mode` | `literal` | `categorical` | `union`, `per_head`, `per_layer_perhead` |
 | `kv_cache_compression_config.normalize_scores` | `bool` | `value` |  |
 | `kv_cache_compression_config.nvfp4_residual_dim` | `literal` | `categorical` | `0`, `64` |
-| `kv_cache_compression_config.quant` | `literal` | `categorical` | `nvfp4` |
+| `kv_cache_compression_config.quant` | `literal` | `categorical` | `nvfp4`, `turboquant` |
 | `kv_cache_compression_config.skip_rope_quantization` | `bool` | `value` |  |
+| `kv_cache_compression_config.turboquant_bits` | `float` | `value` |  |
+| `kv_cache_compression_config.turboquant_mode` | `literal` | `categorical` | `mse`, `prod` |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `int` | `value` |  |
 | `kv_cache_config.avg_seq_len` | `int\|none` | `value` |  |
 | `kv_cache_config.block_reuse_config.enable_branch_snapshot` | `bool` | `value` |  |

@@ -16,6 +16,7 @@
 import functools
 import json
 import math
+import numbers
 import os
 import re
 import types
@@ -33,7 +34,8 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, TypeAdapter, field_validator,
+                      PrivateAttr, SerializerFunctionWrapHandler, StrictInt,
+                      TypeAdapter, field_validator, model_serializer,
                       model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
@@ -4871,22 +4873,33 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+_TURBOQUANT_BITS = (2, 2.5, 3, 3.5, 4)
+_TURBOQUANT_PROD_BITS = (2, 3, 4)
+_NVFP4_COLD_PAGE_OPTIONS = frozenset(
+    {"nvfp4_residual_dim", "scale_checkpoint_path"})
+_TURBOQUANT_COLD_PAGE_OPTIONS = frozenset(
+    {"turboquant_bits", "turboquant_mode", "turboquant_seed"})
+
+
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     """Quantize Host and Disk KV pages without changing the active GPU cache."""
 
     algorithm: Literal["quantization_for_cold_page"] = Field(
         default="quantization_for_cold_page")
-    quant: Literal["nvfp4"] = Field(
+    quant: Literal["nvfp4", "turboquant"] = Field(
         default="nvfp4",
-        description="Quantization format stored in the compressed cache tier.")
+        description=
+        "Quantization format stored in the compressed cache tier: nvfp4, or "
+        "turboquant (prototype) for 2 to 4 bits per value.")
     skip_rope_quantization: bool = Field(
         default=False,
         status="prototype",
         description=
         "True: preserve the position-encoded (RoPE) part of each K vector in "
-        "its original active-cache precision and quantize the rest to NVFP4. "
-        "False (default): quantize both parts, using residual RoPE quantization "
-        "for DeepSeek-V4 when nvfp4_residual_dim is 64. "
+        "its original active-cache precision and quantize the rest. "
+        "False (default): quantize both parts; for DeepSeek-V4, nvfp4 uses "
+        "residual RoPE quantization when nvfp4_residual_dim is 64 and "
+        "turboquant always keeps RoPE lossless. "
         "An option to explore; measure its accuracy effect on your model.")
     nvfp4_residual_dim: Literal[0, 64] = Field(
         default=64,
@@ -4921,6 +4934,31 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         "sliding-window layer keeps the same tokens (its window is this value plus "
         "one, with the same sink pages): the high layers would share that layer's "
         "page group, which the cold-page codec cannot split.")
+    turboquant_bits: float = Field(
+        default=4.0,
+        status="prototype",
+        json_schema_extra={"enum": list(_TURBOQUANT_BITS)},
+        description=
+        "TurboQuant average bits per quantized value: codebook indices plus "
+        "QJL sign bits, excluding per-vector scales. One of 2, 2.5, 3, 3.5, "
+        "or 4; prod mode supports 2, 3, and 4.")
+    turboquant_mode: Literal["mse", "prod"] = Field(
+        default="mse",
+        status="prototype",
+        description=
+        "TurboQuant mode. mse (default): minimize the reconstruction error. "
+        "prod: spend one of the bits on a QJL sign of the residual so that "
+        "inner products with decoded vectors are unbiased.")
+    turboquant_seed: NonNegativeInt = Field(
+        default=5,
+        status="prototype",
+        telemetry=False,
+        description=
+        "TurboQuant seed of the random rotation and QJL projection matrices; "
+        "equal seeds give equal matrices in every process. Every seed has the "
+        "same expected distortion; the default is one under which the "
+        "all-equal vector, a common structured input, also gets a typical "
+        "distortion.")
 
     @property
     def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
@@ -4928,6 +4966,52 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         if self.mixed_precision_first_n or self.mixed_precision_last_n:
             return (self.mixed_precision_first_n, self.mixed_precision_last_n)
         return None
+
+    @field_validator("turboquant_bits", mode="before")
+    @classmethod
+    def _validate_turboquant_bits(cls, value: object) -> float:
+        # bool is an int subclass: reject it rather than read True as 1 bit.
+        if (isinstance(value, bool) or not isinstance(value, numbers.Real)
+                or value not in _TURBOQUANT_BITS):
+            raise ValueError("turboquant_bits must be one of 2, 2.5, 3, 3.5, "
+                             f"or 4, got {value!r}")
+        return float(value)
+
+    @model_validator(mode="after")
+    def _validate_format_options(
+            self) -> "ColdPageQuantizationCompressionConfig":
+        """Reject options of the other format and prod with fractional bits."""
+        if self.quant == "turboquant":
+            owner, unused = "nvfp4", _NVFP4_COLD_PAGE_OPTIONS
+        else:
+            owner, unused = "turboquant", _TURBOQUANT_COLD_PAGE_OPTIONS
+        misplaced = sorted(self.model_fields_set & unused)
+        if misplaced:
+            verb = "applies" if len(misplaced) == 1 else "apply"
+            raise ValueError(f"{', '.join(misplaced)} {verb} only to "
+                             f"quant={owner!r}, not quant={self.quant!r}")
+        if (self.turboquant_mode == "prod"
+                and self.turboquant_bits not in _TURBOQUANT_PROD_BITS):
+            raise ValueError(
+                "turboquant_mode='prod' supports turboquant_bits 2, 3, and 4, "
+                f"not {self.turboquant_bits:g}; fractional bit widths require "
+                "turboquant_mode='mse'")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_selected_format(
+            self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        """Leave out the options of the format not selected.
+
+        They always hold their defaults, and leaving them out keeps a dump
+        valid input for this class.
+        """
+        data = handler(self)
+        unused = (_NVFP4_COLD_PAGE_OPTIONS if self.quant == "turboquant" else
+                  _TURBOQUANT_COLD_PAGE_OPTIONS)
+        for name in unused:
+            data.pop(name, None)
+        return data
 
     def supports_block_reuse(self) -> bool:
         """Block reuse is unchanged because token identity is preserved."""

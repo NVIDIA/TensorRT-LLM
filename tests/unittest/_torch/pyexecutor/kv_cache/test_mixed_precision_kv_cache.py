@@ -296,19 +296,37 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert manager.mixed_precision_high_block_deltas == {0: 0}
 
 
-def test_cold_page_window_high_pages_cross_the_host_tier_unchanged(make_manager):
-    """With the real NVFP4 cold-page codec, a page the high layer holds comes back from the host
-    tier bit-exact, while the layer's own page of the same tokens comes back quantized."""
-    from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
-        Nvfp4ColdPageQuantizationCompression,
-    )
+@pytest.mark.parametrize("quant", ["nvfp4", "turboquant"])
+def test_cold_page_window_high_pages_cross_the_host_tier_unchanged(make_manager, quant):
+    """With a real cold-page codec (NVFP4 or TurboQuant), a page the high layer holds comes back
+    from the host tier bit-exact, while the layer's own page of the same tokens comes back
+    quantized."""
     from tensorrt_llm.bindings.internal import kv_cache_compression as native_kvcc
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 
-    provider = Nvfp4ColdPageQuantizationCompression(
-        ColdPageQuantizationCompressionConfig(mixed_precision_first_n=1, mixed_precision_last_n=65),
-        pretrained_config=SimpleNamespace(model_type="qwen3"),
+    config = ColdPageQuantizationCompressionConfig(
+        quant=quant, mixed_precision_first_n=1, mixed_precision_last_n=65
     )
+    if quant == "nvfp4":
+        from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
+            Nvfp4ColdPageQuantizationCompression as Provider,
+        )
+
+        # The provider calls the native kernels, which the spies below wrap.
+        spied, encode_name, decode_name = (
+            native_kvcc,
+            "nvfp4_cold_page_encode",
+            "nvfp4_cold_page_decode",
+        )
+    else:
+        from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.turboquant_quantization import (
+            TurboQuantColdPageQuantizationCompression as Provider,
+        )
+
+    provider = Provider(config, pretrained_config=SimpleNamespace(model_type="qwen3"))
+    if quant == "turboquant":
+        # The native codec looks the provider's encode and decode up per call.
+        spied, encode_name, decode_name = provider, "encode_cold_pages", "decode_cold_pages"
     manager = make_manager(
         config=cold_page_config(max_tokens=4096, host_cache_size=64 << 20),
         cold_page_codec_provider=provider,
@@ -329,12 +347,8 @@ def test_cold_page_window_high_pages_cross_the_host_tier_unchanged(make_manager)
 
     tokens = list(range(5 * 128))
     with (
-        patch.object(
-            native_kvcc, "nvfp4_cold_page_encode", wraps=native_kvcc.nvfp4_cold_page_encode
-        ) as encode,
-        patch.object(
-            native_kvcc, "nvfp4_cold_page_decode", wraps=native_kvcc.nvfp4_cold_page_decode
-        ) as decode,
+        patch.object(spied, encode_name, wraps=getattr(spied, encode_name)) as encode,
+        patch.object(spied, decode_name, wraps=getattr(spied, decode_name)) as decode,
         closing(native.create_kv_cache(None, [])) as source,
     ):
         assert source.resume(stream) and source.resize(len(tokens))

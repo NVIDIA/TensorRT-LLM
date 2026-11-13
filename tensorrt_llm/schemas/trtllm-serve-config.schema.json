@@ -587,6 +587,80 @@
     },
     "ColdPageQuantizationCompressionConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "turboquant_bits"
+                  ]
+                },
+                {
+                  "required": [
+                    "turboquant_mode"
+                  ]
+                },
+                {
+                  "required": [
+                    "turboquant_seed"
+                  ]
+                }
+              ]
+            }
+          },
+          "if": {
+            "properties": {
+              "quant": {
+                "const": "turboquant"
+              }
+            },
+            "required": [
+              "quant"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "nvfp4_residual_dim"
+                  ]
+                },
+                {
+                  "required": [
+                    "scale_checkpoint_path"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "turboquant_mode": {
+                "const": "prod"
+              }
+            },
+            "required": [
+              "turboquant_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "turboquant_bits": {
+                "enum": [
+                  2,
+                  3,
+                  4
+                ]
+              }
+            }
+          }
+        }
+      ],
       "description": "Quantize Host and Disk KV pages without changing the active GPU cache.",
       "properties": {
         "algorithm": {
@@ -623,9 +697,12 @@
           "type": "integer"
         },
         "quant": {
-          "const": "nvfp4",
           "default": "nvfp4",
-          "description": "Quantization format stored in the compressed cache tier.",
+          "description": "Quantization format stored in the compressed cache tier: nvfp4, or turboquant (prototype) for 2 to 4 bits per value.",
+          "enum": [
+            "nvfp4",
+            "turboquant"
+          ],
           "title": "Quant",
           "type": "string"
         },
@@ -648,10 +725,46 @@
         },
         "skip_rope_quantization": {
           "default": false,
-          "description": "True: preserve the position-encoded (RoPE) part of each K vector in its original active-cache precision and quantize the rest to NVFP4. False (default): quantize both parts, using residual RoPE quantization for DeepSeek-V4 when nvfp4_residual_dim is 64. An option to explore; measure its accuracy effect on your model.",
+          "description": "True: preserve the position-encoded (RoPE) part of each K vector in its original active-cache precision and quantize the rest. False (default): quantize both parts; for DeepSeek-V4, nvfp4 uses residual RoPE quantization when nvfp4_residual_dim is 64 and turboquant always keeps RoPE lossless. An option to explore; measure its accuracy effect on your model.",
           "status": "prototype",
           "title": "Skip Rope Quantization",
           "type": "boolean"
+        },
+        "turboquant_bits": {
+          "default": 4.0,
+          "description": "TurboQuant average bits per quantized value: codebook indices plus QJL sign bits, excluding per-vector scales. One of 2, 2.5, 3, 3.5, or 4; prod mode supports 2, 3, and 4.",
+          "enum": [
+            2,
+            2.5,
+            3,
+            3.5,
+            4
+          ],
+          "status": "prototype",
+          "title": "Turboquant Bits",
+          "type": "number"
+        },
+        "turboquant_mode": {
+          "default": "mse",
+          "description": "TurboQuant mode. mse (default): minimize the reconstruction error. prod: spend one of the bits on a QJL sign of the residual so that inner products with decoded vectors are unbiased.",
+          "enum": [
+            "mse",
+            "prod"
+          ],
+          "status": "prototype",
+          "title": "Turboquant Mode",
+          "type": "string"
+        },
+        "turboquant_seed": {
+          "default": 5,
+          "description": "TurboQuant seed of the random rotation and QJL projection matrices; equal seeds give equal matrices in every process. Every seed has the same expected distortion; the default is one under which the all-equal vector, a common structured input, also gets a typical distortion.",
+          "minimum": 0,
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Turboquant Seed",
+          "type": "integer"
         }
       },
       "title": "ColdPageQuantizationCompressionConfig",
