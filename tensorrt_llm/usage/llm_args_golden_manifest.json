@@ -889,14 +889,14 @@
       "path": "kv_cache_config.mixed_precision_last_n"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "kv_cache_config.mixed_precision_recompute_last_n"
-    },
-    {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "kv_cache_config.mixed_precision_reuse_with_optional_last_n"
+      "allowed_values": [
+        "default",
+        "strict",
+        "recompute"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.mixed_precision_reuse"
     },
     {
       "capture_policy": "list[float]|none",

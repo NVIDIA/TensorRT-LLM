@@ -233,7 +233,9 @@ def test_automatic_pool_sizing_defaults_to_half_max_seq_len(make_manager):
 
 @pytest.mark.parametrize("policy,reused_tokens", [("per_request", 128), ("all_reusable", 512)])
 def test_native_common_reuse_and_window_retention(make_manager, policy, reused_tokens):
-    manager = make_manager(config=mixed_config(block_reuse_config={"policy": policy}))
+    manager = make_manager(
+        config=mixed_config(block_reuse_config={"policy": policy}, mixed_precision_reuse="strict")
+    )
     config = manager.kv_cache_manager_py_config
     assert [layer.reuse_policy for layer in config.layers] == [kv.ReusePolicy.REQUIRED] * 2
     assert (config.layers[1].num_sink_tokens, config.layers[1].sliding_window_size) == (1, 66)
@@ -260,10 +262,10 @@ def test_native_common_reuse_and_window_retention(make_manager, policy, reused_t
         assert shortened.resume(stream)
 
 
-def test_reuse_with_optional_last_n_reads_evicted_window_from_history(make_manager):
+def test_default_reuse_reads_evicted_window_from_history(make_manager):
     """A prefix whose high-precision last-N pages were evicted is reused in full; its window reads
     those pages from the low-precision history."""
-    manager = make_manager(config=mixed_config(mixed_precision_reuse_with_optional_last_n=True))
+    manager = make_manager(config=mixed_config())
     block = manager.tokens_per_block
     staging = MixedPrecisionKVStaging(
         manager, Buffers(), rows=1, layout="NHD", pool_layout="NHD", tokens_per_block=block
@@ -312,9 +314,7 @@ def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
     """A prefix whose high-precision last-N pages were evicted is reused in full, or with
     recompute only up to the block boundary before them. Its window reads the history: the high
     page table drops the pages after the sink."""
-    options = dict(
-        mixed_precision_reuse_with_optional_last_n=True, mixed_precision_recompute_last_n=recompute
-    )
+    options = dict(mixed_precision_reuse="recompute" if recompute else "default")
     if window == "mixed_dtype":
         manager = make_manager(config=mixed_config(**options))
     else:
@@ -347,9 +347,7 @@ def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
     missing last-N window, and reads its own window from the history there instead of backing off
     again."""
     draft = make_manager(
-        config=mixed_config(
-            mixed_precision_reuse_with_optional_last_n=True, mixed_precision_recompute_last_n=True
-        ),
+        config=mixed_config(mixed_precision_reuse="recompute"),
         is_draft=True,
         joint_kv_cache_reuse=True,
     )
@@ -632,6 +630,8 @@ def test_cold_page_window_skips_the_codec_while_estimating(make_manager):
     )
     assert manager.mixed_precision_high_layers == {0: 1}
     assert provider.calls == []
+    # Without sinks, reuse is strict.
+    assert manager.kv_cache_manager_py_config.layers[1].reuse_policy == kv.ReusePolicy.REQUIRED
 
 
 def test_mixed_precision_rejects_custom_managers():
@@ -1035,7 +1035,7 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
 
 
 @pytest.mark.parametrize("high_dtype", [DataType.FP8, DataType.BF16])
-def test_reuse_with_optional_last_n_on_sparse_managers(high_dtype):
+def test_default_reuse_on_sparse_managers(high_dtype):
     """A sparse manager's high layers reuse a prefix without their last N tokens, whatever the
     high dtype."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
@@ -1043,9 +1043,7 @@ def test_reuse_with_optional_last_n_on_sparse_managers(high_dtype):
 
     def build():
         return DSACacheManagerV2(
-            kv_cache_config=mixed_config(
-                high_dtype, pool_ratio=None, mixed_precision_reuse_with_optional_last_n=True
-            ),
+            kv_cache_config=mixed_config(high_dtype, pool_ratio=None),
             kv_cache_type=CacheType.SELFKONLY,
             num_layers=1,
             num_kv_heads=1,

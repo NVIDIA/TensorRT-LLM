@@ -5426,26 +5426,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept "
         "in whole cache pages.")
 
-    mixed_precision_reuse_with_optional_last_n: bool = Field(
-        default=False,
+    mixed_precision_reuse: Literal["default", "strict", "recompute"] = Field(
+        default="default",
         status="prototype",
         description=
-        "Mixed-precision KV and the cold-page first/last-N window: reuse a cached prefix down to its "
-        "last block boundary even when the high-precision copy of its last N tokens was evicted. "
-        "Those tokens are then read from the history (the low-precision pool, or with the cold-page "
-        "window the layer's own pages) until they leave the window, so they keep the history's "
-        "precision. When False "
-        "(default), reuse stops where the high-precision copy is still complete and the rest is "
-        "recomputed.")
-
-    mixed_precision_recompute_last_n: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "With mixed_precision_reuse_with_optional_last_n: when the high-precision copy of a reused "
-        "prefix's last N tokens was evicted, reuse the prefix only up to before them and recompute "
-        "them, so they keep the high precision. The N tokens before them are read from the "
-        "history as context for that recomputation.")
+        "Block reuse of a cached prefix whose high-precision copy of its last N tokens was evicted "
+        "(mixed-precision KV and the cold-page first/last-N window). 'default' reuses the prefix "
+        "down to its last block boundary and reads those tokens from the history (the "
+        "low-precision pool, or with the cold-page window the layer's own pages) until they leave "
+        "the window, so they keep the history's precision. 'recompute' reuses the prefix only up "
+        "to before them and recomputes them in high precision, reading the N tokens before them "
+        "from the history. 'strict' reuses the prefix only where its high-precision copy is "
+        "complete and recomputes the rest; without first-N sink tokens, reuse is always strict."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -5848,10 +5841,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "Mixed-precision KV requires mixed_precision_first_n or "
                 "mixed_precision_last_n to be greater than zero.")
-        if (self.mixed_precision_recompute_last_n
-                and not self.mixed_precision_reuse_with_optional_last_n):
-            raise ValueError("mixed_precision_recompute_last_n requires "
-                             "mixed_precision_reuse_with_optional_last_n.")
         return self
 
     @field_validator('pool_ratio')

@@ -172,12 +172,12 @@ mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
 With block reuse, the high-precision copy of a cached prefix's last N tokens
-can be evicted while its NVFP4 history is still cached; reuse then stops where
-that copy is complete. `mixed_precision_reuse_with_optional_last_n: true` reuses the
-prefix down to its last block boundary and reads those tokens from the NVFP4
-history, at NVFP4 precision, until they leave the window.
-`mixed_precision_recompute_last_n: true` also set reuses the prefix up to before
-them and recomputes them in high precision. The cold-page first/last-N window of
+can be evicted while its NVFP4 history is still cached. `mixed_precision_reuse`
+sets what reuse does then. `default` reuses the prefix down to its last block
+boundary and reads those tokens from the NVFP4 history, at NVFP4 precision,
+until they leave the window. `recompute` reuses the prefix up to before them and
+recomputes them in high precision. `strict` stops reuse where the high-precision
+copy is complete; it is the only mode without first-N tokens. The cold-page first/last-N window of
 [cold-page quantization](kv-cache-compression.md) reads them from its history
 pages, at the runtime KV type.
 

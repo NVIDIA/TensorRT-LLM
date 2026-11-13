@@ -293,9 +293,8 @@ chunk is history, as for a native sliding-window layer. Attention kernels are
 unchanged: the page tables point the first/last tokens at that copy, and each
 step's new tokens are copied into the history pages as well.
 
-`mixed_precision_reuse_with_optional_last_n` and `mixed_precision_recompute_last_n`
-reuse a prefix whose GPU copy of the last N tokens was evicted, as described for
-the [mixed-precision KV cache](kvcache.md).
+`mixed_precision_reuse` sets how a prefix whose GPU copy of the last N tokens was
+evicted is reused, as described for the [mixed-precision KV cache](kvcache.md).
 
 The option is a prototype and has the limits of the mixed-precision KV cache:
 the TRTLLM attention backend, the standard KV cache manager, the hybrid Mamba
