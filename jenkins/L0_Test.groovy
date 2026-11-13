@@ -3925,7 +3925,7 @@ def trimForStageList(stageNameList)
     if (stageNameList == null) {
         return null
     }
-    trimedList = []
+    def trimedList = []
     stageNameList.each { stageName ->
         trimedList.add(stageName.trim().replaceAll('\\\\', ''))
     }
@@ -4123,14 +4123,12 @@ def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 @Field
 def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
-// Hoisted out of globalVars into BINDING variables in launchTestJobs. globalVars
-// is not a parameter of runLLMTestlistWithSbatch or runLLMTestlistOnPlatformImpl,
-// so reading it inside them throws MissingPropertyException; Build.groovy handles
-// BOLT_CONSUME_ENABLED the same way.
+// BOLT settings resolved from globalVars before dispatching test branches.
 BOLT_PINNED_REF = ""
 BOLT_TEST_BOLTED_TARBALL = false
 // Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
 TRTLLM_RELEASE_REPO = null
+@Field
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -7091,7 +7089,7 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
 }
 
 def checkStageName(stageNames) {
-    invalidStageName = stageNames.findAll { !(it ==~ /[-\+\w\[\]]+/) }
+    def invalidStageName = stageNames.findAll { !(it ==~ /[-\+\w\[\]]+/) }
     if (invalidStageName) {
         throw new Exception("Invalid stage name: [${invalidStageName}], we only support chars '-+_[]0-9a-zA-Z' .")
     }
@@ -7855,7 +7853,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     docBuildConfigs = [
         "CPU-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
-            runLLMDocBuild(pipeline, config=VANILLA_CONFIG, versionOverride)
+            runLLMDocBuild(pipeline, VANILLA_CONFIG, versionOverride)
         }],
     ]
 
