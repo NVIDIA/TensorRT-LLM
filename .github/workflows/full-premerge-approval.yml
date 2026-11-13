@@ -43,11 +43,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request_target' &&
         github.event.action == 'synchronize' &&
-        github.event.pull_request.state == 'open' &&
-        (github.event.pull_request.base.ref == 'main' ||
-         startsWith(github.event.pull_request.base.ref, 'release/')) &&
-        !contains(github.event.pull_request.labels.*.name,
-                  'ci: full pre-merge approved')) ||
+        !contains(github.event.pull_request.labels.*.name, 'ci: full pre-merge approved')) ||
        (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         startsWith(github.event.workflow_run.display_title,
@@ -70,7 +66,7 @@ jobs:
         uses: actions/github-script@v8
         env:
           AGENT_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
-          DISPATCH_PULL_NUMBER: ${{ inputs.pull_number }}
+          DISPATCH_PULL_NUMBER: ${{ github.event.pull_request.number || inputs.pull_number }}
           SIGNAL_PATH: ${{ runner.temp }}/full-premerge-approval/pr-number.txt
         with:
           github-token: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
@@ -84,9 +80,7 @@ jobs:
             }
 
             let rawPullNumber = process.env.DISPATCH_PULL_NUMBER;
-            if (context.eventName === 'pull_request_target') {
-              rawPullNumber = String(context.payload.pull_request?.number ?? '');
-            } else if (context.eventName === 'workflow_run') {
+            if (context.eventName === 'workflow_run') {
               try {
                 rawPullNumber = await readFile(process.env.SIGNAL_PATH, 'utf8');
               } catch (error) {
@@ -110,11 +104,6 @@ jobs:
                     baseRefName
                     reviewDecision
                     state
-                    labels(first: 100) {
-                      nodes {
-                        name
-                      }
-                    }
                     latestOpinionatedReviews(first: 100, writersOnly: true) {
                       nodes {
                         state
@@ -152,12 +141,6 @@ jobs:
                   `PR #${pullNumber} does not target main or a release branch; ` +
                   'skipping auto-labeling.'
                 );
-                return;
-              }
-              if (pullRequest.labels?.nodes?.some(
-                (label) => label.name?.toLowerCase() === approvalLabel.toLowerCase()
-              )) {
-                console.log(`PR #${pullNumber} already has ${approvalLabel}; skipping auto-labeling.`);
                 return;
               }
               const latestOpinions = pullRequest.latestOpinionatedReviews?.nodes ?? [];
