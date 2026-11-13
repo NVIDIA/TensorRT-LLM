@@ -22,7 +22,7 @@ import torch
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.executor.utils import RequestError, is_context_length_exceeded_message
 
-from .test_llm import get_model_path
+from .model_paths import get_model_path
 
 BERT_MODEL_PATH = "bert/bert-base-uncased-yelp-polarity"
 BERT_MAX_SEQ_LEN = 512

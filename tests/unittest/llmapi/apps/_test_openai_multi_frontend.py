@@ -25,7 +25,7 @@ import psutil
 import pytest
 import requests
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 NUM_FRONTENDS = 8

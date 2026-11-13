@@ -13,10 +13,17 @@ l0_a100:
       stage: pre_merge
       backend: "pytorch"
   tests:
-    - unittest/llmapi/test_llm_pytorch.py -m "part0"
-    - unittest/llmapi/test_llm_pytorch.py -m "part1"
-    - unittest/llmapi/test_llm_pytorch.py -m "part2"
-    - unittest/llmapi/test_llm_pytorch.py -m "part3"
+    - unittest/llmapi/test_llm_pytorch.py
+    - unittest/llmapi/test_llm_metrics.py::test_llm_get_stats
+    - unittest/llmapi/test_llm_metrics.py::test_llm_get_stats_async
+    - unittest/llmapi/test_llm_metrics.py::test_llm_get_stats_with_interval
+    - unittest/llmapi/test_llm_metrics.py::test_llm_perf_metrics
+    - unittest/llmapi/test_llm_metrics.py::test_llm_prefix_cache_reuse
+    - unittest/llmapi/test_llm_metrics.py::test_llm_prometheus
+    - unittest/llmapi/test_llm_pytorch_errors.py
+    - unittest/llmapi/test_llm_pytorch_lora.py
+    - unittest/llmapi/test_llm_pytorch_disagg.py
+    - unittest/llmapi/test_llm_postprocess.py::test_llm_with_postprocess_parallel_and_result_handler
     - unittest/llmapi/test_llm_encode.py
     - unittest/llmapi/test_llm_scheduled_pooling.py
     - unittest/llmapi/test_llm_encode_multi_item.py
@@ -54,8 +61,12 @@ l0_a100:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/llmapi/test_llm.py -m "part0"
-  - unittest/llmapi/test_llm.py -m "not part0" TIMEOUT (90)
+  - unittest/llmapi/test_llm.py
+  - unittest/llmapi/test_llm_tokenizer.py
+  - unittest/llmapi/test_llm_generation.py
+  - unittest/llmapi/test_llm_lifecycle.py
+  - unittest/llmapi/test_llm_metrics.py::test_llm_get_queued_stats
+  - unittest/llmapi/test_llm_postprocess.py::test_llm_with_postprocess_parallel
 - condition:
     ranges:
       system_gpu_count:

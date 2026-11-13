@@ -245,33 +245,3 @@ def test_set_affinity_binds_pre_existing_threads_for_real():
     assert probe.returncode == 0, probe.stderr
     assert "OK" in probe.stdout or "SKIP" in probe.stdout, (probe.stdout,
                                                             probe.stderr)
-
-
-class DelayedAssert:
-
-    def __init__(self, store_stack: bool = False):
-        self.assertions = []
-        self.store_stack = store_stack
-
-    def add(self, result: bool, msg: str):
-        import traceback
-        self.assertions.append(
-            (bool(result), str(msg), traceback.format_stack()))
-
-    def get_msg(self):
-        ret = ['Some assertions failed:']
-        for result, msg, stack in self.assertions:
-            ret.append('\n'.join([
-                f'Assert result: {result}', msg,
-                ''.join(stack) if self.store_stack else ''
-            ]))
-        ret = '\n-----------------------------------------\n'.join(ret)
-        ret = 'Some assertions failed:\n' + ret
-        return ret
-
-    def clear(self):
-        self.assertions.clear()
-
-    def assert_all(self):
-        assert all(ret[0] for ret in self.assertions), self.get_msg()
-        self.clear()

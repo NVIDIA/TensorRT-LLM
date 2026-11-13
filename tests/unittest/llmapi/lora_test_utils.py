@@ -34,7 +34,7 @@ from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
                                                  LoraLayer)
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 
-from .test_utils import DelayedAssert
+from .assert_utils import DelayedAssert
 
 QWEN3_MODEL_DIR = Path(llm_models_root()) / "Qwen3" / "Qwen3-0.6B"
 
@@ -146,7 +146,7 @@ def create_mock_nemo_lora_checkpoint(
 
         # NOTE:
         # for seed=42, and coefficient=0.02, the expected outputs are hardcoded
-        # in the test `test_llm_pytorch.py::test_gqa_nemo_lora`.
+        # in the test `test_llm_pytorch_lora.py::test_gqa_nemo_lora`.
         # Therefore changing "WEIGHTS_COEFFICIENT" or the seed will break the test.
         WEIGHTS_COEFFICIENT = 0.02
         for layer_idx in range(num_layers):

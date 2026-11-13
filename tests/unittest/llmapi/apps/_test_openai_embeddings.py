@@ -29,7 +29,7 @@ import pytest
 import requests
 from utils.util import skip_gpu_memory_less_than
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteEmbeddingServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)

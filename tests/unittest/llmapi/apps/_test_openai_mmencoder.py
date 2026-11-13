@@ -8,7 +8,7 @@ import requests
 import yaml
 from utils.llm_data import llm_models_root
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteMMEncoderServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)

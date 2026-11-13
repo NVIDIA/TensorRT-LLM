@@ -14,9 +14,15 @@ l0_a30:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/modeling -k "modeling_qwen3"
-  - unittest/_torch/modeling -k "modeling_out_of_tree"
-  - unittest/_torch/modeling -k "modeling_speculative"
+  - unittest/_torch/modeling/test_modeling_qwen3.py
+  - unittest/_torch/modeling/test_modeling_qwen3_5_vl.py
+  - unittest/_torch/modeling/test_modeling_qwen3_5_vl_moe.py
+  - unittest/_torch/modeling/test_modeling_qwen3_embedding.py
+  - unittest/_torch/modeling/test_modeling_qwen3vl.py
+  - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py
+  - unittest/_torch/modeling/test_modeling_qwen3vl_preprocess.py
+  - unittest/_torch/modeling/test_modeling_out_of_tree.py
+  - unittest/_torch/modeling/test_modeling_speculative.py
   - unittest/_torch/sampler/test_beam_search.py
   - unittest/_torch/sampler/test_beam_search_speculative_d2h.py
   - unittest/_torch/sampler/test_logits_logprobs.py

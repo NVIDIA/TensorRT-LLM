@@ -9,11 +9,12 @@ from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .test_llm import (_test_llm_capture_request_error, llama_model_path,
-                       llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness,
-                       llm_return_logprobs_test_harness,
-                       tinyllama_logits_processor_test_harness)
+from .llm_logprobs_test_utils import llm_return_logprobs_test_harness
+from .llm_stats_test_utils import (llm_get_stats_async_test_harness,
+                                   llm_get_stats_test_harness)
+from .llm_test_utils import (_test_llm_capture_request_error,
+                             tinyllama_logits_processor_test_harness)
+from .model_paths import llama_model_path
 
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 

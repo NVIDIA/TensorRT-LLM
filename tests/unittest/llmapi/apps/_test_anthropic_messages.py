@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterator, Tuple
 import pytest
 import requests
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 # An Anthropic request or response body, as it appears on the wire.
