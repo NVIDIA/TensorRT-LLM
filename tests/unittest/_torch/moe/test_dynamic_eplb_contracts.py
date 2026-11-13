@@ -16,7 +16,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 
@@ -1792,7 +1792,7 @@ def test_route_wait_occurs_after_independent_staging():
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
     impl = _extract_class(
         source,
-        "TrtllmCutedslMegaMoeNvfp4Impl",
+        "MegaMoECuteDslBase",
         {"_stage_inputs"},
         {"torch": SimpleNamespace(uint8="uint8")},
     )
@@ -1880,7 +1880,7 @@ def test_megamoe_launch_buffers_are_built_once_per_bucket_and_mode():
     fake_torch = SimpleNamespace(is_inference_mode_enabled=lambda: inference.enabled)
     impl = _extract_class(
         _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py",
-        "TrtllmCutedslMegaMoeNvfp4Impl",
+        "MegaMoECuteDslBase",
         {"_acquire_buffers"},
         {"torch": fake_torch},
     )
@@ -1986,7 +1986,13 @@ def _autotune_helpers(torch):
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
         "enumerate_megamoe_candidate_tactics",
+        # The quant-kind rules validation and enumeration apply.
+        "_megamoe_operand_format",
+        "megamoe_quant_kind_is_block_scaled",
+        "_check_megamoe_quant_kind",
+        "_megamoe_tactic_with_mma_tile_k",
     }
+    classes = {"_MegaMoEOperandFormat"}
     constants = {
         "_NVFP4_BLOCK_SIZE",
         "_SUPPORTED_MMA_TILE_M",
@@ -2007,11 +2013,15 @@ def _autotune_helpers(torch):
         "_EPI_FLAG_BATCH_SMALL",
         "_EPI_FLAG_BATCH_LARGE",
         "_EPI_FLAG_BATCH_TOKEN_THRESHOLD",
+        "_MEGAMOE_OPERAND_FORMATS",
+        "_BF16_MMA_TILE_K",
     }
     tree = ast.parse(source.read_text())
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in functions:
+            nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name in classes:
             nodes.append(node)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -2025,6 +2035,8 @@ def _autotune_helpers(torch):
         "List": List,
         "Optional": Optional,
         "Any": Any,
+        "Dict": Dict,
+        "NamedTuple": NamedTuple,
         "logger": SimpleNamespace(debug=lambda *args: None),
     }
     exec(

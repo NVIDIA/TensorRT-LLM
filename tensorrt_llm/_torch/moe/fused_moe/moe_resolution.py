@@ -59,7 +59,11 @@ from .impl_environment import collect_moe_environment
 from .impl_identity import MOE_IMPL_REGISTRY, MoEImplId, MoEImplQuery
 from .interface import MoE
 from .marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
-from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl
+from .mega_moe import (
+    DeepgemmCudaW4a8Mxfp4Mxfp8Impl,
+    TrtllmCutedslMegaMoeBf16Impl,
+    TrtllmCutedslMegaMoeNvfp4Impl,
+)
 from .moe_load_balancer import get_moe_load_balancer
 from .trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
@@ -100,7 +104,9 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xNvfp4FusedMoE,
     CuteDslB12xW4a16Nvfp4FusedMoE,
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
+    # The two MegaMoE CuteDSL leaves publish disjoint ``quant`` segments, so their order is free.
     TrtllmCutedslMegaMoeNvfp4Impl,
+    TrtllmCutedslMegaMoeBf16Impl,
     # Disjoint ``quant`` segments, so the order between them does not matter.
     TrtllmCutedslGroupedGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmNvfp4PlusImpl,
@@ -161,7 +167,8 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     ),
     "TRITON": frozenset({TritonFusedMoE}),
     "MEGAMOE_DEEPGEMM": frozenset({DeepgemmCudaW4a8Mxfp4Mxfp8Impl}),
-    "MEGAMOE_CUTEDSL": frozenset({TrtllmCutedslMegaMoeNvfp4Impl}),
+    # The quant picks the leaf: NVFP4, or unquantized BF16 on SM100/SM103.
+    "MEGAMOE_CUTEDSL": frozenset({TrtllmCutedslMegaMoeNvfp4Impl, TrtllmCutedslMegaMoeBf16Impl}),
 }
 
 # Catch table drift at import time.

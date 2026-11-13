@@ -1,9 +1,9 @@
 # Dynamic UMMA N for fused fc1+fc2 swap-AB MegaMoE kernel.
 #
-# Emits the block-scaled UMMA instruction as literal PTX text (via
-# ``llvm.inline_asm``) so the instruction descriptor (``idesc``) is under our
-# control -- specifically so its ``n_dim_`` bitfield becomes a runtime SSA
-# value (= ``align16(valid_tokens_in_tile) >> 3``).
+# Emits the UMMA instruction (block-scaled, or dense kind::f16 for bf16) as
+# literal PTX text (via ``llvm.inline_asm``) so the instruction descriptor
+# (``idesc``) is under our control -- specifically so its ``n_dim_`` bitfield
+# becomes a runtime SSA value (= ``align16(valid_tokens_in_tile) >> 3``).
 #
 # Why PTX text instead of ``cutlass._mlir.dialects.nvvm`` (the dialect Python
 # binding): that binding is a private/unstable surface that has already
@@ -28,6 +28,17 @@
 # SM100_MMA_MXF8F6F4_SS at :1573 emit the same
 # ``[%0], %1, %2, %3, [%5], [%6], p`` with ``"r,l,l,r,r,r,r"``). Note that
 # mxf8f6f4 takes NO scale-vec suffix -- its scale vector size is implicitly 32.
+#
+# The unquantized bf16 kind takes the dense path instead:
+#
+#   kind::f16                            bf16           UMMA_K = 16
+#
+# It has no scale-factor operands and a different descriptor layout (CUTLASS
+# ``UMMA::InstrDescriptor`` rather than ``UMMA::InstrDescriptorBlockScaled``),
+# so it gets its own static idesc builder, emitter and tile issuer below. Its
+# emitted text matches CUTLASS SM100_MMA_F16BF16_SS (cta_group::1) and
+# SM100_MMA_F16BF16_2x1SM_SS (cta_group::2) minus the optional all-zero
+# disable-output-lane vector: ``[%0], %1, %2, %3, p`` with ``"r,l,l,r,r"``.
 
 from typing import Optional
 
@@ -142,6 +153,67 @@ def build_static_idesc_base(
     return desc & 0xFFFFFFFF
 
 
+# Bit layout of the dense ``kind::f16`` instruction descriptor: CUTLASS
+# ``UMMA::InstrDescriptor`` (cute/arch/mma_sm100_desc.hpp; filled by
+# ``UMMA::make_instr_desc``) and the PTX ISA tcgen05 instruction-descriptor
+# table for .kind::tf32 / .kind::f16 / .kind::f8f6f4 / .kind::i8. It shares
+# the format / negate / major / N / M fields with the block-scaled layout
+# above; the differences are what this path must get right:
+#
+#   bit [ 0, 2) : sparse_id2_      (0)
+#   bit [ 2, 3) : sparse_flag_     (0 = dense)
+#   bit [ 3, 4) : saturate_        (0; 1 is valid only for kind::i8)
+#   bit [ 4, 6) : c_format_        (F32 = 1; the b_sf_id_ slot when block-scaled)
+#   bit [ 6, 7) : reserved         (0)
+#   bit [ 7,10) : a_format_        (UMMA::F16F32Format: F16 = 0, BF16 = 1, TF32 = 2)
+#   bit [10,13) : b_format_        (same enum)
+#   bit [13,14) : a_negate_        (0)
+#   bit [14,15) : b_negate_        (0)
+#   bit [15,16) : a_major_         (0 = K-major)
+#   bit [16,17) : b_major_         (0 = K-major)
+#   bit [17,23) : n_dim_           (runtime, OR'd in: align16(valid) >> 3)
+#   bit [23,24) : reserved         (0; scale_format_ when block-scaled)
+#   bit [24,29) : m_dim_           (M >> 4: 256 -> 16, 128 -> 8)
+#   bit [29,30) : reserved         (0; a_sf_id_ low bit when block-scaled)
+#   bit [30,32) : max_shift_       (0; only meaningful for the .ws variant)
+
+_BIT_C_FORMAT = 4  # width 2
+_C_FORMAT_F32 = 1  # UMMA::CFormat::F32
+
+
+def build_static_idesc_base_f16(
+    *,
+    umma_m: int,  # 64, 128, or 256
+    a_format: int,
+    b_format: int,
+    a_major: int = 0,  # 0 = K-major
+    b_major: int = 0,
+) -> int:
+    """Pack the static fields of a dense ``kind::f16`` idesc (F32 accumulator) into a u32.
+
+    Only ``n_dim_`` is left for the call site. For UMMA_M=256 / BF16 x BF16 / K-major the base is
+    ``0x10000490``; for UMMA_M=128 it is ``0x08000490`` -- identical to CUTLASS
+    ``UMMA::make_instr_desc<bfloat16_t, bfloat16_t, float, M, N, K, K>()`` with ``n_dim_`` zeroed.
+    """
+    assert umma_m in (64, 128, 256), f"Unsupported UMMA_M={umma_m}"
+    assert 0 <= a_format < (1 << 3)
+    assert 0 <= b_format < (1 << 3)
+
+    m_dim = umma_m >> 4  # 256 -> 16, 128 -> 8, 64 -> 4
+
+    desc = 0
+    desc |= _C_FORMAT_F32 << _BIT_C_FORMAT
+    desc |= (a_format & 0x7) << _BIT_A_FORMAT
+    desc |= (b_format & 0x7) << _BIT_B_FORMAT
+    desc |= (a_major & 0x1) << _BIT_A_MAJOR
+    desc |= (b_major & 0x1) << _BIT_B_MAJOR
+    desc |= (m_dim & 0x1F) << _BIT_M_DIM
+    # Reserved bits 6, 23 and 29 plus max_shift_ [30,32) must stay clear; the sparse / saturate /
+    # negate fields are left at their dense, unsaturated, un-negated zero.
+    assert desc & ((1 << 6) | (1 << 23) | (0x7 << 29)) == 0
+    return desc & 0xFFFFFFFF
+
+
 # =============================================================================
 # Runtime idesc finalization (per-MMA-call OR steps)
 # =============================================================================
@@ -234,6 +306,43 @@ def _tcgen05_mma_block_scaled(
         "[$0], $1, $2, $3, [$5], [$6], p;\n\t"
         "}\n",
         "r,l,l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _tcgen05_mma_f16(
+    *,
+    cta_group: int,  # 1 or 2 (Python int, folds into the asm mnemonic)
+    d_tmem_i32,  # ir.Value (i32) -- accumulator TMEM address
+    a_desc_i64,  # ir.Value (i64) -- A operand smem descriptor
+    b_desc_i64,  # ir.Value (i64) -- B operand smem descriptor
+    idesc_i32,  # ir.Value (i32) -- instruction descriptor
+    enable_input_d_i32,  # ir.Value (i32) -- 0/1, D = A@B (+ D if nonzero)
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Emit ``tcgen05.mma.cta_group::{1,2}.kind::f16 [d], a_desc, b_desc, idesc, p``.
+
+    Same predicate idiom as ``_tcgen05_mma_block_scaled``. CUTLASS's
+    ``SM100_MMA_F16BF16_SS`` / ``SM100_MMA_F16BF16_2x1SM_SS`` (cute/arch/mma_sm100_umma.hpp) also
+    pass an all-zero ``{disable-output-lane}`` vector; the PTX ISA makes that operand optional and
+    zero disables no lane, so this form omits it.
+    """
+    assert cta_group in (1, 2), f"cta_group must be 1 or 2, got {cta_group}"
+    llvm.inline_asm(
+        None,
+        [d_tmem_i32, a_desc_i64, b_desc_i64, idesc_i32, enable_input_d_i32],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, $4, 0;\n\t"
+        f"tcgen05.mma.cta_group::{cta_group}.kind::f16 [$0], $1, $2, $3, p;\n\t"
+        "}\n",
+        "r,l,l,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -353,4 +462,71 @@ def issue_dynamic_block_scaled_mma_tile(
                 enable_input_d_i32=Int32(Boolean(accum_flag)).ir_value(),
                 sfa_tmem_i32=operand_sfa_i32,
                 sfb_tmem_i32=operand_sfb_i32,
+            )
+
+
+@dsl_user_op
+def issue_dynamic_dense_mma_tile(
+    *,
+    # Must be a dense kind (``not quant_kind.is_block_scaled``); selects the idesc format fields.
+    quant_kind: QuantKind,
+    # Logical shape: (V, MMA_M, MMA_N). TMEM tensor for one accumulator stage.
+    acc_tensor: cute.Tensor,
+    # A/B fragment tensors at current AB pipeline stage (smem_desc iterators),
+    # logical shape (V, MMA_M|N, MMA_K).
+    a_frag_tile: cute.Tensor,
+    b_frag_tile: cute.Tensor,
+    # Outer K-tile index (Int32 SSA).  Drives accumulate flag.
+    k_tile_idx: Int32,
+    # Logical valid token count for this tile (Int32 SSA).  Rounded up to 16
+    # before encoding into idesc.n_dim_.
+    valid_tokens_in_tile: Int32,
+    mma_tiler_mnk: tuple = (256, 256, 64),
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Issue (mma_tiler_k / 16) dense ``kind::f16`` MMAs for one K-tile.
+
+    The runtime-N scheme is the block-scaled one (``idesc.n_dim_ = align16(valid) >> 3``, the
+    cluster-total N under ``cta_group::2``); only the descriptor layout and the operand list
+    differ. With no scale-factor ids to fold in, the idesc is the same for every inner K step.
+    """
+    if quant_kind.is_block_scaled:
+        raise ValueError(f"{quant_kind} is block-scaled; use issue_dynamic_block_scaled_mma_tile.")
+    static_idesc_base = build_static_idesc_base_f16(
+        umma_m=mma_tiler_mnk[0],
+        a_format=quant_kind.weight_format_code,
+        b_format=quant_kind.activation_format_code,
+    )
+    n_dim_value = _align16(valid_tokens_in_tile) >> Int32(3)
+    idesc = Int32(static_idesc_base) | (Int32(n_dim_value) << _BIT_N_DIM)
+
+    # 4 at the bf16 K=64 tile.
+    num_k_inner = mma_tiler_mnk[2] // quant_kind.instruction_k("1x")
+    cta_group = 2 if mma_tiler_mnk[0] == 256 else 1
+    m_inner = 0
+    n_inner = 0
+
+    for k_inner in range(num_k_inner):  # Python int -> compile-time unroll
+        a_atom = a_frag_tile[(None, m_inner, k_inner)]
+        b_atom = b_frag_tile[(None, n_inner, k_inner)]
+        acc_atom = acc_tensor[(None, m_inner, n_inner)]
+
+        operand_a = _smem_desc_to_i64(_as_value(a_atom.iterator))
+        operand_b = _smem_desc_to_i64(_as_value(b_atom.iterator))
+        operand_acc_i32 = _tmem_ptr_to_i32(_as_value(acc_atom.iterator))
+
+        if k_inner == 0:
+            accum_flag = k_tile_idx != 0
+        else:
+            accum_flag = True
+
+        with cute.arch.elect_one():
+            _tcgen05_mma_f16(
+                cta_group=cta_group,
+                d_tmem_i32=operand_acc_i32,
+                a_desc_i64=operand_a,
+                b_desc_i64=operand_b,
+                idesc_i32=idesc.ir_value(),
+                enable_input_d_i32=Int32(Boolean(accum_flag)).ir_value(),
             )

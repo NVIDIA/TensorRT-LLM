@@ -579,6 +579,12 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
 
             iket.range_push("router.prefix_and_publish")
+            # The histogram was built with generic-proxy SMEM atomics; the broadcast reads it through the async
+            # proxy (cp.async.bulk / cp.reduce.async.bulk). Without this fence the bulk copy can read counts whose
+            # atomics are not yet visible to the async proxy and publish a partial row (seen at EP32 as wrong
+            # push tables and dropped routes). Same fence as token_comm_dedup.py.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_threads()
             publish_sizes = self._broadcast_sizes_to_peers(
                 cute.make_tensor(histogram.iterator, cute.make_layout((self.expert_count_padded,)))
             )
@@ -737,6 +743,8 @@ class _MetadataPushRouter(KernelComponent):
             expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
             if expert < Int32(self.expert_count_padded):
                 totals[expert] = size_counter[expert]
+        # Generic-proxy SMEM stores read by the async-proxy broadcast below (see _router_single_cta).
+        cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
 
         publish_sizes = self._broadcast_sizes_to_peers(totals)

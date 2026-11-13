@@ -1,4 +1,4 @@
-"""Mainloop component for the block-scaled swap-AB FC12 kernel."""
+"""Mainloop component for the swap-AB FC12 kernel: block-scaled kinds, or the dense bf16 kind."""
 
 from typing import ClassVar, Optional, Tuple
 
@@ -11,11 +11,13 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import Boolean, Int32
 
+from .....activation_def import ExpertActivation
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....helpers.cute_py_helpers import (
     Tcgen05MmaInstruction,
     make_smem_layouts,
     tcgen05_block_scaled_acc_dtype,
+    tcgen05_dense_acc_dtype,
     tcgen05_smem_alloc_type,
 )
 from .....helpers.dsl_helpers import spin_wait, tma_multicast_mask
@@ -49,7 +51,12 @@ def _make_executable_tma_atom_for_cluster(atom_or_pair: TmaAtomOrPair, is_fallba
 
 
 class BlockScaledSwapAbFc12Mainloop(KernelComponent):
-    """Own all load, MMA, pipeline, SMEM, and TMEM mainloop state."""
+    """Own all load, MMA, pipeline, SMEM, and TMEM mainloop state.
+
+    Every scale-factor resource (SFA/SFB SMEM, their TMA atoms, the TMEM SF columns and the S2T
+    copies) exists only for a block-scaled kind; the dense bf16 kind branches all of it out at
+    trace time and issues ``kind::f16`` MMAs, so block-scaled code generation is unchanged.
+    """
 
     ab_pipeline_mbarriers_region: ClassVar[str] = "blackwell.swap_ab_fc12.mainloop.ab_pipeline_mbarriers"
     a_smem_tensor_region: ClassVar[str] = "blackwell.swap_ab_fc12.mainloop.a_smem_tensor"
@@ -69,6 +76,8 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
             "b_major_mode": OperandMajorMode,
             "hidden_size": StaticOrRuntimeIntegerType,
             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
+            # Fixes FC2's K from the FC1 rows; see ExpertActivation.intermediate_downproj.
+            "expert_activation": OptionalRequirement(Optional[str]),
         }
 
     @classmethod
@@ -89,13 +98,23 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         # Derived, not declared: see BlockScaledSwapAbMegaMoeKernel.__init__ for the reasoning.
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
-        self.sf_dtype = self.quant_kind.sf_dtype
-        self.sf_vec_size = self.quant_kind.sf_vec_size
-        self.acc_dtype = tcgen05_block_scaled_acc_dtype
+        self.is_block_scaled = self.quant_kind.is_block_scaled
+        # None for bf16, which also makes the MMA instruction below a dense (no-SF) one.
+        self.sf_dtype = self.quant_kind.sf_dtype if self.is_block_scaled else None
+        self.sf_vec_size = self.quant_kind.sf_vec_size if self.is_block_scaled else None
+        self.acc_dtype = tcgen05_block_scaled_acc_dtype if self.is_block_scaled else tcgen05_dense_acc_dtype
         self.a_major_mode = problem_desc["a_major_mode"]
         self.b_major_mode = problem_desc["b_major_mode"]
         self.hidden_size = problem_desc["hidden_size"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
+        self.expert_activation = ExpertActivation.from_problem_desc(problem_desc)
+        # FC2's K (the FC1 output width) when the FC1 rows are static; assign_device_members
+        # derives it from the runtime extent otherwise.
+        self.intermediate_downproj = (
+            self.expert_activation.intermediate_downproj(self.intermediate_gateup_size)
+            if isinstance(self.intermediate_gateup_size, int)
+            else None
+        )
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.fallback_cluster_shape_mn = impl_desc.get("fallback_cluster_shape_mn")
@@ -209,8 +228,8 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         if isinstance(self.intermediate_gateup_size, int):
             if self.intermediate_gateup_size <= 0:
                 raise ValueError("intermediate_gateup_size must be positive.")
-            if self.intermediate_gateup_size % 2 != 0:
-                raise ValueError("intermediate_gateup_size must be even.")
+            if self.expert_activation.is_gated and self.intermediate_gateup_size % 2 != 0:
+                raise ValueError(f"A gated ({self.expert_activation}) intermediate_gateup_size must be even.")
 
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Register the selected mainloop SMEM plan."""
@@ -231,22 +250,23 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
             swizzle=self.b_smem_region.swizzle,
             byte_alignment=self.b_smem_region.byte_alignment,
         )
-        smem_workspace.register_tensor(
-            self.sfa_smem_tensor_region,
-            self.sfa_smem_region.dtype,
-            self.sfa_smem_region.shape,
-            stride=self.sfa_smem_region.stride,
-            swizzle=self.sfa_smem_region.swizzle,
-            byte_alignment=self.sfa_smem_region.byte_alignment,
-        )
-        smem_workspace.register_tensor(
-            self.sfb_smem_tensor_region,
-            self.sfb_smem_region.dtype,
-            self.sfb_smem_region.shape,
-            stride=self.sfb_smem_region.stride,
-            swizzle=self.sfb_smem_region.swizzle,
-            byte_alignment=self.sfb_smem_region.byte_alignment,
-        )
+        if self.is_block_scaled:
+            smem_workspace.register_tensor(
+                self.sfa_smem_tensor_region,
+                self.sfa_smem_region.dtype,
+                self.sfa_smem_region.shape,
+                stride=self.sfa_smem_region.stride,
+                swizzle=self.sfa_smem_region.swizzle,
+                byte_alignment=self.sfa_smem_region.byte_alignment,
+            )
+            smem_workspace.register_tensor(
+                self.sfb_smem_tensor_region,
+                self.sfb_smem_region.dtype,
+                self.sfb_smem_region.shape,
+                stride=self.sfb_smem_region.stride,
+                swizzle=self.sfb_smem_region.swizzle,
+                byte_alignment=self.sfb_smem_region.byte_alignment,
+            )
         smem_workspace.register_mbarrier(self.acc_pipeline_mbarriers_region, self.num_accumulator_pipeline_stages * 2)
         smem_workspace.register_mbarrier(self.tmem_deallocation_mbarrier_region, 1)
         smem_workspace.register_tensor(self.tmem_holding_buffer_region, cutlass.Int32, (1,), byte_alignment=8)
@@ -255,7 +275,9 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         stage_one_regions = make_smem_layouts(
             self.mma_instruction, self.mma_tiler_mnk, 1, (self.a_major_mode, self.b_major_mode), self.architecture
         )
-        a_region, b_region, sfa_region, sfb_region = stage_one_regions
+        # (A, B) for the dense kind; (A, B, SFA, SFB) when block-scaled.
+        a_region, b_region = stage_one_regions[:2]
+        scale_factor_regions = stage_one_regions[2:]
 
         def packed_bytes(region, dtype) -> int:
             return (region.cosize * int(dtype.width) + 7) // 8
@@ -264,8 +286,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         self.ab_stage_tma_bytes = (
             packed_bytes(a_region, self.a_dtype)
             + packed_bytes(b_region, self.b_dtype)
-            + sfa_region.nbytes
-            + sfb_region.nbytes
+            + sum(region.nbytes for region in scale_factor_regions)
         )
         mbarrier_bytes = int(cutlass.Int64.width) // 8
         ab_stage_cost_bytes = self.ab_stage_payload_bytes + 2 * mbarrier_bytes
@@ -277,54 +298,69 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 f"{ab_stage_cost_bytes + plan_tail_bytes} bytes, exceeding the "
                 f"{self.mainloop_smem_budget_bytes}-byte mainloop budget."
             )
-        (self.a_smem_region, self.b_smem_region, self.sfa_smem_region, self.sfb_smem_region) = make_smem_layouts(
+        selected_regions = make_smem_layouts(
             self.mma_instruction,
             self.mma_tiler_mnk,
             self.num_ab_pipeline_stages,
             (self.a_major_mode, self.b_major_mode),
             self.architecture,
         )
-        self.selected_smem_bytes = sum(
-            region.nbytes
-            for region in (self.a_smem_region, self.b_smem_region, self.sfa_smem_region, self.sfb_smem_region)
-        )
+        self.a_smem_region, self.b_smem_region = selected_regions[:2]
+        self.sfa_smem_region, self.sfb_smem_region = selected_regions[2:] if self.is_block_scaled else (None, None)
+        self.selected_smem_bytes = sum(region.nbytes for region in selected_regions)
 
     def materialize_codegen_members(self) -> None:
         """Materialize IR-backed MMA and layout objects from the host plan."""
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        common_mma_arguments = (
-            self.a_dtype,
-            self.b_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-        )
-        self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            *common_mma_arguments, cta_group, self.mma_tiler_mnk[:2]
-        )
-        sfb_shape_mn = (self.cta_tile_m, round_up(self.cta_tile_n, 128))
-        self.tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            *common_mma_arguments, tcgen05.CtaGroup.ONE, sfb_shape_mn
-        )
+        if self.is_block_scaled:
+            common_mma_arguments = (
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+            )
+            self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+                *common_mma_arguments, cta_group, self.mma_tiler_mnk[:2]
+            )
+            sfb_shape_mn = (self.cta_tile_m, round_up(self.cta_tile_n, 128))
+            self.tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+                *common_mma_arguments, tcgen05.CtaGroup.ONE, sfb_shape_mn
+            )
+        else:
+            # kind::f16; the MMA itself is emitted by dynamic_mainloop, this atom only drives the
+            # SMEM layouts, the operand partitioning and the TMA atoms.
+            self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.acc_dtype,
+                cta_group,
+                self.mma_tiler_mnk[:2],
+            )
+            self.tiled_mma_sfb = None
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)), (self.tiled_mma.thr_id.shape,)
         )
-        self.cluster_layout_sfb_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.cluster_shape_mn, 1)), (self.tiled_mma_sfb.thr_id.shape,)
-        )
+        if self.is_block_scaled:
+            self.cluster_layout_sfb_vmnk = cute.tiled_divide(
+                cute.make_layout((*self.cluster_shape_mn, 1)), (self.tiled_mma_sfb.thr_id.shape,)
+            )
         self.fallback_cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.resolved_fallback_cluster_shape_mn, 1)), (self.tiled_mma.thr_id.shape,)
         )
-        self.fallback_cluster_layout_sfb_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.resolved_fallback_cluster_shape_mn, 1)), (self.tiled_mma_sfb.thr_id.shape,)
-        )
+        if self.is_block_scaled:
+            self.fallback_cluster_layout_sfb_vmnk = cute.tiled_divide(
+                cute.make_layout((*self.resolved_fallback_cluster_shape_mn, 1)), (self.tiled_mma_sfb.thr_id.shape,)
+            )
         if self.cluster_layout_vmnk.shape != self.cluster_layout_shape_vmnk:
             raise ValueError(
                 f"Main cluster layout mismatch: Python {self.cluster_layout_shape_vmnk}, "
                 f"CuTe {self.cluster_layout_vmnk.shape}."
             )
-        if self.cluster_layout_sfb_vmnk.shape != self.cluster_layout_sfb_shape_vmnk:
+        if self.is_block_scaled and self.cluster_layout_sfb_vmnk.shape != self.cluster_layout_sfb_shape_vmnk:
             raise ValueError(
                 f"SFB cluster layout mismatch: Python {self.cluster_layout_sfb_shape_vmnk}, "
                 f"CuTe {self.cluster_layout_sfb_vmnk.shape}."
@@ -334,7 +370,10 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 f"Fallback cluster layout mismatch: Python {self.fallback_cluster_layout_shape_vmnk}, "
                 f"CuTe {self.fallback_cluster_layout_vmnk.shape}."
             )
-        if self.fallback_cluster_layout_sfb_vmnk.shape != self.fallback_cluster_layout_sfb_shape_vmnk:
+        if (
+            self.is_block_scaled
+            and self.fallback_cluster_layout_sfb_vmnk.shape != self.fallback_cluster_layout_sfb_shape_vmnk
+        ):
             raise ValueError(
                 f"Fallback SFB cluster layout mismatch: Python {self.fallback_cluster_layout_sfb_shape_vmnk}, "
                 f"CuTe {self.fallback_cluster_layout_sfb_vmnk.shape}."
@@ -350,18 +389,22 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         self.b_smem_composed_layout_staged = b_composed_layout
         self.a_smem_layout_staged = a_composed_layout.outer
         self.b_smem_layout_staged = b_composed_layout.outer
-        self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
-            self.tiled_mma, self.mma_tiler_mnk, self.sf_vec_size, self.num_ab_pipeline_stages
-        )
-        self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
-            self.tiled_mma, self.mma_tiler_mnk, self.sf_vec_size, self.num_ab_pipeline_stages
-        )
-        for tensor_name, materialized_layout, planned_region in (
+        planned_layouts = [
             ("A", self.a_smem_layout_staged, self.a_smem_region),
             ("B", self.b_smem_layout_staged, self.b_smem_region),
-            ("SFA", self.sfa_smem_layout_staged, self.sfa_smem_region),
-            ("SFB", self.sfb_smem_layout_staged, self.sfb_smem_region),
-        ):
+        ]
+        if self.is_block_scaled:
+            self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+                self.tiled_mma, self.mma_tiler_mnk, self.sf_vec_size, self.num_ab_pipeline_stages
+            )
+            self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+                self.tiled_mma, self.mma_tiler_mnk, self.sf_vec_size, self.num_ab_pipeline_stages
+            )
+            planned_layouts += [
+                ("SFA", self.sfa_smem_layout_staged, self.sfa_smem_region),
+                ("SFB", self.sfb_smem_layout_staged, self.sfb_smem_region),
+            ]
+        for tensor_name, materialized_layout, planned_region in planned_layouts:
             if materialized_layout.shape != planned_region.shape or not strides_equal_ignoring_singletons(
                 planned_region.shape, materialized_layout.stride, planned_region.stride
             ):
@@ -376,23 +419,35 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         *,
         fc1_a: cute.Tensor,
         fc1_b: cute.Tensor,
-        fc1_sfa: cute.Tensor,
-        fc1_sfb: cute.Tensor,
+        fc1_sfa: Optional[cute.Tensor],
+        fc1_sfb: Optional[cute.Tensor],
         fc2_a: cute.Tensor,
         fc2_b: cute.Tensor,
-        fc2_sfa: cute.Tensor,
-        fc2_sfb: cute.Tensor,
+        fc2_sfa: Optional[cute.Tensor],
+        fc2_sfb: Optional[cute.Tensor],
     ) -> Tuple:
-        """Return TMA tensor/atom pairs ordered for run_tma_a then run_tma_b."""
+        """Return TMA tensor/atom pairs ordered for run_tma_a then run_tma_b.
+
+        The four scale-factor views are given exactly when the kind is block-scaled; for bf16 they
+        are None and so are the SF tensor/atom slots of the returned tuple.
+        """
+        scale_factor_views = (fc1_sfa, fc1_sfb, fc2_sfa, fc2_sfb)
+        if any((view is None) == self.is_block_scaled for view in scale_factor_views):
+            raise ValueError(
+                f"{self.quant_kind} requires the scale-factor views to be "
+                f"{'given' if self.is_block_scaled else 'None'}."
+            )
         a_stage_layout = cute.slice_(self.a_smem_composed_layout_staged, (None, None, None, 0))
         b_stage_layout = cute.slice_(self.b_smem_composed_layout_staged, (None, None, None, 0))
-        sfa_stage_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
-        sfb_stage_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+        if self.is_block_scaled:
+            sfa_stage_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            sfb_stage_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
 
         a_operation = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, self.tiled_mma.thr_id)
         b_operation = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, self.tiled_mma.thr_id)
-        sfa_operation = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, self.tiled_mma.thr_id)
-        sfb_operation = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, self.tiled_mma.thr_id)
+        if self.is_block_scaled:
+            sfa_operation = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, self.tiled_mma.thr_id)
+            sfb_operation = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, self.tiled_mma.thr_id)
 
         # An operand whose SMEM container is wider than its element type must be loaded by the
         # unpacking TMA variant; naming the container as internal_type is what selects it.
@@ -453,26 +508,29 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
             self.fallback_cluster_layout_vmnk,
             b_internal_type,
         )
-        fc1_sfa_atom, fc1_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_operation,
-            fc1_sfa,
-            sfa_stage_layout,
-            self.mma_tiler_mnk,
-            self.tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint16,
-        )
-        fc1_sfb_tensor, fc1_sfb_atom_or_pair = make_tma_maybe_pair(
-            cute.nvgpu.make_tiled_tma_atom_B,
-            sfb_operation,
-            fc1_sfb,
-            sfb_stage_layout,
-            self.mma_tiler_sfb,
-            self.tiled_mma_sfb,
-            self.cluster_layout_sfb_vmnk,
-            self.fallback_cluster_layout_sfb_vmnk,
-            cutlass.Uint16,
-        )
+        fc1_sfa_atom, fc1_sfa_tensor = None, None
+        fc1_sfb_tensor, fc1_sfb_atom_or_pair = None, None
+        if self.is_block_scaled:
+            fc1_sfa_atom, fc1_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
+                sfa_operation,
+                fc1_sfa,
+                sfa_stage_layout,
+                self.mma_tiler_mnk,
+                self.tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Uint16,
+            )
+            fc1_sfb_tensor, fc1_sfb_atom_or_pair = make_tma_maybe_pair(
+                cute.nvgpu.make_tiled_tma_atom_B,
+                sfb_operation,
+                fc1_sfb,
+                sfb_stage_layout,
+                self.mma_tiler_sfb,
+                self.tiled_mma_sfb,
+                self.cluster_layout_sfb_vmnk,
+                self.fallback_cluster_layout_sfb_vmnk,
+                cutlass.Uint16,
+            )
         fc2_a_atom, fc2_a_tensor = cute.nvgpu.make_tiled_tma_atom_A(
             a_operation,
             fc2_a,
@@ -493,26 +551,29 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
             self.fallback_cluster_layout_vmnk,
             b_internal_type,
         )
-        fc2_sfa_atom, fc2_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_operation,
-            fc2_sfa,
-            sfa_stage_layout,
-            self.mma_tiler_mnk,
-            self.tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint16,
-        )
-        fc2_sfb_tensor, fc2_sfb_atom_or_pair = make_tma_maybe_pair(
-            cute.nvgpu.make_tiled_tma_atom_B,
-            sfb_operation,
-            fc2_sfb,
-            sfb_stage_layout,
-            self.mma_tiler_sfb,
-            self.tiled_mma_sfb,
-            self.cluster_layout_sfb_vmnk,
-            self.fallback_cluster_layout_sfb_vmnk,
-            cutlass.Uint16,
-        )
+        fc2_sfa_atom, fc2_sfa_tensor = None, None
+        fc2_sfb_tensor, fc2_sfb_atom_or_pair = None, None
+        if self.is_block_scaled:
+            fc2_sfa_atom, fc2_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
+                sfa_operation,
+                fc2_sfa,
+                sfa_stage_layout,
+                self.mma_tiler_mnk,
+                self.tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Uint16,
+            )
+            fc2_sfb_tensor, fc2_sfb_atom_or_pair = make_tma_maybe_pair(
+                cute.nvgpu.make_tiled_tma_atom_B,
+                sfb_operation,
+                fc2_sfb,
+                sfb_stage_layout,
+                self.mma_tiler_sfb,
+                self.tiled_mma_sfb,
+                self.cluster_layout_sfb_vmnk,
+                self.fallback_cluster_layout_sfb_vmnk,
+                cutlass.Uint16,
+            )
         return (
             fc1_a_tensor,
             fc1_a_atom,
@@ -545,8 +606,11 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         """Root device-side SMEM tensors and CTA coordinates."""
         self.a_smem_tensor = smem_workspace.tensor(self.a_smem_tensor_region, smem_base)
         self.b_smem_tensor = smem_workspace.tensor(self.b_smem_tensor_region, smem_base)
-        self.sfa_smem_tensor = smem_workspace.tensor(self.sfa_smem_tensor_region, smem_base)
-        self.sfb_smem_tensor = smem_workspace.tensor(self.sfb_smem_tensor_region, smem_base)
+        self.sfa_smem_tensor = None
+        self.sfb_smem_tensor = None
+        if cutlass.const_expr(self.is_block_scaled):
+            self.sfa_smem_tensor = smem_workspace.tensor(self.sfa_smem_tensor_region, smem_base)
+            self.sfb_smem_tensor = smem_workspace.tensor(self.sfb_smem_tensor_region, smem_base)
         self.cta_coord_in_cluster = cta_coord_in_cluster
         self.is_fallback_cluster = is_fallback_cluster
         self.is_preferred_cluster = is_fallback_cluster == Boolean(False)
@@ -559,13 +623,15 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
             cta_coord_in_cluster[2],
         )
         bound_hidden_size = self.hidden_size if isinstance(self.hidden_size, int) else hidden_size
-        bound_intermediate_gateup_size = (
-            self.intermediate_gateup_size
+        # FC2's K is the FC1 output width: half the FC1 rows for a gated kind, all of them for a
+        # non-gated one. This is the only source of the FC2 k-tile count (TMA A / B and MMA).
+        bound_intermediate_downproj = (
+            self.intermediate_downproj
             if isinstance(self.intermediate_gateup_size, int)
-            else intermediate_gateup_size
+            else self.expert_activation.intermediate_downproj(intermediate_gateup_size)
         )
         self.fc1_k_tile_count = ceil_div(bound_hidden_size, self.mma_tile_k)
-        self.fc2_k_tile_count = ceil_div(bound_intermediate_gateup_size // 2, self.mma_tile_k)
+        self.fc2_k_tile_count = ceil_div(bound_intermediate_downproj, self.mma_tile_k)
         self.sfb_vmnk_coord = (0, cta_coord_in_cluster[0], cta_coord_in_cluster[1], cta_coord_in_cluster[2])
 
     @cute.jit
@@ -635,18 +701,18 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         *,
         fc1_tma_a_tensor: cute.Tensor,
         fc1_tma_a_atom: cute.CopyAtom,
-        fc1_tma_sfa_tensor: cute.Tensor,
-        fc1_tma_sfa_atom: cute.CopyAtom,
+        fc1_tma_sfa_tensor: Optional[cute.Tensor],
+        fc1_tma_sfa_atom: Optional[cute.CopyAtom],
         fc2_tma_a_tensor: cute.Tensor,
         fc2_tma_a_atom: cute.CopyAtom,
-        fc2_tma_sfa_tensor: cute.Tensor,
-        fc2_tma_sfa_atom: cute.CopyAtom,
+        fc2_tma_sfa_tensor: Optional[cute.Tensor],
+        fc2_tma_sfa_atom: Optional[cute.CopyAtom],
         ab_pipeline: pipeline.PipelineAsync,
         ab_pipeline_state: pipeline.PipelineState,
         sched_consumer: SchedulerConsumer,
         kernel_extension: BlockScaledSwapAbFc12Extension,
     ) -> None:
-        """Run the TMA-A warp that loads weights and their scale factors."""
+        """Run the TMA-A warp that loads weights and, when block-scaled, their scale factors."""
         multicast_mask = None
         if cutlass.const_expr(self.is_a_mcast or self.use_2cta_instrs):
             multicast_mask = tma_multicast_mask(
@@ -664,14 +730,19 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 iket.range_push("tma_weight_fc1")
                 k_tile_count = self.fc1_k_tile_count
                 real_a, a_descriptor_ptr = kernel_extension.get_gmem_tensor("a", fc1_tma_a_tensor, work_tile)
-                real_sfa, sfa_descriptor_ptr = kernel_extension.get_gmem_tensor("sfa", fc1_tma_sfa_tensor, work_tile)
+                if cutlass.const_expr(self.is_block_scaled):
+                    real_sfa, sfa_descriptor_ptr = kernel_extension.get_gmem_tensor(
+                        "sfa", fc1_tma_sfa_tensor, work_tile
+                    )
 
                 global_a = cute.local_tile(real_a, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None))
-                global_sfa = cute.local_tile(
-                    real_sfa, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None)
-                )
+                if cutlass.const_expr(self.is_block_scaled):
+                    global_sfa = cute.local_tile(
+                        real_sfa, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None)
+                    )
                 partitioned_global_a = thread_mma.partition_A(global_a)
-                partitioned_global_sfa = thread_mma.partition_A(global_sfa)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_global_sfa = thread_mma.partition_A(global_sfa)
 
                 partitioned_smem_a, partitioned_global_a = cpasync.tma_partition(
                     fc1_tma_a_atom,
@@ -680,19 +751,21 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                     cute.group_modes(self.a_smem_tensor, 0, 3),
                     cute.group_modes(partitioned_global_a, 0, 3),
                 )
-                partitioned_smem_sfa, partitioned_global_sfa = cpasync.tma_partition(
-                    fc1_tma_sfa_atom,
-                    self.main_vmnk_coord[2],
-                    sfa_cta_layout,
-                    cute.group_modes(self.sfa_smem_tensor, 0, 3),
-                    cute.group_modes(partitioned_global_sfa, 0, 3),
-                )
-                partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
-                partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_smem_sfa, partitioned_global_sfa = cpasync.tma_partition(
+                        fc1_tma_sfa_atom,
+                        self.main_vmnk_coord[2],
+                        sfa_cta_layout,
+                        cute.group_modes(self.sfa_smem_tensor, 0, 3),
+                        cute.group_modes(partitioned_global_sfa, 0, 3),
+                    )
+                    partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
+                    partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
 
                 mma_tile_m = work_tile.tile_m_idx // self.mma_cta_count
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
-                global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
+                if cutlass.const_expr(self.is_block_scaled):
+                    global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -710,26 +783,32 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         tma_desc_ptr=a_descriptor_ptr,
                         mcast_mask=multicast_mask,
                     )
-                    cute.copy(
-                        fc1_tma_sfa_atom,
-                        global_sfa_slice[(None, k_tile_idx)],
-                        partitioned_smem_sfa[(None, stage_index)],
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=sfa_descriptor_ptr,
-                        mcast_mask=multicast_mask,
-                    )
+                    if cutlass.const_expr(self.is_block_scaled):
+                        cute.copy(
+                            fc1_tma_sfa_atom,
+                            global_sfa_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfa[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfa_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                        )
             else:
                 iket.range_push("tma_weight_fc2")
                 k_tile_count = self.fc2_k_tile_count
                 real_a, a_descriptor_ptr = kernel_extension.get_gmem_tensor("a", fc2_tma_a_tensor, work_tile)
-                real_sfa, sfa_descriptor_ptr = kernel_extension.get_gmem_tensor("sfa", fc2_tma_sfa_tensor, work_tile)
+                if cutlass.const_expr(self.is_block_scaled):
+                    real_sfa, sfa_descriptor_ptr = kernel_extension.get_gmem_tensor(
+                        "sfa", fc2_tma_sfa_tensor, work_tile
+                    )
 
                 global_a = cute.local_tile(real_a, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None))
-                global_sfa = cute.local_tile(
-                    real_sfa, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None)
-                )
+                if cutlass.const_expr(self.is_block_scaled):
+                    global_sfa = cute.local_tile(
+                        real_sfa, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None)
+                    )
                 partitioned_global_a = thread_mma.partition_A(global_a)
-                partitioned_global_sfa = thread_mma.partition_A(global_sfa)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_global_sfa = thread_mma.partition_A(global_sfa)
 
                 partitioned_smem_a, partitioned_global_a = cpasync.tma_partition(
                     fc2_tma_a_atom,
@@ -738,19 +817,21 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                     cute.group_modes(self.a_smem_tensor, 0, 3),
                     cute.group_modes(partitioned_global_a, 0, 3),
                 )
-                partitioned_smem_sfa, partitioned_global_sfa = cpasync.tma_partition(
-                    fc2_tma_sfa_atom,
-                    self.main_vmnk_coord[2],
-                    sfa_cta_layout,
-                    cute.group_modes(self.sfa_smem_tensor, 0, 3),
-                    cute.group_modes(partitioned_global_sfa, 0, 3),
-                )
-                partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
-                partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_smem_sfa, partitioned_global_sfa = cpasync.tma_partition(
+                        fc2_tma_sfa_atom,
+                        self.main_vmnk_coord[2],
+                        sfa_cta_layout,
+                        cute.group_modes(self.sfa_smem_tensor, 0, 3),
+                        cute.group_modes(partitioned_global_sfa, 0, 3),
+                    )
+                    partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
+                    partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
 
                 mma_tile_m = work_tile.tile_m_idx // self.mma_cta_count
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
-                global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
+                if cutlass.const_expr(self.is_block_scaled):
+                    global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -768,14 +849,15 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         tma_desc_ptr=a_descriptor_ptr,
                         mcast_mask=multicast_mask,
                     )
-                    cute.copy(
-                        fc2_tma_sfa_atom,
-                        global_sfa_slice[(None, k_tile_idx)],
-                        partitioned_smem_sfa[(None, stage_index)],
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=sfa_descriptor_ptr,
-                        mcast_mask=multicast_mask,
-                    )
+                    if cutlass.const_expr(self.is_block_scaled):
+                        cute.copy(
+                            fc2_tma_sfa_atom,
+                            global_sfa_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfa[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfa_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                        )
 
             iket.range_pop()
             work_tile = sched_consumer.consume_work()
@@ -788,12 +870,12 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         *,
         fc1_tma_b_tensor: cute.Tensor,
         fc1_tma_b_atom_or_pair: TmaAtomOrPair,
-        fc1_tma_sfb_tensor: cute.Tensor,
-        fc1_tma_sfb_atom_or_pair: TmaAtomOrPair,
+        fc1_tma_sfb_tensor: Optional[cute.Tensor],
+        fc1_tma_sfb_atom_or_pair: Optional[TmaAtomOrPair],
         fc2_tma_b_tensor: cute.Tensor,
         fc2_tma_b_atom_or_pair: TmaAtomOrPair,
-        fc2_tma_sfb_tensor: cute.Tensor,
-        fc2_tma_sfb_atom_or_pair: TmaAtomOrPair,
+        fc2_tma_sfb_tensor: Optional[cute.Tensor],
+        fc2_tma_sfb_atom_or_pair: Optional[TmaAtomOrPair],
         ab_pipeline: pipeline.PipelineAsync,
         ab_pipeline_state: pipeline.PipelineState,
         sched_consumer: SchedulerConsumer,
@@ -801,7 +883,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         fc1_done_counter_pointer: cute.Pointer,
         fc2_spin_threshold: Int32,
     ) -> None:
-        """Run the TMA-B warp that loads token data and scale factors."""
+        """Run the TMA-B warp that loads token data and, when block-scaled, their scale factors."""
         # Partition with preferred tiling; select the active descriptor when issuing the copy.
         fc1_tma_b_partition_atom = fc1_tma_b_atom_or_pair
         fc1_tma_sfb_partition_atom = fc1_tma_sfb_atom_or_pair
@@ -809,18 +891,21 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         fc2_tma_sfb_partition_atom = fc2_tma_sfb_atom_or_pair
         if cutlass.const_expr(isinstance(fc1_tma_b_atom_or_pair, tuple)):
             fc1_tma_b_partition_atom = fc1_tma_b_atom_or_pair[0]
-            fc1_tma_sfb_partition_atom = fc1_tma_sfb_atom_or_pair[0]
             fc2_tma_b_partition_atom = fc2_tma_b_atom_or_pair[0]
-            fc2_tma_sfb_partition_atom = fc2_tma_sfb_atom_or_pair[0]
+            if cutlass.const_expr(self.is_block_scaled):
+                fc1_tma_sfb_partition_atom = fc1_tma_sfb_atom_or_pair[0]
+                fc2_tma_sfb_partition_atom = fc2_tma_sfb_atom_or_pair[0]
 
         fc1_tma_b_exec_atom = _make_executable_tma_atom_for_cluster(fc1_tma_b_atom_or_pair, self.is_fallback_cluster)
-        fc1_tma_sfb_exec_atom = _make_executable_tma_atom_for_cluster(
-            fc1_tma_sfb_atom_or_pair, self.is_fallback_cluster
-        )
+        if cutlass.const_expr(self.is_block_scaled):
+            fc1_tma_sfb_exec_atom = _make_executable_tma_atom_for_cluster(
+                fc1_tma_sfb_atom_or_pair, self.is_fallback_cluster
+            )
         fc2_tma_b_exec_atom = _make_executable_tma_atom_for_cluster(fc2_tma_b_atom_or_pair, self.is_fallback_cluster)
-        fc2_tma_sfb_exec_atom = _make_executable_tma_atom_for_cluster(
-            fc2_tma_sfb_atom_or_pair, self.is_fallback_cluster
-        )
+        if cutlass.const_expr(self.is_block_scaled):
+            fc2_tma_sfb_exec_atom = _make_executable_tma_atom_for_cluster(
+                fc2_tma_sfb_atom_or_pair, self.is_fallback_cluster
+            )
 
         b_multicast_mask = None
         sfb_multicast_mask = None
@@ -833,17 +918,19 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 self.use_2cta_instrs,
                 "b",
             )
-            sfb_multicast_mask = tma_multicast_mask(
-                self.cluster_shape_mn,
-                self.resolved_fallback_cluster_shape_mn if self.is_mixed_cga else None,
-                self.cta_coord_in_cluster,
-                self.is_preferred_cluster if self.is_mixed_cga else None,
-                self.use_2cta_instrs,
-                "sfb",
-            )
+            if cutlass.const_expr(self.is_block_scaled):
+                sfb_multicast_mask = tma_multicast_mask(
+                    self.cluster_shape_mn,
+                    self.resolved_fallback_cluster_shape_mn if self.is_mixed_cga else None,
+                    self.cta_coord_in_cluster,
+                    self.is_preferred_cluster if self.is_mixed_cga else None,
+                    self.use_2cta_instrs,
+                    "sfb",
+                )
 
         b_cta_layout = cute.make_layout(cute.slice_(self.cluster_layout_vmnk, (0, None, 0, 0)).shape)
-        sfb_cta_layout = cute.make_layout(cute.slice_(self.cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape)
+        if cutlass.const_expr(self.is_block_scaled):
+            sfb_cta_layout = cute.make_layout(cute.slice_(self.cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape)
         # Rescale fallback CTA coordinates into the preferred tile partition.
         b_partition_coord = self.main_vmnk_coord[1]
         sfb_partition_coord = self.sfb_vmnk_coord[1]
@@ -853,7 +940,8 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 b_partition_coord = b_partition_coord * Int32(split_factor)
                 sfb_partition_coord = sfb_partition_coord * Int32(split_factor)
         thread_mma = self.tiled_mma.get_slice(self.mma_cta_index)
-        thread_mma_sfb = self.tiled_mma_sfb.get_slice(self.mma_cta_index)
+        if cutlass.const_expr(self.is_block_scaled):
+            thread_mma_sfb = self.tiled_mma_sfb.get_slice(self.mma_cta_index)
 
         work_tile = sched_consumer.consume_work()
         while work_tile.is_valid_tile:
@@ -865,7 +953,10 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 iket.range_pop()
                 k_tile_count = self.fc1_k_tile_count
                 real_b, b_descriptor_ptr = kernel_extension.get_gmem_tensor("b", fc1_tma_b_tensor, work_tile)
-                real_sfb, sfb_descriptor_ptr = kernel_extension.get_gmem_tensor("sfb", fc1_tma_sfb_tensor, work_tile)
+                if cutlass.const_expr(self.is_block_scaled):
+                    real_sfb, sfb_descriptor_ptr = kernel_extension.get_gmem_tensor(
+                        "sfb", fc1_tma_sfb_tensor, work_tile
+                    )
 
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
@@ -875,11 +966,13 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         real_b = cute.domain_offset((load_shift, 0, 0), real_b)
 
                 global_b = cute.local_tile(real_b, cute.slice_(self.mma_tiler_mnk, (0, None, None)), (None, None, None))
-                global_sfb = cute.local_tile(
-                    real_sfb, cute.slice_(self.mma_tiler_sfb, (0, None, None)), (None, None, None)
-                )
+                if cutlass.const_expr(self.is_block_scaled):
+                    global_sfb = cute.local_tile(
+                        real_sfb, cute.slice_(self.mma_tiler_sfb, (0, None, None)), (None, None, None)
+                    )
                 partitioned_global_b = thread_mma.partition_B(global_b)
-                partitioned_global_sfb = thread_mma_sfb.partition_B(global_sfb)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_global_sfb = thread_mma_sfb.partition_B(global_sfb)
 
                 partitioned_smem_b, partitioned_global_b = cpasync.tma_partition(
                     fc1_tma_b_partition_atom,
@@ -888,21 +981,23 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                     cute.group_modes(self.b_smem_tensor, 0, 3),
                     cute.group_modes(partitioned_global_b, 0, 3),
                 )
-                partitioned_smem_sfb, partitioned_global_sfb = cpasync.tma_partition(
-                    fc1_tma_sfb_partition_atom,
-                    sfb_partition_coord,
-                    sfb_cta_layout,
-                    cute.group_modes(self.sfb_smem_tensor, 0, 3),
-                    cute.group_modes(partitioned_global_sfb, 0, 3),
-                )
-                partitioned_smem_sfb = cute.filter_zeros(partitioned_smem_sfb)
-                partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_smem_sfb, partitioned_global_sfb = cpasync.tma_partition(
+                        fc1_tma_sfb_partition_atom,
+                        sfb_partition_coord,
+                        sfb_cta_layout,
+                        cute.group_modes(self.sfb_smem_tensor, 0, 3),
+                        cute.group_modes(partitioned_global_sfb, 0, 3),
+                    )
+                    partitioned_smem_sfb = cute.filter_zeros(partitioned_smem_sfb)
+                    partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
 
                 global_b_slice = partitioned_global_b[(None, work_tile.tile_n_idx, None, 0)]
-                sfb_tile_n_index = work_tile.tile_n_idx
-                if cutlass.const_expr(self.cta_tile_n == 64):
-                    sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
-                global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
+                if cutlass.const_expr(self.is_block_scaled):
+                    sfb_tile_n_index = work_tile.tile_n_idx
+                    if cutlass.const_expr(self.cta_tile_n == 64):
+                        sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
+                    global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
 
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -919,15 +1014,18 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         mcast_mask=b_multicast_mask,
                     )
                     cute.copy(b_issue_atom, global_b_slice[(None, k_tile_idx)], partitioned_smem_b[(None, stage_index)])
-                    sfb_issue_atom = bind_executable_tma_load_fields(
-                        fc1_tma_sfb_exec_atom,
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=sfb_descriptor_ptr,
-                        mcast_mask=sfb_multicast_mask,
-                    )
-                    cute.copy(
-                        sfb_issue_atom, global_sfb_slice[(None, k_tile_idx)], partitioned_smem_sfb[(None, stage_index)]
-                    )
+                    if cutlass.const_expr(self.is_block_scaled):
+                        sfb_issue_atom = bind_executable_tma_load_fields(
+                            fc1_tma_sfb_exec_atom,
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfb_descriptor_ptr,
+                            mcast_mask=sfb_multicast_mask,
+                        )
+                        cute.copy(
+                            sfb_issue_atom,
+                            global_sfb_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfb[(None, stage_index)],
+                        )
             else:
                 iket.range_push("tma_token_fc2")
                 counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
@@ -943,7 +1041,10 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
 
                 k_tile_count = self.fc2_k_tile_count
                 real_b, b_descriptor_ptr = kernel_extension.get_gmem_tensor("b", fc2_tma_b_tensor, work_tile)
-                real_sfb, sfb_descriptor_ptr = kernel_extension.get_gmem_tensor("sfb", fc2_tma_sfb_tensor, work_tile)
+                if cutlass.const_expr(self.is_block_scaled):
+                    real_sfb, sfb_descriptor_ptr = kernel_extension.get_gmem_tensor(
+                        "sfb", fc2_tma_sfb_tensor, work_tile
+                    )
 
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
@@ -953,11 +1054,13 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         real_b = cute.domain_offset((load_shift, 0, 0), real_b)
 
                 global_b = cute.local_tile(real_b, cute.slice_(self.mma_tiler_mnk, (0, None, None)), (None, None, None))
-                global_sfb = cute.local_tile(
-                    real_sfb, cute.slice_(self.mma_tiler_sfb, (0, None, None)), (None, None, None)
-                )
+                if cutlass.const_expr(self.is_block_scaled):
+                    global_sfb = cute.local_tile(
+                        real_sfb, cute.slice_(self.mma_tiler_sfb, (0, None, None)), (None, None, None)
+                    )
                 partitioned_global_b = thread_mma.partition_B(global_b)
-                partitioned_global_sfb = thread_mma_sfb.partition_B(global_sfb)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_global_sfb = thread_mma_sfb.partition_B(global_sfb)
 
                 partitioned_smem_b, partitioned_global_b = cpasync.tma_partition(
                     fc2_tma_b_partition_atom,
@@ -966,21 +1069,23 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                     cute.group_modes(self.b_smem_tensor, 0, 3),
                     cute.group_modes(partitioned_global_b, 0, 3),
                 )
-                partitioned_smem_sfb, partitioned_global_sfb = cpasync.tma_partition(
-                    fc2_tma_sfb_partition_atom,
-                    sfb_partition_coord,
-                    sfb_cta_layout,
-                    cute.group_modes(self.sfb_smem_tensor, 0, 3),
-                    cute.group_modes(partitioned_global_sfb, 0, 3),
-                )
-                partitioned_smem_sfb = cute.filter_zeros(partitioned_smem_sfb)
-                partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
+                if cutlass.const_expr(self.is_block_scaled):
+                    partitioned_smem_sfb, partitioned_global_sfb = cpasync.tma_partition(
+                        fc2_tma_sfb_partition_atom,
+                        sfb_partition_coord,
+                        sfb_cta_layout,
+                        cute.group_modes(self.sfb_smem_tensor, 0, 3),
+                        cute.group_modes(partitioned_global_sfb, 0, 3),
+                    )
+                    partitioned_smem_sfb = cute.filter_zeros(partitioned_smem_sfb)
+                    partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
 
                 global_b_slice = partitioned_global_b[(None, work_tile.tile_n_idx, None, 0)]
-                sfb_tile_n_index = work_tile.tile_n_idx
-                if cutlass.const_expr(self.cta_tile_n == 64):
-                    sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
-                global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
+                if cutlass.const_expr(self.is_block_scaled):
+                    sfb_tile_n_index = work_tile.tile_n_idx
+                    if cutlass.const_expr(self.cta_tile_n == 64):
+                        sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
+                    global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
 
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -997,15 +1102,18 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         mcast_mask=b_multicast_mask,
                     )
                     cute.copy(b_issue_atom, global_b_slice[(None, k_tile_idx)], partitioned_smem_b[(None, stage_index)])
-                    sfb_issue_atom = bind_executable_tma_load_fields(
-                        fc2_tma_sfb_exec_atom,
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=sfb_descriptor_ptr,
-                        mcast_mask=sfb_multicast_mask,
-                    )
-                    cute.copy(
-                        sfb_issue_atom, global_sfb_slice[(None, k_tile_idx)], partitioned_smem_sfb[(None, stage_index)]
-                    )
+                    if cutlass.const_expr(self.is_block_scaled):
+                        sfb_issue_atom = bind_executable_tma_load_fields(
+                            fc2_tma_sfb_exec_atom,
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfb_descriptor_ptr,
+                            mcast_mask=sfb_multicast_mask,
+                        )
+                        cute.copy(
+                            sfb_issue_atom,
+                            global_sfb_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfb[(None, stage_index)],
+                        )
 
             iket.range_pop()
             work_tile = sched_consumer.consume_work()
@@ -1031,32 +1139,33 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         accumulator_layout = cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride)
         accumulator_base = cute.make_tensor(accumulator_pointer, accumulator_layout)
 
-        sfa_pointer = cute.recast_ptr(accumulator_pointer + self.num_accumulator_tmem_cols, dtype=self.sf_dtype)
-        sfa_layout = blockscaled_utils.make_tmem_layout_sfa(
-            self.tiled_mma,
-            self.mma_tiler_mnk,
-            self.sf_vec_size,
-            cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0)),
-        )
-        tmem_sfa = cute.make_tensor(sfa_pointer, sfa_layout)
+        if cutlass.const_expr(self.is_block_scaled):
+            sfa_pointer = cute.recast_ptr(accumulator_pointer + self.num_accumulator_tmem_cols, dtype=self.sf_dtype)
+            sfa_layout = blockscaled_utils.make_tmem_layout_sfa(
+                self.tiled_mma,
+                self.mma_tiler_mnk,
+                self.sf_vec_size,
+                cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0)),
+            )
+            tmem_sfa = cute.make_tensor(sfa_pointer, sfa_layout)
 
-        sfb_pointer = cute.recast_ptr(
-            accumulator_pointer + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols, dtype=self.sf_dtype
-        )
-        sfb_layout = blockscaled_utils.make_tmem_layout_sfb(
-            self.tiled_mma,
-            self.mma_tiler_mnk,
-            self.sf_vec_size,
-            cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0)),
-        )
-        tmem_sfb = cute.make_tensor(sfb_pointer, sfb_layout)
+            sfb_pointer = cute.recast_ptr(
+                accumulator_pointer + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols, dtype=self.sf_dtype
+            )
+            sfb_layout = blockscaled_utils.make_tmem_layout_sfb(
+                self.tiled_mma,
+                self.mma_tiler_mnk,
+                self.sf_vec_size,
+                cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0)),
+            )
+            tmem_sfb = cute.make_tensor(sfb_pointer, sfb_layout)
 
-        tiled_copy_sfa, partitioned_smem_sfa, partitioned_tmem_sfa = self._s2t_copy_and_partition(
-            self.sfa_smem_tensor, tmem_sfa
-        )
-        tiled_copy_sfb, partitioned_smem_sfb, partitioned_tmem_sfb = self._s2t_copy_and_partition(
-            self.sfb_smem_tensor, tmem_sfb
-        )
+            tiled_copy_sfa, partitioned_smem_sfa, partitioned_tmem_sfa = self._s2t_copy_and_partition(
+                self.sfa_smem_tensor, tmem_sfa
+            )
+            tiled_copy_sfb, partitioned_smem_sfb, partitioned_tmem_sfb = self._s2t_copy_and_partition(
+                self.sfb_smem_tensor, tmem_sfb
+            )
 
         acc_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_accumulator_pipeline_stages
@@ -1078,14 +1187,15 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
             if self.is_leader_cta:
                 accumulator = accumulator_base[(None, None, acc_stage_index)]
                 accumulator = cute.tiled_divide(accumulator, accumulator.shape)
-                mma_tmem_sfb = tmem_sfb
-                if cutlass.const_expr(self.cta_tile_n == 64):
-                    sfb_shift = (work_tile.tile_n_idx % Int32(2)) * Int32(2)
-                    shifted_sfb_pointer = cute.recast_ptr(
-                        accumulator_pointer + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols + sfb_shift,
-                        dtype=self.sf_dtype,
-                    )
-                    mma_tmem_sfb = cute.make_tensor(shifted_sfb_pointer, sfb_layout)
+                if cutlass.const_expr(self.is_block_scaled):
+                    mma_tmem_sfb = tmem_sfb
+                    if cutlass.const_expr(self.cta_tile_n == 64):
+                        sfb_shift = (work_tile.tile_n_idx % Int32(2)) * Int32(2)
+                        shifted_sfb_pointer = cute.recast_ptr(
+                            accumulator_pointer + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols + sfb_shift,
+                            dtype=self.sf_dtype,
+                        )
+                        mma_tmem_sfb = cute.make_tensor(shifted_sfb_pointer, sfb_layout)
                 next_ab_pipeline_state = ab_pipeline_state.clone()
                 next_ab_pipeline_state.advance()
                 full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
@@ -1097,21 +1207,33 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                     if k_tile_idx + 1 < k_tile_count:
                         next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
-                    s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                    cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                    cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
+                    if cutlass.const_expr(self.is_block_scaled):
+                        s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
+                        cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                        cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
                     stage_coord = (None, None, None, ab_pipeline_state.index)
-                    dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
-                        quant_kind=self.quant_kind,
-                        acc_tensor=accumulator,
-                        a_frag_tile=fragment_a[stage_coord],
-                        b_frag_tile=fragment_b[stage_coord],
-                        sfa_tensor=tmem_sfa,
-                        sfb_tensor=mma_tmem_sfb,
-                        k_tile_idx=k_tile_idx,
-                        valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
-                        mma_tiler_mnk=self.mma_tiler_mnk,
-                    )
+                    if cutlass.const_expr(self.is_block_scaled):
+                        dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                            quant_kind=self.quant_kind,
+                            acc_tensor=accumulator,
+                            a_frag_tile=fragment_a[stage_coord],
+                            b_frag_tile=fragment_b[stage_coord],
+                            sfa_tensor=tmem_sfa,
+                            sfb_tensor=mma_tmem_sfb,
+                            k_tile_idx=k_tile_idx,
+                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                            mma_tiler_mnk=self.mma_tiler_mnk,
+                        )
+                    else:
+                        dynamic_mainloop.issue_dynamic_dense_mma_tile(
+                            quant_kind=self.quant_kind,
+                            acc_tensor=accumulator,
+                            a_frag_tile=fragment_a[stage_coord],
+                            b_frag_tile=fragment_b[stage_coord],
+                            k_tile_idx=k_tile_idx,
+                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                            mma_tiler_mnk=self.mma_tiler_mnk,
+                        )
                     ab_pipeline.consumer_release(ab_pipeline_state)
                     ab_pipeline_state.advance()
                     next_ab_pipeline_state.advance()

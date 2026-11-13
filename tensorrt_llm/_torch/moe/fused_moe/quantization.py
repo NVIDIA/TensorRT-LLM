@@ -965,6 +965,93 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
         super().transform_weights(module)
 
 
+class UnquantizedMegaMoECuteDslMethod(UnquantizedFusedMoEMethod):
+    """BF16 weight lifecycle for the unquantized MegaMoE CuteDSL backend.
+
+    The fused kernel reads its weights in the shapes the unquantized parent
+    already registers -- ``w3_w1_weight`` ``(slots, expand_intermediate,
+    hidden)`` and ``w2_weight`` ``(slots, hidden, intermediate)``, K
+    innermost -- through ``transpose(1, 2)`` views, so unlike
+    :class:`NVFP4MegaMoECuteDslMethod` there are no derived ``mega_fc*``
+    buffers and the routed weights are not held twice. ``expand_intermediate``
+    is ``2 * intermediate`` for a gated activation and ``intermediate`` for
+    the non-gated Relu2.
+
+    The one transform is the FC1 row order of a gated activation. The gated
+    epilogue reads each warp's 32 TMEM lanes as 16 gate rows followed by 16
+    up rows, so the loaded ``[w3 (up) | w1 (gate)]`` rows are regrouped into
+    ``[gate16, up16]`` blocks: the permutation
+    ``NVFP4MegaMoECuteDslMethod._build_mega_format_buffers`` applies to its
+    NVFP4 rows, which ``interleave_gate_and_linear(group_size=16)`` is pinned
+    against in test_cutedsl_fc1_weight_layout.py. It runs per expert right
+    after the expert is copied in, on the routed weights and the EPLB host
+    staging alike, so both hold the kernel layout and dynamic EPLB migrates
+    kernel-ready rows. That needs both halves of an expert in one call, hence
+    full loading only for a gated activation. Relu2 has one FC1 row per
+    feature (w1 alone; w3 is empty), which the kernel reads as loaded, so a
+    partial load (an RL weight sync streams experts in buckets) overwrites
+    exactly the rows it carries; with no derived buffers, that is a complete
+    hot reload (``TrtllmCutedslMegaMoeBf16Impl._hot_reload_refusal``).
+    """
+
+    # Rows per gate block and per up block of the gated FC1 epilogue.
+    FC1_GATE_UP_INTERLEAVE = 16
+
+    def create_weights(self, module: torch.nn.Module):
+        # bf16 is the only operand type of the kernel's kind::f16 mainloop. A
+        # None module dtype is read as bf16, as the backend reads it for its
+        # output.
+        if module.dtype not in (None, torch.bfloat16):
+            raise ValueError(
+                "UnquantizedMegaMoECuteDslMethod requires bfloat16 weights; "
+                f"got dtype={module.dtype}.")
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.expand_intermediate_size_per_partition,
+                              module.hidden_size)
+        w2_weight_shape = (
+            module.expert_size_per_partition,
+            module.hidden_size,
+            module.intermediate_size_per_partition,
+        )
+        FusedMoEMethodBase.create_weights(self, module, torch.bfloat16,
+                                          w3_w1_weight_shape, w2_weight_shape)
+        self.setup_quant_scales(module)
+
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
+        if allow_partial_loading and module.is_gated_activation:
+            raise NotImplementedError(
+                "MegaMoE-CuteDSL loads a gated activation's experts whole: the "
+                "FC1 gate/up interleave needs both halves of an expert in one "
+                "load.")
+        super().load_weights(module,
+                             weights,
+                             weight_loading_mode,
+                             allow_partial_loading=allow_partial_loading)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
+        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                         dst_w3_w1_weight,
+                                         allow_partial_loading)
+        # Gated: [w3 (up) | w1 (gate)] -> [gate16, up16, gate16, up16, ...]
+        # along the rows. Relu2's rows are w1's, in the order the kernel
+        # reads them. See the class docstring.
+        if module.is_gated_activation:
+            dst_w3_w1_weight.copy_(
+                interleave_gate_and_linear(
+                    dst_w3_w1_weight,
+                    group_size=self.FC1_GATE_UP_INTERLEAVE,
+                    dim=0))
+
+
 def load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
                                          dst_fc31_input_scale: torch.Tensor):
     if w1_input_scale is not None and w1_input_scale.numel() != 0:
