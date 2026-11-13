@@ -342,6 +342,25 @@ def test_reuse_without_the_last_n(make_manager, window, recompute, reused):
     manager.free_resources(reader)
 
 
+def test_default_reuse_publishes_no_missing_window(make_manager):
+    """A request that reused a prefix without its last-N window commits only its own blocks: the
+    next request on that prefix still finds the window missing and reads it from the history."""
+    manager = make_manager(config=mixed_config())
+    tokens = list(range(640))
+    _cache_prompt(manager, tokens)
+    reader = _request(2, tokens[:512] + [9999])
+    assert manager.prepare_context(reader) and manager.resize_context(reader, 1)
+    assert manager._mixed_precision_low_prefix_len[2] == 512
+    reader.move_to_next_context_chunk()
+    manager.try_commit_blocks(reader)
+    manager.free_resources(reader)
+
+    follower = _request(3, tokens[:512] + [9999, 10000])
+    assert manager.prepare_context(follower)
+    assert manager._mixed_precision_low_prefix_len[3] == 512
+    manager.free_resources(follower)
+
+
 def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
     """A paired draft pool claims the depth the target settled on after backing off before its
     missing last-N window, and reads its own window from the history there instead of backing off
@@ -1223,7 +1242,7 @@ def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
                     assert row == -7, (layer_idx, position, row)
         # A prefix resumed without its window reads it from the COMPRESS pages: the high tables
         # drop its pages after the sink (4 and 5 of request 1).
-        manager._mixed_precision_high_start[1] = cached[1]
+        manager._mixed_precision_low_prefix_len[1] = cached[1]
         metadata.prepare()
         for ratio in (4, 128):
             high_table = metadata.mixed_precision_high_block_table[ratio].cpu()

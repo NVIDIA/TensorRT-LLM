@@ -2046,14 +2046,11 @@ class KVCacheManagerV2(BaseResourceManager):
     _supports_mixed_precision_kv = False
     # True when the manager's own pool already holds the history in the mixed-precision low format.
     _own_pool_is_mixed_precision_low = False
-    # KvCacheConfig.mixed_precision_reuse; without mixed-precision KV no prefix lacks its
-    # high-precision window, and reuse takes the plain path.
+    # KvCacheConfig.mixed_precision_reuse; "strict" is plain reuse, as without mixed precision.
     mixed_precision_reuse = "strict"
-    # Requests whose cache made its one reuse-group selection, at its first resume.
-    _mixed_precision_selected: set[int] = set()
-    # The first token whose high-precision copy a request writes itself, once it reused a prefix
-    # without its high-precision last N tokens: its high pages before that token hold nothing.
-    _mixed_precision_high_start: dict[int, int] = {}
+    # Request id -> length of the prefix it reused without the high-precision last-N window
+    # (0: none), set by its first resume; those window tokens read the history.
+    _mixed_precision_low_prefix_len: dict[int, int] = {}
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -4814,8 +4811,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # this value so the profiling run allocates it at its final size.
         self.mixed_precision_max_seq_len = max_seq_len
         self._shared_kv_layers: set[int] = set()
-        self._mixed_precision_selected: set[int] = set()
-        self._mixed_precision_high_start: dict[int, int] = {}
+        self._mixed_precision_low_prefix_len: dict[int, int] = {}
         # Tests pass plain config stand-ins that predate the mixed-precision fields.
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         # (first_n, last_n) of the cold-page compression config, if it asks for the window.
@@ -4850,7 +4846,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # dtype are the same; only pages in the cold tiers are quantized.
             self.first_n, self.last_n = cold_page_window
             self.mixed_precision_low_dtype = self.mixed_precision_high_dtype = dtype
-        # A prefix without its last-N pages is reused with its sinks; without sinks, reuse is strict.
+        # Reuse without the last N tokens keeps the sinks; with none, reuse is strict.
         if not self.first_n:
             self.mixed_precision_reuse = "strict"
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
@@ -4974,8 +4970,7 @@ class KVCacheManagerV2(BaseResourceManager):
         layers = list(config.layers)
         layer_by_id = {int(layer.layer_id): layer for layer in layers}
         roles = (Role.KEY,) if self.kv_factor == 1 else (Role.KEY, Role.VALUE)
-        # Unless reuse is strict, a prefix is reused without its last-N pages; its sinks still come
-        # with it.
+        # Sinks come with a reused prefix; the last-N window is optional unless reuse is strict.
         high_policy = (
             ReusePolicy.REQUIRED
             if self.mixed_precision_reuse == "strict"
@@ -5165,15 +5160,16 @@ class KVCacheManagerV2(BaseResourceManager):
         pages = np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor)
         # Entries past a request's blocks are left as they are.
         np.copyto(out[:, :width], pages, where=np.arange(width) < counts[:, None])
-        if self._mixed_precision_high_start and layer in self.mixed_precision_high_layers.values():
-            # A request that reused a prefix without its high-precision last N tokens reads them
-            # from the history: its high pages after the sinks and before its own tokens are empty.
+        if (
+            self._mixed_precision_low_prefix_len
+            and layer in self.mixed_precision_high_layers.values()
+        ):
+            # Window pages of a request's low prefix hold nothing: those tokens read the history.
             block = self.tokens_per_block
             sinks = -(-self.first_n // block)
             for row, request_id in zip(out, request_ids):
-                start = self._mixed_precision_high_start.get(request_id)
-                if start is not None:
-                    row[sinks : -(-start // block)] = BAD_PAGE_INDEX
+                low_len = self._mixed_precision_low_prefix_len.get(request_id, 0)
+                row[sinks : -(-low_len // block)] = BAD_PAGE_INDEX
 
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
@@ -6001,26 +5997,21 @@ class KVCacheManagerV2(BaseResourceManager):
             self.mixed_precision_reuse == "strict"
             or not req.is_first_context_chunk
             or kv_cache.is_active
-            # Only the first resume selects; a cache suspended before its first forward keeps it.
-            or req.py_request_id in self._mixed_precision_selected
+            # The first resume selects; a cache suspended before its first forward keeps that.
+            or req.py_request_id in self._mixed_precision_low_prefix_len
         ):
             return self._resume_and_restore(req.py_request_id, kv_cache)
-        # The high-precision groups claimed their first N tokens with the prefix. Their last N
-        # tokens are reused only when every page of them is cached.
+        # Sinks came with the prefix; a window is reused only when all of its pages are cached.
         windows = [kv_cache.reuse_status[group] for group in self._mixed_precision_high_groups]
         selected = [status.group_id for status in windows if status.complete]
         if not self._resume_and_restore(req.py_request_id, kv_cache, selected):
             return False
-        self._mixed_precision_selected.add(req.py_request_id)
-        # The prefix came without some last-N pages: their fresh high pages hold only the tokens
-        # this request writes, so the reused ones read the history (see _fill_page_table). A
-        # disaggregated generation request receives them from the context worker instead.
-        if (
-            len(selected) < len(windows)
-            and kv_cache.num_committed_tokens > 0
-            and not req.is_disagg_generation_init_state
-        ):
-            self._mixed_precision_high_start[req.py_request_id] = kv_cache.num_committed_tokens
+        # A missing window's fresh pages hold only what this request writes. Disaggregated
+        # generation receives the window instead.
+        missing = len(selected) < len(windows) and not req.is_disagg_generation_init_state
+        self._mixed_precision_low_prefix_len[req.py_request_id] = (
+            kv_cache.num_committed_tokens if missing else 0
+        )
         return True
 
     @cached_property
@@ -6034,10 +6025,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _mixed_precision_reuse_limit(self, req: LlmRequest, kv_cache: _KVCache) -> int | None:
-        """Reuse limit for a prefix that came without its high-precision last N tokens, or None:
-        the block boundary at its end, so the high pages after it hold only what this request
-        computes; in "recompute" mode, the one at least N tokens earlier. A
-        paired draft pool claims the depth its target settles on instead."""
+        """Block boundary to reuse a prefix up to when it came without its last-N window, or None;
+        "recompute" stops N tokens earlier. A paired draft pool takes its target's depth instead."""
         if (
             self.mixed_precision_reuse == "strict"
             or self.is_draft
@@ -6286,8 +6275,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 window_limit = self._mixed_precision_reuse_limit(req, kv_cache)
                 if window_limit is not None:
-                    # Reuse the prefix only up to a block boundary, so that the high pages after it
-                    # hold only what this request computes.
+                    # Stop at a block boundary: the window pages after it hold only what this request
+                    # computes.
                     self._remove_kv_cache(req.py_request_id)
                     tokens = self._context_reuse_tokens(req, window_limit)
                     num_lookup_tokens = len(tokens)
@@ -8613,8 +8602,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.discard_pending_stats()
         if self._sharing is not None:
             self._sharing._on_free(request_id, kv_cache)
-        self._mixed_precision_selected.discard(request_id)
-        self._mixed_precision_high_start.pop(request_id, None)
+        self._mixed_precision_low_prefix_len.pop(request_id, None)
         kv_cache.close()
         self.impl.clear_stats_excluded(request_id)
         if request_id in self._early_freed_index_requests:
