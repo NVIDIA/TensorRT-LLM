@@ -113,7 +113,7 @@ def supports_context_first_bf16(
         and manager.is_disagg
         and manager.dtype == DataType.BF16
         and manager.kv_cache_type == CacheTypeCpp.SELF
-        and manager.low_precision_dtype is None
+        and manager.mixed_precision_low_dtype is None
         and not manager.get_disagg_ignored_roles()
         and not mapping.enable_attention_dp
         and mapping.tp_size in (1, 2)

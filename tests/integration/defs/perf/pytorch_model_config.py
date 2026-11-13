@@ -108,6 +108,32 @@ def get_model_yaml_config(model_label: str,
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
         {
+            'patterns': ['muse_spark_open_nvfp4-serve-pytorch'],
+            'config': {
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'disable_overlap_scheduler': False,
+                'attn_backend': 'TRTLLM',
+                'allreduce_strategy': 'NCCL',
+                'max_seq_len': 49152,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 256,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': True,
+                    'free_gpu_memory_fraction': 0.8,
+                    'use_kv_cache_manager_v2': True,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
             'patterns': ['deepseek_v41_flash_nvfp4'],
             'config': {
                 'gpus_per_node': 4,
@@ -355,9 +381,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Single-node experimental adaptation of the NVFP4 DSpark generation
-        # recipe in tests/scripts/perf/disaggregated/
-        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Single-node experimental NVFP4 DSpark generation recipe.
         # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
         # The blog does not provide a tuned single-node NVFP4 DSpark config.
         {
@@ -524,6 +548,38 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # NVFP4 on SM100 requires the Modeling V2 split/fused targets.
+        {
+            'patterns': [
+                'glm_5.3_flash_nvfp4-serve-pytorch',
+                'glm_5.3_flash_nvfp4_mtp-serve-pytorch',
+            ],
+            'config': {
+                'modeling_v2': 'require',
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 8192,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_nvfp4_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
         # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).
@@ -611,9 +667,8 @@ def get_model_yaml_config(model_label: str,
             }
         },
         # Gemma 4 NVFP4: VSWA (1024-token sliding window) plus per-layer
-        # head_dim 256/512. The FLASHINFER backend is selected by the model's
-        # own get_model_defaults(), so it is not repeated here. KV-cache reuse
-        # is disabled to match the validated accuracy configuration.
+        # head_dim 256/512. KV-cache reuse is disabled to match the validated
+        # accuracy configuration.
         {
             'patterns': ['gemma_4_'],
             'config': {
@@ -1053,6 +1108,13 @@ def get_model_yaml_config(model_label: str,
                     recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
+    # Gemma4 NVFP4 needs FlashInfer for its 512-wide attention heads on SM107.
+    if (model_label.lower().startswith(
+        ('gemma_4_26b_a4b_nvfp4-', 'gemma_4_31b_it_nvfp4-'))
+            and '-pytorch-' in model_label.lower()
+            and _get_sm_version_safe() == 107):
+        base_config['attn_backend'] = 'FLASHINFER'
+
     # DeepSeek FP8 (block-scale) models on Blackwell (SM100+) must use the
     # DEEPGEMM MoE backend; the default CUTLASS backend's FP8 block-scale path
     # JIT-compiles DeepGEMM kernels that only target Hopper (SM90).
@@ -1063,8 +1125,9 @@ def get_model_yaml_config(model_label: str,
             moe_config = base_config.setdefault('moe_config', {})
             moe_config.setdefault('backend', 'DEEPGEMM')
 
-    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly; other
-    # GPUs keep the model's own get_model_defaults() choice.
+    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly. Gemma 4
+    # NVFP4 on SM107 is forced to FLASHINFER above; other GPUs keep the
+    # model's own get_model_defaults() choice.
     if 'gemma_4_' in model_label.lower() and _get_sm_version_safe() == 121:
         base_config['attn_backend'] = 'FLASHINFER'
 

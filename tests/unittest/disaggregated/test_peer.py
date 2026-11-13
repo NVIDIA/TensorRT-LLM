@@ -40,7 +40,10 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    NATIVE_TRANSFER_PROTOCOL_VERSION,
+    RankInfo,
+)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
@@ -711,6 +714,7 @@ def test_receiver_rejects_view_mismatch_before_registration(
         for rid in (1, 2):
             params = SimpleNamespace(ctx_info_endpoint=bad_endpoint, ctx_dp_rank=0)
             task = KVRecvTask(rid, chunk, slice_id=0, params=params, aux_slot=None)
+            task._enforce_physical_ownership = enforce_physical_ownership
             if enforce_physical_ownership:
                 task.begin_publication()
 
@@ -913,6 +917,17 @@ def test_peer_registrar_incompatible_peer_raises():
         instance_name="peer", instance_rank=3, is_mla=True, page_table=make_page_table()
     )
     with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_peer_registrar_rejects_mismatched_protocol_version():
+    # A peer whose native transfer protocol version differs is rejected at
+    # registration, before any other RankInfo field is trusted.
+    self_rankinfo = make_rankinfo(instance_name="local")
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(instance_name="peer", instance_rank=4, page_table=make_page_table())
+    peer_ri.protocol_version = NATIVE_TRANSFER_PROTOCOL_VERSION + 1
+    with pytest.raises(ValueError, match="protocol version"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
@@ -1822,3 +1837,29 @@ def test_attention_replicated_validation_rejects_missing_index_key_view():
     peer_pt = make_page_table(global_layer_ids=[0])
     with pytest.raises(ValueError, match="AttentionPolicy.*differ on overlapping layers"):
         AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
+
+
+@pytest.mark.parametrize(("local_draft", "peer_draft"), [(0, 0), (1, 1), (1, 0), (0, 1)])
+def test_peer_registrar_requires_matching_unified_draft_layers(
+    local_draft: int, peer_draft: int
+) -> None:
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = local_draft
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.num_draft_layers = peer_draft
+    if local_draft != peer_draft:
+        with pytest.raises(
+            ValueError,
+            match=f"draft KV layer count differs.*local={local_draft}, peer={peer_draft}",
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri

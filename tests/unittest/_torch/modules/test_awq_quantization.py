@@ -43,6 +43,7 @@ def test_linear_nvfp4_awq_pre_quant_scale(has_scale):
         quant_config=quant_config,
     ).cuda()
 
+    scale = None
     # Set pre_quant_scale based on test parameter (skip weight init as it's quantized)
     if has_scale:
         scale = torch.full((in_features,), 0.5, dtype=torch.bfloat16, device="cuda")
@@ -82,7 +83,7 @@ def test_linear_nvfp4_awq_pre_quant_scale(has_scale):
 
     assert captured_input is not None, "fp4_quantize was not called"
 
-    if has_scale:
+    if scale is not None:
         # Should be scaled
         expected = x * scale
         assert torch.allclose(captured_input, expected, rtol=1e-5, atol=1e-5), (

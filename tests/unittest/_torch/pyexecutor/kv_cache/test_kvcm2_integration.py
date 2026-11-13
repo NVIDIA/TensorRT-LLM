@@ -15,33 +15,52 @@
 
 import array
 import os
+import sys
+from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor._util import _get_num_storage_pool_groups
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    HostMemoryLimits,
     KVCacheLayerOwner,
     KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
     _extend_swa_windows_for_reuse,
+    _get_generation_kv_capacity,
+    _get_kv_alloc_extra_tokens,
     _KVCacheManagerInitStatus,
+    _raise_on_every_rank,
     _swa_branch_snapshot_point,
     _swa_endpoint_priority,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
+    SPARSE_ARENA_ALIGNMENT,
+    HostHistoryReservations,
+    sparse_arena_bytes,
+    sparse_arena_shapes,
+    sparse_batch_shape,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -50,23 +69,32 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheT
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
+    CapacitySchedulerPolicy,
+    DecodingBaseConfig,
     DFlashDecodingConfig,
+    DraftTargetDecodingConfig,
+    DSparkDecodingConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     PARDDecodingConfig,
+    SparseKvCacheOffloadConfig,
 )
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
+    CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
+    GPU_LEVEL,
     AttentionLayerConfig,
     AttnLifeCycle,
+    Batch,
     BatchDesc,
     BufferConfig,
     BufferId,
     CacheLevel,
+    CacheTier,
     CudaStream,
     DataRole,
     DiskCacheTierConfig,
@@ -79,6 +107,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
     ReusePolicy,
     ReuseScope,
+    SparseCacheConfig,
     SsmLayerConfig,
     _introspection,
 )
@@ -151,6 +180,8 @@ def test_create_kv_cache_swa_endpoint_priority(
     manager.num_pools = 0
     manager.impl = Mock()
     manager.impl.create_kv_cache.return_value.beam_width = 1
+    # Belongs to no Batch, so it still owns its page index buffers.
+    manager.impl.create_kv_cache.return_value.batch_row = None
 
     manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=prompt)
 
@@ -326,6 +357,7 @@ def _make_cache_config_for_test(
     pp_layers: list[int] | None = None,
     dtype: DataType = DataType.HALF,
     kv_cache_type: CacheType = CacheType.SELFKONLY,
+    sparse_kv_offload: SparseKvCacheOffloadConfig | None = None,
 ) -> KVCacheManagerConfig:
     if max_attention_window_vec is None:
         max_attention_window_vec = [None]
@@ -335,6 +367,7 @@ def _make_cache_config_for_test(
 
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.layer_specs = None
+    cache_manager._sparse_kv_offload = sparse_kv_offload
     cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype
@@ -421,11 +454,9 @@ def _make_manager_for_cache_tier_test(
         None,
     )
     if fake_impl is not None:
-        fake_impl.layer_grouping = [[0]]
+        fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
         fake_impl.pool_group_descs = []
         fake_impl.get_layer_group_id.side_effect = lambda _: 0
-        fake_impl.all_buffer_ids = [BufferId(LayerId(0), Role.KEY)]
-        fake_impl.is_sparse.return_value = False
 
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     with (
@@ -659,6 +690,107 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
         manager.shutdown()
 
 
+def _layer_api_snapshot(manager: KVCacheManagerV2) -> dict:
+    """A manager's built cache config and layer-based API, with pool addresses as (pool, offset)."""
+    impl = manager.impl
+    config = manager.kv_cache_manager_py_config
+    pools = {
+        int(pool.base_address): (int(group.pool_group_index), int(pool.pool_index))
+        for group in impl.pool_group_descs
+        for pool in group.pools
+    }
+
+    def pool_offset(address: int):
+        if address == 0:
+            return None
+        base = max(base for base in pools if base <= address)
+        return pools[base], address - base
+
+    return {
+        "layers": [
+            (
+                type(layer).__name__,
+                int(layer.layer_id),
+                [
+                    (str(buffer.role), buffer.size, buffer.coalescing_group, buffer.reuse_policy)
+                    for buffer in layer.buffers
+                ],
+                getattr(layer, "sliding_window_size", None),
+                layer.reuse_policy,
+            )
+            for layer in config.layers
+        ],
+        "commit_min_snapshot": config.commit_min_snapshot,
+        "regions": [region.name for region in config.regions],
+        "initial_pool_ratio": config.initial_pool_ratio,
+        "pool_groups": [
+            (int(group.num_slots), list(group.slot_desc.slot_size_list), len(group.pools))
+            for group in impl.pool_group_descs
+        ],
+        "layer_grouping": [[int(layer_id) for layer_id in group] for group in impl.layer_grouping],
+        "layer_group_ids": [
+            int(impl.get_layer_group_id(LayerId(layer_id)))
+            for layer_id in range(manager.num_local_layers)
+        ],
+        "layer_to_pool_mapping_dict": dict(manager.layer_to_pool_mapping_dict),
+        "pool_pointers": [
+            pool_offset(int(address))
+            for address in manager.kv_cache_pool_pointers.flatten().tolist()
+        ],
+        "pool_mapping": manager.kv_cache_pool_mapping.tolist(),
+        "index_scales": manager.index_scales.tolist(),
+        "block_offsets_shape": tuple(manager.host_kv_cache_block_offsets.shape),
+    }
+
+
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_manager_without_regions_builds_as_before(monkeypatch, enable_block_reuse: bool) -> None:
+    """Without regions, the region hooks change neither the built cache nor the layer-based API."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+
+    def build() -> KVCacheManagerV2:
+        return KVCacheManagerV2(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+                enable_block_reuse=enable_block_reuse,
+                max_attention_window=[MAX_SEQ_LEN, 8],
+                pool_ratio=[0.5, 0.5],
+            ),
+            CacheType.SELF,
+            num_layers=4,
+            num_kv_heads=2,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )
+
+    manager = build()
+    try:
+        assert manager.region_layout == RegionLayout()
+        assert manager.get_region_group_ids("recurrent_state") == ()
+        with_hooks = _layer_api_snapshot(manager)
+    finally:
+        manager.shutdown()
+    with monkeypatch.context() as patch:
+        patch.setattr(KVCacheManagerV2, "_declare_regions", lambda self: None)
+        patch.setattr(KVCacheManagerV2, "_lay_out_regions", lambda self, config: config)
+        manager = build()
+        try:
+            without_hooks = _layer_api_snapshot(manager)
+        finally:
+            manager.shutdown()
+
+    assert with_hooks == without_hooks
+    assert len(with_hooks["layer_grouping"]) == 2
+
+
 @pytest.mark.parametrize("kv_first", [False, True], ids=["key-first", "kv-first"])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layout: str) -> None:
@@ -762,6 +894,85 @@ def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layo
             assert torch.all(key_buffer[3 * slot, 0] == 10 + ordinal)
             assert torch.all(kv_buffer[slot, 0] == 20 + ordinal)
             assert torch.all(kv_buffer[slot, 1] == 30 + ordinal)
+    finally:
+        manager.shutdown()
+
+
+def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    torch.cuda.init()
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=2,
+        head_dim=8,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    # Equal byte sizes coalesce the FP8 target and BF16 draft pages, placing
+    # the draft's K buffer at a nonzero offset within each physical slot.
+    draft = replace(
+        target,
+        global_layer_id=1,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+    )
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=target.num_kv_heads,
+        head_dim=target.head_dim,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.FP8,
+        layer_specs=[target, draft],
+    )
+    try:
+        assert manager._use_per_layer_page_tables
+        request_ids = [7, 9]
+        for request_id, num_blocks in zip(request_ids, (2, 3)):
+            cache = manager._create_kv_cache(request_id, None, None)
+            assert cache.resume(manager._stream.cuda_stream)
+            assert cache.resize(num_blocks * TOKENS_PER_BLOCK, 0)
+
+        worker = object.__new__(DFlashWorker)
+        worker._ctx_unified_cache = True
+        pool = worker._managed_ctx_pool(
+            manager, 1, draft.num_kv_heads, draft.head_dim, torch.bfloat16, 2
+        )
+        assert pool is not None
+        assert worker._init_ctx_block_tables(
+            manager, pool, len(request_ids), 1, draft.num_kv_heads, draft.head_dim, TOKENS_PER_BLOCK
+        )
+        assert worker._ctx_block_offset > 0
+
+        block_offsets = torch.empty(
+            (manager.num_attention_op_pools, len(request_ids), 2, manager.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        manager.copy_batch_block_offsets(
+            block_offsets, request_ids, beam_width=1, num_contexts=0, num_seqs=len(request_ids)
+        )
+        metadata = SimpleNamespace(kv_cache_block_offsets=block_offsets)
+        assert worker._refresh_ctx_block_tables(metadata, len(request_ids))
+
+        expected = manager.get_batch_cache_indices(request_ids, layer_idx=draft.global_layer_id)
+        for row, indices in enumerate(expected):
+            assert len(indices) == (2, 3)[row]
+            assert worker._ctx_block_tables[row, : len(indices)].tolist() == indices
     finally:
         manager.shutdown()
 
@@ -947,6 +1158,50 @@ def test_zero_size_filter_preserves_ssm_and_nonempty_extra_buffers() -> None:
     assert filtered.initial_pool_ratio == pytest.approx([0.25, 0.75])
 
 
+def test_zero_size_filter_keeps_a_sparse_fetch_path() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.pp_layers = [0, 1]
+    manager.num_layers = 2
+    manager.num_local_layers = 2
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager.num_kv_heads_per_layer = [1, 1]
+    manager.head_dim_per_layer = [64, 64]
+    manager.max_attention_window_vec = [None, None]
+    cache = SparseCacheConfig(
+        num_selected_blocks=1, max_cached_units=2, unit_tokens=TOKENS_PER_BLOCK
+    )
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=1024, is_sparse=True),
+                    BufferConfig(role=Role.VALUE, size=256),
+                    BufferConfig(role=Role.INDEX_KEY, size=0),
+                ],
+                sparse_cache=cache,
+            ),
+            # Its only sparse buffer is empty, so nothing is left to fetch.
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=0, is_sparse=True),
+                    BufferConfig(role=Role.VALUE, size=256),
+                ],
+                sparse_cache=cache,
+            ),
+        ],
+    )
+
+    kept, emptied = manager._remove_zero_size_buffers(config).layers
+
+    assert kept.sparse_cache is not None
+    assert kept.sparse_cache.max_cached_units == 2
+    assert emptied.sparse_cache is None
+
+
 def test_zero_size_filter_rejects_empty_local_cache() -> None:
     manager = object.__new__(KVCacheManagerV2)
     config = KVCacheManagerConfig(
@@ -1020,6 +1275,67 @@ def test_zero_size_filter_preserves_layer_and_buffer_reuse_policies() -> None:
     assert private_layer.reuse_policy == ReusePolicy.PRIVATE
 
 
+def test_layer_group_helpers_describe_split_ssm_layers() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=4096)],
+                sliding_window_size=8,
+            ),
+            *[
+                SsmLayerConfig(
+                    layer_id=LayerId(layer_id),
+                    buffers=[
+                        BufferConfig(role=DataRole("ssm_state"), size=4096),
+                        BufferConfig(
+                            role=DataRole("old_x"), size=2048, reuse_policy=ReusePolicy.PRIVATE
+                        ),
+                    ],
+                )
+                for layer_id in (1, 2)
+            ],
+        ],
+        commit_min_snapshot=True,
+    )
+    impl = KVCacheManager(config)
+    try:
+        manager = object.__new__(KVCacheManagerV2)
+        manager.max_seq_len = MAX_SEQ_LEN
+        manager.tokens_per_block = TOKENS_PER_BLOCK
+        manager.kv_cache_manager_py_config = config
+        manager.impl = impl
+        manager._layer_group_life_cycles = None
+
+        attention = impl.get_layer_group_id(LayerId(0))
+        required = impl.get_buffer_group_id(LayerId(1), DataRole("ssm_state"))
+        private = impl.get_buffer_group_id(LayerId(1), DataRole("old_x"))
+        assert len({attention, required, private}) == 3
+        assert sorted({buffer.layer_id for buffer in impl.buffer_grouping[private]}) == [1, 2]
+
+        assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {attention: 8}
+        assert manager._get_event_window_sizes_by_layer_group() == {
+            attention: 8,
+            required: MAX_SEQ_LEN,
+            private: MAX_SEQ_LEN,
+        }
+        life_cycles = manager._life_cycle_by_layer_group()
+        assert life_cycles[attention].window_size == 8
+        assert life_cycles[required].window_size is None
+        assert life_cycles[private].window_size is None
+        metadata = manager._stats_life_cycle_metadata()
+        assert metadata[attention][1:] == (8, "attention")
+        assert metadata[required][1:] == (None, "ssm")
+        assert metadata[private][1:] == (None, "ssm")
+        assert len({metadata[group][0] for group in (attention, required, private)}) == 3
+    finally:
+        impl.shutdown()
+
+
 @pytest.mark.parametrize("sliding_window_size", [None, 8])
 @pytest.mark.parametrize("attention_first", [False, True])
 def test_event_window_sizes_filter_attention_without_backend_internals(
@@ -1042,7 +1358,11 @@ def test_event_window_sizes_filter_attention_without_backend_internals(
     )
     # Match the C++ binding surface: layer_grouping is public, while the
     # Python implementation's private _life_cycles registry is absent.
-    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]] if attention_first else [[1], [0]])
+    manager.impl = SimpleNamespace(
+        buffer_grouping=[
+            [BufferId(LayerId(i), Role.KEY)] for i in ([0, 1] if attention_first else [1, 0])
+        ]
+    )
 
     attention_group_id = 0 if attention_first else 1
     window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
@@ -1343,11 +1663,14 @@ def test_extend_swa_windows_for_reuse_preserves_non_attention_windows() -> None:
     ) == [None, 0, recurrent_states, 6, None]
 
 
-def test_pool_ratio_overrides_constraints() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+def test_pool_ratio_overrides_constraints(offload: bool) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(pool_ratio=[1.0], avg_seq_len=256, host_cache_size=0),
         max_batch_size=3,
         max_num_tokens=2048,
+        sparse_kv_offload=SparseKvCacheOffloadConfig() if offload else None,
     )
 
     assert config.initial_pool_ratio == pytest.approx([1.0])
@@ -1383,6 +1706,81 @@ def test_avg_seq_len_builds_context_warmup_constraint() -> None:
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
     )
     assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("avg_seq_len", "capacity"), [(1024, 897), (None, 1921)], ids=["avg_seq_len", "max_seq_len"]
+)
+def test_sparse_kv_offload_typical_step_models_only_decoding(
+    avg_seq_len: int | None, capacity: int
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0, avg_seq_len=avg_seq_len),
+        max_batch_size=3,
+        max_seq_len=2048,
+        max_num_tokens=2048,
+        sparse_kv_offload=SparseKvCacheOffloadConfig(),
+    )
+
+    # Decode-only sizing samples a block boundary within avg_seq_len or max_seq_len,
+    # with no context warmup batch. The native manager still derives the pool ratio.
+    assert config.typical_step == BatchDesc(
+        [KVCacheDesc(capacity=capacity, history_length=capacity - 1)] * 3
+    )
+    assert config.constraints == []
+    assert config.initial_pool_ratio is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_seq_len", "full_history_pages"),
+    [
+        (1, 1),
+        (127, 1),
+        (128, 1),
+        (129, 2),
+        (255, 2),
+        (256, 2),
+        (257, 3),
+        (32768, 256),
+        (32769, 257),
+        (33024, 258),
+        (33025, 259),
+    ],
+)
+@pytest.mark.parametrize("num_sink_tokens", [0, 129])
+def test_sparse_kv_offload_pool_sizing_covers_window_boundaries(
+    max_seq_len: int, full_history_pages: int, num_sink_tokens: int
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0),
+        max_seq_len=max_seq_len,
+        sparse_kv_offload=SparseKvCacheOffloadConfig(),
+    )
+    tokens_per_block = config.tokens_per_block
+    generation = config.typical_step.kv_caches[0]
+    assert 0 < generation.capacity <= max_seq_len
+    assert generation.history_length == generation.capacity - 1
+    assert (generation.capacity + tokens_per_block - 1) // tokens_per_block == full_history_pages
+
+    def required_pages(life_cycle: AttnLifeCycle, capacity: int) -> int:
+        stale = life_cycle.get_stale_range(capacity - 1, tokens_per_block)
+        return (capacity + tokens_per_block - 1) // tokens_per_block - len(stale)
+
+    for window in (None, 1, 8, 128, 129, 256, 65536):
+        life_cycle = AttnLifeCycle.make(
+            window, num_sink_tokens if window is not None else 0, tokens_per_block
+        )
+        # Native lifecycle accounting must cover every decode phase, including
+        # windows shorter than a page, non-aligned windows and retained sinks.
+        peak_pages = max(
+            required_pages(life_cycle, capacity)
+            for capacity in range(max(1, max_seq_len - tokens_per_block + 1), max_seq_len + 1)
+        )
+        assert required_pages(life_cycle, generation.capacity) == peak_pages, window
+        if max_seq_len == 33024 and num_sink_tokens == 0 and window in (8, 128):
+            assert peak_pages == 2
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
@@ -1568,7 +1966,7 @@ def test_host_init_failure_propagates_with_disk_tier(tmp_path) -> None:
 @pytest.mark.cpu_only
 def test_cold_codec_provider_receives_draft_role() -> None:
     impl = Mock()
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     codec_provider.create_cold_page_codec.return_value = object()
     _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20),
@@ -1592,7 +1990,7 @@ def test_cold_codec_provider_receives_draft_role() -> None:
 def test_cold_codec_provider_receives_layer_spec_dtype(
     manager_dtype: DataType, layer_dtype: DataType
 ) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     layer = KVCacheLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
@@ -1617,7 +2015,7 @@ def test_cold_codec_provider_receives_layer_spec_dtype(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("manager_dtype", [DataType.HALF, DataType.BF16])
 def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataType) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20),
         [Mock()],
@@ -1636,7 +2034,7 @@ def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataTy
 def test_cold_codec_provider_rejects_mixed_layer_spec_dtypes(
     layer_dtypes: tuple[DataType, DataType],
 ) -> None:
-    codec_provider = Mock()
+    codec_provider = Mock(mixed_precision_high_window=None)
     layer_specs = [
         KVCacheLayerSpec(
             global_layer_id=layer_id,
@@ -1788,6 +2186,8 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager.kv_compression_manages_history = False
     # Fresh-page fill is off; the allocation path calls it unconditionally.
     manager._fresh_page_fill = None
+    # No windowed pools; the window-crossing check reads them on every growth.
+    manager._windowed_layer_group_sizes = {}
 
     assert manager.try_allocate_generation(request)
     assert kv_cache.resize.call_args_list[0].args == (105,)
@@ -1885,6 +2285,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     manager.is_draft = True
     manager.enable_block_reuse = True
     manager.enable_joint_kv_cache_reuse = True
+    manager._mirror_uses_draft_view = True
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     observed_progress_views = []
 
@@ -1908,6 +2309,911 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     assert observed_progress_views == [False, False]
     assert not request.use_draft_model
     manager._required_gen_capacity.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    (
+        "uses_draft_view",
+        "disagg_gen_init",
+        "position",
+        "mirror_capacity",
+        "mirror_history",
+        "expected_resize",
+        "dflash",
+    ),
+    [
+        # External drafter (target view), aggregated chunked prefill. The
+        # prompt is 8192 + 2 * 1024 tokens, so the 1024-token chunk at 8192 is
+        # not the last one and carries no draft tokens.
+        pytest.param(False, False, 0, 0, 0, (1024, 0), False, id="first_chunk"),
+        # A later chunk of a mirror that holds [0, 8192): the chunk start is
+        # history, so a sliding window drops the pages below it.
+        pytest.param(False, False, 8192, 8192, 4096, (9216, 8192), False, id="later_chunk"),
+        # The history is already ahead of the chunk start; a resize never
+        # lowers it.
+        pytest.param(False, False, 8192, 8192, 8704, (9216, 8704), False, id="history_ahead"),
+        # A mirror first seen past position 0 (a target prefix this worker did
+        # not compute). A DFlash/DSpark pool takes the chunk start as history:
+        # that drafter stores the chunk at its target position above the
+        # prefix. Any other keeps its history and covers [0, chunk end).
+        pytest.param(False, False, 8192, 0, 0, (9216, 8192), True, id="fresh_past_zero-dflash"),
+        pytest.param(False, False, 8192, 0, 0, (9216, None), False, id="fresh_past_zero-pard"),
+        # Target chunk progress sizes the mirror while its history is preserved.
+        pytest.param(True, False, 8192, 8192, 0, (9216, None), False, id="draft_view"),
+        # Disaggregated generation init: the mirror holds no drafter K/V for
+        # the transferred prompt (10240 tokens), so the whole prompt is
+        # history; the capacity stays absolute, as the drafter's positions.
+        pytest.param(False, True, 0, 0, 0, (10243, 10240), False, id="disagg_gen_init-target_view"),
+        pytest.param(True, True, 0, 0, 0, (10243, None), False, id="disagg_gen_init-draft_view"),
+    ],
+)
+def test_unpaired_draft_mirror_context_resize(
+    uses_draft_view: bool,
+    disagg_gen_init: bool,
+    position: int,
+    mirror_capacity: int,
+    mirror_history: int,
+    expected_resize: tuple,
+    dflash: bool,
+) -> None:
+    """Which request view an unpaired draft mirror reads, and the capacity and
+    history its context resize asks for."""
+    prompt, chunk, draft_len = 8192 + 2 * 1024, 1024, 3
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=4,
+        input_tokens=[0] * prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * draft_len,
+    )
+    if disagg_gen_init:
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        assert request.is_last_context_chunk
+    else:
+        request.state = LlmRequestState.CONTEXT_INIT
+        request.context_current_position = position
+        request.context_chunk_size = chunk
+        assert not request.is_last_context_chunk
+
+    kv_cache = Mock(is_active=True, capacity=mirror_capacity, history_length=mirror_history)
+    views = []
+    kv_cache.resize.side_effect = lambda *args: views.append(request.use_draft_model) or True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    manager._mirror_uses_draft_view = uses_draft_view
+    manager._is_dflash_draft = dflash
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk.append(request)
+    manager._prepare_draft_resources(batch)
+
+    kv_cache.resize.assert_called_once_with(*expected_resize)
+    assert views == [False]
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_unpaired_draft_mirror_that_cannot_grow_raises_with_the_pool_diagnostic(phase: str) -> None:
+    """When a mirror finds no page to grow into, the iteration fails
+    explicitly: the mirror left at its size has no storage for the K/V the
+    drafter writes next, and there is no per-request way to skip drafting.
+    The error carries the pool diagnostic."""
+    position, chunk, draft_len = 8192, 1024, 3
+
+    def make_request(request_id: int) -> LlmRequest:
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=4,
+            input_tokens=[0] * (position + chunk),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            draft_tokens=[1] * draft_len,
+        )
+        if phase == "context":
+            request.state = LlmRequestState.CONTEXT_INIT
+            request.context_current_position = position
+            request.context_chunk_size = chunk
+        else:
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        return request
+
+    requests = [make_request(51), make_request(52)]
+    caches = {
+        51: Mock(is_active=True, capacity=position, history_length=position, beam_width=1),
+        52: Mock(is_active=True, capacity=position, history_length=position, beam_width=1),
+    }
+    caches[51].resize.return_value = True
+    caches[52].resize.return_value = False
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    manager._mirror_uses_draft_view = False
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = dict(caches)
+    manager._allocated_draft_lens = set()
+    manager._resume_and_restore = Mock(return_value=True)
+    manager._required_gen_capacity = Mock(return_value=position + 1 + draft_len)
+    manager._draft_pool_diagnostic = Mock(return_value=" [draft pool: full]")
+    manager.kv_cache_type = CacheType.SELF
+    manager.max_beam_width = 1
+
+    batch = ScheduledRequests()
+    if phase == "context":
+        batch.context_requests_last_chunk.extend(requests)
+        expected_resize = call(position + chunk + draft_len, position)
+        expected_capacity = position + chunk + draft_len
+    else:
+        batch.generation_requests.extend(requests)
+        expected_resize = call(position + 1 + draft_len)
+        expected_capacity = position + 1 + draft_len
+    with pytest.raises(RuntimeError) as excinfo:
+        manager._prepare_draft_resources(batch)
+
+    assert caches[51].resize.call_args_list == [expected_resize]
+    assert caches[52].resize.call_args_list == [expected_resize]
+    message = str(excinfo.value)
+    assert f"Draft KV cache {phase} resize failed for request 52" in message
+    assert f"could not resize to {expected_capacity} tokens" in message
+    assert "[draft pool: full]" in message
+
+
+def test_exhausted_pool_fails_explicitly_on_an_empty_fresh_mirror() -> None:
+    """A fresh mirror whose first resize fails holds no page at all. The
+    manager raises before the forward, with a diagnostic that shows the empty
+    mirror and how full the pool was."""
+    prompt, draft_len = 1024, 3
+    request = LlmRequest(
+        request_id=61,
+        max_new_tokens=4,
+        input_tokens=[0] * prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * draft_len,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 0
+    request.context_chunk_size = prompt
+
+    # Two occupants with distinct fields, so a swapped field or a max in
+    # place of the sum changes the message.
+    occupant = Mock(is_active=True, capacity=1216, history_length=512, num_blocks=38)
+    small = Mock(is_active=True, capacity=64, history_length=0, num_blocks=2)
+    fresh = Mock(is_active=True, capacity=0, history_length=0, num_blocks=0)
+    fresh.resize.return_value = False
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    manager._mirror_uses_draft_view = False
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {60: occupant, 62: small, 61: fresh}
+    manager.max_attention_window_vec = [2048]
+    manager._gpu_max_tokens = 1216
+    manager._resume_and_restore = Mock(return_value=True)
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk.append(request)
+    with pytest.raises(RuntimeError) as excinfo:
+        manager._prepare_draft_resources(batch)
+
+    fresh.resize.assert_called_once_with(prompt + draft_len, 0)
+    message = str(excinfo.value)
+    assert (
+        f"context resize failed for request 61: could not resize to {prompt + draft_len} tokens"
+        in message
+    )
+    assert "3 live caches, capacity 1280 tokens in 40 logical blocks" in message
+    assert "60: capacity=1216 history=512 logical_blocks=38" in message
+    assert "61: capacity=0 history=0 logical_blocks=0" in message
+    assert "windows=[2048]" in message
+    assert "gpu_max_tokens=1216" in message
+
+
+def test_windowed_draft_pool_backs_only_the_window_of_a_generation_dummy() -> None:
+    """A CUDA-graph warmup dummy is a generation request at the longest length
+    the target pool can hold. Its draft mirror carries the same history hint
+    as the target cache, so a windowed draft pool sized for a few mirrors of
+    window + chunk backs only the dummy's window; without the hint the mirror
+    would need the dummy's whole length, which such a pool cannot hold."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=4, speculative_model="draft")
+    # 32 KiB per token (8 layers, 8 KV heads of 128, fp16): a mirror of a
+    # 256-token window plus a 512-token chunk is ~26 MiB; the pool holds four
+    # of them (~104 MiB), while a 60k-token dummy held in full needs ~1.8 GiB.
+    num_layers, num_kv_heads, head_dim = 8, 8, 128
+    tokens_per_block, window, chunk, max_seq_len, batch_size = 32, 256, 512, 65536, 2
+    token_num = 60_000
+    draft_config = KvCacheConfig(
+        enable_block_reuse=False, max_attention_window=[window] * num_layers
+    )
+    bytes_per_token = num_layers * 2 * num_kv_heads * head_dim * 2
+    _, headroom = _get_generation_kv_capacity(spec, is_draft=True)
+    tokens_per_mirror = window + chunk + 2 * headroom + tokens_per_block
+    pages_per_mirror = -(-tokens_per_mirror // tokens_per_block)
+    draft_budget = 2 * batch_size * pages_per_mirror * tokens_per_block * bytes_per_token
+    assert token_num * bytes_per_token > 4 * draft_budget
+    draft = KVCacheManagerV2(
+        draft_config.model_copy(update={"max_gpu_total_bytes": draft_budget}),
+        CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=chunk,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=spec,
+        is_draft=True,
+    )
+    # A small windowless target pool (512 B per token) that holds the whole
+    # dummy, so the target side of add_dummy_requests cannot be what fails.
+    target = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=128 << 20),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=chunk,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=spec,
+    )
+    stream = torch.cuda.current_stream().cuda_stream
+
+    def live_pages(cache: object) -> int:
+        return len(cache.get_aggregated_page_indices(0, valid_only=True))
+
+    requests = None
+    try:
+        # The mirror resize without a history hint: the whole dummy on the
+        # windowed pool, which is more than the pool has.
+        probe = draft.impl.create_kv_cache()
+        try:
+            assert probe.resume(stream)
+            assert not probe.resize(token_num + draft.num_extra_kv_tokens)
+        finally:
+            probe.close()
+        requests = target.add_dummy_requests(
+            [7],
+            token_nums=[token_num],
+            is_gen=True,
+            max_num_draft_tokens=spec.max_draft_len,
+            draft_kv_cache_manager=draft,
+        )
+        assert requests is not None, "the dummy's draft mirror did not fit the windowed pool"
+        (request,) = requests
+        target_cache = target.kv_cache_map[request.py_request_id]
+        mirror = draft.kv_cache_map[request.py_request_id]
+        assert live_pages(target_cache) >= token_num // tokens_per_block
+        assert mirror.capacity == target_cache.capacity
+        assert mirror.history_length == token_num - 1
+        assert live_pages(mirror) <= pages_per_mirror
+    finally:
+        for request in requests or ():
+            draft.free_resources(request)
+            target.free_resources(request)
+        draft.shutdown()
+        target.shutdown()
+
+
+def _small_spec_manager(
+    spec: DecodingBaseConfig,
+    is_draft: bool,
+    *,
+    window: int | None = None,
+    num_kv_heads: int = 2,
+    dtype: DataType = DataType.HALF,
+    max_gpu_total_bytes: int = 256 << 20,
+    max_seq_len: int = 16384,
+    max_num_tokens: int = 8192,
+    tokens_per_block: int = 32,
+) -> KVCacheManagerV2:
+    """A two-layer, head_dim 64 V2 manager for ``spec`` (32-token pages by
+    default), optionally with a uniform sliding window and no block reuse."""
+    num_layers = 2
+    config = KvCacheConfig(
+        enable_block_reuse=False,
+        max_attention_window=None if window is None else [window] * num_layers,
+        max_gpu_total_bytes=max_gpu_total_bytes,
+    )
+    return KVCacheManagerV2(
+        config,
+        CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=64,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=2,
+        max_num_tokens=max_num_tokens,
+        mapping=Mapping(),
+        dtype=dtype,
+        spec_config=spec,
+        is_draft=is_draft,
+    )
+
+
+def _backed_ordinals(cache: object) -> set[int]:
+    """Block ordinals of ``cache`` that have a page behind them."""
+    return {
+        ordinal
+        for ordinal, page in enumerate(cache.get_base_page_indices(0))
+        if page != BAD_PAGE_INDEX
+    }
+
+
+@pytest.mark.parametrize(
+    ("make_spec", "external_drafter"),
+    [
+        pytest.param(
+            lambda: DFlashDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="dflash",
+        ),
+        pytest.param(
+            lambda: DSparkDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="dspark",
+        ),
+        pytest.param(
+            lambda: PARDDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="pard",
+        ),
+        pytest.param(
+            lambda: DraftTargetDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="draft_target_one_model",
+        ),
+        pytest.param(lambda: MTPDecodingConfig(num_nextn_predict_layers=1), False, id="mtp"),
+        pytest.param(
+            lambda: Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"),
+            False,
+            id="eagle3_one_model",
+        ),
+    ],
+)
+def test_only_an_external_drafters_draft_manager_reads_the_target_view(
+    make_spec: Callable[[], DecodingBaseConfig], external_drafter: bool
+) -> None:
+    """The draft manager of a one-engine external drafter reads the target's
+    position and chunk; every other manager keeps the draft request view."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = make_spec()
+    assert spec.spec_dec_mode.is_external_drafter() is external_drafter
+    for is_draft in (False, True):
+        manager = _small_spec_manager(spec, is_draft, max_gpu_total_bytes=4 << 20)
+        try:
+            assert manager._mirror_uses_draft_view is not (is_draft and external_drafter)
+        finally:
+            manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("make_spec", "releases_below_window"),
+    [
+        # MTP/Eagle draft layers process the target's chunks through the draft
+        # pool but the mirror reads the draft request view, which nothing
+        # advances: it keeps the whole prompt backed.
+        pytest.param(
+            lambda: Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"),
+            False,
+            id="eagle3_one_model",
+        ),
+        # An external drafter follows the target's chunks and drops what falls
+        # out of the window.
+        pytest.param(
+            lambda: DFlashDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="dflash",
+        ),
+    ],
+)
+def test_windowed_draft_mirror_backs_what_the_next_chunk_attends(
+    make_spec: Callable[[], DecodingBaseConfig], releases_below_window: bool
+) -> None:
+    """Chunked prefill with block reuse off on a sliding-window draft pool:
+    after the second chunk's resize, every page the chunk attends (its window
+    back from the chunk start, through the chunk end) is backed."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    window, page, prompt, chunk = 256, 32, 8192, 512
+    draft = _small_spec_manager(make_spec(), True, window=window)
+    request = LlmRequest(
+        request_id=101,
+        max_new_tokens=8,
+        input_tokens=[1] * prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    try:
+        request.context_chunk_size = chunk
+        batch = ScheduledRequests()
+        batch.context_requests_chunking.append(request)
+        draft._prepare_draft_resources(batch)
+
+        request.move_to_next_context_chunk()
+        request.context_chunk_size = chunk
+        assert request.context_current_position == chunk
+        batch = ScheduledRequests()
+        batch.context_requests_chunking.append(request)
+        draft._prepare_draft_resources(batch)
+
+        backed = _backed_ordinals(draft.kv_cache_map[request.py_request_id])
+        attended = set(range((chunk - window) // page, 2 * chunk // page))
+        assert attended <= backed
+        assert (0 in backed) is not releases_below_window
+        draft.free_resources(request)
+    finally:
+        draft.shutdown()
+
+
+class _PoolBoundDFlashDraftModel:
+    """Just enough of a DFlash draft model for the worker to bind the draft
+    KV pool and run its generation-step context store."""
+
+    block_size = 4
+    config = SimpleNamespace(max_position_embeddings=1 << 17)
+    dflash_attention_backend = "TRTLLM"
+    hidden_norm = object()
+
+    def __init__(self, num_layers: int, num_kv_heads: int, head_dim: int, hidden: int) -> None:
+        self.fc = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16, device="cuda"))
+        self._layers = (num_layers, num_kv_heads, head_dim)
+        embed_tokens = torch.nn.Embedding(16, hidden).cuda()
+        self.draft_model_full = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed_tokens))
+
+    def _build_fused_kv_buffers(self) -> None:
+        self._num_attn_layers, self._num_kv_heads, self._head_dim = self._layers
+        self._num_heads = self._num_kv_heads
+
+    def _get_attention_mask_args(self, layer_idx: int) -> tuple:
+        return True, (-1, -1)
+
+    def validate_block_attention_windows(self) -> frozenset:
+        return frozenset()
+
+    def project_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+    def precompute_context_kv(
+        self, projected: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_layers, num_kv_heads, head_dim = self._layers
+        k = torch.full(
+            (projected.shape[0], num_layers, num_kv_heads, head_dim),
+            3.0,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        return k, k.clone()
+
+
+def _disagg_draft_fixture(
+    spec: DFlashDecodingConfig,
+    prompt: int,
+    occupant_prompt: int,
+    window: int,
+    tokens_per_block: int = 32,
+) -> tuple[KVCacheManagerV2, LlmRequest, LlmRequest]:
+    """A sliding-window draft pool with room for 8192 tokens (two layers, one
+    KV head of 64, bf16), an occupant that prefilled ``occupant_prompt``
+    tokens on it, and a request in disaggregated generation init whose
+    transferred prompt is ``prompt`` tokens."""
+    num_layers, num_kv_heads, head_dim = 2, 1, 64
+    bytes_per_token = num_layers * 2 * num_kv_heads * head_dim * 2
+    draft = _small_spec_manager(
+        spec,
+        True,
+        window=window,
+        num_kv_heads=num_kv_heads,
+        dtype=DataType.BF16,
+        max_gpu_total_bytes=8192 * bytes_per_token,
+        max_seq_len=1 << 17,
+        max_num_tokens=occupant_prompt,
+        tokens_per_block=tokens_per_block,
+    )
+    occupant = LlmRequest(
+        request_id=1,
+        max_new_tokens=8,
+        input_tokens=[1] * occupant_prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    occupant.state = LlmRequestState.CONTEXT_INIT
+    occupant.context_chunk_size = occupant_prompt
+    request = LlmRequest(
+        request_id=2,
+        max_new_tokens=64,
+        input_tokens=[1] * prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * spec.max_draft_len,
+    )
+    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    return draft, occupant, request
+
+
+def _disagg_generation_step(draft: KVCacheManagerV2, request: LlmRequest) -> None:
+    """One executor generation step on the draft manager: grow the mirror,
+    then the post-forward update_resources (nothing accepted, one token)."""
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+    draft._prepare_draft_resources(batch)
+    request.py_num_accepted_draft_tokens = 0
+    request.py_rewind_len = 0
+    draft.update_resources(batch)
+    request.add_new_token(1, 0)
+
+
+def test_gen_init_draft_mirror_survives_generation_updates() -> None:
+    """A disaggregated generation worker's draft mirror for a prompt far
+    larger than its sliding-window pool fits at generation init and stays
+    consistent through generation steps, including update_resources, which
+    advances the history in absolute positions: the history follows the
+    request and the pages from the prompt end up to the capacity stay
+    backed."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=3, speculative_model="draft")
+    prompt, page = 65536, 32
+    draft, occupant, request = _disagg_draft_fixture(spec, prompt, 512, window=256)
+    try:
+        for req in (occupant, request):
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk.append(req)
+            draft._prepare_draft_resources(batch)
+        cache = draft.kv_cache_map[request.py_request_id]
+        # The context worker's first token arrives with the transferred KV.
+        request.add_new_token(1, 0)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        for _ in range(3):
+            _disagg_generation_step(draft, request)
+            assert cache.history_length == request.max_beam_num_tokens - 2
+            assert set(range(prompt // page, -(-cache.capacity // page))) <= _backed_ordinals(cache)
+        draft.free_resources(request)
+        draft.free_resources(occupant)
+    finally:
+        draft.shutdown()
+
+
+@pytest.mark.parametrize("slot_loss", [False, True], ids=["first_step", "slot_loss"])
+@pytest.mark.parametrize("reuse_addressable", [False, True], ids=["unpaired", "reuse_addressable"])
+def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
+    monkeypatch: pytest.MonkeyPatch, reuse_addressable: bool, slot_loss: bool
+) -> None:
+    """A disaggregated generation worker receives a prompt far larger than its
+    sliding-window draft pool, while another request owns the pool's low
+    pages. After generation steps (update_resources included), the drafter's
+    step -- DFlashSpecMetadata.prepare() assigning the request a fresh slot,
+    the context K/V store of the accepted tokens, the block decode's read and
+    its block append -- must address only pages the request's own mirror
+    holds. The slot is seeded on the page holding the request's absolute
+    position and reads only what it stored, whether or not the pool joins
+    block reuse, and again after the request loses its slot and comes back."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    num_layers, num_kv_heads, head_dim, hidden = 2, 1, 64, 8
+    window, prompt, occupant_prompt, max_draft_len = 256, 65536, 512, 3
+    spec = DFlashDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model="draft",
+        attention_backend="TRTLLM",
+        mask_token_id=0,
+    )
+    draft, occupant, request = _disagg_draft_fixture(spec, prompt, occupant_prompt, window)
+    offsets = torch.zeros(
+        (getattr(draft, "num_attention_op_pools", draft.num_pools), 2, 2, draft.max_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    tokens_per_req = max_draft_len + 1
+    try:
+        for req in (occupant, request):
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk.append(req)
+            draft._prepare_draft_resources(batch)
+        request.add_new_token(1, 0)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        for _ in range(2):
+            _disagg_generation_step(draft, request)
+
+        worker = DFlashWorker(spec, Mapping())
+        draft_model = _PoolBoundDFlashDraftModel(num_layers, num_kv_heads, head_dim, hidden)
+        worker.set_draft_model(draft_model)
+        attn_metadata = SimpleNamespace(
+            max_seq_len=1 << 17,
+            draft_kv_cache_block_offsets=offsets,
+            num_contexts=0,
+            num_seqs=1,
+            num_ctx_tokens=0,
+            _seq_lens_cuda=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            _seq_lens=torch.zeros(1, dtype=torch.int32),
+        )
+        worker._lazy_init_ctx_buffers(
+            draft_model,
+            SimpleNamespace(max_num_requests=2),
+            attn_metadata,
+            draft_kv_cache_manager=draft,
+        )
+        assert worker._ctx_block_tables is not None, "the drafter did not bind the draft pool"
+        worker._ctx_reuse_addressable = reuse_addressable
+        # V2 hands out per-layer views over one interleaved pool: a table entry
+        # names layer 0's slot of a page, and layer l of that page is slot
+        # entry + l of the same dense view, so view 0 sees every layer's write.
+        assert worker._ctx_block_divisor == draft.kv_factor
+        pool = worker._ctx_kv_buf[0]
+        page = worker._ctx_page_size
+
+        spec_metadata = DFlashSpecMetadata(
+            max_num_requests=2, max_draft_len=max_draft_len, max_total_draft_tokens=max_draft_len
+        )
+        spec_metadata._dflash_worker = worker
+
+        def prepare(request_ids: list[int]) -> None:
+            """DFlashSpecMetadata.prepare() for a batch of generation rows at
+            their current positions."""
+            reqs = {request.py_request_id: request, occupant.py_request_id: occupant}
+            spec_metadata.request_ids = request_ids
+            spec_metadata.num_generations = len(request_ids)
+            spec_metadata.seq_lens = [tokens_per_req] * len(request_ids)
+            spec_metadata.host_position_ids = torch.tensor(
+                [
+                    reqs[rid].max_beam_num_tokens - 1 + offset
+                    for rid in request_ids
+                    for offset in range(tokens_per_req)
+                ],
+                dtype=torch.int32,
+            )
+            spec_metadata.prepare()
+
+        prepare([request.py_request_id])
+        if slot_loss:
+            # The request misses a batch (its slot is evicted), runs a step
+            # elsewhere in the meantime, and comes back on a fresh slot.
+            prepare([])
+            _disagg_generation_step(draft, request)
+            prepare([request.py_request_id])
+        batch = ScheduledRequests()
+        batch.generation_requests.append(request)
+        draft._prepare_draft_resources(batch)
+
+        def own_slots(req: LlmRequest) -> set[int]:
+            draft.copy_batch_block_offsets(offsets, [req.py_request_id], 1, 0, 1)
+            worker._refresh_ctx_block_tables(attn_metadata, 1)
+            row = worker._ctx_block_tables[0].tolist()
+            return {
+                row[ordinal] + layer
+                for ordinal in _backed_ordinals(draft.kv_cache_map[req.py_request_id])
+                for layer in range(num_layers)
+            }
+
+        occupant_slots = own_slots(occupant)
+        request_slots = own_slots(request)
+        assert occupant_slots and request_slots
+        assert not occupant_slots & request_slots
+
+        pool.fill_(7.0)
+        before = pool.clone()
+        captured = torch.randn(tokens_per_req, hidden, device="cuda")
+        step_metadata = SimpleNamespace(
+            hidden_size=hidden,
+            runtime_draft_len=max_draft_len,
+            captured_hidden_states=None,
+            get_hidden_states=lambda num_tokens: captured[:num_tokens],
+        )
+        inputs = worker.prepare_1st_drafter_inputs(
+            input_ids=torch.zeros(tokens_per_req, dtype=torch.long, device="cuda"),
+            position_ids=torch.zeros(tokens_per_req, dtype=torch.long, device="cuda"),
+            hidden_states=torch.zeros(tokens_per_req, hidden, device="cuda"),
+            accepted_tokens=torch.ones((1, tokens_per_req), dtype=torch.long, device="cuda"),
+            num_accepted_tokens=torch.tensor([tokens_per_req], dtype=torch.int32, device="cuda"),
+            attn_metadata=attn_metadata,
+            spec_metadata=step_metadata,
+            draft_model=draft_model,
+            total_target_tokens=tokens_per_req,
+        )
+        torch.cuda.synchronize()
+        written = set((pool != before).flatten(1).any(dim=1).nonzero().flatten().tolist())
+        assert written, "the drafter wrote nothing"
+        assert not written & occupant_slots, "the drafter wrote another request's draft pages"
+        assert written <= request_slots
+
+        # The block decode reads num_ctx positions and appends the block right
+        # after them, both through the table row it is handed.
+        num_ctx = int(inputs["num_ctx_per_req"][0])
+        read_row = inputs["ctx_page_table"][0].tolist()
+        block = worker._compute_block_size
+        addressed = {
+            read_row[pos // page] + layer
+            for pos in range(num_ctx + block)
+            for layer in range(num_layers)
+        }
+        assert addressed <= request_slots, "the block decode addresses another request's pages"
+
+        # The slot started empty on the page holding the request's absolute
+        # position, every page below it hidden, and reads exactly the context
+        # it stored this step.
+        base = (request.max_beam_num_tokens - 1) // page
+        slot = worker._req_to_slot[request.py_request_id]
+        assert worker._ctx_seed_page_aligned
+        assert worker._ctx_base_host[slot] == base
+        assert worker._ctx_len_host[slot] == base * page
+        assert num_ctx == tokens_per_req
+        draft.free_resources(request)
+        draft.free_resources(occupant)
+    finally:
+        draft.shutdown()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_slot_from_zero_worker_refuses_a_disagg_windowed_draft_pool(
+    monkeypatch: pytest.MonkeyPatch, is_disagg: bool
+) -> None:
+    """A worker that numbers drafter slots from 0 (the Kimi K3 workers) binds a
+    sliding-window draft pool, but not on a disaggregated worker, whose every
+    generation slot starts past position 0."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    spec = DFlashDecodingConfig(
+        max_draft_len=3, speculative_model="draft", attention_backend="TRTLLM", mask_token_id=0
+    )
+    draft, _, _ = _disagg_draft_fixture(spec, 65536, 512, 256)
+    draft.is_disagg = is_disagg
+    try:
+        worker = DFlashWorker(spec, Mapping())
+        worker._ctx_reads_rebased_view = False
+        draft_model = _PoolBoundDFlashDraftModel(2, 1, 64, 8)
+        worker.set_draft_model(draft_model)
+        num_pools = getattr(draft, "num_attention_op_pools", draft.num_pools)
+        offsets = torch.zeros(
+            (num_pools, 2, 2, draft.max_blocks_per_seq), dtype=torch.int32, device="cuda"
+        )
+        attn_metadata = SimpleNamespace(max_seq_len=1 << 17, draft_kv_cache_block_offsets=offsets)
+
+        def bind() -> None:
+            """Bind the drafter's ctx cache to the draft pool."""
+            worker._lazy_init_ctx_buffers(
+                draft_model,
+                SimpleNamespace(max_num_requests=2),
+                attn_metadata,
+                draft_kv_cache_manager=draft,
+            )
+
+        if is_disagg:
+            with pytest.raises(ValueError, match="numbers drafter slots from 0"):
+                bind()
+        else:
+            bind()
+            assert worker._ctx_block_tables is not None and worker._ctx_pool_windowed
+    finally:
+        draft.shutdown()
+
+
+@pytest.mark.parametrize("lag", [2, 7, 31, 127])
+def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
+    monkeypatch: pytest.MonkeyPatch, lag: int
+) -> None:
+    """A disaggregated generation worker seeds the drafter slot on the page
+    holding the request's position, ``lag`` tokens behind it, while the
+    request's sliding-window draft mirror advances its history with the
+    request. Over many generation steps (one accepted token each), every
+    block-table entry the drafter's window reads -- keys from the slot length
+    + 1 - window, never below the slot's base -- must stay on a page the
+    request's own mirror holds; a released entry resolves to another
+    request's page."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    num_layers, num_kv_heads, head_dim, hidden = 2, 1, 64, 8
+    window, page, max_draft_len, steps = 256, 128, 3, 600
+    spec = DFlashDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model="draft",
+        attention_backend="TRTLLM",
+        mask_token_id=0,
+    )
+    # The first token and two generation steps put the request at prompt + 2.
+    prompt = 65536 + lag - 2
+    draft, occupant, request = _disagg_draft_fixture(spec, prompt, 512, window, page)
+    offsets = torch.zeros(
+        (getattr(draft, "num_attention_op_pools", draft.num_pools), 2, 2, draft.max_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    try:
+        for req in (occupant, request):
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk.append(req)
+            draft._prepare_draft_resources(batch)
+        request.add_new_token(1, 0)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        for _ in range(2):
+            _disagg_generation_step(draft, request)
+
+        worker = DFlashWorker(spec, Mapping())
+        draft_model = _PoolBoundDFlashDraftModel(num_layers, num_kv_heads, head_dim, hidden)
+        worker.set_draft_model(draft_model)
+        attn_metadata = SimpleNamespace(
+            max_seq_len=1 << 17,
+            draft_kv_cache_block_offsets=offsets,
+            num_contexts=0,
+            num_seqs=1,
+            num_ctx_tokens=0,
+            _seq_lens_cuda=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            _seq_lens=torch.zeros(1, dtype=torch.int32),
+        )
+        worker._lazy_init_ctx_buffers(
+            draft_model,
+            SimpleNamespace(max_num_requests=2),
+            attn_metadata,
+            draft_kv_cache_manager=draft,
+        )
+        assert worker._ctx_page_size == page
+        assert worker._ctx_seed_page_aligned
+        spec_metadata = DFlashSpecMetadata(
+            max_num_requests=2, max_draft_len=max_draft_len, max_total_draft_tokens=max_draft_len
+        )
+        spec_metadata._dflash_worker = worker
+        spec_metadata.request_ids = [request.py_request_id]
+        spec_metadata.num_generations = 1
+        spec_metadata.seq_lens = [max_draft_len + 1]
+        position = request.max_beam_num_tokens - 1
+        spec_metadata.host_position_ids = torch.tensor(
+            [position + offset for offset in range(max_draft_len + 1)], dtype=torch.int32
+        )
+        spec_metadata.prepare()
+        slot = worker._req_to_slot[request.py_request_id]
+        seed_len, base = int(worker._ctx_len_host[slot]), int(worker._ctx_base_host[slot])
+        assert (base, position - seed_len) == (position // page, lag)
+
+        cache = draft.kv_cache_map[request.py_request_id]
+        unbacked_reads = []
+        for step in range(steps):
+            slot_len = seed_len + step + 1
+            lowest = max(base * page, slot_len + 1 - window)
+            read = {key // page for key in range(lowest, slot_len)}
+            missing = read - _backed_ordinals(cache)
+            if missing:
+                unbacked_reads.append((step, cache.history_length, slot_len, sorted(missing)))
+            _disagg_generation_step(draft, request)
+        assert not unbacked_reads, (
+            f"{len(unbacked_reads)}/{steps} steps read a released entry; first "
+            f"(step, history, slot length, entries): {unbacked_reads[:3]}"
+        )
+        draft.free_resources(request)
+        draft.free_resources(occupant)
+    finally:
+        draft.shutdown()
 
 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
@@ -2214,6 +3520,276 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
         manager.shutdown()
 
 
+def _adp_dummy_executor(
+    cleanup: ExitStack,
+    spec: DFlashDecodingConfig,
+    *,
+    joint_reuse: bool,
+    transactional: bool,
+) -> tuple[PyExecutor, dict[ResourceManagerType, KVCacheManagerV2]]:
+    """An attention-DP executor over real target and draft KV pools.
+
+    ``joint_reuse`` pairs the two pools (block reuse on both); without it the
+    draft pool is an unpaired mirror of the target pool.
+    """
+    managers = {}
+    for resource_type, is_draft in (
+        (ResourceManagerType.KV_CACHE_MANAGER, False),
+        (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, True),
+    ):
+        manager = KVCacheManagerV2(
+            KvCacheConfig(enable_block_reuse=joint_reuse, max_gpu_total_bytes=4 << 20),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=128,
+            max_batch_size=4,
+            max_num_tokens=128,
+            mapping=Mapping(),
+            spec_config=spec,
+            is_draft=is_draft,
+            joint_kv_cache_reuse=joint_reuse,
+        )
+        cleanup.callback(manager.shutdown)
+        managers[resource_type] = manager
+
+    executor = object.__new__(PyExecutor)
+    executor.resource_manager = ResourceManager(managers)
+    executor.kv_cache_manager = managers[ResourceManagerType.KV_CACHE_MANAGER]
+    executor.draft_kv_cache_manager = managers[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
+    executor.scheduler = KVCacheV2Scheduler(
+        max_batch_size=4,
+        max_num_tokens=128,
+        kv_cache_manager=executor.kv_cache_manager,
+        draft_kv_cache_manager=executor.draft_kv_cache_manager,
+        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+    )
+    executor.enable_attention_dp = True
+    # Two attention-DP ranks: a single-rank group skips dummy padding.
+    executor.dist = SimpleNamespace(tp_size=2)
+    executor.kv_cache_transceiver = object() if transactional else None
+    executor.adp_router = SimpleNamespace(exclude_retiring_requests=False)
+    executor.active_requests = []
+    executor.expected_num_active_requests = 1
+    executor.max_num_active_requests = 4
+    executor.max_total_draft_tokens = spec.max_draft_len
+    executor._adp_dummy_is_gen = True
+    executor._pending_adp_dummy_request = None
+    executor._enable_adp_dummy_fixes = True
+    executor._enable_scheduler_aware_adp_dummy = False
+    executor._enable_non_overlap_adp_forward_intent = False
+    executor._benchmark_fill_phase_active = False
+    executor._is_kv_manager_v2 = True
+    executor.enable_joint_kv_cache_reuse = joint_reuse
+    return executor, managers
+
+
+@pytest.mark.parametrize("draft_len", [3, 8])
+@pytest.mark.parametrize("path", ["plain", "transactional", "empty_batch"])
+def test_adp_dummy_holds_paired_draft_kv(path: str, draft_len: int) -> None:
+    """An idle attention-DP rank's dummy needs a cache in both paired pools.
+
+    Under joint KV cache reuse the scheduler admits a generation request in
+    the target and the draft pool together, so a dummy holding only a target
+    cache is never scheduled and the fleet cannot run a forward. Each padding
+    path must allocate the dummy in both pools, and a vetoed iteration must
+    release both so the singleton dummy ID can be allocated again.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=draft_len, speculative_model="draft")
+    with ExitStack() as cleanup:
+        executor, managers = _adp_dummy_executor(
+            cleanup, spec, joint_reuse=True, transactional=path == "transactional"
+        )
+
+        def assert_dummy_in_both_pools(dummy: LlmRequest) -> None:
+            for manager in managers.values():
+                assert manager.kv_cache_map[dummy.py_request_id].is_active
+
+        def assert_dummy_released(dummy: LlmRequest) -> None:
+            assert executor.active_requests == []
+            for manager in managers.values():
+                assert dummy.py_request_id not in manager.kv_cache_map
+                assert dummy.py_request_id not in manager._allocated_draft_lens
+                assert dummy.py_request_id not in manager._inflight_draft_lens
+
+        def prepare_without_growing(scheduled: ScheduledRequests, dummy: LlmRequest) -> None:
+            capacities = {
+                key: manager.kv_cache_map[dummy.py_request_id].capacity
+                for key, manager in managers.items()
+            }
+            executor.resource_manager.prepare_resources(scheduled)
+            for key, manager in managers.items():
+                assert manager.kv_cache_map[dummy.py_request_id].capacity == capacities[key]
+
+        if path == "empty_batch":
+            # The dummy joins the already scheduled batch directly; a vetoed
+            # iteration rolls it back, and the next one pads again.
+            for can_queue in (False, True):
+                scheduled = ScheduledRequests()
+                executor._pad_empty_attention_dp_batch(scheduled)
+                (dummy,) = scheduled.generation_requests
+                assert executor.active_requests == [dummy]
+                assert_dummy_in_both_pools(dummy)
+                executor._finalize_adp_dummy_allocation(can_queue)
+                if not can_queue:
+                    assert_dummy_released(dummy)
+                else:
+                    prepare_without_growing(scheduled, dummy)
+            executor.resource_manager.free_resources(dummy)
+            for manager in managers.values():
+                assert dummy.py_request_id not in manager.kv_cache_map
+            return
+
+        # A rejected fleet vote must release both pools and permit the same
+        # singleton dummy ID to be allocated and admitted on the next pass.
+        for attempt in range(2 if path == "transactional" else 1):
+            executor._pad_attention_dp_dummy_request()
+            (dummy,) = executor.active_requests
+            scheduled = executor.scheduler.schedule_request(executor.active_requests, set())
+            assert scheduled.generation_requests == [dummy]
+            assert scheduled.paused_requests == []
+            assert_dummy_in_both_pools(dummy)
+            if path == "transactional" and attempt == 0:
+                executor._revert_gen_alloc(scheduled)
+                executor._finalize_adp_dummy_allocation(False)
+                assert_dummy_released(dummy)
+            else:
+                executor._finalize_adp_dummy_allocation(True)
+                prepare_without_growing(scheduled, dummy)
+                executor.resource_manager.free_resources(dummy)
+                for manager in managers.values():
+                    assert dummy.py_request_id not in manager.kv_cache_map
+
+
+@pytest.mark.parametrize("path", ["plain", "transactional", "empty_batch"])
+def test_adp_dummy_grows_unpaired_draft_mirror(path: str) -> None:
+    """An unpaired draft pool sizes the attention-DP dummy's mirror in prepare_resources.
+
+    The dummy is created in the target pool only. The scheduler admits the
+    draft mirror while it schedules the dummy but leaves it empty, and the
+    empty-batch path leaves no mirror at all, so the draft manager has to grow
+    it by one generation step. An empty mirror cannot take the history of the
+    previous iteration's finished dummy, which shares its ID and which the
+    overlap loop applies once this iteration is prepared.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=8, speculative_model="draft")
+    with ExitStack() as cleanup:
+        executor, managers = _adp_dummy_executor(
+            cleanup, spec, joint_reuse=False, transactional=path == "transactional"
+        )
+        draft = executor.draft_kv_cache_manager
+        assert executor.scheduler._joint_draft_manager is None
+
+        previous_batch = None
+        for _ in range(2):
+            batch = ScheduledRequests()
+            if path == "empty_batch":
+                executor._pad_empty_attention_dp_batch(batch)
+                (dummy,) = batch.generation_requests
+                assert dummy.py_request_id not in draft.kv_cache_map
+            else:
+                executor._pad_attention_dp_dummy_request()
+                (dummy,) = executor.active_requests
+                scheduled = executor.scheduler.schedule_request(executor.active_requests, set())
+                assert scheduled.generation_requests == [dummy]
+                batch.generation_requests.append(dummy)
+                # Admitted by the scheduler, not sized.
+                assert draft.kv_cache_map[dummy.py_request_id].capacity == 0
+            executor._finalize_adp_dummy_allocation(True)
+
+            executor.resource_manager.prepare_resources(batch)
+            draft_cache = draft.kv_cache_map[dummy.py_request_id]
+            assert draft_cache.capacity == draft._required_gen_capacity(dummy, 0)
+
+            if previous_batch is not None:
+                # _process_previous_batch: the deferred batch still holds the
+                # finished dummy, whose ID now maps to this iteration's mirror.
+                executor.resource_manager.update_resources(
+                    previous_batch, skip_kv_cache_manager=True
+                )
+            # _terminate_attention_dp_dummy_requests.
+            dummy.state = LlmRequestState.GENERATION_COMPLETE
+            executor.resource_manager.free_resources(dummy)
+            executor.active_requests.remove(dummy)
+            previous_batch = batch
+
+        for manager in managers.values():
+            assert dummy.py_request_id not in manager.kv_cache_map
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "joint_reuse,is_dummy,mirror_capacity,grows",
+    [
+        # Paired pool: add_dummy_requests sized the dummy's mirror with the dummy.
+        pytest.param(True, True, 24, False, id="paired-dummy-preallocated"),
+        # Unpaired pool: the scheduler admitted the dummy's mirror, still empty.
+        pytest.param(False, True, 0, True, id="unpaired-dummy-admitted-empty"),
+        # Unpaired pool, empty-batch padding: the dummy has no mirror yet.
+        pytest.param(False, True, None, True, id="unpaired-dummy-no-mirror"),
+        # Real requests are a control: they grow by one step in either pool.
+        pytest.param(True, False, 24, True, id="paired-request"),
+        pytest.param(False, False, 24, True, id="unpaired-request"),
+        pytest.param(False, False, None, True, id="unpaired-request-no-mirror"),
+    ],
+)
+def test_draft_mirror_preserves_preallocated_dummy_capacity(
+    joint_reuse: bool, is_dummy: bool, mirror_capacity: int | None, grows: bool
+) -> None:
+    """A paired pool's preallocated dummy fits one page; charging another step would need two.
+
+    Every other mirror, an unpaired pool's dummy included, is sized here.
+    """
+    request = LlmRequest(
+        request_id=100,
+        max_new_tokens=1,
+        input_tokens=[1] * 9,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * 8,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.is_dummy_request = is_dummy
+    capacity = mirror_capacity or 0
+    cache = Mock(capacity=capacity, is_active=True)
+    # Dummies have only one 32-token page available. Real requests are a
+    # control: unlike fixed-shape dummies they still need per-step growth.
+    cache.resize.side_effect = lambda capacity: capacity <= (32 if is_dummy else 64)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = joint_reuse
+    manager._mirror_uses_draft_view = False
+    manager._kv_reserve_draft_tokens = 8
+    manager._allocated_draft_lens = {}
+    manager.kv_cache_map = {} if mirror_capacity is None else {request.py_request_id: cache}
+    manager._mirror_draft_kv_cache = Mock(return_value=cache)
+    manager._resume_and_restore = Mock(return_value=True)
+    manager._ensure_generation_beam_width = Mock(return_value=True)
+    manager._mirror_resize_error = Mock(return_value=RuntimeError("draft pool exhausted"))
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+
+    manager._prepare_draft_resources(batch)
+
+    manager._resume_and_restore.assert_called_once_with(request.py_request_id, cache)
+    if grows:
+        # One generation step: the token itself and the eight draft slots.
+        cache.resize.assert_called_once_with(capacity + 9)
+    else:
+        cache.resize.assert_not_called()
+    # Recognizing a preallocated dummy must not fabricate scheduler rollback
+    # bookkeeping; the dummy is freed as a whole after the iteration.
+    assert manager._allocated_draft_lens == {}
+
+
 def test_generation_dummy_does_not_reuse_real_request_prefix() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -2278,6 +3854,7 @@ def test_helix_retention_uses_rank_local_ranges(
             world_size=2, cp_size=2, tp_size=1, rank=rank, cp_config={"cp_type": "HELIX"}
         ),
         dtype=DataType.HALF,
+        is_disagg=True,
     )
     request = _ContextRequest(
         1, list(range(local_prompt)), local_prompt, "retention", use_conversation_params=False
@@ -2293,6 +3870,59 @@ def test_helix_retention_uses_rank_local_ranges(
         assert manager.prepare_context_cache(request) is not None
         cache = manager.kv_cache_map[request.py_request_id]
         assert cache.resize(global_prompt)
+        group = manager.impl.get_layer_group_id(0)
+        assert cache.get_page_priorities(group) == expected
+        assert cache.resize((len(expected) + 1) * 128)
+        assert cache.get_page_priorities(group) == expected + [10]
+    finally:
+        manager.free_resources(request)
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "range_start,range_end,expected", [(0, 128, [80, 35]), (128, 256, [35, 80])]
+)
+@pytest.mark.parametrize("rank", [0, 1])
+def test_agg_helix_retention_uses_global_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    range_start: int,
+    range_end: int,
+    expected: list[int],
+) -> None:
+    # Aggregated helix holds the full prompt on every rank, so a range in prompt
+    # tokens marks exactly the ledger blocks (two 64-token pages each) it covers.
+    dist = SimpleNamespace(allreduce=lambda value, op: value, local_world_size=1)
+    monkeypatch.setattr(Distributed, "get", lambda mapping: dist)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=512,
+        max_batch_size=1,
+        max_num_tokens=256,
+        mapping=Mapping(
+            world_size=2, cp_size=2, tp_size=1, rank=rank, cp_config={"cp_type": "HELIX"}
+        ),
+        dtype=DataType.HALF,
+        is_disagg=False,
+    )
+    prompt_len = 256
+    request = _ContextRequest(
+        1, list(range(prompt_len)), prompt_len, "retention", use_conversation_params=False
+    )
+    request.total_input_len_cp = prompt_len
+    request.kv_cache_retention_config = KvCacheRetentionConfig(
+        [KvCacheRetentionConfig.TokenRangeRetentionConfig(range_start, range_end, 80)],
+        decode_retention_priority=10,
+    )
+    try:
+        assert manager.prepare_context_cache(request) is not None
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.resize(prompt_len)
         group = manager.impl.get_layer_group_id(0)
         assert cache.get_page_priorities(group) == expected
         assert cache.resize((len(expected) + 1) * 128)
@@ -3208,6 +4838,8 @@ def _index_mapper_capacity_for(
     is_disagg: bool = False,
     num_reserved_index_slots: int = 1,
     disable_overlap_scheduler: bool = True,
+    sparse: bool = False,
+    guard_page: bool = False,
 ) -> tuple[int, int, int]:
     """Construct a manager and return the three sizes it derives.
 
@@ -3221,11 +4853,9 @@ def _index_mapper_capacity_for(
     """
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
-    fake_impl.all_buffer_ids = [BufferId(LayerId(0), Role.KEY)]
-    fake_impl.is_sparse.return_value = False
 
     def build_base_config(
         self: KVCacheManagerV2,
@@ -3233,27 +4863,44 @@ def _index_mapper_capacity_for(
         *,
         tokens_per_block: int,
         cache_tiers: list[object],
-    ) -> _FakeManagerConfig:
-        del self, config, tokens_per_block
-        return _FakeManagerConfig(cache_tiers=cache_tiers)
+    ) -> KVCacheManagerConfig:
+        del self, config
+        return KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            cache_tiers=cache_tiers,
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=128, is_sparse=sparse),
+                        BufferConfig(role=Role.VALUE, size=128),
+                    ],
+                    sparse_cache=SparseCacheConfig(
+                        num_selected_blocks=1, max_cached_units=2, unit_tokens=tokens_per_block
+                    )
+                    if sparse
+                    else None,
+                )
+            ],
+        )
 
     with (
-        # Pin both diagnostics off: the guard page would add an index slot.
         patch.dict(
             os.environ,
-            {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
+            {"TRTLLM_KV_GUARD_PAGE": "1" if guard_page else "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
         ),
         patch(f"{module}.IndexMapper") as index_mapper_cls,
-        patch(f"{module}.KVCacheManagerPy", Mock(return_value=fake_impl)),
+        patch(f"{module}.KVCacheManagerPy", return_value=fake_impl) as create_impl,
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
         patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
         patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor") as page_table,
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+        patch.object(KVCacheManagerV2, "_reserve_guard_page"),
     ):
         manager = KVCacheManagerV2(
             # A quota must be set or __init__ asserts; the value is irrelevant here.
-            KvCacheConfig(max_gpu_total_bytes=16 << 20),
+            KvCacheConfig(max_gpu_total_bytes=16 << 20, enable_block_reuse=False),
             CacheType.SELFKONLY,
             num_layers=1,
             num_kv_heads=1,
@@ -3273,9 +4920,14 @@ def _index_mapper_capacity_for(
             is_disagg=is_disagg,
             num_reserved_index_slots=num_reserved_index_slots,
             disable_overlap_scheduler=disable_overlap_scheduler,
+            sparse_kv_offload_config=SparseKvCacheOffloadConfig() if sparse else None,
         )
     index_mapper_cls.assert_called_once()
     page_table.assert_called_once()
+    config = create_impl.call_args.args[0]
+    # The sparse arenas are the Batch's and take their lease count from its rows, so
+    # nothing encodes a request count as a constraint any more.
+    assert not config.constraints
     return (
         index_mapper_cls.call_args.args[0],
         page_table.call_args.args[0],
@@ -3301,13 +4953,21 @@ _INDEX_MAPPER_CAPACITY_CASES = [
     pytest.param(2, 4, True, True, 1, 17, id="pp4_disagg_unchanged"),
     # Reserved slots are still added on top of the widened pool.
     pytest.param(2, 1, False, False, 5, 9, id="reserved_slots_still_added"),
+    pytest.param(1, 1, True, False, 1, 2, id="single_live_request_and_padding"),
+    pytest.param(2, 1, True, False, 0, 2, id="no_reserved_slots"),
 ]
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "max_batch_size,pp_size,disable_overlap_scheduler,is_disagg,reserved,expected",
-    _INDEX_MAPPER_CAPACITY_CASES,
+    "max_batch_size,pp_size,disable_overlap_scheduler,is_disagg,reserved,expected,sparse",
+    [
+        pytest.param(*case.values, sparse, id=f"{case.id}-{sparse}")
+        for case in _INDEX_MAPPER_CAPACITY_CASES
+        for sparse in (False, True)
+        # Sparse offload rejects pipeline parallelism.
+        if not (sparse and case.values[1] > 1)
+    ],
 )
 def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     max_batch_size: int,
@@ -3316,6 +4976,7 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     is_disagg: bool,
     reserved: int,
     expected: int,
+    sparse: bool,
 ) -> None:
     capacity, page_table_capacity, max_admissible_sequences = _index_mapper_capacity_for(
         max_batch_size=max_batch_size,
@@ -3323,10 +4984,1456 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
         is_disagg=is_disagg,
         num_reserved_index_slots=reserved,
         disable_overlap_scheduler=disable_overlap_scheduler,
+        sparse=sparse,
     )
     assert capacity == expected
     assert page_table_capacity == expected
     assert max_admissible_sequences == expected - reserved
+
+
+@pytest.mark.cpu_only
+def test_sparse_arena_also_reserves_guard_request() -> None:
+    assert _index_mapper_capacity_for(
+        max_batch_size=2, num_reserved_index_slots=1, sparse=True, guard_page=True
+    ) == (4, 4, 2)
+
+
+def _sparse_arena_config(
+    max_batch_size: int,
+    explicit_ratio: bool,
+    dense_size: int = 4096,
+    *,
+    num_layers: int = 1,
+    shared_selection: bool = False,
+) -> KVCacheManagerConfig:
+    return KVCacheManagerConfig(
+        tokens_per_block=16,
+        cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(layer),
+                buffers=[
+                    # Sparse pages of four 4-token units, beside the dense buffer
+                    # that sizes the pool group's slots.
+                    BufferConfig(role=Role.KEY, size=4 * 4096, is_sparse=True),
+                    BufferConfig(role=Role.KEY_BLOCK_SCALE, size=4 * 128, is_sparse=True),
+                    BufferConfig(role=Role.VALUE, size=dense_size),
+                ],
+                sparse_cache=SparseCacheConfig(
+                    num_selected_blocks=2,
+                    max_cached_units=4,
+                    unit_tokens=4,
+                    selection_id=0 if shared_selection else None,
+                ),
+            )
+            for layer in range(num_layers)
+        ],
+        constraints=[]
+        if explicit_ratio
+        else [BatchDesc([KVCacheDesc(capacity=16, history_length=0)] * max_batch_size)],
+        initial_pool_ratio=[1.0] if explicit_ratio else None,
+    )
+
+
+@pytest.mark.parametrize("explicit_ratio", [False, True])
+def test_sparse_arena_leases_follow_the_batch_rows(explicit_ratio: bool) -> None:
+    """The arena is the Batch's, so its rows alone decide how many leases exist."""
+    torch.cuda.synchronize()
+    config = _sparse_arena_config(2, explicit_ratio)
+    core = KVCacheManager(config)
+    stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+    try:
+        (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=config.tokens_per_block)
+        for rows in (1, 2, 5):
+            batch = Batch(
+                core,
+                stream,
+                max_batch_size=rows,
+                max_blocks_per_seq=1,
+                index_tables=core.sparse_index_table_specs(),
+            )
+            try:
+                assert batch.sparse_arena_bytes == shape.arena_bytes(rows)
+            finally:
+                del batch
+    finally:
+        core.shutdown()
+
+
+@pytest.mark.parametrize("max_batch_size,reserved", [(1, 1), (3, 2)])
+@pytest.mark.parametrize("explicit_ratio", [False, True])
+def test_sparse_arena_retains_padding_with_full_live_batch(
+    max_batch_size: int, reserved: int, explicit_ratio: bool
+) -> None:
+    torch.cuda.synchronize()
+    config = _sparse_arena_config(max_batch_size, explicit_ratio)
+    core = KVCacheManager(config)
+    caches = []
+    stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+    batch = Batch(
+        core,
+        stream,
+        max_batch_size=max_batch_size,
+        max_blocks_per_seq=1,
+        index_tables=core.sparse_index_table_specs(),
+    )
+    try:
+        # A lease follows membership, so padding caches outside the Batch hold none and a
+        # resumed request receiving its history costs the arena nothing.
+        lc_id = core.get_layer_group_id(0)
+        for index in range(reserved + max_batch_size):
+            cache = core.create_kv_cache()
+            caches.append(cache)
+            assert cache.resume(stream)
+            assert cache.resize(1)
+            assert _introspection.sparse_cache_base_cell(cache, lc_id) is None
+            if index >= reserved:
+                batch.add_kv_cache(cache)
+                assert _introspection.sparse_cache_base_cell(cache, lc_id) is not None
+        assert batch.max_batch_size == max_batch_size
+        batch.publish()
+        batch.wait_published()
+
+        # The rows bound membership, not the arena: a free row always has a free lease,
+        # so a full Batch refuses on its rows rather than running out of cells.
+        extra = core.create_kv_cache()
+        caches.append(extra)
+        assert extra.resume(stream)
+        assert extra.resize(1)
+        with pytest.raises(Exception, match="full"):
+            batch.add_kv_cache(extra)
+        batch.remove_kv_cache(caches[-2])
+        assert _introspection.sparse_cache_base_cell(caches[-2], lc_id) is None
+        batch.add_kv_cache(extra)
+        assert _introspection.sparse_cache_base_cell(extra, lc_id) is not None
+    finally:
+        for cache in caches:
+            if batch.row_of(cache) is not None:
+                batch.remove_kv_cache(cache)
+            cache.close()
+        core.shutdown()
+
+
+def test_sparse_arena_shape_matches_native_layout() -> None:
+    torch.cuda.synchronize()
+    leases = 5
+    config = _sparse_arena_config(2, False)
+    core = KVCacheManager(config)
+    try:
+        (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=config.tokens_per_block)
+        layer = LayerId(0)
+        units_per_page = core.get_sparse_cache_units_per_page(layer)
+        assert shape.units_per_cell == units_per_page
+        assert shape.cells_per_buffer == -(
+            -core.get_sparse_cache_max_units(layer) // units_per_page
+        )
+        assert len(shape.cell_bytes) == core.get_sparse_cache_buffer_count(layer)
+        # Pool regions are consecutive, each holding every lease's cells for one pool and
+        # then a zeroed over-read tail of 128 selection units.
+        regions = {
+            -(
+                -(
+                    leases * shape.cells_per_buffer * cell_bytes
+                    + 128 * (cell_bytes // shape.units_per_cell)
+                )
+                // SPARSE_ARENA_ALIGNMENT
+            )
+            * SPARSE_ARENA_ALIGNMENT
+            for cell_bytes in shape.cell_bytes
+        }
+        batch = Batch(
+            core,
+            CudaStream(torch.cuda.current_stream().cuda_stream),
+            max_batch_size=leases,
+            max_blocks_per_seq=1,
+            index_tables=core.sparse_index_table_specs(),
+        )
+        key_base = batch.get_sparse_cache_base_address(layer, Role.KEY)
+        scale_base = batch.get_sparse_cache_base_address(layer, Role.KEY_BLOCK_SCALE)
+        assert abs(scale_base - key_base) in regions
+
+        # The sparse buffers' pools share one pool group with the dense buffer, and
+        # their slots hold one page of every sparse buffer: a cell's worth each.
+        sparse_buffers = {(0, str(Role.KEY)), (0, str(Role.KEY_BLOCK_SCALE))}
+        (group,) = core.pool_group_descs
+        coalesced_buffers = group.slot_desc.variants[0].coalesced_buffers
+        sparse_pool_bytes = [
+            pool.slot_bytes
+            for pool in group.pools
+            if any(
+                (int(buffer_id.layer_id), str(buffer_id.role)) in sparse_buffers
+                for buffer_id in coalesced_buffers[int(pool.pool_index)].buffer_ids
+            )
+        ]
+        assert sorted(sparse_pool_bytes) == sorted(shape.cell_bytes)
+        assert len(group.pools) == 3
+    finally:
+        core.shutdown()
+
+
+# A dense buffer that sorts between the sparse ones leaves a pool index no sparse buffer
+# uses; one that sorts last leaves none. The two exercise different arena layouts, and
+# until both were checked a missing placeholder region and a phantom shared array cancelled.
+@pytest.mark.parametrize("dense_size", [4096, 256], ids=["dense-between", "dense-last"])
+def test_sparse_arena_bytes_match_the_native_allocation(dense_size: int) -> None:
+    """Python predicts the arena's bytes; this is the only thing that checks the prediction.
+
+    The reservation has to run before a manager exists, so the bytes are modelled in
+    Python and compared against a figure Python also computed -- which cannot catch the
+    model drifting from the allocation. Reading the allocation back closes that loop.
+    """
+    torch.cuda.synchronize()
+    leases = 5
+    config = _sparse_arena_config(2, False, dense_size)
+    core = KVCacheManager(config)
+    try:
+        (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=config.tokens_per_block)
+        batch = Batch(
+            core,
+            CudaStream(torch.cuda.current_stream().cuda_stream),
+            max_batch_size=leases,
+            max_blocks_per_seq=1,
+            index_tables=core.sparse_index_table_specs(),
+        )
+        assert batch.sparse_arena_bytes == shape.arena_bytes(leases)
+        assert batch.sparse_arena_bytes > 0
+    finally:
+        core.shutdown()
+
+
+@pytest.mark.parametrize("shared_selection", [False, True], ids=["apart", "shared"])
+def test_sparse_arena_bytes_follow_the_selection_count(shared_selection: bool) -> None:
+    """The metadata is sized by selections, so sharing one has to shrink the allocation.
+
+    The same loop as above, closed over the dimension a selection group changes: the
+    Python model counts metadata rows itself, and nothing else would catch it counting
+    layers where the arena counts selections.
+    """
+    torch.cuda.synchronize()
+    leases = 5
+    config = _sparse_arena_config(2, False, num_layers=2, shared_selection=shared_selection)
+    core = KVCacheManager(config)
+    try:
+        (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=config.tokens_per_block)
+        assert shape.num_layers == 2
+        assert shape.num_selections == (1 if shared_selection else 2)
+        batch = Batch(
+            core,
+            CudaStream(torch.cuda.current_stream().cuda_stream),
+            max_batch_size=leases,
+            max_blocks_per_seq=1,
+            index_tables=core.sparse_index_table_specs(),
+        )
+        assert batch.sparse_arena_bytes == shape.arena_bytes(leases)
+    finally:
+        core.shutdown()
+
+
+def _native_config_with_sparse_arena(
+    *,
+    arena_bytes: int,
+    budget: int,
+    sparse_layers: bool = False,
+    batch_buffer_bytes: int = 0,
+    mapping: Mapping | None = None,
+    sparse_kv_offload_config: SparseKvCacheOffloadConfig | None = None,
+    kv_cache_config: KvCacheConfig | None = None,
+    host_history_budget: int = 0,
+    host_pinnable_bytes: float = float("inf"),
+) -> KVCacheManagerConfig:
+    """Construct a manager that reserves ``arena_bytes`` for its arena and
+    ``batch_buffer_bytes`` for its offload buffers, and plans
+    ``host_history_budget`` bytes of host history out of ``host_pinnable_bytes``;
+    return the config it gives the native manager."""
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+    layers = (
+        _sparse_arena_config(2, False).layers
+        if sparse_layers
+        else [
+            AttentionLayerConfig(
+                layer_id=LayerId(0), buffers=[BufferConfig(role=Role.KEY, size=128)]
+            )
+        ]
+    )
+    fake_impl = Mock()
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
+    fake_impl.pool_group_descs = []
+    fake_impl.get_layer_group_id.side_effect = lambda _: 0
+
+    def build_base_config(
+        self: KVCacheManagerV2,
+        config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        cache_tiers: list[object],
+    ) -> KVCacheManagerConfig:
+        del self, config
+        return KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block, cache_tiers=cache_tiers, layers=layers
+        )
+
+    def plan_host_history_budget(
+        self: KVCacheManagerV2, kv_cache_config: KvCacheConfig, **kwargs: object
+    ) -> None:
+        # Settles the budget only; the manager divides the device quota against it.
+        self._host_history_budget = host_history_budget
+        self._host_pinnable_bytes = host_pinnable_bytes
+
+    with (
+        patch.dict(os.environ, {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""}),
+        patch(f"{module}.IndexMapper"),
+        patch(f"{module}.KVCacheManagerPy", return_value=fake_impl) as create_impl,
+        patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
+        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+        patch.object(KVCacheManagerV2, "_reserve_guard_page"),
+        patch.object(
+            KVCacheManagerV2, "_get_sparse_arena_bytes", return_value=arena_bytes
+        ) as get_arena_bytes,
+        patch.object(
+            KVCacheManagerV2,
+            "_get_sparse_batch_buffer_bytes",
+            return_value=(batch_buffer_bytes, 4096 if batch_buffer_bytes else 0),
+        ) as get_batch_buffer_bytes,
+        patch.object(KVCacheManagerV2, "_plan_host_history_budget", plan_host_history_budget),
+    ):
+        KVCacheManagerV2(
+            kv_cache_config or KvCacheConfig(max_gpu_total_bytes=budget, enable_block_reuse=False),
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=2,
+            mapping=mapping or Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+            execution_stream=Mock(),
+            is_disagg=True,
+            sparse_kv_offload_config=sparse_kv_offload_config,
+        )
+    # A lease follows Batch membership, so the arena is sized by the rows rather than by
+    # the 5 indices the mapper can hand out -- disagg doubling and padding included.
+    get_arena_bytes.assert_called_once_with(ANY, tokens_per_block=TOKENS_PER_BLOCK, max_leases=2)
+    get_batch_buffer_bytes.assert_called_once_with(ANY, tokens_per_block=TOKENS_PER_BLOCK)
+    return create_impl.call_args.args[0]
+
+
+def _device_quota_with_sparse_arena(**kwargs: object) -> int:
+    """Return the device quota of ``_native_config_with_sparse_arena``."""
+    return _native_config_with_sparse_arena(**kwargs).cache_tiers[0].quota
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arena_bytes", "batch_buffer_bytes"), [(0, 0), (3 << 20, 0), (3 << 20, 1 << 20)]
+)
+def test_device_quota_leaves_room_for_the_offload_allocations(
+    arena_bytes: int, batch_buffer_bytes: int
+) -> None:
+    quota = _device_quota_with_sparse_arena(
+        arena_bytes=arena_bytes, budget=16 << 20, batch_buffer_bytes=batch_buffer_bytes
+    )
+
+    assert quota == (16 << 20) - arena_bytes - batch_buffer_bytes
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arena_bytes", "batch_buffer_bytes"), [(16 << 20, 0), (12 << 20, 4 << 20)]
+)
+def test_offload_allocations_larger_than_the_budget_are_rejected(
+    arena_bytes: int, batch_buffer_bytes: int
+) -> None:
+    with pytest.raises(ValueError, match="Sparse KV cache offload needs"):
+        _device_quota_with_sparse_arena(
+            arena_bytes=arena_bytes, budget=16 << 20, batch_buffer_bytes=batch_buffer_bytes
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_tokens", [4 * TOKENS_PER_BLOCK, 1 << 30])
+def test_max_tokens_sizes_the_pools_beside_the_offload_allocations(max_tokens: int) -> None:
+    # The arena and buffers come out of the device memory budget. max_tokens sizes the
+    # pools alone, so a pool for a few tokens still fits beside a large arena.
+    def quota(arena_bytes: int, batch_buffer_bytes: int) -> int:
+        return _device_quota_with_sparse_arena(
+            arena_bytes=arena_bytes,
+            budget=16 << 20,
+            batch_buffer_bytes=batch_buffer_bytes,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=16 << 20, max_tokens=max_tokens, enable_block_reuse=False
+            ),
+        )
+
+    pools = quota(0, 0)
+    assert quota(12 << 20, 1 << 20) == min(pools, (16 << 20) - (13 << 20))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arena_bytes", "error", "match"),
+    [
+        # Rank 1 fits its budget, but another rank does not.
+        (0, RuntimeError, "Sizing sparse KV cache offload failed on another rank"),
+        # Rank 1 itself does not fit, and raises its own error.
+        (16 << 20, ValueError, "Sparse KV cache offload needs"),
+    ],
+)
+def test_offload_sizing_fails_on_every_rank_before_the_token_sync(
+    arena_bytes: int, error: type, match: str
+) -> None:
+    ok, abort = int(_KVCacheManagerInitStatus.OK), int(_KVCacheManagerInitStatus.ABORT)
+    dist = Mock()
+    # The config check passes everywhere; then sizing fails on some rank.
+    dist.allreduce.side_effect = [ok, abort]
+
+    with (
+        patch.object(Distributed, "get", return_value=dist),
+        pytest.raises(error, match=match),
+    ):
+        _device_quota_with_sparse_arena(
+            arena_bytes=arena_bytes,
+            budget=16 << 20,
+            mapping=Mapping(world_size=2, rank=1, tp_size=2),
+            sparse_kv_offload_config=SparseKvCacheOffloadConfig(),
+        )
+
+    # Every rank stops after agreeing; none is left in the token sync.
+    this_rank = ok if arena_bytes == 0 else abort
+    assert dist.allreduce.call_args_list == [
+        call(ok, op=ReduceOp.MAX),
+        call(this_rank, op=ReduceOp.MAX),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_host_history_budget_is_the_smallest_ranks() -> None:
+    # Each rank sizes its budget from its own host memory. Ranks whose history pools
+    # differed would suspend different requests, so every rank takes the smallest.
+    local_budget, peer_budget = 8 << 30, 6 << 30
+    dist = Mock()
+
+    def allreduce(value, op):
+        if op == ReduceOp.MIN and value == local_budget:
+            return peer_budget
+        return value
+
+    dist.allreduce.side_effect = allreduce
+    with patch.object(Distributed, "get", return_value=dist):
+        config = _native_config_with_sparse_arena(
+            arena_bytes=0,
+            budget=16 << 20,
+            mapping=Mapping(world_size=2, rank=1, tp_size=2),
+            sparse_kv_offload_config=SparseKvCacheOffloadConfig(),
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=16 << 20, host_cache_size=16 << 20, enable_block_reuse=False
+            ),
+            host_history_budget=local_budget,
+        )
+
+    assert call(local_budget, op=ReduceOp.MIN) in dist.allreduce.call_args_list
+    assert config.host_sparse_pool_quota == peer_budget
+
+
+@pytest.mark.cpu_only
+def test_automatic_host_tier_gets_what_offload_leaves(monkeypatch) -> None:
+    # The 8 GiB of history and 4 KiB of staging leave 10 MiB of the memlock limit.
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "get_host_memory_limits",
+        lambda mapping: HostMemoryLimits(1, float(400 << 30), float((8 << 30) + 4096 + (10 << 20))),
+    )
+
+    with patch.object(kv_cache_v2_module.logger, "warning") as warning:
+        config = _native_config_with_sparse_arena(
+            arena_bytes=0,
+            budget=16 << 20,
+            batch_buffer_bytes=1 << 20,
+            sparse_kv_offload_config=SparseKvCacheOffloadConfig(),
+            host_history_budget=8 << 30,
+        )
+
+    _, host_tier = config.cache_tiers
+    assert isinstance(host_tier, HostCacheTierConfig)
+    assert host_tier.quota == int((10 << 20) * 0.8)
+    assert not any("cache tier" in c.args[0] for c in warning.call_args_list)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("host_history_size", [None, 8 << 30])
+def test_automatic_host_tier_takes_what_the_history_pools_leave(
+    monkeypatch, host_history_size: int | None
+) -> None:
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "get_host_memory_limits",
+        lambda mapping: HostMemoryLimits(1, float(400 << 30), float("inf")),
+    )
+
+    config = _native_config_with_sparse_arena(
+        arena_bytes=0,
+        budget=16 << 20,
+        batch_buffer_bytes=1 << 20,
+        sparse_kv_offload_config=SparseKvCacheOffloadConfig(host_history_size=host_history_size),
+        host_history_budget=8 << 30,
+        host_pinnable_bytes=float((8 << 30) + 4096 + (6 << 20)),
+    )
+
+    device_tier, host_tier = config.cache_tiers
+    if host_history_size is None:
+        # Sized automatically, the history pools come first: the tier gets the 6 MiB they
+        # and the 4 KiB of staging leave of what automatic sizing may pin, not the device
+        # quota.
+        assert host_tier.quota == 6 << 20
+    else:
+        # An explicit size is the user's split; the tier is sized from available memory.
+        assert host_tier.quota == device_tier.quota
+
+
+def _host_tier_growth_manager(pinned: int, *, world_size: int = 1) -> KVCacheManagerV2:
+    """A manager whose history pools pin ``pinned`` of their 7 GiB budget.
+
+    Automatic sizing may pin 10 GiB beside 1 GiB of staging, the device quota is 6 GiB,
+    and the host tier was sized at 2 GiB beside the whole budget.
+    """
+    manager = _offload_setup_manager([64], world_size=world_size, cold_tier=True)
+    quotas = {GPU_LEVEL: 6 << 30, CACHE_LEVEL1: 2 << 30}
+    manager.impl.get_quota = lambda level: quotas[level]
+    manager.impl.resize = Mock(return_value=True)
+    manager._get_host_backed_pool_bytes = lambda: pinned
+    manager._host_pinnable_bytes = float(10 << 30)
+    manager._sparse_batch_staging_bytes = 1 << 30
+    manager._host_history_budget = 7 << 30
+    manager._host_tier_follows_history = True
+    return manager
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("pinned", "grown_to"),
+    [
+        # Pinning 2 GiB leaves 7 GiB beside the pools and staging; the tier grows to the
+        # 6 GiB device quota.
+        (2 << 30, 6 << 30),
+        # Pools that pin their whole budget leave the tier as it was sized.
+        (7 << 30, None),
+    ],
+)
+def test_automatic_host_tier_grows_into_unpinned_history(pinned: int, grown_to: int | None) -> None:
+    manager = _host_tier_growth_manager(pinned)
+
+    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
+        )
+
+    if grown_to is None:
+        manager.impl.resize.assert_not_called()
+    else:
+        manager.impl.resize.assert_called_once_with(CACHE_LEVEL1, grown_to)
+
+
+@pytest.mark.cpu_only
+def test_host_tier_keeps_its_size_when_a_rank_cannot_grow_it() -> None:
+    manager = _host_tier_growth_manager(2 << 30, world_size=2)
+    dist = Mock()
+    # The ranks agree on the capacity and the 6 GiB target; another rank fails to grow.
+    dist.allreduce.side_effect = [64, 6 << 30, 0]
+
+    with (
+        patch.object(kv_cache_v2_module.Distributed, "get", return_value=dist),
+        patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"),
+        patch.object(kv_cache_v2_module.logger, "warning") as warning,
+    ):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
+        )
+
+    # Every rank goes back to the tier the ranks agreed on at construction.
+    assert manager.impl.resize.call_args_list == [
+        call(CACHE_LEVEL1, 6 << 30),
+        call(CACHE_LEVEL1, 2 << 30),
+    ]
+    assert any("could not grow the host cache tier" in c.args[0] for c in warning.call_args_list)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("tiers", "reserve"),
+    [
+        # Room for one 1,000-token request: 8 pages of two layers' 4,096 + 512 bytes.
+        ("automatic", 8 * 2 * (4096 + 512)),
+        # An explicit host tier is set aside already, and a disk tier takes suspended
+        # pages the host tier has no room for.
+        ("explicit host", 0),
+        ("disk", 0),
+    ],
+)
+def test_host_tier_reserve_holds_one_max_seq_len_request(
+    tmp_path, tiers: str, reserve: int
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = 1000
+    manager.num_extra_kv_tokens = 0
+    manager._generation_kv_capacity_headroom = 1
+    layer = AttentionLayerConfig(
+        layer_id=LayerId(0),
+        buffers=[BufferConfig(role=Role.KEY, size=4096), BufferConfig(role=Role.VALUE, size=512)],
+    )
+    config = SimpleNamespace(tokens_per_block=128, layers=[layer, layer])
+    kv_cache_config = {
+        "automatic": KvCacheConfig(),
+        "explicit host": KvCacheConfig(host_cache_size=1 << 20),
+        "disk": KvCacheConfig(disk_cache_size=1 << 20, disk_cache_path=str(tmp_path)),
+    }[tiers]
+
+    assert manager._get_host_tier_reserve_bytes(kv_cache_config, config) == reserve
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("max_seq_len", "history_pages"), [(128 << 10, 1024), (1 << 20, 8192)])
+def test_host_tier_reserve_holds_only_the_pages_a_window_keeps(
+    max_seq_len: int, history_pages: int
+) -> None:
+    # DeepSeek-V4-Flash at FP8 with fp4 indexer keys, in 128-token pages, one layer per
+    # life cycle holding its buffers' bytes: the compressed history, which a request keeps
+    # whole, its ratio-4 rows offloaded and its indexer keys and ratio-128 rows on the GPU;
+    # the 128-token sliding window; and the 8-token compressor state.
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = max_seq_len
+    manager.num_extra_kv_tokens = 0
+    manager._generation_kv_capacity_headroom = 1
+    history = AttentionLayerConfig(
+        layer_id=LayerId(0),
+        buffers=[
+            BufferConfig(role=DataRole("offloaded_rows"), size=344_064, is_sparse=True),
+            BufferConfig(role=DataRole("resident_rows"), size=55_936),
+        ],
+    )
+    sliding_window = AttentionLayerConfig(
+        layer_id=LayerId(1),
+        buffers=[BufferConfig(role=DataRole("swa"), size=13_303_808)],
+        sliding_window_size=128,
+    )
+    compressor_state = AttentionLayerConfig(
+        layer_id=LayerId(2),
+        buffers=[BufferConfig(role=DataRole("compressor_state"), size=27_525_120)],
+        sliding_window_size=8,
+    )
+    config = SimpleNamespace(
+        tokens_per_block=128, layers=[history, sliding_window, compressor_state]
+    )
+
+    reserve = manager._get_host_tier_reserve_bytes(KvCacheConfig(), config)
+
+    # Each window keeps the two pages its live tokens can straddle, so one request holds
+    # 0.46 GiB at 128K tokens and 3.13 GiB at 1M, not the 39.3 GiB and 314.6 GiB that
+    # max_seq_len pages of every life cycle would take.
+    assert reserve == history_pages * (344_064 + 55_936) + 2 * 13_303_808 + 2 * 27_525_120
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("disk_tier", [False, True])
+def test_offload_refuses_to_leave_no_room_for_the_automatic_host_tier(
+    monkeypatch, tmp_path, disk_tier: bool
+) -> None:
+    # The offloaded history takes all of the memlock limit.
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "get_host_memory_limits",
+        lambda mapping: HostMemoryLimits(1, float(400 << 30), float(8 << 30)),
+    )
+    kwargs = dict(
+        arena_bytes=0,
+        budget=16 << 20,
+        sparse_kv_offload_config=SparseKvCacheOffloadConfig(),
+        host_history_budget=8 << 30,
+    )
+
+    if not disk_tier:
+        # Falling back to the device quota would pin past the limit.
+        with pytest.raises(ValueError, match="leaves none for the host cache tier"):
+            _native_config_with_sparse_arena(**kwargs)
+        return
+    # A disk tier still gives evicted pages somewhere to go.
+    config = _native_config_with_sparse_arena(
+        **kwargs,
+        kv_cache_config=KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+            enable_block_reuse=False,
+        ),
+    )
+    assert [type(tier) for tier in config.cache_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+
+
+@pytest.mark.cpu_only
+def test_offload_warns_when_it_runs_without_a_cold_tier() -> None:
+    with patch.object(kv_cache_v2_module.logger, "warning") as warning:
+        config = _native_config_with_sparse_arena(
+            arena_bytes=0,
+            budget=16 << 20,
+            sparse_kv_offload_config=SparseKvCacheOffloadConfig(),
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=16 << 20, host_cache_size=0, enable_block_reuse=False
+            ),
+        )
+
+    assert [type(tier) for tier in config.cache_tiers] == [GpuCacheTierConfig]
+    assert any(
+        "runs without a host or disk cache tier" in c.args[0] for c in warning.call_args_list
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("error", "agreed_status", "raised", "match"),
+    [
+        (None, _KVCacheManagerInitStatus.OK, None, None),
+        (None, _KVCacheManagerInitStatus.ABORT, RuntimeError, "Checking failed on another rank"),
+        (ValueError("no room"), _KVCacheManagerInitStatus.ABORT, ValueError, "no room"),
+    ],
+)
+def test_raise_on_every_rank_agrees_across_ranks(
+    error: Exception | None,
+    agreed_status: _KVCacheManagerInitStatus,
+    raised: type | None,
+    match: str | None,
+) -> None:
+    mapping = SimpleNamespace(world_size=4, rank=2)
+    dist = Mock()
+    dist.allreduce.return_value = int(agreed_status)
+
+    with patch.object(Distributed, "get", return_value=dist):
+        if raised is None:
+            _raise_on_every_rank(error, mapping, "Checking")
+        else:
+            with pytest.raises(raised, match=match):
+                _raise_on_every_rank(error, mapping, "Checking")
+
+    # Every rank offers its own outcome through the init-status sync, and the most
+    # severe one is every rank's.
+    local_status = _KVCacheManagerInitStatus.ABORT if error else _KVCacheManagerInitStatus.OK
+    dist.allreduce.assert_called_once_with(int(local_status), op=ReduceOp.MAX)
+
+
+@pytest.mark.cpu_only
+def test_raise_on_every_rank_needs_no_collective_on_one_rank() -> None:
+    mapping = SimpleNamespace(world_size=1, rank=0)
+
+    with patch.object(Distributed, "get") as get:
+        _raise_on_every_rank(None, mapping, "Checking")
+        with pytest.raises(ValueError, match="no room"):
+            _raise_on_every_rank(ValueError("no room"), mapping, "Checking")
+
+    get.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_sparse_arena_without_a_reservation_is_rejected() -> None:
+    # Cached sparse buffers declared without sparse_kv_offload_config reserve no
+    # device memory for their arena.
+    with pytest.raises(RuntimeError, match="sparse_kv_offload_config"):
+        _device_quota_with_sparse_arena(arena_bytes=0, budget=16 << 20, sparse_layers=True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+def test_sparse_arena_bytes_come_from_a_provisional_config(offload: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = MAX_SEQ_LEN
+    manager.mapping = Mapping()
+    if offload:
+        manager._sparse_kv_offload = SparseKvCacheOffloadConfig()
+    config = _sparse_arena_config(2, False)
+
+    with patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config) as build:
+        arena_bytes = manager._get_sparse_arena_bytes(
+            KvCacheConfig(), tokens_per_block=16, max_leases=5
+        )
+
+    if not offload:
+        assert arena_bytes == 0
+        build.assert_not_called()
+        return
+    assert arena_bytes == sparse_arena_bytes(config, 5) > 0
+    # Layer configs do not depend on tier quotas, so any quota gives the same arena.
+    (gpu_tier,) = build.call_args.kwargs["cache_tiers"]
+    assert gpu_tier.quota == sys.maxsize
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+def test_sparse_batch_buffers_come_from_a_provisional_config(offload: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.mapping = Mapping()
+    manager.max_seq_len = MAX_SEQ_LEN
+    manager.max_batch_size = 2
+    manager._generation_kv_capacity_headroom = 1
+    manager._ledger_tokens_per_block = TOKENS_PER_BLOCK
+    if offload:
+        manager._sparse_kv_offload = SparseKvCacheOffloadConfig()
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=sys.maxsize)],
+        layers=_offload_layers(),
+    )
+
+    with (
+        patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config) as build,
+        patch.object(
+            KVCacheManagerV2, "get_sparse_offload_scratch_bytes", return_value=1000
+        ) as get_scratch_bytes,
+    ):
+        device_bytes, staging_bytes = manager._get_sparse_batch_buffer_bytes(
+            KvCacheConfig(), tokens_per_block=TOKENS_PER_BLOCK
+        )
+
+    if not offload:
+        assert (device_bytes, staging_bytes) == (0, 0)
+        build.assert_not_called()
+        return
+    # 17 tokens of 16 and the decode step's one span five pages, padded to eight.
+    batch = sparse_batch_shape(
+        config.layers, tokens_per_block=TOKENS_PER_BLOCK, max_batch_size=2, max_blocks_per_seq=8
+    )
+    assert batch.num_life_cycles == 2
+    assert batch.selection_widths == (1,)
+    # The Batch also converts the sparse buffer's indices into one table per row.
+    assert batch.index_table_bytes == 4 * batch.index_table_entries * 2 * 8 > 0
+    assert device_bytes == (
+        batch.block_bytes
+        + batch.mirror_bytes
+        + batch.index_table_bytes
+        + batch.fetch_scratch_bytes
+        + 1000
+    )
+    assert staging_bytes == batch.staging_bytes == 4096
+    get_scratch_bytes.assert_called_once_with(config)
+    (gpu_tier,) = build.call_args.kwargs["cache_tiers"]
+    assert gpu_tier.quota == sys.maxsize
+
+
+@pytest.mark.cpu_only
+def test_sparse_startup_rejects_ordinal_overflow_before_sizing() -> None:
+    manager = _offload_manager()
+    manager.max_seq_len = 262_143 * 4
+    config = _sparse_arena_config(2, False)
+    with (
+        patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config),
+        patch.object(kv_cache_v2_module, "sparse_arena_bytes") as size_arena,
+        pytest.raises(ValueError, match="max_seq_len=1048572"),
+    ):
+        manager._get_sparse_arena_bytes(KvCacheConfig(), tokens_per_block=16, max_leases=2)
+
+    size_arena.assert_not_called()
+    assert manager._offload_sizing_config is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local_overflow", [False, True])
+def test_sparse_ordinal_overflow_fails_startup_on_every_rank(local_overflow: bool) -> None:
+    manager = _offload_manager()
+    manager.max_seq_len = 1_000_000
+    manager.mapping = Mapping(world_size=2, rank=0 if local_overflow else 1, tp_size=2)
+    config = _sparse_arena_config(2, False)
+    # Only the token-sparse rank exceeds the limit; the four-token units fit.
+    layer = config.layers[0]
+    layer.sparse_cache = SparseCacheConfig(
+        num_selected_blocks=2, max_cached_units=4, unit_tokens=1 if local_overflow else 4
+    )
+    config.layers = [layer]
+    dist = Mock()
+    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.ABORT)
+    error_type = ValueError if local_overflow else RuntimeError
+    message = "unit_tokens=1" if local_overflow else "sequence-length check failed on another rank"
+    with (
+        patch.object(Distributed, "get", return_value=dist),
+        patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config),
+        patch.object(kv_cache_v2_module, "sparse_arena_bytes") as size_arena,
+        pytest.raises(error_type, match=message),
+    ):
+        manager._get_sparse_arena_bytes(KvCacheConfig(), tokens_per_block=16, max_leases=2)
+
+    status = _KVCacheManagerInitStatus.ABORT if local_overflow else _KVCacheManagerInitStatus.OK
+    dist.allreduce.assert_called_once_with(int(status), op=ReduceOp.MAX)
+    size_arena.assert_not_called()
+    assert manager._offload_sizing_config is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_seq_len", "headroom", "max_blocks_per_seq"), [(16, 1, 8), (15, 1, 4), (16, 0, 4)]
+)
+def test_page_table_holds_the_decode_step_and_pads_to_four_pages(
+    max_seq_len: int, headroom: int, max_blocks_per_seq: int
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._generation_kv_capacity_headroom = headroom
+    manager._ledger_tokens_per_block = TOKENS_PER_BLOCK
+
+    assert manager._get_max_blocks_per_seq(max_seq_len) == max_blocks_per_seq
+
+
+def _gen_init_manager(host_capacity_blocks: int | None) -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    if host_capacity_blocks is not None:
+        manager._host_history_reservations = HostHistoryReservations(host_capacity_blocks)
+    manager.num_extra_kv_tokens = 0
+    manager.tokens_per_block = 128
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    return manager
+
+
+def _gen_init_request(request_id: int, prompt_len: int, max_new_tokens: int):
+    return SimpleNamespace(
+        py_request_id=request_id,
+        prompt_len=prompt_len,
+        orig_prompt_len=prompt_len,
+        max_new_tokens=max_new_tokens,
+        py_beam_width=1,
+        try_get_encoder_output_len=lambda: None,
+    )
+
+
+@pytest.mark.cpu_only
+def test_gen_init_reserves_host_history_to_completion() -> None:
+    manager = _gen_init_manager(host_capacity_blocks=10)
+    reservations = manager._host_history_reservations
+
+    with patch.object(
+        KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True
+    ) as prepare:
+        # 641 tokens through the last output token span six blocks.
+        assert manager.prepare_disagg_gen_init(_gen_init_request(1, 512, 129))
+        assert reservations.reserved_blocks == 6
+        # Five more blocks do not fit beside it, and the cache is left untouched.
+        assert not manager.prepare_disagg_gen_init(_gen_init_request(2, 512, 128))
+        assert prepare.call_count == 1
+        # Preparing a request again replaces its reservation.
+        assert manager.prepare_disagg_gen_init(_gen_init_request(1, 256, 0))
+        assert manager.prepare_disagg_gen_init(_gen_init_request(2, 512, 128))
+        assert reservations.reserved_blocks == 7
+        # A request larger than the whole pool is never admitted.
+        assert not manager.prepare_disagg_gen_init(_gen_init_request(3, 128 * 11, 0))
+    with patch.object(KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=False):
+        # A request whose cache could not be prepared reserves nothing.
+        assert not manager.prepare_disagg_gen_init(_gen_init_request(4, 128, 0))
+    assert reservations.reserved_blocks == 7
+
+
+@pytest.mark.cpu_only
+def test_gen_init_without_sparse_offload_reserves_nothing() -> None:
+    manager = _gen_init_manager(host_capacity_blocks=None)
+
+    with patch.object(
+        KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True
+    ) as prepare:
+        assert manager.prepare_disagg_gen_init(_gen_init_request(1, 1 << 20, 0))
+
+    prepare.assert_called_once()
+    assert not manager.kv_block_budget_applies()
+    assert manager.get_request_kv_block_budget(_gen_init_request(1, 1 << 20, 0)) is None
+
+
+@pytest.mark.cpu_only
+def test_request_larger_than_host_history_is_rejected_on_arrival() -> None:
+    manager = _gen_init_manager(host_capacity_blocks=10)
+    manager._host_history_capacity_blocks = 10
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+
+    assert manager.kv_block_budget_applies()
+    # 1281 tokens through the last output token span 11 blocks, which no rank can
+    # reserve, so the request fails instead of waiting for admission forever.
+    with pytest.raises(ValueError, match="requires 11 KV cache blocks.*capacity of 10 blocks"):
+        executor._validate_request_budget(_gen_init_request(1, 1024, 257))
+    # Ten blocks fit, and admission reserves exactly what the check counted.
+    request = _gen_init_request(2, 1024, 256)
+    executor._validate_request_budget(request)
+    with patch.object(KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True):
+        assert manager.prepare_disagg_gen_init(request)
+    assert manager._host_history_reservations.reserved_blocks == 10
+
+
+def _offload_setup_manager(
+    local_slots: list[int],
+    *,
+    world_size: int = 1,
+    attention_dp: bool = False,
+    guard_page: bool = False,
+    max_total_draft_tokens: int = 0,
+    cold_tier: bool = False,
+) -> KVCacheManagerV2:
+    """A manager stand-in whose host-backed pool groups hold ``local_slots`` slots.
+
+    Without ``cold_tier`` it has no cache tier below the GPU, so admission reserves
+    history.
+    """
+    manager = object.__new__(KVCacheManagerV2)
+    tiers = [CacheTier.GPU_MEM, CacheTier.HOST_MEM] if cold_tier else [CacheTier.GPU_MEM]
+    manager.impl = SimpleNamespace(cache_tier_list=tiers)
+    manager.mapping = SimpleNamespace(
+        world_size=world_size, rank=0, enable_attention_dp=attention_dp
+    )
+    manager.is_estimating_kv_cache = False
+    manager.num_extra_kv_tokens = 0
+    manager.max_total_draft_tokens = max_total_draft_tokens
+    manager.tokens_per_block = 128
+    manager.kv_cache_map = {kv_cache_v2_module._GUARD_PAGE_REQUEST_ID: Mock()} if guard_page else {}
+    manager.get_host_backed_pool_groups = lambda: [
+        SimpleNamespace(num_slots=n) for n in local_slots
+    ]
+    return manager
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("world_size", "local_slots", "peer_slots", "capacity_blocks"),
+    [
+        (1, [12, 10], None, 10),
+        # Every rank judges arriving requests and admits them by the smallest pool,
+        # including a rank whose layers hold no host history.
+        (2, [12, 10], 8, 8),
+        (2, [], 8, 8),
+        (2, [], sys.maxsize, None),
+    ],
+)
+def test_sparse_offload_setup_judges_requests_by_the_smallest_host_pool(
+    world_size: int, local_slots: list[int], peer_slots: int | None, capacity_blocks: int | None
+) -> None:
+    manager = _offload_setup_manager(local_slots, world_size=world_size)
+    dist = Mock()
+    dist.allreduce.side_effect = lambda value, op: min(value, peer_slots)
+
+    with (
+        patch.object(kv_cache_v2_module.Distributed, "get", return_value=dist),
+        patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"),
+        patch.object(kv_cache_v2_module.logger, "warning") as warning,
+    ):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
+        )
+
+    if world_size > 1:
+        dist.allreduce.assert_called_once_with(
+            min(local_slots, default=sys.maxsize), op=ReduceOp.MIN
+        )
+    else:
+        dist.allreduce.assert_not_called()
+    assert manager._host_history_capacity_blocks == capacity_blocks
+    assert manager.kv_block_budget_applies() == (capacity_blocks is not None)
+    if local_slots:
+        # A rank that admitted against its own larger pool would serve requests
+        # its peers left waiting, and wait for them in collectives alone.
+        assert manager._host_history_reservations.capacity_blocks == capacity_blocks
+    else:
+        assert manager._host_history_reservations is None
+    # Eight blocks of 128 tokens hold a max_seq_len request of 1024 tokens.
+    warning.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_admits_by_current_need_with_a_cold_tier() -> None:
+    # A suspended request's history can move to the host tier, so requests take
+    # history slots as they decode and nothing is reserved up front. A request that
+    # could never fit alone is still rejected on arrival.
+    manager = _offload_setup_manager([12, 10], cold_tier=True)
+
+    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
+        )
+
+    assert manager._host_history_reservations is None
+    assert manager._host_history_capacity_blocks == 10
+    assert manager.get_request_kv_block_budget(_gen_init_request(1, 128 * 11, 0)) == (11, 10)
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    with patch.object(
+        KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True
+    ) as prepare:
+        # Two requests of ten blocks each are admitted beside each other.
+        assert manager.prepare_disagg_gen_init(_gen_init_request(1, 1024, 256))
+        assert manager.prepare_disagg_gen_init(_gen_init_request(2, 1024, 256))
+    assert prepare.call_count == 2
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_setup_warns_when_max_seq_len_outgrows_host_history() -> None:
+    manager = _offload_setup_manager([8])
+
+    with (
+        patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"),
+        patch.object(kv_cache_v2_module.logger, "warning") as warning,
+    ):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=1025, num_reserved_index_slots=0
+        )
+
+    message = warning.call_args.args[0]
+    assert "rejects requests whose prompt and max_tokens exceed 1024 tokens" in message
+    assert "max_seq_len=1025 tokens needs 9" in message
+    assert "kv_cache_offload_config.host_history_size" in message
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("num_reserved_index_slots", "attention_dp", "guard_page", "draft_tokens", "set_aside"),
+    [
+        # The CUDA-graph padding dummy.
+        (1, False, False, 0, 1),
+        # Plus the attention-DP dummy and the guard page.
+        (1, True, False, 0, 2),
+        (1, True, True, 0, 3),
+        # A dummy with 64 draft tokens holds 1 + 2 x 64 tokens, two blocks of 128.
+        (2, False, False, 64, 4),
+    ],
+)
+def test_sparse_offload_setup_sets_dummy_history_aside(
+    num_reserved_index_slots: int,
+    attention_dp: bool,
+    guard_page: bool,
+    draft_tokens: int,
+    set_aside: int,
+) -> None:
+    manager = _offload_setup_manager(
+        [12, 10],
+        attention_dp=attention_dp,
+        guard_page=guard_page,
+        max_total_draft_tokens=draft_tokens,
+    )
+
+    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=128, num_reserved_index_slots=num_reserved_index_slots
+        )
+
+    # Dummy requests hold history pages without a reservation, so neither
+    # admission nor the check on arrival may promise those pages to a request.
+    assert manager._host_history_reservations.capacity_blocks == 10 - set_aside
+    assert manager._host_history_capacity_blocks == 10 - set_aside
+    whole_pool = _gen_init_request(1, 128 * 10, 0)
+    assert manager.get_request_kv_block_budget(whole_pool) == (10, 10 - set_aside)
+
+
+@pytest.mark.cpu_only
+def test_free_resources_releases_host_history() -> None:
+    manager = _gen_init_manager(host_capacity_blocks=10)
+    manager._host_history_reservations.reserve(1, 6)
+    manager.kv_connector_manager = None
+    manager.conversation_manager = None
+    manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
+    manager._request_stats_enabled_ids = set()
+    manager._fresh_pages_filled = {}
+    manager._disagg_receive_ready = {}
+    manager._pending_preemption = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    manager.kv_cache_map = {}
+    manager.impl = Mock()
+
+    manager.free_resources(SimpleNamespace(py_request_id=1, request_id=1))
+
+    assert manager._host_history_reservations.reserved_blocks == 0
+
+
+@pytest.mark.cpu_only
+def test_host_memory_limits_cap_automatic_pinning() -> None:
+    assert HostMemoryLimits(4, float(400 << 30), float("inf")).auto_pinnable_bytes == 50 << 30
+    assert HostMemoryLimits(1, float("inf"), float(10 << 30)).auto_pinnable_bytes == 8 << 30
+    assert HostMemoryLimits(1, float("inf"), float("inf")).auto_pinnable_bytes == float("inf")
+
+
+@pytest.mark.cpu_only
+def test_sparse_kv_offload_config_is_checked_against_this_rank(monkeypatch) -> None:
+    limits = {"value": HostMemoryLimits(4, float(400 << 30), float("inf"))}
+    monkeypatch.setattr(
+        kv_cache_v2_module, "get_host_memory_limits", lambda mapping: limits["value"]
+    )
+
+    def check(offload_config, kv_cache_config, mapping):
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            offload_config, kv_cache_config, mapping, spec_config=None
+        )
+
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+    check(SparseKvCacheOffloadConfig(host_history_size=50 << 30), kv_cache_config, Mapping())
+    # A quarter of 400 GiB is this rank's share.
+    with pytest.raises(ValueError, match="share of available host memory"):
+        check(SparseKvCacheOffloadConfig(host_history_size=101 << 30), kv_cache_config, Mapping())
+    # An explicit host cache tier is pinned beside the history.
+    check(
+        SparseKvCacheOffloadConfig(host_history_size=50 << 30),
+        KvCacheConfig(enable_block_reuse=False, host_cache_size=50 << 30),
+        Mapping(),
+    )
+    with pytest.raises(
+        ValueError, match=r"plus kv_cache_config.host_cache_size \(51.00GiB\) exceeds this rank"
+    ):
+        check(
+            SparseKvCacheOffloadConfig(host_history_size=50 << 30),
+            KvCacheConfig(enable_block_reuse=False, host_cache_size=51 << 30),
+            Mapping(),
+        )
+    limits["value"] = HostMemoryLimits(1, float("inf"), float(10 << 30))
+    with pytest.raises(ValueError, match="RLIMIT_MEMLOCK"):
+        check(SparseKvCacheOffloadConfig(host_history_size=50 << 30), kv_cache_config, Mapping())
+    with pytest.raises(ValueError, match=r"plus kv_cache_config.host_cache_size .* RLIMIT_MEMLOCK"):
+        check(
+            SparseKvCacheOffloadConfig(host_history_size=5 << 30),
+            KvCacheConfig(enable_block_reuse=False, host_cache_size=6 << 30),
+            Mapping(),
+        )
+    with pytest.raises(ValueError, match="enable_kv_pool_rebalance"):
+        check(
+            SparseKvCacheOffloadConfig(),
+            KvCacheConfig(enable_block_reuse=False, enable_kv_pool_rebalance=True),
+            Mapping(),
+        )
+
+
+@pytest.mark.cpu_only
+def test_sparse_kv_offload_rejects_speculative_decoding() -> None:
+    # A sparse cache takes one input token per decode step, and the history set
+    # aside for dummy requests counts a single CUDA-graph padding dummy.
+    with pytest.raises(ValueError, match="does not support speculative decoding"):
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            SparseKvCacheOffloadConfig(),
+            KvCacheConfig(enable_block_reuse=False),
+            Mapping(),
+            spec_config=MTPDecodingConfig(max_draft_len=1),
+        )
+
+
+@pytest.mark.cpu_only
+def test_sparse_kv_offload_accepts_block_reuse() -> None:
+    # Reuse is on by default. On a decode worker it lets the KV transfer skip a
+    # prompt prefix the reuse tree already holds.
+    KVCacheManagerV2._check_sparse_kv_offload_config(
+        SparseKvCacheOffloadConfig(), KvCacheConfig(), Mapping(), spec_config=None
+    )
+
+
+@pytest.mark.cpu_only
+def test_sparse_kv_offload_rejects_pipeline_parallelism() -> None:
+    # The attention Batch holds one micro-batch's members; publishing the next one would
+    # release the leases of the first while it is still in flight.
+    with pytest.raises(ValueError, match="does not support pipeline parallelism"):
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            SparseKvCacheOffloadConfig(),
+            KvCacheConfig(enable_block_reuse=False),
+            Mapping(world_size=2, rank=0, pp_size=2),
+            spec_config=None,
+        )
+
+
+@pytest.mark.cpu_only
+def test_sparse_kv_offload_config_check_fails_on_every_rank(monkeypatch) -> None:
+    # This rank's node has room, but rank 0's does not.
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "get_host_memory_limits",
+        lambda mapping: HostMemoryLimits(4, float(400 << 30), float("inf")),
+    )
+    dist = Mock()
+    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.ABORT)
+
+    with (
+        patch.object(Distributed, "get", return_value=dist),
+        pytest.raises(RuntimeError, match="config check failed on another rank"),
+    ):
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            SparseKvCacheOffloadConfig(host_history_size=50 << 30),
+            KvCacheConfig(enable_block_reuse=False),
+            Mapping(world_size=2, rank=1, tp_size=2),
+            spec_config=None,
+        )
+
+    dist.allreduce.assert_called_once_with(int(_KVCacheManagerInitStatus.OK), op=ReduceOp.MAX)
+
+
+def _offload_layers() -> list[AttentionLayerConfig]:
+    """A layer whose 1 KiB sparse pages sit beside 256-byte dense ones, and a windowed layer."""
+    return [
+        AttentionLayerConfig(
+            layer_id=LayerId(0),
+            buffers=[
+                BufferConfig(role=Role.KEY, size=1024, is_sparse=True),
+                BufferConfig(role=Role.VALUE, size=256),
+            ],
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=1, max_cached_units=2, unit_tokens=TOKENS_PER_BLOCK
+            ),
+        ),
+        AttentionLayerConfig(
+            layer_id=LayerId(1),
+            buffers=[BufferConfig(role=Role.KEY, size=4096)],
+            sliding_window_size=8,
+        ),
+    ]
+
+
+def _offload_manager(host_history_size: int | None = None) -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sparse_kv_offload = SparseKvCacheOffloadConfig(host_history_size=host_history_size)
+    manager.max_seq_len = MAX_SEQ_LEN
+    manager.max_batch_size = 2
+    manager.mapping = Mapping()
+    manager._generation_kv_capacity_headroom = 1
+    return manager
+
+
+def _base_config(layers: list, initial_pool_ratio: list[float] | None = None):
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=layers,
+        initial_pool_ratio=initial_pool_ratio,
+    )
+    return (
+        patch.object(KVCacheManagerV2, "_build_base_config", return_value=config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pinned", [False, True])
+def test_offload_leaves_the_pool_ratio_to_the_manager_unless_pinned(pinned: bool) -> None:
+    manager = _offload_manager()
+    build_base, build_cache = _base_config(_offload_layers(), [0.25, 0.75] if pinned else None)
+
+    with build_base, build_cache:
+        config = manager._build_manager_config(
+            KvCacheConfig(),
+            tokens_per_block=TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        )
+
+    # The manager splits the quota from the decode-only typical step itself, counting
+    # host-backed pools in their own grain, so offload hands it no ratio of its own.
+    assert config.initial_pool_ratio == ([0.25, 0.75] if pinned else None)
+
+
+@pytest.mark.cpu_only
+def test_host_backed_pools_come_from_the_native_pool_descriptions() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+
+    def group(*media: CacheTier) -> SimpleNamespace:
+        return SimpleNamespace(
+            pools=[
+                SimpleNamespace(pool_index=index, storage_medium=medium)
+                for index, medium in enumerate(media)
+            ]
+        )
+
+    mixed = group(CacheTier.HOST_MEM, CacheTier.GPU_MEM)
+    dense = group(CacheTier.GPU_MEM)
+    get_num_bytes = Mock(return_value=10 << 20)
+    manager.impl = SimpleNamespace(
+        pool_group_descs=[mixed, dense],
+        sparse_backing_medium=lambda: CacheTier.HOST_MEM,
+        get_num_bytes=get_num_bytes,
+    )
+
+    # A group keeps its dense pools on the GPU; each pool reports its own medium.
+    assert manager.get_host_backed_pool_groups() == [mixed]
+    # The native count includes how each pool rounds to the host grain.
+    assert manager._get_host_backed_pool_bytes() == 10 << 20
+    get_num_bytes.assert_called_once_with(GPU_LEVEL, CacheTier.HOST_MEM)
+
+    manager.impl = SimpleNamespace(pool_group_descs=[dense], sparse_backing_medium=lambda: None)
+    assert manager.get_host_backed_pool_groups() == []
+    assert manager._get_host_backed_pool_bytes() == 0
+
+
+@pytest.mark.cpu_only
+def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
+    """The device quota is not lowered to fit the host budget; the manager divides both.
+
+    Lowering the quota to hold back host memory would shrink every pool group, device-only
+    ones included, though only some of them spend host memory. The manager is given the
+    budget instead and holds the host-backed pools inside it while the rest keep the device
+    bytes.
+    """
+
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+    fake_impl = Mock()
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
+    fake_impl.pool_group_descs = []
+    fake_impl.get_layer_group_id.side_effect = lambda _: 0
+
+    def build_base_config(
+        self: KVCacheManagerV2,
+        config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        cache_tiers: list[object],
+    ) -> KVCacheManagerConfig:
+        del self, config
+        return KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            cache_tiers=cache_tiers,
+            layers=_offload_layers()[:1],
+        )
+
+    # One rank on a node with 250 MiB of host memory available.
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "get_host_memory_limits",
+        lambda mapping: HostMemoryLimits(1, float(250 << 20), float("inf")),
+    )
+    with (
+        patch.dict(os.environ, {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""}),
+        patch(f"{module}.IndexMapper"),
+        patch(f"{module}.KVCacheManagerPy", return_value=fake_impl) as create_impl,
+        patch(f"{module}.is_device_integrated", return_value=False),
+        patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
+        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+        patch.object(KVCacheManagerV2, "_reserve_guard_page"),
+    ):
+        KVCacheManagerV2(
+            KvCacheConfig(max_gpu_total_bytes=64 << 20, enable_block_reuse=False),
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+            execution_stream=Mock(),
+            is_disagg=True,
+            sparse_kv_offload_config=SparseKvCacheOffloadConfig(host_history_size=200 << 20),
+        )
+
+    config = create_impl.call_args.args[0]
+    gpu_tier, host_tier = config.cache_tiers
+    # The manager splits both from its typical step, host-backed pools included.
+    assert config.initial_pool_ratio is None
+    # Only the offload allocations come off the 64 MiB budget.
+    assert gpu_tier.quota > (63 << 20)
+    # The 200 MiB of host history less the sparse Batch's one-page staging copy, handed
+    # over whole: the manager counts host bytes in their own grain.
+    assert config.host_sparse_pool_quota == (200 << 20) - 4096
+    # The automatic host tier still takes half of what the 200 MiB leaves of the 250 MiB.
+    assert host_tier.quota == (50 << 20) // 2
 
 
 @pytest.mark.parametrize(
@@ -3779,6 +6886,27 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
     assert torch.equal(buffer[5], torch.zeros(2))
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+def test_warmup_scan_leaves_host_backed_history_alone(offload: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager.layer_to_pool_mapping_dict = {0: 0, 1: 1}
+    manager.layer_specs = None
+    manager.get_buffers = lambda layer_idx, kv_layout="NHD": torch.ones(2)
+    # Layer 0's KEY pages are offloaded history; layer 1's are device memory.
+    manager.impl = SimpleNamespace(
+        is_sparse=lambda layer_id, role: layer_id == LayerId(0) and role == Role.KEY
+    )
+    if offload:
+        manager._sparse_kv_offload = SparseKvCacheOffloadConfig()
+
+    scanned = [layer_id for layer_id, _ in manager._iter_cache_buffers_for_invalid_check()]
+
+    # Nothing reads host history before a transfer or a write-back fills it.
+    assert scanned == ([1] if offload else [0, 1])
+
+
 class _FakeLogger:
     """Stand-in for tensorrt_llm.logger with a settable level and captured messages."""
 
@@ -3877,6 +7005,47 @@ def test_window_crossing_is_silent_without_a_crossing(
 
 
 @pytest.mark.parametrize(
+    "pre_capacity,new_capacity",
+    [
+        (100, 101),  # an ordinary decode step far below the window
+        (2049, 2050),  # an ordinary decode step past the window
+        (2048, 2048),  # no growth at all
+    ],
+)
+def test_window_crossing_does_not_query_the_logger_without_a_crossing(
+    monkeypatch, pre_capacity: int, new_capacity: int
+) -> None:
+    """The per-step common case must not ask the logger anything.
+
+    ``_log_window_crossing`` runs for every generation request on every
+    step, and ``is_debug_enabled`` resolves the caller's module from the
+    stack, so consulting it before the integer crossing test puts that cost
+    on every request of every iteration.
+    """
+    fake_logger = _FakeLogger()
+    calls: list[None] = []
+
+    def counting_is_debug_enabled() -> bool:
+        calls.append(None)
+        return True
+
+    fake_logger.is_debug_enabled = counting_is_debug_enabled
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1),
+        _FakeWindowedKVCache({0: [1]}),
+        pre_capacity,
+        new_capacity,
+        "generation",
+    )
+
+    assert calls == []
+    assert fake_logger.messages == []
+
+
+@pytest.mark.parametrize(
     "level,expected",
     [("trace", 1), ("debug", 1), ("verbose", 1), ("info", 0), ("warning", 0), ("error", 0)],
 )
@@ -3948,6 +7117,194 @@ def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
 
     assert len(fake_logger.messages) == 1
     assert "unavailable" in fake_logger.messages[0]
+
+
+@pytest.mark.parametrize(
+    "target_dtype,target_layers,draft_windows",
+    [
+        (DataType.BF16, 2, [None]),
+        (DataType.FP8, 2, [None]),
+        (DataType.FP8, 3, [128]),
+        (DataType.BF16, 2, [128]),
+    ],
+    ids=["bf16_same_window", "fp8_same_window", "fp8_windowed_draft", "bf16_windowed_draft"],
+)
+def test_storage_pool_group_count_matches_manager(
+    target_dtype, target_layers, draft_windows
+) -> None:
+    """The estimator's pool-group count is what the manager creates."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=target_dtype,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    layer_specs = [replace(target, global_layer_id=i) for i in range(target_layers)]
+    layer_specs += [
+        replace(
+            target,
+            global_layer_id=target_layers + i,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            sliding_window_size=window,
+        )
+        for i, window in enumerate(draft_windows)
+    ]
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        max_gpu_total_bytes=64 << 20,
+        host_cache_size=0,
+        enable_swa_scratch_reuse=False,
+    )
+    manager = KVCacheManagerV2(
+        kv_cache_config,
+        CacheType.SELF,
+        num_layers=len(layer_specs),
+        num_kv_heads=8,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=1024,
+        max_batch_size=2,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=target_dtype,
+        layer_specs=layer_specs,
+    )
+    try:
+        assert _get_num_storage_pool_groups(layer_specs, 32) == len(manager.impl.pool_group_descs)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("disagg", [False, True], ids=["aggregated", "disaggregated"])
+@pytest.mark.parametrize(
+    "spec_config_cls,shared_draft_block_width",
+    [(DFlashDecodingConfig, None), (DSparkDecodingConfig, 7), (DSparkDecodingConfig, 8)],
+    ids=["dflash", "dspark_shifted", "dspark_unshifted"],
+)
+def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(
+    disagg: bool, spec_config_cls: type, shared_draft_block_width: int | None
+) -> None:
+    """The drafter appends its block after the context, so its pages must reach it.
+
+    After a decode step accepts every draft token the context is ``prompt + K +
+    1`` long and the drafter's block follows it. The prompt is chosen so that
+    this furthest write is the first position of a third page.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    max_draft_len = 7
+    block_width = shared_draft_block_width or max_draft_len + 1
+    tokens_per_block = 32
+    prompt_len = 2 * tokens_per_block - (max_draft_len + 1) - block_width + 1
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    draft_layer = 2
+    layer_specs = [
+        target,
+        replace(target, global_layer_id=1),
+        replace(
+            target, global_layer_id=draft_layer, owner=KVCacheLayerOwner.DRAFT, dtype=DataType.BF16
+        ),
+    ]
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=False,
+            max_gpu_total_bytes=64 << 20,
+            host_cache_size=0,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=len(layer_specs),
+        num_kv_heads=8,
+        head_dim=128,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        layer_specs=layer_specs,
+        spec_config=spec_config_cls(max_draft_len=max_draft_len, speculative_model="draft"),
+        shared_draft_block_width=shared_draft_block_width,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+    request = _ContextRequest(
+        1,
+        list(range(prompt_len)),
+        prompt_len,
+        "conversation",
+        use_conversation_params=False,
+        is_disagg_generation_init_state=disagg,
+    )
+    try:
+        assert manager._shared_draft_block_width == block_width
+        assert manager._generation_kv_capacity_headroom == max_draft_len + 1 + block_width
+        if disagg:
+            request.py_draft_tokens = []
+            request.is_disagg_generation_transmission_complete = False
+            request.context_phase_params = None
+            assert manager.prepare_disagg_gen_init(request)
+            request.is_disagg_generation_init_state = False
+        else:
+            _run_context(manager, request)
+        generation = SimpleNamespace(
+            py_request_id=request.py_request_id,
+            py_beam_width=1,
+            py_draft_tokens=[0] * max_draft_len,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+            is_dummy_request=False,
+            is_disagg_generation_transmission_complete=False,
+            context_phase_params=None,
+            max_beam_num_tokens=prompt_len + 1,
+        )
+        assert manager.try_allocate_generation(generation)
+
+        furthest_write_end = prompt_len + max_draft_len + 1 + block_width
+        pages = manager.get_batch_cache_indices([request.py_request_id], layer_idx=draft_layer)[0]
+        assert len(pages) * tokens_per_block >= furthest_write_end
+    finally:
+        manager.free_resources(request)
+        manager.shutdown()
+
+
+def test_cost_headroom_counts_the_drafter_block_only_for_shared_layers() -> None:
+    """The budget charges the allocation headroom, not the position-side count."""
+    from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
+
+    max_draft_len = 7
+    spec_config = DFlashDecodingConfig(max_draft_len=max_draft_len, speculative_model="draft")
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.BF16,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    draft = replace(target, global_layer_id=1, owner=KVCacheLayerOwner.DRAFT)
+
+    _, own = _get_generation_kv_capacity(spec_config, is_draft=False, layer_specs=[target])
+    _, shared = _get_generation_kv_capacity(
+        spec_config, is_draft=False, layer_specs=[target, draft]
+    )
+
+    # The block is K + 1 = 8 wide against K - 1 = 6 extra positions.
+    assert shared - own == (max_draft_len + 1) - (max_draft_len - 1)
+    assert _get_kv_alloc_extra_tokens(spec_config, [target, draft]) == max_draft_len + 1
+    assert get_num_extra_kv_tokens(spec_config) == max_draft_len - 1
 
 
 def test_generation_token_slice_shares_token_view() -> None:
@@ -4057,3 +7414,41 @@ def test_try_commit_generation_blocks_honors_guards(
     manager.try_commit_generation_blocks(request)
 
     assert kv_cache.committed_tokens is None
+
+
+@pytest.mark.parametrize("role", [Role.VALUE, Role.KEY_BLOCK_SCALE])
+def test_default_attention_rejects_split_coupled_buffers(monkeypatch, role):
+    original = KVCacheManagerV2._build_cache_config
+
+    def build_config(self, config):
+        config = original(self, config)
+        layers = list(config.layers)
+        layer = layers[0]
+        buffers = [
+            BufferConfig(
+                role=buffer.role,
+                size=buffer.size,
+                reuse_policy=ReusePolicy.PRIVATE if buffer.role == role else None,
+            )
+            for buffer in layer.buffers
+        ]
+        if role == Role.KEY_BLOCK_SCALE:
+            buffers.append(BufferConfig(role=role, size=128, reuse_policy=ReusePolicy.PRIVATE))
+        layers[0] = AttentionLayerConfig(layer_id=layer.layer_id, buffers=buffers)
+        return replace(config, layers=layers)
+
+    monkeypatch.setattr(KVCacheManagerV2, "_build_cache_config", build_config)
+    with pytest.raises(ValueError, match="requires one shared page-index table"):
+        KVCacheManagerV2(
+            KvCacheConfig(max_gpu_total_bytes=4 << 20, host_cache_size=0),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )

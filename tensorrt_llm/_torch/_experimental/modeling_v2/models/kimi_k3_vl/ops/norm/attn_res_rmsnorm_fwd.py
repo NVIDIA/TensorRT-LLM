@@ -79,9 +79,11 @@ class AttnResRmsnormFwd(OpWrapper):
     before reading output or overwriting these inputs. Non-PDL kernels use
     normal stream ordering; disabling PDL changes scheduling, not arithmetic.
     Shape-only launches capture after warm-up and replay eager bits.
-    Kimi K3 calls this before attention, snapshot-appending MLPs and model
-    output up to KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS (default 1, topology mode 32),
-    unless the persistent topology handles it. Drafter-captured mixtures use
+    The Kimi K3 targets call this before attention, snapshot-appending MLPs and
+    model output up to KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS (their default 1,
+    topology mode 32), unless the persistent topology handles it. The built-in
+    model (default ceiling 64) runs the CuTe DSL decode kernel there and this
+    op where that kernel is unavailable on the device. Drafter-captured mixtures use
     the unfused entry. The fake op returns empty_like(layer_residual).
     """
 

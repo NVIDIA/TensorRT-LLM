@@ -233,6 +233,9 @@ class ScheduledRequests:
     """Maps a request id to the prompt-ordered indices of its multimodal items
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
+    paused_in_place_ids: frozenset[int]
+    """Generation requests paused in place or displaced by a forced resume:
+    left out of this batch, but their drafter state must be kept."""
 
     def __init__(self):
         self.attention_dp_phase: RemoteTailPhase | None = None
@@ -245,6 +248,7 @@ class ScheduledRequests:
         self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        self.paused_in_place_ids: frozenset[int] = frozenset()
 
     @property
     def is_generation_only(self) -> bool:
@@ -379,6 +383,16 @@ class RequestScheduler(ABC):
         Only schedulers that allocate KV cache while scheduling use it, to skip
         the generation-init requests the window would defer; the default is a
         no-op.
+        """
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Register a live probe for rank-local receive resources being retired.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
         """
 
 
@@ -734,6 +748,14 @@ class MultimodalScheduler(RequestScheduler):
 
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         self.scheduler.set_disagg_transfer_admission_controller(controller)
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Forward the local retirement probe to the wrapped scheduler.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+        self.scheduler.set_retiring_gen_receives_probe(probe)
 
     def _new_encoder_step(self) -> _MultimodalEncoderStep:
         return _MultimodalEncoderStep(
