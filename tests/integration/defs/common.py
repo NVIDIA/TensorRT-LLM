@@ -264,7 +264,7 @@ def get_dummy_spec_decoding_heads(hf_model_dir,
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Create a dummy trainer.
-    trainer = transformers.Trainer(model=model, tokenizer=tokenizer)
+    trainer = transformers.Trainer(model=model, processing_class=tokenizer)
     trainer._move_model_to_device(model, 'cuda')
 
     # Enable HF checkpointing so that the saved model will contain the speculative decoding module.

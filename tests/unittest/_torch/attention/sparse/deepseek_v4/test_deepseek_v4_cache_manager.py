@@ -591,6 +591,7 @@ def test_sparse_warmup_cleanup_covers_arenas_and_leaves_host_history(
         return convert(wrapper) if device == "cuda" else buffer.reshape(wrapper.shape)
 
     monkeypatch.setattr(deepseek_v4_cache, "convert_to_torch_tensor", convert_storage)
+    cleanup_stream = None
     if device == "cpu":
         manager._stream = SimpleNamespace(device="cpu")
         cleanup_stream = Mock()

@@ -1809,7 +1809,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         return torch.ones(1, 1, 4), layout, torch.full((1, 8), 7.0), torch.full((1, 3), 9.0)
 
     monkeypatch.setattr(h3_pipeline, "prepare_references", prepare)
-    original = pipeline.transformer.__class__.__call__
+    original = _FakeMiniMaxH3Transformer.__call__
 
     def observe(
         self: _FakeMiniMaxH3Transformer, **kwargs: object

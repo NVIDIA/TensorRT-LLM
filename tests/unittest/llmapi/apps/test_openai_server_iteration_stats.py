@@ -281,7 +281,8 @@ async def test_finished_read_stays_with_its_scrape_until_the_scrape_resumes():
     def on_read_done(_):
         # Runs once the read has finished and before the first scrape resumes:
         # another scrape arrives, then the first scrape is cancelled.
-        racing.append(asyncio.Task(server.get_iteration_stats(), loop=loop, eager_start=True))
+        if sys.version_info >= (3, 12):
+            racing.append(asyncio.Task(server.get_iteration_stats(), loop=loop, eager_start=True))
         first.cancel()
 
     server._metrics_stats_read.add_done_callback(on_read_done)

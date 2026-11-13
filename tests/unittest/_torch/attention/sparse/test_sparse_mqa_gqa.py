@@ -1513,8 +1513,10 @@ def _create_context_inputs(s: ContextScenario) -> _ContextInputs:
     kv_cache_manager.add_dummy_requests(request_ids, list(s.seq_lens))
 
     metadata = _SparseMqaGqaMetadata(
+        # pyrefly: ignore [unexpected-keyword]
         num_contexts=s.batch_size,
         kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0] * s.batch_size),
+        # pyrefly: ignore [unexpected-keyword]
         seq_lens=torch.tensor(s.seq_lens, dtype=torch.int32),
         max_num_requests=s.batch_size,
         max_num_tokens=s.nnz_q,
@@ -1586,10 +1588,12 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
                 logical_page += 1
 
     metadata = _SparseMqaGqaMetadata(
+        # pyrefly: ignore [unexpected-keyword]
         num_contexts=0,
         kv_cache_params=KVCacheParams(
             use_cache=True, num_cached_tokens_per_seq=list(s.past_kv_lens)
         ),
+        # pyrefly: ignore [unexpected-keyword]
         seq_lens=torch.full((s.batch_size,), s.query_len, dtype=torch.int32),
         max_num_requests=s.batch_size,
         max_num_tokens=s.nnz_q,

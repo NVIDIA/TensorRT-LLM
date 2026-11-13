@@ -93,10 +93,33 @@ def test_certified_cells(cell) -> None:
     compiled = _compiled(spec["topk"], spec["max_blocks"])
     snap = [a.clone() for a in args[:3]]
     with validating(op):
-        out = op(*args, spec["layer_id"], compiled=compiled)
+        call_req_id, call_block_table, call_token_indices, call_block_size, call_stride_factor = (
+            args
+        )
+        out = op(
+            call_req_id,
+            call_block_table,
+            call_token_indices,
+            call_block_size,
+            call_stride_factor,
+            spec["layer_id"],
+            compiled=compiled,
+        )
     for a, s in zip(args[:3], snap):
         assert torch.equal(a, s), "an input tensor was mutated"
-    _compare(out, op.reference(*args, spec["layer_id"], compiled=compiled))
+    call_req_id, call_block_table, call_token_indices, call_block_size, call_stride_factor = args
+    _compare(
+        out,
+        op.reference(
+            call_req_id,
+            call_block_table,
+            call_token_indices,
+            call_block_size,
+            call_stride_factor,
+            spec["layer_id"],
+            compiled=compiled,
+        ),
+    )
     # The padding has to survive as -1, not as a row computed from -1.
     assert bool((out[args[2] < 0] == -1).all())
     if spec.get("pad_block_table"):

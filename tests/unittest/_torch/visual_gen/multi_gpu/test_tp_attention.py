@@ -310,11 +310,17 @@ def _run_tp_with_params(
         else:
             ref_out = _manual_attention(x, qkv_w, qkv_b, out_w, out_b, num_heads, head_dim)
     else:
+        call_q_w, call_q_b = _wb(attn_ref.to_q)
+        call_k_w, call_k_b = _wb(attn_ref.to_k)
+        call_v_w, call_v_b = _wb(attn_ref.to_v)
         ref_out = _manual_attention_separate(
             x,
-            *_wb(attn_ref.to_q),
-            *_wb(attn_ref.to_k),
-            *_wb(attn_ref.to_v),
+            call_q_w,
+            call_q_b,
+            call_k_w,
+            call_k_b,
+            call_v_w,
+            call_v_b,
             out_w,
             out_b,
             num_heads,

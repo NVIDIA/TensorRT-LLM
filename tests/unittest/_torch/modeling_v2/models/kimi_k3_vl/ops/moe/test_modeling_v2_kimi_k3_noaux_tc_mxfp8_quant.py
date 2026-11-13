@@ -167,7 +167,8 @@ def test_rejects_out_of_contract() -> None:
     }
     for name, args in bad_calls.items():
         try:
-            kimi_k3_noaux_tc_mxfp8_quant(*args, 1.0)
+            call_router_logits, call_bias, call_hidden_states = args
+            kimi_k3_noaux_tc_mxfp8_quant(call_router_logits, call_bias, call_hidden_states, 1.0)
         except RuntimeError:
             continue
         raise AssertionError(f"{name}: the op accepted an out-of-contract call")

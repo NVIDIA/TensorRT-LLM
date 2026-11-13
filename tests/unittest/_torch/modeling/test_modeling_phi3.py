@@ -52,6 +52,7 @@ def test_phi3_for_causal_lm_forward():
 
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(42)
+        # pyrefly: ignore [missing-argument]
         reference = HFPhi3ForCausalLM(config).to(device="cuda",
                                                  dtype=torch.float16).eval()
         model = model_class(

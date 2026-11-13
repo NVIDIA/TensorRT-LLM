@@ -848,7 +848,12 @@ def _assert_late_copy_overlaps(src):
     for _ in range(3):
         _late_copy(dst, src)
         _copy_no_wait[(triton.cdiv(src.numel(), 1024),)](
-            dst, snap, src.numel(), BLOCK=1024, launch_pdl=True
+            dst,
+            snap,
+            src.numel(),
+            BLOCK=1024,
+            # pyrefly: ignore [unexpected-keyword]
+            launch_pdl=True,
         )
         torch.cuda.synchronize()
         stale.append(not torch.equal(snap, src))

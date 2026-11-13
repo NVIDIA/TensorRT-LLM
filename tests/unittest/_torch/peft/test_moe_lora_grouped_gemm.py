@@ -490,16 +490,30 @@ def test_fp8_scratch_growth_preserves_compute_dtype_capacity():
     small = _build_base_inputs(2, hidden_size, inter_size, num_experts, top_k, dtype, device)
     large = _build_base_inputs(16, hidden_size, inter_size, num_experts, top_k, dtype, device)
     small_kwargs = _slot_kwargs(torch.zeros(2, dtype=torch.int32), [adapters], rank)
-    _call_fused_moe(*small, dtype, small_kwargs)
+    call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores = small
+    _call_fused_moe(
+        call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores, dtype, small_kwargs
+    )
     fp8_kwargs = _slot_kwargs(torch.zeros(16, dtype=torch.int32), [fp8_adapters], rank)
     fp8_kwargs["lora_dtype"] = torch.float8_e4m3fn
-    graph, captured = _warmup_and_capture(lambda: _call_fused_moe(*large, dtype, fp8_kwargs))
+    call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores = large
+    graph, captured = _warmup_and_capture(
+        lambda: _call_fused_moe(
+            call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores, dtype, fp8_kwargs
+        )
+    )
     graph.replay()
     torch.cuda.synchronize()
     expected_fp8 = captured.clone()
     bf16_kwargs = _slot_kwargs(torch.zeros(16, dtype=torch.int32), [adapters], rank)
-    actual_bf16 = _call_fused_moe(*large, dtype, bf16_kwargs)
-    expected_bf16 = _reference(*large, adapters)
+    call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores = large
+    actual_bf16 = _call_fused_moe(
+        call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores, dtype, bf16_kwargs
+    )
+    call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores = large
+    expected_bf16 = _reference(
+        call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores, adapters
+    )
     torch.testing.assert_close(actual_bf16, expected_bf16, rtol=_RTOL, atol=_ATOL)
     graph.replay()
     torch.cuda.synchronize()
@@ -533,7 +547,8 @@ def test_fp8_moe_rejects_misaligned_rank(schema, max_rank):
         else "requires active ranks divisible by 16"
     )
     with pytest.raises(RuntimeError, match=error):
-        _call_fused_moe(*inputs, dtype, kwargs)
+        call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores = inputs
+        _call_fused_moe(call_x, call_w3_w1, call_w2, call_topk_ids, call_topk_scores, dtype, kwargs)
 
 
 @requires_cuda_and_op

@@ -23,8 +23,9 @@ runtime cache-manager plumbing.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, cast
 
 import torch
 from einops import rearrange
@@ -320,7 +321,10 @@ class KimiKDAReference(nn.Module):
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
-        o, new_recurrent = fused_recurrent_kda(
+        kda_reference = cast(
+            Callable[..., tuple[torch.Tensor, torch.Tensor | None]], fused_recurrent_kda
+        )
+        o, new_recurrent = kda_reference(
             q=q,
             k=k,
             v=v,

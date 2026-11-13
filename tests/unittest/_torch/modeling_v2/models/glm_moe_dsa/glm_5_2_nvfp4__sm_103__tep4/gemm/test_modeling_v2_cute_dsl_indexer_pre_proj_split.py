@@ -102,7 +102,8 @@ def test_a_handle_refuses_another_row_count() -> None:
     step's rows, so a mismatch must raise rather than compute a partial tile."""
     compiled = compile_handle(torch.cuda.current_device(), 2)
     with pytest.raises(ValueError, match="compiled for M=2"):
-        op(*_build(4, seed=4), compiled)
+        call_x, call_weight, call_key, call_head_weights = _build(4, seed=4)
+        op(call_x, call_weight, call_key, call_head_weights, compiled)
 
 
 @pytest.mark.parametrize("rows", MTP_ROWS)
@@ -176,7 +177,8 @@ def test_runtime_m_handle_is_the_compiled_handles_bitwise() -> None:
     torch.cuda.synchronize()
     assert torch.equal(key, key2) and torch.equal(head_weights, head_weights2)
     with pytest.raises(ValueError, match="M=1..192"):
-        op(*_build(193, seed=5), rag)
+        call_x, call_weight, call_key, call_head_weights = _build(193, seed=5)
+        op(call_x, call_weight, call_key, call_head_weights, rag)
 
 
 #: MTP5 at 1-3 requests (6 / 12 / 18 rows; MTP3 at 3 is 12): captured decode row counts without

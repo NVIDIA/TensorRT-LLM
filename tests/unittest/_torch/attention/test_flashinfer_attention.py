@@ -152,7 +152,9 @@ class TestFlashInferAttention(unittest.TestCase):
             return_value=torch.tensor([2], dtype=torch.int32))
 
         metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=torch.zeros(1, dtype=torch.int32),
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -191,7 +193,9 @@ class TestFlashInferAttention(unittest.TestCase):
             self.skipTest("CUDA is required for FlashInfer metadata")
 
         metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             kv_cache_manager=None,
             request_ids=[0, 1],
@@ -299,7 +303,9 @@ class TestFlashInferAttention(unittest.TestCase):
             self.skipTest("CUDA is required for FlashInfer metadata")
 
         metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             kv_cache_manager=None,
             request_ids=[0, 1],
@@ -353,7 +359,9 @@ class TestFlashInferAttention(unittest.TestCase):
             self.assertEqual(len(reserved_blocks[0]), 2)
 
             metadata = FlashInferAttentionMetadata(
+                # pyrefly: ignore [unexpected-keyword]
                 seq_lens=torch.full((1, ), 4, dtype=torch.int32),
+                # pyrefly: ignore [unexpected-keyword]
                 num_contexts=0,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -406,7 +414,9 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         try:
             metadata = FlashInferAttentionMetadata(
+                # pyrefly: ignore [unexpected-keyword]
                 seq_lens=torch.full((2, ), 4, dtype=torch.int32),
+                # pyrefly: ignore [unexpected-keyword]
                 num_contexts=0,
                 kv_cache_params=KVCacheParams(use_cache=True),
                 max_num_requests=2,
@@ -507,7 +517,9 @@ class TestFlashInferAttention(unittest.TestCase):
                                              is_gen=True,
                                              max_num_draft_tokens=3)
             metadata = FlashInferAttentionMetadata(
+                # pyrefly: ignore [unexpected-keyword]
                 seq_lens=torch.ones(2, dtype=torch.int32),
+                # pyrefly: ignore [unexpected-keyword]
                 num_contexts=0,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -576,7 +588,9 @@ class TestFlashInferAttention(unittest.TestCase):
                 self.plan_kwargs = kwargs
 
         metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=2,
             kv_cache_manager=None,
             request_ids=[0, 1],

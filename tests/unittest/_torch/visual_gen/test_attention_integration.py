@@ -858,7 +858,9 @@ def run_all_tests():
     if _cute_dsl_available:
         fast_backends.append("CUTEDSL")
     for backend in ["VANILLA", "TRTLLM"] + fast_backends:
-        results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend, "NO_QUANT")
+        results[f"self_attention_{backend}"] = test_self_attention_equivalence(
+            head_dim=128, attn_backend=backend, quant_attention_config=None
+        )
 
     # Run SageAttention self-attention tests (subset for manual runner)
     for batch_size in [1, 2]:
@@ -870,11 +872,17 @@ def run_all_tests():
                 )
 
     # Run cross-attention tests
-    results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA", "NO_QUANT")
+    results["cross_attention_VANILLA"] = test_cross_attention_equivalence(
+        head_dim=128, attn_backend="VANILLA", quant_attention_config=None
+    )
     if _flash_attn4_available:
-        results["cross_attention_FA4"] = test_cross_attention_equivalence("FA4", "NO_QUANT")
+        results["cross_attention_FA4"] = test_cross_attention_equivalence(
+            head_dim=128, attn_backend="FA4", quant_attention_config=None
+        )
     if _cute_dsl_available:
-        results["cross_attention_CUTEDSL"] = test_cross_attention_equivalence("CUTEDSL", "NO_QUANT")
+        results["cross_attention_CUTEDSL"] = test_cross_attention_equivalence(
+            head_dim=128, attn_backend="CUTEDSL", quant_attention_config=None
+        )
 
     # Run TRTLLM-specific caching tests
     results["trtllm_cached_prepare"] = test_trtllm_cached_prepare()

@@ -68,9 +68,52 @@ def _build(spec, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     certifying(op)
-    out = op(*args, True)
+    (
+        call_embed_table,
+        call_input_ids,
+        call_hidden_states,
+        call_enorm_weight,
+        call_hnorm_weight,
+        call_eps,
+        call_col_lo,
+        call_col_hi,
+    ) = args
+    out = op(
+        call_embed_table,
+        call_input_ids,
+        call_hidden_states,
+        call_enorm_weight,
+        call_hnorm_weight,
+        call_eps,
+        call_col_lo,
+        call_col_hi,
+        True,
+    )
     assert out.is_contiguous() and out.shape == (cell.spec["rows"], args[7] - args[6])
-    _compare(out, op.reference(*args, True))
+    (
+        call_embed_table,
+        call_input_ids,
+        call_hidden_states,
+        call_enorm_weight,
+        call_hnorm_weight,
+        call_eps,
+        call_col_lo,
+        call_col_hi,
+    ) = args
+    _compare(
+        out,
+        op.reference(
+            call_embed_table,
+            call_input_ids,
+            call_hidden_states,
+            call_enorm_weight,
+            call_hnorm_weight,
+            call_eps,
+            call_col_lo,
+            call_col_hi,
+            True,
+        ),
+    )
 
 
 def test_window_is_flashinfer_rmsnorm_bitwise() -> None:

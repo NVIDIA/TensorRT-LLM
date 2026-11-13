@@ -3460,7 +3460,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         seq_lens = torch.ones(batch_size, dtype=torch.int)
         metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=seq_lens,
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             is_cuda_graph=True,
             kv_cache_params=KVCacheParams(
@@ -3696,7 +3698,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         torch.cuda.synchronize()
 
         reference_metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=torch.ones(len(new_request_ids), dtype=torch.int),
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -3827,7 +3831,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         # --- Reference run (eager, no CUDA graph) ---
         ref_metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=seq_lens,
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             kv_cache_params=KVCacheParams(
                 use_cache=True, num_cached_tokens_per_seq=past_seen_tokens
@@ -3849,7 +3855,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         # --- CUDA graph run ---
         workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         cg_metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=seq_lens,
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             is_cuda_graph=True,
             kv_cache_params=KVCacheParams(
@@ -3973,7 +3981,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         # --- CUDA graph setup ---
         workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         cg_metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=seq_lens,
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             is_cuda_graph=True,
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
@@ -4043,7 +4053,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
             # --- Reference (eager) for comparison ---
             ref_metadata = FlashInferAttentionMetadata(
+                # pyrefly: ignore [unexpected-keyword]
                 seq_lens=seq_lens,
+                # pyrefly: ignore [unexpected-keyword]
                 num_contexts=0,
                 kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
                 max_num_requests=batch_size,
@@ -4162,7 +4174,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         # --- CUDA graph setup ---
         workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         cg_metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=seq_lens,
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             is_cuda_graph=True,
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
@@ -4208,7 +4222,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
             # Compare with eager reference
             ref_metadata = FlashInferAttentionMetadata(
+                # pyrefly: ignore [unexpected-keyword]
                 seq_lens=seq_lens,
+                # pyrefly: ignore [unexpected-keyword]
                 num_contexts=0,
                 kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
                 max_num_requests=batch_size,
@@ -4354,7 +4370,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         # --- CUDA graph ---
         workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         cg_metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=seq_lens,
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             is_cuda_graph=True,
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
@@ -4402,7 +4420,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
             # --- Reference (eager) ---
             ref_metadata = FlashInferAttentionMetadata(
+                # pyrefly: ignore [unexpected-keyword]
                 seq_lens=seq_lens,
+                # pyrefly: ignore [unexpected-keyword]
                 num_contexts=0,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -4566,7 +4586,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         cg_metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=seq_lens,
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=0,
             is_cuda_graph=True,
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),

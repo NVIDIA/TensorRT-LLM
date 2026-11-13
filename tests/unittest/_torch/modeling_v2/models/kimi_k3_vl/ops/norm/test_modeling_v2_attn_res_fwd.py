@@ -78,9 +78,18 @@ def _check(cell) -> None:
     inputs = _make_inputs(num_tokens, num_candidates, zlib.crc32(cell.why.encode()) % 2**31)
     before = [tensor.clone() for tensor in inputs]
     with validating(attn_res_fwd):
-        outputs = attn_res_fwd(*inputs, rms_eps)
-        repeat = attn_res_fwd(*inputs, rms_eps)
-    expected = attn_res_fwd.reference(*inputs, rms_eps)
+        call_layer_residual, call_block_residual, call_res_weight, call_rms_weight = inputs
+        outputs = attn_res_fwd(
+            call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, rms_eps
+        )
+        call_layer_residual, call_block_residual, call_res_weight, call_rms_weight = inputs
+        repeat = attn_res_fwd(
+            call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, rms_eps
+        )
+    call_layer_residual, call_block_residual, call_res_weight, call_rms_weight = inputs
+    expected = attn_res_fwd.reference(
+        call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, rms_eps
+    )
 
     cell = f"T={num_tokens} N={num_candidates} rms_eps={rms_eps}"
     stats_shape = (num_candidates, num_tokens, 1)
@@ -118,18 +127,27 @@ def test_guard_refuses_mixed_devices(index) -> None:
     inputs[index] = inputs[index].to(f"cuda:{other_device}")
     with pytest.raises(AssertionError, match="device"):
         with validating(attn_res_fwd):
-            attn_res_fwd(*inputs, RMS_EPS)
+            call_layer_residual, call_block_residual, call_res_weight, call_rms_weight = inputs
+            attn_res_fwd(
+                call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, RMS_EPS
+            )
 
 
 def test_cuda_graph_replay_matches_eager() -> None:
     """One cell per kernel: a call captured in a CUDA graph replays the eager call's bits."""
     for num_tokens, num_candidates in ((1, 4), (1, 8), (4, 9)):
         inputs = _make_inputs(num_tokens, num_candidates)
-        eager = attn_res_fwd(*inputs, RMS_EPS)
+        call_layer_residual, call_block_residual, call_res_weight, call_rms_weight = inputs
+        eager = attn_res_fwd(
+            call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, RMS_EPS
+        )
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured = attn_res_fwd(*inputs, RMS_EPS)
+            call_layer_residual, call_block_residual, call_res_weight, call_rms_weight = inputs
+            captured = attn_res_fwd(
+                call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, RMS_EPS
+            )
         # One replay before the poison: under cudaMallocAsync the captured outputs are graph allocations, backed by
         # memory only once the graph has run.
         graph.replay()

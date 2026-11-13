@@ -133,7 +133,9 @@ class TestGemma4Assistant(unittest.TestCase):
         self.assertIsNotNone(requests)
         manager.get_buffers(0).zero_()
         metadata = FlashInferAttentionMetadata(
+            # pyrefly: ignore [unexpected-keyword]
             seq_lens=torch.tensor([3], dtype=torch.int),
+            # pyrefly: ignore [unexpected-keyword]
             num_contexts=1,
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
             workspace_buffer=torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda"),

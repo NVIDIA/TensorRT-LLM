@@ -944,6 +944,8 @@ unexpected-positional-argument = "error"
 [tool.pyrefly-tests]
 project-includes = ["tests"]
 # Paths are relative to the repository root and apply only to the test pass.
+# The wrapper appends literal __extra_import_path__ directories found under tests/.
+# Ancestor directories use fallback resolution instead of becoming global roots.
 search-path = [
     ".",
     "tests",
@@ -966,11 +968,6 @@ search-path = [
     "tests/scripts/perf-sanity/cache_transceiver_precheck",
 ]
 enable-fallback-search-path = true
-
-[tool.pyrefly-tests.errors]
-missing-argument = "ignore"
-unexpected-keyword = "ignore"
-bad-argument-count = "ignore"
 
 # Diagnostics for dynamically loaded modules and unresolved names.
 [tool.pyrefly-exclusions]

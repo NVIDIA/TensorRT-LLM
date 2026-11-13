@@ -66,7 +66,10 @@ def _tokens(batch, length, seed, eos_positions=(), lead_eos=True, eos_density=0.
 
 
 def _hash(ids, num_query_tokens):
-    return op(ids, *_constants(), EOS, num_query_tokens)
+    call_layer_multipliers, call_head_vocab_sizes, call_head_offsets = _constants()
+    return op(
+        ids, call_layer_multipliers, call_head_vocab_sizes, call_head_offsets, EOS, num_query_tokens
+    )
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -132,15 +135,23 @@ def test_cuda_graph_capture_and_replay(windows) -> None:
     warmup.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup):
         for _ in range(3):
-            op(ids, *constants, EOS, 1)
+            call_layer_multipliers, call_head_vocab_sizes, call_head_offsets = constants
+            op(ids, call_layer_multipliers, call_head_vocab_sizes, call_head_offsets, EOS, 1)
     torch.cuda.current_stream().wait_stream(warmup)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = op(ids, *constants, EOS, 1)
+        call_layer_multipliers, call_head_vocab_sizes, call_head_offsets = constants
+        captured = op(ids, call_layer_multipliers, call_head_vocab_sizes, call_head_offsets, EOS, 1)
 
     fresh = _tokens(windows, CKPT_CONTEXT_LEN + 1, seed=54, lead_eos=False, eos_density=0.2)
     ids.copy_(fresh)
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.equal(captured, op.reference(fresh, *constants, EOS, 1))
+    call_layer_multipliers, call_head_vocab_sizes, call_head_offsets = constants
+    assert torch.equal(
+        captured,
+        op.reference(
+            fresh, call_layer_multipliers, call_head_vocab_sizes, call_head_offsets, EOS, 1
+        ),
+    )

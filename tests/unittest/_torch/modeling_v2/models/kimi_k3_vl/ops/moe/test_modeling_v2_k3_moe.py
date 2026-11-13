@@ -427,7 +427,12 @@ def test_state_armed_and_sized():
     [1024, 3584] zero; a layer's counters int32 [680] zero. The loader's buffers fit the kernels.
     """
     proc, _, _ = _experts()
-    ok, why = is_supported(*_weights(proc), E_LOCAL)
+    call_w3_w1_weight, call_w3_w1_weight_scale, call_w2_weight, call_w2_weight_scale = _weights(
+        proc
+    )
+    ok, why = is_supported(
+        call_w3_w1_weight, call_w3_w1_weight_scale, call_w2_weight, call_w2_weight_scale, E_LOCAL
+    )
     assert ok, why
     sms = torch.cuda.get_device_properties(_device()).multi_processor_count
     state = K3MoeState(_device(), I_TP, E_LOCAL)
@@ -779,10 +784,12 @@ def test_unsupported_calls_refused_before_launch():
     before = [_snapshot(st, lyrs) for st, lyrs in objects]
     for m in (0, DECODE_MAX + 1):
         with pytest.raises(ValueError):
-            k3_moe(*_routed_zeros(m), OFFSET, layers[0])
+            call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights = _routed_zeros(m)
+            k3_moe(call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights, OFFSET, layers[0])
     for m in (0, WIDE_MAX + 1):
         with pytest.raises(ValueError):
-            k3_moe(*_routed_zeros(m), OFFSET, wide_layers[0])
+            call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights = _routed_zeros(m)
+            k3_moe(call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights, OFFSET, wide_layers[0])
     with pytest.raises(ValueError, match="head"):
         k3_moe(x_fp8, x_sf, ids, weights, OFFSET, flags_layer)
     with pytest.raises(ValueError, match="head"):
