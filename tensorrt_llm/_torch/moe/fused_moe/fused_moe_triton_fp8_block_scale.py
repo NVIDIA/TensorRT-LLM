@@ -1107,3 +1107,44 @@ def run_triton_fp8_block_scale_moe_fp8_act(
             ic2, token_final_scales.contiguous(), output, hidden, TOP_K=top_k, BLOCK_H=block_h
         )
     return output
+
+
+def prewarm_triton_fp8_block_scale_moe_fp8_act(
+    w3_w1: torch.Tensor,
+    w3_w1_scales: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scales: torch.Tensor,
+    top_k: int,
+    max_tokens: int,
+    swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Compile every kernel :func:`run_triton_fp8_block_scale_moe_fp8_act` uses for 1 to ``max_tokens`` tokens.
+
+    The kernels are compiled per row-count class: the power-of-two pair and slot counts, the alignment variant,
+    the GEMM tile and Triton's ``== 1`` / ``% 16`` integer specializations. Running each count once on these
+    weights compiles all of them, so no later call of at most ``max_tokens`` tokens compiles. Does nothing for
+    weights that are not on a CUDA device.
+    """
+    if not w3_w1.is_cuda:
+        return
+    num_experts, _, hidden = w3_w1.shape
+    device = w3_w1.device
+    with torch.no_grad():
+        for num_tokens in range(1, max_tokens + 1):
+            experts = (
+                torch.arange(num_tokens * top_k, dtype=torch.int32, device=device) % num_experts
+            )
+            run_triton_fp8_block_scale_moe_fp8_act(
+                torch.zeros((num_tokens, hidden), dtype=torch.bfloat16, device=device),
+                experts.view(num_tokens, top_k),
+                torch.ones((num_tokens, top_k), dtype=torch.float32, device=device),
+                w3_w1,
+                w3_w1_scales,
+                w2,
+                w2_scales,
+                swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                output_dtype=output_dtype,
+            )

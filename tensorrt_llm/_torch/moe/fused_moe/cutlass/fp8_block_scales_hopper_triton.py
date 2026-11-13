@@ -14,11 +14,16 @@
 # limitations under the License.
 """``trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales``."""
 
+from typing import ClassVar
+
 import torch
 
 from ....utils import ActivationType
 from ..activation import ActivationParamShape, MoEActivationSupport
-from ..fused_moe_triton_fp8_block_scale import run_triton_fp8_block_scale_moe_fp8_act
+from ..fused_moe_triton_fp8_block_scale import (
+    prewarm_triton_fp8_block_scale_moe_fp8_act,
+    run_triton_fp8_block_scale_moe_fp8_act,
+)
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -75,6 +80,10 @@ class TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl(DeepgemmCudaHopperFp8Block
     - The layer's clamp, if any, is one value for every local expert
       (decided once in :meth:`cache_derived_state`).
 
+    The Triton kernels compile per row-count class. :meth:`cache_derived_state`
+    compiles every class up to ``TRITON_FP8_ACT_MAX_TOKENS`` rows, once per
+    process for each weight shape, top-k and clamp, so no served step compiles.
+
     Opt-in: resolution passes this leaf over unless
     ``TLLM_MOE_ENABLE_SM90_TRITON_FP8_DECODE=1`` (``opt_in_flag``), so by
     default the parent leaf serves every SM90 FP8 block-scale layer.
@@ -108,6 +117,9 @@ class TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl(DeepgemmCudaHopperFp8Block
     #: ``(limit, clamp_after_silu)`` for the Triton SwiGLU, or None while the
     #: layer cannot take the Triton path. Set by :meth:`cache_derived_state`.
     _triton_swiglu: tuple[float | None, bool] | None = None
+    #: The ``_prewarm_key`` of every layer whose Triton kernels this process
+    #: already compiled; layers with the same key reuse those kernels.
+    _prewarmed: ClassVar[set[tuple]] = set()
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -123,6 +135,43 @@ class TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl(DeepgemmCudaHopperFp8Block
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
         self._triton_swiglu = self._uniform_swiglu_clamp()
+        self._prewarm_triton_path()
+
+    def _prewarm_key(self) -> tuple:
+        """What decides which Triton kernels this layer compiles."""
+        return (
+            tuple(self.w3_w1_weight.shape),
+            tuple(self.w2_weight.shape),
+            self.w3_w1_weight.dtype,
+            self.quant_scales.fc_weight_scales.dtype,
+            self.routing_method.top_k,
+            self._triton_swiglu,
+            str(self.w3_w1_weight.device),
+        )
+
+    def _prewarm_triton_path(self) -> None:
+        """Compile the Triton kernels for every row count the Triton path takes.
+
+        Runs at most once per process for each :meth:`_prewarm_key`. A layer
+        whose clamp keeps it on the fused op compiles nothing.
+        """
+        if self._triton_swiglu is None:
+            return
+        key = self._prewarm_key()
+        if key in self._prewarmed:
+            return
+        swiglu_limit, swiglu_clamp_after_silu = self._triton_swiglu
+        prewarm_triton_fp8_block_scale_moe_fp8_act(
+            self.w3_w1_weight,
+            self.quant_scales.fc_weight_scales,
+            self.w2_weight,
+            self.quant_scales.proj_weight_scales,
+            top_k=self.routing_method.top_k,
+            max_tokens=self.TRITON_FP8_ACT_MAX_TOKENS,
+            swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+        )
+        self._prewarmed.add(key)
 
     def _uniform_swiglu_clamp(self) -> tuple[float | None, bool] | None:
         """The Triton SwiGLU settings read off the installed ``act_*`` slots.

@@ -7108,6 +7108,61 @@ def test_sm90_triton_fp8_act_leaf_reads_the_clamp_off_its_slots(slots, expected)
 
 
 @pytest.mark.cpu_only
+def test_sm90_triton_fp8_act_leaf_prewarms_once_per_layer_shape(monkeypatch):
+    """``cache_derived_state`` compiles the Triton path up to the row threshold
+    once per process for layers that share weight shapes, top-k and clamp, and
+    not at all for a layer whose clamp keeps it on the fused op."""
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+        fp8_block_scales_hopper,
+        fp8_block_scales_hopper_triton,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        fp8_block_scales_hopper_triton,
+        "prewarm_triton_fp8_block_scale_moe_fp8_act",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl, "_prewarmed", set())
+    monkeypatch.setattr(
+        fp8_block_scales_hopper.DeepgemmCudaHopperFp8BlockScalesImpl,
+        "cache_derived_state",
+        lambda self: None,
+    )
+
+    def layer(clamp):
+        leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+        leaf.w3_w1_weight = torch.zeros((4, 32, 8), dtype=torch.bfloat16)
+        leaf.w2_weight = torch.zeros((4, 8, 16), dtype=torch.bfloat16)
+        leaf.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
+            fc_weight_scales=torch.ones((4, 1, 1)), proj_weight_scales=torch.ones((4, 1, 1))
+        )
+        leaf.routing_method = SimpleNamespace(top_k=2)
+        leaf.act_clamp = clamp
+        leaf.cache_derived_state()
+        return leaf
+
+    first = layer(7.0)
+    layer(7.0)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    expected = (
+        first.w3_w1_weight,
+        first.quant_scales.fc_weight_scales,
+        first.w2_weight,
+        first.quant_scales.proj_weight_scales,
+    )
+    assert all(arg is want for arg, want in zip(args, expected, strict=True))
+    assert kwargs == dict(top_k=2, max_tokens=32, swiglu_limit=7.0, swiglu_clamp_after_silu=False)
+
+    layer(6.0)
+    assert len(calls) == 2
+    per_expert = layer(torch.tensor([5.0, 6.0, 5.0, 5.0]))
+    assert per_expert._triton_swiglu is None
+    assert len(calls) == 2
+
+
+@pytest.mark.cpu_only
 def test_configurable_moe_exposes_the_backend_lora_state():
     """``MoE.forward``'s torch.compile guard reads the layer, so the wrapper has
     to answer for the backend that holds the state."""

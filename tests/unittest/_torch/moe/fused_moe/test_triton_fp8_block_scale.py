@@ -15,11 +15,14 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
 from _torch.helpers import calc_diff, per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0
 
+from tensorrt_llm._torch.moe.fused_moe import fused_moe_triton_fp8_block_scale
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
     _moe_align_small,
     moe_align_block_size,
+    prewarm_triton_fp8_block_scale_moe_fp8_act,
     run_triton_fp8_block_scale_moe,
     run_triton_fp8_block_scale_moe_fp8_act,
 )
@@ -481,3 +484,49 @@ def test_fp8_act_zero_weights_and_output_dtype() -> None:
     assert out.dtype == torch.float32
     diff = calc_diff(out, ref).item()
     assert diff < 1e-4, f"cosine-diff={diff:.4e}"
+
+
+def _compiled_kernel_count() -> int:
+    """Kernels compiled so far, on every device, by the module's Triton functions."""
+    count = 0
+    for value in vars(fused_moe_triton_fp8_block_scale).values():
+        while not isinstance(value, triton.runtime.JITFunction) and hasattr(value, "fn"):
+            value = value.fn
+        if isinstance(value, triton.runtime.JITFunction):
+            count += sum(len(cache[0]) for cache in value.device_caches.values())
+    return count
+
+
+@skip_pre_hopper
+# Hidden 2048 runs the narrow-N tile at up to 4 tokens and the wide one above.
+@pytest.mark.parametrize("hidden", [512, 2048])
+def test_fp8_act_prewarm_leaves_nothing_to_compile(hidden: int) -> None:
+    """After the prewarm, no call of 1 to ``max_tokens`` tokens on the same weights compiles a kernel,
+    whatever the routing: routing changes device data only, never a compile-time choice."""
+    num_experts, top_k, max_tokens, limit = 72, 8, 32, 0.5
+    shape = MoeShape(
+        "decode", 1, hidden=hidden, intermediate=256, num_experts=num_experts, top_k=top_k
+    )
+    inputs = _make_inputs(shape, seed=hidden)
+    weights = {name: inputs[name] for name in ("w3_w1", "w3_w1_scales", "w2", "w2_scales")}
+
+    prewarm_triton_fp8_block_scale_moe_fp8_act(
+        **weights, top_k=top_k, max_tokens=max_tokens, swiglu_limit=limit
+    )
+    compiled = _compiled_kernel_count()
+    assert compiled > 0
+
+    g = torch.Generator(device="cuda").manual_seed(hidden)
+    for num_tokens in range(1, max_tokens + 1):
+        # As the routing hands them over: int32 expert IDs and FP32 weights.
+        experts = (
+            torch.rand((num_tokens, num_experts), device="cuda", generator=g).topk(top_k).indices
+        )
+        run_triton_fp8_block_scale_moe_fp8_act(
+            torch.randn((num_tokens, hidden), device="cuda", generator=g).bfloat16(),
+            experts.to(torch.int32),
+            torch.rand((num_tokens, top_k), device="cuda", generator=g),
+            **weights,
+            swiglu_limit=limit,
+        )
+        assert _compiled_kernel_count() == compiled, f"{num_tokens} tokens compiled a kernel"
