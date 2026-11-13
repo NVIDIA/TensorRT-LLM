@@ -57,6 +57,7 @@ from ..modules.mlp import MLP
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
     find_input_mm_embeds,
@@ -489,7 +490,7 @@ class MiniCPMV4_6Merger(nn.Module):
         return processed_features
 
 
-class MiniCPMV4_6VisionModel(nn.Module):
+class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
     """Full vision tower: embeddings -> encoder (+window merger) -> merger.
 
     Consumes a batch of :class:`MultimodalParams`, concatenates every request's
@@ -541,6 +542,26 @@ class MiniCPMV4_6VisionModel(nn.Module):
         self.merger = MiniCPMV4_6Merger(vision_model_config)
 
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        # Per-segment capacity required by the shared encoder metadata helper.
+        # Like the Qwen-VL and Cosmos3 vision towers, default to the model's
+        # token budget rather than the live grid length. The engine replaces it
+        # with its encoder token budget through `set_attn_max_seq_len`.
+        self._attn_max_seq_len = model_config.max_num_tokens
+
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
+        # Metadata is sized per forward from the live grids in `_make_attn_metadata`.
+        pass
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(
+                f"MiniCPM-V 4.6 vision attention max_seq_len must be positive, got {max_seq_len}"
+            )
+        self._attn_max_seq_len = max_seq_len
 
     def _make_attn_metadata(self, seq_lens: List[int]) -> AttentionMetadata:
         num_segments = len(seq_lens)
@@ -549,7 +570,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
             max_num_tokens=sum(seq_lens) + 1,
             kv_cache_manager=None,
         )
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(
+            seq_lens, attn_metadata, max_seq_len=self._attn_max_seq_len
+        )
 
     @staticmethod
     def _grid_seq_lens(target_sizes: torch.Tensor) -> List[int]:

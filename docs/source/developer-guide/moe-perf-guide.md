@@ -141,7 +141,7 @@ TensorRT-LLM provides many MoE implementations, differing in supported quantizat
 | Backend | GPU arch | Quantization |
 |---|---|---|
 | `CUTLASS` | SM80+ | unquantized, FP8 QDQ, FP8 block-scale, NVFP4, W4A16_NVFP4, W4A8_AWQ, W8A16, MXFP4, MXFP8 |
-| `TRTLLM` | SM100 / SM103 | NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 (a separate FlashInfer path) |
+| `TRTLLM` | SM100 / SM103 | NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 |
 | `CUTEDSL` | SM100 / SM103 / SM107, SM120 / SM121 (CUTLASS prefill / FlashInfer decode) | NVFP4, BF16 (SM107), W4A16_NVFP4 (SM120 / SM121) |
 | `CUTEDSL_FC12` | SM107 | NVFP4 |
 | `DEEPGEMM` | SM100 / SM103 / SM107 | FP8 block-scale |
@@ -402,9 +402,63 @@ Usage: [`examples/wide_ep/ep_load_balancer/README.md`](https://github.com/NVIDIA
 
 [Distributed Weight Data Parallelism (DWDP)](https://doi.org/10.48550/arXiv.2604.01621) targets layer-wise synchronization and token-exchange overhead in the prefill phase, where differences in sequence lengths and KV-cache hits can leave workers waiting for the slowest rank. DWDP keeps a resident subset of experts on each worker and asynchronously prefetches the remaining expert weights from its NVLink peers. Each worker computes on its own tokens, replacing synchronized token dispatch/combine with weight transfers that overlap with computation.
 
-DWDP can be applied to the prefill phase of a serving system when the context batch is large enough for computation to hide the weight prefetch. Decode typically has too little computation to hide these transfers, so generation keeps the normal EP dispatch. Experimental cost of DWDP is a TTFT regression, from a lower service rate on the context stage, plus extra prefetch memory: each rank stores only its local experts, but adds a double-buffered region of about two layers of remote experts. DWDP cannot run on the same MoE path as EPLB. A disaggregated deployment can use DWDP on context servers and EPLB on generation servers.
+DWDP can be applied to the prefill phase of a serving system when the context batch is large enough for computation to hide the weight prefetch. Decode typically has too little computation to hide these transfers, so generation keeps the normal EP dispatch. Experimental cost of DWDP is a TTFT regression, from a lower service rate on the context stage, plus extra prefetch memory: each rank stores only its local experts, but adds `num_prefetch_slots` prefetch slots (two by default) of about one layer of remote experts each; more slots let the prefetch run further ahead of the compute. DWDP cannot run on the same MoE path as EPLB. A disaggregated deployment can use DWDP on context servers and EPLB on generation servers.
+
+Each worker of a DWDP group stores a contiguous range of the routed experts and prefetches the others. Leave `dwdp_config.num_experts_per_worker` and `num_prefetch_experts` at 0 (the default) for the balanced partition: each worker stores `floor` or `ceil` of `num_experts / dwdp_size` experts, the lower ranks the larger count, and no expert is stored twice. Set both for a strided partition, where worker `r` stores the experts `[r * num_prefetch_experts, r * num_prefetch_experts + num_experts_per_worker)`: `num_prefetch_experts` is the stride between consecutive workers, not a number of prefetched experts. With `N = dwdp_size`, a strided partition takes one of three forms:
+
+- equal values whose ranges cover the experts exactly: `N * num_experts_per_worker == num_experts`;
+- equal values whose last range is cut short at `num_experts` and still holds at least one expert: `(N - 1) * num_experts_per_worker < num_experts < N * num_experts_per_worker`;
+- a smaller stride, whose ranges overlap, only when the last range ends exactly at `num_experts`: `(N - 1) * num_prefetch_experts + num_experts_per_worker == num_experts`.
+
+Any other combination raises on every rank when the model is built, since the expert count comes from the model.
+
+DWDP needs `moe_config.backend: CUTEDSL` (or `CUTEDSL_FC12`), and the launch is refused with any other backend: it manages the MoE layers that run it with NVFP4 weights and no locality domains. Any other MoE layer, such as a BF16 MTP layer, keeps every expert on every rank, in memory the KV cache would otherwise get; the first such layer of each backend and reason logs a warning, and DWDP setup logs how many layers each reason covers.
 
 Usage: [`examples/dwdp/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/dwdp/README.md) and [blog19](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md).
+
+#### Dense DWDP
+
+Dense DWDP (prototype) applies the same idea to the dense weights of the MoE decoder layers: the attention, the shared expert, the router and the other dense weights of the MoE block, which every context rank otherwise holds in full. Each rank of the group keeps one row-shard of every covered layer, and dense DWDP gathers each layer into small staging slots two layers ahead of its use. Most of the replicated dense weights are freed for the KV cache. It applies to models whose decoder layers provide dense DWDP roots, currently Kimi-K3.
+
+Dense DWDP frees memory; it does not by itself make a server faster. The gathers overlap with the compute of the layers before them, so with the same settings a server runs at about the speed it had without dense DWDP. The gain comes from spending the freed memory: raise `max_num_tokens` or the KV-cache share (`kv_cache_config.free_gpu_memory_fraction`) with it.
+
+It runs in one of two modes:
+
+- With expert DWDP, on the context servers of a DWDP group: the dense rows are sharded over the DWDP group, and the dense copies run on the copy stream of the expert prefetch, with its transfer.
+
+  ```yaml
+  dwdp_config:
+    dwdp_size: 16
+    enable_dense: true
+  moe_config:
+    backend: CUTEDSL
+  disable_overlap_scheduler: true
+  cuda_graph_config: null
+  ```
+
+- Without expert DWDP, on one attention-DP context instance: the dense rows are sharded over the attention-DP ranks of the instance, the copies run on a copy stream of their own, and the overlap scheduler may stay on.
+
+  ```yaml
+  tensor_parallel_size: 16
+  enable_attention_dp: true
+  dwdp_config:
+    enable_experts: false
+    enable_dense: true
+  cuda_graph_config: null
+  ```
+
+`dwdp_config.copy_mode` picks the transfer of every DWDP copy, the expert prefetch and the dense gathers alike: `per_slice` (one copy-engine copy per slice), `batched` (one batched copy-engine copy per layer) or `gather` (the SM fabric gather kernel, which keeps SMs from the compute kernels while it runs). Left unset, the expert prefetch keeps its usual selection (`per_slice`, `batched` with `contention_opt`, `gather` with the `TRTLLM_DWDP_PREFETCH_GATHER` environment variable, which is deprecated), the dense copies follow it, and dense DWDP without expert DWDP uses `batched`. With `copy_mode: gather`, `dwdp_config.gather_kernel` picks the gather kernel: `register` or `tma` (bulk copies staged in shared memory, SM90 or newer). It replaces the deprecated `TRTLLM_DWDP_GATHER_KERNEL` environment variable, which still applies while `gather_kernel` is unset.
+
+`LLM()` and `trtllm-serve` check these settings when they build the LLM arguments, and each worker checks its host before the model is built. Dense DWDP needs:
+
+- eager execution: no `cuda_graph_config`, `torch_compile_config` or prefill CUDA graphs;
+- no `sleep_config`, `lora_config` or `speculative_config`;
+- `enable_locality_domains` off, and pipeline and context parallel size 1;
+- FABRIC peer memory handles (multi-node NVLink systems);
+- with expert DWDP, `dwdp_size > 1` and `disable_overlap_scheduler: true`, as expert DWDP requires, and tensor parallel size 1;
+- without expert DWDP, `enable_attention_dp: true` with `tensor_parallel_size > 1`, the MPI backend, and the gather kernel when `copy_mode` is `gather`. The expert DWDP fields (`dwdp_size`, `num_groups`, `num_experts_per_worker`, `num_prefetch_experts`, `contention_opt`, `num_prefetch_slots`) keep their defaults.
+
+Every server of a DWDP group must set the same `enable_dense`: setup compares it in its first collective, and a disagreement, or a setup failure on any rank, makes every rank of the group raise. A server whose launch is refused exits before it reaches that collective, and its DWDP peers wait for it there: with the store rendezvous until `TRTLLM_DWDP_RENDEZVOUS_TIMEOUT_S` (1800 s by default), under MPI without a limit. When a group does not come up, look for a refused server among its logs. Dense DWDP is meant for context servers; on a generation server every decode step would gather every covered layer. `trtllm-serve` refuses `enable_dense` on a generation server (`--server_role GENERATION`, `TRTLLM_DISAGG_ROLE=generation`, or a generation server of a disaggregated MPI launch, on every rank before the launch splits) and warns on a server without the context role, so launch context servers with `--server_role CONTEXT` (a gRPC server, which takes no `--server_role`, with `TRTLLM_DISAGG_ROLE=context`). A Kimi-K3 server with expert DWDP and `enable_dense` off still runs the first collective of dense setup at startup, so that a group whose servers disagree fails at once.
 
 ## Appendix
 

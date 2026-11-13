@@ -46,7 +46,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -187,7 +187,9 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     (model_layer, attn_type) into synthetic IDs via the
     _layer_attn_to_layer_id inverse mapping.
     """
-    local_layer_ids = manager.impl.layer_grouping[lg_idx]
+    local_layer_ids = list(
+        dict.fromkeys(int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[lg_idx])
+    )
 
     get_global_layer_ids = getattr(manager, "get_disagg_global_layer_ids", None)
     if get_global_layer_ids is not None:
@@ -236,6 +238,7 @@ def _build_pool_views_for_variant(
     role_layouts: Optional[Dict] = None,
     ignored_roles: frozenset[DataRole] = frozenset(),
     view_partition: Optional[Callable] = None,
+    kv_heads_for_layer: Optional[Callable[[int], int]] = None,
 ) -> List[PoolView]:
     """Bucket one slot-desc variant's coalesced buffers into pool views.
 
@@ -243,6 +246,10 @@ def _build_pool_views_for_variant(
     kind share a view (KEY+VALUE), roles with different kinds in the same
     physical pool get separate views (M3 coalesced index-K). ``role_layouts``
     supplies the per-role resharding geometry carried onto the view.
+    ``view_partition`` further splits roles of one kind (e.g. by owning
+    model). ``kv_heads_for_layer`` gives a layer's positive per-rank KV-head
+    count; head-sharded views also partition by that count so equal-sized
+    buffers with different head geometry never share a view.
     """
     role_layouts = role_layouts or {}
     bucket_entries: Dict[tuple, list] = defaultdict(list)
@@ -261,7 +268,13 @@ def _build_pool_views_for_variant(
                     if view_partition is not None
                     else None
                 )
-                bucket_key = (pool_idx, kind, partition)
+                num_kv_heads = (
+                    kv_heads_for_layer(int(buffer_id.layer_id))
+                    if kv_heads_for_layer is not None
+                    and kind in (MapperKind.INDEXED, MapperKind.NHD)
+                    else None
+                )
+                bucket_key = (pool_idx, kind, partition, num_kv_heads)
                 bucket_entries[bucket_key].append(
                     (int(buffer_id.layer_id), offset, single_buffer_size)
                 )
@@ -279,7 +292,7 @@ def _build_pool_views_for_variant(
         key=lambda key: (key[0], min(entry[1] for entry in bucket_entries[key])),
     )
     for bucket_key in lg_bucket_keys:
-        pool_idx, mapper_kind, _ = bucket_key
+        pool_idx, mapper_kind, _, num_kv_heads = bucket_key
         roles = frozenset(bucket_roles[bucket_key])
         context = (
             f"View(layer_group={layer_group_id}, pool={pool_idx}, "
@@ -310,6 +323,15 @@ def _build_pool_views_for_variant(
                 f"{context} bytes_per_layer={bytes_per_layer} is not a multiple of "
                 f"bytes_per_head={layout.bytes_per_head}"
             )
+        if layout.ring_slot_bytes is not None and (
+            mapper_kind != MapperKind.REPLICATED
+            or layout.ring_slot_bytes <= 0
+            or bytes_per_layer % layout.ring_slot_bytes != 0
+        ):
+            raise ValueError(
+                f"{context} ring_slot_bytes={layout.ring_slot_bytes} needs a REPLICATED view "
+                f"whose bytes_per_layer={bytes_per_layer} is a positive multiple of it"
+            )
         pool_views.append(
             PoolView(
                 pool_idx=pool_idx,
@@ -321,6 +343,8 @@ def _build_pool_views_for_variant(
                     list(layout.section_bytes) if layout.section_bytes is not None else None
                 ),
                 bytes_per_head=layout.bytes_per_head,
+                num_kv_heads=num_kv_heads,
+                ring_slot_bytes=layout.ring_slot_bytes,
             )
         )
 
@@ -394,9 +418,54 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
 
         raise ValueError(f"Cannot resolve layer config for internal layer {internal_layer_id}")
 
+    virtual_layer_mapping = getattr(manager, "_layer_attn_to_layer_id", None)
+    model_layer_by_internal_id: dict[int, int] = {}
+    if virtual_layer_mapping is not None:
+        # Shared caches are declared by their owner before dependent layers.
+        for (model_layer, _attn_type), internal_layer_id in virtual_layer_mapping.items():
+            model_layer_by_internal_id.setdefault(int(internal_layer_id), int(model_layer))
+    # A mixed-precision high layer has the head geometry of the local layer it belongs to.
+    local_layer_by_mixed_precision_high_layer = {
+        int(high_layer): int(local_layer)
+        for local_layer, high_layer in manager.mixed_precision_high_layers.items()
+    }
+
+    def _kv_heads_for_layer(internal_layer_id: int) -> int:
+        if internal_layer_id in local_layer_by_mixed_precision_high_layer:
+            local_layer_id = local_layer_by_mixed_precision_high_layer[internal_layer_id]
+        elif virtual_layer_mapping is not None:
+            model_layer = model_layer_by_internal_id.get(internal_layer_id)
+            if model_layer is None:
+                raise ValueError(
+                    f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
+                    "no owning model layer"
+                )
+            local_layer_id = manager.layer_offsets.get(model_layer)
+            if local_layer_id is None:
+                raise ValueError(
+                    f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
+                    f"model layer {model_layer} is not local to this rank"
+                )
+        else:
+            # Without a virtual layer mapping, the internal id is the layer offset.
+            local_layer_id = internal_layer_id
+        heads = manager.num_kv_heads_per_layer
+        if not 0 <= local_layer_id < len(heads):
+            raise ValueError(
+                f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
+                f"local layer {local_layer_id} is outside the per-layer head list"
+            )
+        num_kv_heads = int(heads[local_layer_id])
+        if num_kv_heads <= 0:
+            raise ValueError(
+                f"Internal layer {internal_layer_id} must have a positive KV-head count, "
+                f"got {num_kv_heads}"
+            )
+        return num_kv_heads
+
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
-    layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
+    layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.buffer_grouping)
 
     for pg_desc in pool_group_descs:
         storage_pg_idx = int(pg_desc.pool_group_index)
@@ -408,6 +477,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         base_address=int(pool.base_address),
                         slot_bytes=int(pool.slot_bytes),
                         num_slots=int(pg_desc.num_slots),
+                        # A sparse pool of the GPU tier is host memory mapped into the
+                        # device address space; the pool, not its group, reports that.
+                        memory_type=(
+                            "VRAM" if pool.storage_medium == CacheTier.GPU_MEM else "DRAM"
+                        ),
                     )
                     for pool in pg_desc.pools
                 ]
@@ -421,7 +495,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         # memory is reused, not concatenated.
         for variant in pg_desc.slot_desc.variants:
             layer_group_id = int(variant.layer_group_id)
-            all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
+            all_internal_layer_ids = list(
+                dict.fromkeys(
+                    int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[layer_group_id]
+                )
+            )
             all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
             local_layers = [
                 LocalLayer(local_layer_id=int(iid), global_layer_id=int(gid))
@@ -442,10 +520,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 )
             cache_kind = CacheKind.STATE if is_recurrent else CacheKind.PAGED
 
-            # Bucket buffer entries by (pool, mapper kind). One PoolView is
-            # emitted per bucket and spans every layer of that role class,
-            # so the view count per layer group is bounded by the number of
-            # role classes — never by the layer count. ``pool_role`` stays
+            # Bucket buffer entries by pool, mapper kind, manager partition
+            # and resolved KV-head count. ``pool_role`` stays
             # the manager-supplied equivalence label used for peer matching
             # without enumerating role names. Buffer offsets within a slot
             # follow ``buffer_ids`` order: the i-th buffer of a coalesced
@@ -458,7 +534,12 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 role_layouts=role_layouts,
                 ignored_roles=ignored_roles,
                 view_partition=view_partition,
+                kv_heads_for_layer=None if is_recurrent else _kv_heads_for_layer,
             )
+            if not pool_views:
+                # Ignored-only groups keep their lifecycle index but have no
+                # transferable layers or regions to match against a peer.
+                local_layers = []
             for pool_view in pool_views:
                 if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:
                     raise ValueError(
@@ -476,15 +557,12 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 )
                 continue
 
-            # Determine layer group metadata.
-            # For managers with virtual layers, internal layer_ids
-            # may exceed the length of num_kv_heads_per_layer. Use index 0 as
-            # all layers within a pool group share the same kv_heads count.
+            # The group field describes its first head-sharded view; each
+            # view carries the actual geometry used for transfer.
             first_local_layer = all_internal_layer_ids[0]
-            if first_local_layer < len(manager.num_kv_heads_per_layer):
-                num_kv_heads = manager.num_kv_heads_per_layer[first_local_layer]
-            else:
-                num_kv_heads = manager.num_kv_heads_per_layer[0]
+            num_kv_heads = next(
+                (view.num_kv_heads for view in pool_views if view.num_kv_heads is not None), 0
+            )
             sliding_window_size = _window_size_for_layer(first_local_layer)
 
             layer_groups_by_id[layer_group_id] = AttentionLayerGroup(

@@ -72,6 +72,8 @@ class WeightLoader(BaseWeightLoader):
         Args:
             checkpoint_dir: Path to checkpoint (pipeline root or component dir)
             mapping: Distributed mapping (for future TP/PP support)
+            kwargs: Optional loading controls. ``prefetch=False`` disables
+                safetensors host page-cache prefetch before loading.
 
         Returns:
             - If single component: Dict mapping weight names to tensors
@@ -79,6 +81,7 @@ class WeightLoader(BaseWeightLoader):
               Example: {"transformer": {...}, "transformer_2": {...}}
         """
         checkpoint_path = Path(checkpoint_dir)
+        prefetch = kwargs.get("prefetch", True)
 
         # Standard and modular Diffusers manifests use the same component
         # subdirectory layout for weight-bearing models.
@@ -109,7 +112,7 @@ class WeightLoader(BaseWeightLoader):
             if not weight_files:
                 raise ValueError(f"No weight files found in {weight_dir}")
 
-            if all(wf.endswith(".safetensors") for wf in weight_files):
+            if prefetch and all(wf.endswith(".safetensors") for wf in weight_files):
                 prefetch_files_to_host_cache(
                     weight_files,
                     description="visual-gen checkpoint",

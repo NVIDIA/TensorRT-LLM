@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType, AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
@@ -66,7 +67,7 @@ def _has_dsv4_indexer(self) -> bool:
 def _get_validated_sm_version() -> int:
     sm_version = get_sm_version()
     if sm_version < 90:
-        raise RuntimeError(f"DeepSeek-V4 requires Hopper or newer GPUs, got SM{sm_version}")
+        raise UnsupportedError(f"DeepSeek-V4 requires Hopper or newer GPUs, got SM{sm_version}")
     return sm_version
 
 

@@ -23,6 +23,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
+from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._frontend_processes import (
     FrontendStartupCancelled,
@@ -31,12 +32,14 @@ from tensorrt_llm.serve._frontend_processes import (
     _spawn_attached_frontends,
     _terminate_attached_frontends,
 )
+from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 
 from ._health import OpenEngineHealthServicer
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
 from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
+from .metrics import MetricsDirectory, OpenEngineMetrics
 from .servicer import OpenEngineInferenceServicer
 
 __all__ = ["OpenEngineServer", "launch_server"]
@@ -99,6 +102,8 @@ class OpenEngineServer:
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        max_media_preparations: Concurrent media preparation requests. Defaults to
+            TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT, or four when unset.
     """
 
     def __init__(
@@ -111,10 +116,19 @@ class OpenEngineServer:
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
         subagent_affinity_auth_key: str | None = None,
+        max_media_preparations: int | None = None,
+        metrics: OpenEngineMetrics | None = None,
     ) -> None:
+        if max_media_preparations is None:
+            max_media_preparations = int(
+                os.getenv("TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT", "4")
+            )
+        if type(max_media_preparations) is not int or max_media_preparations < 1:
+            raise ValueError("max_media_preparations must be a positive integer")
         self.host = host
         self.port = port
         self._llm = llm
+        self._metrics = metrics
         self._frontend = frontend
         self._stopping = False
         self._health_task: asyncio.Task | None = None
@@ -141,8 +155,10 @@ class OpenEngineServer:
             kv_transfer_backend=kv_transfer_backend,
             frontend=frontend,
             subagent_affinity_auth_key=subagent_affinity_auth_key,
+            metrics=metrics,
             input_executor=self._input_executor,
             media_executor=self._media_executor,
+            max_media_preparations=max_media_preparations,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
@@ -187,6 +203,8 @@ class OpenEngineServer:
                     "KV events are configured but the loaded engine has no streaming publisher; "
                     "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
                 )
+        if self._metrics is not None:
+            await self._metrics.start()
         await self._server.start()
         await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
         await self._refresh_inference_health()
@@ -276,10 +294,21 @@ class OpenEngineServer:
                 await asyncio.gather(self._health_task, return_exceptions=True)
             await self._server.stop(grace=grace)
         finally:
-            await asyncio.gather(
-                asyncio.to_thread(self._input_executor.shutdown, wait=True, cancel_futures=True),
-                asyncio.to_thread(self._media_executor.shutdown, wait=True, cancel_futures=True),
-            )
+            try:
+                if self._metrics is not None:
+                    await self._metrics.stop()
+            finally:
+                try:
+                    await _close_aiohttp_session()
+                finally:
+                    await asyncio.gather(
+                        asyncio.to_thread(
+                            self._input_executor.shutdown, wait=True, cancel_futures=True
+                        ),
+                        asyncio.to_thread(
+                            self._media_executor.shutdown, wait=True, cancel_futures=True
+                        ),
+                    )
         logger.info("OpenEngine server stopped")
 
     async def wait_for_termination(self) -> None:
@@ -307,6 +336,8 @@ def launch_server(
     report_failure: Callable[[int, str, str], None] | None = None,
     enable_load_metrics: bool = False,
     subagent_affinity_auth_key: str | None = None,
+    metrics_host: str | None = None,
+    metrics_port: int = 8001,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -318,6 +349,8 @@ def launch_server(
         report_failure: Records a child exit before startup readiness.
         enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        metrics_host: HTTP bind address; defaults to the inference host.
+        metrics_port: HTTP port when performance-metrics configuration enables Prometheus.
     """
     _warn_if_python_protobuf()
 
@@ -331,6 +364,16 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend",
             )
+
+        perf_metrics = resolve_perf_metrics_config(
+            llm_args.get("return_perf_metrics", False),
+            llm_args.get("perf_metrics_output_dir"),
+        )
+        metrics_enabled = perf_metrics.collect_request_metrics
+        if metrics_enabled:
+            llm_args["return_perf_metrics"] = True
+        if metrics_enabled and metrics_port == port and port != 0:
+            raise click.UsageError("--openengine-metrics-port must differ from --port")
 
         mode = _init_multi_frontend_mode(llm_args, enabled=True)
         if mode.num_frontends > 1 and port == 0:
@@ -346,8 +389,10 @@ def launch_server(
         startup_cancelled = threading.Event()
         server = llm = coordinator = frontend = monitor = None
         directory = None
+        metrics_directory = metrics = None
         children = []
         failure = None
+        serving = False
         parent_pid = os.getppid()
 
         def fail(reason: str) -> None:
@@ -402,6 +447,8 @@ def launch_server(
                 if terminal_engine_failure():
                     fail("OpenEngine terminal engine failure")
                     return
+                if serving and metrics is not None:
+                    metrics.check_health()
                 if frontend is not None:
                     try:
                         status = await frontend.request("heartbeat", frontend=frontend.frontend_id)
@@ -420,6 +467,8 @@ def launch_server(
                 fail(f"OpenEngine supervision failed: {error}")
 
         try:
+            if metrics_enabled:
+                metrics_directory = MetricsDirectory(mode.is_attached_frontend)
             llm_args["_enable_routing_load"] = enable_load_metrics
             # A new incarnation fences every node's metadata after a restart.
             # The executor starts node discovery only when streaming is enabled.
@@ -434,6 +483,14 @@ def launch_server(
                     raise RuntimeError(failure)
                 return
             logger.info("Model loaded successfully")
+            if metrics_enabled:
+                metrics = OpenEngineMetrics(
+                    llm,
+                    model,
+                    host if metrics_host is None else metrics_host,
+                    metrics_port,
+                    owner=not mode.is_attached_frontend,
+                )
             instance_id = llm_args["_openengine_discovery"]["engine_id"]
             if mode.is_launcher:
                 directory = tempfile.TemporaryDirectory(prefix="tllm-openengine-")
@@ -491,9 +548,11 @@ def launch_server(
                 frontend=frontend,
                 instance_id=instance_id,
                 subagent_affinity_auth_key=subagent_affinity_auth_key,
+                metrics=metrics,
             )
             _disable_gc_if_requested()
             await server.start()
+            serving = True
             if any(child.poll() is not None for child in children):
                 raise RuntimeError("An OpenEngine frontend exited during startup")
             _signal_frontend_ready(mode)
@@ -530,8 +589,12 @@ def launch_server(
                         if llm is not None:
                             await asyncio.to_thread(llm.shutdown)
                     finally:
+                        if metrics is not None:
+                            await metrics.wait_for_collection()
                         if directory is not None:
                             directory.cleanup()
+                        if metrics_directory is not None:
+                            metrics_directory.close()
                         for sig, previous in previous_handlers.items():
                             signal.signal(sig, previous)
                 logger.info("LLM engine stopped")

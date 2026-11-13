@@ -54,6 +54,8 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.kv_hints import KvHintsEnvelope
+from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
@@ -150,6 +152,20 @@ def _logit_bias_to_embedding_bias(
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("kv_hints", mode="before", check_fields=False)
+    @classmethod
+    def admit_hint_envelope(cls, value: Any) -> Optional[KvHintsEnvelope]:
+        """Apply optional-hint admission before nested schema validation.
+
+        Args:
+            value: The decoded hint field from a trusted ingress.
+
+        Returns:
+            Supported metadata or None for ignored hints, including malformed
+            envelopes. Validation of other request fields remains unchanged.
+        """
+        return admit_kv_hints(value)
 
 
 class SpeculativeDecodingStats(OpenAIBaseModel):
@@ -639,6 +655,12 @@ def _record_sampling_params_request_fields(
 
 
 class CompletionRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        repr=False,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str
@@ -684,6 +706,13 @@ class CompletionRequest(OpenAIBaseModel):
     return_context_logits: bool = False
     detokenize: bool = True
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -768,6 +797,7 @@ class CompletionRequest(OpenAIBaseModel):
                 self.response_format),
             detokenize=self.detokenize,
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -925,6 +955,12 @@ class ChatCompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     # TODO: and use a JSON-safe handle to refer to the server-side output
     mm_embedding_handle: Optional[Dict[str, Any]] = None
 
+    # Ids of the generated tokens. RL rollouts need exactly what the engine
+    # sampled -- re-tokenizing the decoded text is lossy -- and these models are
+    # extra="forbid", so without a declared field the ids cannot survive the
+    # disaggregated server's re-validation of a worker's response.
+    token_ids: Optional[List[int]] = None
+
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
     speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
@@ -1043,6 +1079,21 @@ class ChatCompletionToolsParam(OpenAIBaseModel):
     function: FunctionDefinition
 
 
+class NamespacedFunctionToolParam(ChatCompletionToolsParam):
+    """A tool that a Responses request declared inside a namespace.
+
+    ``function`` is what a chat template without namespaces is given: the
+    tool as a function named ``<namespace>.<name>``. That is all a dump
+    carries. The declaration itself is kept beside it, out of every dump, for
+    a model whose renderer reads namespaces (``ServingExtension.serialize_tool``).
+    """
+
+    namespace: str = Field(exclude=True)
+    namespace_description: Optional[str] = Field(default=None, exclude=True)
+    declared_name: str = Field(exclude=True)
+    declared_description: Optional[str] = Field(default=None, exclude=True)
+
+
 class ChatCompletionNamedFunction(OpenAIBaseModel):
     name: str
 
@@ -1066,6 +1117,12 @@ class ChatCompletionThinkingParam(OpenAIBaseModel):
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        repr=False,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -1086,6 +1143,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
+    service_tier: Optional[Literal["auto", "default", "flex", "scale",
+                                   "priority", "fast"]] = Field(
+                                       default=None,
+                                       description=(
+                                           "Accepted for OpenAI compatibility "
+                                           "and ignored: the server has no "
+                                           "service tiers. Scheduling priority "
+                                           "is the separate `priority` field."))
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     # Standard OpenAI field, accepted for compatibility and otherwise ignored:
     # the server keeps no copy of a chat completion, so there is nothing to
@@ -1104,20 +1169,36 @@ class ChatCompletionRequest(OpenAIBaseModel):
     parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
-        "low", "medium", "high", "max", "none"]] = Field(
+        "minimal", "low", "medium", "high", "xhigh", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
             description=(
                 "The level of reasoning effort to use. Controls how much "
                 "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'max' and "
-                "'none' for models with Kimi-style thinking control."),
+                "'low', 'medium', 'high' (harmony/gpt-oss), 'max' and "
+                "'none' for models with Kimi-style thinking control, plus "
+                "'minimal' and 'xhigh' for models whose chat template "
+                "supports the extended effort scale."),
         )
     # Kimi/Moonshot extension: structured control of reasoning output. The
     # serving layer maps it into the chat-template kwargs for models whose
     # template understands it (e.g. kimi_k3); other models ignore it.
     thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     prompt_ignore_length: Optional[int] = 0
+    # Match Codex CLI's string-map contract; widen only for a client that needs
+    # other value types, even though the metadata is otherwise ignored.
+    client_metadata: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=("Not an OpenAI field: opaque per-request metadata that "
+                     "agent clients attach, a map of strings to strings. "
+                     "Accepted and ignored."))
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -1297,6 +1378,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 reasoning_parser=reasoning_parser,
                 chat_template_kwargs=self.chat_template_kwargs),
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -1501,6 +1583,12 @@ def _materialize_validator_iterators(value, _depth=0):
 
 
 class ResponsesRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        repr=False,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
     #
@@ -2370,34 +2458,37 @@ class VideoGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
-    image_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    image_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Image reference(s) conditioning generation (e.g. image-to-video "
              "first frame). Send a ``{content, format, role}`` object or a list "
              "of them, where ``format`` is ``path`` / ``url`` / ``base64``; or "
-             "upload a single image file via multipart, whose form is implied. "
+             "upload image files via repeated multipart fields, whose format "
+             "is implied. "
              "PNG or JPEG only — HEIF/AVIF are not supported."),
         )
-    video_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    video_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Video reference(s) conditioning generation (video-to-video). Send "
              "a ``{content, format}`` object or a list of them, where ``format`` "
-             "is ``path`` / ``url`` / ``base64``; or upload a single video file "
-             "via multipart, whose form is implied. MP4 or AVI, with H.264 the "
+             "is ``path`` / ``url`` / ``base64``; or upload video files "
+             "via repeated multipart fields, whose format is implied. MP4 or AVI, "
+             "with H.264 the "
              "tested codec and others best-effort."),
         )
-    audio_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    audio_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Audio reference(s) conditioning generation. Send a "
              "``{content, format}`` object or a list of them, where ``format`` "
-             "is ``path`` / ``url`` / ``base64``; or upload a single audio "
-             "file via multipart, whose form is implied. Accepted only by "
+             "is ``path`` / ``url`` / ``base64``; or upload audio "
+             "files via repeated multipart fields, whose format is implied. "
+             "Accepted only by "
              "models that declare an audio reference slot."),
         )
     input_reference: Optional[Union[str, UploadFile]] = Field(

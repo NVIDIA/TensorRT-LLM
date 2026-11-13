@@ -232,6 +232,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         assert mla.o_a_proj_dequant is None
         assert not mla.use_cute_dsl_blockscaling_bmm
 
+    dim = fp8_a_weight = fp8_a_scale = o_a_proj_bf16 = fp8_b_weight_dequant = None
     # Initialize weights
     nn_init_std = 0.02
     with torch.no_grad():

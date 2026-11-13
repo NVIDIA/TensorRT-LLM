@@ -6,6 +6,7 @@ import dataclasses
 import json
 import math
 import time
+import traceback
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -232,6 +233,9 @@ class GenerationResultBase:
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
+        self.ctx_computed_tokens = 0
+        self.ctx_first_begin = -1
+        self.ctx_num_chunks = 0
         self.per_pos_drafted = None
         self.per_pos_accepted = None
         # Cumulative (accepted, drafted) draft-token totals attached by the
@@ -361,10 +365,22 @@ class GenerationResultBase:
                          sequence_index,
                          logprobs_result=None,
                          req_perf_metrics_dict: Optional[dict[str,
-                                                              float]] = None):
-        """Handle a single sequence in the response."""
+                                                              float]] = None,
+                         *,
+                         output_token_ids=None,
+                         request_perf_metrics=None):
+        """Handle a single sequence in the response.
+
+        ``output_token_ids`` and ``request_perf_metrics`` are the
+        corresponding ``response_tensors`` attributes, pre-read by the caller
+        so a per-beam loop does not re-read (and re-convert) them per beam.
+        """
         seq_idx = sequence_index
         src_idx = sequence_index if self.sampling_params.use_beam_search else 0
+        if output_token_ids is None:
+            output_token_ids = response_tensors.output_token_ids
+        if request_perf_metrics is None:
+            request_perf_metrics = response_tensors.request_perf_metrics
 
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
@@ -380,21 +396,26 @@ class GenerationResultBase:
             # Beam search enforces returning all generated tokens
             output.token_ids = [
                 *decoder_output_prefix,
-                *response_tensors.output_token_ids[src_idx],
+                *output_token_ids[src_idx],
             ]
         else:
             if decoder_output_prefix and not output.token_ids:
                 output.token_ids.extend(decoder_output_prefix)
-            output.token_ids.extend(response_tensors.output_token_ids[src_idx])
+            output.token_ids.extend(output_token_ids[src_idx])
 
-        if (cum_log_probs := response_tensors.cum_log_probs) is not None:
+        # Sampler logprobs belong to the Python result. Native results carry
+        # token/lifecycle metadata and can also reach this response handler.
+        has_sampler_outputs = not isinstance(response_tensors, tllm.Result)
+        if has_sampler_outputs and (cum_log_probs :=
+                                    response_tensors.cum_log_probs) is not None:
             output.cumulative_logprob = cum_log_probs[src_idx]
 
         # prompt logprobs handling
         if logprobs_result and logprobs_result.prompt is not None:
             output.prompt_logprobs = logprobs_result.prompt
         # Generation logprobs are computed by the sampler.
-        if (log_probs := response_tensors.log_probs) is not None:
+        if has_sampler_outputs and (log_probs :=
+                                    response_tensors.log_probs) is not None:
             # handle logprobs directly from response tensors given by sampler
             if decoder_output_prefix and self.sampling_params.use_beam_search:
                 output.logprobs = [
@@ -474,8 +495,7 @@ class GenerationResultBase:
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
-        if (request_perf_metrics :=
-                response_tensors.request_perf_metrics) is not None:
+        if request_perf_metrics is not None:
             output.request_perf_metrics = request_perf_metrics
             self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
 
@@ -564,6 +584,11 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        """Update outputs, completion state, and handoff metadata from a response.
+
+        Args:
+            response: Executor or postprocessing result for this request.
+        """
         req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
             req_perf_metrics_dict = response.request_perf_metrics
@@ -578,6 +603,10 @@ class GenerationResultBase:
             self.avg_decoded_tokens_per_iter = (
                 response.avg_decoded_tokens_per_iter)
             self.cached_tokens = response.cached_tokens
+            self.ctx_computed_tokens = getattr(response, 'ctx_computed_tokens',
+                                               0)
+            self.ctx_first_begin = getattr(response, 'ctx_first_begin', -1)
+            self.ctx_num_chunks = getattr(response, 'ctx_num_chunks', 0)
             if isinstance(response.res, CompletionOutput):
                 # in streaming mode
                 self._outputs[0] = response.res
@@ -643,6 +672,11 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
+            self.ctx_computed_tokens = getattr(response_result,
+                                               'ctx_computed_tokens', 0)
+            self.ctx_first_begin = getattr(response_result, 'ctx_first_begin',
+                                           -1)
+            self.ctx_num_chunks = getattr(response_result, 'ctx_num_chunks', 0)
             self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
@@ -681,19 +715,34 @@ class GenerationResultBase:
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
                     multimodal_embedding_handles=None,
+                    multimodal_input_layout=None,
                 )
 
             finish_reasons = response_result.finish_reasons
-            # output_token_ids = (beams, tokens)
+            # output_token_ids = (beams, tokens). Read the attribute once: on
+            # the C++-backed result every access converts the whole
+            # per-beam vector of vectors, which the per-beam loop below would
+            # otherwise repeat beam_width times.
+            output_token_ids = response_result.output_token_ids
+            request_perf_metrics = response_result.request_perf_metrics
             if self.sampling_params.use_beam_search:
-                for beam_idx, _ in enumerate(response_result.output_token_ids):
-                    self._handle_sequence(finish_reasons, response_result,
-                                          beam_idx, logprobs_result,
-                                          req_perf_metrics_dict)
+                for beam_idx in range(len(output_token_ids)):
+                    self._handle_sequence(
+                        finish_reasons,
+                        response_result,
+                        beam_idx,
+                        logprobs_result,
+                        req_perf_metrics_dict,
+                        output_token_ids=output_token_ids,
+                        request_perf_metrics=request_perf_metrics)
             else:
-                self._handle_sequence(finish_reasons, response_result,
+                self._handle_sequence(finish_reasons,
+                                      response_result,
                                       response_result.sequence_index,
-                                      logprobs_result, req_perf_metrics_dict)
+                                      logprobs_result,
+                                      req_perf_metrics_dict,
+                                      output_token_ids=output_token_ids,
+                                      request_perf_metrics=request_perf_metrics)
 
             # For context_only responses, carry the first gen token's
             # logprobs and generation logits so the generation_only side
@@ -759,6 +808,15 @@ class GenerationResultBase:
         else:
             raise ValueError(f"Unknown response type: {response}")
 
+    def _num_prompt_tokens(self) -> int:
+        """Prompt length without expanding an int32-buffer prompt into a list."""
+        num = getattr(getattr(self, "_generation_request", None),
+                      "num_prompt_tokens", None)
+        if isinstance(num, int):
+            return num
+        prompt_token_ids = getattr(self, "prompt_token_ids", None)
+        return len(prompt_token_ids) if prompt_token_ids is not None else 0
+
     def record_stats(self,
                      output: CompletionOutput,
                      stats: Optional[dict[str, float]] = None,
@@ -789,10 +847,10 @@ class GenerationResultBase:
             metrics_stats.update(processed_metrics_stat)
         # Record prompt tokens only for the first candidate to avoid
         # double-counting the shared prompt across n candidates.
-        prompt_token_ids = getattr(self, "prompt_token_ids", None)
         if output.finish_reason and sequence_index == 0:
-            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
-                metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+            num_prompt_tokens = self._num_prompt_tokens()
+            if num_prompt_tokens > 0:
+                metrics_stats[MetricNames.PROMPT_TOKENS] = num_prompt_tokens
 
         # Request-scoped metrics: only record for the first candidate to avoid
         # double-counting across n candidates.
@@ -816,6 +874,9 @@ class GenerationResultBase:
                     metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
                         [spec_dec.total_draft_tokens]
 
+            # The ids themselves are needed only here, for prompt logprobs.
+            prompt_token_ids = (getattr(self, "prompt_token_ids", None)
+                                if output.prompt_logprobs else None)
             if output.prompt_logprobs and prompt_token_ids:
                 try:
                     prompt_lps = []
@@ -837,8 +898,8 @@ class GenerationResultBase:
                         if math.isfinite(ppl):
                             metrics_stats[MetricNames.PREFILL_PERPLEXITY] = ppl
                 except (ValueError, TypeError):
-                    logger.debug("Failed to compute prefill perplexity",
-                                 exc_info=True)
+                    logger.debug("Failed to compute prefill perplexity:\n"
+                                 f"{traceback.format_exc()}")
 
         # Candidate-scoped metric: generation perplexity is computed per candidate
         # from this candidate's logprobs.
@@ -865,8 +926,8 @@ class GenerationResultBase:
                         mean_lp = sum(gen_lps) / len(gen_lps)
                         gen_ppl = math.exp(-mean_lp)
                 except (ValueError, TypeError):
-                    logger.debug("Failed to compute generation perplexity",
-                                 exc_info=True)
+                    logger.debug("Failed to compute generation perplexity:\n"
+                                 f"{traceback.format_exc()}")
             if gen_ppl is not None and math.isfinite(gen_ppl):
                 metrics_stats[MetricNames.GENERATION_PERPLEXITY] = gen_ppl
 
@@ -929,10 +990,10 @@ class GenerationResultBase:
                           sampling_params.n)
             safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_ID,
                           self.id)
-            if prompt_token_ids := getattr(self, "prompt_token_ids", None):
+            if num_prompt_tokens := self._num_prompt_tokens():
                 safe_set_attr(span,
                               tracing.SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
-                              len(prompt_token_ids))
+                              num_prompt_tokens)
             safe_set_attr(span,
                           tracing.SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS,
                           output.length)
@@ -1023,9 +1084,19 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
-                if hasattr(
-                        self.tokenizer, 'decode_incrementally'
-                ) and self._streaming and not self.sampling_params.use_beam_search:
+                # A stop word matched by token id is trimmed from token_ids in
+                # _handle_sequence. If some of its ids came in earlier streamed
+                # responses, the incremental decoder has already turned them
+                # into text, or holds the lead bytes of a character that the
+                # final flush would emit as U+FFFD. Decode the kept ids afresh
+                # instead, as the non-streaming path does.
+                trimmed_streamed_ids = (len(beam_output.token_ids)
+                                        < beam_output._last_token_ids_len)
+                use_incremental = (self._streaming
+                                   and not self.sampling_params.use_beam_search
+                                   and not trimmed_streamed_ids and hasattr(
+                                       self.tokenizer, 'decode_incrementally'))
+                if use_incremental:
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
                         beam_output.token_ids_diff,
                         prev_text=beam_output.text,
@@ -1036,6 +1107,13 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
+                    if trimmed_streamed_ids:
+                        # Drop the pending flush, and move the watermark to the
+                        # kept ids so that later responses for sibling
+                        # candidates (n > 1) do not decode this output again.
+                        beam_output._incremental_states = None
+                        beam_output._last_token_ids_len = len(
+                            beam_output.token_ids)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
@@ -1334,6 +1412,121 @@ class IterationResult:
             raise StopAsyncIteration
 
 
+def _reduce_prompt_logprobs_chunk(logits: torch.Tensor,
+                                  token_ids: Optional[list[int]], top_k: int,
+                                  normalized: bool) -> torch.Tensor:
+    logprobs = logits.to(dtype=torch.float32)
+    if not normalized:
+        logprobs = F.log_softmax(logprobs, dim=-1)
+    columns = []
+    if token_ids is not None:
+        targets = torch.tensor(token_ids,
+                               dtype=torch.int64,
+                               device=logprobs.device).unsqueeze(1)
+        target_logprobs = logprobs.gather(1, targets)
+        ranks = (logprobs > target_logprobs).sum(dim=1, keepdim=True) + 1
+        columns += [target_logprobs, ranks]
+    if top_k > 0:
+        top_values, top_ids = torch.topk(logprobs, k=top_k, dim=-1)
+        columns += [top_values, top_ids]
+    if not columns:
+        return torch.empty((logprobs.shape[0], 0), dtype=torch.float64)
+    # FP64 holds FP32 logprobs and integer ranks/token ids exactly.
+    return torch.cat([column.to(torch.float64) for column in columns],
+                     dim=1).cpu()
+
+
+def reduce_prompt_logprobs(logits: torch.Tensor,
+                           token_ids: Optional[list[int]],
+                           top_k: int,
+                           *,
+                           normalized: bool = False) -> torch.Tensor:
+    """Reduce context logits to the values reported as prompt logprobs.
+
+    The reduction runs on the logits' device and copies one small host tensor
+    per bounded chunk, so no per-token host synchronization is needed.
+
+    Args:
+        logits: ``[rows, vocab]`` (or ``[1, rows, vocab]``) logits of any
+            floating dtype; row ``t`` predicts ``token_ids[t]``.
+        token_ids: Target token ids, one per used row, or None to report only
+            the top-k tokens.
+        top_k: Number of most likely tokens to report per row.
+        normalized: ``logits`` already hold log probabilities, so they are
+            reported as is instead of being log-softmaxed again.
+
+    Returns:
+        ``[rows, columns]`` FP64 host tensor. With ``token_ids``, the columns
+        start with the target logprob and its 1-based vocabulary rank; ``top_k``
+        logprobs and then ``top_k`` token ids follow.
+    """
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+    if token_ids is not None:
+        logits = logits[:len(token_ids)]
+    # Bound softmax scratch independently of prompt length. On the GPU, a
+    # slice can fall back to CPU without retaining a full-vocabulary GPU result.
+    rows_per_chunk = max(1, (16 * 1024 * 1024) // (4 * logits.shape[-1]))
+    chunks = []
+    for start in range(0, logits.shape[0], rows_per_chunk):
+        chunk = logits[start:start + rows_per_chunk]
+        tokens = None if token_ids is None else token_ids[start:start +
+                                                          chunk.shape[0]]
+        try:
+            reduced = _reduce_prompt_logprobs_chunk(chunk, tokens, top_k,
+                                                    normalized)
+        except torch.OutOfMemoryError:
+            if not chunk.is_cuda:
+                raise
+            reduced = None
+        if reduced is None:
+            reduced = _reduce_prompt_logprobs_chunk(chunk.cpu(), tokens, top_k,
+                                                    normalized)
+        chunks.append(reduced)
+    if not chunks:
+        columns = (0 if token_ids is None else 2) + 2 * top_k
+        return torch.empty((0, columns), dtype=torch.float64)
+    return torch.cat(chunks)
+
+
+def prompt_logprobs_from_reduced(
+        reduced: torch.Tensor, token_ids: Optional[list[int]], top_k: int,
+        simple: bool) -> TokenLogprobs | SimpleTokenLogprobs:
+    """Build the user-facing prompt logprobs from ``reduce_prompt_logprobs`` rows.
+
+    Args:
+        reduced: ``[rows, columns]`` FP64 host tensor from
+            ``reduce_prompt_logprobs`` with the same ``token_ids`` presence
+            and ``top_k``.
+        token_ids: The target token ids the rows were reduced against, or None.
+        top_k: Number of top tokens reduced per row.
+        simple: Return a flat list of target logprobs when ``top_k`` is 0.
+    """
+    rows = reduced.tolist()
+    if top_k == 0:
+        if token_ids is None:
+            return []
+        if simple:
+            return [row[0] for row in rows]
+        return [{
+            token_id: Logprob(logprob=row[0], rank=int(row[1]))
+        } for token_id, row in zip(token_ids, rows)]
+    first = 0 if token_ids is None else 2
+    results: TokenLogprobs = []
+    for index, row in enumerate(rows):
+        values = row[first:first + top_k]
+        ids = row[first + top_k:first + 2 * top_k]
+        token_dict = {
+            int(token_id): Logprob(logprob=value, rank=rank + 1)
+            for rank, (value, token_id) in enumerate(zip(values, ids))
+        }
+        if token_ids is not None and token_ids[index] not in token_dict:
+            token_dict[token_ids[index]] = Logprob(logprob=row[0],
+                                                   rank=int(row[1]))
+        results.append(token_dict)
+    return results
+
+
 def compute_prompt_logprobs(
     k_prompt_logprobs: int,
     context_logits: Optional[torch.Tensor],
@@ -1345,69 +1538,14 @@ def compute_prompt_logprobs(
     When ``simple_prompt_logprobs`` is True and ``k_prompt_logprobs`` is 0,
     return a flat list of sampled-token logprobs instead of per-token dicts.
     """
-
-    def _topk_logprobs(logits: torch.Tensor, top_k: int,
-                       tokens: Optional[list[int]],
-                       simple: bool) -> TokenLogprobs | SimpleTokenLogprobs:
-        if logits.dim() == 3:
-            # reshape from [1, T, V] to [T, V]
-            logits = logits.squeeze(0)
-
-        if tokens is not None and logits.size(0) > len(tokens):
-            # Only consume logits corresponding to the supplied tokens.
-            logits = logits[:len(tokens)]
-
-        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
-
-        # only return sampled token
-        if top_k == 0:
-            if simple:
-                simple_results: list[float] = []
-                if tokens is not None:
-                    for t in range(logprobs.size(0)):
-                        simple_results.append(logprobs[t, tokens[t]].item())
-                return simple_results
-
-            results: TokenLogprobs = []
-            if tokens is not None:
-                for t in range(logprobs.size(0)):
-                    token_id = tokens[t]
-                    token_logprob = logprobs[t, token_id].item()
-                    rank = (logprobs[t] > token_logprob).sum().item() + 1
-                    token_dict = {
-                        token_id: Logprob(logprob=token_logprob, rank=rank)
-                    }
-                    results.append(token_dict)
-            return results
-
-        topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
-
-        results: TokenLogprobs = []
-        # for each token position
-        for t in range(logprobs.size(0)):
-            token_dict = {
-                idx.item(): Logprob(logprob=val.item(), rank=r + 1)
-                for r, (val,
-                        idx) in enumerate(zip(topk_vals[t], topk_indices[t]))
-            }
-
-            # If we have the sampled token list and it's not in top-k, add it
-            if tokens is not None:
-                token_id = tokens[t]
-                if token_id not in token_dict:
-                    token_logprob = logprobs[t, token_id].item()
-                    rank = (logprobs[t] > token_logprob).sum().item() + 1
-                    token_dict[token_id] = Logprob(logprob=token_logprob,
-                                                   rank=rank)
-
-            results.append(token_dict)
-        return results
-
-    prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs, prompt_token_ids,
-        simple_prompt_logprobs
-    ) if k_prompt_logprobs is not None and context_logits is not None else None
-    return LogProbsResult(prompt=prompt_logprobs)
+    if k_prompt_logprobs is None or context_logits is None:
+        return LogProbsResult(prompt=None)
+    reduced = reduce_prompt_logprobs(context_logits, prompt_token_ids,
+                                     k_prompt_logprobs)
+    tokens = None if prompt_token_ids is None else prompt_token_ids[:reduced.
+                                                                    shape[0]]
+    return LogProbsResult(prompt=prompt_logprobs_from_reduced(
+        reduced, tokens, k_prompt_logprobs, simple_prompt_logprobs))
 
 
 def _build_perf_metrics_dict(

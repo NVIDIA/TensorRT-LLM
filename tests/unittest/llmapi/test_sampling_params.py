@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
+import pickle
+from dataclasses import fields
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -301,6 +305,21 @@ def test_sampling_params_accepts_in_range_values(field, value):
     assert getattr(SamplingParams(**{field: value}), field) == value
 
 
+@pytest.mark.parametrize(
+    "round_trip",
+    [lambda params: pickle.loads(pickle.dumps(params)), copy.copy, copy.deepcopy],
+)
+def test_sampling_params_copy_round_trip_keeps_every_field(round_trip):
+    # A distinct value in every field, so a field the pickling misses fails.
+    params = SamplingParams()
+    for f in fields(SamplingParams):
+        object.__setattr__(params, f.name, f"value of {f.name}")
+    restored = round_trip(params)
+    assert type(restored) is SamplingParams
+    for f in fields(SamplingParams):
+        assert getattr(restored, f.name) == getattr(params, f.name), f.name
+
+
 @pytest.mark.parametrize("value", [None, -1])
 def test_thinking_token_budget_unlimited_values(value):
     assert SamplingParams(thinking_token_budget=value).thinking_token_budget is None
@@ -534,3 +553,84 @@ def test_thinking_budget_text_generation_caps_reasoning_tokens(thinking_token_bu
     assert tokenizer.decode(generated_ids) == tokenizer.decode(
         [start_id, *expected_reasoning_ids, end_id, answer_id]
     )
+
+
+class _WordTokenizer:
+    """Maps each whitespace-separated word to a fixed id."""
+
+    eos_token_id = 0
+    pad_token_id = None
+    vocab = {"<eos>": 0, "Hello": 1, "world": 2, "STOP": 3, "BAD": 4}
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return [self.vocab[word] for word in text.split()]
+
+
+def _prepare_sampling_params(
+    sampling_params: SamplingParams, tokenizer, generation_config=None
+) -> SamplingParams:
+    llm = _TestLLM()
+    llm._tokenizer = tokenizer
+    llm._hf_model_config = None
+    llm._generation_config = generation_config
+    llm._generation_config_explicit_values = {}
+    return llm._prepare_sampling_params(sampling_params)
+
+
+@pytest.mark.parametrize("end_id", [None, -1, 7])
+def test_prepare_sampling_params_tokenizes_stop_and_bad_words(end_id):
+    sampling_params = _prepare_sampling_params(
+        SamplingParams(end_id=end_id, stop=["Hello world", "STOP"], bad="BAD"),
+        _WordTokenizer(),
+    )
+
+    assert sampling_params._get_stop_words() == [[1, 2], [3]]
+    assert sampling_params._get_bad_words() == [[4]]
+    assert sampling_params._get_stop_reasons_and_words() == [
+        ("Hello world", [1, 2]),
+        ("STOP", [3]),
+    ]
+    expected_end_id = _WordTokenizer.eos_token_id if end_id is None else end_id
+    assert sampling_params.end_id == expected_end_id
+
+
+def test_prepare_sampling_params_explicit_end_id_without_stop_needs_no_tokenizer():
+    sampling_params = _prepare_sampling_params(SamplingParams(end_id=7, stop=[]), None)
+
+    assert sampling_params._get_stop_words() == []
+
+
+def test_prepare_sampling_params_explicit_end_id_tokenizes_bad_words_only():
+    sampling_params = _prepare_sampling_params(
+        SamplingParams(end_id=7, bad=["BAD", "Hello world"]), _WordTokenizer()
+    )
+
+    assert sampling_params._get_bad_words() == [[4], [1, 2]]
+    assert sampling_params._get_stop_words() == []
+
+
+@pytest.mark.parametrize(
+    "words", [{"stop": "STOP"}, {"stop": ""}, {"bad": "BAD"}, {"bad": ""}, {"bad": ["BAD"]}]
+)
+def test_prepare_sampling_params_explicit_end_id_strings_without_tokenizer_are_rejected(words):
+    with pytest.raises(ValueError, match="tokenizer is required"):
+        _prepare_sampling_params(SamplingParams(end_id=7, **words), None)
+
+
+@pytest.mark.parametrize("end_id", [None, -1])
+def test_prepare_sampling_params_generation_config_eos_only_for_default_end_id(end_id):
+    # generation_config EOS ids become extra stop tokens only when end_id is
+    # defaulted; an explicit end_id (e.g. -1 to ignore EOS) must not get them.
+    generation_config = SimpleNamespace(eos_token_id=[_WordTokenizer.eos_token_id, 9])
+
+    sampling_params = _prepare_sampling_params(
+        SamplingParams(end_id=end_id, stop="STOP"), _WordTokenizer(), generation_config
+    )
+
+    assert sampling_params._get_stop_words()[-1] == [3]
+    if end_id is None:
+        assert sampling_params.stop_token_ids == [9]
+    else:
+        assert sampling_params.end_id == -1
+        assert sampling_params.stop_token_ids is None

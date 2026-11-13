@@ -20,6 +20,7 @@
 # ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
 import json
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -40,6 +41,7 @@ from .vocab_parallel import tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
+    from ..pyexecutor.llm_request import LlmRequest
 
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
@@ -63,7 +65,10 @@ def load_sts_temperatures_from_path(path: str) -> list[float]:
         )
     if not isinstance(temps, list) or not temps:
         raise ValueError(f"{path} must contain a non-empty temperature list")
-    return [float(t) for t in temps]
+    temperatures = [float(t) for t in temps]
+    if any(not math.isfinite(value) or value <= 0.0 for value in temperatures):
+        raise ValueError("STS temperatures must be a finite positive numeric vector")
+    return temperatures
 
 
 def resolve_confidence_head(draft_model: torch.nn.Module) -> Optional[torch.nn.Module]:
@@ -73,6 +78,35 @@ def resolve_confidence_head(draft_model: torch.nn.Module) -> Optional[torch.nn.M
     if not stages:
         return None
     return getattr(stages[-1], "confidence_head", None)
+
+
+def validate_confidence_request(spec_config: "DSparkDecodingConfig", request: "LlmRequest") -> None:
+    """Reject unsupported request controls before confidence-policy admission."""
+    if not spec_config.enable_confidence_scheduling:
+        return
+    if getattr(request, "py_logits_post_processors", None):
+        raise ValueError(
+            "DSpark confidence scheduling does not support per-request logits post-processors"
+        )
+    sampling = request.sampling_config
+    if not spec_config.use_rejection_sampling or sampling is None:
+        return
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    # Match SpecMetadata's actual draft-sampler classification; temperature
+    # alone is insufficient (for example, top_k=1 remains greedy).
+    greedy = SamplingParams.params_imply_greedy_decoding(
+        temperature=sampling.temperature,
+        top_k=sampling.top_k,
+        top_p=sampling.top_p,
+        min_p=sampling.min_p,
+        use_beam_search=False,
+    )
+    if not greedy:
+        raise ValueError(
+            "DSpark confidence scheduling does not support advanced rejection draft sampling: "
+            "confidence is conditioned on the greedy proposal prefix"
+        )
 
 
 def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
@@ -232,13 +266,14 @@ class DSparkSpecMetadata(SpecMetadata):
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
         if worker is not None and worker._win_inited:
-            current = set(self.request_ids)
+            # Requests paused in place (GEN slot preemption) keep their window.
+            current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot] = 0
-                    worker._valid_len[slot] = 0
-                    worker._position_initialized[slot] = False
+                    worker._ctx_len[slot].zero_()
+                    worker._valid_len[slot].zero_()
+                    worker._position_initialized[slot].zero_()
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
             # Assign a persistent rolling-window slot to every real generation
@@ -249,8 +284,8 @@ class DSparkSpecMetadata(SpecMetadata):
             # without this, all concurrent gen requests fall through to the shared
             # scratch row below and corrupt each other's draft window at batch
             # size > 1 (GitHub #16767). Context-prefix entries are left to
-            # ``_seed_context_windows``. CUDA-graph capture dummies and real
-            # generation requests acquire a persistent slot only once; prepare()
+            # ``_seed_context_windows``. Real generation requests acquire a
+            # persistent slot only once; prepare()
             # runs before every replay, so it must never reset a live slot.
             # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
@@ -271,9 +306,9 @@ class DSparkSpecMetadata(SpecMetadata):
             # unconditional advance would leave its ABSOLUTE position climbing
             # across graph shapes and iterations until it indexes past the RoPE
             # table. A real slot is bounded instead by its request's lifetime.
-            worker._ctx_len[scratch] = 0
-            worker._valid_len[scratch] = 0
-            worker._position_initialized[scratch] = False
+            worker._ctx_len[scratch].zero_()
+            worker._valid_len[scratch].zero_()
+            worker._position_initialized[scratch].zero_()
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
@@ -454,7 +489,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
         sequence of the last completed draft.
         """
         prev = self._draft_seq_host
-        self._draft_seq_host += 1
+        self._draft_seq_host = (prev + 1) & ((1 << 31) - 1)
+        if self._draft_seq_host == 0:
+            # Recycled stamps must not authenticate an ancient score. The
+            # wrap step sees expected=-1 and uses neutral confidence; later
+            # steps can consume only newly produced scores or neutral rows.
+            if self._confidence_stamp is not None:
+                self._confidence_stamp.zero_()
+            if self._confidence_logits is not None:
+                self._confidence_logits.fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         if self._draft_seq_cuda is not None:
             self._draft_seq_cuda.fill_(self._draft_seq_host)
         return prev
@@ -552,18 +595,22 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._win = int(draft_model._attn_params["window_size"])
             head_dim = int(draft_model._attn_params["head_dim"])
 
-            # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
-            # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
+            # Real requests occupy slots ``[0, num_slots)`` (``max_batch`` plus
+            # requests paused in place by GEN slot preemption); one extra "scratch"
+            # row at index ``num_slots`` absorbs padded / unknown request IDs (CUDA-graph
             # padding, ADP idle requests, or disagg seed forwards that arrive without
             # a real request id) so they can never overwrite a live request's rolling
             # window. Previously such IDs aliased to slot 0 and corrupted whichever
             # real request occupied it. The scratch row is never handed out through
             # ``_free_slots`` and its contents are throwaway.
-            self._scratch_slot = max_batch
-            num_rows = max_batch + 1
+            cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+            num_slots = max_batch + getattr(cache_manager, "gen_preemption_headroom", 0)
+            self._scratch_slot = num_slots
+            num_rows = num_slots + 1
 
-            # CUDA-graph padding requests carry ids in
-            # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
+            # Both CUDA-graph padding variants, each with K+1 runtime widths,
+            # use ``[CUDA_GRAPH_DUMMY_REQUEST_ID - 2*(K+1) + 1,
+            # CUDA_GRAPH_DUMMY_REQUEST_ID]``, where K is the physical draft cap,
             # while real request ids start at ``max_batch_size`` and grow, so a simple
             # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
             # (0) these dummies must route to the scratch row (see ``prepare()``) and
@@ -571,7 +618,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
             from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
-            self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+            self._graph_dummy_id_floor = (
+                CUDA_GRAPH_DUMMY_REQUEST_ID - 2 * (self.max_draft_len + 1) + 1
+            )
 
             self._kv_windows = torch.zeros(
                 (num_rows, num_stages, self._win, head_dim),
@@ -605,12 +654,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 with torch.inference_mode(False):
                     self._draft_seq_cuda = torch.zeros((), dtype=torch.int32, device="cuda")
                 self._build_verify_planner(draft_model, block_size)
-            self._free_slots = deque(range(max_batch))
+            self._free_slots = deque(range(num_slots))
             self._req_to_slot = {}
             logger.info(
                 f"DSpark: allocated rolling KV windows "
                 f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
-                f"({max_batch} request slots + 1 scratch row)"
+                f"({num_slots} request slots + 1 scratch row)"
             )
             # Buffer state is complete independently of CuTe DSL prewarming.
             # A failed prewarm must not cause the next forward to recreate the
@@ -640,6 +689,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 warmup_fused_dsv4_dspark_attention(
                     block_size,
                     eps=float(draft_model._attn_params["eps"]),
+                    num_heads=int(draft_model._attn_params["n_heads"]),
                 )
         self._attention_warmup_attempted = True
 
@@ -655,41 +705,50 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         cfg = DSparkScheduleConfig(block_size=block_size, min_verify_len=1)
 
-        table_path = self.spec_config.confidence_sps_table_path
-        # ModelEngine owns the actual CUDA graph ladder, so it is the only
-        # component that may read, authenticate, and construct the deployment
-        # cost object. Reopening this path here creates a TOCTOU window in
-        # which graph capture and scheduling can observe different files.
-        logger.info(
-            f"DSpark: deferring exact SPS table {table_path} to the validated "
-            "ModelEngine runtime object"
-        )
+        # ModelEngine loads the cost table because it owns the captured CUDA
+        # graph ladder; the planner receives that runtime object before its
+        # first decision.
 
         # Calibration lives on the draft's confidence head; fall back to a plain
         # sigmoid when the head is absent (no confidence to calibrate anyway).
         head = resolve_confidence_head(draft_model)
+        if head is None:
+            logger.warning(
+                "DSpark confidence scheduling is enabled, but the checkpoint has no "
+                "confidence-head weights; every step verifies the full draft block."
+            )
         apply_calibration = head.apply_sts if head is not None else None
-        sts_path = self.spec_config.confidence_sts_path
-        if sts_path and head is None:
+        calibration_path = self.spec_config.confidence_calibration_path
+        if calibration_path and head is None:
             # Refuse rather than degrade: a configured calibration that cannot
             # be attached is a wiring bug, never a preference.
             raise ValueError(
-                f"confidence_sts_path is set but no confidence head was found "
+                f"confidence_calibration_path is set but no confidence head was found "
                 f"on {type(draft_model).__name__}; calibration cannot be "
                 f"applied, so the planner would schedule on raw sigmoid "
                 f"survivals. This is a model-wiring bug, not a config choice."
             )
-        if sts_path and head is not None:
+        if calibration_path and head is not None:
             # Accepts either key spelling ("sts_temperatures" here,
             # "temperatures" in SGLang); the vectors are interchangeable.
-            temps = load_sts_temperatures_from_path(sts_path)
-            head.load_sts_temperatures(torch.tensor(temps, dtype=torch.float32))
-            logger.info(f"DSpark: loaded STS calibration from {sts_path}")
+            temps = load_sts_temperatures_from_path(calibration_path)
+            num_positions = int(head.sts_temperatures.numel())
+            if len(temps) < num_positions:
+                raise ValueError(
+                    f"{calibration_path} has {len(temps)} temperatures but the "
+                    f"confidence head scores {num_positions} draft positions"
+                )
+            # Temperatures are per draft position, so a calibration fitted at a
+            # larger K serves every smaller K through its leading entries.
+            head.load_sts_temperatures(torch.tensor(temps[:num_positions], dtype=torch.float32))
+            logger.info(f"DSpark: loaded confidence calibration from {calibration_path}")
 
         self.verify_planner = DSparkVerifyPlanner(
             cfg=cfg,
             apply_calibration=apply_calibration,
-            device_windows=bool(self.spec_config.enable_fused_confidence_scheduler),
+            device_windows=bool(
+                getattr(self.spec_config, "enable_fused_confidence_scheduler", False)
+            ),
         )
         logger.info(
             f"DSpark verify planner: max_verify_len={self.verify_planner.max_verify_len}, "
@@ -700,9 +759,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         """Get (or refresh) the slot for a request; reset clears its window."""
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
-            self._ctx_len[old] = 0
-            self._valid_len[old] = 0
-            self._position_initialized[old] = False
+            self._ctx_len[old].zero_()
+            self._valid_len[old].zero_()
+            self._position_initialized[old].zero_()
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
         if req_id not in self._req_to_slot:
@@ -713,9 +772,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            self._ctx_len[slot] = 0
-            self._valid_len[slot] = 0
-            self._position_initialized[slot] = False
+            self._ctx_len[slot].zero_()
+            self._valid_len[slot].zero_()
+            self._position_initialized[slot].zero_()
             self._kv_windows[slot].zero_()
             if self._confidence_logits is not None:
                 # A recycled slot still holds the previous occupant's scores;
@@ -1237,6 +1296,15 @@ class DSparkWorker(DFlashWorker):
         ):
             self._markov_tp_exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
 
+    @staticmethod
+    def block_width_for(spec_config, *, shift_label: bool = True) -> int:
+        """Block slots a DSpark worker computes for ``spec_config``.
+
+        The ``shift_label`` convention reads slots 0..K-1; a checkpoint that
+        turns it off reads slots 1..K and needs K+1 positions.
+        """
+        return spec_config.max_draft_len + (0 if shift_label else 1)
+
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
 
@@ -1245,9 +1313,7 @@ class DSparkWorker(DFlashWorker):
         checkpoint at max_draft_len=7, which is how both published DSpark
         drafters are meant to run.
         """
-        if getattr(draft_model, "_dspark_shift_label", False):
-            return self.max_draft_len
-        return super()._draft_block_width(draft_model)
+        return self.block_width_for(self.spec_config, shift_label=draft_model.shift_label)
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
@@ -1258,9 +1324,8 @@ class DSparkWorker(DFlashWorker):
         draft model rather than assumed: a DSpark drafter trained with the
         legacy DFlash slot layout keeps the base class' slots 1..K.
         """
-        shift_label = getattr(draft_model, "_dspark_shift_label", False)
         return dflash_draft_slot_ids(
-            num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
+            num_gens, block_size, num_draft_tokens, draft_model.shift_label, device="cuda"
         )
 
     def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:

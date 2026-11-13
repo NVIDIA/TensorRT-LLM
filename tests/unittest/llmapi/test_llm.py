@@ -1435,7 +1435,19 @@ class _FakeRawRequest:
         return True
 
 
-def test_startup_metrics_by_server_info() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("checkpoint_io_policy", [
+    None,
+    {
+        "requested": "auto",
+        "selected": "rank_striped_read_ahead",
+        "activated": True,
+        "effective": "native",
+        "fallback_reason": "reader failed after activation",
+    },
+])
+def test_startup_metrics_by_server_info(
+        checkpoint_io_policy: dict[str, str | bool | None] | None) -> None:
 
     class FakeExecutor:
 
@@ -1446,7 +1458,12 @@ def test_startup_metrics_by_server_info() -> None:
             self.calls += 1  # keep track of # calls to ensure the cache in the server works
             if self.calls == 1:
                 return None
-            return {"model_loader": {"total_model_loading_seconds": 1.5}}
+            return {
+                "model_loader": {
+                    "total_model_loading_seconds": 1.5,
+                    "checkpoint_io_policy": checkpoint_io_policy,
+                }
+            }
 
     executor = FakeExecutor()
     generator = object.__new__(BaseLLM)
@@ -1460,7 +1477,18 @@ def test_startup_metrics_by_server_info() -> None:
     second_response = asyncio.run(server.get_server_info())
     third_response = asyncio.run(server.get_server_info())
 
-    assert json.loads(first_response.body) == {
+    first, second, third = (json.loads(response.body)
+                            for response in (first_response, second_response,
+                                             third_response))
+    # The render fingerprint is covered by its own tests; here it only has to be
+    # present and the same on every call.
+    fingerprints = [
+        body.pop("render_fingerprint") for body in (first, second, third)
+    ]
+    assert fingerprints[0]["digest"]
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2]
+
+    assert first == {
         "disaggregated_params": {},
         "startup_metrics": {},
     }
@@ -1468,12 +1496,13 @@ def test_startup_metrics_by_server_info() -> None:
         "disaggregated_params": {},
         "startup_metrics": {
             "model_loader": {
-                "total_model_loading_seconds": 1.5
+                "total_model_loading_seconds": 1.5,
+                "checkpoint_io_policy": checkpoint_io_policy,
             }
         },
     }
-    assert json.loads(second_response.body) == expected_success
-    assert json.loads(third_response.body) == expected_success
+    assert second == expected_success
+    assert third == expected_success
     assert executor.calls == 2
 
 

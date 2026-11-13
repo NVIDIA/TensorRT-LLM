@@ -1,5 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from utils.llm_data import llm_models_root
+from utils.util import similar
+
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.speculative.utils import (
+    get_draft_len_for_batch_size,
+    resolve_draft_len,
+    update_draft_len,
+)
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig, NGramDecodingConfig
+from tensorrt_llm.llmapi.llm_args import PARDDecodingConfig
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +29,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import pytest
-import torch
-from utils.llm_data import llm_models_root
-from utils.util import similar
-
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig, NGramDecodingConfig
 
 
 # # ============================================================================
@@ -345,3 +353,48 @@ def test_draft_len_schedule_functionality(enforce_single_worker, draft_schedule:
             assert actual_len <= drafter_tokens, (
                 f"Iter {idx}, req {req_idx}: NGram produced {actual_len} > max {drafter_tokens}"
             )
+
+
+@pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
+def test_draft_length_resolution_resyncs_dynamic_buffers(config_cls):
+    config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
+    engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=3,
+        max_total_draft_tokens=config.tokens_per_gen_step - 1,
+    )
+    requests = [
+        SimpleNamespace(
+            py_draft_tokens=[7, 8, 9] + [0] * (config.tokens_per_gen_step - 4),
+            py_needs_onehot_draft_probs=False,
+        )
+        for _ in range(2)
+    ]
+    batch = SimpleNamespace(batch_size=2, generation_requests=requests)
+
+    def resolve(**kwargs):
+        return resolve_draft_len(config, batch, max_draft_len=3, static_draft_len=3, **kwargs)
+
+    # Normal iteration selects K=2.
+    assert update_draft_len(engine, batch) == 2
+    assert all(request.py_draft_tokens[:2] == [7, 8] for request in requests)
+    # Each explicit warmup shape resynchronizes the buffers and returns its
+    # length, even when the batch size is unchanged.
+    for draft_len in (0, 3, 1):
+        assert resolve(draft_len=draft_len) == draft_len
+        assert all(
+            len(request.py_draft_tokens) == config.get_runtime_tokens_per_gen_step(draft_len) - 1
+            for request in requests
+        )
+    assert resolve() == 2
+    assert resolve(speculation_permanently_disabled=True) == 0
+    assert all(request.py_draft_tokens == [] for request in requests)
+
+
+def test_static_draft_length_resolution_preserves_proposals():
+    request = SimpleNamespace(py_draft_tokens=[7], py_needs_onehot_draft_probs=False)
+    batch = SimpleNamespace(batch_size=1, generation_requests=[request])
+
+    assert resolve_draft_len(None, batch, max_draft_len=3, static_draft_len=5) == 5
+    assert request.py_draft_tokens == [7]
+    assert not request.py_needs_onehot_draft_probs

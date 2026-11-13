@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FlashInfer attention backend for visual generation models."""
 
+import hashlib
 import math
 from typing import Any, Literal
 
@@ -48,6 +49,7 @@ class FlashInferAttention(AttentionBackend):
         self._metadata_state = (
             attention_metadata_state if attention_metadata_state is not None else {}
         )
+        self._static_global_scale = self._metadata_state.get("_ltx23_static_global_scale") == 1.0
 
         self._single_prefill = flashinfer.single_prefill_with_kv_cache
         self._batch_prefill_cls = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
@@ -143,6 +145,10 @@ class FlashInferAttention(AttentionBackend):
         is_causal: bool,
         key_padding_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._static_global_scale:
+            return self._run_capture_safe_batch_prefill(
+                q, k, v, is_causal=is_causal, key_padding_mask=key_padding_mask
+            )
         batch_size, query_length = q.shape[:2]
         key_value_length = k.shape[1]
         stream = torch.cuda.current_stream(q.device)
@@ -240,6 +246,145 @@ class FlashInferAttention(AttentionBackend):
         # Batch prefill reports log2 LSE; VisualGen exposes natural-log LSE.
         return output, lse * math.log(2.0)
 
+    def _prefill_mask_digest(self, mask: torch.Tensor | None, *, capturing: bool) -> str | None:
+        if mask is None:
+            return None
+        version = None if torch.is_inference(mask) else mask._version
+        identity = (id(mask), mask.data_ptr(), version)
+        identities = self._metadata_state.setdefault("flashinfer_mask_identities", {})
+        if capturing:
+            if identity not in identities:
+                raise RuntimeError("FlashInfer padding mask must be warmed before CUDA capture.")
+            return identities[identity][1]
+        digest = hashlib.sha256(mask.detach().to("cpu", torch.bool).numpy().tobytes()).hexdigest()
+        # Retain the tensor so its identity cannot be recycled while a plan uses it.
+        identities[identity] = (mask, digest)
+        return digest
+
+    def _run_capture_safe_batch_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        is_causal: bool,
+        key_padding_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse immutable mask-content plans across warmup and capture streams.
+
+        The component's shared metadata state requires serialized forwards.
+        Planning and mask readback occur only outside capture; a changed mask
+        owns a new wrapper rather than mutating a plan retained by an old graph.
+        """
+        capturing = torch.cuda.is_current_stream_capturing()
+        mask_digest = self._prefill_mask_digest(key_padding_mask, capturing=capturing)
+        batch_size, query_length = q.shape[:2]
+        key_value_length = k.shape[1]
+        plan_key = (
+            q.device,
+            batch_size,
+            query_length,
+            key_value_length,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            q.dtype,
+            is_causal,
+            mask_digest,
+        )
+        plans = self._metadata_state.setdefault("flashinfer_immutable_prefill_plans", {})
+        entry = plans.get(plan_key)
+        if entry is None:
+            if capturing:
+                raise RuntimeError("FlashInfer batched prefill must be warmed before CUDA capture.")
+            workspaces = self._metadata_state.setdefault("flashinfer_immutable_workspaces", {})
+            workspace = workspaces.get(q.device)
+            if workspace is None:
+                workspace = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=q.device)
+                workspaces[q.device] = workspace
+            wrapper = self._batch_prefill_cls(workspace, "NHD")
+            query_indptr = (
+                torch.arange(batch_size + 1, dtype=torch.int32, device=q.device) * query_length
+            )
+            key_value_indptr = (
+                torch.arange(batch_size + 1, dtype=torch.int32, device=q.device) * key_value_length
+            )
+            custom_mask = None
+            if key_padding_mask is not None:
+                custom_mask = (
+                    key_padding_mask.to(device=q.device, dtype=torch.bool)
+                    .unsqueeze(1)
+                    .expand(-1, query_length, -1)
+                    .reshape(-1)
+                    .clone()
+                )
+            torch.cuda.current_stream(q.device).synchronize()
+            wrapper.plan(
+                query_indptr,
+                key_value_indptr,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                custom_mask=custom_mask,
+                causal=is_causal,
+                sm_scale=self.scale,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+                o_data_type=q.dtype,
+            )
+            entry = (wrapper, query_indptr, key_value_indptr, custom_mask)
+            plans[plan_key] = entry
+        output, lse = entry[0].run(
+            q.contiguous().view(-1, self.num_heads, self.head_dim),
+            k.contiguous().view(-1, self.num_kv_heads, self.head_dim),
+            v.contiguous().view(-1, self.num_kv_heads, self.head_dim),
+            return_lse=True,
+        )
+        return (
+            output.view(batch_size, query_length, self.num_heads, self.head_dim),
+            lse.view(batch_size, query_length, self.num_heads).transpose(1, 2) * math.log(2.0),
+        )
+
+    @staticmethod
+    def _quantize_qk_static_global(
+        tensor: torch.Tensor, mode: _BlockScaledQKMode
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode NHD Q/K with global one and native, input-dependent block scales."""
+        from flashinfer.quantization import fp4_quantize, mxfp8_quantize
+
+        batch, sequence, heads, dimension = tensor.shape
+        padded_sequence = ((sequence + 127) // 128) * 128
+        data = tensor.transpose(1, 2).contiguous()
+        if padded_sequence != sequence:
+            data = torch.nn.functional.pad(data, (0, 0, 0, padded_sequence - sequence))
+        matrix = data.reshape(batch * heads * padded_sequence, dimension)
+        if mode == "mxfp8":
+            encoded, factors = mxfp8_quantize(
+                matrix, is_sf_swizzled_layout=True, alignment=32, backend="cute-dsl"
+            )
+            encoded = encoded.view(batch, heads, padded_sequence, dimension)[:, :, :sequence]
+            factors = factors.view(torch.float8_e8m0fnu)
+        elif mode == "nvfp4":
+            # fp4_quantize takes the inverse global dequantization scale. Both
+            # encode and FMHA decode use one; only native block factors vary.
+            inverse_global = torch.ones(1, device=tensor.device, dtype=torch.float32)
+            encoded, factors = fp4_quantize(
+                matrix,
+                inverse_global,
+                sf_vec_size=16,
+                is_sf_swizzled_layout=True,
+                backend="cute-dsl",
+            )
+            encoded = encoded.view(batch, heads, padded_sequence, dimension // 2)[:, :, :sequence]
+            factors = factors.view(torch.float8_e4m3fn)
+        else:
+            raise ValueError(f"Unsupported static-global Q/K mode: {mode!r}.")
+        encoded = encoded.transpose(1, 2).contiguous()
+        if mode == "nvfp4":
+            # Copy packed bytes before viewing Float4, whose deterministic fill is unsupported.
+            encoded = encoded.view(torch.float4_e2m1fn_x2)
+        return encoded, factors
+
     @staticmethod
     def _quantize_fp8_per_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         fp8_dtype = torch.float8_e4m3fn
@@ -265,8 +410,14 @@ class FlashInferAttention(AttentionBackend):
         from flashinfer.attention.cute_dsl.fmha_blockscaled import cute_dsl_fmha_blockscaled_prefill
         from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
 
-        q_store, k_store, q_sf, k_sf, q_scale, k_scale = quantize_blockscaled_qk(q, k, qk_mode)
-        v_store, v_scale = self._quantize_fp8_per_tensor(v)
+        if self._static_global_scale:
+            q_store, q_sf = self._quantize_qk_static_global(q, qk_mode)
+            k_store, k_sf = self._quantize_qk_static_global(k, qk_mode)
+            v_store = v.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+            q_scale = k_scale = v_scale = 1.0
+        else:
+            q_store, k_store, q_sf, k_sf, q_scale, k_scale = quantize_blockscaled_qk(q, k, qk_mode)
+            v_store, v_scale = self._quantize_fp8_per_tensor(v)
         output = torch.empty_like(q)
         lse = torch.empty(
             (q.shape[0], q.shape[1], self.num_heads),
@@ -287,6 +438,7 @@ class FlashInferAttention(AttentionBackend):
             scale_q=q_scale,
             scale_k=k_scale,
             scale_v=v_scale,
+            scale_o=1.0,
         )
         # CuTe DSL reports log2 LSE; VisualGen exposes natural-log LSE.
         return output, lse.transpose(1, 2).contiguous() * math.log(2.0)
@@ -405,11 +557,7 @@ class FlashInferAttention(AttentionBackend):
                 qk_mode=qk_dtype,
                 is_causal=is_causal,
             )
-        if (
-            capability in ((12, 0), (12, 1))
-            and qk_dtype == "nvfp4"
-            and quant_config.v_dtype == "nvfp4"
-        ):
+        if capability[0] == 12 and qk_dtype == "nvfp4" and quant_config.v_dtype == "nvfp4":
             return self._run_nvfp4_sm12x(q, k, v, is_causal=is_causal)
         raise RuntimeError(
             "Unsupported FlashInfer quantized attention recipe for "

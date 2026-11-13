@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
+from typing import Any, Optional, Tuple
 from unittest.mock import Mock, create_autospec
 
 import pytest
@@ -36,6 +37,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
+from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
@@ -62,6 +64,9 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
 )
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import (
+    convert_compressed_tensors_nvfp4_weights,
+)
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
     MiniMaxM3DecoderLayer,
@@ -71,6 +76,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
     _dispatch_attention_over_live_tokens,
+    _load_index_qk_proj_weights,
     _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _moe_routed_output_is_global,
@@ -85,7 +91,12 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     is_minimax_m3_vl_config,
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+from tensorrt_llm._torch.models.modeling_utils import (
+    _load_weights_impl_v2,
+    apply_layerwise_quant_config,
+    apply_quant_config_exclude_modules,
+    fused_checkpoint_names,
+)
 from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
@@ -199,6 +210,8 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
     def read_scales():
         return torch.cat((k_scale, v_scale, projection.inv_kv_scales[1:]))
 
+    graph = None
+    captured = None
     if device == "cuda":
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
@@ -213,7 +226,7 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
     ] == pointers
     expected = torch.tensor([0.5, 0.25, 2.0, 4.0], device=device)
     torch.testing.assert_close(read_scales(), expected)
-    if device == "cuda":
+    if graph is not None:
         graph.replay()
         torch.testing.assert_close(captured, expected)
 
@@ -988,6 +1001,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         msa_write_idx_k=Mock(),
         msa_prefill_proxy_plan=None,
         msa_prefill_n_valid_blocks=None,
+        _msa_prefill_identity=None,
         msa_prefill_proxy_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
         msa_qo_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
@@ -1324,6 +1338,187 @@ def test_get_moe_layer_ids_length_mismatch_raises():
     cfg.moe_layer_freq = [0] * (_NUM_HIDDEN_LAYERS - 1)
     with pytest.raises(ValueError, match="moe_layer_freq length"):
         get_moe_layer_ids(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Compressed-tensors NVFP4 MoE packaging of the MiniMax M3 architecture
+# ---------------------------------------------------------------------------
+
+
+def _make_packaged_text_config() -> SimpleNamespace:
+    """The trimmed text config as the compressed-tensors package declares it.
+
+    Every attention layer is sparse and K-only while layers 0-2 keep a dense
+    MLP; rope_theta 1e7, 1M positions, no MTP module and no text model_type.
+    """
+    cfg = _make_text_config()
+    cfg.sparse_attention_config["sparse_attention_freq"] = [1] * _NUM_HIDDEN_LAYERS
+    cfg.sparse_attention_config["sparse_disable_index_value"] = [1] * _NUM_HIDDEN_LAYERS
+    cfg.rope_theta = 10000000
+    cfg.max_position_embeddings = 1048576
+    cfg.num_mtp_modules = 0
+    del cfg.model_type
+    return cfg
+
+
+def _packaged_vl_config(
+    text_config_as_dict: bool = False, **quant_overrides: Any
+) -> SimpleNamespace:
+    quantization_config = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "group_size": 16,
+        "moe_quant_algo": "NVFP4",
+        "moe_quant_format": "nvfp4-pack-quantized",
+        "ignored_layers": [
+            "lm_head",
+            "model.embed_tokens",
+            "vision_tower",
+            "multi_modal_projector",
+            "patch_merge_mlp",
+        ]
+        + [
+            f"language_model.model.layers.{i}.block_sparse_moe.gate"
+            for i in range(3, _NUM_HIDDEN_LAYERS)
+        ],
+    }
+    quantization_config.update(quant_overrides)
+    text_config = _make_packaged_text_config()
+    cfg = _make_vl_config()
+    cfg.text_config = dict(vars(text_config)) if text_config_as_dict else text_config
+    cfg.quantization_config = quantization_config
+    return cfg
+
+
+def _expand_packaged_quant_config(
+    pretrained_config: SimpleNamespace,
+) -> Tuple[QuantConfig, Optional[dict[str, QuantConfig]]]:
+    """Parse the inline config as from_pretrained does, then apply the M3 hook."""
+    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
+        pretrained_config.quantization_config, "CUTLASS"
+    )
+    assert quant_config.quant_algo == QuantAlgo.MXFP8
+    assert layer_quant_config is None
+    return ModelConfig._set_minimax_m3_layer_quant_config(
+        pretrained_config, quant_config, layer_quant_config
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("text_config_as_dict", [False, True])
+def test_packaged_moe_config_expands_to_mixed_precision(text_config_as_dict: bool) -> None:
+    cfg = _packaged_vl_config(text_config_as_dict)
+    # An ignored layer gets no entry and is excluded; its neighbours are unaffected.
+    cfg.quantization_config["ignored_layers"].append(
+        "language_model.model.layers.4.self_attn.o_proj"
+    )
+    quant_config, layer_quant_config = _expand_packaged_quant_config(cfg)
+
+    assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert quant_config.is_module_excluded_from_quantization("model.layers.4.self_attn.o_proj")
+    assert "model.layers.3.block_sparse_moe.gate" in quant_config.exclude_modules
+    assert not any(name.startswith("language_model.") for name in quant_config.exclude_modules)
+    assert quant_config.is_module_excluded_from_quantization("lm_head")
+
+    expected = {}
+    for layer in range(_NUM_HIDDEN_LAYERS):
+        prefix = f"model.layers.{layer}"
+        names = [
+            f"{prefix}.self_attn.{proj}"
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj", "index_q_proj", "index_k_proj")
+        ]
+        if _MOE_LAYER_FREQ[layer]:
+            names += [
+                f"{prefix}.block_sparse_moe.shared_experts.{proj}"
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            ]
+            expected[f"{prefix}.block_sparse_moe.experts"] = (QuantAlgo.NVFP4, 16)
+        else:
+            names += [f"{prefix}.mlp.{proj}" for proj in ("gate_proj", "up_proj", "down_proj")]
+        expected.update({name: (QuantAlgo.MXFP8, 32) for name in names})
+    del expected["model.layers.4.self_attn.o_proj"]
+    assert {k: (v.quant_algo, v.group_size) for k, v in layer_quant_config.items()} == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"moe_quant_algo": "MXFP4"},
+        {"moe_quant_format": "float-quantized"},
+        {"group_size": 32},
+        {"group_size": None},
+        {"moe_quant_format": None},
+        {"moe_quant_algo": None},
+    ],
+)
+def test_packaged_moe_config_rejects_unsupported_expert_recipes(
+    overrides: dict[str, str | int | None],
+) -> None:
+    with pytest.raises(ValueError, match="routed-expert packaging"):
+        _expand_packaged_quant_config(_packaged_vl_config(**overrides))
+
+
+@pytest.mark.cpu_only
+def test_packaged_moe_config_rejects_a_quantized_head() -> None:
+    cfg = _packaged_vl_config()
+    cfg.quantization_config["ignored_layers"].remove("lm_head")
+    with pytest.raises(ValueError, match="must exclude lm_head"):
+        _expand_packaged_quant_config(cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "module",
+    ["self_attn.q_proj", "mlp.gate_proj", "block_sparse_moe.shared_experts.up_proj"],
+)
+def test_packaged_moe_config_rejects_partly_excluded_fused_projections(module: str) -> None:
+    layer = 1 if module.startswith("mlp.") else 4
+    cfg = _packaged_vl_config()
+    cfg.quantization_config["ignored_layers"].append(
+        f"language_model.model.layers.{layer}.{module}"
+    )
+    with pytest.raises(ValueError, match="all or none of the fused projections"):
+        _expand_packaged_quant_config(cfg)
+
+
+@pytest.mark.cpu_only
+def test_uniform_mxfp8_and_bf16_configs_are_unchanged() -> None:
+    cfg = _packaged_vl_config()
+    for key in ("moe_quant_algo", "moe_quant_format", "group_size"):
+        del cfg.quantization_config[key]
+    quant_config, _ = ModelConfig.load_hf_quant_config(cfg.quantization_config, "CUTLASS")
+    result = ModelConfig._set_minimax_m3_layer_quant_config(cfg, quant_config, None)
+    assert result[0] is quant_config and result[1] is None
+
+    no_quant = QuantConfig()
+    result = ModelConfig._set_minimax_m3_layer_quant_config(_make_vl_config(), no_quant, None)
+    assert result[0] is no_quant and result[1] is None
+
+
+@pytest.mark.cpu_only
+def test_modelopt_mixed_precision_map_is_normalized() -> None:
+    base_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    expert_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    global_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    layer_map = {
+        "language_model.model.layers.0.self_attn.o_proj": base_config,
+        "language_model.model.layers.3.block_sparse_moe.experts.0.w1": expert_config,
+    }
+    quant_config, out = ModelConfig._set_minimax_m3_layer_quant_config(
+        _make_vl_config(), global_config, layer_map
+    )
+    assert quant_config is global_config
+    assert out["model.layers.0.self_attn.o_proj"] is base_config
+    assert out["model.layers.3.block_sparse_moe.experts.0.w1"] is expert_config
+    assert not any(key.startswith("language_model.") for key in out)
+    for layer in range(_NUM_HIDDEN_LAYERS):
+        key = f"model.layers.{layer}.block_sparse_moe.experts"
+        if _MOE_LAYER_FREQ[layer]:
+            assert (out[key].quant_algo, out[key].group_size) == (QuantAlgo.NVFP4, 16)
+        else:
+            assert key not in out
 
 
 # ---------------------------------------------------------------------------
@@ -1953,16 +2148,14 @@ def _make_fused_qk_norm_rope_test_config():
     return text_cfg, model_cfg
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
-@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
-@torch.inference_mode()
-def test_horizontal_producer_explicit_caches_match_manager(
-    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
-) -> None:
-    """Exercise real producer dispatch and replay the PCG custom op."""
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+def _make_horizontal_producer_layer(
+    kv_dtype: str,
+) -> tuple[MiniMaxM3Attention, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a sparse layer wired for the horizontal producer, plus its paged caches.
+
+    Returns the layer and zeroed two-page main, index-K and NVFP4 scale caches
+    in the HND layouts the producer accepts for ``kv_dtype``.
+    """
     _, model_cfg = _make_fused_qk_norm_rope_test_config()
     layer = MiniMaxM3Attention(
         model_config=model_cfg,
@@ -1981,9 +2174,6 @@ def test_horizontal_producer_explicit_caches_match_manager(
     torch.manual_seed(7)
     for norm in (layer.q_norm, layer.k_norm, layer.index_q_norm, layer.index_k_norm):
         norm.weight = nn.Parameter(torch.randn(128, dtype=torch.bfloat16, device="cuda") * 0.1)
-    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
-    positions = torch.arange(4, dtype=torch.int32, device="cuda")
-    slots = torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda")
     nvfp4 = kv_dtype == "nvfp4"
     main = torch.zeros(
         (2, 2, 2, 128, 64 if nvfp4 else 128),
@@ -1992,6 +2182,40 @@ def test_horizontal_producer_explicit_caches_match_manager(
     )
     index = torch.zeros((2, 1, 128, 128), dtype=torch.float8_e4m3fn, device="cuda")
     scales = torch.zeros((2, 2, 2, 128, 8), dtype=torch.uint8, device="cuda")
+    return layer, main, index, scales
+
+
+def _count_plan_resolutions(
+    monkeypatch: pytest.MonkeyPatch, layer: MiniMaxM3Attention
+) -> list[int]:
+    """Spy on the layer's producer-plan validation; returns a one-element call counter."""
+    calls = [0]
+    resolve = layer._resolve_fused_producer_plan
+
+    def counting_resolve(*args: object, **kwargs: object) -> object:
+        """Count the call and delegate to the real validation."""
+        calls[0] += 1
+        return resolve(*args, **kwargs)
+
+    monkeypatch.setattr(layer, "_resolve_fused_producer_plan", counting_resolve)
+    return calls
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_explicit_caches_match_manager(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """Exercise real producer dispatch and replay the PCG custom op."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    slots = torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda")
+    nvfp4 = kv_dtype == "nvfp4"
     manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
     manager.is_nvfp4_layer.return_value = nvfp4
     manager.get_buffers.return_value = main
@@ -2043,6 +2267,171 @@ def test_horizontal_producer_explicit_caches_match_manager(
     eager = snapshot(op(*args))
     for actual, reference in zip(replay, eager):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+class _ReachedProducerLaunch(Exception):
+    """Raised once the producer passed every check and starts building kernel arguments."""
+
+
+class _PositionsAtLaunch:
+    """position_ids stand-in that stops the producer right before its kernel launch."""
+
+    def reshape(self, *shape: int) -> torch.Tensor:
+        """The producer reshapes positions only after its plan and capacity checks pass."""
+        raise _ReachedProducerLaunch
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_plan_reuses_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """The producer plan is validated once per distinct set of cache views and parameters."""
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    nvfp4 = kv_dtype == "nvfp4"
+    views = {
+        "buffers": main,
+        "index_k_cache": index,
+        "scale_buffers": scales if nvfp4 else None,
+        "out_cache_loc": torch.zeros(4, dtype=torch.int32, device="cuda"),
+    }
+    calls = _count_plan_resolutions(monkeypatch, layer)
+
+    plan = layer._fused_producer_plan(**views)
+    assert plan is not None
+    assert layer._fused_producer_plan(**views) is plan
+    assert calls[0] == 1
+
+    def expect_miss(supported: bool = True, **new_views: torch.Tensor) -> object:
+        """Assert the next lookup re-validates once and the one after it hits."""
+        before = calls[0]
+        views.update(new_views)
+        new_plan = layer._fused_producer_plan(**views)
+        assert calls[0] == before + 1
+        assert (new_plan is not None) == supported
+        assert layer._fused_producer_plan(**views) is new_plan
+        assert calls[0] == before + 1
+        return new_plan
+
+    expect_miss(buffers=main.clone())
+    expect_miss(index_k_cache=index.clone())
+    expect_miss(out_cache_loc=views["out_cache_loc"].clone())
+    if nvfp4:
+        expect_miss(scale_buffers=scales.clone())
+    norms = (layer.q_norm, layer.k_norm, layer.index_q_norm, layer.index_k_norm)
+    for position, norm in enumerate(norms):
+        norm.weight = nn.Parameter(norm.weight.detach().clone())
+        assert expect_miss()[1][6 + position] is norm.weight
+    # Mismatched epsilons reject the plan; once they agree again it resolves with the new value.
+    layer.k_norm.variance_epsilon = 1e-5
+    expect_miss(supported=False)
+    for norm in norms:
+        norm.variance_epsilon = 1e-5
+    assert expect_miss()[1][5] == 1e-5
+    layer.rotary_emb.rotary_cos_sin = layer.rotary_emb.rotary_cos_sin.clone()
+    assert expect_miss()[1][10] is layer.rotary_emb.rotary_cos_sin
+
+    layer.qkv_proj.inv_kv_scales = layer.qkv_proj.inv_kv_scales.clone()
+    if nvfp4:
+        assert expect_miss()[0] is layer.qkv_proj.inv_kv_scales
+    else:
+        # FP8 layers do not read the NVFP4 KV scales, so replacing them keeps the plan.
+        before = calls[0]
+        assert layer._fused_producer_plan(**views) is not None
+        assert calls[0] == before
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize(
+    "kv_dtype, layout",
+    [
+        ("fp8", "int64_slots"),
+        ("nvfp4", "int64_slots"),
+        ("fp8", "strided_slots"),
+        ("nvfp4", "padded_head_rows"),
+    ],
+)
+@torch.inference_mode()
+def test_horizontal_producer_plan_caches_unsupported_layout(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str, layout: str
+) -> None:
+    """An unsupported layout resolves to ``None`` once and stays ``None`` without re-validating."""
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    # The supported slot table is the head of a larger allocation, so the strided view below shares
+    # its address and shape and differs only in stride.
+    backing = torch.zeros(8, dtype=torch.int32, device="cuda")
+    slots = backing[:4]
+    supported = (main, index, scales if kv_dtype == "nvfp4" else None, slots)
+    if layout == "int64_slots":
+        unsupported = (*supported[:3], slots.to(torch.int64))
+    elif layout == "strided_slots":
+        strided = backing[::2]
+        assert (strided.data_ptr(), strided.shape) == (slots.data_ptr(), slots.shape)
+        unsupported = (*supported[:3], strided)
+    else:
+        # Rows padded past 128 per head: valid HND geometry the packed producer cannot write.
+        padded = torch.zeros((2, 2, 2, 129, 64), dtype=torch.uint8, device="cuda")[:, :, :, :128]
+        unsupported = (padded, *supported[1:])
+    calls = _count_plan_resolutions(monkeypatch, layer)
+
+    # The same layer accepts its supported views, so the rejection below is the layout's alone.
+    plan = layer._fused_producer_plan(*supported)
+    assert plan is not None
+    assert calls[0] == 1
+    assert layer._fused_producer_plan(*unsupported) is None
+    assert layer._fused_producer_plan(*unsupported) is None
+    assert calls[0] == 2
+    assert layer._fused_producer_plan(*supported) is plan
+    assert calls[0] == 2
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_checks_slot_capacity_after_plan_hit(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """A cached plan does not skip the per-step check that every packed row has a slot."""
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    slots = torch.zeros(2, dtype=torch.int32, device="cuda")
+    cache_tensors = (main, index, scales if kv_dtype == "nvfp4" else None, slots)
+    metadata = SimpleNamespace(kv_cache_manager=None)
+    calls = _count_plan_resolutions(monkeypatch, layer)
+
+    def produce(num_rows: int) -> object:
+        """Run the producer over ``num_rows`` packed rows against the two-slot table."""
+        packed = torch.zeros((num_rows, 11 * 128), dtype=torch.bfloat16, device="cuda")
+        return layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+            packed, _PositionsAtLaunch(), metadata, cache_tensors=cache_tensors
+        )
+
+    with pytest.raises(_ReachedProducerLaunch):
+        produce(2)
+    assert calls[0] == 1
+    assert produce(3) is None
+    assert calls[0] == 1
+    with pytest.raises(_ReachedProducerLaunch):
+        produce(1)
+    assert calls[0] == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@torch.inference_mode()
+def test_horizontal_producer_plan_cache_is_bounded() -> None:
+    """Distinct cache views never grow the per-layer plan cache past its bound."""
+    layer, main, index, _ = _make_horizontal_producer_layer("fp8")
+    bound = modeling_minimaxm3._MAX_FUSED_PRODUCER_PLANS
+    slot_tables = [torch.zeros(4, dtype=torch.int32, device="cuda") for _ in range(2 * bound + 4)]
+    for slots in slot_tables:
+        plan = layer._fused_producer_plan(main, index, None, slots)
+        assert plan is not None
+        assert len(layer.__dict__["_fused_producer_plans"]) <= bound
+    assert layer._fused_producer_plan(main, index, None, slot_tables[-1]) is plan
 
 
 @pytest.mark.gpu
@@ -3009,3 +3398,457 @@ def test_minimax_m3_dense_backend_library_order(
             )
     kernel.forward.assert_called_once()
     torch.testing.assert_close(output, q)
+
+
+# ---------------------------------------------------------------------------
+# Compressed-tensors NVFP4 MoE packaging: CUDA loading and forward checks
+# ---------------------------------------------------------------------------
+#
+# The references below are written from the checkpoint format (E4M3 / UE8M0 /
+# E2M1 definitions) without calling TensorRT-LLM quantizers.
+
+_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _relative_l2(out: torch.Tensor, ref: torch.Tensor) -> float:
+    return float((out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-6))
+
+
+def _cosine(out: torch.Tensor, ref: torch.Tensor) -> float:
+    return float(
+        torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0)
+    )
+
+
+def _mxfp8_dequant(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """E4M3 weight times 2**(UE8M0 - 127) per 32 input channels."""
+    exponent = scale_inv.float().repeat_interleave(32, dim=1) - 127.0
+    return weight.float() * torch.exp2(exponent)
+
+
+@pytest.mark.gpu
+@skip_pre_blackwell
+@skip_blackwell_geforce
+def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """index_q/k_proj load as MXFP8 with each rank's scale rows next to its weight rows.
+
+    Every index-Q head gets its own scale exponent, so a scale row that lands
+    on another head's weights changes the output by powers of two; index-K is
+    replicated on every rank with all of its scale rows.
+    """
+    import tensorrt_llm._torch.distributed as distributed
+
+    # Simulate each rank on one GPU; COLUMN projections need no collective.
+    monkeypatch.setattr(distributed, "AllReduce", lambda **_kwargs: nn.Identity())
+    torch.manual_seed(0)
+    hidden, index_dim, index_heads, tp_size = 256, 32, 4, 4
+    head_exponents = torch.tensor([127, 123, 130, 125], dtype=torch.int32)
+    q_weight = (torch.randn(index_heads * index_dim, hidden) * 2).to(torch.float8_e4m3fn)
+    q_scale = (
+        head_exponents.repeat_interleave(index_dim)[:, None]
+        + torch.randint(-1, 2, (index_heads * index_dim, hidden // 32))
+    ).to(torch.uint8)
+    k_weight = (torch.randn(index_dim, hidden) * 2).to(torch.float8_e4m3fn)
+    k_scale = torch.randint(121, 129, (index_dim, hidden // 32)).to(torch.uint8)
+    x = torch.randn(48, hidden, device="cuda", dtype=torch.bfloat16)
+    ref_q = x.float() @ _mxfp8_dequant(q_weight, q_scale).cuda().T
+    ref_k = x.float() @ _mxfp8_dequant(k_weight, k_scale).cuda().T
+    mxfp8 = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+
+    for rank in range(tp_size):
+        text_cfg, model_cfg = _make_attention_test_config()
+        text_cfg.hidden_size = hidden
+        text_cfg.num_attention_heads = 8
+        text_cfg.num_key_value_heads = 4
+        text_cfg.sparse_attention_config["sparse_num_index_heads"] = index_heads
+        model_cfg.mapping = Mapping(world_size=tp_size, rank=rank, tp_size=tp_size)
+        model_cfg.quant_config_dict = {
+            "model.layers.3.self_attn.index_q_proj": mxfp8,
+            "model.layers.3.self_attn.index_k_proj": mxfp8,
+        }
+        attn = MiniMaxM3Attention(
+            model_config=model_cfg,
+            layer_idx=3,
+            is_sparse_attention_layer=True,
+            disable_index_value=True,
+        )
+        proj = attn.index_qk_proj
+        # The enclosing model's __post_init__ applies the per-layer entries.
+        named = [("model.layers.3.self_attn.index_qk_proj", proj)]
+        apply_layerwise_quant_config(model_cfg, iter(named))
+        apply_quant_config_exclude_modules(model_cfg, iter(named))
+        assert proj.quant_config.quant_algo == QuantAlgo.MXFP8
+        proj.create_weights()
+        assert type(proj.quant_method).__name__ == "MXFP8LinearMethod"
+        proj.cuda()
+
+        layer = nn.Module()
+        layer.self_attn = attn
+        _load_index_qk_proj_weights(
+            layer,
+            {
+                "self_attn.index_q_proj.weight": q_weight,
+                "self_attn.index_q_proj.weight_scale_inv": q_scale,
+                "self_attn.index_k_proj.weight": k_weight,
+                "self_attn.index_k_proj.weight_scale_inv": k_scale,
+            },
+        )
+        rows = slice(rank * index_dim, (rank + 1) * index_dim)
+        expected_weight = torch.cat([q_weight[rows], k_weight]).view(torch.uint8).cuda()
+        assert torch.equal(proj.weight.view(torch.uint8), expected_weight)
+        expected_scale = torch.cat([q_scale[rows], k_scale]).cuda()
+        if proj.quant_method.use_cutlass:
+            expected_scale = torch.ops.trtllm.block_scale_interleave(expected_scale)
+        assert torch.equal(proj.weight_scale.view(torch.uint8).flatten(), expected_scale.flatten())
+
+        out = proj(x)
+        ref = torch.cat([ref_q[:, rows], ref_k], dim=1)
+        # Dynamic per-token MXFP8 activations cost ~1% relative error; a scale
+        # row on the wrong head is off by at least a factor of two.
+        assert _relative_l2(out, ref) < 0.05, rank
+        assert _cosine(out, ref) > 0.998, rank
+
+
+def _e2m1_values(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack [rows, K/2] bytes (even element in the low nibble) to float32 [rows, K]."""
+    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(packed.shape[0], -1).long()
+    magnitude = torch.tensor(_E2M1_GRID, device=packed.device)[codes & 0x7]
+    return torch.where(codes >= 8, -magnitude, magnitude)
+
+
+def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Round to the E2M1 grid, ties to the even code, saturating at 6."""
+    grid = torch.tensor(_E2M1_GRID, device=x.device)
+    bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    magnitude = x.abs()
+    index = torch.bucketize(magnitude, bounds)
+    index = index + torch.isin(magnitude, bounds[[1, 3, 5]]).long()
+    return torch.copysign(grid[index], x)
+
+
+def _nvfp4_activation(x: torch.Tensor, global_scale: float = 1.0) -> torch.Tensor:
+    """Quantize-dequantize with 16-element E4M3 block scales and a static global scale."""
+    blocks = x.float().reshape(*x.shape[:-1], -1, 16)
+    scale = blocks.abs().amax(-1, keepdim=True) * (1.0 / 6.0) * global_scale
+    scale = scale.to(torch.float8_e4m3fn).float()
+    scaled = torch.where(scale > 0, blocks * (global_scale / scale), torch.zeros_like(blocks))
+    return (_round_to_e2m1(scaled) * scale / global_scale).reshape(x.shape)
+
+
+@pytest.mark.gpu
+@skip_pre_blackwell
+def test_packaged_nvfp4_experts_load_and_run_on_cutlass() -> None:
+    """Packed experts reach the CUTLASS NVFP4 path intact and compute the static recipe.
+
+    Each expert has its own global scales, so a dropped scale or a wrong
+    expert assignment is visible in the output. The FC1 input is quantized
+    with the static input scale, the FC1 results round to BF16, the FC2 input
+    is quantized from that BF16 activation and the routing weights apply in
+    the finalize.
+    """
+    from tensorrt_llm._torch.moe.fused_moe import SwigluBiasActivation, create_moe
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
+
+    torch.manual_seed(0)
+    num_experts, top_k, hidden, inter, tokens = 8, 2, 256, 256, 24
+    prefix = "language_model.model.layers.3.block_sparse_moe.experts"
+    generator = torch.Generator().manual_seed(1)
+    checkpoint = {}
+    for e in range(num_experts):
+        for proj, rows, cols, global_scale in (
+            ("w1", inter, hidden, 50.0 + 7.0 * e),
+            ("w3", inter, hidden, 50.0 + 7.0 * e),
+            ("w2", hidden, inter, 60.0 + 5.0 * e),
+        ):
+            name = f"{prefix}.{e}.{proj}"
+            checkpoint[f"{name}.weight_packed"] = torch.randint(
+                0, 256, (rows, cols // 2), dtype=torch.uint8, generator=generator
+            )
+            checkpoint[f"{name}.weight_scale"] = (
+                torch.rand(rows, cols // 16, generator=generator) * 2 + 0.25
+            ).to(torch.float8_e4m3fn)
+            checkpoint[f"{name}.weight_global_scale"] = torch.tensor(global_scale)
+            checkpoint[f"{name}.input_global_scale"] = torch.tensor(1.0)
+
+    _, layer_quant_config = _expand_packaged_quant_config(_packaged_vl_config())
+    pretrained = _make_packaged_text_config()
+    pretrained.num_local_experts = num_experts
+    pretrained.hidden_size = hidden
+    pretrained.intermediate_size = inter
+    pretrained.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict=layer_quant_config,
+        moe_backend="CUTLASS",
+        max_num_tokens=256,
+    )
+    bias = torch.randn(num_experts, device="cuda") * 0.1
+    routing = MiniMaxM3MoeRoutingMethod(
+        top_k=top_k,
+        num_experts=num_experts,
+        callable_e_score_correction_bias=lambda: bias,
+        routed_scaling_factor=2.0,
+    )
+    moe = create_moe(
+        routing_method=routing,
+        num_experts=num_experts,
+        model_config=model_config,
+        layer_idx=3,
+        override_quant_config=MiniMaxM3MoE._get_experts_quant_config(model_config, 3),
+        activation=SwigluBiasActivation(gate_sigmoid_scale=1.702, linear_offset=1.0, clamp=7.0),
+        allow_backend_degradation=False,
+    )
+    backend = moe.backend
+    assert type(backend).__name__ == "TrtllmCutlassNvfp4Impl"
+    translated = convert_compressed_tensors_nvfp4_weights(dict(checkpoint))
+    module_weights = {
+        key[len(prefix) + 1 :]: value
+        for key, value in translated.items()
+        if key.startswith(prefix + ".")
+    }
+    with torch.device("cuda"):
+        moe.create_weights()
+        assert type(backend.quant_method).__name__ == "NVFP4CutlassFusedMoEMethod"
+        moe.load_weights([module_weights])
+        moe.post_load_weights()
+
+    # Static input scales of 1.0 stay 1.0; alphas are the reciprocal weight global scales.
+    assert backend.fc31_input_scale.item() == 1.0 and backend.fc2_input_scale.item() == 1.0
+    experts = []
+    for e in range(num_experts):
+        source = {
+            proj: (
+                checkpoint[f"{prefix}.{e}.{proj}.weight_packed"],
+                checkpoint[f"{prefix}.{e}.{proj}.weight_scale"],
+                torch.reciprocal(checkpoint[f"{prefix}.{e}.{proj}.weight_global_scale"]).item(),
+            )
+            for proj in ("w1", "w2", "w3")
+        }
+        assert torch.equal(
+            backend.w3_w1_weight[e].view(torch.uint8),
+            torch.cat([source["w3"][0], source["w1"][0]]).cuda(),
+        )
+        assert torch.equal(backend.w2_weight[e].view(torch.uint8), source["w2"][0].cuda())
+        expected_fc31_scale = torch.ops.trtllm.block_scale_interleave(
+            torch.cat([source["w3"][1], source["w1"][1]]).cuda().view(float4_sf_dtype)
+        )
+        assert torch.equal(
+            backend.w3_w1_weight_scale[e].view(torch.uint8).flatten(),
+            expected_fc31_scale.view(torch.uint8).flatten(),
+        )
+        expected_fc2_scale = torch.ops.trtllm.block_scale_interleave(
+            source["w2"][1].cuda().view(float4_sf_dtype)
+        )
+        assert torch.equal(
+            backend.w2_weight_scale[e].view(torch.uint8).flatten(),
+            expected_fc2_scale.view(torch.uint8).flatten(),
+        )
+        alphas = (source["w1"][2], source["w3"][2], source["w2"][2])
+        # The alpha is 1 / (input_scale * (1 / weight_scale_2)): within one ulp.
+        for alpha, golden in (
+            (backend.fc31_alpha[e].item(), source["w1"][2]),
+            (backend.fc2_alpha[e].item(), source["w2"][2]),
+        ):
+            assert abs(alpha - golden) <= 2**-23 * golden, (e, alpha, golden)
+        # Dequantized FP4 weights without the global scale (exact in FP32), and that scale.
+        experts.append(
+            (
+                tuple(
+                    _e2m1_values(w).cuda() * s.float().cuda().repeat_interleave(16, dim=1)
+                    for w, s, _ in (source["w1"], source["w3"], source["w2"])
+                ),
+                alphas,
+            )
+        )
+
+    def gemm(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """FP32 rounding of the FP64 sum of exactly representable products."""
+        return (a.double() @ w.double().T).float()
+
+    def reference(x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """Static unit FC1 scale; BF16 FC1 results; FC2 input quantized from its
+        BF16 cast; routing weights in the finalize."""
+        scores = torch.sigmoid(logits.float())
+        ids = torch.topk(scores + bias, top_k, dim=-1).indices
+        weights = scores.gather(1, ids)
+        weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * 2.0
+        x_q = _nvfp4_activation(x)
+        slots = torch.zeros(x.shape[0], top_k, hidden, device="cuda")
+        for e, ((w1, w3, w2), (a1, a3, a2)) in enumerate(experts):
+            rows, slot = (ids == e).nonzero(as_tuple=True)
+            if rows.numel() == 0:
+                continue
+            acc1, acc3 = gemm(x_q[rows], w1), gemm(x_q[rows], w3)
+            w = weights[rows, slot, None]
+            gate = (acc1 * a1).bfloat16().float().clamp(max=7.0)
+            up = (acc3 * a3).bfloat16().float().clamp(-7.0, 7.0)
+            act = (gate * torch.sigmoid(1.702 * gate) * (up + 1.0)).bfloat16().float()
+            y = (gemm(_nvfp4_activation(act), w2) * a2).bfloat16().float()
+            slots[rows, slot] = y * w
+        out = torch.zeros(x.shape[0], hidden, device="cuda")
+        for j in range(top_k):
+            out = out + slots[:, j]
+        return out
+
+    def forward(x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        return moe(x, logits, all_rank_num_tokens=[tokens], use_dp_padding=False)
+
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    logits = torch.randn(tokens, num_experts, device="cuda")
+    with torch.inference_mode():
+        out = forward(x, logits)
+    ref = reference(x, logits)
+    assert torch.isfinite(out).all()
+    # Same recipe on both sides; the remainder is accumulation order and the
+    # BF16 rounding of the GEMM outputs.
+    assert _relative_l2(out, ref) < 0.02
+    assert _cosine(out, ref) > 0.999
+
+
+def _stub_minimax_m3_attention_construction(
+    monkeypatch: pytest.MonkeyPatch, *, is_neox: bool = True
+) -> Mock:
+    """Keep the M3 constructor real while removing generic GPU setup and projection allocation."""
+
+    def initialize_attention(self: nn.Module, **kwargs: Any) -> None:
+        nn.Module.__init__(self)
+        config = kwargs["config"]
+        self.pos_embd_params = SimpleNamespace(rope=kwargs["pos_embd_params"].rope, is_neox=is_neox)
+        self.rotary_emb = object()
+        self.head_dim = config.pretrained_config.head_dim
+        self.qkv_proj = nn.Module()
+        self.qkv_proj.mapping = config.mapping
+
+    def make_linear(*args: Any, **kwargs: Any) -> nn.Module:
+        projection = nn.Module()
+        projection.quant_config = kwargs["quant_config"]
+        return projection
+
+    monkeypatch.setattr(modeling_minimaxm3.Attention, "__init__", initialize_attention)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    projection_factory = Mock(side_effect=make_linear)
+    monkeypatch.setattr(modeling_minimaxm3, "Linear", projection_factory)
+    return projection_factory
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_index_projection_declares_its_checkpoint_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """index_qk_proj starts unquantized and names its checkpoint parts for the quantization passes."""
+    _, model_config = _make_fused_qk_norm_rope_test_config()
+    projection_factory = _stub_minimax_m3_attention_construction(monkeypatch)
+    layer = MiniMaxM3Attention(
+        model_config=model_config,
+        layer_idx=3,
+        is_sparse_attention_layer=True,
+        disable_index_value=True,
+    )
+    projection_factory.assert_called_once()
+    assert projection_factory.call_args.kwargs["quant_config"] is None
+    assert layer.index_qk_proj.fused_checkpoint_names == ("index_q_proj", "index_k_proj")
+    assert fused_checkpoint_names(
+        layer.index_qk_proj, "model.layers.3.self_attn.index_qk_proj"
+    ) == ["model.layers.3.self_attn.index_q_proj", "model.layers.3.self_attn.index_k_proj"]
+
+
+def _dense_sdpa_decode_reference(q, k_ctx, v_ctx, seq_lens, num_kv_heads, head_dim):
+    """Per-request GQA decode via explicit ``repeat_interleave`` (pre-#18872 math).
+
+    ``q`` is ``[batch, num_heads * head_dim]``; ``k_ctx`` / ``v_ctx`` are
+    ``[batch, max_len, num_kv_heads, head_dim]`` holding each request's full
+    context, valid for positions ``< seq_lens[b]``.
+    """
+    batch = q.shape[0]
+    num_heads = q.shape[1] // head_dim
+    group = num_heads // num_kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    for b in range(batch):
+        n = int(seq_lens[b])
+        q_b = q[b].view(num_heads, 1, head_dim).float()  # [H, 1, d]
+        k_b = k_ctx[b, :n].float().repeat_interleave(group, dim=1).transpose(0, 1)  # [H, n, d]
+        v_b = v_ctx[b, :n].float().repeat_interleave(group, dim=1).transpose(0, 1)
+        o_b = torch.nn.functional.scaled_dot_product_attention(q_b, k_b, v_b)  # [H, 1, d]
+        out[b] = o_b.reshape(-1)
+    return out
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="dense SDPA decode runs on the CUDA KV pool")
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("group", [1, 4])
+def test_minimax_m3_sdpa_dense_decode_matches_repeat_interleave_reference(num_kv_heads, group):
+    """The decode branch of ``_sdpa_dense_attention_core`` matches plain GQA math.
+
+    Covers ``group > 1``, ``num_kv_heads > 1`` and a batch with mixed
+    ``seq_lens`` (shorter rows padded out to ``max_k``), so a head-order or
+    mask-broadcast mistake in the GQA-into-query-axis fold shows up here even
+    though it would not move throughput (NVBug 6877539).
+    """
+    torch.manual_seed(0)
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    head_dim, tokens_per_block = 64, 4
+    num_heads = num_kv_heads * group
+    seq_lens = torch.tensor([5, 1, 11, 8], dtype=torch.int32)  # mixed; max 11 -> 3 blocks
+    batch, max_len = int(seq_lens.numel()), int(seq_lens.max())
+    blocks_per_req = -(-max_len // tokens_per_block)
+
+    # Requests own scattered, non-contiguous pages so a gather or slot mix-up
+    # cannot pass by accident.
+    num_pages = batch * blocks_per_req + 3
+    pages = torch.randperm(num_pages)[: batch * blocks_per_req].view(batch, blocks_per_req)
+    pos = torch.arange(blocks_per_req * tokens_per_block)
+    req_to_token = (
+        pages[:, pos // tokens_per_block] * tokens_per_block + pos % tokens_per_block
+    ).to(device=device, dtype=torch.int32)
+
+    k_ctx = torch.randn(batch, max_len, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v_ctx = torch.randn_like(k_ctx)
+    # Pool layout [num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim].
+    # Fill every unused slot with garbage: the seq_lens mask must hide it.
+    kv_pool = (
+        torch.randn(
+            num_pages, 2, tokens_per_block, num_kv_heads, head_dim, device=device, dtype=dtype
+        )
+        * 50
+    )
+    for b in range(batch):
+        n = int(seq_lens[b])
+        slots = req_to_token[b, : n - 1].long()  # context before this decode step
+        page, within = slots // tokens_per_block, slots % tokens_per_block
+        kv_pool[page, 0, within] = k_ctx[b, : n - 1]
+        kv_pool[page, 1, within] = v_ctx[b, : n - 1]
+    # The new token's K/V arrives through ``k`` / ``v`` and is written by the method.
+    out_cache_loc = torch.stack(
+        [req_to_token[b, int(seq_lens[b]) - 1] for b in range(batch)]
+    ).long()
+    k_new = k_ctx[torch.arange(batch), seq_lens.long() - 1].reshape(batch, -1)
+    v_new = v_ctx[torch.arange(batch), seq_lens.long() - 1].reshape(batch, -1)
+    q = torch.randn(batch, num_heads * head_dim, device=device, dtype=dtype)
+
+    layer = SimpleNamespace(
+        layer_idx=0, num_heads=num_heads, num_key_value_heads=num_kv_heads, head_dim=head_dim
+    )
+    m3_meta = SimpleNamespace(
+        slot_ids=torch.arange(batch, device=device, dtype=torch.int32),
+        req_to_token=req_to_token,
+        seq_lens=seq_lens.to(device),
+        max_seqlen_k=max_len,
+        is_prefill=False,
+    )
+    attn_metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(get_buffers=lambda layer_idx: kv_pool),
+        minimax_m3={"metadata": m3_meta, "out_cache_loc": out_cache_loc},
+        is_cuda_graph=False,
+        max_seq_len=max_len,
+    )
+    output = torch.empty(batch, num_heads * head_dim, device=device, dtype=dtype)
+
+    MiniMaxM3Attention._sdpa_dense_attention_core(layer, q, k_new, v_new, attn_metadata, output)
+
+    ref = _dense_sdpa_decode_reference(q, k_ctx, v_ctx, seq_lens, num_kv_heads, head_dim)
+    torch.testing.assert_close(output.float(), ref, atol=2e-2, rtol=2e-2)

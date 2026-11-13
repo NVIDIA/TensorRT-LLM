@@ -17,6 +17,8 @@
 Model PyTorch YAML config for trtllm-bench performance tests.
 """
 
+import copy
+
 from ..conftest import llm_models_root
 
 # DeepSeek FP8 (block-scale) models that hit the DeepGEMM-on-Hopper-only
@@ -28,6 +30,34 @@ _DEEPSEEK_FP8_BLOCK_SCALE_MODELS = (
     'deepseek_v3_lite_fp8',
     'deepseek_r1_0528_fp8',
 )
+
+# Named LLM API overrides, selected by the "cfg:<name>[+<name>...]" test-name
+# label and applied after every other rule in get_model_yaml_config().
+PERF_CONFIG_PRESETS = {
+    # KV cache block reuse (prefix caching) on or off. Hybrid linear-attention
+    # and Mamba models reuse a prefix only up to a recurrent-state snapshot,
+    # taken here every 8192 tokens (the long-context prefill chunk size).
+    'reuse': {
+        'kv_cache_config': {
+            'enable_block_reuse': True,
+            'mamba_state_config': {
+                'periodic_snapshot_interval': 8192
+            }
+        }
+    },
+    'noreuse': {
+        'kv_cache_config': {
+            'enable_block_reuse': False
+        }
+    },
+    # MTP drafting three tokens per step.
+    'mtp3': {
+        'speculative_config': {
+            'decoding_type': 'MTP',
+            'max_draft_len': 3
+        }
+    },
+}
 
 
 def _get_sm_version_safe() -> int:
@@ -77,6 +107,32 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        {
+            'patterns': ['muse_spark_open_nvfp4-serve-pytorch'],
+            'config': {
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'disable_overlap_scheduler': False,
+                'attn_backend': 'TRTLLM',
+                'allreduce_strategy': 'NCCL',
+                'max_seq_len': 49152,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 256,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': True,
+                    'free_gpu_memory_fraction': 0.8,
+                    'use_kv_cache_manager_v2': True,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
         {
             'patterns': ['deepseek_v41_flash_nvfp4'],
             'config': {
@@ -325,9 +381,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Single-node experimental adaptation of the NVFP4 DSpark generation
-        # recipe in tests/scripts/perf/disaggregated/
-        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Single-node experimental NVFP4 DSpark generation recipe.
         # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
         # The blog does not provide a tuned single-node NVFP4 DSpark config.
         {
@@ -437,6 +491,95 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4,
             }
         },
+        # GLM-5.3 B200 TP8/EP8 deployment recipe, without MTP.
+        {
+            'patterns': ['glm_5.3_fp8-serve-pytorch'],
+            'config': {
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 16384,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 128,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.75,
+                },
+                'moe_config': {
+                    'backend': 'DEEPGEMM',
+                },
+                'stream_interval': 10,
+            }
+        },
+        # GLM-5.3-Flash B200 TP4/EP4: FP8 weights and BF16 KV cache.
+        {
+            'patterns': [
+                'glm_5.3_flash_fp8-serve-pytorch',
+                'glm_5.3_flash_fp8_mtp-serve-pytorch',
+            ],
+            'config': {
+                # Text-only perf does not need the image/video processor.
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 16384,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'auto',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_fp8_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        # NVFP4 on SM100 requires the Modeling V2 split/fused targets.
+        {
+            'patterns': [
+                'glm_5.3_flash_nvfp4-serve-pytorch',
+                'glm_5.3_flash_nvfp4_mtp-serve-pytorch',
+            ],
+            'config': {
+                'modeling_v2': 'require',
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 8192,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_nvfp4_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
         # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).
@@ -524,9 +667,8 @@ def get_model_yaml_config(model_label: str,
             }
         },
         # Gemma 4 NVFP4: VSWA (1024-token sliding window) plus per-layer
-        # head_dim 256/512. The FLASHINFER backend is selected by the model's
-        # own get_model_defaults(), so it is not repeated here. KV-cache reuse
-        # is disabled to match the validated accuracy configuration.
+        # head_dim 256/512. KV-cache reuse is disabled to match the validated
+        # accuracy configuration.
         {
             'patterns': ['gemma_4_'],
             'config': {
@@ -549,6 +691,18 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # Long-context and shared-prefix cases.
+        {
+            'patterns': [
+                'maxnt:8192-input_output_len:16384,',
+                'maxnt:8192-input_output_len:32768,',
+                'maxnt:8192-input_output_len:65536,',
+                '-prefix:',
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
+        },
         # Qwen3.6-35B-A3B NVFP4 GDN-attn MoE: trust_remote_code, TRTLLM-Gen NVFP4 MoE (SM100/103), block reuse off.
         {
             'patterns': ['qwen3.6_35b_a3b_fp4'],
@@ -564,7 +718,10 @@ def get_model_yaml_config(model_label: str,
         },
         # Qwen3.6-35B-A3B NVFP4 streaming (Spark) cases: CuteDSL MoE, FP8 KV cache with block reuse.
         {
-            'patterns': ['qwen3.6_35b_a3b_fp4-bench-pytorch-streaming'],
+            'patterns': [
+                'qwen3.6_35b_a3b_fp4-bench-pytorch-streaming',
+                'qwen3.6_35b_a3b_fp4-serve-pytorch-streaming',
+            ],
             'config': {
                 'trust_remote_code': True,
                 'kv_cache_config': {
@@ -589,7 +746,10 @@ def get_model_yaml_config(model_label: str,
         },
         # Qwen3.6-35B-A3B NVFP4 one-model MTP drafting
         {
-            'patterns': ['qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming'],
+            'patterns': [
+                'qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming',
+                'qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming',
+            ],
             'config': {
                 'trust_remote_code': True,
                 'moe_config': {
@@ -700,6 +860,7 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': [
                 'gpt_oss_120b_eagle3-bench-pytorch',
+                'gpt_oss_120b_eagle3-serve-pytorch',
             ],
             'config': {
                 'enable_attention_dp': False,
@@ -947,6 +1108,13 @@ def get_model_yaml_config(model_label: str,
                     recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
+    # Gemma4 NVFP4 needs FlashInfer for its 512-wide attention heads on SM107.
+    if (model_label.lower().startswith(
+        ('gemma_4_26b_a4b_nvfp4-', 'gemma_4_31b_it_nvfp4-'))
+            and '-pytorch-' in model_label.lower()
+            and _get_sm_version_safe() == 107):
+        base_config['attn_backend'] = 'FLASHINFER'
+
     # DeepSeek FP8 (block-scale) models on Blackwell (SM100+) must use the
     # DEEPGEMM MoE backend; the default CUTLASS backend's FP8 block-scale path
     # JIT-compiles DeepGEMM kernels that only target Hopper (SM90).
@@ -957,10 +1125,17 @@ def get_model_yaml_config(model_label: str,
             moe_config = base_config.setdefault('moe_config', {})
             moe_config.setdefault('backend', 'DEEPGEMM')
 
-    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly; other
-    # GPUs keep the model's own get_model_defaults() choice.
+    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly. Gemma 4
+    # NVFP4 on SM107 is forced to FLASHINFER above; other GPUs keep the
+    # model's own get_model_defaults() choice.
     if 'gemma_4_' in model_label.lower() and _get_sm_version_safe() == 121:
         base_config['attn_backend'] = 'FLASHINFER'
+
+    for label in model_label.split('-'):
+        if label.startswith('cfg:'):
+            for preset in label.removeprefix('cfg:').split('+'):
+                recursive_update(base_config,
+                                 copy.deepcopy(PERF_CONFIG_PRESETS[preset]))
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:

@@ -10,7 +10,9 @@
 # derivation changes (see disagg_config_ctxtp4_gentp4_deepseek_v41.yaml):
 #   sparse_attention_config   auto-derived from architectures[0].
 #   kv_cache_config.dtype     the CSA2 TRTLLM backend stages BF16 KV and rejects
-#                             anything but auto/bfloat16.
+#                             anything but auto/bfloat16. Written out as `auto`
+#                             (the default) only because the perf harness
+#                             records a missing dtype as fp8.
 #   tokens_per_block          model default (128 == sliding_window).
 #   moe_config.backend        V4.1's experts are MXFP4; the model selects its
 #                             own MoE path.
@@ -49,6 +51,7 @@ server_configs:
       enable_padding: true
       batch_sizes: [1, 2, 4, 8]
     kv_cache_config:
+      dtype: auto
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
     client_configs:
@@ -81,6 +84,7 @@ server_configs:
       enable_padding: true
       batch_sizes: [1, 2, 4, 8, 16, 32]
     kv_cache_config:
+      dtype: auto
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
     client_configs:
@@ -110,6 +114,7 @@ server_configs:
       enable_padding: true
       batch_sizes: [1, 2, 4, 8]
     kv_cache_config:
+      dtype: auto
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
     speculative_config:
