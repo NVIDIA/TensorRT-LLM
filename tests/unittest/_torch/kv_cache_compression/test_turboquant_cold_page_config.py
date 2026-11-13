@@ -10,7 +10,11 @@ import yaml
 from transformers import PretrainedConfig
 
 from tensorrt_llm._errors import UnsupportedError
+from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.turboquant_quantization import (
+    TurboQuantColdPageQuantizationCompression,
+)
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
+from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import (
     ColdPageQuantizationCompressionConfig,
@@ -19,6 +23,7 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -191,6 +196,42 @@ def test_model_defaults_revalidate_the_dump_of_either_format() -> None:
 def test_unsupported_settings_are_rejected_at_construction(options, match) -> None:
     with pytest.raises(ValueError, match=match):
         ColdPageQuantizationCompressionConfig(**options)
+
+
+@pytest.mark.parametrize(
+    ("bits", "mode", "width", "error", "match"),
+    [
+        (4, "mse", 24, ValueError, "divisible by 16"),  # alignment of integer widths
+        (2.5, "mse", 48, ValueError, "divisible by 32"),  # alignment of fractional widths
+        (4, "mse", 560, NotImplementedError, "power-of-two rest"),  # 2 x 256 + 48
+        (4, "mse", 1024, NotImplementedError, "up to 1008"),  # instance size
+        (4, "prod", 752, NotImplementedError, "at most 4 power-of-two pieces"),  # 512+128+64+32+16
+    ],
+)
+def test_codec_state_rejects_unsupported_vector_widths(bits, mode, width, error, match) -> None:
+    """The width rules reject a layout before any kernel is compiled (no GPU needed)."""
+    provider = TurboQuantColdPageQuantizationCompression(
+        _turboquant(turboquant_bits=bits, turboquant_mode=mode),
+        pretrained_config=SimpleNamespace(model_type="llama"),
+    )
+    slot_bytes = 32 * width * 2  # one KV head, 32 tokens, BF16
+    cache_config = SimpleNamespace(
+        tokens_per_block=32,
+        layers=(
+            AttentionLayerConfig(
+                layer_id=0,
+                buffers=[BufferConfig(role=role, size=slot_bytes) for role in ("key", "value")],
+            ),
+        ),
+    )
+    with pytest.raises(error, match=match):
+        provider.build_codec_state(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(width,),
+        )
 
 
 def test_factory_builds_the_turboquant_provider() -> None:
