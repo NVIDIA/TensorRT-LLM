@@ -32,6 +32,7 @@ The checkpoint's MTP module (`mtp.*`) is not loaded: this target implements no
 draft path, and routing refuses speculative decoding.
 """
 
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -53,6 +54,11 @@ MOE_BACKENDS = {
     "MEGAMOE_CUTEDSL": "MEGAMOE_CUTEDSL",
     "TRTLLM": "TRTLLM",
 }
+
+# A checkpoint layer's keys, `backbone.layers.{i}.`, and a routed expert's,
+# `backbone.layers.{i}.mixer.experts.{e}.`.
+_LAYER_KEY = re.compile(r"backbone\.layers\.(\d+)\.")
+_EXPERT_KEY = re.compile(r"backbone\.layers\.\d+\.mixer\.experts\.(\d+)\.")
 
 
 def engine_moe_backend(model_config) -> str:
@@ -354,11 +360,42 @@ class NemotronUltraBf16Dep16Weights:
             return entry[index]
         return entry if getattr(entry, "ndim", 1) == 0 else entry[:]
 
-    def load(self, model, weights) -> None:
+    @classmethod
+    def _expert(cls, entry, key: str, d: SimpleNamespace, allow_partial: bool) -> torch.Tensor:
+        """One routed-expert tensor for the engine's MoE layer, in the model dtype. A weight
+        update may send another dtype, which the layer's loader would reinterpret byte for byte
+        rather than convert; the checkpoint itself must match."""
+        t = cls._take(entry, None)
+        if t.dtype != d.dtype:
+            assert allow_partial, (key, t.dtype, d.dtype)
+            t = t.to(d.dtype)
+        return t
+
+    def load(self, model, weights, allow_partial: bool = False) -> set[str]:
+        """Fill the model from `weights` and return the keys it took: the whole checkpoint at build,
+        or with `allow_partial` one bucket of an in-flight weight update (llmapi/rlhf_utils.py),
+        any subset of the keys, written into the same tensors (captured graphs read them). A key a
+        bucket does not carry keeps its value. A bucket key this rank neither loads nor expects a
+        full update to carry for others fails the update before anything is written."""
         core = model.model
         d = self.dims(core)
         manifest = self.manifest(core)
         consumed: set[str] = set()
+        if allow_partial:
+            # A full update sends every checkpoint key to every rank, the MTP module and the other
+            # ranks' experts included; anything else is a name this target does not know, and
+            # dropping it would leave the policy's weights stale with no error.
+            loads = self.refit_keys(core)
+            unknown = sorted(
+                k for k in weights.keys() if k not in loads and not self.loaded_elsewhere(d, k)
+            )
+            if unknown:
+                raise ValueError(
+                    f"weight update: {len(unknown)} keys the dep16 target neither loads nor expects "
+                    f"from a full update, e.g. {unknown[:4]}; it takes the checkpoint's names "
+                    "(backbone.layers.*, one tensor per routed expert), not HF transformers 5.x "
+                    "names (model.*, stacked experts)"
+                )
         assert set(manifest) == set(core.w.keys()), (
             "manifest/parameter drift",
             set(manifest) ^ set(core.w.keys()),
@@ -366,13 +403,19 @@ class NemotronUltraBf16Dep16Weights:
 
         def fill(param: torch.Tensor, row: Source, transform) -> None:
             key, src_index, dst_index = row
-            assert key in weights, f"checkpoint key missing: {key}"
+            if key not in weights:
+                assert allow_partial, f"checkpoint key missing: {key}"
+                return
             dst = param.data if dst_index is None else param.data[dst_index]
             src = self._take(weights[key], src_index).to(dst.device, non_blocking=True)
             if transform is not None:
                 src = transform(src, core)
             assert dst.shape == src.shape, (key, tuple(dst.shape), tuple(src.shape))
-            assert src.dtype == dst.dtype, (key, src.dtype, dst.dtype)
+            if src.dtype != dst.dtype:
+                # A trainer may send another dtype than the checkpoint holds: a weight update
+                # converts, as the built-in model's loads do. The checkpoint itself must match.
+                assert allow_partial, (key, src.dtype, dst.dtype)
+                src = src.to(dst.dtype)
             dst.copy_(src, non_blocking=True)
             consumed.add(key)
 
@@ -389,16 +432,27 @@ class NemotronUltraBf16Dep16Weights:
         for i in d.moe_layers:
             fed = {}
             for up_key, down_key, e in self.engine_expert_feed(d, i):
-                assert up_key in weights and down_key in weights, (
+                assert allow_partial or (up_key in weights and down_key in weights), (
                     f"checkpoint key missing: {up_key} / {down_key}"
                 )
-                up = self._take(weights[up_key], None)
-                fed[f"{e}.w1.weight"] = up
-                fed[f"{e}.w3.weight"] = up[:0]
-                fed[f"{e}.w2.weight"] = self._take(weights[down_key], None)
-                consumed.update((up_key, down_key))
-            core.routed_experts[str(i)].load_weights([fed])
-            torch.cuda.empty_cache()
+                if up_key in weights:
+                    up = self._expert(weights[up_key], up_key, d, allow_partial)
+                    fed[f"{e}.w1.weight"] = up
+                    fed[f"{e}.w3.weight"] = up[:0]
+                    consumed.add(up_key)
+                if down_key in weights:
+                    fed[f"{e}.w2.weight"] = self._expert(
+                        weights[down_key], down_key, d, allow_partial
+                    )
+                    consumed.add(down_key)
+            if not fed:
+                continue
+            # A weight update's bucket carries any subset of the experts and projections; the
+            # leaves route() admits for weight updates (CUTLASS, MegaMoE) copy them into their
+            # own tensors in place.
+            core.routed_experts[str(i)].load_weights([fed], allow_partial_loading=allow_partial)
+            if not allow_partial:
+                torch.cuda.empty_cache()
 
         # Shell-registered exception: the base class owns lm_head (untied), and under
         # attention DP it builds it whole -- every rank holds different tokens, so a
@@ -418,6 +472,8 @@ class NemotronUltraBf16Dep16Weights:
         assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
 
         torch.cuda.synchronize()
+        if allow_partial:
+            return consumed
 
         leftover = set(weights.keys()) - consumed
         expected = self.expected_unconsumed(d, weights)
@@ -426,27 +482,38 @@ class NemotronUltraBf16Dep16Weights:
             f"rank's off-window experts; unexpected {sorted(leftover - expected)[:8]}, "
             f"missed {sorted(expected - leftover)[:8]}"
         )
+        return consumed
+
+    def refit_keys(self, core) -> set[str]:
+        """Every checkpoint key this rank loads: what one whole weight update feeds."""
+        d = self.dims(core)
+        keys = {row[0] for rows in self.manifest(core).values() for row, _ in rows}
+        for i in d.moe_layers:
+            for up_key, down_key, _ in self.engine_expert_feed(d, i):
+                keys.update((up_key, down_key))
+        keys.add("lm_head.weight")
+        return keys
 
     @staticmethod
-    def expected_unconsumed(d, weights) -> set[str]:
-        """The MTP module, every routed-expert tensor outside this rank's window, and
-        any layer past the configured stack (a checkpoint directory holding a prefix of
-        the layers can still carry a later layer in a shared shard)."""
-        lo, hi = d.expert_offset, d.expert_offset + d.local_experts
-        out = set()
-        for key in weights.keys():
-            if key.startswith("mtp."):
-                out.add(key)
-                continue
-            parts = key.split(".")
-            if len(parts) > 2 and parts[1] == "layers" and int(parts[2]) >= d.num_layers:
-                out.add(key)
-                continue
-            # backbone.layers.{i}.mixer.experts.{e}.<proj>.<tensor>
-            if len(parts) > 5 and parts[3] == "mixer" and parts[4] == "experts":
-                if not lo <= int(parts[5]) < hi:
-                    out.add(key)
-        return out
+    def loaded_elsewhere(d: SimpleNamespace, key: str) -> bool:
+        """Whether a checkpoint key belongs to no tensor of this rank but is still part of a
+        whole checkpoint: the MTP module, a routed expert outside this rank's window, or a
+        layer past the configured stack (a checkpoint directory holding a prefix of the layers
+        can still carry a later layer in a shared shard)."""
+        if key.startswith("mtp."):
+            return True
+        layer = _LAYER_KEY.match(key)
+        if layer is not None and int(layer.group(1)) >= d.num_layers:
+            return True
+        expert = _EXPERT_KEY.match(key)
+        return expert is not None and not (
+            d.expert_offset <= int(expert.group(1)) < d.expert_offset + d.local_experts
+        )
+
+    @classmethod
+    def expected_unconsumed(cls, d, weights) -> set[str]:
+        """The keys of a whole checkpoint this rank does not load (see `loaded_elsewhere`)."""
+        return {key for key in weights.keys() if cls.loaded_elsewhere(d, key)}
 
 
 MODEL_WEIGHTS = NemotronUltraBf16Dep16Weights()

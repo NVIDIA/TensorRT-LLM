@@ -356,12 +356,14 @@ def _layer_views(core) -> list:
                 A_hd=A[:, None, None].expand(d.heads_r, hd, st),
                 D=D,
                 D_hd=D[:, None].expand(d.heads_r, hd),
-                # FlashInfer's decode kernel takes D and dt_bias only in dt's dtype: the
-                # checkpoint's bf16 values, which the fp32 copies hold exactly.
-                D_hd16=D.to(torch.bfloat16)[:, None].expand(d.heads_r, hd),
+                # FlashInfer's decode kernel takes D and dt_bias only in dt's dtype (bf16):
+                # bf16 copies of the fp32 parameters, refreshed in place by post_load_weights.
+                # Exact for the bf16 checkpoint and bf16 weight updates; rounded (2^-8
+                # relative) when an update sends fp32 values bf16 cannot hold.
+                D_hd16=core.bf16_copy(f"l{i}_D")[:, None].expand(d.heads_r, hd),
                 dt_bias=dtb,
                 dt_bias_hd=dtb[:, None].expand(d.heads_r, hd),
-                dt_bias_hd16=dtb.to(torch.bfloat16)[:, None].expand(d.heads_r, hd),
+                dt_bias_hd16=core.bf16_copy(f"l{i}_dt_bias")[:, None].expand(d.heads_r, hd),
                 gnorm=w[f"l{i}_gnorm"],
                 out_w=w[f"l{i}_out_proj_w"].t(),
             )
@@ -504,14 +506,72 @@ class NemotronUltraBf16Dep32ModelingV2(DecoderModel):
         self.splitk_projections = _SPLITK_PROJECTIONS_DEFAULT
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
+        # bf16 copies of fp32 parameters that kernels read in bf16 (key -> tensor): made once with
+        # the targets, refreshed in place by later post_load_weights calls (captured graphs read them).
+        self._bf16_copies: dict[str, torch.Tensor] = {}
+        # The checkpoint keys an in-flight weight update has fed since its pre_reload_weights.
+        self._refit_fed: "set[str] | None" = None
+
+    def bf16_copy(self, key: str) -> torch.Tensor:
+        """A bf16 copy of fp32 parameter `key`, made once; later post_load_weights calls refresh
+        it in place, so a graph captured over it stays valid across weight updates."""
+        copy = self._bf16_copies.get(key)
+        if copy is None:
+            copy = self._bf16_copies[key] = self.w[key].detach().to(torch.bfloat16)
+        return copy
+
+    def pre_reload_weights(self) -> None:
+        """An in-flight weight update (llmapi/rlhf_utils.py) starts: record what its partial
+        loads feed, so post_load_weights can report what it left stale (a new update discards
+        the record an aborted one left).
+
+        The module walk reaches this before the engine MoE layers' own hooks. TRTLLM's BF16
+        leaf would re-stage every routed expert there (a second copy of this rank's experts,
+        and an expert the update does not feed left uninitialized), so it is refused before
+        any buffer moves, as route() refuses an RL engine on it."""
+        if self.dims.engine_moe == "TRTLLM":
+            raise NotImplementedError(
+                "nemotron3_ultra_bf16__sm_100__dep32: weight updates on moe_config.backend=TRTLLM "
+                "re-stage every routed expert; build RL engines on CUTLASS or MEGAMOE_CUTEDSL"
+            )
+        self._refit_fed = set()
+
+    def record_refit_fed(self, keys: set[str]) -> None:
+        if self._refit_fed is not None:
+            self._refit_fed.update(keys)
+
+    def _report_refit(self) -> None:
+        """Warn when the weight update that just finished left checkpoint tensors at their
+        previous values: rank 0 for the tensors every rank holds, each rank for its own routed
+        experts (no other rank loads them)."""
+        fed, self._refit_fed = self._refit_fed, None
+        if fed is None:
+            return
+        stale = sorted(_weights.MODEL_WEIGHTS.refit_keys(self) - fed)
+        rank = self.model_config.mapping.rank
+        experts = [k for k in stale if ".mixer.experts." in k]
+        report = stale if rank == 0 else experts
+        if report:
+            logger.warning(
+                f"nemotron3_ultra_bf16__sm_100__dep32: rank {rank}: the weight update left "
+                f"{len(report)} checkpoint tensors at their previous values ({len(experts)} of "
+                f"them this rank's routed experts), e.g. {report[:4]}"
+            )
 
     def post_load_weights(self) -> None:
         """Construct the two targets, now that the weights are real.
 
-        Called twice by the engine (the shell's hook, then the loader's module
-        walk), so it rebuilds rather than accumulates. Must never run from
-        `__init__`, where the containers are still meta.
+        The engine calls this twice at build (the shell's hook, then the loader's module walk)
+        and again after every in-flight weight update. Only the first call builds: the targets
+        read views of the parameters, which loads refresh in place, so later calls only refresh
+        the bf16 copies in place (captured graphs read them). Must never run from `__init__`,
+        where the containers are still meta.
         """
+        if self._decode is not None:
+            for key, copy in self._bf16_copies.items():
+                copy.copy_(self.w[key])
+            self._report_refit()
+            return
         mapping = self.model_config.mapping
         self.lowm_max_rows = _env_rows(
             LOWM_MAX_ROWS_ENV, _LOWM_MAX_ROWS_DEFAULT, 0, _LOWM_MAX_ROWS_CERTIFIED
@@ -1186,8 +1246,12 @@ class ModelingV2Nemotron3UltraBf16Sm100Dep32(
             vocab_size=cfg.vocab_size,
         )
 
-    def load_weights(self, weights, *args, **kwargs):
-        _weights.MODEL_WEIGHTS.load(self, weights)
+    def load_weights(self, weights, weight_mapper=None, allow_partial_loading: bool = False):
+        """The whole checkpoint at build; with allow_partial_loading, one bucket of an in-flight
+        weight update (llmapi/rlhf_utils.py). The targets read checkpoint keys, not the mapper's."""
+        fed = _weights.MODEL_WEIGHTS.load(self, weights, allow_partial=allow_partial_loading)
+        if allow_partial_loading:
+            self.model.record_refit_fed(fed)
 
     def post_load_weights(self):
         super().post_load_weights()

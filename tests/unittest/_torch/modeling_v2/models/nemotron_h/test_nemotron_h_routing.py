@@ -594,14 +594,40 @@ _RL_WEIGHT_SYNC = dict(
 )
 
 
-@pytest.mark.parametrize(
-    "mapping", [_TEP8, _TP8EP2, _DEP16, _DEP32], ids=["tep8", "tp8ep2", "dep16", "dep32"]
-)
+@pytest.mark.parametrize("mapping", [_TEP8, _TP8EP2], ids=["tep8", "tp8ep2"])
 def test_ultra_bf16_refuses_in_flight_weight_updates(mapping):
     """The targets load a whole checkpoint only, so an RL engine keeps the built-in model in auto
     and fails at build in require, not at its first weight sync."""
     config = _model_config(_ultra_bf16_config(), **mapping)
     _refused(config, "ray_worker_extension_cls", **_RL_WEIGHT_SYNC)
+
+
+_DEP_LAYOUTS = pytest.mark.parametrize(
+    "mapping, target",
+    [(_DEP16, _ULTRA_BF16_DEP16_TARGET), (_DEP32, _ULTRA_BF16_DEP32_TARGET)],
+    ids=["dep16", "dep32"],
+)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("backend", ["AUTO", "CUTLASS", "MEGAMOE_CUTEDSL"])
+@_DEP_LAYOUTS
+def test_ultra_bf16_dep_targets_take_in_flight_weight_updates(mapping, target, backend, mode):
+    """dep16 and dep32 load a weight update's buckets in place, and so do the CUTLASS and MegaMoE
+    leaves of the engine MoE layer: an RL engine keeps the target."""
+    config = replace(_model_config(_ultra_bf16_config(), **mapping), moe_backend_requested=backend)
+    llm_args = _llm_args(mode, **_RL_WEIGHT_SYNC)
+    assert _qualified(modeling_v2_resolve(config, llm_args)) == target
+
+
+@_DEP_LAYOUTS
+def test_ultra_bf16_dep_targets_refuse_weight_updates_on_trtllm_moe(mapping, target):
+    """TRTLLM's BF16 leaf re-stages every routed expert during a weight update, so an RL engine on
+    it keeps the built-in model in auto and fails at build in require."""
+    config = replace(_model_config(_ultra_bf16_config(), **mapping), moe_backend_requested="TRTLLM")
+    _refused(config, "re-stages every routed expert", **_RL_WEIGHT_SYNC)
+    # The same layout and backend without the weight-sync extension still run the target.
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == target
 
 
 def test_ultra_nvfp4_refuses_in_flight_weight_updates(_on_sm107):

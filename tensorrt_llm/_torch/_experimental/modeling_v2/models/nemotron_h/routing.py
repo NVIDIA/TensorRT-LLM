@@ -79,6 +79,14 @@ _BF16_BLOCK_REUSE_ENVS = {
     _BF16_DEP16: ("dep16", BF16_DEP16_BLOCK_REUSE_ENV),
     _BF16_DEP32: ("dep32", BF16_DEP32_BLOCK_REUSE_ENV),
 }
+# The layouts whose targets take an in-flight weight update (bucketed partial loads into their own
+# tensors, derived copies refreshed in place), and the MoE backends whose leaf takes one in place:
+# CUTLASS (AUTO resolves to it) and MegaMoE. TRTLLM's BF16 leaf re-stages every routed expert
+# during an update instead. The other layouts load a whole checkpoint only.
+_BF16_REFIT_MOE_BACKENDS = {
+    _BF16_DEP16: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL"}),
+    _BF16_DEP32: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL"}),
+}
 
 # The KV cache algorithms each BF16 layout was gated with (None: the checkpoint's bf16).
 _BF16_KV_ALGOS = {
@@ -279,13 +287,16 @@ def route(
         )
     if (llm_args.max_beam_width or 1) != 1:
         raise NoTarget(f"max_beam_width={llm_args.max_beam_width}; beam search is not implemented")
-    if llm_args.ray_worker_extension_cls is not None:
+    refit_backends = None if nvfp4 else _BF16_REFIT_MOE_BACKENDS.get(layout)
+    if llm_args.ray_worker_extension_cls is not None and refit_backends is None:
         # The RL weight-sync extensions (llmapi/rlhf_utils.py) are the engine's only in-flight
-        # weight update; refusing here keeps an RL engine off a target before training starts.
+        # weight update; refusing here keeps an RL engine off a target that cannot take one,
+        # before training starts.
         raise NoTarget(
             f"ray_worker_extension_cls={llm_args.ray_worker_extension_cls!r}: in-flight weight "
-            "updates stream partial checkpoints, and the targets load a whole checkpoint only "
-            "(AsyncLLM installs tensorrt_llm.llmapi.rlhf_utils.WorkerExtension by default; pass "
+            f"updates stream partial checkpoints, and the target for {split} loads a whole "
+            "checkpoint only; the BF16 dep16 and dep32 targets take them (AsyncLLM installs "
+            "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension by default; pass "
             "ray_worker_extension_cls=None to an engine that never updates its weights)"
         )
     kv_cache_config = llm_args.kv_cache_config
@@ -327,6 +338,17 @@ def route(
         raise NoTarget(
             f"moe_config.backend={model_config.moe_backend_requested!r} at parallel layout "
             f"{split}; the target runs its routed experts on {served}"
+        )
+    if llm_args.ray_worker_extension_cls is not None and requested not in refit_backends:
+        # TRTLLM's BF16 leaf re-registers every routed expert in its load layout at
+        # pre_reload_weights: a second copy of this rank's experts (about 60 GiB per rank on dep16,
+        # 30 GiB on dep32) and, after the update, uninitialized values for an expert it did not feed.
+        raise NoTarget(
+            f"ray_worker_extension_cls={llm_args.ray_worker_extension_cls!r} with "
+            f"moe_config.backend={model_config.moe_backend_requested!r}: that MoE leaf re-stages "
+            "every routed expert during an in-flight weight update (a second copy of this rank's "
+            "experts); the target takes weight updates on "
+            f"{', '.join(sorted(refit_backends - {'AUTO'}))}"
         )
     if str(llm_args.prefill_cuda_graph_backend.value) == "piecewise":
         raise NoTarget(
