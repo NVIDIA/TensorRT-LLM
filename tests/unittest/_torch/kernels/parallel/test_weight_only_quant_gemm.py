@@ -61,6 +61,10 @@ def test_weight_only_quant_gemm(a_dtype, b_dtype, m, k, n):
     output = torch.ops.trtllm.weight_only_quant_gemm(a, processed_b.cuda(),
                                                      b_dtype, b_scales.cuda(),
                                                      a_dtype)
+    torch.library.opcheck(
+        torch.ops.trtllm.weight_only_quant_gemm,
+        (a, processed_b.cuda(), b_dtype, b_scales.cuda(), a_dtype),
+        test_utils=("test_faketensor", ))
 
     output_ref = weight_only_quant_gemm_reference(a, b.cuda(), b_scales.cuda())
 

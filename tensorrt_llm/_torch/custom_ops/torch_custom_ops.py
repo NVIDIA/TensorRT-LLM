@@ -2040,14 +2040,18 @@ def weight_only_quant_gemm(
 def _(
         activation: torch.Tensor,
         weight: torch.Tensor,
-        weight_type: torch.dtype,
+        weight_dtype: torch.dtype,
         weight_scale: torch.Tensor,
         output_dtype: torch.dtype = None,
         output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     dtype = output_dtype if output_dtype is not None else activation.dtype
-    return activation.new_empty((activation.size(0), weight.size(1)),
-                                dtype=dtype)
+    # INT4 weights pack two values per int8 element, so the real op returns
+    # N = 2 * weight.size(1) for torch.quint4x2 (weightOnlyQuantGemm.cpp).
+    n = weight.size(1)
+    if weight_dtype == torch.quint4x2:
+        n *= 2
+    return activation.new_empty((activation.size(0), n), dtype=dtype)
 
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
@@ -2167,12 +2171,10 @@ def _(
     bias: Optional[torch.Tensor] = None,
     zeros: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # For a typical GEMM: input [M, K] @ weight [K, N] -> output [M, N]
-    # Weight is typically packed, so we need to infer the output dimension
-    M = input.size(0)
-    # Assuming weight is packed and the output dimension can be inferred from weight.size(1)
-    N = weight.size(1) if weight.dim() > 1 else weight.size(0)
-    return input.new_empty((M, N), dtype=output_dtype)
+    # input [..., K] @ weight [K, N / 2] (two INT4 values per byte) -> [..., N],
+    # matching finegrainedMixedDtypeGemmRunner::runGemm.
+    N = weight.size(1) * 2
+    return input.new_empty((*input.shape[:-1], N), dtype=output_dtype)
 
 
 _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
