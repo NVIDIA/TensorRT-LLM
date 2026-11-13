@@ -74,15 +74,17 @@ from tensorrt_llm.logger import logger
 
 from .. import m31_capture_fork
 from ..m31_tail_bookkeep import TailBookkeepMixin
+from . import dspark_draft_head as _dhead8
 from . import dspark_tailfold as _tfold
 from .drafter_mxfp8 import route_mx_linears, route_projection_layout
 from .dspark_markov_worker import MAX_FAST_BATCH, TAILBK_SPEC, S4WorkerMixin
-from .dspark_t6 import routes_line
-from .dspark_tailfork import ctx_store_launch, ctx_store_prep, view_key
+from .dspark_t6 import route_lowm_linears, routes_line
+from .dspark_tailfork import copy_captures, ctx_store_launch, ctx_store_prep, view_key
 from .gen_glue import glue_disabled
 from .kernels import m3_mc_allreduce, m3_nnt_fold, m3_report
-from .m31_switches import m31_disabled
+from .m31_switches import m31_disabled, m31_enabled
 from .ops.embedding.m3_embedding import m3_embedding
+from .ops.gemm.m31_fc_shard import FcShard
 from .ops.spec.m3_force_vec import m3_force_vec
 
 # S9BVR: the drafter's row-parallel all-reduces (each layer's o_proj and MLP down projection) of up to this many
@@ -196,6 +198,25 @@ MXDRAFT = not m31_disabled("DRAFTER_MXFP8")
 # TRTLLM_M31_DISABLE_DRAFTER_HISLAYOUT, read at import.
 DRAFTER_HISLAYOUT = not m31_disabled("DRAFTER_HISLAYOUT")
 
+# DRAFT_LOWM_GEMM (opt-in, TRTLLM_M31_ENABLE_DRAFT_LOWM_GEMM=1; dspark_t6): the drafter's decode-block GEMMs the MXFP8
+# GEMV does not execute (the row-parallel o_proj and down, whose all-reduce takes the NCCL window output and so bypasses
+# the MXFP8 hook) on FlashInfer's low-M BF16 kernels at tactics pinned per (N, K, M): o_proj and down at 7 and 14 rows
+# (draft length 7, batches 1 and 2). Not bitwise against cuBLAS (drafter-only precision). With DRAFTER_HISLAYOUT on,
+# those projections already run MXFP8 at these rows, so the low-M route finds no (projection, rows) left. Read at
+# import.
+T6 = m31_enabled("DRAFT_LOWM_GEMM")
+# DRAFT_LOWM_GEMM takes every (projection, rows) the MXFP8 GEMV routed but does not execute
+# (drafter_mxfp8.executed_rows: none for a row-parallel projection whose forward bypasses apply_linear). Kill switch
+# TRTLLM_M31_DISABLE_DRAFT_LOWM_GEMM_HANDOFF=1: the low-M route leaves every projection the MXFP8 GEMV routed alone.
+MXDRAFT_RP = not m31_disabled("DRAFT_LOWM_GEMM_HANDOFF")
+
+# DRAFT_HEAD_MXFP8 (opt-in, TRTLLM_M31_ENABLE_DRAFT_HEAD_MXFP8=1; dspark_draft_head): the drafter head's Markov-chain
+# shard GEMM ([B x K, 6144] x [100032, 6144]^T) on a separate MXFP8 copy of the shard padded to 100,096 rows (FlashInfer
+# CuTe DSL quantize + CuTe DSL MXFP8 GEMM at a pinned tactic, logits sliced back to the shard) at the draft-length-7
+# batch-1 / batch-2 rows; any other row count keeps the BF16 head. Not bitwise (drafter-only precision); adds about
+# 634 MB per GPU at prebuild (before the KV cache is sized). Read at import.
+DHEAD_MX8 = m31_enabled("DRAFT_HEAD_MXFP8")
+
 # S9B-MC: S9b's fused drafter all-reduces + norms on the target's multicast all-reduce + norm (its 8-token bucket, the
 # drafter-norm form: the unrounded fp32 sum normalized, opts bit 16) instead of the stock fused all-reduce; not
 # bitwise, as S9b (a different summation order). The K7 c1 drafter block (8 rows) takes it; other row counts keep S9b's.
@@ -221,6 +242,24 @@ S9B_MC_MAX_ROWS = (
 )  # capacity: fixed: the K7 4-request drafter block (4 x 7 rows) fits 32
 # Whether this process's build takes the wide drafter form: None until the first eager wide call decides it.
 _S9B_MC_WIDE_STATE: dict = {"ok": None}
+
+
+def mcag_unreachable(worker) -> Optional[str]:
+    """Why no vocab-sharded draft logits reach the rejection sampler's all-gather that DRAFT_LOGITS_ALLGATHER_MC
+    replaces (None: some can). Only the S4-logits path hands the stock sampler a rank's vocab shard of the draft logits;
+    without it the drafter's head gathers its logits itself (gather_output), they arrive full-vocab, and the gather is
+    never called (no DRAFT_LOGITS_ALLGATHER_MC work at TP2)."""
+    if getattr(worker, "_s4", None) is None:
+        return (
+            "no vocab-sharded draft logits reach the rejection sampler: S4 is not set up, the drafter's gathered head "
+            "returns full-vocab logits"
+        )
+    if not getattr(worker, "_s4_logits_on", False):
+        return (
+            "no vocab-sharded draft logits reach the rejection sampler: S4-logits is off, sampled steps take the "
+            "in-tree chain on the gathered head's full-vocab logits"
+        )
+    return None
 
 
 def _counted(item: str, fn, *extra):
@@ -326,6 +365,10 @@ def _s9b_mc_wide_ready() -> bool:
 # earlier K7 divergence ran with the autotune unpinned). TRTLLM_M31_DISABLE_DRAFTER_LEAN_GLUE=1 turns it off.
 S10_MAX_DRAFT_LEN = 63
 
+# DRAFT_WINDOW_CAPPED_DECODE (opt-in, TRTLLM_M31_ENABLE_DRAFT_WINDOW_CAPPED_DECODE=1): the largest decode batch the
+# window-capped max_seq_len applies to, by draft length; 0 = off (draft length 3: never; 7: batches 1 and 2).
+S5_MAX_BATCH_BY_K = {3: 0, 7: 2}
+
 # TAIL_FORCEVEC: a fractional forced
 # acceptance (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS, the benchmark knob) draws the step's forced counts with the
 # one-launch m3_force_vec (the Eagle3 path's op) instead of the in-tree _apply_force_accepted_tokens' ~11 launches: the
@@ -334,6 +377,19 @@ S10_MAX_DRAFT_LEN = 63
 # per-request key (that switch drives only the Eagle3 fused verify). Default ON; kill switch
 # TRTLLM_M31_DISABLE_TAIL_FORCEVEC=1. Read at import.
 TAIL_FORCEVEC = not m31_disabled("TAIL_FORCEVEC")
+# TAIL_DEFER_CAPTURE (opt-in, TRTLLM_M31_ENABLE_TAIL_DEFER_CAPTURE=1; under TAIL_FORK the copy runs in the fork): on a
+# decode-only step, a capture layer whose MoE boundary is the MC finalize all-reduce (modeling's MC_FINALIZE branch:
+# m3_mc_finalize_allreduce_norm, the 9..48-row decode steps, so the draft-length-7 batch-2 16-row step) is kept by
+# reference instead of copied into the capture buffer, and the kept captures are written (the same bytes into the same
+# columns: copy_captures, one concatenation when every capture layer was kept) just before the drafter first reads the
+# buffer. No graph memcpy node then sits between a capture layer's boundary and the next layer's QKV GEMV. A capture is
+# kept only when its tensor is, by identity, the finalize op's updated residual (modeling.is_mc_finalize_capture,
+# published by the decode target around that one capture call): a fresh torch::empty_like output that every later
+# launch of the step only reads (the next layer's boundary takes it as a const input). Every other capture (8-row steps,
+# generic layers, mixed steps, the final hidden state) keeps the stock copy. FRONT_CAPFORK already takes these copies
+# off the layer chain (capture stream), so this stays off by default; when on, a kept capture skips the capture-stream
+# fork and TAIL_FORK's aux stream writes it. Read at import.
+TAIL_DEFER_CAPTURE = m31_enabled("TAIL_DEFER_CAPTURE")
 
 
 # TAIL_FORK (dspark_tailfork): at a
@@ -361,10 +417,50 @@ TAIL_FORK_MAX_ROWS = 16  # capacity: fixed: the K7 verify rows at batch 2 (b2t16
 TAIL_FORK_B1_ROWS = (
     8  # capacity: fixed: the K7 batch-1 verify rows (TAIL_FORK_B1 off: steps up to 8 rows unforked)
 )
+# TAIL_FORK_AFTER_VERIFY_GATHER (opt-in, TRTLLM_M31_ENABLE_TAIL_FORK_AFTER_VERIFY_GATHER=1): the fork point moves from
+# right after the verify head GEMM to right after the verify logits' multicast all-gather (VERIFY_LOGITS_ALLGATHER_MC,
+# "A1") launch, so the fork's work (its 1056-CTA fc first) waits for A1 to complete and cannot delay A1's CTAs; it then
+# overlaps the verify sampling only. Bitwise either way. Read at import.
+TAIL_FORK_AFTER_A1 = TAIL_FORK and m31_enabled("TAIL_FORK_AFTER_VERIFY_GATHER")
+# TAIL_FORK_ISSUE_AFTER_VERIFY_GATHER (opt-in, TRTLLM_M31_ENABLE_TAIL_FORK_ISSUE_AFTER_VERIFY_GATHER=1; launch order
+# only): the fork still depends only on the verify head GEMM (an event recorded right after it), but its kernels are
+# issued after A1's launch, so A1's graph node and host launch come first while the fork keeps overlapping A1. Bitwise
+# either way; TAIL_FORK_AFTER_VERIFY_GATHER wins over it. Read at import.
+TAIL_FORK_A1_FIRST = (
+    TAIL_FORK and not TAIL_FORK_AFTER_A1 and m31_enabled("TAIL_FORK_ISSUE_AFTER_VERIFY_GATHER")
+)
+# DRAFT_FC_SHARD (opt-in, TRTLLM_M31_ENABLE_DRAFT_FC_SHARD=1; ops/gemm/m31_fc_shard): the drafter's replicated fc as
+# this rank's 3072-column shard (mv2_minimax_m3::minimax_m31_fc_shard_gemm at the full fc's pinned cuBLASLt algo) + an
+# all-gather in rank order, bit for bit the full fc (the module's own forward) at its row counts (the draft-length
+# verify rows of batches 1..MAX_FAST_BATCH up to TAIL_FORK_MAX_ROWS) by its boot self-check (probes at each of those row
+# counts; a difference at one of them keeps the stock fc at that row count, on every rank). Inside the fork it halves
+# each rank's fc weight read and CTAs (less contention with A1 and the verify sampling). Read at import.
+FC_SHARD16 = m31_enabled("DRAFT_FC_SHARD")
+# TAIL_FC_GATHER (with DRAFT_FC_SHARD, inside the fork): the shards' all-gather as one multicast launch (catalog
+# allgather_f32 on the bf16 [rows, 3072] shard viewed as fp32 [rows, 1536]: the int32 words copied as is, in rank order
+# along the last dim, so the bf16 view of the result is the NCCL all-gather's [rows, 6144] bit for bit) on its own
+# workspace (not A1's), instead of the NCCL all-gather + concat. A fork that runs this multicast launch is forked after
+# the verify logits' all-gather (A1, or its NCCL fallback), never beside it: two spin-waiting collectives on two streams
+# have no proven progress order. The fork never all-gathers over NCCL: at row counts the multicast launch is not
+# compiled for, the fork runs the replicated fc (bitwise the shard + gather by the self-check). Kill switch
+# TRTLLM_M31_DISABLE_TAIL_FC_GATHER=1 (the replicated fc in the fork), read at import.
+TAIL_FC_GATHER = TAIL_FORK and FC_SHARD16 and not m31_disabled("TAIL_FC_GATHER")
+
+
+def _stock_projection(draft) -> bool:
+    """Whether ``draft`` projects with the in-tree DFlash project_target_hidden (fc or its DRAFT_FC_SHARD shard, then
+    hidden_norm), the one _tf_project reproduces with the multicast gather: the class's method is
+    DFlashForCausalLM's own (inherited, not overridden)."""
+    fn = getattr(type(draft), "project_target_hidden", None)
+    return (
+        getattr(fn, "__module__", None) == "tensorrt_llm._torch.models.modeling_dflash"
+        and getattr(fn, "__qualname__", None) == "DFlashForCausalLM.project_target_hidden"
+    )
 
 
 class _TailStep:
-    """One step's TAIL_FORK state (armed in arm_capture_norm, cleared when the worker's forward ends)."""
+    """One step's TAIL_FORK state (armed in arm_capture_norm, cleared when the worker's forward ends). The kept
+    captures stay in the step's _DeferredCaptures (TAIL_DEFER_CAPTURE), which the fork copies."""
 
     __slots__ = (
         "spec",
@@ -379,6 +475,7 @@ class _TailStep:
         "prep",
         "used",
         "refreshed",
+        "sharded",
         "stored",
         "skipped",
         "rebind",
@@ -401,10 +498,26 @@ class _TailStep:
         # fork's refresh writes keeps their blocks out of the caching allocator until the step-end join, even when a
         # draft KV cache rebind drops the worker's references while that write is still queued on the aux stream.
         self.refreshed = None
+        self.sharded = None  # how the fork's fc ran: "replicated", "DRAFT_FC_SHARD shard + multicast gather", ...
         self.stored = None  # the store wrapper's use of the prep: None (not asked), True (its kernel only), False
         self.skipped = False  # the in-tree refresh was skipped for the fork's
         self.rebind = False  # the fork was joined before a draft KV cache rebind (its refresh then redone on main)
         self.point = None  # where the fork was launched (after the verify head GEMM, A1, ...)
+
+
+class _DeferredCaptures:
+    """One decode step's TAIL_DEFER_CAPTURE state (armed in arm_capture_norm, written before the drafter reads the
+    capture buffer, dropped when the worker's forward ends)."""
+
+    __slots__ = ("spec", "kept", "copied")
+
+    def __init__(self, spec) -> None:
+        self.spec = spec
+        # [(capture index, boundary residual)] kept by reference: holding them keeps the caching allocator from handing
+        # their memory to any later allocation of the step before the copy into the buffer is queued.
+        self.kept = []
+        # The kept captures were written into the buffer (no later capture of the step is kept).
+        self.copied = False
 
 
 def s10_applies(num_draft_tokens: int) -> bool:
@@ -418,6 +531,15 @@ def install_draft_swiglu(draft_model) -> int:
         return 0
     layers = getattr(getattr(draft_model, "model", None), "layers", None) or []
     return native_swiglu.install(getattr(layer, "mlp", None) for layer in layers)
+
+
+def s5_max_batch_for(num_draft_tokens: int) -> int:
+    """K <= 3 takes the K3 entry, K >= 7 the K7 entry, and K in between the smaller of the two."""
+    if num_draft_tokens <= 3:
+        return S5_MAX_BATCH_BY_K[3]
+    if num_draft_tokens >= 7:
+        return S5_MAX_BATCH_BY_K[7]
+    return min(S5_MAX_BATCH_BY_K.values())
 
 
 def is_standalone_dspark(spec_config) -> bool:
@@ -517,6 +639,13 @@ DRAFT_A1 = not m31_disabled("DRAFT_A1")
 # A1 at draft lengths other than 3 (K7 included; switch TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC_ANY_DRAFT_LEN, K3
 # keeps A1).
 A1_K7_DISABLED = m31_disabled("VERIFY_LOGITS_ALLGATHER_MC_ANY_DRAFT_LEN")
+# DRAFT_LOGITS_ALLGATHER_MC (opt-in, TRTLLM_M31_ENABLE_DRAFT_LOGITS_ALLGATHER_MC=1): the rejection sampler's gather of
+# the vocab-sharded fp32 draft logits (stock: the NCCL all-gather + a concat copy) as one launch on the
+# VERIFY_LOGITS_ALLGATHER_MC multicast workspace (allgather_cast.allgather_f32: copied as is, bit for bit). Taken for
+# the B * K draft rows up to the fp32 capacity while that workspace is set up; other shapes keep the stock all-gather.
+# Off by default: with it on, two runs of the same requests sampled different tokens on a few long requests, which the
+# stock all-gather does not. Read at import.
+MCAG = m31_enabled("DRAFT_LOGITS_ALLGATHER_MC")
 # DRAFT_APPEND_FUSE: on top of EX11, the same
 # launch also writes the drafter block's K / V into the layer's paged cache (catalog qk_norm_rope_append: the same K
 # bits, V copied, the same pages and slots as flashinfer's append_paged_kv_cache, HND), and the per-layer append launch
@@ -670,7 +799,22 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         self, spec_metadata, layer_id: int, hidden_states, residual=None
     ) -> None:
         """The in-tree DFlash capture: layer output (hidden + residual) into the static capture buffer; a decode
-        capture layer's plain copy of up to FRONT_CAPFORK_MAX_ROWS rows runs on the capture stream (FRONT_CAPFORK)."""
+        capture layer's plain copy of up to FRONT_CAPFORK_MAX_ROWS rows runs on the capture stream (FRONT_CAPFORK).
+        Under TAIL_DEFER_CAPTURE (opt-in), on a step armed for it, a capture whose tensor is the MC finalize
+        boundary's updated residual is kept by reference instead, and written (the same bytes) before the drafter reads
+        the buffer; such a capture does not reach the capture-stream fork."""
+
+        st = self._dc
+        if (
+            st is not None
+            and residual is None
+            and spec_metadata is st.spec
+            and not st.copied
+            and self._dc_keepable(spec_metadata, layer_id, hidden_states)
+        ):
+            st.kept.append((spec_metadata._layer_to_idx[layer_id], hidden_states))
+            return
+
         m31_capture_fork.capture_or_inline(
             spec_metadata,
             layer_id,
@@ -686,7 +830,9 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
     def arm_capture_norm(
         self, attn_metadata, spec_metadata, lm_head: nn.Module, draft_model
     ) -> None:
-        """No capture norm: DSpark's fc reads the raw captured layers. Arms (or clears) this step's TAIL_FORK."""
+        """No capture norm: DSpark's fc reads the raw captured layers. Arms (or clears) this step's
+        TAIL_DEFER_CAPTURE and TAIL_FORK."""
+        self._dc = self._dc_arm(attn_metadata, spec_metadata) if self._dc_on else None
         self._tf = (
             self._tf_arm(attn_metadata, spec_metadata, draft_model)
             if self._tf_aux is not None
@@ -694,10 +840,106 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         )
         return None
 
+    # ------------------------------------------------------------------------------------- TAIL_DEFER_CAPTURE
+
+    _dc = None  # this step's _DeferredCaptures, or None
+    _dc_on = False  # TAIL_DEFER_CAPTURE set up (prebuild)
+    _dc_logged = ()  # the (rows, kept, one concatenation) shapes whose engagement line this rank logged
+
+    def _dc_arm(self, attn_metadata, spec_metadata):
+        """This step's deferred-capture state when the step is one TAIL_DEFER_CAPTURE serves, else None: a
+        decode-only, non-ragged drafting step with a DFlash capture buffer. Host state only (the same on every rank,
+        fixed per captured graph); which captures are kept is decided per capture (_dc_keepable)."""
+        if spec_metadata is None or attn_metadata is None:
+            return None
+        if getattr(spec_metadata, "is_ragged_verify", False):
+            return None
+        if attn_metadata.num_contexts != 0:
+            return None
+        if int(getattr(spec_metadata, "runtime_draft_len", 0) or 0) <= 0:
+            return None
+        if getattr(spec_metadata, "captured_hidden_states", None) is None or not getattr(
+            spec_metadata, "layers_to_capture", None
+        ):
+            return None
+        return _DeferredCaptures(spec_metadata)
+
+    def _dc_keepable(self, spec_metadata, layer_id: int, hidden_states) -> bool:
+        """Whether this capture can be kept by reference: the decode capture layer's MC finalize boundary residual
+        (modeling.is_mc_finalize_capture: this exact tensor, during its capture call), a capture layer, the buffer's
+        dtype and width, every row fits."""
+        from . import modeling as _modeling  # imported here: modeling imports this module
+
+        if not isinstance(hidden_states, torch.Tensor) or not _modeling.is_mc_finalize_capture(
+            hidden_states
+        ):
+            return False
+        idx = getattr(spec_metadata, "_layer_to_idx", {}).get(layer_id)
+        buf = spec_metadata.captured_hidden_states
+        return (
+            idx is not None
+            and hidden_states.dim() == 2
+            and hidden_states.is_contiguous()
+            and hidden_states.dtype == buf.dtype
+            and hidden_states.device == buf.device
+            and hidden_states.shape[1] == spec_metadata.hidden_size
+            and hidden_states.shape[0] <= buf.shape[0]
+        )
+
+    _dc_fork_logged = ()  # the (rows, kept, one concatenation, captured) in-fork takes whose line this rank logged
+
+    def _dc_flush(
+        self, st: _DeferredCaptures, forked: bool = False, captured: bool = False
+    ) -> None:
+        """Write the kept captures into the buffer on the current stream (copy_captures), once; later captures of the
+        step (none on the stock path) are copied as they come. ``forked``: the call runs on TAIL_FORK's stream (the
+        same copy, earlier; its own engagement line, which says whether the step is being captured: ``captured``)."""
+        if st.kept and not st.copied:
+            spec = st.spec
+            rows = st.kept[0][1].shape[0]
+            cat = copy_captures(
+                spec.captured_hidden_states,
+                rows,
+                spec.hidden_size,
+                spec.num_capture_layers,
+                st.kept,
+            )
+            key = (rows, len(st.kept), cat)
+            rank = getattr(getattr(self, "mapping", None), "tp_rank", None)
+            if forked:
+                if (*key, captured) not in self._dc_fork_logged:
+                    self._dc_fork_logged = (*self._dc_fork_logged, (*key, captured))
+                    logger.info(
+                        f"[M3 sm107 tp2] fast path engaged: TAIL_DEFER_CAPTURE taken in the TAIL_FORK fork ({rows} "
+                        f"rows, {len(st.kept)} of {spec.num_capture_layers} captures, "
+                        f"{'one concatenation' if cat else 'slice copies'}, "
+                        f"{'under CUDA-graph capture' if captured else 'eager'}): MC finalize boundary residuals kept "
+                        f"by reference and written on the fork's stream before the drafter's fc reads them on rank "
+                        f"{rank}"
+                    )
+            elif key not in self._dc_logged:
+                self._dc_logged = (*self._dc_logged, key)
+                logger.info(
+                    f"[M3 sm107 tp2] fast path engaged: TAIL_DEFER_CAPTURE taken ({rows} rows, {len(st.kept)} of "
+                    f"{spec.num_capture_layers} captures, "
+                    f"{'one concatenation' if cat else 'slice copies'}): MC finalize boundary residuals kept by "
+                    f"reference and written before the drafter reads them on rank "
+                    f"{rank}"
+                )
+            m3_report.work(
+                "TAIL_DEFER_CAPTURE",
+                f"{len(st.kept)} captures, {rows} rows, {'one concatenation' if cat else 'slice copies'}"
+                + (", in the fork" if forked else ""),
+            )
+        st.copied = True
+
     # ------------------------------------------------------------------------------------------------ TAIL_FORK
 
     _tf = None  # this step's _TailStep, or None
     _tf_aux = None  # the fork's stream (prebuild, TAIL_FORK)
+    _tf_gather = (
+        None  # TAIL_FC_GATHER: (allgather_f32 workspace args, rows, fp32 shard columns) (prebuild)
+    )
     _tf_logged = (
         False  # the TAIL_FORK engagement line (first fork under CUDA-graph capture) was logged
     )
@@ -710,8 +952,9 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
     def _tf_arm(self, attn_metadata, spec_metadata, draft_model):
         """This step's fork state when the step is one TAIL_FORK serves, else None. Host state and shapes only (the
         same on every rank, fixed per captured graph): a decode-only, non-ragged drafting step of n requests x (K + 1)
-        rows (at most TAIL_FORK_MAX_ROWS), a DFlash capture buffer, a drafter with the stock fc (no S2 split; the
-        replicated fc), the context bound to the draft pool."""
+        rows (at most TAIL_FORK_MAX_ROWS), a DFlash capture buffer, a drafter with the stock fc (no DRAFT_FC_TP_SPLIT
+        split; the replicated fc, or DRAFT_FC_SHARD's shard when it takes these rows), the context bound to the draft
+        pool."""
         if draft_model is None or spec_metadata is None or attn_metadata is None:
             return None
         if getattr(spec_metadata, "is_ragged_verify", False):
@@ -739,6 +982,15 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
             or getattr(draft_model, "hidden_norm", None) is None
         ):
             return None
+        shard = getattr(draft_model, "_dflash_fc_shard", None)
+        if (
+            shard is not None
+            and shard.applies(draft_model.fc, rows)
+            and not _stock_projection(draft_model)
+        ):
+            return (
+                None  # a projection of its own might all-gather the shard over NCCL inside the fork
+            )
         if not (
             getattr(self, "_ctx_buf_inited", False)
             and getattr(self, "_ctx_paged", False)
@@ -747,20 +999,32 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
             return None
         return _TailStep(spec_metadata, draft_model, attn_metadata, rows, total)
 
-    def _tf_launch(self) -> None:
-        """Fork this step's drafter input work onto the aux stream, after everything queued on the current stream (the
-        target forward, its captures and the verify head GEMM)."""
+    def _tf_launch(self, after=None, point: str = "head") -> None:
+        """Fork this step's drafter input work onto the aux stream: after everything queued on the current stream
+        (the target forward, its captures, the verify head GEMM and, at a later ``point``, the verify logits'
+        all-gather), or, with ``after``, after that event only (TAIL_FORK_ISSUE_AFTER_VERIFY_GATHER: the head
+        GEMM's)."""
         st = self._tf
         if st is None or st.forked:
             return
+        dc = self._dc
+        if dc is not None and dc.spec is not st.spec:
+            return  # never: both are armed from the same step's metadata
         spec, draft = st.spec, st.draft
         aux = self._tf_aux
-        aux.wait_stream(torch.cuda.current_stream())
+        captured = torch.cuda.is_current_stream_capturing()
+        if after is None:
+            aux.wait_stream(torch.cuda.current_stream())
+        else:
+            aux.wait_event(after)
         with torch.cuda.stream(aux):
+            # TAIL_DEFER_CAPTURE's kept captures, written before the fc reads the buffer (the same bytes).
+            if dc is not None:
+                self._dc_flush(dc, forked=True, captured=captured)
             hs = spec.get_hidden_states(st.total)
             gen = hs[0 : st.rows]
             gen = gen.reshape(-1, gen.shape[-1])
-            proj = draft.project_target_hidden(gen)
+            proj, st.sharded = self._tf_project(draft, gen)
             prep = None
             kv_buf = getattr(self, "_ctx_kv_buf", None)
             if self._tf_kv and kv_buf is not None:
@@ -776,7 +1040,7 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
                     # Both written tensors held until the step-end join (see _TailStep.refreshed).
                     st.refreshed = (tables, counts, num_seqs, attn)
         st.forked = True
-        st.point = "head"
+        st.point = point
         st.key = view_key(gen)
         st.proj = proj
         st.prep = prep
@@ -789,7 +1053,7 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         rank = getattr(getattr(self, "mapping", None), "tp_rank", None)
         captured = torch.cuda.is_current_stream_capturing()
         what = (
-            f"drafter fc (replicated){' + ctx K/V prep' if st.prep is not None else ''}"
+            f"drafter fc ({st.sharded}){' + ctx K/V prep' if st.prep is not None else ''}"
             f"{' + block-table refresh' if st.refreshed is not None else ''}"
         )
         if captured and not self._tf_logged:
@@ -806,6 +1070,64 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
                 f"the verify {st.point} on rank {rank}"
             )
         m3_report.work("TAIL_FORK", f"{st.rows} rows, {what}")
+
+    def _tf_gather_takes(self, rows: int) -> bool:
+        g = self._tf_gather
+        return g is not None and rows in g[1]
+
+    def _tf_mc(self, st: _TailStep) -> bool:
+        """Whether this step's fork runs TAIL_FC_GATHER's multicast all-gather (DRAFT_FC_SHARD's shard takes its rows
+        and the multicast launch is compiled for them): such a fork is launched after the verify logits' all-gather."""
+        draft = st.draft
+        shard = getattr(draft, "_dflash_fc_shard", None)
+        return (
+            shard is not None
+            and shard.applies(draft.fc, st.rows)
+            and self._tf_gather_takes(st.rows)
+        )
+
+    def _tf_late(self, a1: bool) -> bool:
+        """Whether this step's fork is launched after the verify logits' all-gather instead of right after the head
+        GEMM: TAIL_FORK_AFTER_VERIFY_GATHER (with A1 taken), or a fork with TAIL_FC_GATHER's multicast launch (never
+        beside A1's or the NCCL all-gather)."""
+        st = self._tf
+        if st is None or st.forked:
+            return False
+        return (TAIL_FORK_AFTER_A1 and a1) or self._tf_mc(st)
+
+    def _tf_project(self, draft, hidden_states):
+        """(the drafter's projection of ``hidden_states``, how the fc ran), with no collective but TAIL_FC_GATHER's
+        multicast launch: where DRAFT_FC_SHARD's shard takes these rows, its shard GEMM + that multicast all-gather when
+        it is compiled for them (the same partial GEMM, the same gathered bytes, the same hidden norm), else the
+        replicated fc (bitwise the shard + gather at these rows by DRAFT_FC_SHARD's self-check), never the NCCL
+        all-gather (_tf_arm armed such a step only with the stock projection); without the shard, the drafter's own
+        projection (the replicated fc)."""
+        shard = getattr(draft, "_dflash_fc_shard", None)
+        rows = hidden_states.shape[0]
+        if shard is None or not shard.applies(draft.fc, rows):
+            return draft.project_target_hidden(hidden_states), "replicated"
+        x = hidden_states.to(draft.fc.weight.dtype)  # project_target_hidden's first line
+        if self._tf_gather_takes(rows):
+            ws, _, cols = self._tf_gather
+            part = shard.partial(x)
+            if (
+                part.dtype == torch.bfloat16
+                and part.is_contiguous()
+                and part.shape == (rows, 2 * cols)
+                and part.data_ptr() % 16 == 0
+                and _allgather_cast.is_compiled(
+                    rows, cols, ws["world"], device=part.device, fp32=True
+                )
+            ):
+                full = _allgather_cast.allgather_f32(part.view(torch.float32), **ws)
+                return (
+                    draft.hidden_norm(full.view(torch.bfloat16)),
+                    "DRAFT_FC_SHARD shard + multicast gather",
+                )
+        return (
+            draft.hidden_norm(draft.fc(x)),
+            "replicated: DRAFT_FC_SHARD's multicast gather not compiled at these rows",
+        )
 
     def _refresh_ctx_block_tables(self, attn_metadata, num_seqs: int) -> bool:
         """The in-tree refresh, unless this step's fork already refreshed the same tables for the same step."""
@@ -922,9 +1244,12 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         return inputs
 
     def _tf_prepare_1st_drafter_inputs(self, *args, **kwargs):
-        """The in-tree first drafter inputs (the drafter's fc reads the capture buffer here first); on a forked step the
-        drafter's project_target_hidden returns the fork's rows (after the join) for exactly the rows the fork
-        projected."""
+        """The in-tree first drafter inputs (the drafter's fc reads the capture buffer here first), after this step's
+        kept captures are written into it (by the fork, or here); on a forked step the drafter's project_target_hidden
+        returns the fork's rows (after the join) for exactly the rows the fork projected."""
+        dc = self._dc
+        if dc is not None:
+            self._dc_flush(dc)  # nothing left to write when the fork copied them
         st = self._tf
         if st is None or not st.forked:
             return super().prepare_1st_drafter_inputs(*args, **kwargs)
@@ -1001,19 +1326,58 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         )
 
     def _tf_prebuild(self, draft_model) -> None:
-        """TAIL_FORK's stream (rank-local), outside capture, on every rank; then its set-up line."""
+        """TAIL_FORK's stream (rank-local) and TAIL_FC_GATHER's workspace + compiles (collective, after A1's workspace
+        fixed the multicast capacity), outside capture, on every rank; then its set-up line."""
         rank = getattr(getattr(self, "mapping", None), "tp_rank", None)
         if TAIL_FORK and draft_model is not None and torch.cuda.is_available():
             self._tf_aux = torch.cuda.Stream()
+        shard = getattr(draft_model, "_dflash_fc_shard", None) if draft_model is not None else None
+        if self._tf_aux is not None and TAIL_FC_GATHER and shard is not None:
+            self._tf_gather = self._tf_prebuild_gather(draft_model)
         on = self._tf_aux is not None
+        point = (
+            "A1 all-gather"
+            if TAIL_FORK_AFTER_A1
+            else ("head, issued after A1's launch" if TAIL_FORK_A1_FIRST else "head")
+        )
         logger.info(
             f"M3.1 DSpark TAIL_FORK: {'on' if on else 'off'} (decode steps up to {TAIL_FORK_MAX_ROWS} rows, the "
-            f"{TAIL_FORK_B1_ROWS}-row batch-1 step {'on' if TAIL_FORK_B1 else 'off'}; fork after the verify head; "
+            f"{TAIL_FORK_B1_ROWS}-row batch-1 step {'on' if TAIL_FORK_B1 else 'off'}; fork after the verify {point}; "
             f"KV prep {'on' if self._tf_kv and on else 'off'}, refresh {'on' if TAIL_FORK_REFRESH and on else 'off'}, "
-            "fc replicated"
+            f"captures in the fork {'on' if self._dc_on and on else 'off'}, fc "
+            f"{'DRAFT_FC_SHARD' if shard is not None else 'replicated'}, fc gather in the fork "
+            + (
+                f"multicast at rows {self._tf_gather[1]}, forked after the verify logits' all-gather"
+                if self._tf_gather is not None
+                else ("none: the replicated fc" if shard is not None else "none")
+            )
             + f") on rank {rank}"
             + ("" if TAIL_FORK else " (TRTLLM_M31_DISABLE_TAIL_FORK set)")
         )
+
+    def _tf_prebuild_gather(self, draft_model):
+        """TAIL_FC_GATHER's workspace and compile (collective: every rank of the TP group runs it at the same point of
+        prebuild, and every rank keeps it only if every rank compiled): (workspace args, rows, fp32 columns) or None."""
+        mapping = getattr(self, "mapping", None)
+        shard = getattr(draft_model, "_dflash_fc_shard", None)
+        if mapping is None or mapping.tp_size <= 1 or mapping.enable_attention_dp or shard is None:
+            return None
+        k = int(getattr(getattr(self, "spec_config", None), "max_draft_len", 0) or 0)
+        rows = tuple(
+            b * (k + 1)
+            for b in range(1, MAX_FAST_BATCH + 1)
+            if 0 < b * (k + 1) <= TAIL_FORK_MAX_ROWS and shard.applies(draft_model.fc, b * (k + 1))
+        )
+        w = shard.w_shard
+        if not rows or w.dtype != torch.bfloat16 or w.shape[0] % 8 != 0:
+            return None
+        cols = w.shape[0] // 2
+        if not _allgather_cast.precompile_f32(mapping, cols, rows, w.device, agree=self._a1_all_ok):
+            logger.warning(
+                "M3.1 DSpark TAIL_FC_GATHER: a compile failed on some rank; the fc keeps NCCL"
+            )
+            return None
+        return (_allgather_cast.workspace_args(mapping, cols), rows, cols)
 
     # -------------------------------------------------------------------------------- TAILGLUE_B / MEMCPY86K
 
@@ -1113,8 +1477,9 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
             )
 
     def _forward_impl(self, *args, **kwargs):
-        """The S4 / DFlash step; a forked step's aux stream is always joined before the step returns, and no step state
-        (TAIL_FORK, TAILGLUE_B, MEMCPY86K) outlives the step."""
+        """The S4 / DFlash step; a forked step's aux stream is always joined and kept captures are always written
+        before the step returns, and no step state (TAIL_FORK, TAIL_DEFER_CAPTURE, TAILGLUE_B, MEMCPY86K) outlives
+        the step."""
         attn = kwargs.get("attn_metadata", args[4] if len(args) > 4 else None)
         self._decode_step = attn is not None and int(getattr(attn, "num_contexts", 1)) == 0
         done = False
@@ -1129,7 +1494,11 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
                 self._tf_join(st)
                 if done:
                     self._tf_account(st)
+            dc = self._dc
+            if dc is not None:
+                self._dc_flush(dc)
             self._tf = None
+            self._dc = None
             self._tfold_end_step(kwargs.get("draft_model", args[6] if len(args) > 6 else None))
 
     # ------------------------------------------------------------------------------------------- TAIL_FORCEVEC
@@ -1250,19 +1619,57 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         k = getattr(getattr(self, "spec_config", None), "max_draft_len", 0) or 0
         lean = not m31_disabled("DRAFTER_LEAN_GLUE") and s10_applies(k)
         self.enable_lean_glue(draft_model, lean)
-        # S5 (window-capped drafter decode) and S2 (the drafter's fc split row-parallel) stay off.
-        self.enable_window_capped_decode(draft_model, 0)
+        # DRAFT_WINDOW_CAPPED_DECODE (opt-in): window-capped max_seq_len for the drafter's sliding-window decode (not
+        # bitwise: the TRTLLM-Gen tile / KV split changes, not the keys read).
+        s5_max_batch = s5_max_batch_for(k) if m31_enabled("DRAFT_WINDOW_CAPPED_DECODE") else 0
+        self.enable_window_capped_decode(draft_model, s5_max_batch)
         self.enable_full_slot_arena()
-        s2 = self.enable_fc_tp_split(draft_model, False)
+        # DRAFT_FC_TP_SPLIT (opt-in): the drafter's replicated fc split row-parallel with one fp32 all-reduce (not
+        # bitwise: the partial-sum order changes). Collective.
+        s2 = self.enable_fc_tp_split(draft_model, m31_enabled("DRAFT_FC_TP_SPLIT"))
         split = getattr(draft_model, "_dflash_fc_split", None)
+        # DRAFT_FC_SHARD (opt-in; bitwise by its boot self-check at each of its row counts, the draft-length verify rows
+        # of batches 1..MAX_FAST_BATCH within its bound; collective when on: every rank builds or every rank declines).
+        # DRAFT_FC_TP_SPLIT, when on, wins. No drafter (a shell worker): nothing to set.
+        if draft_model is not None and getattr(draft_model, "fc", None) is not None:
+            fc_rows = tuple(
+                b * (k + 1)
+                for b in range(1, MAX_FAST_BATCH + 1)
+                if k > 0 and b * (k + 1) <= TAIL_FORK_MAX_ROWS
+            )
+            draft_model._dflash_fc_shard = (
+                FcShard.build(draft_model.fc, self.mapping, rows=fc_rows)
+                if FC_SHARD16 and not s2 and fc_rows
+                else None
+            )
+        logger.info(
+            f"M3.1 DSpark DRAFT_FC_SHARD: drafter fc as column shards + all-gather at up to {TAIL_FORK_MAX_ROWS} rows "
+            f"{'on' if getattr(draft_model, '_dflash_fc_shard', None) is not None else 'off'} on rank {rank}"
+            + (
+                ""
+                if FC_SHARD16
+                else " (default off: opt in with TRTLLM_M31_ENABLE_DRAFT_FC_SHARD=1)"
+            )
+        )
         ar = split[3] if split is not None else None
         ar_path = (
             "MNNVL"
             if getattr(ar, "mnnvl_allreduce", None) is not None
             else getattr(ar, "strategy", None)
         )
-        logger.info(f"M3.1 DSpark S2: fc TP split {'on' if s2 else 'off'} on rank {rank} (all-reduce "
+        logger.info(f"M3.1 DSpark DRAFT_FC_TP_SPLIT: fc TP split {'on' if s2 else 'off'} on rank {rank} (all-reduce "
                     f"{ar_path})")  # fmt: skip
+        logger.info(f"M3.1 DSpark DRAFT_WINDOW_CAPPED_DECODE: window-capped draft decode for batches <= "
+                    f"{s5_max_batch} on rank {rank}")  # fmt: skip
+        # DRAFT_FMHA_BATCH2_SPLIT (opt-in; dspark_draft_fmha): the batch-2 window decode as two per-request
+        # window-capped calls on two streams (not bitwise: drafter-only precision). Config only, the same on every
+        # rank.
+        from . import dspark_draft_fmha as _dfmha
+
+        _, dfmha_line = (
+            _dfmha.install(draft_model, rank) if k > 0 else (False, "off: no draft length")
+        )
+        logger.info(f"M3.1 DSpark DRAFT_FMHA_BATCH2_SPLIT: {dfmha_line} on rank {rank}")
         logger.info(f"M3.1 DSpark S10: lean drafter glue {'on' if lean else 'off'} on rank {rank}")
         # S9b: each drafter layer's all-reduce fused with the add + RMSNorm after it (not bitwise: the sum is not
         # rounded before the add). On by default; kill switch TRTLLM_M31_DISABLE_DRAFT_AR_NORM_FUSED, read at import.
@@ -1407,9 +1814,39 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
             else route_mx_linears(draft_model, [b * k for b in range(1, MAX_FAST_BATCH + 1)])
         )
         logger.info(f"M3.1 DSpark MXDRAFT: MXFP8 drafter GEMV on {mx} projections on rank {rank}")
+        # DRAFT_LOWM_GEMM (opt-in): the decode-block GEMMs the MXFP8 GEMV does not execute on the pinned low-M kernels
+        # (compiled here, outside capture).
+        t6 = (
+            0
+            if not T6 or k <= 0
+            else route_lowm_linears(
+                draft_model,
+                [b * k for b in range(1, MAX_FAST_BATCH + 1)],
+                handoff=MXDRAFT_RP,
+                rank=rank,
+            )
+        )
+        logger.info(
+            f"M3.1 DSpark DRAFT_LOWM_GEMM: low-M drafter GEMMs on {t6} projections on rank {rank} ("
+            + (
+                "default off: opt in with TRTLLM_M31_ENABLE_DRAFT_LOWM_GEMM=1"
+                if not T6
+                else f"MXFP8 hand-off {'on' if MXDRAFT_RP else 'off'}"
+            )
+            + ")"
+        )
         if k > 0:
             logger.info(routes_line(draft_model, (k, 2 * k), rank))
+        # DRAFT_MLP_MXFP8_14_ROWS (opt-in; dspark_draft_mlp): the drafter MLP's gate_up + SwiGLU at the draft-length-7
+        # batch-2 block (14 rows) as MXFP8 quantize + MX GEMV with the SwiGLU in its epilogue (drafter-only precision;
+        # the routes line above keeps the default names). Collective agreement when on.
+        from . import dspark_draft_mlp as _dmlp
+
+        logger.info(_dmlp.prebuild(draft_model, k, rank, self._a1_all_ok))
         self.prebuild_s4(lm_head, draft_model)
+        # DRAFT_HEAD_NVFP4 (dspark_draft_head_fp4) first, then DRAFT_HEAD_MXFP8 unless the NVFP4 copy took the drafter
+        # head.
+        self._prebuild_draft_heads(lm_head, k, rank, draft_model)
         # DHEAD_NOSLICE: the MARKOV16 fold kernels for the head copy's padded output window (collective when a head copy
         # that declares padded_window is set up: it is on every rank or on none); its off line otherwise.
         self.prebuild_dhead_noslice()
@@ -1419,7 +1856,20 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
         self._a1 = self._prebuild_a1(lm_head) if lm_head is not None else None
         if DRAFT_A1 and self._a1 is not None:
             self._prebuild_draft_a1(lm_head, draft_model)
-        self.enable_draft_logits_gather_op(None)
+        # The rank-agreed Markov-chain set-up and its logits switch decide whether any vocab-sharded draft logits reach
+        # the gather DRAFT_LOGITS_ALLGATHER_MC replaces; when none can, it is not compiled and its line says why (every
+        # rank alike).
+        mcag_off = mcag_unreachable(self) if self._a1 is not None and MCAG else None
+        self._mcag_cols = (
+            self._prebuild_mcag(lm_head)
+            if self._a1 is not None and MCAG and mcag_off is None
+            else 0
+        )
+        mcag = self.enable_draft_logits_gather_op(self._mcag_gather if self._mcag_cols else None)
+        logger.info(
+            "M3.1 DRAFT_LOGITS_ALLGATHER_MC: draft-logits all-gather on the multicast kernel "
+            f"{'on' if mcag else 'off'} on rank {rank}" + (f" ({mcag_off})" if mcag_off else "")
+        )
         n3a_kv = False
         if not N3A_KV_DISABLED and lm_head is not None:
             _strict_accept.precompile_kv_rewind(lm_head.weight.device)
@@ -1475,8 +1925,81 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
                 ),
             )
         )
-        # TAIL_FORK: the fork's stream.
+        # TAIL_DEFER_CAPTURE: the MC finalize boundary's capture residuals kept by reference on decode-only steps.
+        self._dc_on = TAIL_DEFER_CAPTURE
+        logger.info(
+            f"M3.1 DSpark TAIL_DEFER_CAPTURE: MC finalize capture residuals kept by reference and written before the "
+            f"drafter reads them {'on' if self._dc_on else 'off'} on rank {rank}"
+        )
+        # TAIL_FORK: the fork's stream, then (DRAFT_FC_SHARD on) TAIL_FC_GATHER's workspace after A1's (collective).
         self._tf_prebuild(draft_model)
+
+    def _prebuild_draft_heads(self, lm_head: nn.Module, k: int, rank, draft_model=None) -> None:
+        """The drafter head's copies, by precedence: DRAFT_HEAD_NVFP4 (dspark_draft_head_fp4: an NVFP4 copy whose
+        activation scale comes from the drafter's final RMSNorm; opt-in, collective agreement when on) first; when every
+        rank set it up it serves the head and DRAFT_HEAD_MXFP8 is not built (one line names why); otherwise
+        DRAFT_HEAD_MXFP8 (an MXFP8 copy; opt-in, collective agreement when on)."""
+        from . import dspark_draft_head_fp4 as _dheadfp4
+
+        fp4_on, fp4_line = _dheadfp4.prebuild(
+            getattr(self, "_s4", None),
+            lm_head,
+            k,
+            rank,
+            getattr(getattr(self, "mapping", None), "tp_size", None),
+            self._a1_all_ok,
+            norm=getattr(getattr(draft_model, "model", None), "norm", None),
+        )
+        logger.info(fp4_line)
+        if fp4_on:
+            why = (
+                "DRAFT_HEAD_NVFP4 set up: the NVFP4 copy takes precedence"
+                if DHEAD_MX8
+                else "default off: opt in with TRTLLM_M31_ENABLE_DRAFT_HEAD_MXFP8=1"
+            )
+            # "not built", not "MXFP8 draft head off": the latter names a DRAFT_HEAD_MXFP8 set-up failure.
+            logger.info(
+                f"M3.1 DSpark DRAFT_HEAD_MXFP8: not built on rank {rank} ({why}); NVFP4 draft head"
+            )
+            return
+        self._prebuild_dhead8(lm_head)
+
+    def _prebuild_dhead8(self, lm_head: nn.Module) -> bool:
+        """Set up DRAFT_HEAD_MXFP8 on the Markov-chain state (every rank or none); False, with one line naming why, when
+        it is off.
+        Off by its switch: no collective (the environment is the same on every rank). On: every rank builds the copy
+        (or names why not) and the ranks agree before any of them uses it."""
+        mapping = getattr(self, "mapping", None)
+        rank = getattr(mapping, "tp_rank", None)
+        if not DHEAD_MX8:
+            why = "default off: opt in with TRTLLM_M31_ENABLE_DRAFT_HEAD_MXFP8=1"
+            logger.info(
+                f"M3.1 DSpark DRAFT_HEAD_MXFP8: MXFP8 draft head off on rank {rank} ({why}); BF16 draft head"
+            )
+            return False
+        state = getattr(self, "_s4", None)
+        k = int(getattr(getattr(self, "spec_config", None), "max_draft_len", 0) or 0)
+        why = _dhead8.unfit(lm_head, getattr(state, "shard", None), k)
+        head8 = None
+        if why is None:
+            try:
+                head8 = _dhead8.DraftHeadMx8(lm_head, [b * k for b in _dhead8.BATCHES], rank=rank)
+            except Exception as e:  # noqa: BLE001 - any set-up failure (a FlashInfer compile, memory) declines on
+                # every rank through the agreement below instead of leaving the ranks on different heads
+                why = f"set-up failed: {type(e).__name__}: {e}"
+        if not self._a1_all_ok(why is None):
+            logger.info(
+                f"M3.1 DSpark DRAFT_HEAD_MXFP8: MXFP8 draft head off on rank {rank} ({why or 'off on another rank'}); "
+                "BF16 draft head"
+            )
+            return False
+        state.head8 = head8
+        logger.info(
+            f"M3.1 DSpark DRAFT_HEAD_MXFP8: MXFP8 draft head set up on rank {rank}/{getattr(mapping, 'tp_size', None)} "
+            f"(shard {head8.n} rows padded to {head8.np}, K {head8.k}, rows {head8.rows}, tactic {_dhead8.TACTIC}, "
+            f"quantize {head8.quantizer}, copy {head8.bytes / 1e6:.1f} MB, set-up {head8.setup_s:.2f} s)"
+        )
+        return True
 
     _n3a_kv_buf = None  # the persistent rewind amounts of N3A-KV (int32, MAX_REQUESTS)
 
@@ -1620,6 +2143,47 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
             f"M3.1 DRAFT_A1: draft-head all-gather set up on rank {self.mapping.tp_rank}, rows {rows}"
         )
 
+    def _prebuild_mcag(self, lm_head: nn.Module) -> int:
+        """Compile the fp32 draft-logits gather for B * K rows up to its capacity, on every rank (A1's workspace and
+        agreement); its shard columns, or 0 (every rank alike) when a compile fails anywhere."""
+        cols = int(getattr(lm_head, "out_features", 0))
+        k = int(self.max_draft_len)
+        if k <= 0 or cols % 4 != 0:
+            return 0
+        rows = tuple(b * k for b in range(1, _allgather_cast.MAX_ROWS_FP32 // k + 1))
+        if not _allgather_cast.precompile_f32(
+            lm_head.mapping, cols, rows, lm_head.weight.device, agree=self._a1_all_ok
+        ):
+            logger.warning(
+                "M3.1 DRAFT_LOGITS_ALLGATHER_MC: a compile failed on some rank; every rank keeps the NCCL all-gather"
+            )
+            return 0
+        return cols
+
+    def _mcag_gather(self, logits: torch.Tensor):
+        """The draft logits gathered in one launch on the A1 workspace, or None (the stock all-gather) for a shape
+        that is not compiled; the decision depends on the shape only, the same on every rank."""
+        rows = logits.numel() // max(int(logits.shape[-1]), 1)
+        if (
+            logits.dtype != torch.float32
+            or int(logits.shape[-1]) != self._mcag_cols
+            or not _allgather_cast.is_compiled(
+                rows, self._mcag_cols, self._a1["world"], device=logits.device, fp32=True
+            )
+        ):
+            _a1_log_once(
+                ("mcag", rows, logits.dtype),
+                f"[M3 dispatch] DRAFT_LOGITS_ALLGATHER_MC draft-logits all-gather not taken: {rows} rows "
+                f"{logits.dtype}; NCCL all-gather",
+            )
+            return None
+        _a1_log_once(
+            "mcag",
+            "[M3 dispatch] DRAFT_LOGITS_ALLGATHER_MC draft-logits all-gather taken: one launch on the A1 workspace",
+        )
+        m3_report.work("DRAFT_LOGITS_ALLGATHER_MC", f"{rows} draft rows, world {self._a1['world']}")
+        return _allgather_cast.gather_last_dim_f32(logits.contiguous(), **self._a1)
+
     def _n3a_eligible(
         self, logits, draft_tokens, num_contexts: int, batch_size: int, spec_metadata
     ) -> bool:
@@ -1710,8 +2274,16 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
             and rows <= A1_MAX_ROWS
             and _allgather_cast.is_compiled(rows, shard.shape[-1], tp, 0, shard.device)
         )
-        # TAIL_FORK: the drafter's input work forks here, after the head GEMM.
-        self._tf_launch()
+        # TAIL_FORK: the drafter's input work forks here, after the head GEMM; after the verify logits' all-gather when
+        # TAIL_FORK_AFTER_VERIFY_GATHER (with A1) or when the fork runs TAIL_FC_GATHER's multicast launch (_tf_late);
+        # TAIL_FORK_ISSUE_AFTER_VERIFY_GATHER: still after the head GEMM only (its event), its kernels issued after A1's
+        # launch.
+        head_done = None
+        if not self._tf_late(a1):
+            if TAIL_FORK_A1_FIRST and a1 and self._tf is not None:
+                head_done = torch.cuda.current_stream().record_event()
+            else:
+                self._tf_launch()
         if self._a1 is not None:
             if a1:
                 _a1_log_once(
@@ -1723,13 +2295,25 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
                     m3_report.work(
                         "A1_K7", f"draft length {int(self.max_draft_len)}, {rows} verify rows"
                     )
-                return _allgather_cast.allgather_cast(shard, **self._a1)
+                out = _allgather_cast.allgather_cast(shard, **self._a1)
+                # A fork not launched above (a no-op otherwise): TAIL_FORK_ISSUE_AFTER_VERIFY_GATHER's on the head
+                # GEMM's event, or a late one after A1.
+                self._tf_launch(
+                    after=head_done,
+                    point="head, issued after A1's launch"
+                    if head_done is not None
+                    else "A1 all-gather",
+                )
+                return out
             _a1_log_once(
                 rows,
                 f"[M3 dispatch] n3_a1 allgather_cast not taken: {rows} verify rows (compiled: verify rows up to "
                 f"{A1_MAX_ROWS}); NCCL all-gather",
             )
         gathered = allgather(shard, lm_head.mapping, dim=0)
+        self._tf_launch(
+            point="NCCL all-gather"
+        )  # a late fork (a no-op once the fork launched above)
         vocab_shard = shard.shape[-1]
         out = torch.empty((rows, tp * vocab_shard), dtype=torch.float32, device=shard.device)
         out.view(rows, tp, vocab_shard).copy_(gathered.view(tp, rows, vocab_shard).transpose(0, 1))

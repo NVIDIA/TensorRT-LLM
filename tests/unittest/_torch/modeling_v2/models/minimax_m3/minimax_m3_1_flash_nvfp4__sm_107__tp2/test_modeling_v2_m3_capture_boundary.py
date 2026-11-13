@@ -70,8 +70,8 @@ def layer(request, monkeypatch):
         lambda core, x, r, norm, allreduce=None: (("normed", x, norm), ("updated", x, r)),
     )
 
-    def boundary(self, x, x2, residual, norm_w):
-        calls.append((x, x2, norm_w))
+    def boundary(self, x, x2, residual, norm_w, qkv_a1_next=False):
+        calls.append((x, x2, norm_w, qkv_a1_next))
         return ("next", norm_w), ("sum", x, x2)
 
     if request.param == "prefill":
@@ -114,6 +114,11 @@ def test_a_capture_layer_captures_the_boundary_residual_sum(layer, i) -> None:
         "the boundary applies the next layer's norm (the final norm after the last)"
     )
     assert captured == [(i, out[1], None)]
+    # The prefill boundary tells CTXNORMQ whether the next layer is sparse (TP2AGG_SP's SP_OVL overlaps its push with
+    # the fused QKV kernel there); the decode target's generic layer never passes it.
+    assert core.calls[-1][3] == (
+        isinstance(run.__self__, modeling.PrefillTarget) and (i + 1) in core.sparse_layers
+    )
     if i in core.moe_layers:
         assert core.calls[-1][1] == ("routed", i), "the routed part folds into the boundary"
 
@@ -209,9 +214,10 @@ def ctxnormq_prefill(monkeypatch):
         fp4_scale,
         allreduce=None,
         router_w=None,
+        qkv_a1_next=False,
         pre_moe=False,
     ):
-        calls.append(("ctxnormq", x, residual, norm_w, fp4_scale, router_w, pre_moe))
+        calls.append(("ctxnormq", x, residual, norm_w, fp4_scale, router_w, qkv_a1_next, pre_moe))
         return ("ctxnormq_normed", norm_w), ("ctxnormq_updated", norm_w)
 
     def native(core, x, residual, norm_w, allreduce=None):
@@ -253,14 +259,14 @@ def test_prefill_uses_the_ctxnormq_boundary_in_place_of_the_fused_allreduce(
         lambda spec, layer, h, r: captured.append((layer, h, r)),
     )
     post = core.w[f"l{i}_post_norm"]
-    kind, x, res, norm, fp4, router, pre_moe = calls[0]
+    kind, x, res, norm, fp4, router, next_sparse, pre_moe = calls[0]
     assert (kind, x, norm) == ("ctxnormq", ("attn", i), post), (
         "the attention boundary is offered to CTXNORMQ"
     )
     assert res is residual
     assert fp4 == (f"fp4_{i}" if i in core.moe_layers else None), "NVFP4 for the MoE's input only"
     assert router == (core.w[f"l{i}_router"] if i in core.moe_layers else None)
-    assert pre_moe
+    assert pre_moe and not next_sparse
     normed = ("ctxnormq_normed", post)
     ff = ("moe", i, normed) if i in core.moe_layers else ("mlp", f"l{i}_mlp", normed)
     if i + 1 < LAYERS:
@@ -272,6 +278,7 @@ def test_prefill_uses_the_ctxnormq_boundary_in_place_of_the_fused_allreduce(
             nxt,
             None,
             None,
+            (i + 1) in core.sparse_layers,
             False,
         )
         assert out == (("ctxnormq_normed", nxt), ("ctxnormq_updated", nxt))

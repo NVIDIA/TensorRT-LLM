@@ -60,6 +60,9 @@ ITEMS: Dict[str, str] = {
     "DRAFT_AR_NORM_FUSED": "the drafter's stock all-reduce followed by its add + RMSNorm",
     "DRAFT_HEAD_NO_SLICE": "the contiguous slice copy of a draft head copy's logits",
     "DRAFT_KV_REWIND_FUSED": "the in-tree draft-forward KV rewind bookkeeping",
+    "DRAFT_LOWM_GEMM_HANDOFF": (
+        "DRAFT_LOWM_GEMM leaving every projection the MXFP8 GEMV routed alone (with DRAFT_LOWM_GEMM on)"
+    ),
     "DRAFT_PROB1": "the stock per-position ancestral draft loop",
     "DRAFT_S4": "the in-tree Markov chain (instead of the one-launch sharded chain)",
     "DRAFT_SWIGLU": "the drafter MLPs' stock activation (instead of the shared native SwiGLU)",
@@ -145,6 +148,9 @@ ITEMS: Dict[str, str] = {
     "TAIL_BOOKKEEP_SPEC": "the Markov chain's stock KV rewind and biased-logits glue",
     "TAIL_DRAFT_PROBS_SLOT_COPY": "the stock index_put of the block draft probabilities",
     "TAIL_DSFOLD_FWD": "the step gather only (no store at the forward's tail)",
+    "TAIL_FC_GATHER": (
+        "the replicated fc in the TAIL_FORK fork (instead of the shard + multicast all-gather, with DRAFT_FC_SHARD on)"
+    ),
     "TAIL_FORCEVEC": "the in-tree forced-acceptance draw",
     "TAIL_FORK": "the stock order of the drafter's input work (no aux-stream fork)",
     "TAIL_FORK_B1": "no fork at the batch-1 step's 8 rows",
@@ -159,6 +165,7 @@ ITEMS: Dict[str, str] = {
     "TP2AGG_ROUTER_F32": "the prefill router's own fp32 cast of its input",
     "TP2AGG_SP": "the ordinary prefill layer boundaries (no sequence-parallel boundary)",
     "TP2CTX_SP_ADDNORM": "the peer add and the NORMQ launch as two kernels",
+    "TP2CTX_SP_OVL": "the owned MXFP8 rows pushed before the fused QKV kernel (with TP2_PREFILL_QKV_FUSED on)",
     "TP2CTX_SP_PMOVL": "the pre-MoE products pushed after the router GEMM",
     "TP2WIDE_COMBINE_MXFP8": "o_proj's own quantize of the sparse prefill output",
     "TP2WIDE_COMMGEMV": (
@@ -244,3 +251,86 @@ def m31_disabled(item_id: str) -> bool:
             f"{item_id!r} is not a registered switch of this target (m31_switches.ITEMS)"
         )
     return item_id in _DISABLED
+
+
+# Default-off items (opt-ins): ``TRTLLM_M31_ENABLE_<ID>=1`` turns item ``<ID>`` on. Each changes the target's numerics
+# against the default path (not bitwise) or is not faster on every shape, so it stays off unless asked for. Same strict
+# values as the kill switches, read once at import; an opt-in variable naming an id this target does not register is
+# logged once and otherwise ignored.
+_ENABLE_PREFIX = "TRTLLM_M31_ENABLE_"
+
+# Opt-in id -> what TRTLLM_M31_ENABLE_<id>=1 turns on.
+OPT_INS: Dict[str, str] = {
+    "AR_AUTOTUNE": (
+        "AllReduce AUTO's per-process timing autotuner (the target otherwise pins the C++ size / world heuristic)"
+    ),
+    "DRAFT_FC_SHARD": (
+        "the drafter's replicated fc as this rank's column shard + an all-gather at the draft-length verify rows"
+    ),
+    "DRAFT_FC_TP_SPLIT": "the drafter's replicated fc split row-parallel with one fp32 all-reduce (not bitwise)",
+    "DRAFT_FMHA_BATCH2_SPLIT": (
+        "the drafter's batch-2 window decode as two per-request window-capped calls (not bitwise)"
+    ),
+    "DRAFT_HEAD_MXFP8": "the drafter head's shard GEMM on an MXFP8 copy of the shard (not bitwise)",
+    "DRAFT_HEAD_NVFP4": (
+        "the drafter head's shard GEMM on an NVFP4 copy of the shard (not bitwise; wins over DRAFT_HEAD_MXFP8)"
+    ),
+    "DRAFT_LOGITS_ALLGATHER_MC": "the rejection sampler's draft-logits all-gather as one multicast launch",
+    "DRAFT_LOWM_GEMM": (
+        "the drafter's o_proj / down GEMMs the MXFP8 GEMV does not run on FlashInfer's low-M BF16 kernels (not bitwise)"
+    ),
+    "DRAFT_MLP_MXFP8_14_ROWS": "the drafter MLP's gate_up + SwiGLU at 14 rows as MXFP8 quantize + GEMV (not bitwise)",
+    "DRAFT_WINDOW_CAPPED_DECODE": "the window-capped max_seq_len for the drafter's sliding-window decode (not bitwise)",
+    "EMBED16_LAYER0_DECODE": (
+        "the 9..16-row step's layer 0 on the decode layer (FlashInfer RMSNorm of the gathered rows)"
+    ),
+    "LC_TP2": "no Triton-route engagement line for the long-context rows the long-context decode leaves (log only)",
+    "MOE_ENGINE_9_TO_13_ROWS": (
+        "the 9..13-row MoE engine (a TP4-width kernel: at this target's width its build fails and the generic MoE runs)"
+    ),
+    "MOE_ENGINE_FC2_LAG": "the 8-row MoE engine's FC2 six groups behind FC1 (scheduling only, bitwise)",
+    "MOE_ROUTE_IDS_9_TO_16_ROWS": "the 9..16-row generation step's MoE routed from top-4 ids computed by one kernel",
+    "R6_DENSE_PREQUANT": "the dense-MLP boundary's MXFP8 QKV hand-off to the next layer (not bitwise)",
+    "SLOT_IDS_CHANGED": (
+        "the spec sampler's slot-id table uploaded only when it changes (RuntimeHooks spec_slot_ids_changed_only)"
+    ),
+    "TAIL_DEFER_CAPTURE": (
+        "the MC finalize boundary's capture residuals kept by reference and written before the drafter reads them"
+    ),
+    "TAIL_FORK_AFTER_VERIFY_GATHER": "the TAIL_FORK fork launched after the verify logits' multicast all-gather",
+    "TAIL_FORK_ISSUE_AFTER_VERIFY_GATHER": (
+        "the TAIL_FORK fork's kernels issued after the verify logits' all-gather launch"
+    ),
+    "TP2_LC2_SMALL_DRAFT_LEN_3": "the long-context decode from 9 rows at draft length 3 too (not bitwise)",
+    "TP2_PREFILL_QKV_FUSED": (
+        "the large prefill steps' sparse-layer QKV + index MXFP8 GEMM with the producer in its epilogue (not bitwise)"
+    ),
+}
+
+
+def _read_enabled() -> FrozenSet[str]:
+    """The registered opt-in ids switched on in this process; logs each unregistered opt-in variable once."""
+    out = set()
+    for name, value in os.environ.items():
+        if not name.startswith(_ENABLE_PREFIX):
+            continue
+        item_id = name[len(_ENABLE_PREFIX) :]
+        if item_id not in OPT_INS:
+            logger.warning(f"{name} is not an opt-in of this MiniMax-M3.1 target; ignored")
+            continue
+        if _is_set(name, value):
+            out.add(item_id)
+    return frozenset(out)
+
+
+# The opt-in ids switched on in this process, read once at import.
+_ENABLED: FrozenSet[str] = _read_enabled()
+
+
+def m31_enabled(item_id: str) -> bool:
+    """Whether ``TRTLLM_M31_ENABLE_<item_id>`` turned the default-off item on for this process."""
+    if item_id not in OPT_INS:
+        raise KeyError(
+            f"{item_id!r} is not a registered opt-in of this target (m31_switches.OPT_INS)"
+        )
+    return item_id in _ENABLED

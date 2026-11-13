@@ -71,6 +71,7 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Tuple,
     Union,
@@ -201,6 +202,7 @@ from .kernels import m3_select_long_dsl as _select_long_dsl_kernel
 from .kernels import m3_shard_accept as m3_shard_accept_kernel
 from .kernels import m3_target_head as m3_target_head_kernel
 from .kernels import m3_tokmap_guard as _tokmap_guard
+from .kernels import m31_route_ids16 as _route_ids16_kernel
 from .kernels import msa_kv_update as _msa_kv_update_kernel
 from .kernels import triton_sparse_decode as _sparse_decode_kernel
 from .kernels.long_select import long_select_blocks
@@ -209,7 +211,7 @@ from .kernels.m3_moe_finalize import m3_moe_finalize
 from .kernels.m3_nvfp4_index_decode import Nvfp4IndexDecodeScorer
 from .kernels.mx_gemv import op as mx_gemv
 from .kernels.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
-from .m31_switches import m31_disabled
+from .m31_switches import m31_disabled, m31_enabled
 from .ops import gqamix_sparse_decode as _gqamix_kernel
 from .ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
@@ -295,6 +297,11 @@ _SM = (10, 7)  # capacity: fixed: the device capability, not a size
 # load only, no numerics change. TRTLLM_M31_DISABLE_MSA_PROXY_PREBUILD=1: each variant compiles on its first call
 # instead (which can be after the server is ready).
 MSA_PROXY_PREBUILD = not m31_disabled("MSA_PROXY_PREBUILD")
+# R6_DENSE_PREQUANT (opt-in, TRTLLM_M31_ENABLE_R6_DENSE_PREQUANT=1): the dense-MLP layer boundary also publishes the
+# next layer's MXFP8 QKV activation (as the MoE boundary does): M3.1's layers 1-3 follow a dense MLP but have the sparse
+# five-way QKV. Off by default: on sm_107 the hand-off's QKV output is not bitwise against the BF16 hand-off (where the
+# next QKV quantizes its own input). Read at import.
+R6_DENSE_PREQUANT = m31_enabled("R6_DENSE_PREQUANT")
 # CTXNORMQ: a prefill layer boundary of at least ``CTXNORMQ_MIN_ROWS`` rows runs the plain all-reduce, then
 # one kernel for the residual add + RMSNorm that also writes the next MXFP8 projection's activation (and, at a MoE
 # boundary, the routed experts' NVFP4 input), instead of the fused all-reduce + norm followed by the consumers' own
@@ -352,6 +359,13 @@ S2_TAIL_MIN_ROWS = 49  # capacity: fixed: the Triton finalize's rows (past the M
 S2_TAIL_MAX_ROWS = (
     224  # capacity: measured: microbench rows (the in-model one-shot Lamport takes up to 256)
 )
+# TP2_PREFILL_QKV_FUSED (opt-in, TRTLLM_M31_ENABLE_TP2_PREFILL_QKV_FUSED=1; the tp2ctx target's TP2CTX_QKV_FUSED kernel,
+# kernels/qkv_fusion): an eager sparse-layer step of more than A1_MIN_ROWS rows whose QKV activation CTXNORMQ published
+# runs one CuTe DSL kernel for the QKV + index MXFP8 GEMM with the horizontal producer in its epilogue, instead of the
+# GEMM + m3_producer. The producer math is the stock producer's on the kernel's own bf16 GEMM output; the GEMM is
+# deterministic but not bitwise against the stock MXFP8 GEMM (one E4M3 step on a few q bytes). Read at import.
+QKV_A1 = m31_enabled("TP2_PREFILL_QKV_FUSED")
+A1_MIN_ROWS = 1024  # capacity: tp2ctx _CTX_QKV_FUSED_MIN_ROWS (steps above it)
 # TP2AGG_SP: the tp2ctx TP2CTX_SP recipe on agg's eager steps of
 # 4096 < T <= 16384 rows. Each CTXNORMQ boundary becomes an IPC reduce-scatter of the partial to this rank's owned rows
 # (rank 0 [0, S), rank 1 [S, T), S the 128-row boundary nearest T / 2), the residual add + RMSNorm + quantize on the
@@ -364,7 +378,7 @@ S2_TAIL_MAX_ROWS = (
 # without them every step keeps the ordinary boundary ("not taken" logged once). Enabled by default.
 # TRTLLM_M31_DISABLE_TP2AGG_SP=1 or TRTLLM_M31_DISABLE_AGG_SP=1 disables both boundaries.
 # TRTLLM_M31_DISABLE_AGG_SP_PREMOE=1 keeps only post-MoE SP, gathering the residual before pre-MoE.
-# The per-item ids stay tp2ctx's (TP2CTX_ROUTER_ZC / _SP_ADDNORM / _SP_PMOVL).
+# The per-item ids stay tp2ctx's (TP2CTX_ROUTER_ZC / _SP_ADDNORM / _SP_OVL / _SP_PMOVL).
 TP2AGG_SP = not m31_disabled("TP2AGG_SP") and not m31_disabled("AGG_SP")
 SP_PREMOE = not m31_disabled("AGG_SP_PREMOE")
 SP_MIN_ROWS = 4097  # capacity: eager agg SP band; the workspace also covers the Lamport overlap
@@ -373,11 +387,16 @@ SP_SF_TILE_ROWS = 128  # rank 1's rows start on a 128-row MXFP8 scale-factor swi
 SP_LOGITS_ROW_BYTES = 128 * 4  # the "logits" gather kind: [T, 128] fp32
 _SP_STATE: dict = {}
 # SP_ADDNORM: the owned-row peer add fused into the NORMQ out= launch (bitwise the two kernels). SP_PMOVL: the pre-MoE
-# products pushed by the peer push kernel on a side stream under the router GEMM (scheduling only).
+# products pushed by the peer push kernel on a side stream under the router GEMM (scheduling only). SP_OVL (with
+# TP2_PREFILL_QKV_FUSED on): before a sparse layer whose QKV runs the fused kernel, the owned MXFP8 rows go by copy
+# engine on a side stream while the kernel runs on the own rows (it is row-split bitwise; the stock MXFP8 GEMM is not
+# guaranteed to be, so it waits for the push).
 # Each is on by default; TRTLLM_M31_DISABLE_<ID>=1 turns it off.
 SP_ADDNORM = not m31_disabled("TP2CTX_SP_ADDNORM")
 SP_PMOVL = not m31_disabled("TP2CTX_SP_PMOVL")
 SP_PMOVL_MIN_ROWS = 12288  # capacity: tp2ctx measurement (A8K +1.6% below it)
+SP_OVL = not m31_disabled("TP2CTX_SP_OVL")
+SP_OVL_MIN_ROWS = 12288  # capacity: tp2ctx _SP_OVL_MIN_ROWS
 # GQAMIX: a mixed ctx+gen step's sparse generation rows (MsaDecodeFmha) run the Triton block-sparse decode
 # through ops/gqamix_sparse_decode, a verbatim copy of the in-tree kernel module whose two decode kernels do not
 # specialize on the step's row count or on the [num_ctx:] slices' alignment, registered on MsaDecodeFmha's
@@ -767,6 +786,11 @@ ATTN_PUSH_MAX_TOKENS = (
 # (the generic embedding). Read once, at import.
 EMBED16 = not m31_disabled("EMBED16")
 EMBED16_MAX_TOKENS = 16  # capacity: fixed: the gather's built rows (2 requests x 8 verify rows)
+# EMBED16_LAYER0_DECODE (opt-in, TRTLLM_M31_ENABLE_EMBED16_LAYER0_DECODE=1; needs EMBED16): the 9..16-row step also runs
+# FlashInfer's RMSNorm on the gathered rows and hands (normed, raw) to layer 0, which then runs the decode layer
+# (``_layer``: the decode plan's boundaries) instead of the generic one, as the 1..8-row fused embedding and
+# TP2WIDE_INPUT9 do. Not shown bitwise to the generic first layer. Read once, at import.
+EMBED16_L0FAST = EMBED16 and m31_enabled("EMBED16_LAYER0_DECODE")
 # ATTN_PUSH16 (9..16 rows) is covered by TP2WIDE_PUSH above (9..32 rows, the same prepushed-2
 # exchange): the names stay for its engagement line only; the push bound's kill is TRTLLM_M31_DISABLE_TP2WIDE_PUSH=1.
 ATTN_PUSH16 = ATTN_PUSH_MAX_TOKENS >= 16
@@ -786,19 +810,23 @@ MOE_PUSH_MAX_TOKENS = (
     MOE_ENGINE_MAX_TOKENS if MC_AR_TP4 else 0
 )  # capacity: fixed: the engine's rows
 # The 9..13-row engine (router, routed and shared experts in one kernel); its bf16 sum goes to the boundary. Its kernel
-# is the TP4 build, at the TP4 expert width (768), so this target builds no engine (MOE16_ENGINE covers no rows):
-# 9..13-row steps run the generic MoE inside the decode layer.
+# is the TP4 build, at the TP4 expert width (768), so by default this target builds no engine (MOE16_ENGINE covers no
+# rows): 9..13-row steps run the generic MoE inside the decode layer. MOE_ENGINE_9_TO_13_ROWS (opt-in,
+# TRTLLM_M31_ENABLE_MOE_ENGINE_9_TO_13_ROWS=1) gives the engine its 9..13 rows; until a TP2-width build of the kernel
+# exists, the engine build at this target's width fails and those steps run the generic MoE. Read at import.
+MOE16_TP2 = m31_enabled("MOE_ENGINE_9_TO_13_ROWS")
 # The width the 9..13-row engine's kernel is compiled for (kernels/m3_moe/m3_moe16_kernel.py I_TP / SH_I, SH_SPLIT 2).
 MOE16_KERNEL_WIDTH = 768  # capacity: fixed: the TP4-width build of m3_moe16_kernel
 MOE16_MIN_TOKENS = 9  # capacity: fixed: the 9..13-row engine's lower bound
-MOE16_MAX_TOKENS = 0  # capacity: fixed: built rows (0: off at TP2)
+MOE16_MAX_TOKENS = 13 if MOE16_TP2 else 0  # capacity: fixed: built rows (0: off at TP2)
 # TP2WC_MOE_ENGINE (the TP4 target's TP4_MOE_ENGINE): at the served K7 c1 decode shape (8 rows) the MoE
 # engine is an NVIDIA reference fused engine (the low-latency reference, vendored byte for byte in the family module
 # minimax_m3/kernels/m3ll, host at this target's width 1536 via tp4_moe_engine.host_module) built on THIS target's
 # 8-row m3_moe state (the MOESK build): the same routed / shared CTA split (SMs - 24 + 24), phase plan and arithmetic
 # keys, so routing, out and the pushed set-A words are m3_moe's bit for bit; plus the reference engine's scheduling keys
 # only (the FC1 -> FC2 B-image hand-off with the FC2 scale atoms by warp 6, rolled FC2 k-tile loops, the shared CTAs'
-# early trigger). B2LAG (FC2 six groups behind FC1) stays off as at TP4. Die-local roles, 48 shared CTAs and mode Q
+# early trigger). B2LAG (FC2 six groups behind FC1) is off by default (opt-in MOE_ENGINE_FC2_LAG,
+# TRTLLM_M31_ENABLE_MOE_ENGINE_FC2_LAG=1: scheduling only, also bitwise). Die-local roles, 48 shared CTAs and mode Q
 # are never taken (they change summation orders). Built at prebuild and agreed across the TP group, else m3_moe.
 # Rows: 8 only. The engine kernel is structurally 1..8 rows (32 B rows per stage, 8-row phase groups), so 16 / 24 / 32
 # K7 rows (b2..b4) keep the trtllm-gen runner + MC finalize (their wide engine is W13, behind its own MB kill gate).
@@ -820,6 +848,7 @@ TP2WC_MOE_ENGINE_ROWS = frozenset(
 TP2WC_DIE_LOCAL = TP2WC_MOE_ENGINE and not m31_disabled("TP2_DIE_LOCAL")
 # capacity: fixed: the engine rows whose plan the roles and placement follow
 TP2WC_DIE_LOCAL_ROWS = 8
+TP2WC_MOE_ENGINE_B2LAG = m31_enabled("MOE_ENGINE_FC2_LAG")
 TP2WC_MOE_ENGINE_EARLY_TRIG = not m31_disabled("WC_EARLY_TRIG")
 # From this many tokens the MoE runs unfinalized through the TRTLLM-Gen runner and its finalize (top-k gather,
 # routing weights, shared expert add) runs inside the boundary all-reduce. 9..13 take it only when their engine is
@@ -1477,6 +1506,16 @@ ROUTER_TC_GEN_MAX_ROWS = 48 if ROUTER48 else 16  # capacity: fixed: the op's cer
 S1B_MAX_ROWS = 448  # capacity: fixed: the WIDE decode rows (A1_WIDE_448)
 # TRTLLM_M31_DISABLE_S1B_FOLD_PDL=1 launches the fold without PDL.
 S1B_FOLD_PDL = not m31_disabled("S1B_FOLD_PDL")
+# MOE_ROUTE_IDS_9_TO_16_ROWS (opt-in, TRTLLM_M31_ENABLE_MOE_ROUTE_IDS_9_TO_16_ROWS=1; kernels/m31_route_ids16.py): a
+# pure generation step of 9..16 rows routes its MoE from top-4 ids. One PDL-launched CuTe DSL kernel (a warp per token)
+# takes the router's fp32 logits and writes the MiniMax2 top-4 ids and bf16 weights, TRTLLM-Gen's routing arithmetic
+# and tie order operation for operation; the runner then routes from the ids (DynBlock skips its single-CTA per-token
+# top-k) at the logits path's GEMM tactic (``_moe_tactic_as_logits``). Ids, weights and the expanded->permuted index are
+# bitwise the stock routing's, so the output is. The kernel is compiled before warmup (``prebuild_kernels``); AutoTuner
+# profiling keeps the logits path. Read at import.
+ROUTE_IDS16 = m31_enabled("MOE_ROUTE_IDS_9_TO_16_ROWS")
+ROUTE_IDS16_MIN_ROWS = _route_ids16_kernel.MIN_ROWS  # capacity: fixed: past the MoE engine's 8 rows
+ROUTE_IDS16_MAX_ROWS = _route_ids16_kernel.MAX_ROWS  # capacity: fixed: DynBlock's token bound
 ROUTER_TC_GEN = RowRange(
     "m3_router_tc",
     _rows(ROUTER_TC_GEN_MIN_ROWS, ROUTER_TC_GEN_MAX_ROWS),
@@ -2297,6 +2336,7 @@ def _linear(
     if not mode.decode_graph:
         prequant = _CTXNORMQ_MX.take(x) if CTXNORMQ and not mode.tuned_quantize_gemm else None
         if prequant is not None:
+            _sp_ovl_wait(x)
             if x.data_ptr() == _COMBINE_MXFP8_STATE.get("src"):
                 _COMBINE_MXFP8_STATE["src"] = None
                 m3_report.work(
@@ -2569,6 +2609,16 @@ def _sp_logits_bytes(num_tokens: int, rank: int) -> Tuple[int, int]:
     return off * SP_LOGITS_ROW_BYTES, (off + count) * SP_LOGITS_ROW_BYTES
 
 
+class _SpOvl(NamedTuple):
+    """An SP boundary's asynchronous push (SP_OVL): the event the peer's rows wait on and the two row / scale ranges."""
+
+    event: Any
+    own_rows: Tuple[int, int]
+    peer_rows: Tuple[int, int]
+    own_sf: slice
+    peer_sf: slice
+
+
 def _sp_once(key, message: str) -> None:
     """One info line per key (engagement lines a gate job greps)."""
     noted = _SP_STATE.setdefault("noted", set())
@@ -2703,7 +2753,25 @@ def _sp_unshard(residual, x):
     return view.clone()
 
 
-def _sp_boundary(core, ws, op, x, residual, norm_w, fp4_scale, allreduce, router_w):
+def _sp_ovl_take(x: torch.Tensor):
+    """The SP_OVL push pending for the keyed tensor ``x`` (cleared), or None."""
+    pending, _SP_STATE["ovl"] = _SP_STATE.get("ovl"), None
+    if pending is None or x.dim() != 2 or pending[0] != x.data_ptr():
+        if pending is not None:
+            torch.cuda.current_stream().wait_event(pending[1].event)
+        return None
+    return pending[1]
+
+
+def _sp_ovl_wait(x: torch.Tensor) -> None:
+    """A consumer that reads the whole gathered activation: wait for a pending SP_OVL push first."""
+    if _SP_STATE.get("ovl") is not None:
+        ovl = _sp_ovl_take(x)
+        if ovl is not None:
+            torch.cuda.current_stream().wait_event(ovl.event)
+
+
+def _sp_boundary(core, ws, op, x, residual, norm_w, fp4_scale, allreduce, router_w, qkv_a1_next):
     """The CTXNORMQ boundary on this rank's owned rows: (the keyed bf16 view, the owned updated residual). The
     gathered MXFP8 (+ NVFP4) products and, at a pre-MoE boundary, the gathered router logits are published for the
     keyed view, so the consumers take them as today."""
@@ -2789,9 +2857,29 @@ def _sp_boundary(core, ws, op, x, residual, norm_w, fp4_scale, allreduce, router
         # The owned rows' logits from the same full-T router call as today (bitwise per row), gathered as a kind.
         logits = _sp_put(ws, "logits", rows, ws.route_owned_full_shape(x32, router_w, rows))
         kinds = ["logits"] if pushed else kinds + ["logits"]
-    ws.push_owned(kinds, rows)
+    ovl = None
+    if (
+        not pre_moe
+        and qkv_a1_next
+        and QKV_A1
+        and SP_OVL
+        and rows >= SP_OVL_MIN_ROWS
+        and normq_out is not None
+    ):
+        event = ws.push_owned_async(kinds, rows)
+        peer_first = first + count if first == 0 else 0
+        ovl = _SpOvl(
+            event,
+            (first, count),
+            (peer_first, rows - count),
+            ws.own_sf_slice(rows),
+            ws.peer_sf_slice(rows),
+        )
+    else:
+        ws.push_owned(kinds, rows)
     keyed = ws.gather_view("bf16", rows)
     _CTXNORMQ_MX.publish(keyed, xq, xsf)
+    _SP_STATE["ovl"] = (keyed.data_ptr(), ovl) if ovl is not None else None
     if pre_moe:
         _CTXNORMQ_FP4.publish(keyed, fp4, fp4_sf)
         _SP_LOGITS.publish(keyed, logits, None)
@@ -2817,14 +2905,16 @@ def _ctxnormq_allreduce_norm(
     fp4_scale,
     allreduce=None,
     router_w=None,
+    qkv_a1_next=False,
     pre_moe=False,
 ):
     """A prefill boundary as the plain all-reduce + the fused residual add, RMSNorm and quantize, or None (switched
     off, fewer than ``CTXNORMQ_MIN_ROWS`` rows, op not built). Returns (normed, updated) like the fused all-reduce;
     the MXFP8 activation (and with ``fp4_scale`` the NVFP4 one) wait in the CTXNORMQ slots for their consumers.
     ``allreduce``: the all-reduce to run (default the target's AUTO one). TP2AGG_SP: a step in its band runs the
-    boundary sequence-parallel (``_sp_boundary``; a pre-MoE one needs ``router_w``, the layer's router weight) and
-    returns (keyed view, owned residual)."""
+    boundary sequence-parallel (``_sp_boundary``; a pre-MoE one needs ``router_w``, the layer's router weight;
+    ``qkv_a1_next``: the next projection is a sparse layer's QKV, for SP_OVL) and returns (keyed view, owned
+    residual)."""
     if not CTXNORMQ or x.dim() != 2 or x.shape[0] < CTXNORMQ_MIN_ROWS:
         return None
     op = _ctxnormq_op()
@@ -2836,7 +2926,9 @@ def _ctxnormq_allreduce_norm(
         else None
     )
     if ws is not None:
-        return _sp_boundary(core, ws, op, x, residual, norm_w, fp4_scale, allreduce, router_w)
+        return _sp_boundary(
+            core, ws, op, x, residual, norm_w, fp4_scale, allreduce, router_w, qkv_a1_next
+        )
     residual = _sp_unshard(residual, x)
     reduced = m3_allreduce(x, core.allreduce if allreduce is None else allreduce, None)
     f32_op = _ctxnormq_f32_op() if fp4_scale is not None else None
@@ -3227,6 +3319,53 @@ def _select_triggers(num_tokens: int) -> Tuple[bool, int]:
     return early, phase
 
 
+_ROUTE_IDS16_LOGGED: set = set()
+
+
+def _route_ids16(core, i: int, router_logits) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """MOE_ROUTE_IDS_9_TO_16_ROWS: (int32 top-4 ids, bf16 weights) of a pure generation step's MoE at 9..16 rows from
+    its fp32 router logits, or None (the runner routes on the logits): switched off, AutoTuner profiling (it tunes the
+    logits path, whose tactic the ids call reuses), rows or operands outside the kernel's, or the kernel not built
+    before warmup. The decision depends on the row count, the operands' layout and the prebuild only, the same on every
+    rank: a prebuild failure with the opt-in on stops the process (``prebuild_kernels``), so no rank routes on the
+    logits while another routes from ids."""
+    if not ROUTE_IDS16 or router_logits is None or AutoTuner.get().is_tuning_mode:
+        return None
+    rows = router_logits.shape[0] if router_logits.dim() == 2 else 0
+    if not ROUTE_IDS16_MIN_ROWS <= rows <= ROUTE_IDS16_MAX_ROWS:
+        return None
+    pdl = get_env_enable_pdl()
+    if not _route_ids16_kernel.is_compiled(pdl):
+        return None
+    out = _route_ids16_kernel.route(
+        router_logits, core.w[f"l{i}_router_bias"], float(core.routed_scaling_factor), pdl
+    )
+    if out is None:
+        if ("declined", rows) not in _ROUTE_IDS16_LOGGED:
+            _ROUTE_IDS16_LOGGED.add(("declined", rows))
+            logger.info(
+                f"[M3 dispatch] MOE_ROUTE_IDS_9_TO_16_ROWS not taken: rank {mpi_rank()}: {rows} rows, logits "
+                f"{router_logits.dtype} {tuple(router_logits.shape)} (contiguous {router_logits.is_contiguous()}) "
+                "outside the kernel's operands; the runner routes on the logits (logged once per row count)"
+            )
+        return None
+    if "taken" not in _ROUTE_IDS16_LOGGED:
+        _ROUTE_IDS16_LOGGED.add("taken")
+        logger.info(
+            f"[M3 dispatch] MOE_ROUTE_IDS_9_TO_16_ROWS taken: MiniMax2 top-4 ids + bf16 weights in one PDL launch, the "
+            f"MoE routes from ids ({rows} rows, layer {i}, pdl {pdl}) on rank {mpi_rank()}"
+        )
+    if "capture" not in _ROUTE_IDS16_LOGGED and torch.cuda.is_current_stream_capturing():
+        # The first take inside a CUDA-graph capture: the captured decode graph launches the kernel (the line above
+        # can come from an eager warmup step alone).
+        _ROUTE_IDS16_LOGGED.add("capture")
+        logger.info(
+            f"[M3 dispatch] MOE_ROUTE_IDS_9_TO_16_ROWS taken in capture: the route kernel is in the captured graph "
+            f"({rows} rows, layer {i}, pdl {pdl}) on rank {mpi_rank()}"
+        )
+    return out
+
+
 def _triton_finalize(rows: int, routed, shared: Optional[torch.Tensor]) -> torch.Tensor:
     """The finalized routed output (+ ``shared``) from the runner's unfinalized parts via kernels/m3_moe_finalize
     (``TP2W_MOE_FINALIZE``). Raises if the parts are not the trtllm-gen layout (the runner did not finalize them:
@@ -3300,7 +3439,8 @@ def _triton_finalize_rows(core, h: torch.Tensor) -> bool:
 def _moe_tactic_as_logits(core, inputs, do_finalize: bool):
     """(runner, tactic) the stock runner resolves for these rows with ROUTING LOGITS: the same AutoTuner key as
     ``fp4_block_scale_moe_runner``'s (an fp32 [rows, experts] logits operand in slot 0, no top-k tensors), so a
-    top-k-ids call (``S1B_FOLD``) runs the GEMM tactic the logits path runs (the
+    top-k-ids call (``S1B_FOLD``; ``MOE_ROUTE_IDS_9_TO_16_ROWS`` at its 9..16 rows) runs the GEMM tactic the logits
+    path runs (the
     pinned / tuned one) instead of the tuner's miss default: the same kernels, hence the same output bits. Resolved on
     EVERY call, as the stock op does
     (a tactic resolved before the tuning cache is loaded would otherwise stay the miss default); only
@@ -3337,7 +3477,8 @@ def _moe_tactic_as_logits(core, inputs, do_finalize: bool):
     if seen.get(key) != list(tactic):
         seen[key] = list(tactic)
         logger.info(
-            f"[M3.1] S1B_FOLD MoE tactic at {rows} rows (finalize={do_finalize}): {list(tactic)}"
+            f"[M3.1] {'MOE_ROUTE_IDS_9_TO_16_ROWS' if rows <= ROUTE_IDS16_MAX_ROWS else 'S1B_FOLD'} MoE tactic at "
+            f"{rows} rows (finalize={do_finalize}): {list(tactic)}"
         )
     return runner, tactic
 
@@ -3716,6 +3857,163 @@ def _pack_nvfp4_index_k(nvfp4_index_cache, sink, out_cache_loc, rows: int) -> No
 _NVFP4_INDEXK_LOGGED: list = []
 
 
+class _DeferredA1:
+    """``TP2_PREFILL_QKV_FUSED``: a sparse layer's packed QKV + index MXFP8 GEMM on its CTXNORMQ activation, recorded
+    instead of launched. The producer call site runs it fused (``fold``: the A1 kernel, GEMM + producer) or calls
+    ``materialize`` (the stock GEMM ``_linear`` would have run on that activation). ``placeholder`` has the packed
+    shape and no storage; it is never read. ``ovl`` (TP2AGG_SP's SP_OVL): the own rows run first, under the push of
+    this rank's rows to the peer; the peer's rows after its push landed (A1 is row-split bitwise)."""
+
+    def __init__(self, core, act, act_scale, weight, weight_scale, mode, ovl=None):
+        rows, n = act.shape[0], weight.shape[0]
+        self.placeholder = torch.empty(1, 1, dtype=torch.bfloat16, device=act.device).expand(
+            rows, n
+        )
+        self.core, self.mode = core, mode
+        self.act, self.act_scale = act, act_scale
+        self.weight, self.weight_scale = weight, weight_scale
+        self.ovl = ovl
+        self.done = False
+
+    def _wait_ovl(self) -> None:
+        if self.ovl is not None:
+            torch.cuda.current_stream().wait_event(self.ovl.event)
+
+    def materialize(self) -> torch.Tensor:
+        self.done = True
+        self._wait_ovl()
+        return _ctxnormq_mxfp8_gemm(
+            self.core, (self.act, self.act_scale), self.weight, self.weight_scale, self.mode
+        )
+
+    def fold(
+        self, i, buffers, scale_buffers, index_k_cache, out_cache_loc, kv_quant_scale, cos_sin, pos
+    ):
+        """The A1 kernel for layer ``i``: (q, index_q) as the producer returns them, the caches written; None (nothing
+        launched) when the caches are outside the kernel's alignment contract."""
+        core = self.core
+        rows = int(self.act.shape[0])
+        runner = _a1_runner(core.heads, core.kv_heads, core.index_heads)
+        device = self.act.device
+        q = torch.empty(rows, core.heads, core.head_dim, dtype=torch.float8_e4m3fn, device=device)
+        index_q = torch.empty(
+            rows, core.index_heads, core.head_dim, dtype=torch.float8_e4m3fn, device=device
+        )
+        norms = _A1_NORMS.get(i)
+        if norms is None:
+            w = core.w
+            norms = _A1_NORMS[i] = torch.cat(
+                [w[f"l{i}_q_norm"], w[f"l{i}_k_norm"], w[f"l{i}_idx_q_norm"], w[f"l{i}_idx_k_norm"]]
+            ).contiguous()
+        act = self.act.view(torch.float8_e4m3fn).view(rows, -1)
+        ovl = self.ovl
+        parts = (
+            [((0, rows), slice(None))]
+            if ovl is None
+            else [(ovl.own_rows, ovl.own_sf), (ovl.peer_rows, ovl.peer_sf)]
+        )
+        try:
+            part_args = []
+            for (r0, n), sf_range in parts:
+                rr = slice(r0, r0 + n)
+                part_args.append(
+                    runner.make_args(
+                        act[rr],
+                        self.act_scale[sf_range],
+                        self.weight.view(torch.float8_e4m3fn),
+                        self.weight_scale,
+                        core.mx_alpha,
+                        q[rr],
+                        index_q[rr],
+                        buffers.view(torch.uint8),
+                        scale_buffers.view(torch.uint8),
+                        index_k_cache,
+                        out_cache_loc[rr],
+                        kv_quant_scale,
+                        cos_sin,
+                        pos[rr],
+                        norms,
+                        core.rms_eps,
+                    )
+                )
+        except AssertionError as e:
+            _log_once(
+                logger.warning,
+                "tp2_prefill_qkv_fused",
+                "declined",
+                f"[M3.1 agg] TP2_PREFILL_QKV_FUSED declined: {e}",
+            )
+            return None
+        runner.run_args(part_args[0])
+        if ovl is not None:
+            self._wait_ovl()
+            runner.run_args(part_args[1])
+            _sp_once(
+                ("ovl", rows),
+                f"[M3.1 agg] TP2AGG_SP SP_OVL taken: fused QKV rows {rows} as own {ovl.own_rows[1]} + peer "
+                f"{ovl.peer_rows[1]} (push by copy engine under the own rows)",
+            )
+        self.done = True
+        _a1_count(rows)
+        return q.flatten(1), index_q.flatten(1)
+
+
+_A1_RUNNERS: dict = {}
+_A1_NORMS: dict = {}
+_A1_COUNTS: dict = {}
+
+
+def _a1_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: int):
+    """The compiled A1 runner for one per-rank head geometry (compiled on the first take, eager: the warmup's first
+    long step)."""
+    key = (num_heads_q, num_heads_kv, num_heads_index)
+    runner = _A1_RUNNERS.get(key)
+    if runner is None:
+        from .kernels.qkv_fusion.kernel import M3QkvFusedRunner
+
+        runner = _A1_RUNNERS[key] = M3QkvFusedRunner(
+            num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
+        )
+        logger.info(f"[M3.1 agg] TP2_PREFILL_QKV_FUSED runner compiled for heads {key}")
+    return runner
+
+
+def _a1_count(rows: int) -> None:
+    """Per-call A1 engagement by step-size band, logged at counts 1, 2, 4, ... per band."""
+    band = "<=2K" if rows <= 2048 else "<=4K" if rows <= 4096 else "<=8K" if rows <= 8192 else ">8K"
+    _A1_COUNTS[band] = n = _A1_COUNTS.get(band, 0) + 1
+    if n & (n - 1) == 0:
+        logger.info(f"[M3.1 agg] TP2_PREFILL_QKV_FUSED taken band={band} n={n} (rows {rows})")
+    m3_report.work("TP2_PREFILL_QKV_FUSED", f"{rows} rows")
+
+
+def _a1_defer(core, i: int, hidden: torch.Tensor) -> Optional[_DeferredA1]:
+    """A ``_DeferredA1`` for layer ``i``'s packed QKV projection when A1 takes the step (switched on, eager,
+    not capturing, not tuning, more than A1_MIN_ROWS rows, the CTXNORMQ activation published for ``hidden``), else
+    None (the caller runs ``_linear``; the CTXNORMQ slot is then still published unless this took it)."""
+    if not QKV_A1 or not CTXNORMQ or hidden.dim() != 2 or hidden.shape[0] <= A1_MIN_ROWS:
+        return None
+    mode = _mx_mode(core.mxfp8)
+    if (
+        mode.decode_graph
+        or mode.tuned_quantize_gemm
+        or is_torch_compiling()
+        or torch.cuda.is_current_stream_capturing()
+        or (core.heads, core.kv_heads, core.index_heads) != PRODUCER_HEADS
+    ):
+        return None
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    if AutoTuner.get().is_tuning_mode:
+        # The stock QKV GEMM profiles its shape in the tuning pass (the steps A1 does not take run it).
+        return None
+    w, s = core.w[f"l{i}_qkv_w"], core.w[f"l{i}_qkv_s"]
+    prequant = _CTXNORMQ_MX.take(hidden.contiguous())
+    if prequant is None:
+        return None
+    return _DeferredA1(core, prequant[0], prequant[1], w, s, mode, _sp_ovl_take(hidden))
+
+
 def _qkv_producer_fold(
     core,
     i: int,
@@ -3730,7 +4028,11 @@ def _qkv_producer_fold(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """``QKV_PRODUCER_FOLD``: the deferred QKV GEMV with layer ``i``'s producer in its epilogue
     (``mx_gemv.m3_mx_gemv_producer``), the same outputs and cache bytes as the GEMV + ``m3_producer``; None (nothing
-    launched) when the kernel declines."""
+    launched) when the kernel declines. A ``_DeferredA1`` record runs the A1 kernel instead."""
+    if isinstance(deferred, _DeferredA1):
+        return deferred.fold(
+            i, buffers, scale_buffers, index_k_cache, out_cache_loc, kv_quant_scale, cos_sin, pos
+        )
     rows = int(deferred.act.shape[0])
     device = deferred.act.device
     q = torch.empty(rows, core.heads, core.head_dim, dtype=torch.float8_e4m3fn, device=device)
@@ -3933,12 +4235,15 @@ _WC_ENGINE_STATES: Dict[tuple, object] = {}
 # AR-DET: AllReduce AUTO's per-process timing autotuner made SM107 runs differ across server starts
 # (with it off, 0 / 888 same-node and 0 / 296 across node pairs differ, bitwise to the
 # modal autotuned output). The target turns it off for the whole process at init (AUTO then takes the C++ size / world
-# heuristic, a pure function of the shape). An explicit TLLM_DISABLE_ALLREDUCE_AUTOTUNE is left as given.
+# heuristic, a pure function of the shape), unless TRTLLM_M31_ENABLE_AR_AUTOTUNE=1. An explicit
+# TLLM_DISABLE_ALLREDUCE_AUTOTUNE is left as given. Read once, at import.
+AR_AUTOTUNE_ENABLED = m31_enabled("AR_AUTOTUNE")  # the m31_switches value contract (1/true/on/yes)
 
 
 def _pin_allreduce_heuristic(rank: int) -> bool:
     """Default the AllReduce autotune off for this process (see AR-DET); returns whether it is off. Logs one line."""
-    os.environ.setdefault("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "1")
+    if not AR_AUTOTUNE_ENABLED:
+        os.environ.setdefault("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "1")
     off = os.environ.get("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
     if off:
         m3_report.work("AR_DET", "AllReduce autotune off for this process")
@@ -4366,6 +4671,33 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             range(ROUTER_TC_GEN_MAX_ROWS + 1, S1B_MAX_ROWS + 1),
         )
         times["s1b_fold_pins_s"] = round(time.perf_counter() - start_s1b, 3)
+        # MOE_ROUTE_IDS_9_TO_16_ROWS: compile and load the 9..16-row top-k kernel (the process's PDL flag) outside
+        # capture.
+        start_r16 = time.perf_counter()
+        r16 = "off (default; opt in with TRTLLM_M31_ENABLE_MOE_ROUTE_IDS_9_TO_16_ROWS=1): the MoE routes on the logits"
+        if ROUTE_IDS16:
+            try:
+                _route_ids16_kernel.prebuild(
+                    get_env_enable_pdl(), torch.device("cuda", torch.cuda.current_device())
+                )
+            except Exception as exc:
+                # Fatal, not a per-rank fallback: the ranks must route alike, and a failed launch may leave a sticky
+                # CUDA error behind. Leaving the opt-in unset is the fallback.
+                logger.error(
+                    f"[M3 prebuild] rank {mpi_rank()}: MOE_ROUTE_IDS_9_TO_16_ROWS not set up: the kernel failed to "
+                    f"build or launch ({exc!r}); unset TRTLLM_M31_ENABLE_MOE_ROUTE_IDS_9_TO_16_ROWS to route on the "
+                    "logits"
+                )
+                raise RuntimeError(
+                    "MOE_ROUTE_IDS_9_TO_16_ROWS: the 9..16-row top-k kernel failed to build or launch on rank "
+                    f"{mpi_rank()}; unset TRTLLM_M31_ENABLE_MOE_ROUTE_IDS_9_TO_16_ROWS to route on the logits"
+                ) from exc
+            r16 = (
+                f"set up: MiniMax2 top-4 kernel for {ROUTE_IDS16_MIN_ROWS}..{ROUTE_IDS16_MAX_ROWS}-row "
+                f"generation steps compiled (pdl {get_env_enable_pdl()}); the MoE routes from ids"
+            )
+        logger.info(f"[M3 prebuild] rank {mpi_rank()}: MOE_ROUTE_IDS_9_TO_16_ROWS {r16}")
+        times["route_ids16_s"] = round(time.perf_counter() - start_r16, 3)
         if not self.mxfp8.quant_method.use_cutlass:
             raise ValueError("the MiniMax-M3 decode dispatch needs the CUTLASS MXFP8 GEMM")
         if PREPROCESS_TOKMAP_FIX:
@@ -4666,7 +4998,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             key = (
                 str(device),
                 num_tokens,
-                False,
+                TP2WC_MOE_ENGINE_B2LAG,
                 TP2WC_MOE_ENGINE_EARLY_TRIG,
                 use_dl,
             )
@@ -4676,7 +5008,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
                     state = _WC_ENGINE_STATES[key] = _wc_moe_engine.build_state(
                         device,
                         ours,
-                        b2lag=False,
+                        b2lag=TP2WC_MOE_ENGINE_B2LAG,
                         early_trig=TP2WC_MOE_ENGINE_EARLY_TRIG,
                         die_tab=dl.tab if use_dl else None,
                     )
@@ -4741,7 +5073,8 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
 
     def _build_moe16_engine(self, i: int, num_tokens: int) -> object:
         if MOE16_KERNEL_WIDTH != _MOE_INTER:
-            # The engine's kernel is the TP4-width build; never run it on TP2-width weights.
+            # MOE_ENGINE_9_TO_13_ROWS opted in: the engine's kernel is the TP4-width build; never run it on TP2-width
+            # weights.
             raise RuntimeError(
                 f"the 9..13-row engine is built for expert width {MOE16_KERNEL_WIDTH}, this target's is {_MOE_INTER} "
                 "(no TP2-width build yet); the generic MoE runs"
@@ -5293,9 +5626,10 @@ class PrefillTarget:
         # In-place add into the shared output to avoid allocating a temporary.
         return shared_out.add_(routed_out), None
 
-    def _generic_boundary(self, x, x2, residual, norm_w):
+    def _generic_boundary(self, x, x2, residual, norm_w, qkv_a1_next: bool = False):
         """A generic layer boundary: the multicast all-reduce + residual + RMSNorm on the rows it takes (with the
-        shared + routed add folded in), else the built-in fused all-reduce."""
+        shared + routed add folded in), else the built-in fused all-reduce. ``qkv_a1_next``: the next layer is
+        sparse (TP2AGG_SP's SP_OVL may overlap its push with the fused QKV kernel)."""
         core = self.core
         if _can_mc(x, folded=x2 is not None):
             fused = _mc_allreduce_norm(core, x, x2, residual, norm_w)
@@ -5311,6 +5645,7 @@ class PrefillTarget:
                 norm_w,
                 None,
                 _prefill_allreduce(core, x.shape[0]),
+                qkv_a1_next=qkv_a1_next,
             )
             if fused is not None:
                 return fused
@@ -5368,7 +5703,9 @@ class PrefillTarget:
         else:
             out = self._swiglu_mlp(hidden, f"l{i}_mlp", True, dense=True)
             routed = None
-        normed, updated = self._generic_boundary(out, routed, residual, _next_norm(core, i))
+        normed, updated = self._generic_boundary(
+            out, routed, residual, _next_norm(core, i), qkv_a1_next=(i + 1) in core.sparse_layers
+        )
         if spec_metadata is not None and spec_metadata.is_layer_capture(i):
             # TP2AGG_SP: the capture reads the full residual (gathered from an owned-only one).
             updated = _sp_unshard(updated, normed)
@@ -5395,7 +5732,11 @@ class PrefillTarget:
                 )
             return self._unfused_sparse_attention(i, position_ids, hidden, step)
         in_bcg = is_in_breakable_cuda_graph()
-        packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
+        deferred = None if in_bcg else _a1_defer(core, i, hidden)
+        if deferred is not None:
+            packed = deferred.placeholder
+        else:
+            packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
         if in_bcg:
             output = packed.new_empty(
                 (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
@@ -5412,6 +5753,7 @@ class PrefillTarget:
             step["kv_cache_manager"],
             step["msa_idx_k_cache"],
             step["msa_out_cache_loc"],
+            deferred,
         )
         if horizontal is None:
             raise RuntimeError(
@@ -5712,7 +6054,8 @@ class DecodeTarget:
     def _embed16(self, input_ids: torch.Tensor, num_tokens: int):
         """EMBED16 (``EMBED16_GATHER``, 9..16 rows): the fused kernel's exact gather into the owner's ``raw`` (its norm
         output is not used). (raw, None): layer 0 runs the generic layer and its FlashInfer input norm, the generic
-        embedding's bytes. Without an owner (or with strided ids) the generic embedding runs."""
+        embedding's bytes; with EMBED16_LAYER0_DECODE, (FlashInfer RMSNorm of raw, raw) for the decode layer. Without an
+        owner (or with strided ids) the generic embedding runs."""
         core = self.core
         owner = core.embed_owners.get((num_tokens, input_ids.dtype))
         if owner is None or not input_ids.is_contiguous():
@@ -5727,11 +6070,14 @@ class DecodeTarget:
         _, raw = m3_embedding_firstnorm(
             input_ids, owner.table, owner.weight, owner.eps, owner.raw, owner.output, owner.use_pdl
         )
+        layer0 = "layer 0 decode (EMBED16_LAYER0_DECODE)" if EMBED16_L0FAST else "layer 0 generic"
         taken(
             EMBED16_GATHER.path,
             num_tokens,
-            f"rank {core.mapping.tp_rank}, {input_ids.dtype}, layer 0 generic",
+            f"rank {core.mapping.tp_rank}, {input_ids.dtype}, {layer0}",
         )
+        if EMBED16_L0FAST:
+            return flashinfer_rmsnorm(raw, core.w["l0_in_norm"], core.rms_eps), raw
         return raw, None
 
     def _bucket_flags(self, num_tokens: int):
@@ -5902,14 +6248,29 @@ class DecodeTarget:
         if i not in core.moe_layers:
             # A dense layer: its MLP's down projection pushes into the post-MLP boundary's all-reduce, as the o_proj
             # does into the attention one (the same slot; the gate_up projection never pushes). The next layer's QKV
-            # quantizes its own BF16 input.
+            # quantizes its own BF16 input, unless R6_DENSE_PREQUANT hands it its MXFP8 activation from this boundary,
+            # as after a MoE layer.
+            quant = R6_DENSE_PREQUANT and plan.qkv_prequant and i + 1 < core.num_layers
+            if plan.qkv_prequant and i + 1 < core.num_layers:
+                _log_once(
+                    logger.info,
+                    "r6_dense_prequant",
+                    "on" if quant else "off",
+                    "[M3 dispatch] r6_dense_prequant "
+                    + (
+                        "taken: the dense-MLP boundary hands the next QKV its MXFP8 activation"
+                        if quant
+                        else "off (default; TRTLLM_M31_ENABLE_R6_DENSE_PREQUANT=1 turns it on), BF16 hand-off"
+                    )
+                    + " (logged once)",
+                )
             dense_push = plan.attn_mc_ar and decode_graph and DENSE_PUSH.covers(num_tokens)
             armed = self._attn_push_target(num_tokens) if dense_push else None
             out, dense_pushed = self._swiglu_mlp(hidden, f"l{i}_mlp", True, armed, dense=True)
             if armed is not None and dense_pushed:
                 taken(DENSE_PUSH.path, num_tokens)
                 return self._prepushed(
-                    i, out, residual, norm_w, False, AR_PUSH_MODE, capture=capture
+                    i, out, residual, norm_w, quant, AR_PUSH_MODE, capture=capture
                 )
             if armed is not None:
                 missed(
@@ -5917,7 +6278,9 @@ class DecodeTarget:
                     num_tokens,
                     "the dense MLP's down projection did not push its rows into the armed boundary all-reduce",
                 )
-            return self._boundary(plan.attn_mc_ar, out, residual, norm_w, capture=capture)
+            return self._boundary(
+                plan.attn_mc_ar, out, residual, norm_w, quant=quant, capture=capture
+            )
 
         quant = plan.qkv_prequant and i + 1 < core.num_layers
         path = moe_path(num_tokens)
@@ -6118,7 +6481,18 @@ class DecodeTarget:
         if fp4:
             x, x_sf = fp4
             taken("X1 router_fp4", rows, "native router payload consumed by routed experts")
+            ids16 = _route_ids16(core, i, router_logits)
+            if ids16 is not None:
+                return _routed_experts(core, i, x, x_sf, None, do_finalize, ids16)
             return _routed_experts(core, i, x, x_sf, router_logits, do_finalize)
+        if topk is None:
+            # MOE_ROUTE_IDS_9_TO_16_ROWS also serves the logits of a step without the router's NVFP4 payload (X1 off,
+            # or the fp32 router on a device without 16-CTA clusters).
+            ids16 = _route_ids16(core, i, router_logits)
+            if ids16 is not None:
+                if not do_finalize:
+                    return _routed_experts(core, i, h, None, None, False, ids16)
+                return self._routed_chunks(i, h, None, ids16)
         if not do_finalize:
             return _routed_experts(core, i, h, None, router_logits, False, topk)
         return self._routed_chunks(i, h, router_logits, topk)
@@ -8312,6 +8686,12 @@ STEP_BLOCKOFF_GUARD = not m31_disabled("BLOCKOFF_GUARD")
 # page released); such a step rewrites the copied rows with the copy kernel's int32 transform done on the host and one
 # host-to-device copy, instead of the full-width copy kernel. TRTLLM_M31_DISABLE_BLOCKOFF_PATCH=1 copies those steps.
 STEP_BLOCKOFF_PATCH = STEP_BLOCKOFF_GUARD and not m31_disabled("BLOCKOFF_PATCH")
+# SLOT_IDS_CHANGED (opt-in, TRTLLM_M31_ENABLE_SLOT_IDS_CHANGED=1; RuntimeHooks spec_slot_ids_changed_only): the spec
+# metadata's per-request slot-id table (batch_slot_ids; rejection sampling) is re-uploaded only when the slot ids
+# change, not copied every step. With BLOCKOFF_GUARD it empties the eager step-boundary stream the next decode graph
+# waits on. Off by default: on this target's step loop the skip can miss a slot-id change (outputs were not token
+# identical to the every-step copy on some requests). Read at import.
+SLOT_IDS_CHANGED = m31_enabled("SLOT_IDS_CHANGED")
 
 
 def _counted_pack_prologue(*args, **kwargs):
@@ -8379,6 +8759,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
         "H2D_CHANGED_SPAN": STEP_H2D_CHANGED_SPAN,
         "BLOCKOFF_GUARD": STEP_BLOCKOFF_GUARD,
         "BLOCKOFF_PATCH": STEP_BLOCKOFF_PATCH,
+        "SLOT_IDS_CHANGED": SLOT_IDS_CHANGED,
         "TAILBK": TAILBK,
         "FRONT_CAPFORK": _dspark.FRONT_CAPFORK,
     }
@@ -8415,7 +8796,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
             spec_small_h2d=STEP_SMALL_H2D,
             skip_accepted_draft_upload=STEP_SKIP_ACCEPTED_UPLOAD,
             spec_batch_map_changed_only=STEP_BATCH_CHANGED_ONLY,
-            spec_slot_ids_changed_only=False,
+            spec_slot_ids_changed_only=SLOT_IDS_CHANGED,
             spec_step_fold=spec_fold,
             sampler_d2h_side_stream=STEP_HOST_D2H_SIDE,
             skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
