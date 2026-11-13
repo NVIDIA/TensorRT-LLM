@@ -8280,6 +8280,7 @@ class TorchLlmArgs(BaseLlmArgs):
                                     and unsupported_headroom_reason(
                                         self.scheduler_config.gen_preemption,
                                         self) is None),
+            seq_slot_micro_batches=self.pipeline_parallel_size,
         )
 
     @model_validator(mode="after")

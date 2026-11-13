@@ -248,6 +248,7 @@ def validate_dflash_ctx_buffer_budget(
     memory_budget_bytes: Optional[int] = None,
     arena_before_pool: bool = True,
     gen_preemption_enabled: bool = False,
+    seq_slot_micro_batches: int = 1,
 ) -> None:
     """Config-time checks for failure modes DFlash otherwise hits late.
 
@@ -288,6 +289,12 @@ def validate_dflash_ctx_buffer_budget(
             (see ``derive_dflash_ctx_memory_budget_bytes``); only affects
             the wording and remedy of the refusal.
         gen_preemption_enabled: Reserve private-arena rows for paused requests.
+        seq_slot_micro_batches: Micro-batches of ``max_batch_size`` the
+            executor's seq-slot pool holds, which the arena spans
+            (``pp_size`` under pipeline parallelism). The overlap headroom's
+            second micro-batch depends on the target model and the resolved
+            KV cache manager, which are unknown here; the arena check in
+            ``_lazy_init_ctx_buffers`` sees the resolved pool.
 
     Raises:
         ValueError: On a token-budget violation or when the pooled-context
@@ -373,10 +380,15 @@ def validate_dflash_ctx_buffer_budget(
 
     from ..pyexecutor.scheduler.gen_preemption import paused_cap
 
-    extra_slots = paused_cap(max_batch_size) if gen_preemption_enabled else 0
-    num_slots = max_batch_size + extra_slots + 1
+    def _headroom(batch: int) -> int:
+        return paused_cap(batch) if gen_preemption_enabled else 0
+
+    # The arena spans the executor's seq-slot pool (compute_max_num_sequences).
+    extra_slots = _headroom(max_batch_size)
+    pool_batch_slots = max_batch_size * seq_slot_micro_batches
+    num_slots = pool_batch_slots + extra_slots + 1
     required = compute_dflash_ctx_buffer_bytes(
-        max_batch_size,
+        pool_batch_slots,
         max_ctx,
         block_size,
         num_layers,
@@ -389,16 +401,15 @@ def validate_dflash_ctx_buffer_budget(
     if required <= memory_budget_bytes:
         return
     per_slot = required // num_slots
-    fitting = max(0, int(memory_budget_bytes // per_slot) - 1)  # one scratch slot
-    if gen_preemption_enabled:
-        lo, hi = 0, fitting
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if mid + paused_cap(mid) + 1 <= memory_budget_bytes // per_slot:
-                lo = mid
-            else:
-                hi = mid - 1
-        fitting = lo
+    fitting_slots = memory_budget_bytes // per_slot
+    lo, hi = 0, max(0, int(fitting_slots) - 1)  # one scratch slot
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if mid * seq_slot_micro_batches + _headroom(mid) + 1 <= fitting_slots:
+            lo = mid
+        else:
+            hi = mid - 1
+    fitting = lo
     gib = 1024**3
     if arena_before_pool:
         budget_desc = (
@@ -429,10 +440,15 @@ def validate_dflash_ctx_buffer_budget(
         if fitting >= 1
         else "no max_batch_size fits; lower max_seq_len or the drafter context"
     )
+    batch_term = (
+        f"{seq_slot_micro_batches} x max_batch_size"
+        if seq_slot_micro_batches > 1
+        else "max_batch_size"
+    )
     slot_formula = (
-        "max_batch_size + resident_headroom + 1 slots"
+        f"{batch_term} + resident_headroom + 1 slots"
         if gen_preemption_enabled
-        else "max_batch_size + 1 slots"
+        else f"{batch_term} + 1 slots"
     )
     message = (
         f"DFlash: the pooled-context K/V buffers for max_batch_size="
@@ -623,6 +639,9 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Keep the full slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
         self._batch_indices_buffer = DeviceCopyBuffer(
             torch.empty([self.max_num_requests], dtype=torch.int, device="cuda"),
             pin_memory=prefer_pinned(),
@@ -1479,7 +1498,6 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables_read = None
         self._ctx_block_counts = None
         self._paged_latent_prepare = False
-        max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
         # max_position_embeddings does not: K3's drafter advertises 1048576,
@@ -1519,11 +1537,15 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = dflash_context_dtype(draft_model)
 
-        # Real requests draw slots 0..num_req_slots-1 (max_batch plus requests
-        # paused in place by GEN slot preemption); the next slot is a scratch
-        # slot for padding/unknown dummies, so dummy writes can't corrupt a
-        # real request's context.
-        num_req_slots = max_batch + getattr(cache_manager, "gen_preemption_headroom", 0)
+        # Real requests draw slots 0..num_req_slots-1; the next slot is a
+        # scratch slot for padding/unknown dummies, so dummy writes can't
+        # corrupt a real request's context. The slots are allocated once and
+        # reused for every later batch shape, so they span the executor's whole
+        # seq-slot pool, which already counts requests paused in place by GEN
+        # slot preemption and, under pipeline parallelism or overlap headroom,
+        # more than one micro-batch. max_num_requests is no bound: it is the
+        # captured bucket on CUDA graph metadata.
+        num_req_slots = spec_metadata.num_seq_slots
         self._dummy_slot = num_req_slots
         num_slots = num_req_slots + 1
         # CUDA-graph padding uses ids counting down from
@@ -1538,7 +1560,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_base_host = [0] * num_slots
         self._batch_to_slot_buffer = DeviceCopyBuffer(
-            torch.zeros(max_batch, dtype=torch.long, device="cuda"),
+            torch.zeros(num_req_slots, dtype=torch.long, device="cuda"),
             pin_memory=prefer_pinned(),
         )
 
@@ -1711,7 +1733,7 @@ class DFlashWorker(SpecWorkerBase):
             )
 
         logger.info(
-            f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
+            f"DFlash: allocated ctx buffers: request_slots={num_req_slots}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"

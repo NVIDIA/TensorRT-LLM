@@ -3004,7 +3004,7 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )
@@ -3152,7 +3152,7 @@ def test_slot_from_zero_worker_refuses_a_disagg_windowed_draft_pool(
             """Bind the drafter's ctx cache to the draft pool."""
             worker._lazy_init_ctx_buffers(
                 draft_model,
-                SimpleNamespace(max_num_requests=2),
+                SimpleNamespace(max_num_requests=2, num_seq_slots=2),
                 attn_metadata,
                 draft_kv_cache_manager=draft,
             )
@@ -3226,7 +3226,7 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )
