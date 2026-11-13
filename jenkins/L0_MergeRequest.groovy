@@ -518,9 +518,12 @@ globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // is free-form JSON, and a quoted "false" would otherwise read as opt-in.
 // Scope variant publication to post-merge and nightly releases so pre-merge
 // consumption remains governed by its own rollout switch and explicit opt-in.
+// A bot-triggered NGC-Container-Scanning run leaves the canonical tarball un-BOLTed
+// so the image build is its only BOLT pass.
+def ngcScanRequested = testFilter[TEST_STAGE_LIST]?.contains("NGC-Container-Scanning") ?: false
 globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
-    ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
-        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    !ngcScanRequested && (ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
+        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true"),
     globalVars[TARGET_BRANCH],
     globalVars[BOLT_PUBLISH_VARIANT])
 if (runMode == "nightly_release") {
@@ -3357,10 +3360,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // every release behind a multi-hour GPU job. Inert on
                             // x86_64 (no promoted bundle) and whenever the wheel is
                             // built from source rather than downloaded.
-                            // Skipped for the bot-triggered NGC-Container-Scanning stage:
-                            // the PR build's wheel is not guaranteed to be BOLT-compatible
-                            // and the scan does not need optimized binaries.
-                            'boltOptimizeWheel': !(runContainerScanning && runMode != "nightly_release"),
+                            'boltOptimizeWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
