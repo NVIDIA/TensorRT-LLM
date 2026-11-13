@@ -45,8 +45,8 @@ vendors:
     - cute/sparse_index_utils.py
     - cute/src/**/*
     patch: 3rdparty/vendor_patches/msa-m31-fmha-sm100.patch
-    patch_digest: sha256:dc4d259100554b08080473558236ebb2085cb36e112dd0104abfabf6efb1e2e1
-    digest: sha256-tree-v1:b2a420d10664bea40cb2fe36e23a49a87e515f04b1bf9d7de70dfd6a4f2c8106
+    patch_digest: sha256:66c20ae1acaf20764386671c7c25cc768293b01f7b961d92dd6c05dff37a15d9
+    digest: sha256-tree-v1:3b7aef62fe2555891bdbddc245e387eec9fafaaf95402260b50fbd6041dbf9a2
   msa-m31-prefill-bf16x:
     url: https://github.com/vllm-project/MSA.git
     branch: dev
