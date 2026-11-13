@@ -135,7 +135,7 @@ SPEC_DEC_REAL_DATASET_MODELS = {
     },
     **{
         model: "cnn_dailymail"
-        for model in DEEPSEEK_V41_MODELS
+        for model in DEEPSEEK_V41_MODELS | QWEN38_MTP_MODELS
     },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
@@ -1314,7 +1314,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                        dataset_source: str,
                                        num_requests: Optional[int] = None,
                                        skip_requests: int = 0):
-        """Write a real-text dataset of fixed-length prompts.
+        """Write a real-text dataset with target-length prompts.
 
         Args:
             num_requests: Samples to write; the case's request count if None.
@@ -1366,8 +1366,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if not prompt_ids:
                         continue
                     if len(prompt_ids) < input_len:
-                        # Keep strict fixed-length requests for perf coverage
-                        # by extending short real-dataset prompts.
+                        # Extend short articles to the target token-ID length.
                         repeats = (input_len + len(prompt_ids) -
                                    1) // len(prompt_ids)
                         prompt_ids = (prompt_ids * repeats)[:input_len]
@@ -1388,8 +1387,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         enable_thinking=False,
                         add_generation_prompt=True,
                     )
-                    prompt_ids = tokenizer.encode(prompt_text,
-                                                  add_special_tokens=False)
+
+                # Count the final text after decoding and any template rendering.
+                prompt_ids = tokenizer.encode(prompt_text,
+                                              add_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
                     max_seq_len = model_config['max_seq_len']
                     if len(prompt_ids) + output_len > max_seq_len:
                         raise ValueError(
