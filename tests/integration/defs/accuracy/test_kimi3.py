@@ -324,6 +324,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if kv_cache_dtype == "fp8":
                 assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            else:
+                assert llm.args.quant_config.kv_cache_quant_algo is None
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
