@@ -242,6 +242,61 @@ void minimaxM31Mxfp8CublasLtGemmOut(at::Tensor const& act, at::Tensor const& act
     launchGemm(act, actScale, weight, weightScale, algo, out);
 }
 
+//! The workspace bytes a recorded configuration needs for (M, N, K), or -1 when it cannot serve that shape
+//! (cublasLtMatmulAlgoCheck on the current device, the serving workspace limit included).
+int64_t minimaxM31Mxfp8CublasLtAlgoCheck(int64_t m, int64_t n, int64_t k, std::vector<int64_t> const& algo)
+{
+    cublasLtMatmulAlgo_t const pinned = buildAlgo(algo);
+    // cublasLtMatmulAlgoCheck rejects VEC32_UE8M0 operands whose scale pointers are NULL (CUBLAS_STATUS_INVALID_VALUE
+    // on sm_103 and sm_107 alike), so the check sets them to valid, aligned device memory: the serving workspace. The
+    // check never dereferences them.
+    auto const device = c10::Device(c10::kCUDA, c10::cuda::current_device());
+    auto const& ws = workspace(device, at::cuda::getCurrentCUDAStream(device.index()).stream());
+    Descs const descs(m, n, k, ws.data_ptr(), ws.data_ptr());
+    cublasLtMatmulHeuristicResult_t result{};
+    cublasStatus_t const status
+        = cublasLtMatmulAlgoCheck(blasLtHandle(), descs.op, descs.a, descs.b, descs.d, descs.d, &pinned, &result);
+    if (status != CUBLAS_STATUS_SUCCESS || result.state != CUBLAS_STATUS_SUCCESS
+        || result.workspaceSize > kWorkspaceBytes)
+    {
+        return -1;
+    }
+    return static_cast<int64_t>(result.workspaceSize);
+}
+
+//! The heuristic's first configuration for (M, N, K) under the serving workspace: the nine attributes, then its
+//! workspace bytes. For recording configurations offline; serving never calls it.
+std::vector<int64_t> minimaxM31Mxfp8CublasLtHeuristic(int64_t m, int64_t n, int64_t k)
+{
+    // Non-null scale pointers, as in minimaxM31Mxfp8CublasLtAlgoCheck (the descriptors must match the launch's).
+    auto const device = c10::Device(c10::kCUDA, c10::cuda::current_device());
+    auto const& ws = workspace(device, at::cuda::getCurrentCUDAStream(device.index()).stream());
+    Descs const descs(m, n, k, ws.data_ptr(), ws.data_ptr());
+    cublasLtMatmulPreference_t pref{nullptr};
+    M31_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    size_t const wsBytes = kWorkspaceBytes;
+    M31_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsBytes, sizeof(wsBytes)));
+    cublasLtMatmulHeuristicResult_t result{};
+    int found = 0;
+    cublasStatus_t const status = cublasLtMatmulAlgoGetHeuristic(
+        blasLtHandle(), descs.op, descs.a, descs.b, descs.d, descs.d, pref, 1, &result, &found);
+    cublasLtMatmulPreferenceDestroy(pref);
+    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS && found > 0,
+        "minimax_m31_mxfp8_cublaslt_heuristic: no configuration for M=", m, " N=", n, " K=", k);
+    std::vector<int64_t> config;
+    for (auto const attr : kAlgoAttrs)
+    {
+        uint64_t value = 0;
+        size_t const size = algoAttrSize(result.algo, attr);
+        size_t written = 0;
+        M31_CUBLASLT_CHECK(cublasLtMatmulAlgoConfigGetAttribute(&result.algo, attr, &value, size, &written));
+        config.push_back(static_cast<int64_t>(value));
+    }
+    config.push_back(static_cast<int64_t>(result.workspaceSize));
+    return config;
+}
+
 } // namespace torch_ext
 
 TRTLLM_MV2_NAMESPACE_END
@@ -254,10 +309,19 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
     m.def(
         "minimax_m31_mxfp8_cublaslt_gemm_out(Tensor act, Tensor act_scale, Tensor weight, Tensor weight_scale, "
         "int[] algo, Tensor(a!) out) -> ()");
+    // No tensor arguments: catch-all kernels on the current device.
+    m.def("minimax_m31_mxfp8_cublaslt_algo_check(int m, int n, int k, int[] algo) -> int");
+    m.def("minimax_m31_mxfp8_cublaslt_heuristic(int m, int n, int k) -> int[]");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
     m.impl("minimax_m31_mxfp8_cublaslt_gemm", &TRTLLM_MV2_NS::torch_ext::minimaxM31Mxfp8CublasLtGemm);
     m.impl("minimax_m31_mxfp8_cublaslt_gemm_out", &TRTLLM_MV2_NS::torch_ext::minimaxM31Mxfp8CublasLtGemmOut);
+}
+
+TRTLLM_MV2_LIBRARY_IMPL(CompositeExplicitAutograd, m)
+{
+    m.impl("minimax_m31_mxfp8_cublaslt_algo_check", &TRTLLM_MV2_NS::torch_ext::minimaxM31Mxfp8CublasLtAlgoCheck);
+    m.impl("minimax_m31_mxfp8_cublaslt_heuristic", &TRTLLM_MV2_NS::torch_ext::minimaxM31Mxfp8CublasLtHeuristic);
 }
