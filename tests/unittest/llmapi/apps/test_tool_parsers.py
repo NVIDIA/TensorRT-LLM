@@ -932,6 +932,31 @@ class TestKimiK2StreamingMatchesWholeTextParse:
         return [(index, name, cls._decoded_arguments(arguments))
                 for index, (name, arguments) in sorted(calls.items())]
 
+    @staticmethod
+    def _multiline_calls():
+        first = {"location": "line\nbreak", "nested": {"text": "a } brace"}}
+        second = {"query": "weather {today}"}
+        text = ("<|tool_calls_section_begin|>"
+                "<|tool_call_begin|>functions.get_weather:0"
+                "<|tool_call_argument_begin|>" + json.dumps(first, indent=2) +
+                "<|tool_call_end|>"
+                "<|tool_call_begin|>functions.search_web:1"
+                "<|tool_call_argument_begin|>" + json.dumps(second, indent=2) +
+                "<|tool_call_end|><|tool_calls_section_end|>")
+        return text, [(0, "get_weather", first), (1, "search_web", second)]
+
+    def test_multiline_arguments_whole_text(self, sample_tools):
+        text, expected = self._multiline_calls()
+        assert self._whole_text_calls(text, sample_tools) == expected
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_multiline_arguments_streaming(self, sample_tools, chunk_size):
+        text, expected = self._multiline_calls()
+        chunks = [
+            text[i:i + chunk_size] for i in range(0, len(text), chunk_size)
+        ]
+        assert self._streamed_calls(chunks, sample_tools) == expected
+
     @pytest.mark.parametrize("output", sorted(_KIMI_K2_OUTPUTS))
     def test_streamed_calls_match_whole_text_parse(self, sample_tools, output):
         """Whole output, one character, fixed sizes, every two-way split.
