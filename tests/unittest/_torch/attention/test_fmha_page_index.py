@@ -1,19 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha import (
-    flashinfer_trtllm_gen as flashinfer_trtllm_gen_module,
-)
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
-from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-    FlashInferTrtllmGenFmha,
-)
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -25,7 +20,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 
-def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
+def test_phased_fmha_uses_v2_page_index_upper_bound_directly() -> None:
     calls: list[tuple[int, object]] = []
     bounds = iter((97, 101))
 
@@ -35,7 +30,7 @@ def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
 
     manager = object.__new__(KVCacheManagerV2)
     manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha = object.__new__(TrtllmGenFmha)
     fmha.kv_factor = 2
     fmha._v1_total_num_blocks_cache = None
     attn = SimpleNamespace(local_layer_idx=7)
@@ -51,7 +46,7 @@ def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
 
 
 @pytest.mark.parametrize("kv_factor", [1, 2])
-def test_flashinfer_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> None:
+def test_phased_fmha_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> None:
     calls: list[int] = []
 
     def get_primary_pool_data(local_layer_idx: int) -> SimpleNamespace:
@@ -70,7 +65,7 @@ def test_flashinfer_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> No
     )
     manager = object.__new__(KVCacheManager)
     manager.impl = SimpleNamespace(get_primary_pool_data=get_primary_pool_data)
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha = object.__new__(TrtllmGenFmha)
     fmha.kv_factor = kv_factor
     fmha._v1_total_num_blocks_cache = None
     attn = SimpleNamespace(local_layer_idx=4)
@@ -87,7 +82,7 @@ def test_flashinfer_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> No
 
 
 def test_phased_fmha_rejects_unknown_kv_cache_manager_type() -> None:
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha = object.__new__(TrtllmGenFmha)
     fmha.kv_factor = 2
     fmha._v1_total_num_blocks_cache = None
     fmha._attn_ref = lambda: SimpleNamespace(local_layer_idx=0)
@@ -112,155 +107,6 @@ def test_multi_ctas_kv_counter_size_keeps_multi_processor_floor() -> None:
     assert get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) >= (
         sm_count * torch.int32.itemsize
     )
-
-
-def test_prepare_workspace_sizes_counter_for_max_num_sequences(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    num_heads, max_num_requests, beam_width, sm_count = 6, 16, 2, 148
-    max_num_sequences = max_num_requests * beam_width
-
-    def check_counter_size_args(
-        actual_num_heads: int,
-        actual_max_num_sequences: int,
-        actual_sm_count: int,
-    ) -> int:
-        assert (actual_num_heads, actual_max_num_sequences, actual_sm_count) == (
-            num_heads,
-            max_num_sequences,
-            sm_count,
-        )
-        raise RuntimeError("counter size arguments observed")
-
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen."
-        "get_multi_ctas_kv_counter_size",
-        check_counter_size_args,
-    )
-
-    fmha = SimpleNamespace(
-        attn=SimpleNamespace(num_heads=num_heads),
-        _multi_processor_count=sm_count,
-    )
-    metadata = SimpleNamespace(
-        max_num_requests=max_num_requests,
-        beam_width=beam_width,
-        max_num_sequences=max_num_sequences,
-    )
-    with pytest.raises(RuntimeError, match="counter size arguments observed"):
-        FlashInferTrtllmGenFmha.prepare_workspace(
-            fmha,
-            q=SimpleNamespace(),
-            k=None,
-            v=None,
-            metadata=metadata,
-            forward_args=SimpleNamespace(),
-            workspace=SimpleNamespace(),
-        )
-
-
-def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cross-attention padding can make active rows irrecoverable from requests and beam width."""
-    batch_size = 3
-    preprocess_calls: list[tuple[object, ...]] = []
-
-    def generation_preprocess(*args: object) -> tuple[object, ...]:
-        preprocess_calls.append(args)
-        return (
-            torch.empty((batch_size, 2, 4)),
-            torch.empty(1),
-            torch.empty((batch_size, 1), dtype=torch.int32),
-            None,
-            None,
-            None,
-            torch.empty(0, dtype=torch.uint8),
-            None,
-            1,
-            1,
-            -1,
-            False,
-        )
-
-    decode_calls: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        flashinfer_trtllm_gen_module.thop,
-        "trtllm_gen_generation_preprocess",
-        generation_preprocess,
-    )
-    monkeypatch.setattr(
-        flashinfer_trtllm_gen_module,
-        "flashinfer",
-        SimpleNamespace(
-            decode=SimpleNamespace(
-                trtllm_batch_decode_with_kv_cache=lambda **kwargs: decode_calls.append(kwargs)
-            )
-        ),
-        raising=False,
-    )
-
-    attn = SimpleNamespace(
-        local_layer_idx=0,
-        num_heads=2,
-        num_kv_heads=1,
-        head_dim=4,
-        q_scaling=1.0,
-        quant_mode=0,
-        predicted_tokens_per_seq=1,
-        attention_chunk_size=None,
-        position_embedding_type=0,
-        rotary_inv_freq=None,
-        rotary_cos_sin=None,
-        rope_params=SimpleNamespace(dim=0, theta=1.0, scale_type=0, scale=1.0, max_positions=1),
-    )
-    metadata = SimpleNamespace(
-        beam_width=2,
-        kv_cache_block_offsets=torch.empty(0),
-        host_kv_cache_pool_pointers=torch.empty(0),
-        host_kv_cache_pool_mapping=torch.empty(0),
-        num_contexts=2,
-    )
-    output = torch.empty((batch_size, 2, 4))
-    forward_args = AttentionForwardArgs(
-        output=output,
-        attention_input_type=AttentionInputType.mixed,
-    )
-    params = FmhaParams(
-        attn=attn,
-        meta=metadata,
-        fwd=forward_args,
-        workspace=torch.empty(0, dtype=torch.uint8),
-        qkv_input=torch.empty((batch_size, 2, 4)),
-        output=output,
-        sequence_lengths=torch.ones(batch_size, dtype=torch.int32),
-        input_seq_length=1,
-        num_tokens=batch_size,
-        seq_offset=2,
-        tokens_per_block=32,
-        kv_factor=2,
-        total_num_blocks=8,
-        batch_size=batch_size,
-        num_requests=1,
-        is_cross=True,
-    )
-    fmha = SimpleNamespace(
-        _layout="HND",
-        _enable_pdl=False,
-        USE_SHARED_PAGED_KV_IDX=False,
-        _multi_processor_count=1,
-        _use_fp8_context_fmha=lambda _output, _input_type: False,
-        _get_multi_ctas_kv_counter_buffer=lambda: None,
-    )
-    fmha._run_generation_preprocess = MethodType(
-        FlashInferTrtllmGenFmha._run_generation_preprocess, fmha
-    )
-    fmha._run_generation_decode = MethodType(FlashInferTrtllmGenFmha._run_generation_decode, fmha)
-
-    FlashInferTrtllmGenFmha.run_generation(fmha, params)
-
-    assert preprocess_calls[0][24] == batch_size
-    assert len(decode_calls) == 1
 
 
 @pytest.mark.cpu_only
@@ -478,88 +324,3 @@ def test_cute_dsl_mla_rejects_invalid_helix_contract(
 
     assert not supported
     assert reason in actual_reason
-
-
-# The tests below guard the MLA generation perf gate that #15300 removed as
-# refactoring collateral, costing ~3% output token throughput on DeepSeek-V3-family
-# and Kimi-K2 MLA decode at the default tokens_per_block. They deliberately call the
-# checker instead of asserting on SLOWER_MLA_GENERATION_KERNELS itself: a test that
-# pins the literal set would be deleted along with the constant by the next
-# mechanical refactor, whereas these turn a dropped parameter into a TypeError and a
-# dropped constant into an AttributeError.
-
-
-def test_mla_generation_declines_slower_trtllm_gen_decode_kernel() -> None:
-    # DeepSeek-V3 / Kimi-K2 shape at the default tokens_per_block=32: the trtllm-gen
-    # MLA decode kernel is slower here than the thop.attention fallback, so this
-    # backend must decline and let selection fall through.
-    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
-        head_size=576,
-        num_heads=128,
-        tokens_per_block=32,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-    assert not supported
-    assert "slower" in reason
-    assert "headDimQk=576" in reason
-    assert "headDimV=512" in reason
-    assert "tokens_per_block=32" in reason
-
-
-@pytest.mark.parametrize("tokens_per_block", [16, 64])
-def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -> None:
-    # The gate must stay narrow: the same head dims at other page sizes are still
-    # served by this backend. Real configs run tokens_per_block=64.
-    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
-        head_size=576,
-        num_heads=128,
-        tokens_per_block=tokens_per_block,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-    assert supported, reason
-    assert reason == ""
-
-
-@pytest.mark.parametrize("tokens_per_block", [32, 64])
-@pytest.mark.parametrize("num_heads", [80, 96])
-def test_mla_generation_declines_unsupported_head_range_for_flashinfer_trtllm_gen(
-    tokens_per_block: int,
-    num_heads: int,
-) -> None:
-    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
-        head_size=576,
-        num_heads=num_heads,
-        tokens_per_block=tokens_per_block,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-    assert not supported
-    assert f"num_heads={num_heads}" in reason
-
-
-@pytest.mark.parametrize("num_heads", [64, 128])
-def test_mla_generation_allows_head_range_boundaries(num_heads: int) -> None:
-    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
-        head_size=576,
-        num_heads=num_heads,
-        tokens_per_block=64,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-    assert supported, reason
-    assert reason == ""
-
-
-def test_mla_generation_allows_other_supported_head_dims() -> None:
-    # (320, 256) is unaffected at every page size.
-    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
-        head_size=320,
-        num_heads=128,
-        tokens_per_block=32,
-        kv_lora_rank=256,
-        qk_rope_head_dim=64,
-    )
-    assert supported, reason
-    assert reason == ""

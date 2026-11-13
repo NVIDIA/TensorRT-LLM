@@ -375,6 +375,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     num_sparse_topk: int = 0
 
     @property
+    def helix_spec_tokens_valid(self) -> bool:
+        return self._helix_spec_tokens_valid
+
+    @property
     def effective_workspace(self) -> Optional[torch.Tensor]:
         """Attention-kernel workspace, switching to the CUDA-graph copy under capture."""
         return self.cuda_graph_workspace if self.is_cuda_graph else self.workspace
@@ -2137,7 +2141,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
         self.kv_cache_dtype = kv_cache_dtype
-        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
+        self.use_fp8_ds_mla: bool = kv_cache_dtype == "fp8_ds_mla"
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
@@ -2220,6 +2224,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self._context_plan_counter_rows = 0
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
+
+    @property
+    def uses_dsa_sparse_mla(self) -> bool:
+        return getattr(self.sparse_params, "algorithm",
+                       None) in ("deepseek_v4", "dsa")
 
     @property
     def uses_fp4_mla_attention(self) -> bool:
@@ -2814,8 +2823,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
         # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
         # so we skip only the RoPE and do the append + scheduler init here: the
-        # generation FMHA only reads the cache, and the fallback path needs the
-        # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
+        # generation FMHA only reads the cache, and the native generation path
+        # needs the scheduler buffers.
         if (self.is_mla_enable and forward_args.skip_mla_rope_generation
                 and not getattr(self, "use_fp8_ds_mla", False)
                 and forward_args.attention_input_type
@@ -3158,16 +3167,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 or metadata.helix_position_offsets is not None
                 or metadata.enable_flash_mla):
             return plan
-        from .fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+        from .fmha.trtllm_gen import TrtllmGenFmha
         fmha = self._fmha_manager.select(self, q, None, None, metadata, fwd)
-        if not isinstance(fmha, FlashInferTrtllmGenFmha):
+        if not isinstance(fmha, TrtllmGenFmha):
             return plan
         # PhasedFmha.forward, context part (seq_offset 0, every sequence a context request)
         n = plan.num_contexts
         fmha.prepare_workspace(q, None, None, metadata, fwd, plan.workspace)
         plan.counter_rows = (metadata.max_num_sequences
                              or metadata.max_num_requests)
-        plan.total_num_blocks = fmha._get_total_num_blocks(metadata)
+        plan.total_num_blocks = self._context_plan_num_blocks(fmha, metadata)
         plan.max_q_len = int(plan.prompt_lens[0:n].max())
         plan.max_kv_len = int(plan.kv_lens[0:n].max())
         plan.fmha_cls = type(fmha)
@@ -3175,6 +3184,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self._context_plan_fmha_owner = self._fmha_manager
         self._context_plan_counter_rows = plan.counter_rows
         return plan
+
+    @staticmethod
+    def _context_plan_num_blocks(fmha: "Fmha",
+                                 metadata: TrtllmAttentionMetadata) -> int:
+        """The KV-pool block extent PhasedFmha.forward hands the library."""
+        return fmha._get_total_num_blocks(
+            metadata) if fmha.NEEDS_BLOCK_EXTENT else 0
 
     def _context_plan_fmha_for(self, plan: _ContextPlan) -> Optional["Fmha"]:
         """This layer's library instance of plan.fmha_cls, prepared for the plan's counter rows."""
@@ -3231,7 +3247,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         fmha = self._context_plan_fmha_for(plan)
         if fmha is None:
             return False
-        total_num_blocks = fmha._get_total_num_blocks(metadata)
+        total_num_blocks = self._context_plan_num_blocks(fmha, metadata)
         if total_num_blocks != plan.total_num_blocks:
             # The selection also depends on the KV-pool bound of the layer.
             plan = self._build_context_plan(q, metadata, fwd, sig)

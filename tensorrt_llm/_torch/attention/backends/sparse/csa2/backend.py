@@ -226,7 +226,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     def update_quant_config(self, new_quant_config):
         """Rebuild the shared dispatcher, then apply CSA2's provider policy."""
-        from ...fmha.fallback import FallbackFmha
+        from ...fmha.fallback import NATIVE_FMHA_LIBS
 
         # A later quantization config cannot change the persistent formats or
         # the staging dtype chosen at construction; only FP8 KV is meaningful
@@ -239,11 +239,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
         self._fmha_manager.fmha_libs = [
             provider
             for provider in self._fmha_manager.fmha_libs
-            if native and isinstance(provider, FallbackFmha)
+            if native and isinstance(provider, NATIVE_FMHA_LIBS)
         ]
         if native and not self._fmha_manager.fmha_libs:
             raise ValueError(
-                "CSA2 native attention requires the FallbackFmha library to be enabled"
+                "CSA2 native attention requires the native FMHA libraries to be enabled"
             )
 
     def forward(self, q, k, v, metadata, forward_args=None, **kwargs):

@@ -20,13 +20,14 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/fmhaDispatcher.h"
+#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
-#include "tensorrt_llm/kernels/xqaDispatcher.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -320,9 +321,14 @@ struct FmhaParams
 
     // ---- hand-written accessors: sizes, derived pointers, and anything taking an index ----
     // Sequence lengths, windows, and paged-KV metadata.
-    /// Block offsets for this phase's sequences; `seq_offset` is applied here.
+    /// Block offsets for this phase's sequences; `seq_offset` is applied here. A call's own
+    /// page table (`kv_block_table`) replaces the layer's pool rows.
     [[nodiscard]] kernels::KVBlockArray::DataType* getKvCacheBlockOffsets(int32_t poolIndex) const
     {
+        if (kv_block_table.has_value())
+        {
+            return static_cast<kernels::KVBlockArray::DataType*>(kv_block_table.value().data_ptr());
+        }
         return meta.kv_cache_block_offsets.has_value() ? static_cast<kernels::KVBlockArray::DataType*>(
                    meta.kv_cache_block_offsets.value().index({poolIndex, seq_offset}).data_ptr())
                                                        : nullptr;
@@ -413,6 +419,10 @@ struct FmhaParams
 
     [[nodiscard]] int getMaxBlocksPerSequence() const
     {
+        if (kv_block_table.has_value())
+        {
+            return static_cast<int>(kv_block_table.value().size(-1));
+        }
         return meta.kv_cache_block_offsets.has_value() ? static_cast<int>(meta.kv_cache_block_offsets.value().size(-1))
                                                        : 0;
     }
@@ -529,7 +539,16 @@ struct FmhaParams
 [[nodiscard]] size_t contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim,
     int32_t qkNopeHeadDim, int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept;
 
-/// Defined in attentionFeature.h; named here for the friend list of AttentionBase.
+/// Defined in attentionFeature.h and phasedFmha.h; named here for the friend list of AttentionBase.
+template <typename AttentionVariant>
+class TrtllmGenFmha;
+template <typename AttentionVariant>
+class FmhaV2Fmha;
+template <typename AttentionVariant>
+class XqaFmha;
+class FlashMlaFmha;
+class MmhaFmha;
+class UnfusedFmha;
 class PagedKVCacheFeature;
 class CustomMaskFeature;
 class SageAttnFeature;
@@ -552,10 +571,11 @@ class SparseMlaFeature;
 ///   of the key.
 ///
 /// For every phase call, the binding builds a key from the call's parameters, looks up
-/// the op for it, and runs the phase:
+/// the op for it, and runs the phase on the library the caller chose:
 ///
 ///     auto const key = AttentionBase::getCacheKey(params);
-///     AttentionBase::getCached(key)->runContext(params);
+///     auto& op = dynamic_cast<MHA&>(*AttentionBase::getCached(key));
+///     op.runContext(op.trtllmGen(), params);
 ///
 /// On a cache miss, `getCached()` constructs the concrete op (`MHA` or `MLA`, both built on
 /// `TrtllmAttention`) from the key. New objects are created only by `getCacheKey()` and by
@@ -584,11 +604,6 @@ public:
 
     [[nodiscard]] bool operator==(AttentionBase const& other) const;
 
-    /// Runs the context or generation phase of one call. Derived ops override both; on a
-    /// key built by `getCacheKey()` they throw.
-    virtual void runContext(FmhaParams& p);
-    virtual void runGeneration(FmhaParams& p);
-
     /// Builds the cache key of one call from its parameters. Reads tensor metadata (data
     /// type, device, presence and sizes), so call it while the tensors are still attached.
     [[nodiscard]] static AttentionBase getCacheKey(FmhaParams const& p);
@@ -612,6 +627,13 @@ public:
     [[nodiscard]] bool isRelativePosition() const
     {
         return position_embedding_type == PositionEmbeddingType::kRELATIVE;
+    }
+
+    /// The fused context kernels read the encoder K/V back from the paged cross cache and learn its element
+    /// type only with paged-context FMHA, so without it they read a quantized cache as the activation type.
+    [[nodiscard]] bool isQuantizedCrossCacheUnfused() const
+    {
+        return cross_attention && use_kv_cache && quant_mode.hasKvCacheQuant() && !paged_context_fmha;
     }
 
     [[nodiscard]] bool isALiBi() const
@@ -738,9 +760,19 @@ protected:
     bool mFMHAForceFP32Acc = false;
 
 private:
-    // These read the key members directly: the hash reads all of them, the features read
-    // the ones that configure them, and the NVFP4 support probe builds a key from scalars.
+    // These read the key members directly: the hash reads all of them, the features and the
+    // FMHA libraries read the ones that configure them, and the NVFP4 support probe builds a
+    // key from scalars.
     friend struct std::hash<AttentionBase>;
+    template <typename>
+    friend class TrtllmGenFmha;
+    template <typename>
+    friend class FmhaV2Fmha;
+    template <typename>
+    friend class XqaFmha;
+    friend class FlashMlaFmha;
+    friend class MmhaFmha;
+    friend class UnfusedFmha;
     friend class PagedKVCacheFeature;
     friend class CustomMaskFeature;
     friend class SageAttnFeature;

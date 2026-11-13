@@ -58,8 +58,7 @@ def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
     assert registry.FMHA_LIBS[LIB_NAME] is PrimsTSSparseMlaFmha
     assert LIB_NAME in registry.DEFAULT_FMHA_LIBS
     names = tuple(registry.FMHA_LIBS)
-    assert names.index(LIB_NAME) < names.index("flashinfer_trtllm_gen")
-    assert names.index(LIB_NAME) < names.index("fallback")
+    assert names.index(LIB_NAME) < names.index("trtllm_gen")
     assert PrimsTSSparseMlaFmha in registry.get_enabled_fmha_lib_classes()
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{LIB_NAME}")
     assert PrimsTSSparseMlaFmha not in registry.get_enabled_fmha_lib_classes()
@@ -935,11 +934,11 @@ def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_d
     ``prims_ts``: no ``TLLM_FMHA_LIBS`` override; the PrimTS library is in the
     default set and must win the generation phase on its own. ``fallback``:
     ``TLLM_FMHA_LIBS=-prims_ts_sparse_mla``, the documented opt-out, must hand
-    generation back to the TRTLLM-Gen fallback (``FallbackFmha``) with PrimTS
+    generation back to the TRTLLM-Gen fallback (``TrtllmGenFmha``) with PrimTS
     never entered, so a regression on that path (what SM103, ``fp8_ds_mla`` and
     NVFP4 deployments run) still fails here.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
     from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 
     if library == "prims_ts":
@@ -950,7 +949,7 @@ def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_d
     prims_calls: list = []
     fallback_calls: list = []
     original_forward = PrimsTSSparseMlaFmha.forward
-    original_fallback = FallbackFmha.forward
+    original_fallback = TrtllmGenFmha.forward
 
     def counting_forward(self, *args, **kwargs):
         prims_calls.append(1)
@@ -965,7 +964,7 @@ def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_d
         return original_fallback(self, q, k, v, metadata, forward_args, *args, **kwargs)
 
     monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", counting_forward)
-    monkeypatch.setattr(FallbackFmha, "forward", counting_fallback)
+    monkeypatch.setattr(TrtllmGenFmha, "forward", counting_fallback)
     _run_unified_sparse_mla_forward(batch_name, kv_cache_dtype, "deepseek_v4")
     if library == "prims_ts":
         assert prims_calls, "the PrimTS sparse MLA FMHA did not serve the generation phase"

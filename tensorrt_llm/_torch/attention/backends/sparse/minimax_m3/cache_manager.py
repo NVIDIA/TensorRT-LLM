@@ -284,22 +284,20 @@ _KV_POOL_ZERO_INIT = os.environ.get("TRTLLM_M3_KV_POOL_ZERO_INIT", "1") == "1"
 def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
     """Fail at setup, not at the first prefill, when the P128 opt-in has no FMHA (SM107).
 
-    On SM107 only FlashInfer TRTLLM-Gen has paged-context kernels for the extra
-    page sizes (its cubins ship with it), so the route exists iff it is enabled.
+    On SM107 only the native trtllm_gen library has paged-context kernels for the extra
+    page sizes, which it generates with NVRTC.
     """
     if get_sm_version() != 107:
         return
     # Imported here: the FMHA backends import the attention classes this module serves.
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        FlashInferTrtllmGenFmha,
-    )
     from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
+    from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 
-    if FlashInferTrtllmGenFmha not in get_enabled_fmha_lib_classes():
+    if TrtllmGenFmha not in get_enabled_fmha_lib_classes():
         raise RuntimeError(
-            f"SM107 with {tokens_per_block}-token KV pages needs the flashinfer_trtllm_gen FMHA "
-            "library, the only one with paged-context kernels for this page size here, but "
-            "TLLM_FMHA_LIBS excludes it. Keep flashinfer_trtllm_gen in TLLM_FMHA_LIBS (or unset it)."
+            f"SM107 with {tokens_per_block}-token KV pages needs the trtllm_gen FMHA library, "
+            "the only one with paged-context kernels for this page size here, but "
+            "TLLM_FMHA_LIBS excludes it. Keep trtllm_gen in TLLM_FMHA_LIBS (or unset it)."
         )
 
 
@@ -349,8 +347,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     _draft_page_table_materializers: Tuple[_BasePageTableMaterializer, ...] = ()
     _draft_index_scales: Optional[torch.Tensor] = None
     _draft_kv_offsets: Optional[torch.Tensor] = None
-    # Extra page sizes trtllm-gen may use with this manager (see
-    # FlashInferTrtllmGenFmha); set with the virtual pools.
+    # Page sizes outside the trtllm-gen cubin table this manager uses (the
+    # native trtllm_gen library generates their kernels); set with the virtual pools.
     trtllm_gen_extra_tokens_per_block: frozenset = frozenset()
 
     def __init__(
@@ -751,7 +749,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # Native layers run at the target's 128-token pages. trtllm-gen has P128
         # kernels for their dense-GQA shapes but not for every shape, so opt in
         # here rather than in the global allowlist. On SM107 this opt-in is the
-        # only route for these layers: FallbackFmha has no P128 paged-context kernels.
+        # only route for these layers: the native FMHA libraries have no P128 paged-context kernels.
         if self.tokens_per_block == 128:
             # On SM107 the dense layers keep SDPA (see the model's native dense attention
             # setup), so only the shared draft layers need the route there.

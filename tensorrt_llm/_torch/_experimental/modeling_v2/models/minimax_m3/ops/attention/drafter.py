@@ -13,14 +13,13 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Tuple, cast
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-    FlashInferTrtllmGenFmha,
-)
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 from tensorrt_llm._torch.attention.backends.fmha.utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
+    get_multi_processor_count_for_device,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
@@ -31,11 +30,42 @@ from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.quantization.mode import QuantMode
 
 
-class DrafterFullCtxBase(FlashInferTrtllmGenFmha):
+class DrafterFullCtxBase(TrtllmGenFmha):
     """Shared execution; target subclasses provide their policy and module bindings."""
 
     FULLCTX: ModuleType
     GEOMETRY_ERROR: str
+    SERVES_MLA = False
+    # The C++ preprocess addresses the KV pool by its block extent.
+    NEEDS_BLOCK_EXTENT = True
+    supports_skip_correction = False
+    supports_variable_window = False
+    _multi_processor_count: Optional[int] = None
+
+    def prepare_workspace(self, q, k, v, metadata, forward_args, workspace) -> None:
+        """Grow the workspace to the C++ generation preprocess's layout for this call."""
+        super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
+        if self._multi_processor_count is None:
+            index = q.device.index if q.device.index is not None else torch.cuda.current_device()
+            self._multi_processor_count = get_multi_processor_count_for_device(index)
+        attn = self.attn
+        max_num_sequences = metadata.max_num_sequences or metadata.max_num_requests
+        layout = thop.get_trtllm_gen_generation_workspace_layout(
+            q.dtype,
+            max_num_sequences,
+            max(q.size(0), max_num_sequences),
+            attn.num_heads,
+            attn.head_dim,
+            attn.rope_dim,
+            attn.num_kv_heads,
+        )
+        required = int(layout["total_size"])
+        if workspace.numel() * workspace.element_size() < required:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "The drafter workspace is smaller than the generation preprocess needs."
+                )
+            workspace.resize_((-(-required // workspace.element_size()),))
 
     def _shape(self, q: torch.Tensor, metadata) -> Optional[Tuple[int, int]]:
         nreq = int(metadata.num_generations)

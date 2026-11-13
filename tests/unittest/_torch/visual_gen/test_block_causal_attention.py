@@ -31,6 +31,7 @@ import torch
 from utils.block_causal_reference import exact_reference as _exact_reference
 from utils.block_causal_reference import reference_attention
 
+from tensorrt_llm._torch.attention.backends.fmha import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
@@ -239,15 +240,9 @@ def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_bloc
 
 
 def expected_fmha_library(dtype, num_causal_blocks):
-    """The FMHA library the TRTLLM backend should pick for a cached forward. On
-    SM100/SM103 FlashInfer's TRTLLM-Gen kernels serve it, except a BF16 context batch
-    of at most 4 requests (one per causal block), which goes to the fallback for LLM
-    time to first token. Elsewhere only the fallback is available."""
-    if get_sm_version() not in (100, 103):
-        return "FallbackFmha"
-    if dtype == torch.bfloat16 and num_causal_blocks <= 4:
-        return "FallbackFmha"
-    return "FlashInferTrtllmGenFmha"
+    """The FMHA library the TRTLLM backend should pick for a cached forward: the native
+    libraries, whatever the dtype or the number of causal blocks."""
+    return "native"
 
 
 def record_fmha_libraries(attn, served):
@@ -257,7 +252,7 @@ def record_fmha_libraries(attn, served):
 
     def recording_select(*args, **kwargs):
         fmha = select(*args, **kwargs)
-        served.add(type(fmha).__name__)
+        served.add("native" if isinstance(fmha, NATIVE_FMHA_LIBS) else type(fmha).__name__)
         return fmha
 
     manager.select = recording_select
@@ -281,8 +276,8 @@ def test_every_layer_and_library_over_a_multi_layer_cache(
 ):
     """A 3-layer cache with different K/V in every layer, attended on every layer
     through a rotating table, with 1, 4 and 8 causal blocks in BF16 and FP16, at two
-    head shapes. Each layer must read its own pages. For TRTLLM the cases also cross the FMHA library
-    boundary on SM100/SM103, and the library that served each one is checked. For
+    head shapes. Each layer must read its own pages. For TRTLLM the library that served each case
+    is checked. For
     cuDNN every layer shares one graph."""
     torch.manual_seed(11)
     num_layers, prompt_len = 3, 17
@@ -303,7 +298,7 @@ def test_every_layer_and_library_over_a_multi_layer_cache(
         if backend == "trtllm":
             if get_sm_version() in (100, 103):
                 names = {type(lib).__name__ for lib in attns[0]._fmha_manager.fmha_libs}
-                assert "FlashInferTrtllmGenFmha" in names, f"FMHA libraries built: {names}"
+                assert "TrtllmGenFmha" in names, f"FMHA libraries built: {names}"
             for attn in attns:
                 record_fmha_libraries(attn, served)
         history = [([], []) for _ in range(num_layers)]

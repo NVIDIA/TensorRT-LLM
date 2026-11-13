@@ -12,31 +12,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""trtllm-gen decode for MiniMax-M3's dense attention layers.
+"""Native trtllm-gen decode for MiniMax-M3's dense attention layers.
 
 The kernel reads its pages from a flat sub-page view of the K/V pool, so both
 halves of that addressing are covered here: the block-table expansion that
-names this layer's K and V sub-pages, and the kernel call itself against a
-PyTorch oracle. A stub cache manager stands in for the pool, so the flashinfer
-argument conventions are exercised without standing up a model.
+names this layer's K and V sub-pages, and the prepared-query TrtllmGenFmha call
+itself against a PyTorch oracle. The call runs on a step's prepared attention
+metadata whose cache manager is then swapped for a stub that holds the pool,
+so the pool rooting and sub-page table conventions are exercised without
+standing up a model.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List
+import contextlib
+from typing import Dict, Iterator, List
 
 import pytest
 import torch
 
+import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
-    dense_decode_workspace_layout,
     minimax_m3_trtllm_gen_dense_decode,
-    split_dense_decode_workspace,
     subpage_block_table,
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -49,45 +57,6 @@ SM_SCALE = HEAD_DIM**-0.5
 def _is_sm100f() -> bool:
     major, minor = torch.cuda.get_device_capability()
     return major == 10 and minor in (0, 3)
-
-
-# --------------------------------------------------------------------------
-# Scratch layout
-# --------------------------------------------------------------------------
-
-
-def test_dense_decode_scratch_is_carved_out_of_one_buffer():
-    """Both halves of the scratch must fit the total the layout reported.
-
-    MsaDecodeFmha grows the shared attention workspace to that total and then
-    splits it, so an offset or a size that disagreed with it would hand the
-    kernel a view running off the end of the workspace.
-    """
-    layout = dense_decode_workspace_layout(
-        q_dtype=torch.bfloat16,
-        num_heads=8,
-        head_dim=HEAD_DIM,
-        num_kv_heads=1,
-        max_num_requests=4,
-        device=torch.device("cuda"),
-    )
-
-    assert layout.counter_offset >= layout.workspace_bytes
-    assert layout.total_bytes > layout.counter_offset
-
-    buffer = torch.full((layout.total_bytes,), 7, dtype=torch.int8, device="cuda")
-    workspace, counters = split_dense_decode_workspace(buffer, layout)
-
-    assert workspace.numel() == layout.workspace_bytes
-    assert counters.numel() == layout.total_bytes - layout.counter_offset
-    assert workspace.data_ptr() == buffer.data_ptr()
-    assert counters.data_ptr() == buffer.data_ptr() + layout.counter_offset
-    # Only the counters are cleared; the slab is the kernel's own to initialize.
-    assert int(counters.sum()) == 0
-    assert int(workspace[0]) == 7
-
-    with pytest.raises(ValueError, match="but this call needs"):
-        split_dense_decode_workspace(buffer[:-1], layout)
 
 
 # --------------------------------------------------------------------------
@@ -174,7 +143,10 @@ def test_uniform_subpages_per_slot_reports_zero_without_a_pool():
 
 
 class _StubManager:
-    """The one method the kernel asks of a KV cache manager."""
+    """What the call and the native op ask of the step's KV cache manager: the
+    layer's sub-page pool, and the length bound the op's JIT warmup reads."""
+
+    max_seq_len = 1024
 
     def __init__(self, pool: torch.Tensor, subpages_per_slot: int):
         self._pool = pool
@@ -183,6 +155,48 @@ class _StubManager:
     def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str = "HND"):
         assert kv_layout == "HND"
         return self._pool, self._scale
+
+
+@contextlib.contextmanager
+def _decode_metadata(stub: _StubManager, batch: int) -> Iterator[TrtllmAttentionMetadata]:
+    """A prepared one-token decode step of batch requests whose KV cache manager is stub.
+
+    The call reads the step's batch bound and runtime views off the metadata
+    and the layer's pool off its manager, so a real cache prepares the step and
+    the stub then takes its place.
+    """
+    manager = KVCacheManager(
+        KvCacheConfig(max_tokens=1024, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=HEAD_DIM,
+        tokens_per_block=PAGE_SIZE,
+        max_seq_len=_StubManager.max_seq_len,
+        max_batch_size=batch,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=torch_dtype_to_binding(torch.bfloat16),
+    )
+    try:
+        request_ids = list(range(batch))
+        manager.add_dummy_requests(request_ids, [PAGE_SIZE + 1] * batch)
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=batch,
+            max_num_tokens=1024,
+            kv_cache_manager=manager,
+            num_contexts=0,
+            seq_lens=torch.ones(batch, dtype=torch.int),
+            request_ids=request_ids,
+            prompt_lens=[PAGE_SIZE] * batch,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=[PAGE_SIZE] * batch
+            ),
+        )
+        metadata.prepare()
+        metadata.kv_cache_manager = stub
+        yield metadata
+    finally:
+        manager.shutdown()
 
 
 def _reference_dense_decode(
@@ -251,21 +265,28 @@ def _make_pool_inputs(
     return q, pool, block_table, torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
 
 
+def _workspace() -> torch.Tensor:
+    """An empty attention workspace; the native op grows it on first use."""
+    return torch.empty((0,), dtype=torch.uint8, device="cuda")
+
+
 def _run_dense(q, pool, subpages_per_slot, block_table, seq_lens, decode_query_len, **kwargs):
     out = torch.zeros_like(q, dtype=torch.bfloat16)
-    minimax_m3_trtllm_gen_dense_decode(
-        q,
-        _StubManager(pool, subpages_per_slot),
-        0,
-        block_table,
-        seq_lens,
-        sm_scale=SM_SCALE,
-        output=out,
-        decode_query_len=decode_query_len,
-        max_seq_len=int(seq_lens.max()),
-        max_num_requests=int(seq_lens.shape[0]),
-        **kwargs,
-    )
+    stub = _StubManager(pool, subpages_per_slot)
+    with _decode_metadata(stub, int(seq_lens.shape[0])) as metadata:
+        minimax_m3_trtllm_gen_dense_decode(
+            q,
+            metadata,
+            0,
+            block_table,
+            seq_lens,
+            sm_scale=SM_SCALE,
+            output=out,
+            decode_query_len=decode_query_len,
+            max_seq_len=int(seq_lens.max()),
+            workspace=_workspace(),
+            **kwargs,
+        )
     return out
 
 
@@ -328,41 +349,43 @@ def test_cuda_graph_replay_tracks_inputs():
     q, pool, block_table, seq_lens_t = _make_pool_inputs(
         seq_lens, 8, 1, 1, 9, torch.bfloat16, seed=7
     )
-    stub = _StubManager(pool, 9)
     out = torch.zeros_like(q, dtype=torch.bfloat16)
+    workspace = _workspace()
 
-    def run():
-        minimax_m3_trtllm_gen_dense_decode(
-            q,
-            stub,
-            0,
-            block_table,
-            seq_lens_t,
-            sm_scale=SM_SCALE,
-            output=out,
-            decode_query_len=1,
-            max_seq_len=PAGE_SIZE * 3,
-            max_num_requests=2,
-        )
+    with _decode_metadata(_StubManager(pool, 9), 2) as metadata:
 
-    run()  # warm the arena and the counter buffer before capture
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(graph):
-            run()
-    torch.cuda.current_stream().wait_stream(stream)
+        def run():
+            minimax_m3_trtllm_gen_dense_decode(
+                q,
+                metadata,
+                0,
+                block_table,
+                seq_lens_t,
+                sm_scale=SM_SCALE,
+                output=out,
+                decode_query_len=1,
+                max_seq_len=PAGE_SIZE * 3,
+                workspace=workspace,
+            )
 
-    q.copy_(torch.randn_like(q, dtype=torch.float32).to(torch.bfloat16))
-    graph.replay()
-    torch.cuda.synchronize()
-    replayed = out.clone()
+        run()  # grow the native workspace and counters before capture
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            with torch.cuda.graph(graph):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
 
-    out.zero_()
-    run()
-    torch.cuda.synchronize()
+        q.copy_(torch.randn_like(q, dtype=torch.float32).to(torch.bfloat16))
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = out.clone()
+
+        out.zero_()
+        run()
+        torch.cuda.synchronize()
     torch.testing.assert_close(replayed.float(), out.float(), rtol=2e-2, atol=2e-2)
 
 
@@ -387,6 +410,5 @@ def test_declines_unsupported_geometry():
 
 
 def test_accepts_the_m3_geometry():
-    pytest.importorskip("flashinfer")
     pool = torch.zeros((1, 1, PAGE_SIZE, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
     assert dense_decode_unsupported_reason(_StubManager(pool, 2), HEAD_DIM) is None

@@ -7,7 +7,7 @@ On SM 10.7 its generation phase runs ``thop.attention``'s in-tree trtllm-gen run
 per (request, KV head): 45-46 us per pass at 165k tokens on 212 SMs, for 85 MB.
 
 This library keeps the in-tree preprocessing -- ``thop.trtllm_gen_generation_preprocess``: RoPE, the FP8 K/V append
-into the paged cache and the FP8 query, as ``FlashInferTrtllmGenFmha`` runs it -- and attends with the full-context
+into the paged cache and the FP8 query, as the native trtllm-gen generation runs it -- and attends with the full-context
 PrimTS split-KV decode of ``ops/m3_fullctx_decode`` at the same pinned recipes as the dense layers.
 
 With ``fused_rope_mode`` set, the preprocess and the query cast run as one launch instead
@@ -43,9 +43,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attenti
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.drafter import (
     install as _shared_install,
-)
-from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-    FlashInferTrtllmGenFmha as FlashInferTrtllmGenFmha,
 )
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase as FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams as FmhaParams

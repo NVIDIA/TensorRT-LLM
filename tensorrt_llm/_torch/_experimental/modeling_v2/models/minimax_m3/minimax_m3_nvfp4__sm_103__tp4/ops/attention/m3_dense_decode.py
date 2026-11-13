@@ -12,7 +12,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.attention.m3_trtllm_gen_dense_decode import (  # noqa: E501
     minimax_m3_trtllm_gen_dense_decode,
 )
 

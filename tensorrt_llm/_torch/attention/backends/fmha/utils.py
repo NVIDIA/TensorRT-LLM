@@ -122,6 +122,64 @@ def get_trtllm_gen_context_workspace_size(
     return int(layout["total_size"])
 
 
+@lru_cache(maxsize=128)
+def get_trtllm_gen_generation_workspace_layout(
+    dtype: torch.dtype,
+    batch_beam: int,
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
+    num_kv_heads: int,
+    rotary_embedding_dim: int,
+) -> dict[str, int]:
+    """Offsets and sizes of the fused generation-preprocessing workspace."""
+    return thop.get_trtllm_gen_generation_workspace_layout(
+        dtype,
+        batch_beam,
+        num_tokens,
+        num_heads,
+        head_size,
+        rotary_embedding_dim,
+        num_kv_heads,
+    )
+
+
+@lru_cache(maxsize=128)
+def get_trtllm_gen_workspace_size(
+    dtype: torch.dtype,
+    num_tokens: int,
+    num_gen_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    max_num_requests: int,
+    rotary_embedding_dim: int,
+    fp8_context_fmha: bool,
+) -> int:
+    """Bytes of the larger of the fused context and generation preprocessing workspaces."""
+    context_size = get_trtllm_gen_context_workspace_size(
+        dtype,
+        max_num_requests,
+        num_tokens,
+        num_heads,
+        head_size,
+        rotary_embedding_dim,
+        fp8_context_fmha,
+    )
+    if num_gen_tokens == 0:
+        return context_size
+    layout = get_trtllm_gen_generation_workspace_layout(
+        dtype,
+        max_num_requests,
+        num_gen_tokens,
+        num_heads,
+        head_size,
+        num_kv_heads if num_kv_heads > 0 else num_heads,
+        rotary_embedding_dim,
+    )
+    return max(context_size, int(layout["total_size"]))
+
+
 # The trtllm-gen kernels index the counters in groups of eight.
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 

@@ -13,13 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable
+import contextlib
+from typing import Callable, Iterator
 
 import torch
 
+import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams, PhasedFmha
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionRuntimeFeatures,
+)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
 
 
 class FakeAttention:
@@ -156,3 +167,80 @@ class FakeFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         self._events.append(("forward", self._name))
+
+
+@contextlib.contextmanager
+def native_batch(
+    dtype: torch.dtype,
+    *,
+    num_contexts: int,
+    num_generations: int,
+    chunked_prefill: bool = False,
+    tokens_per_block: int = 32,
+) -> Iterator[tuple[TrtllmAttention, TrtllmAttentionMetadata, torch.Tensor]]:
+    """A TrtllmAttention layer and one prepared batch over a real KV cache.
+
+    Yields the layer, the metadata and the batch's fused QKV rows: ``num_contexts`` fresh
+    8-token contexts, then ``num_generations`` one-token steps over an 8-token past.
+    """
+    num_heads, num_kv_heads, head_dim, length = 4, 1, 64, 8
+    manager = KVCacheManager(
+        KvCacheConfig(max_tokens=1024, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=1024,
+        max_batch_size=8,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=torch_dtype_to_binding(dtype),
+    )
+    try:
+        num_seqs = num_contexts + num_generations
+        is_gen = [i >= num_contexts for i in range(num_seqs)]
+        manager.add_dummy_requests(list(range(num_seqs)), [length + g for g in is_gen])
+        seq_lens = [1 if g else length for g in is_gen]
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=8,
+            max_num_tokens=1024,
+            kv_cache_manager=manager,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=chunked_prefill),
+            num_contexts=num_contexts,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+            request_ids=list(range(num_seqs)),
+            prompt_lens=[length] * num_seqs,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=[length if g else 0 for g in is_gen]
+            ),
+        )
+        metadata.prepare()
+        attn = TrtllmAttention(
+            layer_idx=0, num_heads=num_heads, head_dim=head_dim, num_kv_heads=num_kv_heads
+        )
+        qkv = torch.randn(
+            sum(seq_lens), (num_heads + 2 * num_kv_heads) * head_dim, device="cuda"
+        ).to(dtype)
+        yield attn, metadata, qkv
+    finally:
+        manager.shutdown()
+
+
+def native_forward_args(
+    attn: TrtllmAttention,
+    metadata: TrtllmAttentionMetadata,
+    qkv: torch.Tensor,
+    **overrides: object,
+) -> AttentionForwardArgs:
+    """Forward arguments of a fused-QKV self-attention call writing a fresh output, as
+    ``TrtllmAttention.forward`` prepares them."""
+    attn.local_layer_idx = attn.get_local_layer_idx(metadata)
+    values = {
+        "attention_window_size": metadata.max_seq_len,
+        "output": torch.empty(
+            (qkv.shape[0], attn.num_heads * attn.head_dim), dtype=qkv.dtype, device=qkv.device
+        ),
+        "is_fused_qkv": True,
+    }
+    values.update(overrides)
+    return AttentionForwardArgs(**values)

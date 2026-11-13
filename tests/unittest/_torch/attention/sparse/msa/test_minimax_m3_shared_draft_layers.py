@@ -23,9 +23,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-    FlashInferTrtllmGenFmha,
-)
+from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 from tensorrt_llm._torch.attention.backends.fmha.utils import get_kv_page_offset
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     cache_manager as m3_cache_manager,
@@ -159,7 +157,7 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         # rejecting the view or delegating to its differently rooted owner.
         attn = TrtllmAttention.__new__(TrtllmAttention)
         attn.local_layer_idx = 4
-        fmha = FlashInferTrtllmGenFmha.__new__(FlashInferTrtllmGenFmha)
+        fmha = TrtllmGenFmha.__new__(TrtllmGenFmha)
         fmha._attn_ref = lambda: attn
         metadata = TrtllmAttentionMetadata(
             max_num_requests=2, max_num_tokens=256, kv_cache_manager=draft, mapping=manager.mapping
@@ -599,19 +597,19 @@ def test_draft_kv_cache_view_accessor_respects_local_layers(
     "sm,fmha_libs,error",
     [
         (107, None, None),
-        (107, "-flashinfer_trtllm_gen", "TLLM_FMHA_LIBS excludes it"),
-        (107, "fallback", "TLLM_FMHA_LIBS excludes it"),
-        (107, "flashinfer_trtllm_gen,fallback", None),
+        # The native trtllm_gen library (in the "fallback" group) generates P128 kernels with NVRTC.
+        (107, "fallback", None),
+        (107, "-trtllm_gen", "TLLM_FMHA_LIBS excludes it"),
         # Elsewhere the fallback has P128 paged-context kernels, so nothing is required.
-        (103, "-flashinfer_trtllm_gen", None),
+        (103, "-trtllm_gen", None),
     ],
 )
 @pytest.mark.parametrize("site", ["separate_draft_manager", "nvfp4_draft_view"])
-def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
+def test_p128_opt_in_fails_fast_without_the_trtllm_gen_route(
     monkeypatch, sm, fmha_libs, error, site
 ):
     """On SM107 the P128 opt-in is checked when the KV manager is set up, not at the
-    first prefill: a missing FlashInfer route raises an error that names the fix."""
+    first prefill: a missing TRTLLM-Gen route raises an error that names the fix."""
     monkeypatch.setattr(f"{_CACHE_MANAGER_MODULE}.get_sm_version", lambda: sm)
     if fmha_libs is None:
         monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
@@ -653,10 +651,10 @@ def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("shared_draft", [False, True])
 def test_p128_target_fails_fast_only_with_a_shared_draft_layer(monkeypatch, shared_draft):
-    """On SM107 a BF16 target's dense layers keep SDPA, so a missing FlashInfer route only
+    """On SM107 a BF16 target's dense layers keep SDPA, so a missing TRTLLM-Gen route only
     fails setup when a shared draft layer needs it."""
     monkeypatch.setattr(f"{_CACHE_MANAGER_MODULE}.get_sm_version", lambda: 107)
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "-flashinfer_trtllm_gen")
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "-trtllm_gen")
     monkeypatch.setattr(
         KVCacheManagerV2,
         "_prepare_page_table_tensor",

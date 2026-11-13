@@ -1406,10 +1406,9 @@ def test_the_triton_sparse_decode_rejects_a_q_that_outruns_the_batch():
 def test_the_trtllm_gen_dense_decode_rejects_a_q_that_outruns_the_batch():
     """The same padded q against the dense kernel, which had no such guard.
 
-    It is handed no cache manager: its multi-CTA counters are sized off the
-    batch, so it has to decline before consulting one.
+    It is handed no attention metadata: its multi-CTA counters are sized off
+    the batch, so it has to decline before consulting the step.
     """
-    pytest.importorskip("flashinfer")
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
         minimax_m3_trtllm_gen_dense_decode,
     )
@@ -1429,7 +1428,7 @@ def test_the_trtllm_gen_dense_decode_rejects_a_q_that_outruns_the_batch():
             output=torch.empty_like(q),
             decode_query_len=query_len,
             max_seq_len=1024,
-            max_num_requests=batch,
+            workspace=torch.empty(0, dtype=torch.uint8),
         )
 
 

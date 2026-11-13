@@ -480,27 +480,55 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
-`FallbackFmha` hands the Python `FmhaParams` to `thop.run_context` or
-`thop.run_generation`; the native carrier behind them is per host thread and
-never visible to Python. Generated nanobind readers
+The native attention op exposes each of its kernel libraries as its own FMHA
+library: `TrtllmGenFmha`, `FlashMlaFmha`, `XqaFmha`, `FmhaV2Fmha`, `MmhaFmha`
+and `UnfusedFmha` (`fmha/trtllm_gen.py` and siblings), each a `PhasedFmha` of
+its own; the checks they share are functions in `fmha/fallback.py`. Each calls
+only its own entry points:
+`thop.<library>_is_supported(params, is_gen)` and
+`thop.<library>_run_context` / `thop.<library>_run_generation` for the phases
+it serves. `FmhaManager` selects among them like any other library; one
+registry order serves MHA and MLA, because FMHA-v2 serves no MHA generation and
+XQA no context phase. `FallbackFmha` wraps them as one library that runs each
+phase on the first native library that serves it, in the op's original
+per-variant priority, for direct callers such as `FallbackFmha.attention`.
+`NATIVE_FMHA_LIBS` lists the wrapper and the libraries, and every `run_*` stays
+eager under `torch.compile`. `XqaFmha` judges its generation
+support at `max_seq_len`, so the choice holds for every KV history length that
+shares a selection cache key. Whether XQA is expected to outrun MMHA weighs the
+call's batch against its KV history; `XqaFmha.has_perf_gain` asks
+`thop.xqa_has_perf_gain` once per batch, history block, speculative mode and output dtype,
+and `FmhaManager` keys selection on the answer once a selection reaches XQA. The native
+carrier behind the entry points is per host thread and never visible to
+Python. Generated nanobind readers
 (`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,
 `meta` and `fwd` into the native struct, build an `AttentionConfig` key, and
 resolve the op from a per-thread C++ cache keyed by that configuration; the op
 is built outside CUDA graph capture on first use and its kernel runners are
-created lazily per phase. Workspace sizing, growth and the multi-CTA counter
-live in C++; `prepare_workspace()` is empty. After each launch the holder drops
+created lazily per phase. `*_is_supported` prepares the call in the op without
+launching or growing the workspace. Workspace sizing, growth and the multi-CTA
+counter live in C++; generation reserves the largest requirement among the op's
+libraries, so a CUDA graph replay can switch library without growth, and
+`prepare_workspace()` is empty. After each launch the holder drops
 every tensor reference so cached parameters never pin a layer's activations.
 Streams are not part of the key so CUDA graph capture reuses runners
 initialized during warmup.
 
-`FallbackFmha._is_supported()` accepts separate Q/K/V only for MLA, cross
-attention, or SageAttention; self-attention requires KV-cache updates. It rejects
-raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
-with the native `AttentionOp` input requirements.
+The native op checks a call's inputs in the static `MHA::checkParams()` or
+`MLA::checkParams()`, which every `thop.<library>_is_supported` runs before it
+builds the op for the call's key; Python adds no checks of its own. `MHA`
+accepts separate Q/K/V only for cross attention or SageAttention, and `MLA`
+declines custom masks. Both then call `TrtllmAttention::checkFeatureParams()`,
+which declines raw FP8 E4M3 query input and runs the static `checkParams()`
+every `AttentionFeature` declares: `CustomMaskFeature` declines custom masks,
+`PagedKVCacheFeature` requires self-attention to update the KV cache, `SpecDecodingFeature` declines a helix
+verify group whose KV straddles CP ranks, and `SparseMlaFeature` declines DSA
+and DeepSeek-V4 sparse MLA with an `fp8_ds_mla` KV cache or on SM120f.
 
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
-defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
+defaults or `TLLM_FMHA_LIBS=fallback` (the group of the native libraries) to
+force the native path. Generic
 block-sparse PrimTS remains enabled by default because a dense fallback cannot
 preserve its routing semantics. The PrimTS sparse MLA library
 (`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4
@@ -549,10 +577,9 @@ returning False. A False would let selection fall through to the generic
 no-library error (or, for a library that is not last in the registry, hand
 the request to a library that masks the broken configuration), while the
 raise names the cause and the remedy at dispatch. `Fp4MlaFmha` raises this
-way for FP4 MLA configurations only it can serve, and `FallbackFmha` raises
-to refuse paged-context FMHA on (SM, head_dim) combinations whose fused
-context kernel is proven absent, where the C++ op would silently fall back
-to unfused MHA and corrupt the cached prefix.
+way for FP4 MLA configurations only it can serve, and `UnfusedFmha` raises to
+refuse a paged-context call that no fused context kernel serves, which would
+otherwise corrupt the cached prefix.
 
 The FMHA package is split by role:
 
@@ -635,9 +662,9 @@ The FMHA package is split by role:
   mixed context/generation batches, and skips its batch-size performance
   gate, only on the FP4 MLA 128-token KV pages when no other MLA
   generation library reads them (`_page_size_exclusive_to_cute_dsl`): the
-  fallback thop op has TRTLLM-Gen MLA generation kernels for 32-token pages
-  only, FlashInfer TRTLLM-Gen reads 128-token pages only when the KV cache
-  manager lists them in `trtllm_gen_extra_tokens_per_block`, and the opt-in
+  trtllm_gen library ships TRTLLM-Gen MLA generation cubins for 32-token pages
+  only and serves 128-token pages only when the KV cache manager lists them in
+  `trtllm_gen_extra_tokens_per_block`, and the opt-in
   PrimTS library reads them on SM100/SM103 from an FP8 or BF16 KV cache
   manager. Every other page size keeps the default routing.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
@@ -661,20 +688,28 @@ The FMHA package is split by role:
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:
-  `gqa_decode` is trtllm-gen that also consumes the module's FP8 KV append and
-  deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
+  `gqa_decode` is native trtllm-gen that also consumes the module's FP8 KV
+  append and deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
   `gqa_split_kv` and `gqa_segmented` take the generation calls their
   `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
   size conditions are evaluated at the upper bound of the selection-cache
-  cell (`generation_selection_cell`). The segment attention of
-  `gqa_kv_replica` and `gqa_segmented` requests the LSE, for which FlashInfer
-  takes softmax stats off the front of the FMHA workspace: these calls run on
-  the trtllm-gen slice extended in place, and `GqaDecodeFmha.prepare_workspace`
-  sizes the attention workspace for the layer's largest such call.
-- `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
-  library.
-- `fmha/fallback.py` implements the fallback library on the native phased
-  `thop.run_context` / `thop.run_generation` entry points.
+  cell (`generation_selection_cell`).
+- The native trtllm-gen generation also takes a prepared query
+  (`FmhaParams.prepared_query`): RoPE applied, in the kernels' query dtype, K/V
+  already in the cache. The op then skips its decoder info and QKV
+  preprocessing and runs only the kernel, optionally over the call's own page
+  table (`kv_block_table`) and with folded heads (`num_heads_q`). With
+  `softmax_lse` it also returns the base-2 LSE of every row. The GQA decode
+  libraries run the module's KV-append plan this way, and the segmented and
+  KV-replica decodes run their per-segment attention this way.
+- The native op's libraries live one per module (`fmha/trtllm_gen.py`,
+  `flash_mla.py`, `xqa.py`, `fmha_v2.py`, `mmha.py`, `unfused.py`);
+  `fmha/fallback.py` holds the checks they share and the wrapper over them.
+  The trtllm-gen cubin table carries dense paged-KV kernels for 32-token pages
+  only. For any other page size the trtllm-gen runner generates the context
+  and generation kernels with NVRTC (`TllmGenFmhaKernel::shouldUseNvrtc()`),
+  except over an NVFP4 KV cache, and the TRTLLM-Gen JIT warmup compiles the
+  context ones before serving starts.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that implement one or more phase-specific entry
@@ -772,26 +807,23 @@ prefill, KV block reuse or speculative draft tokens are configured. Those
 features all require the context phase to attend to KV that is already in the
 cache, and only the fused context FMHA kernel can do that.
 
-`MHA::initContext()` ends with
-`mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()`, so a
-configuration with no compiled kernel silently clears the flag and the context
-phase runs the unfused path instead. That path builds K and V from the current
+A configuration with no compiled fused context kernel leaves `TrtllmGenFmha`
+and `FmhaV2Fmha` unsupported, so the context phase is selected onto
+`UnfusedFmha` instead. That path builds K and V from the current
 chunk alone: the cached prefix is dropped from attention and then overwritten
 by the chunk's write-back, which turns a missing kernel into a plausible wrong
 answer rather than an error.
 
-`MHA::prepareInputs()` refuses a non-MLA, non-cross paged-context request whose
-initialized op has no context FMHA kernel, so an unsupported configuration fails
-when the first context call prepares its workspace (normally during warmup), not
-at op construction. The check uses the exact Q/KV/output precision, mask type and
+`UnfusedFmha::isSupported()` refuses a non-cross paged-context request with an
+error, so an unsupported configuration fails when the first context call is
+selected (normally during warmup), not at op construction. The check uses the exact Q/KV/output precision, mask type and
 page size.
 
 The refusal has three distinct causes, each with its own message, and the
 distinction matters when triaging:
 
-- Relative position embedding (T5-style self attention). The `MHA` constructor
-  clears `mEnableContextFMHA` for it before the kernel table is consulted, so no
-  build carries a fused kernel for it. This is an unsupported feature
+- Relative position embedding (T5-style self attention). Neither fused context
+  library builds a runner for it, so no build carries a fused kernel for it. This is an unsupported feature
   combination: disable chunked prefill, KV block reuse and speculative
   decoding for the model. The message says so and does not point at the
   build's architecture list, because no architecture list can supply the
@@ -814,9 +846,8 @@ is the case on the first decoder context step and on every generation step.
 The exception is the later chunks of a chunked decoder prefill: the executor
 marks the encoder output consumed after the first chunk, the cross layer then
 passes no K/V, and the op must read the cross KV cache instead. Only the fused
-kernel can do that, so the context-stage enqueue in `thop/attentionOp.cpp`
-checks per call that a cross-attention op called without `cross_kv` has
-`mEnableContextFMHA`.
+kernel can do that, so `UnfusedFmha::runContext()` refuses a cross-attention
+call without `cross_kv`.
 
 `thop.fused_context_fmha_kernel_exists(head_size, kv_cache_dtype,
 tokens_per_block, output_dtype)` reports whether this build contains a fused
@@ -825,7 +856,7 @@ with equal Q/KV head counts. Q is probed at the KV precision, except for an
 NVFP4 KV cache, which `AttentionOp` reads with an FP8 Q kernel
 (`hasFp4KvCache()` requires `mFP8ContextFMHA`); only the trtllm-gen kernel
 set carries E2M1-KV context kernels, and the probe reports absent for NVFP4
-KV wherever `FmhaDispatcher` would select FMHA-v2 instead (outside the SM100
+KV wherever the op would select FMHA-v2 instead (outside the SM100
 family, or head size 72) rather than trip that runner's Q/KV precision
 assertion. It is a diagnostic aid: the output dtype is an explicit
 argument because the runtime chooses it independently of the KV cache dtype,

@@ -17,7 +17,7 @@ from utils.util import isSM120Family, skip_blackwell_geforce, skip_pre_blackwell
 
 # from utils.util import default_dtype
 import tensorrt_llm
-from tensorrt_llm._torch.attention.backends.fmha import FallbackFmha, FlashInferSparseMlaFmha
+from tensorrt_llm._torch.attention.backends.fmha import NATIVE_FMHA_LIBS, FlashInferSparseMlaFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
@@ -1464,9 +1464,9 @@ def test_deepseek_v4_sanity(
     fmha_libs = model.model.layers[0].self_attn.mqa._fmha_manager.fmha_libs
     if kv_cache_dtype == "fp8_ds_mla":
         assert any(isinstance(fmha, FlashInferSparseMlaFmha) for fmha in fmha_libs)
-        assert not any(isinstance(fmha, FallbackFmha) for fmha in fmha_libs)
+        assert not any(isinstance(fmha, NATIVE_FMHA_LIBS) for fmha in fmha_libs)
     else:
-        assert any(isinstance(fmha, FallbackFmha) for fmha in fmha_libs)
+        assert any(isinstance(fmha, NATIVE_FMHA_LIBS) for fmha in fmha_libs)
 
     context_sequence_length = [3, 2, 5]
     num_contexts = len(context_sequence_length)

@@ -1079,9 +1079,7 @@ class DecoderWarmup:
             # One MIXED context+generation batch (1 ctx token + 1 gen request).
             warmup_requests_configs.append((1 + self._config.max_total_draft_tokens + 1, 1))
         else:
-            logger.debug(
-                "Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib"
-            )
+            logger.debug("Skipped TRTLLM-Gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib")
 
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._dummy_requests.create_warmup_request(

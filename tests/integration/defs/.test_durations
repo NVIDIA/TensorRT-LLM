@@ -1096,8 +1096,6 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/attention/test_attention_mla.py]": 105.87725939849625,
    "unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py": 26.247144525547448,
    "test_unittests.py::test_unittests_v2[unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py]": 26.247144525547448,
-   "unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py": 59.335434782608694,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py]": 59.335434782608694,
    "unittest/_torch/attention/test_gqa_decode_fmha.py": 59.69080141843972,
    "test_unittests.py::test_unittests_v2[unittest/_torch/attention/test_gqa_decode_fmha.py]": 59.69080141843972,
    "unittest/_torch/attention/test_pixtral_head104_attention.py": 18.58247534516765,

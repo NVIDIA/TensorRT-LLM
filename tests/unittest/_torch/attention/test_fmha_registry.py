@@ -35,9 +35,8 @@ def _enabled_names() -> tuple[str, ...]:
 
 def test_prims_ts_precedes_trtllm_gen_in_canonical_order() -> None:
     names = _canonical_names()
-    assert names.index(PRIMS_TS) < names.index("flashinfer_trtllm_gen")
-    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("flashinfer_trtllm_gen")
-    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("fallback")
+    assert names.index(PRIMS_TS) < names.index("trtllm_gen")
+    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("trtllm_gen")
 
 
 def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -114,3 +113,34 @@ def test_empty_delta_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(ValueError, match="Invalid empty FMHA library entry"):
         registry.get_enabled_fmha_lib_classes()
+
+
+def test_fallback_group_names_the_native_libraries(monkeypatch: pytest.MonkeyPatch) -> None:
+    native = registry.FMHA_LIB_GROUPS["fallback"]
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"{PRIMS_TS},fallback")
+    assert _enabled_names() == (PRIMS_TS, *native)
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "-fallback")
+    assert not set(_enabled_names()) & set(native)
+
+
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+@pytest.mark.parametrize("is_gen", [False, True], ids=["context", "generation"])
+def test_registry_order_matches_native_priority(is_mla: bool, is_gen: bool) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import fallback
+    from tensorrt_llm._torch.attention.backends.fmha.fmha_v2 import FmhaV2Fmha
+
+    def serving(libraries):
+        # fmha_v2 serves no MHA generation, so its position there is free.
+        return [
+            lib
+            for lib in libraries
+            if (lib.SERVES_MLA if is_mla else lib.SERVES_MHA)
+            and (lib.SERVES_GENERATION if is_gen else lib.SERVES_CONTEXT)
+            and not (lib is FmhaV2Fmha and is_gen and not is_mla)
+        ]
+
+    native_libraries = fallback._MLA_LIBRARIES if is_mla else fallback._MHA_LIBRARIES
+    native_priority = [library for library, _ in native_libraries]
+    registry_order = [registry.FMHA_LIBS[name] for name in registry.FMHA_LIB_GROUPS["fallback"]]
+    assert serving(registry_order) == serving(native_priority)

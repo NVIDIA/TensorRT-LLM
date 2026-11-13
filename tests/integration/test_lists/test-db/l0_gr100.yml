@@ -53,7 +53,7 @@ l0_gr100:
   - unittest/_torch/attention/test_fp4_mla_packed.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
-  - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
+  - unittest/_torch/attention/test_attention_backends.py::test_trtllm_native_page_sizes_outside_cubin_table
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py
   - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface

@@ -15,39 +15,57 @@
 
 from .combined import CombinedFmha
 from .cute_dsl_mla import CuteDslMlaFmha
-from .fallback import FallbackFmha
+from .fallback import NATIVE_FMHA_LIBS, FallbackFmha
+from .flash_mla import FlashMlaFmha
 from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
-from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from .fmha_v2 import FmhaV2Fmha
 from .fp4_mla import Fp4MlaFmha
 from .gqa_decode import GqaDecodeFmha
 from .interface import Fmha, FmhaPhase
+from .mmha import MmhaFmha
 from .msa_decode import MsaDecodeFmha
 from .msa_prefill import MsaPrefillFmha
 from .phased import FmhaParams, PhasedFmha
 from .prims_ts import PrimsTSFmha
 from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
-from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
+from .registry import (
+    DEFAULT_FMHA_LIBS,
+    FMHA_LIB_GROUPS,
+    FMHA_LIBS,
+    FmhaCls,
+    get_enabled_fmha_lib_classes,
+)
 from .triton_custom_mask import TritonCustomMaskFmha
+from .trtllm_gen import TrtllmGenFmha
+from .unfused import UnfusedFmha
+from .xqa import XqaFmha
 
 __all__ = [
-    "DEFAULT_FMHA_LIBS",
-    "FMHA_LIBS",
     "CombinedFmha",
     "CuteDslMlaFmha",
+    "DEFAULT_FMHA_LIBS",
+    "FMHA_LIBS",
+    "FMHA_LIB_GROUPS",
     "FallbackFmha",
     "FlashInferSparseMlaFmha",
-    "FlashInferTrtllmGenFmha",
-    "Fp4MlaFmha",
+    "FlashMlaFmha",
     "Fmha",
     "FmhaCls",
     "FmhaParams",
     "FmhaPhase",
+    "FmhaV2Fmha",
+    "Fp4MlaFmha",
     "GqaDecodeFmha",
+    "MmhaFmha",
     "MsaDecodeFmha",
     "MsaPrefillFmha",
+    "NATIVE_FMHA_LIBS",
     "PhasedFmha",
     "PrimsTSFmha",
     "PrimsTSSparseMlaFmha",
     "TritonCustomMaskFmha",
+    "TrtllmGenFmha",
+    "UnfusedFmha",
+    "XqaFmha",
     "get_enabled_fmha_lib_classes",
 ]

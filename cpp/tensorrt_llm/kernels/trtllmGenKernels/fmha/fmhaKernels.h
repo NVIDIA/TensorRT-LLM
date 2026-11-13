@@ -157,6 +157,9 @@ public:
     using FmhaData = fmha::FmhaData;
     using KernelParams = fmha::KernelParams;
 
+    // The only page size of the dense paged-KV kernels in the cubin table; NVRTC generates the others.
+    static constexpr int kCubinNumTokensPerPage = 32;
+
     // Ctor.
     TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ, Data_type dtypeK,
         Data_type dtypeV, Data_type dtypeOut, unsigned int smArch, int numEltsPerSageAttnBlkQ = 0,
@@ -264,16 +267,13 @@ public:
             return false;
         }
 #endif // TLLM_RUBIN_FEATURES
-       // The cubin table has no dense paged-KV kernels for 128-token pages, and the page size is
-       // part of the kernel hash. On SM107, generate those BF16/E4M3 context and KeepsMmaAb
-       // generation kernels for the actual cache layout instead.
-        constexpr int kPageSize128 = 128;
-        if (mSM == kSM_107
-            && (isContextKernel(options.mFmhaKernelType) || isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType))
-            && !options.mIsMlaGen && !isTokenSparse(options.mSparseType) && isPagedKv(options.mQkvLayout)
-            && options.mNumTokensPerPage == kPageSize128 && options.mDtypeQ == options.mDtypeKv
-            && (options.mDtypeQ == tg::Dtype::Bfloat16 || options.mDtypeQ == tg::Dtype::E4m3)
-            && options.mDtypeOut == tg::Dtype::Bfloat16)
+       // The page size is part of the kernel hash, and the cubin table carries dense paged-KV
+       // kernels for kCubinNumTokensPerPage only. Generate the context and KeepsMmaAb generation
+       // kernels of any other page size for the actual cache layout. NVFP4 KV keeps the cubin
+       // path, as for SwapsMmaAb below.
+        if ((isContextKernel(options.mFmhaKernelType) || isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType))
+            && !isTokenSparse(options.mSparseType) && isPagedKv(options.mQkvLayout)
+            && options.mNumTokensPerPage != kCubinNumTokensPerPage && options.mDtypeKv != tg::Dtype::E2m1)
         {
             return true;
         }
@@ -536,9 +536,11 @@ private:
         }
         if (isContextKernel(runnerParams.mKernelType))
         {
-            // Only SM107 needs the dense paged-context NVRTC warmup grid.
-            // Other architectures retain their precompiled context path.
-            if (mSM != kSM_107)
+            // Context kernels come from the cubin table except on SM107 and for paged KV on a page
+            // size the table does not carry (shouldUseNvrtc); only those need the NVRTC warmup grid.
+            bool const usesNvrtcPageSize
+                = isPagedKv(runnerParams.mQkvLayout) && runnerParams.mNumTokensPerPage != kCubinNumTokensPerPage;
+            if (mSM != kSM_107 && !usesNvrtcPageSize)
             {
                 return;
             }

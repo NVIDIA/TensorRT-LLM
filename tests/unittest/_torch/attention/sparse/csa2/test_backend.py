@@ -144,16 +144,18 @@ def _decoded_reference(q, args, swa_valid, extra_valid, sink):
 @pytest.mark.parametrize("extra_width", [0, 17, 512])
 @torch.inference_mode()
 def test_native_dual_pool(heads, extra_width, monkeypatch):
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
+    from tensorrt_llm._torch.attention.backends.fmha.phased import PhasedFmha
 
     calls = []
-    original = FallbackFmha.forward
+    original = PhasedFmha.forward
 
     def record(attn, *args, **kwargs):
         calls.append(attn.attn.sparse_params.algorithm)
         return original(attn, *args, **kwargs)
 
-    monkeypatch.setattr(FallbackFmha, "forward", record)
+    for native_cls in NATIVE_FMHA_LIBS:
+        monkeypatch.setattr(native_cls, "forward", record)
     torch.manual_seed(451)
     attn = _backend(heads)
     q = torch.randn(3, heads, 512, device="cuda", dtype=torch.bfloat16)
@@ -432,13 +434,14 @@ def test_cold_metadata_rejects_capture():
 @pytest.mark.parametrize("context", [False, True])
 @torch.inference_mode()
 def test_alternative_helper_dispatch(implementation, context, monkeypatch):
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     def unexpected_fallback(*args, **kwargs):
         raise AssertionError("Selected CSA2 implementation fell through to native fallback")
 
-    monkeypatch.setattr(FallbackFmha, "forward", unexpected_fallback)
+    for native_cls in NATIVE_FMHA_LIBS:
+        monkeypatch.setattr(native_cls, "forward", unexpected_fallback)
     attn = _backend(8, compute_backend=implementation)
     q = torch.randn(2, 8, 512, device="cuda", dtype=torch.bfloat16)
     swa = torch.randn(2, 4, 512, device="cuda", dtype=torch.bfloat16)
@@ -521,7 +524,8 @@ def test_alternative_helper_revalidates_output_scale():
 @pytest.mark.parametrize("tile_start", [0, 2])
 @torch.inference_mode()
 def test_native_context_preserves_real_query_groups(extra_width, prefix, tile_start, monkeypatch):
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
+    from tensorrt_llm._torch.attention.backends.fmha.phased import PhasedFmha
     from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
@@ -569,14 +573,15 @@ def test_native_context_preserves_real_query_groups(extra_width, prefix, tile_st
         metadata.cu_kv_seqlens.cpu(), torch.tensor([0, topk + 2, 2 * topk + 3], dtype=torch.int32)
     )
     calls = []
-    original = FallbackFmha.forward
+    original = PhasedFmha.forward
 
     def record(provider, query, key, value, meta, forward_args):
         calls.append((meta.num_contexts, meta.num_ctx_tokens, forward_args.attention_input_type))
         assert forward_args.latent_cache is None
         return original(provider, query, key, value, meta, forward_args)
 
-    monkeypatch.setattr(FallbackFmha, "forward", record)
+    for native_cls in NATIVE_FMHA_LIBS:
+        monkeypatch.setattr(native_cls, "forward", record)
     args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
     args.attention_input_type = AttentionInputType.context_only
     output = attn.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
@@ -586,7 +591,8 @@ def test_native_context_preserves_real_query_groups(extra_width, prefix, tile_st
         output, _decoded_reference(q, args, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
     )
 
-    monkeypatch.setattr(FallbackFmha, "forward", original)
+    for native_cls in NATIVE_FMHA_LIBS:
+        monkeypatch.setattr(native_cls, "forward", original)
     generation = CSA2TrtllmMetadata.for_query_tile(q, extra_width)
     generation_args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
     reference_generation = attn.forward(
@@ -603,13 +609,15 @@ def test_packed_helper_skips_bf16_staging(extra_width, monkeypatch):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("SM100 packed attention")
 
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     torch.manual_seed(460)
     heads, count = 32, 3
     attn = _backend(heads, use_packed=True)
-    assert not any(isinstance(provider, FallbackFmha) for provider in attn._fmha_manager.fmha_libs)
+    assert not any(
+        isinstance(provider, NATIVE_FMHA_LIBS) for provider in attn._fmha_manager.fmha_libs
+    )
     q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
     swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
     swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
@@ -666,23 +674,23 @@ def test_packed_helper_skips_bf16_staging(extra_width, monkeypatch):
     "implementation,packed", [("trtllm", False), ("flashinfer", False), ("trtllm", True)]
 )
 def test_csa2_quant_update_rebuilds_local_provider_policy(implementation, packed):
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 
     attn = _backend(32, compute_backend=implementation, use_packed=packed)
     native = implementation == "trtllm" and not packed
     first = attn._fmha_manager
     assert bool(first.fmha_libs) == native
-    assert all(type(provider) is FallbackFmha for provider in first.fmha_libs)
+    assert all(isinstance(provider, NATIVE_FMHA_LIBS) for provider in first.fmha_libs)
     attn.update_quant_config(attn.quant_config)
     assert bool(attn._fmha_manager.fmha_libs) == native
-    assert all(type(provider) is FallbackFmha for provider in attn._fmha_manager.fmha_libs)
+    assert all(isinstance(provider, NATIVE_FMHA_LIBS) for provider in attn._fmha_manager.fmha_libs)
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_native_backend_rejects_disabled_fallback(monkeypatch):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
-    with pytest.raises(ValueError, match="requires the FallbackFmha"):
+    with pytest.raises(ValueError, match="requires the native FMHA libraries"):
         _backend(32, compute_backend="trtllm")
 
 
@@ -951,7 +959,8 @@ def test_global_slot_graph_mapping_folds_visibility(monkeypatch):
 )
 @torch.inference_mode()
 def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, record_property):
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
+    from tensorrt_llm._torch.attention.backends.fmha.phased import PhasedFmha
     from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import unpack_rows
@@ -1008,7 +1017,7 @@ def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, 
     assert metadata.num_contexts == (2 if phase == "context" else 0)
     calls = []
     seen = []
-    native = FallbackFmha.forward
+    native = PhasedFmha.forward
 
     def observe(provider, query, k, v, meta, forward_args):
         calls.append(forward_args.attention_input_type)
@@ -1025,7 +1034,8 @@ def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, 
             assert forward_args.latent_cache.dtype == torch.bfloat16
         return native(provider, query, k, v, meta, forward_args)
 
-    monkeypatch.setattr(FallbackFmha, "forward", observe)
+    for native_cls in NATIVE_FMHA_LIBS:
+        monkeypatch.setattr(native_cls, "forward", observe)
 
     def run():
         if phase == "captured_context":

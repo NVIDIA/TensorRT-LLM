@@ -3,9 +3,9 @@
 """Availability checks for the MiniMax-M3 MSA sparse attention kernels.
 
 The MSA path runs prefill on the fmha_sm100 kernels bundled with TensorRT-LLM
-and decode on the CuTe DSL indexer scorer plus the Triton and trtllm-gen decode
-kernels. Both halves are required: there is no fallback from one to the other,
-so a missing package makes the path unavailable rather than slower. These
+and decode on the CuTe DSL indexer scorer plus the Triton and native trtllm-gen
+decode kernels. Both halves are required: there is no fallback from one to the
+other, so a missing package makes the path unavailable rather than slower. These
 helpers gate backend selection so that fails early with a clear message.
 """
 
@@ -15,7 +15,6 @@ from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from .kernels.msa_utils import msa_package_available
-from .kernels.trtllm_gen_dense_decode import flashinfer_available
 
 # fmha_sm100 runs on the SM100 architecture family (SM100 and SM103). Other
 # architectures, including SM120, are not supported.
@@ -44,12 +43,6 @@ def ensure_msa_available() -> None:
             "MiniMax-M3 MSA sparse attention scores decode steps on the CuTe DSL "
             "indexer kernel, which requires the nvidia-cutlass-dsl package. "
             "Install it or select the 'triton' implementation."
-        )
-    if not flashinfer_available():
-        raise RuntimeError(
-            "MiniMax-M3 MSA sparse attention runs its dense layers through the "
-            "trtllm-gen decode kernel, which requires flashinfer. Install it or "
-            "select the 'triton' implementation."
         )
 
 

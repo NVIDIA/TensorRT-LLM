@@ -22,6 +22,8 @@ cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
 (``unsupported_reason``), which also gates sm-dependent dtypes.
 """
 
+import dataclasses
+
 import backend_case
 import pytest
 import torch
@@ -291,6 +293,45 @@ def test_attention_backend(name):
     run_case(case)
 
 
+# The trtllm-gen cubin table carries dense paged-KV kernels for 32-token pages only;
+# NVRTC generates those of the other page sizes. Rerun representative 32-token cases
+# at those sizes on the native libraries alone.
+_NVRTC_PAGE_SIZES = (16, 64, 128)
+_NVRTC_PAGE_CONFIG_IDS = (
+    "llama3_8b_gqa",
+    "qwen3_5_27b_gqa_hd256",
+    "gemma3_1b_mqa_hd256",
+    "deepseekv3_mla",
+)
+
+
+def _nvrtc_page_cases():
+    cases = {}
+    for name, case in MODEL_CASES.items():
+        cfg_id = name.split("-", 1)[0]
+        if cfg_id not in _NVRTC_PAGE_CONFIG_IDS or case.page_size != 32 or case.kv_layout != "HND":
+            continue
+        for page_size in _NVRTC_PAGE_SIZES:
+            cases[f"{name}-native_p{page_size}"] = dataclasses.replace(case, page_size=page_size)
+    return cases
+
+
+NVRTC_PAGE_CASES = _nvrtc_page_cases()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not 100 <= getSMVersion() < 110,
+    reason="trtllm-gen kernels need an SM100-family GPU",
+)
+@pytest.mark.parametrize("name", list(NVRTC_PAGE_CASES), ids=lambda n: n)
+def test_trtllm_native_page_sizes_outside_cubin_table(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    run_case(NVRTC_PAGE_CASES[name])
+
+
 def _mla_context_v_stride_case() -> BackendCase:
     case = next(
         (
@@ -405,7 +446,7 @@ def test_trtllm_mla_kimi_k3_h96(
         qk_rope_head_dim=64,
     )
     monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "flashinfer_trtllm_gen,fallback")
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
     backend_case.run_case(case)
 
 

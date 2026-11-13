@@ -14,9 +14,10 @@
 # limitations under the License.
 """GQA decode FMHA libraries: trtllm-gen plus dedicated generation kernels, for the layers built with a GqaDecodeSetup.
 
-``gqa_decode`` is trtllm-gen for such a layer that also consumes the FP8 query / K / V the attention module already
-wrote (``AttentionForwardArgs.kv_append``) and runs a prologue the module deferred to it (``kv_append.fold``). The
-libraries registered ahead of it take the generation calls their ``_is_supported`` declares, with an FP8 KV cache:
+``gqa_decode`` is the native trtllm-gen library for such a layer that also consumes the FP8 query / K / V the attention
+module already wrote (``AttentionForwardArgs.kv_append``, run as ``FmhaParams.prepared_query``) and runs a prologue the
+module deferred to it (``kv_append.fold``). The libraries registered ahead of it take the generation calls their
+``_is_supported`` declares, with an FP8 KV cache:
 
 * ``gqa_kv_replica_fused`` / ``gqa_kv_replica`` (gqa_kv_replica.py): TP replicates this rank's one KV head over a group
   of ranks, which split the pages of each request and merge their partial results; partials from the fused kernel or
@@ -34,29 +35,20 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.trace_log_utils import log_tensor_size
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantMode
 
 from . import gqa_kv_replica_fused, gqa_split_kv_decode
-from .flashinfer_trtllm_gen import (
-    FlashInferTrtllmGenFmha,
-    _get_generation_workspace_layout,
-    _get_generation_workspace_size,
-)
 from .gqa_kv_replica import EXCHANGE_CHANNELS, kv_replica_decode, kv_replica_fused_decode
 from .gqa_kv_replica_fused import kv_replica_fused_state, kv_replica_fused_supported
-from .gqa_segmented_decode import (
-    MAX_FOLDED_ROWS,
-    MAX_Q_LEN,
-    segment_attention_softmax_bytes,
-    segmented_decode,
-    segmented_decode_supported,
-)
+from .gqa_segmented_decode import segmented_decode, segmented_decode_supported
 from .gqa_split_kv_decode import (
     split_kv_decode,
     split_kv_decode_buffers,
@@ -66,14 +58,18 @@ from .gqa_split_kv_decode import (
 )
 from .interface import FmhaPhase
 from .phased import FmhaParams
-from .utils import get_attention_chunk_size, get_bmm1_scale
+from .trtllm_gen import TrtllmGenFmha
+from .utils import (
+    get_bmm1_scale,
+    get_multi_processor_count_for_device,
+    get_trtllm_gen_generation_workspace_layout,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-    from tensorrt_llm._torch.distributed.ll_exchange import TPGroupExchange
 
 # Segments of a segmented call.
 _SEGMENTS = 16
@@ -154,16 +150,31 @@ def _kv_replica_exchange_sizes(
     return max(_MIN_EXCHANGE_BYTES, (1 << (kib - 1).bit_length()) * 1024), merge_rows
 
 
-class GqaDecodeFmha(FlashInferTrtllmGenFmha):
-    """trtllm-gen for a layer built with a ``GqaDecodeSetup``; base of the dedicated GQA decode libraries."""
+class GqaDecodeFmha(TrtllmGenFmha):
+    """Native trtllm-gen for a layer built with a ``GqaDecodeSetup``; base of the dedicated GQA decode libraries.
 
+    A generation call whose FP8 query / K / V the module already wrote (a matching ``KvAppendPlan``) runs a dedicated
+    kernel, or the trtllm-gen kernels on that prepared query (``FmhaParams.prepared_query``); every other call is the
+    native generation.
+    """
+
+    SERVES_MLA = False
+    # The C++ generation preprocess addresses the KV pool by its block extent.
+    NEEDS_BLOCK_EXTENT = True
     supports_deferred_prologue = True
+    supports_skip_correction = False
+    supports_variable_window = False
+    # Whether _run_dedicated runs a kernel; a call without a matching plan then runs the C++ generation
+    # preprocess for it.
+    HAS_DEDICATED_KERNEL = False
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
+        # Read once so the hot path is not sensitive to later environment changes.
+        self._enable_pdl = get_env_enable_pdl()
+        # Lazily set from the first query device.
+        self._multi_processor_count: Optional[int] = None
         self._counter_buffer: Optional[torch.Tensor] = None
-        # max_num_requests -> _segment_stats_bytes
-        self._segment_stats_bytes_cache: dict[int, int] = {}
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -179,22 +190,79 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         quant_mode = QuantMode(attn.quant_mode)
         return quant_mode.has_fp8_kv_cache() and not quant_mode.has_fp4_kv_cache()
 
+    def _get_multi_processor_count(self, device: torch.device) -> int:
+        device = torch.device(device)
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        return get_multi_processor_count_for_device(device_index)
+
+    def _use_fp8_context_fmha(
+        self,
+        output: torch.Tensor,
+        attention_input_type: AttentionInputType,
+    ) -> bool:
+        """Whether the call runs FP8 attention: FP8 / NVFP4 output, an NVFP4 KV cache, or an FP8 KV cache outside a
+        generation-only call."""
+        kv_cache_quant_mode = QuantMode(self.attn.quant_mode)
+        return (
+            output.dtype == torch.float8_e4m3fn
+            or output.dtype == torch.uint8
+            or kv_cache_quant_mode.has_fp4_kv_cache()
+            or (
+                kv_cache_quant_mode.has_fp8_kv_cache()
+                and attention_input_type != AttentionInputType.generation_only
+            )
+        )
+
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
+        super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
+        if self._multi_processor_count is None:
+            self._multi_processor_count = self._get_multi_processor_count(q.device)
+        if not self.HAS_DEDICATED_KERNEL:
+            return
+        # The C++ generation preprocess of a call without a matching plan works in the workspace before the op
+        # grows it.
+        attn = self.attn
+        max_num_sequences = metadata.max_num_sequences or metadata.max_num_requests
+        layout = get_trtllm_gen_generation_workspace_layout(
+            q.dtype,
+            max_num_sequences,
+            max(q.size(0), max_num_sequences),
+            attn.num_heads,
+            attn.head_dim,
+            attn.num_kv_heads,
+            attn.rope_dim,
+        )
+        required = int(layout["total_size"])
+        if workspace.numel() * workspace.element_size() < required:
+            if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Attention CUDA graph workspace is smaller than the GQA decode preprocess needs."
+                )
+            workspace.resize_((-(-required // workspace.element_size()),))
+
     def _decode_cell(
         self,
         q: torch.Tensor,
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         phase: Optional[FmhaPhase],
-        generation_only: bool,
     ) -> Optional[Tuple[int, int]]:
-        """(requests, q_len) of a generation phase a dedicated kernel may take, at the upper bound of its selection
+        """(requests, q_len) of a generation-only call a dedicated kernel may take, at the upper bound of its selection
         cell (FP8 query, one beam, no cross attention or sinks), else None."""
         from .manager import generation_selection_cell
 
         if (
             phase == FmhaPhase.CONTEXT
             or metadata.num_generations <= 0
-            or (generation_only and metadata.num_contexts != 0)
+            or metadata.num_contexts != 0
             or metadata.beam_width != 1
             or metadata.is_cross
             or forward_args.attention_sinks is not None
@@ -212,78 +280,113 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         plan = params.fwd.kv_append
         if plan is not None and plan.fold is not None:
             self._run_fold_prologue(params, plan)
+        if plan is not None and self._plan_matches(params, plan):
+            bmm1_scale = plan.scales.narrow(0, 0, 2)
+            bmm2_scale = plan.scales.narrow(0, 4, 1)
+            if not self._run_dedicated(
+                params, plan.q_fp8, plan.kv_pool, plan.block_tables, bmm1_scale, bmm2_scale
+            ):
+                self._run_prepared(params, plan.q_fp8, bmm1_scale, bmm2_scale)
+            return
+        if self.HAS_DEDICATED_KERNEL and self._run_preprocessed(params):
+            return
         super().run_generation(params)
 
-    def _run_generation_preprocess(
-        self,
-        params: FmhaParams,
-        attention_input: torch.Tensor,
-        batch_beam: int,
-        bmm1_scale_static: float,
-        attention_chunk_size: int,
-        fp8_context_fmha: bool,
-    ) -> tuple:
-        plan = params.fwd.kv_append
-        if plan is not None:
-            preprocessed = self._appended_preprocess(
-                params, plan, batch_beam, attention_chunk_size, fp8_context_fmha
+    def _run_preprocessed(self, params: FmhaParams) -> bool:
+        """The C++ generation preprocess (RoPE, FP8 query, K / V append), then the dedicated kernel or the trtllm-gen
+        kernels on the prepared query; False (nothing run) for a call those cannot take."""
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        cyclic_window = params.cyclic_attention_window_size
+        if (
+            meta.num_contexts != 0
+            or params.is_cross
+            or params.qkv_input is None
+            or (
+                params.spec_decoding_generation_lengths is not None
+                and attn.predicted_tokens_per_seq > 1
             )
-            if preprocessed is not None:
-                return preprocessed
-        return super()._run_generation_preprocess(
-            params,
-            attention_input,
-            batch_beam,
-            bmm1_scale_static,
-            attention_chunk_size,
-            fp8_context_fmha,
+            or 0 < cyclic_window < params.max_past_kv_length
+            or not self._has_fp8_kv_cache(attn)
+            or not self._use_fp8_context_fmha(fwd.output, fwd.attention_input_type)
+        ):
+            return False
+        rope_params = attn.rope_params
+        q, kv_pool, block_tables, kv_scale_pool, bmm1_scale, bmm2_scale, *_ = (
+            thop.trtllm_gen_generation_preprocess(
+                params.qkv_input,  # qkv_input
+                params.workspace,  # workspace
+                params.sequence_lengths,  # sequence_lengths
+                params.spec_decoding_generation_lengths,  # spec_decoding_generation_lengths
+                params.spec_decoding_position_offsets,  # spec_decoding_position_offsets
+                meta.kv_cache_block_offsets,  # kv_cache_block_offsets
+                meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
+                meta.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
+                fwd.kv_scale_orig_quant,  # kv_scale_orig_quant
+                fwd.kv_scale_quant_orig,  # kv_scale_quant_orig
+                fwd.out_scale,  # attention_output_orig_quant
+                attn.rotary_inv_freq,  # rotary_inv_freq
+                attn.rotary_cos_sin,  # rotary_cos_sin
+                fwd.mrope_position_deltas,  # mrope_position_deltas
+                attn.local_layer_idx,  # layer_idx
+                params.seq_offset,  # seq_offset
+                attn.num_heads,  # num_heads
+                attn.num_kv_heads,  # num_kv_heads
+                attn.head_dim,  # head_size
+                params.tokens_per_block,  # tokens_per_block
+                attn.quant_mode,  # kv_cache_quant_mode
+                params.max_attention_window_size,  # max_attention_window_size
+                cyclic_window,  # cyclic_attention_window_size
+                params.num_tokens,  # num_tokens
+                params.batch_size,  # batch_beam
+                params.input_seq_length,  # input_seq_length
+                params.max_past_kv_length,  # max_past_kv_length
+                rope_params.dim,  # rotary_embedding_dim
+                rope_params.theta,  # rotary_embedding_base
+                int(rope_params.scale_type),  # rotary_embedding_scale_type
+                rope_params.scale,  # rotary_embedding_scale
+                rope_params.max_positions,  # rotary_embedding_max_positions
+                attn.position_embedding_type,  # position_embedding_type
+                get_bmm1_scale(attn),  # bmm1_scale
+                1.0,  # bmm2_scale
+                True,  # fp8_context_fmha: the FP8 query of an FP8 KV cache
+                attn.predicted_tokens_per_seq,  # predicted_tokens_per_seq
+                0,  # attention_chunk_size
+                self._multi_processor_count,  # multi_processor_count
+                params.total_num_blocks,  # total_num_blocks
+                params.kv_factor,  # kv_factor
+                True,  # need_build_kv_cache_metadata
+                params.is_cross,  # is_cross
+            )
         )
+        if kv_scale_pool is not None or bmm1_scale is None or bmm2_scale is None:
+            raise RuntimeError(
+                "The GQA decode preprocess must produce FP8 K / V and device scales."
+            )
+        num_elements = params.num_tokens * attn.num_heads * attn.head_dim
+        q = (
+            q.view(torch.uint8)
+            .flatten()[:num_elements]
+            .view(torch.float8_e4m3fn)
+            .view(params.num_tokens, attn.num_heads, attn.head_dim)
+        )
+        if not self._run_dedicated(params, q, kv_pool, block_tables, bmm1_scale, bmm2_scale):
+            self._run_prepared(params, q, bmm1_scale, bmm2_scale)
+        return True
 
-    def _run_generation_decode(
+    def _run_prepared(
         self,
         params: FmhaParams,
         q: torch.Tensor,
-        kv_pool: torch.Tensor,
-        block_tables: torch.Tensor,
-        kv_scale_pool: Optional[torch.Tensor],
-        max_kv_len: int,
-        window_left: int,
-        q_len_per_req: Optional[int],
-        max_q_len: Optional[int],
-        cu_seqlens: Optional[torch.Tensor],
-        bmm1_scale,
-        bmm2_scale,
-        fmha_workspace: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
     ) -> None:
-        if (
-            q_len_per_req is not None
-            and kv_scale_pool is None
-            and window_left < 0
-            and q.dim() == 3
-            and q.is_contiguous()
-            and q.dtype == torch.float8_e4m3fn
-            and kv_pool.dim() == 4
-            and kv_pool.is_contiguous()
-            and self._run_dedicated(
-                params, q, kv_pool, block_tables, max_kv_len, bmm1_scale, bmm2_scale, fmha_workspace
-            )
-        ):
-            return
-        super()._run_generation_decode(
-            params,
-            q,
-            kv_pool,
-            block_tables,
-            kv_scale_pool,
-            max_kv_len,
-            window_left,
-            q_len_per_req,
-            max_q_len,
-            cu_seqlens,
-            bmm1_scale,
-            bmm2_scale,
-            fmha_workspace,
-        )
+        """The trtllm-gen kernels on the FP8 query whose K / V the module already appended."""
+        params.prepared_query = q
+        params.prepared_bmm1_scale = bmm1_scale
+        params.prepared_bmm2_scale = bmm2_scale
+        thop.trtllm_gen_run_generation(params)
 
     def _run_dedicated(
         self,
@@ -291,13 +394,41 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         q: torch.Tensor,
         kv_pool: torch.Tensor,
         block_tables: torch.Tensor,
-        max_kv_len: int,
-        bmm1_scale: float | torch.Tensor,
-        bmm2_scale: float | torch.Tensor,
-        fmha_workspace: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
     ) -> bool:
-        """Run this library's kernel on a uniform-q_len generation call with an FP8 query; False: trtllm-gen."""
+        """Run this library's kernel on a generation-only call whose FP8 query / K / V the module wrote; False: the
+        trtllm-gen kernels."""
         return False
+
+    @staticmethod
+    def _plan_matches(params: FmhaParams, plan: KvAppendPlan) -> bool:
+        """Whether the call is the one ``plan`` wrote the FP8 query / K / V of, with no sliding window.
+
+        Otherwise the native generation rewrites the same bytes from the bf16 QKV.
+        """
+        fwd = params.fwd
+        cyclic_window = params.cyclic_attention_window_size
+        return (
+            plan.q_fp8 is not None
+            and plan.scales is not None
+            and plan.layer_idx == params.attn.local_layer_idx
+            and plan.num_tokens == params.num_tokens
+            and plan.num_requests == params.batch_size
+            and plan.q_len == params.input_seq_length
+            and params.meta.num_contexts == 0
+            and params.seq_offset == 0
+            and not params.is_cross
+            and params.spec_decoding_generation_lengths is None
+            and fwd.out_scale is None
+            and fwd.kv_scale_orig_quant is plan.kv_scale_orig_quant
+            and fwd.kv_scale_quant_orig is plan.kv_scale_quant_orig
+            and params.sequence_lengths is not None
+            and params.sequence_lengths.data_ptr() == plan.seq_lens.data_ptr()
+            and params.qkv_input is not None
+            and params.qkv_input.dtype == torch.bfloat16
+            and not 0 < cyclic_window < params.max_past_kv_length
+        )
 
     @staticmethod
     def _gate(params: FmhaParams) -> Optional[torch.Tensor]:
@@ -310,16 +441,16 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         return gate[: params.num_tokens]
 
     @staticmethod
-    def _counter_slots(max_num_requests: int) -> int:
+    def _counter_slots(metadata: "TrtllmAttentionMetadata") -> int:
         """Size of the counter buffer (_ensure_counter_buffer)."""
-        return max(64, max_num_requests) * _COUNTER_SLOTS_PER_REQUEST
+        return max(64, metadata.max_num_requests) * _COUNTER_SLOTS_PER_REQUEST
 
     def _ensure_counter_buffer(
         self, metadata: "TrtllmAttentionMetadata", device: torch.device
     ) -> None:
         """Counters of the segmented trtllm-gen calls: max(b * segments * heads, SMs) of them, more than the regular
         buffer holds. Zeroed once; the kernel resets them at the end of every launch."""
-        slots = self._counter_slots(metadata.max_num_requests)
+        slots = self._counter_slots(metadata)
         buf = self._counter_buffer
         if buf is None or buf.device != device or buf.numel() < slots:
             if torch.cuda.is_current_stream_capturing():
@@ -327,105 +458,6 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
                     "The GQA decode counter buffer must be allocated before CUDA graph capture."
                 )
             self._counter_buffer = torch.zeros(slots, dtype=torch.int32, device=device)
-
-    def _segment_stats_bytes(self, max_num_requests: int) -> int:
-        """Softmax-stats bytes of the largest segment attention call admitted by an enabled library of the layer;
-        the same on every GQA decode library of the layer."""
-        nbytes = self._segment_stats_bytes_cache.get(max_num_requests)
-        if nbytes is None:
-            manager = self.attn._fmha_manager
-            assert manager is not None
-            nbytes = max(
-                (
-                    lib._largest_segment_stats_bytes(self.attn, max_num_requests)
-                    for lib in manager.fmha_libs
-                    if isinstance(lib, (GqaKvReplicaFmha, GqaSegmentedFmha))
-                ),
-                default=0,
-            )
-            self._segment_stats_bytes_cache[max_num_requests] = nbytes
-        return nbytes
-
-    def prepare_workspace(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
-    ) -> None:
-        self._reserve_segment_stats(q, metadata, workspace)
-        super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
-
-    def _reserve_segment_stats(
-        self, q: torch.Tensor, metadata: "TrtllmAttentionMetadata", workspace: torch.Tensor
-    ) -> None:
-        """Size the attention workspace for the layer's largest generation step plus _segment_stats_bytes: a segment
-        attention call runs on the trtllm-gen FMHA workspace, the last region of the generation layout, extended by
-        its softmax stats (_segment_workspace_if_fits).
-
-        Every GQA decode library of the layer asks for the same size, so the layer's first call (the attention JIT
-        warmup, ahead of KV cache sizing and of CUDA graph capture) is the one that grows the workspace.
-        """
-        stats_bytes = self._segment_stats_bytes(metadata.max_num_requests)
-        if stats_bytes == 0:
-            return
-        attn = self.attn
-        max_num_sequences = metadata.max_num_sequences or metadata.max_num_requests
-        # every request with a full step, or the segmented decode at its largest q_len
-        max_num_tokens = max(
-            max_num_sequences * attn.gqa_decode.tokens_per_gen_step,
-            min(max_num_sequences, _SEGMENTED_MAX_BATCH) * MAX_Q_LEN,
-        )
-        required_bytes = stats_bytes + _get_generation_workspace_size(
-            q.dtype,
-            max_num_sequences,
-            max_num_tokens,
-            attn.num_heads,
-            attn.head_dim,
-            attn.num_kv_heads,
-            attn.rope_dim,
-        )
-        current_bytes = workspace.numel() * workspace.element_size()
-        if current_bytes < required_bytes:
-            if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"The attention CUDA graph workspace on {workspace.device} must grow from {current_bytes} to "
-                    f"{required_bytes} bytes for the segment attention before CUDA graph capture."
-                )
-            workspace.resize_((math.ceil(required_bytes / workspace.element_size()),))
-            log_tensor_size(
-                "gqa_decode/attention_workspace",
-                workspace,
-                previous_bytes=current_bytes,
-                segment_stats_bytes=stats_bytes,
-                cuda_graph=metadata.is_cuda_graph,
-            )
-
-    def _segment_workspace_if_fits(
-        self,
-        params: FmhaParams,
-        fmha_workspace: torch.Tensor,
-        num_fmha_requests: int,
-        num_folded_heads: int,
-    ) -> Optional[torch.Tensor]:
-        """fmha_workspace (the trtllm-gen decode's slice, the last region of the attention workspace's generation
-        layout) extended by the softmax stats of a segment attention call of num_fmha_requests x num_folded_heads, or
-        None when the attention workspace does not hold them (the call then takes the trtllm-gen decode)."""
-        workspace = params.workspace.view(-1).view(torch.uint8)
-        offset = fmha_workspace.data_ptr() - workspace.data_ptr()
-        nbytes = fmha_workspace.numel() * fmha_workspace.element_size()
-        nbytes += segment_attention_softmax_bytes(num_fmha_requests, num_folded_heads)
-        if 0 <= offset and offset + nbytes <= workspace.numel():
-            return workspace.narrow(0, offset, nbytes)
-        logger.warning_once(
-            f"{type(self).__name__}: a segment attention call of {num_fmha_requests} x {num_folded_heads} needs "
-            f"{nbytes} bytes at offset {offset} of the {workspace.numel()}-byte attention workspace; falling back "
-            "to the trtllm-gen decode.",
-            key=f"gqa_segment_workspace_{type(self).__name__}",
-        )
-        return None
 
     @staticmethod
     def _run_fold_prologue(params: FmhaParams, plan: KvAppendPlan) -> None:
@@ -454,74 +486,6 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         params.qkv_input = qkv_out[: params.num_tokens]
         if params.fwd.output_gate is not None:
             plan.gate = gate_out
-
-    def _appended_preprocess(
-        self,
-        params: FmhaParams,
-        plan: KvAppendPlan,
-        batch_beam: int,
-        attention_chunk_size: int,
-        fp8_context_fmha: bool,
-    ) -> Optional[tuple]:
-        """trtllm_gen_generation_preprocess outputs for a call whose FP8 query / K / V the module wrote.
-
-        None when the call does not match the plan; the C++ path then rewrites the same bytes from the bf16 QKV.
-        """
-        attn = params.attn
-        fwd = params.fwd
-        if not (
-            fp8_context_fmha
-            and plan.q_fp8 is not None
-            and plan.scales is not None
-            and plan.layer_idx == attn.local_layer_idx
-            and plan.num_tokens == params.num_tokens
-            and plan.num_requests == batch_beam
-            and plan.q_len == params.input_seq_length
-            and params.seq_offset == 0
-            and not params.is_cross
-            and params.spec_decoding_generation_lengths is None
-            and fwd.out_scale is None
-            and fwd.kv_scale_orig_quant is plan.kv_scale_orig_quant
-            and fwd.kv_scale_quant_orig is plan.kv_scale_quant_orig
-            and params.sequence_lengths is not None
-            and params.sequence_lengths.data_ptr() == plan.seq_lens.data_ptr()
-            and params.qkv_input is not None
-            and params.qkv_input.dtype == torch.bfloat16
-        ):
-            return None
-        layout = _get_generation_workspace_layout(
-            params.qkv_input.dtype,
-            batch_beam,
-            params.num_tokens,
-            attn.num_heads,
-            attn.head_dim,
-            attn.num_kv_heads,
-            attn.rope_params.dim,
-        )
-        offset = int(layout["trtllm_gen_workspace_offset"])
-        size = int(layout["trtllm_gen_workspace_size"])
-        workspace = params.workspace.view(-1).view(torch.uint8)
-        if size <= 0 or offset + size > workspace.numel():
-            return None
-        window_left = self._compute_window_left(
-            params.cyclic_attention_window_size,
-            params.max_past_kv_length,
-            attention_chunk_size,
-        )
-        return (
-            plan.q_fp8,
-            plan.kv_pool,
-            plan.block_tables,
-            None,
-            plan.scales.narrow(0, 0, 2),
-            plan.scales.narrow(0, 4, 1),
-            workspace.narrow(0, offset, size),
-            None,
-            params.input_seq_length,
-            params.max_past_kv_length,
-            window_left,
-            False,
-        )
 
     def kv_append_plan(
         self, metadata: "TrtllmAttentionMetadata", num_tokens: int
@@ -682,6 +646,8 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
 class _GqaKvReplicaFmha(GqaDecodeFmha):
     """KV-replica split of the generation-only calls of two or more requests (gqa_kv_replica.py)."""
 
+    HAS_DEDICATED_KERNEL = True
+
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         return (
@@ -710,7 +676,7 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        cell = self._decode_cell(q, metadata, forward_args, phase, generation_only=True)
+        cell = self._decode_cell(q, metadata, forward_args, phase)
         return (
             cell is not None
             and metadata.num_generations >= 2
@@ -720,12 +686,6 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
 
     def _takes(self, batch: int, q_len: int, metadata: "TrtllmAttentionMetadata") -> bool:
         return True
-
-    def _kv_replica_workspace(
-        self, params: FmhaParams, q: torch.Tensor, fmha_workspace: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Workspace of this library's FMHA launches for the call; None: the call takes the trtllm-gen decode."""
-        return fmha_workspace
 
     def prepare_workspace(
         self,
@@ -761,10 +721,8 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
         q: torch.Tensor,
         kv_pool: torch.Tensor,
         block_tables: torch.Tensor,
-        max_kv_len: int,
-        bmm1_scale: float | torch.Tensor,
-        bmm2_scale: float | torch.Tensor,
-        fmha_workspace: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
     ) -> bool:
         attn = params.attn
         exchange = self._exchange
@@ -774,22 +732,9 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
             or params.num_tokens * attn.num_heads * (attn.head_dim * 2 + 4) > exchange.max_words * 4
         ):
             return False
-        # Same shapes and workspace size on every member of the KV group, so the group falls back together.
-        workspace = self._kv_replica_workspace(params, q, fmha_workspace)
-        if workspace is None:
-            return False
         gate = self._gate(params)
         self._run_kv_replica(
-            params,
-            exchange,
-            q,
-            kv_pool,
-            block_tables,
-            max_kv_len,
-            bmm1_scale,
-            bmm2_scale,
-            workspace,
-            gate,
+            params, exchange, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, gate
         )
         if gate is not None:
             params.fwd.output_gate_applied = True
@@ -829,17 +774,7 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
         kv_replica_fused_state(q.device, self._multi_processor_count, metadata.max_num_requests)
 
     def _run_kv_replica(
-        self,
-        params: FmhaParams,
-        exchange: "TPGroupExchange",
-        q: torch.Tensor,
-        kv_pool: torch.Tensor,
-        block_tables: torch.Tensor,
-        max_kv_len: int,
-        bmm1_scale: float | torch.Tensor,
-        bmm2_scale: float | torch.Tensor,
-        workspace: torch.Tensor,
-        gate: Optional[torch.Tensor],
+        self, params, exchange, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, gate
     ) -> None:
         rows, hq, d = q.shape
         kv_replica_fused_decode(
@@ -868,76 +803,34 @@ class GqaKvReplicaFmha(_GqaKvReplicaFmha):
         """Local segments per member: two when the batch alone gives the KV-replica group too few CTAs."""
         return 2 if (num_requests <= 2 or q_len == 1) else 1
 
-    @staticmethod
-    def _segment_call(num_requests: int, q_len: int, group_heads: int) -> tuple[int, int]:
-        """(FMHA requests, folded heads) of the segment attention of a call of num_requests requests of q_len
-        tokens: its segments as one-token requests of q_len x the KV group's heads."""
-        segments = GqaKvReplicaFmha._num_segments(num_requests, q_len)
-        return num_requests * segments, q_len * group_heads
-
-    @staticmethod
-    def _largest_segment_rows(max_requests: int, q_len: int, group_heads: int) -> int:
-        """Most (FMHA request, folded head) pairs of the segment attention over the calls of up to max_requests
-        requests of q_len tokens: at max_requests or, as a larger batch may run fewer segments, at two requests."""
-        return max(
-            math.prod(GqaKvReplicaFmha._segment_call(b, q_len, group_heads))
-            for b in (max_requests, min(max_requests, 2))
-        )
-
     def _takes(self, batch: int, q_len: int, metadata: "TrtllmAttentionMetadata") -> bool:
-        # One counter per (FMHA request, folded head) of the segment attention, at the largest call of this cell.
+        # One counter per (segment request, folded head) of the segment attention: b * segments x q_len x group
+        # heads, at the largest b * segments of a call in this cell (the segments drop from two to one above two
+        # requests).
+        requests = min(batch, metadata.max_num_requests)
+        segment_requests = max(
+            b * self._num_segments(b, q_len) for b in (requests, min(requests, 2))
+        )
         group_heads = self._kv_replicas * self.attn.num_heads
-        max_num_requests = metadata.max_num_requests
-        rows = self._largest_segment_rows(min(batch, max_num_requests), q_len, group_heads)
-        return rows <= self._counter_slots(max_num_requests)
-
-    @classmethod
-    def _largest_segment_stats_bytes(cls, attn: "TrtllmAttention", max_num_requests: int) -> int:
-        setup = attn.gqa_decode
-        group_heads = setup.kv_replicas * attn.num_heads
-        rows = max(
-            cls._largest_segment_rows(max_num_requests, q_len, group_heads)
-            for q_len in range(1, setup.tokens_per_gen_step + 1)
-        )
-        # _takes admits a call only while its pairs fit the counter buffer.
-        return segment_attention_softmax_bytes(min(rows, cls._counter_slots(max_num_requests)), 1)
-
-    def _kv_replica_workspace(
-        self, params: FmhaParams, q: torch.Tensor, fmha_workspace: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        q_len = params.input_seq_length
-        group_heads = self._kv_replicas * params.attn.num_heads
-        return self._segment_workspace_if_fits(
-            params, fmha_workspace, *self._segment_call(q.shape[0] // q_len, q_len, group_heads)
-        )
+        return segment_requests * q_len * group_heads <= self._counter_slots(metadata)
 
     def _run_kv_replica(
-        self,
-        params: FmhaParams,
-        exchange: "TPGroupExchange",
-        q: torch.Tensor,
-        kv_pool: torch.Tensor,
-        block_tables: torch.Tensor,
-        max_kv_len: int,
-        bmm1_scale: float | torch.Tensor,
-        bmm2_scale: float | torch.Tensor,
-        workspace: torch.Tensor,
-        gate: Optional[torch.Tensor],
+        self, params, exchange, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, gate
     ) -> None:
         rows, hq, d = q.shape
         num_segments = self._num_segments(params.num_requests, params.input_seq_length)
         kv_replica_decode(
+            params,
             exchange,
             q,
             kv_pool,
             block_tables,
             params.sequence_lengths,
-            max_kv_len,
+            params.max_past_kv_length,
             params.input_seq_length,
             num_segments,
             bmm1_scale,
             bmm2_scale,
-            workspace,
             self._counter_buffer,
             params.output.view(rows, hq, d),
             self._enable_pdl,
@@ -948,6 +841,8 @@ class GqaKvReplicaFmha(_GqaKvReplicaFmha):
 class GqaSplitKvFmha(GqaDecodeFmha):
     """Fused split-KV decode of generation-only calls of up to four requests (gqa_split_kv_decode.py); also runs a
     deferred prologue in the same launch."""
+
+    HAS_DEDICATED_KERNEL = True
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -969,7 +864,7 @@ class GqaSplitKvFmha(GqaDecodeFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        cell = self._decode_cell(q, metadata, forward_args, phase, generation_only=True)
+        cell = self._decode_cell(q, metadata, forward_args, phase)
         if cell is None:
             return False
         batch, q_len = cell
@@ -1017,10 +912,8 @@ class GqaSplitKvFmha(GqaDecodeFmha):
         q: torch.Tensor,
         kv_pool: torch.Tensor,
         block_tables: torch.Tensor,
-        max_kv_len: int,
-        bmm1_scale: float | torch.Tensor,
-        bmm2_scale: float | torch.Tensor,
-        fmha_workspace: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
     ) -> bool:
         attn = params.attn
         if not split_kv_decode_supported(
@@ -1089,11 +982,8 @@ class GqaSplitKvFmha(GqaDecodeFmha):
             and self._multi_processor_count is not None
         ):
             return False
-        window_left = self._compute_window_left(
-            params.cyclic_attention_window_size,
-            params.max_past_kv_length,
-            get_attention_chunk_size(attn),
-        )
+        cyclic_window = params.cyclic_attention_window_size
+        window_left = cyclic_window - 1 if 0 < cyclic_window < params.max_past_kv_length else -1
         if window_left >= 0 or not split_kv_decode_supported(
             attn.num_heads,
             attn.num_kv_heads,
@@ -1137,8 +1027,10 @@ class GqaSplitKvFmha(GqaDecodeFmha):
 
 
 class GqaSegmentedFmha(GqaDecodeFmha):
-    """Segmented split-KV on top of trtllm-gen for generation phases of up to two requests
+    """Segmented split-KV on top of trtllm-gen for generation-only calls of up to two requests
     (gqa_segmented_decode.py)."""
+
+    HAS_DEDICATED_KERNEL = True
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -1154,7 +1046,7 @@ class GqaSegmentedFmha(GqaDecodeFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        cell = self._decode_cell(q, metadata, forward_args, phase, generation_only=False)
+        cell = self._decode_cell(q, metadata, forward_args, phase)
         if cell is None or metadata.num_generations > _SEGMENTED_MAX_BATCH:
             return False
         batch, q_len = cell
@@ -1185,52 +1077,29 @@ class GqaSegmentedFmha(GqaDecodeFmha):
         super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
         self._ensure_counter_buffer(metadata, q.device)
 
-    @staticmethod
-    def _segment_call(num_requests: int, q_len: int, num_heads: int) -> tuple[int, int]:
-        """(FMHA requests, folded heads) of the segment attention of a call of num_requests requests of q_len
-        tokens: _SEGMENTS one-token requests each, of q_len x the layer's query heads."""
-        return num_requests * _SEGMENTS, q_len * num_heads
-
-    @classmethod
-    def _largest_segment_stats_bytes(cls, attn: "TrtllmAttention", max_num_requests: int) -> int:
-        # The largest call _is_supported admits, whatever the step's q_len: _SEGMENTED_MAX_BATCH requests whose q_len
-        # folds MAX_FOLDED_ROWS rows onto a KV head.
-        q_len = min(MAX_Q_LEN, MAX_FOLDED_ROWS // (attn.num_heads // attn.num_kv_heads))
-        return segment_attention_softmax_bytes(
-            *cls._segment_call(min(max_num_requests, _SEGMENTED_MAX_BATCH), q_len, attn.num_heads)
-        )
-
     def _run_dedicated(
         self,
         params: FmhaParams,
         q: torch.Tensor,
         kv_pool: torch.Tensor,
         block_tables: torch.Tensor,
-        max_kv_len: int,
-        bmm1_scale: float | torch.Tensor,
-        bmm2_scale: float | torch.Tensor,
-        fmha_workspace: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
     ) -> bool:
         attn = params.attn
-        q_len = params.input_seq_length
-        workspace = self._segment_workspace_if_fits(
-            params, fmha_workspace, *self._segment_call(q.shape[0] // q_len, q_len, attn.num_heads)
-        )
-        if workspace is None:
-            return False
         gate = self._gate(params)
         segmented_decode(
+            params,
             q,
             kv_pool,
             block_tables,
             params.sequence_lengths,
-            max_kv_len,
+            params.max_past_kv_length,
             params.input_seq_length,
             attn.num_kv_heads,
             _SEGMENTS,
             bmm1_scale,
             bmm2_scale,
-            workspace,
             self._counter_buffer,
             params.output,
             self._enable_pdl,

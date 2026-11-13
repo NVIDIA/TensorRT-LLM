@@ -207,11 +207,11 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;fmha;full-stack;gpu")
 add_tllm_gtest(
-  fmhaDispatcherTest
+  fmhaMaskSelectionTest
   OWNER
   kernel
   SOURCES
-  fmhaDispatcherTest.cpp
+  fmhaMaskSelectionTest.cpp
   LINK_LIBRARIES
   kernels_src
   context_attention_src

@@ -30,7 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -40,10 +40,10 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
-from ..attention.backends.fmha.fallback import FallbackFmha
-from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from ..attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from ..attention.backends.fmha.registry import get_enabled_fmha_lib_classes
+from ..attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 from ..attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
@@ -1303,19 +1303,18 @@ class MiniMaxM3Attention(Attention):
         if self.main_kv_is_fp8 or self.main_kv_is_nvfp4:
             return
         enabled_libs = get_enabled_fmha_lib_classes()
-        if FlashInferTrtllmGenFmha not in enabled_libs:
+        if TrtllmGenFmha not in enabled_libs:
             return
-        if FallbackFmha in enabled_libs and enabled_libs.index(FallbackFmha) < enabled_libs.index(
-            FlashInferTrtllmGenFmha
-        ):
-            # A fallback-first policy cannot serve P128 cached prefill safely.
+        first_native = next(
+            (index for index, lib in enumerate(enabled_libs) if lib in NATIVE_FMHA_LIBS), None
+        )
+        if first_native is not None and first_native < enabled_libs.index(TrtllmGenFmha):
+            # Only trtllm_gen among the native libraries serves P128 cached prefill.
             return
-        if not FlashInferTrtllmGenFmha.is_environment_available():
-            return
-        if get_sm_version() == 107:
-            # SM107 admits the library only for the KV manager's extra page sizes
-            # (the Eagle3 draft layers at 128-token pages). Dense layers keep SDPA
-            # there, as before SM107 was admitted.
+        sm = get_sm_version()
+        if not is_sm_100f(sm) or sm == 107:
+            # SM107 runs only the Eagle3 draft layers (128-token pages) on trtllm-gen;
+            # the dense layers keep SDPA there.
             return
         # Q/K norm and partial RoPE run in the model before backend dispatch.
         native_attn = TrtllmAttention(
@@ -1328,7 +1327,7 @@ class MiniMaxM3Attention(Attention):
             pos_embd_params=None,
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
         )
-        if not FlashInferTrtllmGenFmha.is_available(native_attn):
+        if not TrtllmGenFmha.is_available(native_attn):
             return
         self.attn = native_attn
         self.support_fused_qkv = self.attn.support_fused_qkv()

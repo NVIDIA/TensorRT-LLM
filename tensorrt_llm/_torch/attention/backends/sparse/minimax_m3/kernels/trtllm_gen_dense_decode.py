@@ -7,21 +7,24 @@ they only run there because MsaPrefillFmha claims every M3 layer. MSA's kernel
 uses the context schedule, spending a 128-row Q tile on one decode token, while
 trtllm-gen has a generation tile scheduler for exactly this shape.
 
-FlashInferTrtllmGenFmha cannot be reused as-is. It reaches the pool through
-build_trtllm_gen_kv_cache_metadata, which assumes each layer contributes
-exactly K+V to a pool slot. M3 packs K+V for every layer of a group into one
-slot, and sparse layers add an index-K sub-page on top, so there is no uniform
-per-layer stride and _kv_pool_mapping_offset is only a ranking, not an
-addressable offset. This module goes around that: it builds the same flat
-sub-page pool and [batch, 2, max_blocks] block table the kernel expects
-directly out of M3's own slot geometry, then calls the same flashinfer entry
-point the generic path calls.
+The layer's own native attention call cannot be reused as-is. It reaches the
+pool through the layer's pool pointer and pool mapping, which assume each layer
+contributes exactly K+V to a pool slot. M3 packs K+V for every layer of a group
+into one slot, and sparse layers add an index-K sub-page on top, so there is no
+uniform per-layer stride and _kv_pool_mapping_offset is only a ranking, not an
+addressable offset. This module goes around that: it builds the flat sub-page
+pool and [batch, 2, max_blocks] block table the kernel expects directly out of
+M3's own slot geometry, then runs the native trtllm-gen generation
+(TrtllmGenFmha) as a prepared-query call over that table, on the step's
+attention metadata with its pool table rooted at this layer's K sub-page.
 """
 
 from __future__ import annotations
 
+import copy
 import functools
-from typing import NamedTuple, Optional, Tuple
+import math
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -32,20 +35,63 @@ from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
-@functools.lru_cache(maxsize=None)
-def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> int:
-    """Byte size of the multi-CTA KV counter block.
+# The pool mapping of the one-pool view below: local layer 0 is layer 0 of pool 0.
+_POOL_MAPPING = torch.zeros((1, 2), dtype=torch.int32)
 
-    Cached like the workspace size below: it depends only on the head count,
-    the request bound and the device's SM count, none of which move during a
-    run, while computing it reaches C++ through a deferred import and a
-    device-properties query on every dense layer of every step.
+
+class _LayerKvPool:
+    """A KV cache manager as the native op reads it for one dense decode call.
+
+    The op addresses a layer's pages through the manager's pool table and the
+    layer's row of its pool mapping, which cannot address M3's pool (see the
+    module docstring). This view holds one pool whose primary pointer is this
+    layer's K sub-page, so the sub-page indexing of the block table built here
+    lands on it, and the call names local layer 0. Every other attribute is the
+    manager's.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 
-    multi_processor_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return int(get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
+    kv_cache_pool_mapping = _POOL_MAPPING
+
+    def __init__(self, manager, kv_pool: torch.Tensor) -> None:
+        self._manager = manager
+        # [pool, (primary, secondary)]
+        self.kv_cache_pool_pointers = torch.tensor([[kv_pool.data_ptr(), 0]], dtype=torch.int64)
+
+    def __getattr__(self, name):
+        manager = self.__dict__.get("_manager")
+        if manager is None:
+            raise AttributeError(name)
+        return getattr(manager, name)
+
+
+def _dense_call_metadata(
+    metadata: "TrtllmAttentionMetadata", kv_pool: torch.Tensor, subpage_table: torch.Tensor
+) -> "TrtllmAttentionMetadata":
+    """The step's metadata as one dense decode call reads it.
+
+    A shallow copy, so the step's own metadata and buffers are untouched. Its
+    manager is the layer's one-pool view and its block offsets are the sub-page
+    table, which kv_block_table also names. The verify rows of a step form a
+    causal chain over the trailing KV that the generation kernel's causal mask
+    covers, so the speculative-decoding state of the step, which describes the
+    layer's own call, is cleared.
+    """
+    call_metadata = copy.copy(metadata)
+    call_metadata.kv_cache_manager = _LayerKvPool(metadata.kv_cache_manager, kv_pool)
+    # Present so the op sees a paged KV cache; kv_block_table replaces its rows.
+    call_metadata.kv_cache_block_offsets = subpage_table
+    call_metadata.is_spec_decoding_enabled = False
+    call_metadata.is_spec_dec_tree = False
+    call_metadata.force_prepare_spec_dec_tree_mask = False
+    call_metadata.max_total_draft_tokens = None
+    return call_metadata
 
 
 def _device_index(device: torch.device) -> int:
@@ -53,123 +99,55 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def _counter_buffer(
-    device: torch.device, num_heads: int, max_num_requests: int, reserve: bool
-) -> torch.Tensor:
-    """Zeroed multi-CTA KV counters for one call.
+@functools.lru_cache(maxsize=None)
+def _dense_attention(
+    device_index: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    fp8_kv: bool,
+    q_scaling: float,
+) -> Tuple["TrtllmAttention", "TrtllmGenFmha"]:
+    """The native attention layer of a dense decode call's geometry, and its trtllm-gen library.
 
-    Taken from the shared arena, like the workspace beside it, so the block
-    joins the graph memory pool and clear_memory_buffers(). The arena hands
-    back uninitialized memory, so the zeroing is per call rather than per
-    allocation; a few KB of memset costs nothing next to the kernel it feeds.
+    It describes the call alone rather than reusing the M3 layer's own
+    attention, whose sparse configuration and KV quantization are those of the
+    model's sparse layers, not of this layer's pool. Built once per geometry: a
+    layer allocates its constant buffers on construction.
     """
-    counters = get_memory_buffers().get_buffer(
-        [_counter_size(num_heads, max_num_requests, _device_index(device))],
-        torch.uint8,
-        buffer_name="m3_trtllm_gen_kv_counters",
-        reserve_buffer=reserve,
-    )
-    counters.zero_()
-    return counters
+    # Function-local: the attention backends reach this package through the
+    # minimax_m3 package init, which a module-scope import here would cycle with.
+    from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8.value) if fp8_kv else None
+    with torch.cuda.device(device_index):
+        attn = TrtllmAttention(
+            layer_idx=0,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+        )
+    attn.local_layer_idx = 0
+    return attn, TrtllmGenFmha(attn)
 
 
 @functools.lru_cache(maxsize=None)
-def _workspace(q_dtype: torch.dtype, num_heads: int, head_dim: int, num_kv_heads: int) -> int:
-    """Byte size of the trtllm-gen scratch slab.
+def _fp8_scales(sm_scale: float, device_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Device BMM1 [softmax scale, softmax scale * log2(e)] and BMM2 [1] scales of an FP8 call.
 
-    It is a fixed slab (kTrtllmGenWorkspaceSize), independent of the batch, but
-    the size is read from the C++ layout rather than hardcoded. Cached so that
-    read, and the layout dict it builds, happen once instead of once per dense
-    layer per step.
+    M3 stores unscaled E4M3, so only the softmax scale is folded in. Filled on
+    the device rather than copied from the host so that a first call under CUDA
+    graph capture records the fill.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_generation_workspace_layout,
-    )
-
-    layout = _get_generation_workspace_layout(q_dtype, 1, 1, num_heads, head_dim, num_kv_heads, 0)
-    return int(layout["trtllm_gen_workspace_size"])
-
-
-def _workspace_buffer(size: int, reserve: bool) -> torch.Tensor:
-    return get_memory_buffers().get_buffer(
-        [size],
-        torch.uint8,
-        buffer_name="m3_trtllm_gen_workspace",
-        reserve_buffer=reserve,
-    )
-
-
-class DenseDecodeWorkspaceLayout(NamedTuple):
-    """Byte layout of the scratch one dense decode call needs.
-
-    The trtllm-gen slab sits at the front of the buffer and the multi-CTA KV
-    counters behind it, so a caller with one byte buffer can serve both.
-    """
-
-    workspace_bytes: int
-    # Aligned start of the counter block.
-    counter_offset: int
-    total_bytes: int
-
-
-# The alignment torch's own allocations start at, so a counter view taken at
-# this offset is as aligned as a standalone buffer would be.
-_COUNTER_OFFSET_ALIGNMENT = 256
-
-
-def dense_decode_workspace_layout(
-    *,
-    q_dtype: torch.dtype,
-    num_heads: int,
-    head_dim: int,
-    num_kv_heads: int,
-    max_num_requests: int,
-    device: torch.device,
-) -> DenseDecodeWorkspaceLayout:
-    """Lay out the scratch a dense decode call needs inside one buffer.
-
-    Both parts are sized by the head geometry and the request bound alone,
-    none of which move during a run, so a caller that knows those before the
-    phase runs can size its buffer there. See split_dense_decode_workspace for
-    the views this describes.
-    """
-    workspace_bytes = _workspace(q_dtype, num_heads, head_dim, num_kv_heads)
-    counter_bytes = _counter_size(num_heads, max_num_requests, _device_index(device))
-    counter_offset = (
-        (workspace_bytes + _COUNTER_OFFSET_ALIGNMENT - 1)
-        // _COUNTER_OFFSET_ALIGNMENT
-        * _COUNTER_OFFSET_ALIGNMENT
-    )
-    return DenseDecodeWorkspaceLayout(
-        workspace_bytes=workspace_bytes,
-        counter_offset=counter_offset,
-        total_bytes=counter_offset + counter_bytes,
-    )
-
-
-def split_dense_decode_workspace(
-    buffer: torch.Tensor, layout: DenseDecodeWorkspaceLayout
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Take the slab and the zeroed KV counters out of one byte buffer.
-
-    The counters are zeroed on every call because the buffer is shared with
-    the other FMHA libraries, any of which may have written it.
-    """
-    if buffer.dim() != 1 or buffer.element_size() != 1:
-        raise ValueError(
-            "MiniMax-M3 dense decode scratch must come from a flat byte buffer; "
-            f"got {tuple(buffer.shape)} of {buffer.dtype}."
-        )
-    if int(buffer.numel()) < layout.total_bytes:
-        raise ValueError(
-            f"MiniMax-M3 dense decode was handed a {int(buffer.numel())}-byte "
-            f"buffer, but this call needs {layout.total_bytes}. It was sized "
-            "from a different head geometry than the kernel sees."
-        )
-    workspace_bytes = buffer.view(torch.uint8)
-    counters = workspace_bytes[layout.counter_offset : layout.total_bytes]
-    counters.zero_()
-    return workspace_bytes[: layout.workspace_bytes], counters
+    device = torch.device("cuda", device_index)
+    bmm1 = torch.full((2,), sm_scale, dtype=torch.float32, device=device)
+    bmm1[1:].mul_(math.log2(math.e))
+    return bmm1, torch.ones(1, dtype=torch.float32, device=device)
 
 
 def subpage_block_table(
@@ -233,7 +211,7 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
 
 def minimax_m3_trtllm_gen_dense_decode(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
-    kv_cache_manager,
+    metadata: "TrtllmAttentionMetadata",
     layer_idx: int,
     block_table: torch.Tensor,  # [batch, max_blocks] slot ids
     seq_lens: torch.Tensor,  # [batch] int32
@@ -242,27 +220,24 @@ def minimax_m3_trtllm_gen_dense_decode(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
     decode_query_len: int,
     max_seq_len: int,
-    max_num_requests: int,
+    workspace: torch.Tensor,
     staged_subpage_table: Optional[torch.Tensor] = None,
     staged_subpages_per_slot: int = 0,
-    workspace: Optional[torch.Tensor] = None,
-    counters: Optional[torch.Tensor] = None,
-    enable_pdl: bool = True,
 ) -> None:
-    """Full-context decode attention through trtllm-gen, in place into output.
+    """Full-context decode attention through the native trtllm-gen library, in place into output.
+
+    metadata is the step's attention metadata, whose KV cache manager owns the
+    layer's pool. block_table and seq_lens are the decode rows' slot table and
+    KV lengths, and max_seq_len bounds those lengths for the multi-CTA KV split.
 
     staged_subpage_table is the expansion of block_table prepare() already
     staged, used when staged_subpages_per_slot matches this layer's factor and
     expanded here otherwise; see subpage_block_table.
 
-    workspace and counters are the scratch a caller already carved out of its
-    own buffer (see split_dense_decode_workspace); both are taken from the
-    arena here when a caller has not, as the standalone kernel tests do. A
-    supplied buffer is checked against the size this call needs, since the
-    caller sizes it from a geometry it derives for itself.
+    workspace is the attention workspace the native op works in and grows
+    outside CUDA graph capture. The multi-CTA KV counters are the op's own,
+    sized for the metadata's max_num_requests.
     """
-    import flashinfer
-
     # The multi-CTA KV counters are sized against max_num_requests, so a batch
     # read out of a longer q would undersize them.
     check_decode_span_shape(
@@ -272,75 +247,83 @@ def minimax_m3_trtllm_gen_dense_decode(
         decode_query_len,
     )
 
-    kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
-    num_heads = int(q.shape[1])
+    kv_pool, subpages_per_slot = metadata.kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
+    num_tokens, num_heads, head_dim = (int(x) for x in q.shape)
+    num_kv_heads, tokens_per_block = int(kv_pool.shape[1]), int(kv_pool.shape[2])
+    batch = int(seq_lens.shape[0])
+    device_index = _device_index(q.device)
 
-    # The kernel variant is picked from the Q dtype and shares one dtype across
-    # q/k/v, so an FP8 pool needs FP8 Q. M3 stores unscaled E4M3, so this is a
-    # plain cast and a no-op when the fused producer already emitted FP8.
-    if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
-        q = fp8_e4m3_saturate(q)
-
-    reserve = torch.cuda.is_current_stream_capturing()
-    workspace_size = _workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1]))
-    if workspace is None:
-        workspace = _workspace_buffer(workspace_size, reserve)
-    elif int(workspace.numel()) < workspace_size:
+    # The kernels share one dtype across q/k/v, so an FP8 pool needs FP8 Q. M3
+    # stores unscaled E4M3, so this is a plain cast and a no-op when the fused
+    # producer already emitted FP8.
+    fp8_kv = kv_pool.dtype == torch.float8_e4m3fn
+    if fp8_kv:
+        prepared_query = fp8_e4m3_saturate(q)
+        bmm1_scale, bmm2_scale = _fp8_scales(float(sm_scale), device_index)
+    elif kv_pool.dtype == q.dtype:
+        prepared_query, bmm1_scale, bmm2_scale = q, None, None
+    else:
         raise ValueError(
-            f"MiniMax-M3 dense decode was handed a {int(workspace.numel())}-byte "
-            f"trtllm-gen workspace, but this call needs {workspace_size}. It was "
-            "reserved from a different head geometry than the kernel sees."
-        )
-    counter_size = _counter_size(num_heads, max_num_requests, _device_index(q.device))
-    if counters is None:
-        counters = _counter_buffer(q.device, num_heads, max_num_requests, reserve)
-    elif int(counters.numel()) < counter_size:
-        raise ValueError(
-            f"MiniMax-M3 dense decode was handed {int(counters.numel())} bytes of "
-            f"multi-CTA KV counters, but this call needs {counter_size}. They were "
-            "reserved from a different head or request bound than the kernel sees."
+            f"MiniMax-M3 dense decode got a {q.dtype} query for a {kv_pool.dtype} KV pool; "
+            "a non-FP8 pool is read with a query of its own dtype."
         )
     if staged_subpage_table is None or staged_subpages_per_slot != subpages_per_slot:
-        staged_subpage_table = subpage_block_table(block_table, subpages_per_slot, reserve)
+        staged_subpage_table = subpage_block_table(
+            block_table, subpages_per_slot, torch.cuda.is_current_stream_capturing()
+        )
 
-    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        query=q,
-        # The tuple form takes the K and V page views separately, which is what
-        # a flat sub-page pool is: both rows of the block table index into it.
-        kv_cache=(kv_pool, kv_pool),
-        workspace_buffer=workspace,
-        block_tables=staged_subpage_table,
-        seq_lens=seq_lens,
-        max_seq_len=max_seq_len,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
-        window_left=-1,  # M3 dense layers are fully causal
-        out=output,
-        sinks=None,
-        kv_layout="HND",
-        enable_pdl=enable_pdl,
-        backend="trtllm-gen",
-        q_len_per_req=decode_query_len,
-        max_q_len=None,
-        cum_seq_lens_q=None,
-        kv_cache_sf=None,  # M3 stores unscaled E4M3
-        uses_shared_paged_kv_idx=False,
-        multi_ctas_kv_counter_buffer=counters,
+    from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
     )
 
-
-@functools.lru_cache(maxsize=1)
-def flashinfer_available() -> bool:
-    """Whether flashinfer can be imported, resolved once for the process.
-
-    The verdict below is consulted by ensure_msa_available and again per dense
-    layer, so the import statement would otherwise be on the hot path.
-    """
-    try:
-        import flashinfer  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    # BF16/FP16 runs take the softmax scale from q_scaling; FP8 runs read the device scales.
+    attn, fmha = _dense_attention(
+        device_index,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        fp8_kv,
+        1.0 / (float(sm_scale) * math.sqrt(head_dim)),
+    )
+    # The op names the activation dtype by its fused-QKV input; the kernel reads
+    # only the prepared query, so a query already in FP8 is named by the output.
+    activation = q if q.dtype in (torch.bfloat16, torch.float16) else output
+    # M3 dense layers are fully causal: a window covering both the page table
+    # and the length bound never slides.
+    window = max(int(staged_subpage_table.shape[-1]) * tokens_per_block, int(max_seq_len))
+    fmha.run_generation(
+        FmhaParams(
+            attn=attn,
+            meta=_dense_call_metadata(metadata, kv_pool, staged_subpage_table),
+            fwd=AttentionForwardArgs(
+                output=output,
+                attention_input_type=AttentionInputType.generation_only,
+                is_fused_qkv=True,
+            ),
+            workspace=workspace,
+            qkv_input=activation.reshape(num_tokens, num_heads * head_dim),
+            output=output.view(num_tokens, num_heads, head_dim),
+            sequence_lengths=seq_lens,
+            context_lengths=seq_lens,
+            input_seq_length=decode_query_len,
+            max_past_kv_length=int(max_seq_len),
+            max_attention_window_size=window,
+            cyclic_attention_window_size=window,
+            num_tokens=num_tokens,
+            tokens_per_block=tokens_per_block,
+            kv_factor=2,
+            batch_size=batch,
+            num_requests=batch,
+            num_gen_tokens=num_tokens,
+            local_layer_idx=0,
+            prepared_query=prepared_query.contiguous(),
+            prepared_bmm1_scale=bmm1_scale,
+            prepared_bmm2_scale=bmm2_scale,
+            kv_block_table=staged_subpage_table,
+        )
+    )
 
 
 def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional[str]:
@@ -353,19 +336,13 @@ def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional
     if not hasattr(kv_cache_manager, "get_kv_subpage_pool"):
         return "the KV cache manager does not expose a flat sub-page pool."
     if int(head_dim) != 128:
-        return f"head_dim {int(head_dim)}; only 128 has trtllm-gen H128 cubins."
-    if not flashinfer_available():
-        return "flashinfer is not installed."
+        return f"head_dim {int(head_dim)}; only 128 is validated on trtllm-gen here."
     return None
 
 
 __all__ = [
-    "DenseDecodeWorkspaceLayout",
     "dense_decode_unsupported_reason",
-    "dense_decode_workspace_layout",
-    "flashinfer_available",
     "minimax_m3_trtllm_gen_dense_decode",
-    "split_dense_decode_workspace",
     "subpage_block_table",
     "uniform_subpages_per_slot",
     "write_subpage_block_table",
