@@ -660,6 +660,7 @@ def _make_receiver_for_view_validation(
     [
         ("missing_heads", "must publish a positive num_kv_heads"),
         ("pool_roles", "has no peer view with the same roles"),
+        ("draft_layers", "unified draft KV layer count differs"),
     ],
 )
 def test_receiver_rejects_view_mismatch_before_registration(
@@ -690,8 +691,11 @@ def test_receiver_rejects_view_mismatch_before_registration(
     bad_view = bad_ri.page_table.layer_groups[0].pool_views[1]
     if mismatch == "missing_heads":
         bad_view.num_kv_heads = None
-    else:
+    elif mismatch == "pool_roles":
         bad_view.pool_role = frozenset({"other_kv"})
+    else:
+        # A sender sharing draft KV with a receiver that keeps a separate cache.
+        bad_ri.num_draft_layers = 2
     bad_ri.sender_endpoints = ["tcp://bad-sender"]
     good_ri.sender_endpoints = ["tcp://good-sender"]
     bad_endpoint = "tcp://bad-info"
@@ -1861,5 +1865,55 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
             reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
         return
 
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+@pytest.mark.parametrize(
+    ("self_kwargs", "peer_kwargs", "compatible"),
+    [
+        # GQA draft layers carry the target's per-rank heads, which differ here.
+        ({"tp_size": 1, "kv_heads_per_rank": 2}, {"tp_size": 2, "kv_heads_per_rank": 1}, False),
+        # Attention DP keeps every head on each rank at any TP size.
+        (
+            {"tp_size": 1, "kv_heads_per_rank": 2, "enable_attention_dp": True},
+            {"tp_size": 4, "dp_size": 4, "kv_heads_per_rank": 2, "enable_attention_dp": True},
+            True,
+        ),
+        # A K-only (MLA) cache holds the whole latent on every rank.
+        (
+            {"tp_size": 1, "kv_heads_per_rank": 1, "is_mla": True},
+            {"tp_size": 4, "kv_heads_per_rank": 1, "is_mla": True},
+            True,
+        ),
+    ],
+    ids=["gqa_different_attention_tp", "attention_dp", "mla"],
+)
+def test_peer_registrar_shares_draft_layers_when_heads_per_rank_agree(
+    self_kwargs: dict, peer_kwargs: dict, compatible: bool
+) -> None:
+    def mamba_tp(kwargs: dict) -> int:
+        # The synthetic recurrent state is sharded by TP unless attention DP.
+        return 1 if kwargs.get("enable_attention_dp") else kwargs["tp_size"]
+
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        page_table=make_page_table(mamba_tp=mamba_tp(self_kwargs)),
+        **self_kwargs,
+    )
+    self_rankinfo.num_draft_layers = 5
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(mamba_tp=mamba_tp(peer_kwargs)),
+        **peer_kwargs,
+    )
+    peer_ri.num_draft_layers = 5
+    if not compatible:
+        with pytest.raises(ValueError, match="same attention TP size"):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri

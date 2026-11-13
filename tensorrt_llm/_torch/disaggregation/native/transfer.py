@@ -3633,6 +3633,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                self._registrar.validate_draft_layers_compatible(sender_info)
                 self._registrar.validate_view_head_geometry(sender_info)
             except ValueError as e:
                 msg = (
