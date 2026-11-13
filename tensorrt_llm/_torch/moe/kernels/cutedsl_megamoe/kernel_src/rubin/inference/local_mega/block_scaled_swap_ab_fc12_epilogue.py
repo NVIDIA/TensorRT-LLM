@@ -19,7 +19,8 @@ from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from .....quant_def import QuantKind
 from ....function_mapping import FunctionMapping
-from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
+from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+from ....schedulers.base import SchedulerConsumer
 from ..mega.block_scaled_swap_ab_fc12_epilogue import (
     GatedActEpilogueArgs,
     SwapABFc1Epilogue,
@@ -29,7 +30,7 @@ from ..mega.block_scaled_swap_ab_fc12_epilogue import (
     make_fc2_stg_process_pipeline,
     make_fc2_ublk_process_pipeline,
 )
-from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .local_routing import RoutingMetadata
 
 

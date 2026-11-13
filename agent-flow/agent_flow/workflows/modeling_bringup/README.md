@@ -24,6 +24,8 @@ infrastructure and is validated against accuracy criteria.
   CUDA graphs, CPU overlap, and chunked prefill.
 - Support various model-parallel strategies used by TensorRT-LLM.
 - Validate the implemented model's accuracy on datasets.
+- Qualify the model for ModelExpress (MX) checkpoint loading when the task asks
+  for it (see [ModelExpress (MX) qualification](#modelexpress-mx-qualification)).
 
 ### What it cannot do yet
 
@@ -259,6 +261,34 @@ All flags from the generic `agent-team` CLI are accepted as-is. See the
 The workflow source lives in `agent_flow/workflows/modeling_bringup/`; import
 the bundle programmatically with
 `from agent_flow.workflows.modeling_bringup import MODELING_BRINGUP_PROMPTS`.
+
+### ModelExpress (MX) qualification
+
+MX qualification is opt-in per task. To ask for it, add a completion criterion
+that points at
+[`docs/source/features/model-express.md`](../../../../docs/source/features/model-express.md),
+which stays the single source of truth for eligibility and the qualification
+steps:
+
+```yaml
+completion_criteria:
+  - "If the model fits the ModelExpress constraints in
+     docs/source/features/model-express.md, MX checkpoint loading is qualified
+     as that doc describes, which includes a passing real donor/receiver test.
+     If that test cannot run here, final-report.md reports MX as pending until
+     the ModelExpress CI stages pass it. If the model does not fit,
+     final-report.md names the constraint that rules it out. Existing MX
+     profiles and constraints are not changed."
+```
+
+The PlanDrafter then plans the MX work from the start, and QA checks it like
+any other criterion. The donor/receiver test needs a ModelExpress server and
+twice as many GPUs as its TP size, because the donor and the receiver each hold
+one TP group: two GPUs for TP=1 and four for TP=2. Runs the bring-up host
+cannot do are left to the ModelExpress CI stages, and MX stays pending in
+`final-report.md` until those stages pass them. Every bring-up already keeps
+post-load work in the staged hooks MX relies on, so a model stays ready for MX
+even without this criterion.
 
 ## Environment
 

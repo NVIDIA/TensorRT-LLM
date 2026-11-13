@@ -733,11 +733,19 @@ def _run_distilled_loop(model, device) -> torch.Tensor:
     """The 4-step fixed-sigma SDE denoise loop the distilled checkpoints run."""
     from diffusers import FlowMatchEulerDiscreteScheduler
 
-    from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
+        Cosmos3SamplingPolicy,
+        SamplingSchedule,
+    )
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(_DISTILLED_SCHEDULER_CONFIG)
     policy = Cosmos3SamplingPolicy.from_scheduler(scheduler)
-    policy.set_timesteps(scheduler, num_inference_steps=len(_DISTILLED_SIGMAS), device=device)
+    policy.set_timesteps(
+        scheduler,
+        num_inference_steps=len(_DISTILLED_SIGMAS),
+        device=device,
+        schedule=SamplingSchedule(grid="fixed", flow_shift=1.0),
+    )
     step_kwargs = policy.scheduler_step_kwargs(torch.Generator().manual_seed(_SEED_SDE))
 
     assert torch.allclose(

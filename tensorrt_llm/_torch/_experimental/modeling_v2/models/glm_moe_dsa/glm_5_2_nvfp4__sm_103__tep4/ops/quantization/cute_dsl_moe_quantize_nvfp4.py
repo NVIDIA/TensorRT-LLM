@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import cutlass.torch as cutlass_torch
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
@@ -17,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 )
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
+from ...kernels.common.cuda_stream import cu_stream as _cu_stream
 from ...kernels.moe import moe_prefill_frontend_schedule as _sched
 from ...kernels.quantization import moe_frontend_quantize_nvfp4 as _decode
 from ...kernels.quantization import moe_prefill_quantize_segmented as _prefill
@@ -80,8 +80,10 @@ class CompiledMoeQuantize:
 
 
 def build_decode(rows: int, device) -> CompiledMoeQuantize:
-    """Compile the exact-row quantizer for `rows` rows (1..64), no PDL role, no zero
-    plane. Call at load. Compiles only (cached per process by the kernel module)."""
+    """Compile the exact-row quantizer for `rows` rows (1..64; 65..512 for the MTP3 / MTP5
+    decode widths: one CTA per row, so a row's bytes do not depend on the count), no PDL
+    role, no zero plane. Call at load. Compiles only (cached per process by the kernel
+    module)."""
     rows = int(rows)
     bf = {"dtype": torch.bfloat16, "device": device}
     u8 = {"dtype": torch.uint8, "device": device}
@@ -104,7 +106,7 @@ def build_decode(rows: int, device) -> CompiledMoeQuantize:
             as_t(fp4_out, 1),
             as_t(scale_out, 1),
             as_t(x, 1),
-            cutlass_torch.current_stream(),
+            _cu_stream(),
         )
 
     return CompiledMoeQuantize("decode", rows, launch)
@@ -140,7 +142,7 @@ def build_prefill(device) -> CompiledMoeQuantize:
         rows = int(x.shape[0])
         h = handles[_sched.propose_schedule(rows).quant_segments]
         # The unfused zero plane is in the ABI but never touched; `x` stands in for it.
-        h(x, global_scale.reshape(1), fp4_out, scale_out, x, rows, cutlass_torch.current_stream())
+        h(x, global_scale.reshape(1), fp4_out, scale_out, x, rows, _cu_stream())
 
     return CompiledMoeQuantize("prefill", None, launch)
 
@@ -163,7 +165,13 @@ class CuteDslMoeQuantizeNvfp4(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="one decode row on the exact-row kernel", spec=dict(rows=1)),
-        Cell(why="64 rows, the exact-row kernel's ceiling", spec=dict(rows=64)),
+        Cell(why="64 rows, the exact-row kernel's MTP1 ceiling", spec=dict(rows=64)),
+        Cell(
+            why="MTP3's 128 decode rows on the exact-row kernel", spec=dict(rows=128, decode=True)
+        ),
+        Cell(
+            why="MTP5's 192 decode rows on the exact-row kernel", spec=dict(rows=192, decode=True)
+        ),
         Cell(why="65 rows, the first prefill count: three segments per row", spec=dict(rows=65)),
         Cell(why="2048 rows, the last three-segment count", spec=dict(rows=2048)),
         Cell(why="2049 rows, the first one-segment count", spec=dict(rows=2049)),
@@ -173,7 +181,9 @@ class CuteDslMoeQuantizeNvfp4(OpWrapper):
     note = """
     The trunk's decode rows arrive already quantized by the closing collective's
     epilogue, so the decode handles (built per power-of-two width up to 64) serve only a
-    remainder chunk past the 8192-row budget, which no configured step produces. A
+    remainder chunk past the 8192-row budget, which no configured step produces. The
+    exact-row kernel also takes 65..512 rows (certified at MTP3's 128 and MTP5's 192), for
+    a wide decode step that quantizes on its own; the target does not build those yet. A
     context step takes the prefill handle when it built, else `fp4_quantize` at the call
     site (which allocates its own outputs and returns 1-D scales; the grouped GEMMs read
     either form).

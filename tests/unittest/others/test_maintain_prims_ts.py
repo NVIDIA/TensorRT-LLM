@@ -1291,6 +1291,7 @@ def test_promotion_record_rejects_reversed_markers() -> None:
 def test_open_pr_checks_live_dev_tip_before_valid_feedback(
     world: World, monkeypatch: pytest.MonkeyPatch, consumer_base: str, case: str
 ) -> None:
+    tip = None
     world.base_branch = consumer_base
     args = world.args(publish=True)
     args.workdir = world.root
@@ -1801,6 +1802,8 @@ def test_interrupted_preparation_resumes_without_extra_commits(
 def test_incomplete_recovery_preserves_unexpected_edits(
     world: World, monkeypatch: pytest.MonkeyPatch, edit: str
 ) -> None:
+    preserved = None
+
     def interrupted(repo: Path, *args: str, text: str | None = None) -> str:
         if args[0] == "commit":
             raise RuntimeError("simulated interruption")

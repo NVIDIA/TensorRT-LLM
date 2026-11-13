@@ -51,7 +51,8 @@ from tensorrt_llm._torch.models import modeling_qwen3_moe as modeling_qwen3_moe_
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode, get_registered_model_class
+from tensorrt_llm._torch.modules import linear as linear_mod
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
@@ -66,6 +67,9 @@ from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
     WEIGHT_MANIFEST_DIR_ENV,
@@ -86,6 +90,7 @@ from tensorrt_llm._torch.weight_sharing import (
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
@@ -365,27 +370,11 @@ def _tiny_qwen3_model(
     model_class: type[nn.Module] = modeling_qwen3_mod.Qwen3ForCausalLM,
     tp_size: int = 1,
     rank: int = 0,
+    tie_word_embeddings: bool = False,
 ) -> nn.Module:
     monkeypatch.setattr(torch.cuda, "Stream", lambda *_args, **_kwargs: MagicMock())
     monkeypatch.setattr(torch.cuda, "Event", lambda *_args, **_kwargs: MagicMock())
-    qwen3_config = Qwen3Config(
-        architectures=["Qwen3ForCausalLM"],
-        attention_bias=False,
-        head_dim=4,
-        hidden_act="silu",
-        hidden_size=16,
-        intermediate_size=32,
-        max_position_embeddings=16,
-        mlp_bias=False,
-        num_attention_heads=4,
-        num_hidden_layers=2,
-        num_key_value_heads=2,
-        rms_norm_eps=1e-6,
-        rope_scaling=None,
-        tie_word_embeddings=False,
-        torch_dtype=torch.bfloat16,
-        vocab_size=32,
-    )
+    qwen3_config = _tiny_qwen3_config(tie_word_embeddings=tie_word_embeddings)
     model = model_class(
         ModelConfig(
             pretrained_config=qwen3_config,
@@ -407,6 +396,186 @@ def _tiny_qwen3_model(
             ).reshape(parameter.shape)
             parameter.copy_(((values + index) % 17).to(parameter.dtype) / 17)
     return model
+
+
+def _tiny_qwen3_config(*, tie_word_embeddings: bool = False) -> Qwen3Config:
+    return Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        attention_bias=False,
+        head_dim=4,
+        hidden_act="silu",
+        hidden_size=16,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        mlp_bias=False,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-6,
+        rope_scaling=None,
+        tie_word_embeddings=tie_word_embeddings,
+        torch_dtype=torch.bfloat16,
+        vocab_size=32,
+    )
+
+
+_QWEN3_FP8_BLOCK_PROFILE_ID = "qwen3-for-causal-lm-fp8-block-sm90-target-v1"
+_FP8_BLOCK_SIZE = 128
+
+
+def _simulate_sm(monkeypatch: pytest.MonkeyPatch, sm_version: int) -> None:
+    """Make FP8 block-scale transforms and MX qualification see `sm_version`.
+
+    Executor unit tests run on CPU, Hopper, and Blackwell runners. FP8
+    block-scale layouts depend on the GPU architecture, so tests that describe
+    one architecture's layout pin it instead of inheriting the runner's.
+    """
+    monkeypatch.setattr(linear_mod, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(linear_mod, "is_sm_100f", lambda *_args, **_kwargs: 100 <= sm_version < 110)
+    monkeypatch.setattr(linear_mod, "is_sm_120f", lambda *_args, **_kwargs: 120 <= sm_version < 130)
+    monkeypatch.setattr(model_loader_mod, "get_sm_version", lambda: sm_version)
+
+
+def _fp8_block_quant_config() -> QuantConfig:
+    # Mirrors what load_hf_quant_config() builds for a `quant_method: fp8`
+    # checkpoint with 128x128 weight blocks and no modules_to_not_convert.
+    return QuantConfig(
+        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+        group_size=_FP8_BLOCK_SIZE,
+        exclude_modules=["*kv_b_proj*", "*k_b_proj*", "*eh_proj"],
+    )
+
+
+def _tiny_qwen3_fp8_block_model(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_class: type[nn.Module] = modeling_qwen3_mod.Qwen3ForCausalLM,
+    tp_size: int = 1,
+    rank: int = 0,
+) -> nn.Module:
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(torch.cuda, "Event", lambda *_args, **_kwargs: MagicMock())
+    # Every per-rank q, k, v, o, gate, up, and down span is a whole number of
+    # 128-wide scale blocks at TP1 and TP2, as in the Qwen3 FP8 checkpoints.
+    qwen3_config = Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        attention_bias=False,
+        head_dim=128,
+        hidden_act="silu",
+        hidden_size=128,
+        intermediate_size=256,
+        max_position_embeddings=16,
+        mlp_bias=False,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        num_key_value_heads=2,
+        # The quantization config the Qwen3 FP8 checkpoints declare.
+        quantization_config={
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [_FP8_BLOCK_SIZE, _FP8_BLOCK_SIZE],
+        },
+        rms_norm_eps=1e-6,
+        rope_scaling=None,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+        vocab_size=32,
+    )
+    model = model_class(
+        ModelConfig(
+            pretrained_config=qwen3_config,
+            quant_config=_fp8_block_quant_config(),
+            mapping=mapping_mod.Mapping(
+                world_size=tp_size,
+                rank=rank,
+                tp_size=tp_size,
+            ),
+            max_num_tokens=16,
+            max_seq_len=16,
+        )
+    )
+    with torch.no_grad():
+        for index, (name, parameter) in enumerate(model.named_parameters()):
+            if name.endswith("input_scale"):
+                # Dynamic-activation checkpoints keep the unit activation scales.
+                continue
+            values = torch.arange(
+                parameter.numel(),
+                dtype=torch.float32,
+                device=parameter.device,
+            ).reshape(parameter.shape)
+            # Positive values keep every FP32 block scale a valid scale.
+            parameter.copy_((((values + index) % 17 + 1) / 17).to(parameter.dtype))
+    return model
+
+
+def _fp8_block_projections(model: nn.Module) -> dict[str, Linear]:
+    layer = model.model.layers[0]
+    return {
+        "qkv": layer.self_attn.qkv_proj,
+        "o": layer.self_attn.o_proj,
+        "gate_up": layer.mlp.gate_up_proj,
+        "down": layer.mlp.down_proj,
+    }
+
+
+def _qwen3_fp8_block_layout_state(model: nn.Module) -> dict[str, object]:
+    state = _qwen3_layout_state(model)
+    for name, projection in _fp8_block_projections(model).items():
+        state[f"{name}_quant_method"] = type(projection.quant_method).__name__
+        state[f"{name}_weight"] = (projection.weight.dtype, tuple(projection.weight.shape))
+        state[f"{name}_weight_scale"] = (
+            projection.weight_scale.dtype,
+            tuple(projection.weight_scale.shape),
+        )
+        state[f"{name}_input_scales"] = (
+            (projection.input_scale.dtype, tuple(projection.input_scale.shape)),
+            (projection.inv_input_scale.dtype, tuple(projection.inv_input_scale.shape)),
+        )
+        state[f"{name}_relayout_parameters"] = tuple(sorted(projection.rebuild_tensor_metadata))
+        # The default range stays unless the DeepGEMM relayout in
+        # transform_weights() replaces it, a step a staged receiver skips.
+        state[f"{name}_low_m_gemm"] = projection.fp8_low_m_gemm
+    state["attention_has_quant_scale"] = model.model.layers[0].self_attn.has_quant_scale
+    state["lm_head_weight_dtype"] = model.lm_head.weight.dtype
+    state["lm_head_has_weight_scale"] = hasattr(model.lm_head, "weight_scale")
+    # GatedMLP derives this flag in post_load_weights() only; the fused Qwen3
+    # projections never share a quantized activation, so both paths agree.
+    state["share_gate_up_quantization"] = tuple(
+        layer.mlp._maybe_share_gate_up_quantize for layer in model.model.layers
+    )
+    return state
+
+
+def _fp8_block_dequantized_weight(projection: Linear) -> torch.Tensor:
+    weight = projection.weight.to(torch.float32)
+    out_features, in_features = weight.shape
+    scale = projection.weight_scale.repeat_interleave(_FP8_BLOCK_SIZE, dim=0)[:out_features]
+    return weight * scale.repeat_interleave(_FP8_BLOCK_SIZE, dim=1)[:, :in_features]
+
+
+def _fp8_block_projection_output(projection: Linear) -> torch.Tensor:
+    # FP8 GEMMs need CUDA, so the probe dequantizes on the CPU in FP32.
+    in_features = projection.weight.shape[1]
+    values = torch.arange(
+        3 * in_features,
+        dtype=torch.float32,
+        device=projection.weight.device,
+    ).reshape(3, in_features)
+    return ((values % 17) / 17) @ _fp8_block_dequantized_weight(projection).T
+
+
+def _fp8_block_output_probes() -> tuple[tuple[str, Callable[[nn.Module], torch.Tensor]], ...]:
+    return tuple(
+        (
+            f"{name}-dequantized-output",
+            lambda model, name=name: _fp8_block_projection_output(
+                _fp8_block_projections(model)[name]
+            ),
+        )
+        for name in ("qkv", "o", "gate_up", "down")
+    )
 
 
 def _tiny_mistral_model(
@@ -785,6 +954,17 @@ def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
     return PostTransformRuntimeConfig(**values)
 
 
+def _fp8_block_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
+    values: dict[str, object] = {
+        "quant_algorithm": QuantAlgo.FP8_BLOCK_SCALES.value,
+        "rope_fusion": False,
+        "sm_version": 90,
+        "weight_block_size": (_FP8_BLOCK_SIZE, _FP8_BLOCK_SIZE),
+    }
+    values.update(overrides)
+    return _bf16_dense_runtime_config(**values)
+
+
 def _qwen2_layout_state(model: nn.Module) -> dict[str, object]:
     layer = model.model.layers[0]
     return {
@@ -1013,6 +1193,17 @@ _DOCUMENTED_SLIDING_WINDOWS = {
     None: "",
     frozenset({"none"}): ", no sliding window",
 }
+# Documented weight-quantization envelopes, keyed by the quant_algorithms,
+# sm_versions, and weight_block_sizes constraints of a dense row. A row with any
+# other combination needs its own description here and in the support table.
+_DOCUMENTED_DENSE_QUANTIZATION = {
+    (frozenset({"none"}), None, None): "unquantized weights and KV cache",
+    (
+        frozenset({QuantAlgo.FP8_BLOCK_SCALES.value}),
+        frozenset({90}),
+        frozenset({(128, 128)}),
+    ): "FP8 block-scale (128x128) weights and unquantized KV cache, SM90 only",
+}
 
 
 def _documented_constraints(profile: PostTransformProfile) -> str:
@@ -1022,7 +1213,9 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
     partitions, and adds the MoE load balancer and DWDP to the exclusions.
     """
     constraints = profile.runtime_constraints
-    assert constraints.quant_algorithms == frozenset({"none"})
+    quantization = _DOCUMENTED_DENSE_QUANTIZATION[
+        (constraints.quant_algorithms, constraints.sm_versions, constraints.weight_block_sizes)
+    ]
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
     assert constraints.layerwise_quantization == frozenset({False})
     assert constraints.force_dynamic_quantization == frozenset({False})
@@ -1030,7 +1223,10 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
     assert constraints.sparse_attention_enabled == frozenset({False})
     assert constraints.attention_dp == frozenset({False})
     assert constraints.multi_node == frozenset({False})
-    assert constraints.tied_word_embeddings == frozenset({False})
+    # Each profile pins one embedding layout. A family that also qualifies tied
+    # checkpoints, such as Qwen3, does so through a sibling profile with its own
+    # layout ABI.
+    assert constraints.tied_word_embeddings in (frozenset({False}), frozenset({True}))
     moe_profile = constraints.moe_backends is not None
     if moe_profile:
         assert constraints.moe_tp_sizes == constraints.tp_sizes
@@ -1075,10 +1271,14 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
     )
     rope_description = _DOCUMENTED_ROPE[(constraints.rope_types, constraints.rope_fusion)]
     sliding_window_description = _DOCUMENTED_SLIDING_WINDOWS[constraints.sliding_windows]
+    embeddings = _format_documented_values(
+        constraints.tied_word_embeddings,
+        labels={False: "untied", True: "tied"},
+    )
     return (
-        f"Single-node {model_description}, unquantized weights and KV cache, "
+        f"Single-node {model_description}, {quantization}, "
         f"{attention_backends} attention, {moe_backend_description}{rope_description}"
-        f"{sliding_window_description}, untied embeddings, {partition_description}, "
+        f"{sliding_window_description}, {embeddings} embeddings, {partition_description}, "
         f"PP/CP={pp_cp_sizes}, no LoRA, sparse attention, attention DP, {moe_exclusions}"
         "speculative mode, or separately loaded draft model"
     )
@@ -1136,13 +1336,20 @@ def _mx_e2e_cases() -> dict[str, dict[str, object]]:
         options = {keyword.arg: keyword.value for keyword in param.keywords}
         row = {keyword.arg: ast.literal_eval(keyword.value) for keyword in case.keywords}
         marks = options["marks"]
-        marks = marks.elts if isinstance(marks, ast.List) else [marks]
-        mark_args = {ast.unparse(mark.func): mark.args for mark in marks}
-        # Every row names its GPU count; a row may also require device memory.
+        marks = marks.elts if isinstance(marks, (ast.List, ast.Tuple)) else [marks]
+        # A bare mark such as `skip_no_hopper` is a name with no arguments.
+        mark_args = {
+            ast.unparse(mark.func if isinstance(mark, ast.Call) else mark): (
+                mark.args if isinstance(mark, ast.Call) else []
+            )
+            for mark in marks
+        }
+        # Every row names its GPU count; a row may also require device memory or SM90.
         assert len(mark_args) == len(marks)
         assert set(mark_args) <= {
             "pytest.mark.skip_less_device",
             "pytest.mark.skip_less_device_memory",
+            "skip_no_hopper",
         }
         row["min_devices"] = ast.literal_eval(mark_args["pytest.mark.skip_less_device"][0])
         case_id = ast.literal_eval(options["id"])
@@ -1248,6 +1455,16 @@ _MX_E2E_ROWS = {
         "qwen3-moe-bf16",
         "qwen3-moe",
         "TRTLLM_MX_QWEN3_MOE_MODEL",
+    ),
+    "qwen3-for-causal-lm-fp8-block-sm90-target-v1": (
+        "qwen3-fp8-block",
+        "qwen3-fp8-block",
+        "TRTLLM_MX_QWEN3_FP8_MODEL",
+    ),
+    "qwen3-for-causal-lm-bf16-tied-target-v1": (
+        "qwen3-tied-bf16",
+        "qwen3-tied",
+        "TRTLLM_MX_QWEN3_TIED_MODEL",
     ),
 }
 
@@ -1359,7 +1576,7 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    case_id_pattern = r"\b[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*?-bf16-tp\d+(?:-ep\d+)?\b"
+    case_id_pattern = r"\b[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*?-(?:bf16|fp8-block)-tp\d+(?:-ep\d+)?\b"
     assert set(re.findall(case_id_pattern, qualification_test)) == set(cases)
     assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b", qualification_test)) == {
         row["model_env"] for row in cases.values()
@@ -2030,6 +2247,490 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
     assert _qwen3_layout_state(producer)["gate_up_weight_shape"] == (32, 16)
 
 
+def _qwen3_tied_embedding_state(model: nn.Module) -> dict[str, object]:
+    """Describe the tie through memory, which identifies it after meta-init materialization."""
+    head = model.lm_head.weight
+    table = model.model.embed_tokens.weight
+    return {
+        "same_view": (head.device, head.data_ptr(), head.shape, head.stride())
+        == (table.device, table.data_ptr(), table.shape, table.stride()),
+        "table_shape": tuple(table.shape),
+        "mx_catalog_names_lm_head": "lm_head.weight" in _mx_canonical_parameter_catalog(model),
+    }
+
+
+def _rank_local_lm_head_logits(model: nn.Module) -> torch.Tensor:
+    return nn.functional.linear(_dense_hidden_states(model), model.lm_head.weight)
+
+
+def _copy_mx_catalog(producer: nn.Module, receiver: nn.Module) -> None:
+    """Copy each tensor of the producer's MX catalog once, by name, as MX transfers it."""
+    catalog = _mx_canonical_parameter_catalog(producer)
+    assert _mx_canonical_parameter_catalog(receiver).keys() == catalog.keys()
+    producer_parameters = dict(producer.named_parameters(remove_duplicate=False))
+    receiver_parameters = dict(receiver.named_parameters(remove_duplicate=False))
+    with torch.no_grad():
+        for name in catalog:
+            receiver_parameters[name].copy_(producer_parameters[name])
+
+
+def _receive_mx_catalog_into_blank_receiver(producer: nn.Module, receiver: nn.Module) -> None:
+    """Zero every receiver parameter, then transfer only the MX catalog.
+
+    A parameter that the catalog does not cover, such as an untied LM head,
+    stays zero and fails the lifecycle comparison.
+    """
+    with torch.no_grad():
+        for _name, parameter in receiver.named_parameters(remove_duplicate=False):
+            parameter.zero_()
+    _copy_mx_catalog(producer, receiver)
+
+
+def test_qwen3_dense_tied_profile_qualifies_full_staged_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = PostTransformQualificationCase(
+        profile_id="qwen3-for-causal-lm-bf16-tied-target-v1",
+        model_factory=lambda: _tiny_qwen3_model(monkeypatch, tie_word_embeddings=True),
+        unqualified_model_factory=lambda: _tiny_qwen3_model(
+            monkeypatch,
+            model_class=_UnqualifiedQwen3ForCausalLM,
+            tie_word_embeddings=True,
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(
+            ("layout", _qwen3_layout_state),
+            ("tied-embedding", _qwen3_tied_embedding_state),
+        ),
+        output_probes=(
+            ("embedding-logits", _dense_embedding_logits),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
+        ),
+        prepare_receiver=_receive_mx_catalog_into_blank_receiver,
+    )
+
+    producer, receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        receiver,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+    assert decision.transform_abi_id == QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _bf16_dense_runtime_config(rope_fusion=False, tied_word_embeddings=True)
+    assert _qwen3_layout_state(producer)["tied_lm_head"] is True
+    assert _qwen3_tied_embedding_state(receiver) == {
+        "same_view": True,
+        "table_shape": (32, 16),
+        "mx_catalog_names_lm_head": False,
+    }
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_qwen3_dense_tied_profile_qualifies_tp2_rank_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+) -> None:
+    monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+    case = PostTransformQualificationCase(
+        profile_id="qwen3-for-causal-lm-bf16-tied-target-v1",
+        model_factory=lambda: _tiny_qwen3_model(
+            monkeypatch,
+            tp_size=2,
+            rank=rank,
+            tie_word_embeddings=True,
+        ),
+        unqualified_model_factory=lambda: _tiny_qwen3_model(
+            monkeypatch,
+            model_class=_UnqualifiedQwen3ForCausalLM,
+            tp_size=2,
+            rank=rank,
+            tie_word_embeddings=True,
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(
+            ("layout", _qwen3_layout_state),
+            ("tied-embedding", _qwen3_tied_embedding_state),
+        ),
+        output_probes=(
+            ("rank-local-lm-head-logits", _rank_local_lm_head_logits),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
+        ),
+        prepare_receiver=_receive_mx_catalog_into_blank_receiver,
+    )
+
+    producer, receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _bf16_dense_runtime_config(
+        tp_size=2,
+        moe_tp_size=2,
+        attention_tp_size=2,
+        rope_fusion=False,
+        tied_word_embeddings=True,
+    )
+    # Each rank holds its vocab shard of the shared table once.
+    assert _qwen3_tied_embedding_state(receiver) == {
+        "same_view": True,
+        "table_shape": (16, 16),
+        "mx_catalog_names_lm_head": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "tp_size, rank",
+    [
+        pytest.param(1, 0, id="tp1"),
+        pytest.param(2, 0, id="tp2-rank0"),
+        pytest.param(2, 1, id="tp2-rank1"),
+    ],
+)
+def test_mx_canonical_catalog_holds_tied_embedding_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    rank: int,
+) -> None:
+    if tp_size > 1:
+        monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+        monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+    untied = _tiny_qwen3_model(monkeypatch, tp_size=tp_size, rank=rank)
+    tied = _tiny_qwen3_model(
+        monkeypatch,
+        tp_size=tp_size,
+        rank=rank,
+        tie_word_embeddings=True,
+    )
+
+    untied_catalog = _mx_canonical_parameter_catalog(untied)
+    tied_catalog = _mx_canonical_parameter_catalog(tied)
+
+    # The shared table is registered once, under its first name; the tied
+    # catalog is the untied one without the LM head, which is why tied
+    # checkpoints carry their own layout ABI.
+    assert set(untied_catalog) - set(tied_catalog) == {"lm_head.weight"}
+    assert set(tied_catalog) < set(untied_catalog)
+    assert tied_catalog["model.embed_tokens.weight"] == (
+        tied.lm_head.weight.data_ptr(),
+        (32 // tp_size, 16),
+        torch.bfloat16,
+    )
+
+
+def test_staged_qwen3_tied_finalization_preserves_mx_tensor_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny_qwen3_model(monkeypatch, tie_word_embeddings=True)
+
+    # MX discovers and registers tensors after receiver alias preparation.
+    ModelLoader._setup_aliases(model)
+    registered_catalog = _mx_canonical_parameter_catalog(model)
+
+    # This is the receiver-side finalization sequence after RDMA completes.
+    ModelLoader._setup_aliases(model)
+    ModelLoader._mark_weights_transformed(model)
+    ModelLoader._walk_cache_state(model)
+    published_catalog = _mx_canonical_parameter_catalog(model)
+
+    assert published_catalog == registered_catalog
+    assert "lm_head.weight" not in published_catalog
+    assert published_catalog["model.embed_tokens.weight"][0] == model.lm_head.weight.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "declared_tie",
+    [
+        pytest.param(True, id="declared-tie-not-realized"),
+        pytest.param(False, id="realized-tie-not-declared"),
+    ],
+)
+def test_qwen3_dense_profiles_reject_tie_the_model_does_not_realize(
+    monkeypatch: pytest.MonkeyPatch,
+    declared_tie: bool,
+) -> None:
+    model = _tiny_qwen3_model(monkeypatch, tie_word_embeddings=declared_tie)
+    if declared_tie:
+        model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach().clone())
+    else:
+        model.lm_head.weight = model.model.embed_tokens.weight
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset({"tied_word_embeddings"})
+
+
+def test_qwen3_tied_and_untied_source_identities_never_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identities = {}
+    for tie_word_embeddings, transform_abi_id in (
+        (False, QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1),
+        (True, QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1),
+    ):
+        model = _tiny_qwen3_model(monkeypatch, tie_word_embeddings=tie_word_embeddings)
+        decision = ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        )
+        assert decision.transform_abi_id == transform_abi_id
+        identities[tie_word_embeddings] = SourceIdentity.from_model_config(
+            model.model_config,
+            model,
+            artifact_identity=_SOURCE_IDENTITY.artifact_identity,
+            transform_abi_id=decision.transform_abi_id,
+        )
+
+    result = identities[True].matches(identities[False])
+    assert {"model_fingerprint", "shard_fingerprint", "transform_abi_id"} <= set(
+        result.mismatched_fields
+    )
+    # ENFORCE skips the config and shard fingerprints, so the layout ABI alone
+    # keeps a tied source and an untied receiver apart.
+    enforce = check_weight_sharing_compatibility(
+        identities[False], identities[True], IdentityCheckPolicy.ENFORCE
+    )
+    assert not enforce.should_share
+    assert enforce.match_result.mismatched_fields == ["transform_abi_id"]
+
+
+class _CatalogCopyingMxLoader(_PostTransformMxLoader):
+    """An MX receiver that copies a producer's catalog into the model it prepared."""
+
+    def __init__(self, producer: nn.Module) -> None:
+        super().__init__(post_transform=True)
+        self._producer = producer
+
+    def _load_weights(self, *args: object, **kwargs: object) -> dict[str, object]:
+        weights = super()._load_weights(*args, **kwargs)
+        if self._post_transform:
+            receiver = cast(nn.Module, kwargs["model"])
+            assert "lm_head.weight" not in _mx_canonical_parameter_catalog(receiver)
+            _copy_mx_catalog(self._producer, receiver)
+        return weights
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Materializes the model on CUDA")
+def test_mx_staged_receiver_load_keeps_tied_qwen3_table_in_one_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    producer = _tiny_qwen3_model(monkeypatch, tie_word_embeddings=True).cuda()
+    ModelLoader._walk_full_post_load(producer)
+
+    real_source_identity = model_loader_mod.SourceIdentity.__dict__["from_model_config"]
+    loader = _make_loader(monkeypatch, events=[])
+    # Build the receiver's real SourceIdentity from the meta-initialized model.
+    monkeypatch.setattr(model_loader_mod.SourceIdentity, "from_model_config", real_source_identity)
+    loader._load_and_validate_config = MagicMock(
+        return_value=ModelConfig(
+            pretrained_config=_tiny_qwen3_config(tie_word_embeddings=True),
+            mapping=mapping_mod.Mapping(world_size=1, rank=0, tp_size=1),
+            max_num_tokens=16,
+            max_seq_len=16,
+        )
+    )
+    construction_devices = []
+
+    def _construct(model_config: ModelConfig) -> nn.Module:
+        model = modeling_qwen3_mod.Qwen3ForCausalLM(model_config)
+        construction_devices.append(model.model.embed_tokens.weight.device.type)
+        return model
+
+    # Run the loader's real meta-init construction and memoized materialization.
+    monkeypatch.setattr(model_loader_mod, "MetaInitMode", MetaInitMode)
+    monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM, "from_config", _construct)
+    checkpoint_loader = _CatalogCopyingMxLoader(producer)
+
+    model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    assert construction_devices == ["meta"]
+    loader._call_load_weights.assert_not_called()
+    assert checkpoint_loader.load_weights.call_args.kwargs["allow_post_transform_weights"] is True
+    assert loader._source_identity.transform_abi_id == QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1
+
+    # Materialization may give each module its own Parameter object, so the tie
+    # is checked through memory: one view of one allocation.
+    head = model.lm_head.weight
+    table = model.model.embed_tokens.weight
+    assert head.is_cuda
+    assert (head.data_ptr(), head.shape, head.stride()) == (
+        table.data_ptr(),
+        table.shape,
+        table.stride(),
+    )
+    assert PostTransformRuntimeConfig.from_model_config(
+        model.model_config, model=model
+    ) == _bf16_dense_runtime_config(rope_fusion=False, tied_word_embeddings=True)
+
+    parameters = dict(model.named_parameters(remove_duplicate=False))
+    catalog = _mx_canonical_parameter_catalog(model)
+    assert "lm_head.weight" not in catalog
+    # Every parameter lives in an allocation that the catalog transfers, so the
+    # head has no second copy of the table.
+    assert {parameter.untyped_storage().data_ptr() for parameter in parameters.values()} == {
+        parameters[name].untyped_storage().data_ptr() for name in catalog
+    }
+
+    with torch.no_grad():
+        torch.testing.assert_close(
+            _dense_embedding_logits(model),
+            _dense_embedding_logits(producer),
+            rtol=0,
+            atol=0,
+        )
+
+
+def _qwen3_fp8_block_case(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tp_size: int = 1,
+    rank: int = 0,
+) -> PostTransformQualificationCase:
+    output_probes = _fp8_block_output_probes()
+    if tp_size == 1:
+        output_probes = (("embedding-logits", _dense_embedding_logits), *output_probes)
+    return PostTransformQualificationCase(
+        profile_id=_QWEN3_FP8_BLOCK_PROFILE_ID,
+        model_factory=lambda: _tiny_qwen3_fp8_block_model(monkeypatch, tp_size=tp_size, rank=rank),
+        unqualified_model_factory=lambda: _tiny_qwen3_fp8_block_model(
+            monkeypatch,
+            model_class=_UnqualifiedQwen3ForCausalLM,
+            tp_size=tp_size,
+            rank=rank,
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("fp8-block-layout", _qwen3_fp8_block_layout_state),),
+        output_probes=output_probes,
+    )
+
+
+def _expected_qwen3_fp8_block_layout(
+    *,
+    qkv_rows: int,
+    o_columns: int,
+    gate_up_rows: int,
+    down_columns: int,
+) -> dict[str, object]:
+    def _blocks(features: int) -> int:
+        return -(-features // _FP8_BLOCK_SIZE)
+
+    expected: dict[str, object] = {
+        "attention_type": modeling_qwen3_mod.Qwen3Attention.__name__,
+        "qkv_weight_mode": WeightMode.FUSED_QKV_LINEAR,
+        "qkv_weight_shape": (qkv_rows, 128),
+        "gate_up_weight_mode": WeightMode.FUSED_GATE_UP_LINEAR,
+        "gate_up_weight_shape": (gate_up_rows, 128),
+        "qkv_bias": False,
+        "q_norm_weight_shape": (128,),
+        "k_norm_weight_shape": (128,),
+        "fuse_qk_norm_rope": True,
+        "rope_fusion": False,
+        "rotary_embedding_present": True,
+        "tied_lm_head": False,
+        "attention_has_quant_scale": True,
+        "lm_head_weight_dtype": torch.bfloat16,
+        "lm_head_has_weight_scale": False,
+        "share_gate_up_quantization": (False, False),
+    }
+    shapes = {
+        "qkv": (qkv_rows, 128),
+        "o": (128, o_columns),
+        "gate_up": (gate_up_rows, 128),
+        "down": (128, down_columns),
+    }
+    for name, (out_features, in_features) in shapes.items():
+        expected[f"{name}_quant_method"] = linear_mod.FP8BlockScalesLinearMethod.__name__
+        expected[f"{name}_weight"] = (torch.float8_e4m3fn, (out_features, in_features))
+        expected[f"{name}_weight_scale"] = (
+            torch.float32,
+            (_blocks(out_features), _blocks(in_features)),
+        )
+        expected[f"{name}_input_scales"] = ((torch.float32, ()), (torch.float32, ()))
+        expected[f"{name}_relayout_parameters"] = ()
+        expected[f"{name}_low_m_gemm"] = linear_mod.Fp8BlockScaleLowMGemmRange()
+    return expected
+
+
+def test_qwen3_fp8_block_profile_qualifies_full_staged_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _simulate_sm(monkeypatch, 90)
+
+    producer, receiver = assert_post_transform_lifecycle_equivalent(
+        _qwen3_fp8_block_case(monkeypatch)
+    )
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        receiver,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+    assert (
+        decision.transform_abi_id == QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1
+    )
+    assert (
+        PostTransformRuntimeConfig.from_model_config(
+            producer.model_config, model=producer, sm_version=90
+        )
+        == _fp8_block_runtime_config()
+    )
+    assert _qwen3_fp8_block_layout_state(producer) == _expected_qwen3_fp8_block_layout(
+        qkv_rows=1024,
+        o_columns=512,
+        gate_up_rows=512,
+        down_columns=256,
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_qwen3_fp8_block_profile_qualifies_tp2_rank_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+) -> None:
+    _simulate_sm(monkeypatch, 90)
+    monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(
+        _qwen3_fp8_block_case(monkeypatch, tp_size=2, rank=rank)
+    )
+
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer, sm_version=90
+    ) == _fp8_block_runtime_config(tp_size=2, moe_tp_size=2, attention_tp_size=2)
+    # Per rank: q, k, and v hold 256, 128, and 128 rows, and gate and up 128
+    # rows each, so every fused shard starts on a scale-block boundary.
+    assert _qwen3_fp8_block_layout_state(producer) == _expected_qwen3_fp8_block_layout(
+        qkv_rows=512,
+        o_columns=256,
+        gate_up_rows=256,
+        down_columns=128,
+    )
+
+
 def test_mistral_dense_profile_qualifies_full_staged_lifecycle() -> None:
     case = PostTransformQualificationCase(
         profile_id="mistral-for-causal-lm-bf16-target-v1",
@@ -2563,6 +3264,8 @@ def test_qwen3_moe_auto_backend_resolves_to_qualified_cutlass(
     monkeypatch.setattr(model_config_mod, "get_sm_version", lambda: sm)
     monkeypatch.setattr(model_config_mod, "is_sm_100f", in_sm_family(100, 110))
     monkeypatch.setattr(model_config_mod, "is_sm_120f", in_sm_family(120, 130))
+    # `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` would resolve AUTO to CUTEDSL on every SM.
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
 
     resolved = ModelConfig.resolve_moe_backend("AUTO", "Qwen3MoeForCausalLM", QuantConfig())
 
@@ -2937,69 +3640,66 @@ def test_phi4mm_root_does_not_inherit_phi3_profile() -> None:
     assert decision.reason is PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
 
 
+# Runtime variants that no BF16 dense profile qualifies, with the dimension each
+# one is rejected on.
+_UNQUALIFIED_RUNTIME_VARIANTS = [
+    pytest.param({"dtype": "float16"}, {"dtype"}, id="fp16"),
+    pytest.param(
+        {"quant_algorithm": "FP8"},
+        {"quant_algorithm"},
+        id="weight-quantization",
+    ),
+    pytest.param(
+        {"kv_cache_quant_algorithm": "FP8"},
+        {"kv_cache_quant_algorithm"},
+        id="kv-cache-quantization",
+    ),
+    pytest.param(
+        {"layerwise_quantization": True},
+        {"layerwise_quantization"},
+        id="layerwise-quantization",
+    ),
+    pytest.param(
+        {"force_dynamic_quantization": True},
+        {"force_dynamic_quantization"},
+        id="dynamic-quantization",
+    ),
+    pytest.param({"lora_enabled": True}, {"lora_enabled"}, id="lora"),
+    pytest.param(
+        {"sparse_attention_enabled": True},
+        {"sparse_attention_enabled"},
+        id="sparse-attention",
+    ),
+    pytest.param(
+        {"attention_backend": "FLASHINFER"},
+        {"attention_backend"},
+        id="attention-backend",
+    ),
+    pytest.param({"tp_size": 4}, {"tp_size"}, id="tp4"),
+    pytest.param({"pp_size": 2}, {"pp_size"}, id="pipeline-parallel"),
+    pytest.param({"cp_size": 2}, {"cp_size"}, id="context-parallel"),
+    pytest.param(
+        {"attention_tp_size": 4},
+        {"attention_tp_size"},
+        id="attention-tensor-parallel",
+    ),
+    pytest.param(
+        {"attention_cp_size": 2},
+        {"attention_cp_size"},
+        id="attention-context-parallel",
+    ),
+    pytest.param(
+        {"attention_dp": True},
+        {"attention_dp"},
+        id="attention-dp",
+    ),
+    pytest.param({"multi_node": True}, {"multi_node"}, id="multi-node"),
+    pytest.param({"rope_type": "yarn"}, {"rope_type"}, id="yarn"),
+]
+
+
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "overrides, expected_dimensions",
-    [
-        pytest.param({"dtype": "float16"}, {"dtype"}, id="fp16"),
-        pytest.param(
-            {"quant_algorithm": "FP8"},
-            {"quant_algorithm"},
-            id="weight-quantization",
-        ),
-        pytest.param(
-            {"kv_cache_quant_algorithm": "FP8"},
-            {"kv_cache_quant_algorithm"},
-            id="kv-cache-quantization",
-        ),
-        pytest.param(
-            {"layerwise_quantization": True},
-            {"layerwise_quantization"},
-            id="layerwise-quantization",
-        ),
-        pytest.param(
-            {"force_dynamic_quantization": True},
-            {"force_dynamic_quantization"},
-            id="dynamic-quantization",
-        ),
-        pytest.param({"lora_enabled": True}, {"lora_enabled"}, id="lora"),
-        pytest.param(
-            {"sparse_attention_enabled": True},
-            {"sparse_attention_enabled"},
-            id="sparse-attention",
-        ),
-        pytest.param(
-            {"attention_backend": "FLASHINFER"},
-            {"attention_backend"},
-            id="attention-backend",
-        ),
-        pytest.param({"tp_size": 4}, {"tp_size"}, id="tp4"),
-        pytest.param({"pp_size": 2}, {"pp_size"}, id="pipeline-parallel"),
-        pytest.param({"cp_size": 2}, {"cp_size"}, id="context-parallel"),
-        pytest.param(
-            {"attention_tp_size": 4},
-            {"attention_tp_size"},
-            id="attention-tensor-parallel",
-        ),
-        pytest.param(
-            {"attention_cp_size": 2},
-            {"attention_cp_size"},
-            id="attention-context-parallel",
-        ),
-        pytest.param(
-            {"attention_dp": True},
-            {"attention_dp"},
-            id="attention-dp",
-        ),
-        pytest.param({"multi_node": True}, {"multi_node"}, id="multi-node"),
-        pytest.param(
-            {"tied_word_embeddings": True},
-            {"tied_word_embeddings"},
-            id="tied-embeddings",
-        ),
-        pytest.param({"rope_type": "yarn"}, {"rope_type"}, id="yarn"),
-    ],
-)
+@pytest.mark.parametrize("overrides, expected_dimensions", _UNQUALIFIED_RUNTIME_VARIANTS)
 @pytest.mark.parametrize(
     "root_model_class, architecture, model_type, supported_rope_fusion, supported_sliding_window",
     [
@@ -3086,6 +3786,141 @@ def test_bf16_profiles_reject_unqualified_runtime_variants(
     assert decision.unsupported_runtime_dimensions == frozenset(expected_dimensions)
 
 
+_BF16_DENSE_ROOTS = (
+    pytest.param(
+        modeling_llama_mod.LlamaForCausalLM,
+        "LlamaForCausalLM",
+        "llama",
+        True,
+        None,
+        id="llama",
+    ),
+    pytest.param(
+        modeling_qwen_mod.Qwen2ForCausalLM,
+        "Qwen2ForCausalLM",
+        "qwen2",
+        True,
+        None,
+        id="qwen2",
+    ),
+    pytest.param(
+        modeling_qwen3_mod.Qwen3ForCausalLM,
+        "Qwen3ForCausalLM",
+        "qwen3",
+        False,
+        None,
+        id="qwen3",
+    ),
+    pytest.param(
+        modeling_mistral_mod.MistralForCausalLM,
+        "MistralForCausalLM",
+        "mistral",
+        True,
+        "none",
+        id="mistral",
+    ),
+    pytest.param(
+        modeling_phi3_mod.Phi3ForCausalLM,
+        "Phi3ForCausalLM",
+        "phi3",
+        True,
+        None,
+        id="phi3",
+    ),
+)
+
+# Roots whose tied checkpoints qualify, mapped to the tied profile and its ABI.
+_TIED_EMBEDDING_PROFILES = {
+    "qwen3": (
+        "qwen3-for-causal-lm-bf16-tied-target-v1",
+        QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
+    ),
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "root_model_class, architecture, model_type, supported_rope_fusion, supported_sliding_window",
+    _BF16_DENSE_ROOTS,
+)
+def test_bf16_dense_profiles_scope_tied_embeddings(
+    root_model_class: type[nn.Module],
+    architecture: str,
+    model_type: str,
+    supported_rope_fusion: bool,
+    supported_sliding_window: str | None,
+) -> None:
+    """Only roots with a tied sibling profile qualify a realized tie; no root accepts an unknown tie."""
+
+    def qualify(tied_word_embeddings: bool | None):
+        return ModelLoader._post_transform_profile_registry().qualify(
+            root_model_class=root_model_class,
+            architecture=architecture,
+            model_type=model_type,
+            speculative_mode=None,
+            protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_config=_bf16_dense_runtime_config(
+                rope_fusion=supported_rope_fusion,
+                sliding_window=supported_sliding_window,
+                tied_word_embeddings=tied_word_embeddings,
+            ),
+        )
+
+    untied = qualify(False)
+    assert untied.qualified
+    assert untied.profile is not None
+    assert "-tied-" not in untied.profile.profile_id
+    assert "-tied-" not in untied.transform_abi_id
+
+    tied = qualify(True)
+    if model_type in _TIED_EMBEDDING_PROFILES:
+        assert tied.qualified
+        assert tied.profile is not None
+        assert (tied.profile.profile_id, tied.transform_abi_id) == (
+            _TIED_EMBEDDING_PROFILES[model_type]
+        )
+        assert tied.transform_abi_id != untied.transform_abi_id
+    else:
+        assert not tied.qualified
+        assert tied.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+        assert tied.unsupported_runtime_dimensions == frozenset({"tied_word_embeddings"})
+
+    # A tie that the constructed model does not realize as declared is unknown.
+    unknown = qualify(None)
+    assert not unknown.qualified
+    assert unknown.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert unknown.unsupported_runtime_dimensions == frozenset({"tied_word_embeddings"})
+    assert unknown.profile is untied.profile
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("overrides, expected_dimensions", _UNQUALIFIED_RUNTIME_VARIANTS)
+def test_qwen3_tied_profile_rejects_unqualified_runtime_variants(
+    overrides: dict[str, object],
+    expected_dimensions: set[str],
+) -> None:
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=modeling_qwen3_mod.Qwen3ForCausalLM,
+        architecture="Qwen3ForCausalLM",
+        model_type="qwen3",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(
+            rope_fusion=False,
+            tied_word_embeddings=True,
+            **overrides,
+        ),
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset(expected_dimensions)
+    assert decision.profile is not None
+    assert decision.profile.profile_id == "qwen3-for-causal-lm-bf16-tied-target-v1"
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "root_model_class, architecture, model_type, realized_overrides, expected_dimension",
@@ -3121,6 +3956,14 @@ def test_bf16_profiles_reject_unqualified_runtime_variants(
             {"rope_fusion": True},
             "rope_fusion",
             id="qwen3-moe-fused-rope",
+        ),
+        pytest.param(
+            modeling_qwen3_mod.Qwen3ForCausalLM,
+            "Qwen3ForCausalLM",
+            "qwen3",
+            {"rope_fusion": True, "tied_word_embeddings": True},
+            "rope_fusion",
+            id="qwen3-tied-fused-rope",
         ),
         pytest.param(
             modeling_mistral_mod.MistralForCausalLM,
@@ -3266,6 +4109,363 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     )
 
     assert decision.qualified
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [None, -1, 90, 100, 103, 120])
+@pytest.mark.parametrize(
+    "root_model_class, architecture, model_type, supported_rope_fusion, supported_sliding_window",
+    [
+        pytest.param(
+            modeling_llama_mod.LlamaForCausalLM,
+            "LlamaForCausalLM",
+            "llama",
+            True,
+            None,
+            id="llama",
+        ),
+        pytest.param(
+            modeling_qwen_mod.Qwen2ForCausalLM,
+            "Qwen2ForCausalLM",
+            "qwen2",
+            True,
+            None,
+            id="qwen2",
+        ),
+        pytest.param(
+            modeling_qwen3_mod.Qwen3ForCausalLM,
+            "Qwen3ForCausalLM",
+            "qwen3",
+            False,
+            None,
+            id="qwen3",
+        ),
+        pytest.param(
+            modeling_mistral_mod.MistralForCausalLM,
+            "MistralForCausalLM",
+            "mistral",
+            True,
+            "none",
+            id="mistral",
+        ),
+        pytest.param(
+            modeling_phi3_mod.Phi3ForCausalLM,
+            "Phi3ForCausalLM",
+            "phi3",
+            True,
+            None,
+            id="phi3",
+        ),
+    ],
+)
+def test_bf16_dense_profiles_qualify_on_any_sm_version(
+    sm_version: int | None,
+    root_model_class: type[nn.Module],
+    architecture: str,
+    model_type: str,
+    supported_rope_fusion: bool,
+    supported_sliding_window: str | None,
+) -> None:
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=root_model_class,
+        architecture=architecture,
+        model_type=model_type,
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(
+            rope_fusion=supported_rope_fusion,
+            sliding_window=supported_sliding_window,
+            sm_version=sm_version,
+        ),
+    )
+
+    assert decision.qualified
+    assert decision.profile is not None
+    assert decision.profile.runtime_constraints.sm_versions is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "device_sm_version, expected_dimensions",
+    [
+        pytest.param(90, frozenset(), id="sm90"),
+        pytest.param(100, frozenset({"sm_version"}), id="sm100"),
+        pytest.param(-1, frozenset({"sm_version"}), id="no-cuda-device"),
+    ],
+)
+def test_qualify_post_transform_profile_uses_device_sm_version(
+    monkeypatch: pytest.MonkeyPatch,
+    device_sm_version: int,
+    expected_dimensions: frozenset[str],
+) -> None:
+    (tiny_profile,) = _tiny_profile_registry().profiles
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        PostTransformProfileRegistry(
+            profiles=(
+                replace(
+                    tiny_profile,
+                    runtime_constraints=PostTransformRuntimeConstraints(
+                        sm_versions=frozenset({90})
+                    ),
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(model_loader_mod, "get_sm_version", lambda: device_sm_version)
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        _TinyModel([]),
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert decision.qualified is (not expected_dimensions)
+    assert decision.unsupported_runtime_dimensions == expected_dimensions
+
+
+def _qualify_qwen3_runtime(runtime_config: PostTransformRuntimeConfig):
+    return ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=modeling_qwen3_mod.Qwen3ForCausalLM,
+        architecture="Qwen3ForCausalLM",
+        model_type="qwen3",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=runtime_config,
+    )
+
+
+@pytest.mark.cpu_only
+def test_qwen3_fp8_block_profile_is_the_sm90_variant_of_the_bf16_row() -> None:
+    profiles = {
+        profile.profile_id: profile
+        for profile in ModelLoader._post_transform_profile_registry().profiles
+    }
+    fp8_profile = profiles[_QWEN3_FP8_BLOCK_PROFILE_ID]
+    bf16_profile = profiles["qwen3-for-causal-lm-bf16-target-v1"]
+
+    assert (
+        fp8_profile.transform_abi_id
+        == QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1
+    )
+    assert fp8_profile.transform_abi_id != bf16_profile.transform_abi_id
+    assert fp8_profile.runtime_constraints == model_loader_mod._with_fp8_block_scale_weights(
+        bf16_profile.runtime_constraints, {90}
+    )
+    assert fp8_profile.runtime_constraints == replace(
+        bf16_profile.runtime_constraints,
+        quant_algorithms=frozenset({"FP8_BLOCK_SCALES"}),
+        sm_versions=frozenset({90}),
+        weight_block_sizes=frozenset({(128, 128)}),
+    )
+    assert not fp8_profile.runtime_constraints.overlaps(bf16_profile.runtime_constraints)
+    assert fp8_profile.supported_features == bf16_profile.supported_features == frozenset()
+
+
+@pytest.mark.cpu_only
+def test_qwen3_fp8_block_row_precedes_the_bf16_qwen3_row() -> None:
+    profile_ids = [
+        profile.profile_id for profile in ModelLoader._post_transform_profile_registry().profiles
+    ]
+
+    assert profile_ids.index(_QWEN3_FP8_BLOCK_PROFILE_ID) + 1 == profile_ids.index(
+        "qwen3-for-causal-lm-bf16-target-v1"
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({}, id="default"),
+        pytest.param({"tp_size": 2, "moe_tp_size": 2, "attention_tp_size": 2}, id="tp2"),
+        pytest.param({"moe_backend": "TRTLLM"}, id="alternate-moe-backend"),
+        pytest.param(
+            {"tp_size": 2, "moe_tp_size": 1, "moe_ep_size": 2, "attention_tp_size": 2},
+            id="alternate-moe-partition",
+        ),
+    ],
+)
+def test_qwen3_fp8_block_profile_qualifies_sm90_runtime(overrides: dict[str, object]) -> None:
+    decision = _qualify_qwen3_runtime(_fp8_block_runtime_config(**overrides))
+
+    assert decision.qualified
+    assert decision.profile is not None
+    assert decision.profile.profile_id == _QWEN3_FP8_BLOCK_PROFILE_ID
+    assert (
+        decision.transform_abi_id == QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [89, 100, 103, 107, 120, 121, -1, None])
+def test_qwen3_fp8_block_profile_rejects_other_sm_versions(sm_version: int | None) -> None:
+    decision = _qualify_qwen3_runtime(_fp8_block_runtime_config(sm_version=sm_version))
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    # The FP8 row and the BF16 row each miss by one dimension; the registry
+    # order makes the report name the SM rather than the quantization.
+    assert decision.profile is not None
+    assert decision.profile.profile_id == _QWEN3_FP8_BLOCK_PROFILE_ID
+    assert decision.unsupported_runtime_dimensions == frozenset({"sm_version"})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides, expected_dimensions",
+    [
+        pytest.param({"dtype": "float16"}, {"dtype"}, id="fp16"),
+        pytest.param({"quant_algorithm": "FP8"}, {"quant_algorithm"}, id="fp8-per-tensor"),
+        pytest.param({"quant_algorithm": "NVFP4"}, {"quant_algorithm"}, id="nvfp4"),
+        pytest.param(
+            {"kv_cache_quant_algorithm": "FP8"},
+            {"kv_cache_quant_algorithm"},
+            id="kv-cache-quantization",
+        ),
+        pytest.param(
+            {"layerwise_quantization": True},
+            {"layerwise_quantization"},
+            id="layerwise-quantization",
+        ),
+        pytest.param(
+            {"force_dynamic_quantization": True},
+            {"force_dynamic_quantization"},
+            id="dynamic-quantization",
+        ),
+        pytest.param({"lora_enabled": True}, {"lora_enabled"}, id="lora"),
+        pytest.param(
+            {"sparse_attention_enabled": True},
+            {"sparse_attention_enabled"},
+            id="sparse-attention",
+        ),
+        pytest.param(
+            {"attention_backend": "FLASHINFER"},
+            {"attention_backend"},
+            id="attention-backend",
+        ),
+        pytest.param({"tp_size": 4}, {"tp_size"}, id="tp4"),
+        pytest.param({"pp_size": 2}, {"pp_size"}, id="pipeline-parallel"),
+        pytest.param({"cp_size": 2}, {"cp_size"}, id="context-parallel"),
+        pytest.param(
+            {"attention_tp_size": 4},
+            {"attention_tp_size"},
+            id="attention-tensor-parallel",
+        ),
+        pytest.param(
+            {"attention_cp_size": 2},
+            {"attention_cp_size"},
+            id="attention-context-parallel",
+        ),
+        pytest.param({"attention_dp": True}, {"attention_dp"}, id="attention-dp"),
+        pytest.param({"multi_node": True}, {"multi_node"}, id="multi-node"),
+        pytest.param(
+            {"tied_word_embeddings": True},
+            {"tied_word_embeddings"},
+            id="tied-embeddings",
+        ),
+        pytest.param({"rope_type": "yarn"}, {"rope_type"}, id="yarn"),
+        pytest.param({"rope_fusion": True}, {"rope_fusion"}, id="fused-rope"),
+        pytest.param(
+            {"weight_block_size": None},
+            {"weight_block_size"},
+            id="undeclared-weight-block-size",
+        ),
+        pytest.param(
+            {"weight_block_size": (1, 128)},
+            {"weight_block_size"},
+            id="1x128-weight-blocks",
+        ),
+        pytest.param(
+            {"weight_block_size": (64, 64)},
+            {"weight_block_size"},
+            id="64x64-weight-blocks",
+        ),
+    ],
+)
+def test_qwen3_fp8_block_profile_rejects_unqualified_runtime_variants(
+    overrides: dict[str, object],
+    expected_dimensions: set[str],
+) -> None:
+    decision = _qualify_qwen3_runtime(_fp8_block_runtime_config(**overrides))
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.profile is not None
+    assert decision.profile.profile_id == _QWEN3_FP8_BLOCK_PROFILE_ID
+    assert decision.unsupported_runtime_dimensions == frozenset(expected_dimensions)
+
+
+@pytest.mark.cpu_only
+def test_fp8_block_scale_linear_keeps_checkpoint_layout_on_sm90(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _simulate_sm(monkeypatch, 90)
+    linear = Linear(
+        256, 384, bias=False, dtype=torch.bfloat16, quant_config=_fp8_block_quant_config()
+    )
+    with torch.no_grad():
+        linear.weight.copy_(torch.ones(linear.weight.shape).to(torch.float8_e4m3fn))
+        linear.weight_scale.fill_(0.5)
+    parameters = dict(linear.named_parameters())
+    before = {name: parameter.detach().clone() for name, parameter in parameters.items()}
+
+    linear.transform_weights()
+
+    assert type(linear.quant_method) is linear_mod.FP8BlockScalesLinearMethod
+    assert dict(linear.named_parameters()) == parameters
+    for name, parameter in linear.named_parameters():
+        assert torch.equal(
+            parameter.reshape(-1).view(torch.uint8), before[name].reshape(-1).view(torch.uint8)
+        )
+    assert linear.weight.dtype == torch.float8_e4m3fn
+    assert tuple(linear.weight_scale.shape) == (3, 2)
+    assert linear.weight_scale.dtype == torch.float32
+    assert linear.rebuild_tensor_metadata == {}
+    assert linear._weights_transformed is True
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "device_sm_version, publishes",
+    [pytest.param(90, True, id="sm90"), pytest.param(100, False, id="sm100")],
+)
+def test_mx_donor_publishes_only_on_a_qualified_sm_version(
+    monkeypatch: pytest.MonkeyPatch,
+    device_sm_version: int,
+    publishes: bool,
+) -> None:
+    loader = _make_loader(monkeypatch, events=[])
+    (tiny_profile,) = _tiny_profile_registry().profiles
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        PostTransformProfileRegistry(
+            profiles=(
+                replace(
+                    tiny_profile,
+                    runtime_constraints=PostTransformRuntimeConstraints(
+                        sm_versions=frozenset({90})
+                    ),
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(model_loader_mod, "get_sm_version", lambda: device_sm_version)
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+    checkpoint_loader.get_initialized_weight_mapper.return_value = MagicMock()
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert kwargs["allow_post_transform_weights"] is publishes
+    assert checkpoint_loader.post_load_publish.called is publishes
 
 
 def test_staged_llama_finalization_preserves_mx_tensor_catalog(

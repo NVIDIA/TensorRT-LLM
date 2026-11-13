@@ -250,9 +250,13 @@ class OpenAIDisaggServer:
         if config.disagg_cluster_config:
             validate_http_cluster_storage_scope(
                 config.disagg_cluster_config.cluster_uri, config.hostname)
-            self._disagg_cluster_storage = create_cluster_storage(
-                config.disagg_cluster_config.cluster_uri,
-                config.disagg_cluster_config.cluster_name)
+            # This app serves only an HTTP cluster storage; an etcd one is used
+            # by the coordinator alone.
+            if not config.disagg_cluster_config.cluster_uri.startswith(
+                    "etcd://"):
+                self._disagg_cluster_storage = create_cluster_storage(
+                    config.disagg_cluster_config.cluster_uri,
+                    config.disagg_cluster_config.cluster_name)
         # The server doesn't build routers -- the coordinator object does:
         # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
         # server just reads .ctx_router / .gen_router off whichever it holds.
