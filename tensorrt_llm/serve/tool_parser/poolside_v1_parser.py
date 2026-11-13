@@ -217,6 +217,12 @@ class PoolsideV1ToolParser(BaseToolParser):
 
         return StreamingParseResult(normal_text="".join(normal_text_parts), calls=calls)
 
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release unfinished text, matching the whole-response parser."""
+        normal_text = self._buffer
+        self._buffer = ""
+        return StreamingParseResult(normal_text=normal_text)
+
     def supports_structural_tag(self) -> bool:
         """Return whether this parser supports strict structural tags."""
         return False
