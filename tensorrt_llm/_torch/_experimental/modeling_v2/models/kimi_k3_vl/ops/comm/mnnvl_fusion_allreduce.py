@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MNNVL all-reduce over a caller-owned :class:`MnnvlWorkspace`: the sum over the TP group, or with a residual the
-sum + residual add + RMSNorm; one-shot up to ``one_shot_max_bytes``, two-shot above."""
+"""The MNNVL all-reduce over a Lamport workspace (a caller-owned :class:`MnnvlWorkspace`, or the mapping's shared one):
+the sum over the TP group, the sum RMS-normalized, or the sum + residual add + RMSNorm; one-shot up to
+``one_shot_max_bytes``, two-shot above."""
 
 from typing import Optional, Sequence, Tuple, Union
 
@@ -11,11 +12,28 @@ from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm.functional import AllReduceFusionOp
 
-from .mnnvl_workspace import MnnvlWorkspace
+from ...mnnvl_workspace import MnnvlWorkspace
 
 native_ops = load_family_ops(__name__)
 
 __all__ = ["MnnvlWorkspace", "mnnvl_fusion_allreduce", "required_buffer_bytes"]
+
+NONE = int(AllReduceFusionOp.NONE)
+"""The plain sum: one output of ``input``'s shape."""
+RMS_NORM = int(AllReduceFusionOp.RMS_NORM)
+"""``RMSNorm(sum) * norm_weight``: one output. The Kimi K3 MLA drafter's context projection."""
+RESIDUAL_RMS_NORM = int(AllReduceFusionOp.RESIDUAL_RMS_NORM)
+"""``(RMSNorm(sum + residual) * norm_weight, sum + residual)``: two outputs."""
+FUSION_OPS = (NONE, RMS_NORM, RESIDUAL_RMS_NORM)
+"""The fusions this entry runs: the ones the Kimi K3 targets and drafters request."""
+
+
+def _fusion(fusion_op: Optional[int], residual: Optional[torch.Tensor]) -> int:
+    """``fusion_op``, or when it is None the one the operands name: ``RESIDUAL_RMS_NORM`` with a residual, else
+    ``NONE``."""
+    if fusion_op is None:
+        return RESIDUAL_RMS_NORM if residual is not None else NONE
+    return int(fusion_op)
 
 
 def required_buffer_bytes(
@@ -32,37 +50,56 @@ def required_buffer_bytes(
 
 
 class MnnvlFusionAllreduce(OpWrapper):
-    """The sum of ``input`` over ``workspace``'s TP group (a new tensor of ``input``'s shape), or with ``residual``,
-    ``norm_weight`` and ``eps`` the pair ``(RMSNorm(sum + residual) * norm_weight, sum + residual)``. Sent one-shot
-    when ``num_tokens * hidden * world * element size <= one_shot_max_bytes``, else two-shot; the workspace's buffers
-    must hold the call (:func:`required_buffer_bytes`). Advances ``workspace`` by one call: every rank of the group
-    makes the same MNNVL calls on it in the same order."""
+    """The sum of ``input`` over ``workspace``'s TP group, with the fusion ``fusion_op`` names:
+
+    * ``NONE``: the sum (a new tensor of ``input``'s shape); no ``residual``, no ``norm_weight``, ``eps`` ignored.
+    * ``RMS_NORM``: ``RMSNorm(sum) * norm_weight`` (one tensor); ``norm_weight`` and ``eps``, no ``residual``.
+    * ``RESIDUAL_RMS_NORM``: the pair ``(RMSNorm(sum + residual) * norm_weight, sum + residual)``; ``residual``,
+      ``norm_weight`` and ``eps``.
+
+    ``fusion_op`` None takes ``RESIDUAL_RMS_NORM`` when ``residual`` is given, else ``NONE``. Sent one-shot when
+    ``num_tokens * hidden * world * element size <= one_shot_max_bytes``, else two-shot; the workspace's buffers must
+    hold the call (:func:`required_buffer_bytes`). ``early_trigger``: release dependent launches (PDL) once the
+    exchange is in flight. ``workspace`` is an :class:`MnnvlWorkspace` or the mapping's shared Lamport workspace
+    (``mnnvl_workspace.shared_lamport_workspace``): anything with ``comm_buffer(dtype)``, ``buffer_flags``,
+    ``buffer_bytes`` and ``world_size``. Advances ``workspace`` by one call: every rank of the group makes the same
+    MNNVL calls on it in the same order."""
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    # Every fusion with both early-trigger settings: the decode path's calls (``K3DecodeComm``, and the all-reduce
+    # module after ``use_decode_one_shot``) trigger early, the all-reduce module's other calls do not.
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=(
-                f"K3 hidden {hidden}, {'residual RMSNorm' if fused else 'plain sum'}: "
-                "inclusive one-shot boundary and one byte below it"
+                f"K3 hidden {hidden}, {name}: inclusive one-shot boundary and one byte below it, "
+                "early trigger off and on"
             ),
             spec=dict(
                 hidden=hidden,
                 tokens=(1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64),
-                fused=fused,
+                fusion_op=fusion_op,
+                early_triggers=(False, True),
                 paths=("one", "two"),
                 dtype=torch.bfloat16,
                 eps=1e-5,
             ),
         )
         for hidden in (3584, 7168)
-        for fused in (False, True)
+        for fusion_op, name in (
+            (NONE, "plain sum"),
+            (RESIDUAL_RMS_NORM, "residual RMSNorm"),
+            (RMS_NORM, "RMSNorm"),
+        )
+        # RMS_NORM: only the MLA drafter's context projection, at the hidden size.
+        if fusion_op != RMS_NORM or hidden == 7168
     ) + (
         Cell(
             why="65 tokens fit two-shot above two ranks after exceeding the one-shot buffer",
             spec=dict(
                 hidden=7168,
                 tokens=(65,),
-                fused=False,
+                fusion_op=NONE,
+                early_triggers=(True,),
                 paths=("two",),
                 dtype=torch.bfloat16,
                 eps=1e-5,
@@ -72,8 +109,9 @@ class MnnvlFusionAllreduce(OpWrapper):
     )
 
     note = """
-    Only plain sum and RESIDUAL_RMS_NORM are exposed; quantizing FP8/NVFP4
-    fusions and scale are inert. Inputs, residual and norm_weight are
+    Only NONE, RMS_NORM and RESIDUAL_RMS_NORM are exposed (FUSION_OPS);
+    the kernel's quantizing FP8/NVFP4 fusions are not, and scale is passed
+    as None. Inputs, residual and norm_weight are
     read-only; outputs are fresh contiguous tensors on the input device.
     An input -0.0 travels as +0.0 because -0.0 is the Lamport empty word.
     The kernel rounds sums and updated to bf16, rounds each RMSNorm square
@@ -121,7 +159,7 @@ class MnnvlFusionAllreduce(OpWrapper):
     The next call waits for the preceding grid before reading flags, takes
     an armed buffer and clears the previous stages using their recorded
     sizes and layout, independent of its own path. Clearing only the
-    current call's rows previously hid stale data until a dip/regrow
+    current call's rows would hide stale data until a dip/regrow
     sequence, causing rank disagreement and serving hangs.
 
     Every rank must issue the same sequence of ops, T, H, fusion and path,
@@ -164,9 +202,11 @@ class MnnvlFusionAllreduce(OpWrapper):
     plain latent H=3584 and wide attention H=7168, fused drafter H=7168
     where k3_sandwich_plain does not apply. At W=16 the 4 MiB ceilings
     are T=36/18 for H=3584/7168, versus 9/4 at 1 MiB; at W=4 they are
-    146/73 and 36/18. Raw calls default to 1 MiB. The K3 module
-    keeps a mapping-keyed workspace grown in 8 MiB steps and a
-    module ceiling with per-call overrides; this entry takes both explicitly.
+    146/73 and 36/18. The K3 all-reduce module (mnnvl_allreduce.
+    K3MnnvlAllReduce) calls this entry on the mapping's shared workspace,
+    grown in 8 MiB steps, with its module ceiling (1 MiB, or per-call
+    overrides), its early_trigger (off, on after use_decode_one_shot) and
+    the NONE, RMS_NORM or RESIDUAL_RMS_NORM fusion its caller asks for.
     """
 
     def __call__(
@@ -177,10 +217,28 @@ class MnnvlFusionAllreduce(OpWrapper):
         residual: Optional[torch.Tensor] = None,
         norm_weight: Optional[torch.Tensor] = None,
         eps: Optional[float] = None,
+        *,
+        fusion_op: Optional[int] = None,
+        early_trigger: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        fused = residual is not None
-        if fused != (norm_weight is not None) or fused != (eps is not None):
-            raise ValueError("mnnvl_fusion_allreduce: residual, norm_weight and eps go together")
+        fusion_op = _fusion(fusion_op, residual)
+        if fusion_op not in FUSION_OPS:
+            raise ValueError(
+                f"mnnvl_fusion_allreduce: fusion_op {fusion_op} is not one of {FUSION_OPS}"
+            )
+        if fusion_op == NONE:
+            if residual is not None or norm_weight is not None:
+                raise ValueError(
+                    "mnnvl_fusion_allreduce: the plain sum takes no residual or norm_weight"
+                )
+        elif (
+            norm_weight is None
+            or eps is None
+            or (residual is not None) != (fusion_op == RESIDUAL_RMS_NORM)
+        ):
+            raise ValueError(
+                "mnnvl_fusion_allreduce: RMS_NORM takes norm_weight and eps, RESIDUAL_RMS_NORM also residual"
+            )
         hidden = input.shape[-1]
         num_tokens = input.numel() // hidden
         need = required_buffer_bytes(
@@ -200,7 +258,6 @@ class MnnvlFusionAllreduce(OpWrapper):
                 "mnnvl_fusion_allreduce: a two-shot call needs the workspace's buffer_bytes to be a multiple of 32, "
                 f"not {workspace.buffer_bytes}"
             )
-        fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM if fused else AllReduceFusionOp.NONE
         outputs = native_ops.k3_mnnvl_fusion_allreduce(
             input,
             norm_weight,
@@ -208,13 +265,13 @@ class MnnvlFusionAllreduce(OpWrapper):
             eps,
             workspace.comm_buffer(input.dtype),
             workspace.buffer_flags,
-            fused,
+            fusion_op != NONE,
             None,
-            int(fusion_op),
+            fusion_op,
             one_shot_max_bytes,
-            True,
+            early_trigger,
         )
-        return (outputs[0], outputs[1]) if fused else outputs[0]
+        return (outputs[0], outputs[1]) if fusion_op == RESIDUAL_RMS_NORM else outputs[0]
 
     def reference(
         self,
@@ -222,12 +279,21 @@ class MnnvlFusionAllreduce(OpWrapper):
         residual: Optional[torch.Tensor] = None,
         norm_weight: Optional[torch.Tensor] = None,
         eps: Optional[float] = None,
+        *,
+        fusion_op: Optional[int] = None,
+        early_trigger: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Takes every rank's ``input`` in rank order (the collective exception) and leaves out the workspace and
+        the one-shot ceiling, which do not change the result; ``early_trigger`` is ignored for the same reason."""
+        fusion_op = _fusion(fusion_op, residual)
         total = torch.stack([x.float() for x in inputs_in_rank_order]).sum(dim=0)
         total = torch.where(total == 0, 0.0, total)
         dtype = inputs_in_rank_order[0].dtype
-        if residual is None:
+        if fusion_op == NONE:
             return total.to(dtype)
+        if fusion_op == RMS_NORM:
+            normed = total * torch.rsqrt(total.square().mean(dim=-1, keepdim=True) + eps)
+            return (normed * norm_weight.float()).to(dtype)
         updated = total + residual.float()
         normed = updated * torch.rsqrt(updated.square().mean(dim=-1, keepdim=True) + eps)
         return (normed * norm_weight.float()).to(dtype), updated.to(dtype)
@@ -240,6 +306,9 @@ class MnnvlFusionAllreduce(OpWrapper):
         residual: Optional[torch.Tensor] = None,
         norm_weight: Optional[torch.Tensor] = None,
         eps: Optional[float] = None,
+        *,
+        fusion_op: Optional[int] = None,
+        early_trigger: bool = True,
     ) -> None:
         if residual is not None:
             assert residual.shape == input.shape, (residual.shape, input.shape)

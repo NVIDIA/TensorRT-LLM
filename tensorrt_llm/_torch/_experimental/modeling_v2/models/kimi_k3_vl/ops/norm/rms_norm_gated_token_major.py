@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-import tensorrt_llm._torch.modules.mamba.layernorm_gated  # noqa: F401 — registers the op
+import tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_rms_norm_gated.op  # noqa: F401  (registers torch.ops.trtllm.k3_rms_norm_gated_token_major)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
@@ -109,8 +109,9 @@ class RmsNormGatedTokenMajor(OpWrapper):
     rejected by the op.
     The multi-row kernel uses PDL when TRTLLM_ENABLE_PDL is unset or 1, SM>=9.0,
     and the grid has fewer CTAs than SMs: wait before the first load, release
-    dependents after the final store. The module-level RMSNorm instead takes
-    z already row-aligned with x.
+    dependents after the final store. The kernels are copies of
+    trtllm::rms_norm_gated_token_major, which the built-in models keep using;
+    both give the same bits.
     """
 
     def __call__(
@@ -122,7 +123,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
     ) -> torch.Tensor:
-        return torch.ops.trtllm.rms_norm_gated_token_major(
+        return torch.ops.trtllm.k3_rms_norm_gated_token_major(
             x, z, weight, eps, fp8_scale, gate_activation
         )
 

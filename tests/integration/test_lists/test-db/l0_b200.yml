@@ -190,6 +190,14 @@ l0_b200:
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_generation.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_append_paged_kv_assign_q.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/graph/test_modeling_v2_eager_on_graph.py
+  # Kimi K3 MLA tests that run on sm_100 only (the MLA kernels the generic path picks there).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_cute_dsl_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_flashinfer_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_merge_chunked_attention_for_mla.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_mla_steps.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_mla_steps.py
   # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py

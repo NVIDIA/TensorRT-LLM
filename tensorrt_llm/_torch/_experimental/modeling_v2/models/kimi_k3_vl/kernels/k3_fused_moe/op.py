@@ -129,38 +129,31 @@ def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[b
     returns from the allocation or from ``build`` is agreed and handled the same way. A rank that fails inside the
     allocation's handle exchange can leave its peers waiting in that exchange: that failure is not turned into an
     error on the other ranks."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
+        mnnvl_workspace as mcast,
     )
-    from tensorrt_llm._torch.distributed.ops import (
-        _make_mnnvl_mcast_buffer,
-        _mnnvl_device_index,
-        _mnnvl_workspace_all_succeeded,
-    )
-    from tensorrt_llm._utils import mpi_disabled
 
     use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
-    comm = mnnvl_workspace.mnnvl_tp_group_comm(mapping)
+    comm = mcast.mnnvl_tp_group_comm(mapping)
     # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a rank
     # failing inside the allocation would leave its peers in the handle exchange.
     problem: Optional[str] = None
     if torch.cuda.is_current_stream_capturing():
         problem = "it is collective and allocates: call it outside CUDA-graph capture"
     else:
-        free_bytes, _ = torch.cuda.mem_get_info(_mnnvl_device_index(mapping))
+        free_bytes, _ = torch.cuda.mem_get_info(mcast.device_index(mapping))
         if free_bytes < words * 4:
             problem = f"its {words * 4} bytes exceed the {free_bytes} free on this rank's device"
-    if not _mnnvl_workspace_all_succeeded(comm, problem is None):
+    if not mcast.all_ranks_succeeded(comm, problem is None):
         # Every rank takes this path: free the MPI communicator made above (a ProcessGroup is c10d's).
-        if not mpi_disabled():
-            comm.Free()
+        mcast.free_group_comm(comm)
         raise RuntimeError(
             f"{name}.create: not every rank can allocate ({problem or 'another rank cannot'})"
         )
     error: Optional[Exception] = None
     state = None
     try:
-        handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
+        handle = mcast.make_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
         uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
         mc = handle.get_mc_buffer((words,), torch.int32, 0)
         uc.fill_(EMPTY_WORD)
@@ -169,11 +162,10 @@ def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[b
     except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
         error = exc
     # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
-    if not _mnnvl_workspace_all_succeeded(comm, error is None):
+    if not mcast.all_ranks_succeeded(comm, error is None):
         # Every rank takes this path too. A handle only borrows the communicator and makes no MPI call when
         # destroyed, so it may outlive the communicator.
-        if not mpi_disabled():
-            comm.Free()
+        mcast.free_group_comm(comm)
         raise RuntimeError(f"{name}: allocation failed on at least one rank") from error
     return state
 

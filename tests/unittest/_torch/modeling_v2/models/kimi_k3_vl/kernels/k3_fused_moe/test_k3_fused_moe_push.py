@@ -22,8 +22,8 @@ k3_moe_push  a K3MoeLayer of the 8-token build on TP16 experts (all 896, the ran
              trtllm::k3_moe_front: K3MoeLayer.push into the run's exchange, the moe/k3_moe entry's k3_moe_push into
              the 16-slot one. The front's head and shared experts are sharded over the run's ranks; its shared
              activation must be the same bits in every call of a set.
-k3_moe_push_route_a
-             the same on route A's experts (tp16_moetp4ep4): a 768-wide intermediate slice of 224 local experts at
+k3_moe_push_moetp4ep4
+             the same on tp16_moetp4ep4's experts: a 768-wide intermediate slice of 224 local experts at
              offset (rank % 4) x 224, so the ranks of one tray hold 4 different expert sets.
 
 Per producer, token count and routing set, against the plain call (K3MoeLayer.__call__ after the same producer), whose
@@ -37,7 +37,7 @@ partial must be nonzero:
            during the sets and the halves keep alternating.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
-  srun -N1 -n4 --mpi=pmix python3 test_k3_fused_moe_push.py [k3_moe_push k3_moe_push_route_a]
+  srun -N1 -n4 --mpi=pmix python3 test_k3_fused_moe_push.py [k3_moe_push k3_moe_push_moetp4ep4]
 """
 
 import functools
@@ -78,8 +78,8 @@ WORLD = 4
 H, NUM_EXPERTS, SV = 3584, 896, 32
 # TP16: a rank's 192-wide intermediate slice, zero-padded to whole tiles (256) by the loader.
 I_TP, I_PAD, MOE_TP = 192, 256, 16
-# Route A (tp16_moetp4ep4): a rank's 768-wide slice (whole tiles) of 224 local experts.
-I_TP_A, E_LOCAL_A, MOE_TP_A = 768, 224, 4
+# tp16_moetp4ep4: a rank's 768-wide slice (whole tiles) of 224 local experts.
+I_TP_EP4, E_LOCAL_EP4, MOE_TP_EP4 = 768, 224, 4
 HIDDEN, SHARED_INTER = 7168, 6144  # the front's input width; two shared experts of 3072
 GATE_CAP, LINEAR_CAP = 4.0, 25.0  # the SiTU caps
 RSF = 2.827
@@ -131,17 +131,17 @@ def _rand_mxfp4(rows, k, k_full, gen):
 _EXPERTS = {}
 
 
-def _experts(seed: int, route_a: bool = False):
+def _experts(seed: int, moetp4ep4: bool = False):
     """This rank's experts through W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod's loader: the buffers K3MoeLayer reads, the
     rank's intermediate slice generated alone. TP16: all 896 experts, the 192-wide slice as rank 0 of tensors that
-    hold exactly it (the loader slices it, then pads it to 256); route A: 224 experts, the 768-wide slice whole tiles,
-    which the loader takes as one shard. Built once per seed and layout."""
-    if (seed, route_a) in _EXPERTS:
-        return _EXPERTS[seed, route_a]
+    hold exactly it (the loader slices it, then pads it to 256); tp16_moetp4ep4: 224 experts, the 768-wide slice
+    whole tiles, which the loader takes as one shard. Built once per seed and layout."""
+    if (seed, moetp4ep4) in _EXPERTS:
+        return _EXPERTS[seed, moetp4ep4]
     from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
 
-    if route_a:
-        i_tp, i_pad, shards, moe_tp, experts = I_TP_A, I_TP_A, 1, MOE_TP_A, E_LOCAL_A
+    if moetp4ep4:
+        i_tp, i_pad, shards, moe_tp, experts = I_TP_EP4, I_TP_EP4, 1, MOE_TP_EP4, E_LOCAL_EP4
     else:
         i_tp, i_pad, shards, moe_tp, experts = I_TP, I_PAD, MOE_TP, MOE_TP, NUM_EXPERTS
     method = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
@@ -162,8 +162,8 @@ def _experts(seed: int, route_a: bool = False):
         method.load_expert_w3_w1_weight_scale_mxfp4(module, gate_s, up_s, w31s[e])
         method.load_expert_w2_weight_scale_mxfp4(module, down_s, w2s[e])
     torch.cuda.synchronize()
-    _EXPERTS[seed, route_a] = w31, w31s, w2, w2s
-    return _EXPERTS[seed, route_a]
+    _EXPERTS[seed, moetp4ep4] = w31, w31s, w2, w2s
+    return _EXPERTS[seed, moetp4ep4]
 
 
 class _Exchange:
@@ -290,15 +290,15 @@ def _front(ctx):
                            head=K3MoeHeadWorkspace.create(ctx.mapping, fabric_handle=fabric))  # fmt: skip
 
 
-def _k3_moe_layer(weights, route_a: bool = False):
+def _k3_moe_layer(weights, moetp4ep4: bool = False):
     """This rank's experts as a K3MoeLayer of the 8-token build; a call with an exchange takes its push build."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe.op import (
         K3MoeState,
     )
 
     device = torch.device("cuda", torch.cuda.current_device())
-    if route_a:
-        return K3MoeState(device, I_TP_A, E_LOCAL_A).layer(*weights)
+    if moetp4ep4:
+        return K3MoeState(device, I_TP_EP4, E_LOCAL_EP4).layer(*weights)
     return K3MoeState(device, I_PAD, NUM_EXPERTS).layer(*weights)
 
 
@@ -329,7 +329,7 @@ def _k3_moe_routed(producer, inputs, front):
     return x_fp8, x_sf, ids, weights, shared
 
 
-def check_k3_moe_push(ctx, route_a: bool = False):
+def check_k3_moe_push(ctx, moetp4ep4: bool = False):
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe import (
         k3_moe_push,
     )
@@ -337,10 +337,10 @@ def check_k3_moe_push(ctx, route_a: bool = False):
     results = []
     front = _front(ctx)
     seed = 20260928 + ctx.rank
-    layer = _k3_moe_layer(_experts(seed, route_a), route_a)
-    # Route A's experts of this rank: global ids [offset, offset + 224), the rank's EP index being rank % 4.
-    offset = ctx.rank * E_LOCAL_A % NUM_EXPERTS if route_a else 0
-    layout = ", route A" if route_a else ""
+    layer = _k3_moe_layer(_experts(seed, moetp4ep4), moetp4ep4)
+    # tp16_moetp4ep4's experts of this rank: global ids [offset, offset + 224), the rank's EP index being rank % 4.
+    offset = ctx.rank * E_LOCAL_EP4 % NUM_EXPERTS if moetp4ep4 else 0
+    layout = ", tp16_moetp4ep4" if moetp4ep4 else ""
     copies16 = 16 // ctx.world
     for start in COUNT_STARTS:
         ex, ex16 = _Exchange(ctx, ctx.world, start), _Exchange(ctx, 16, start)
@@ -375,7 +375,7 @@ def check_k3_moe_push(ctx, route_a: bool = False):
 
 CHECKS = {
     "k3_moe_push": check_k3_moe_push,
-    "k3_moe_push_route_a": functools.partial(check_k3_moe_push, route_a=True),
+    "k3_moe_push_moetp4ep4": functools.partial(check_k3_moe_push, moetp4ep4=True),
 }
 
 

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode path's GEMVs, LM head and embedding on the catalog's single-GPU Kimi K3 entries.
+"""The decode path's GEMVs, LM head and embedding on the Kimi K3 single-GPU ops.
 
 * **Per-site GEMVs** (`K3DecodeGemvs.project`): a projection of a decode step runs on the kernel measured fastest
   at its call site's weight shape (`SITES`): at most `MAX_ROWS` rows on `gemm/k3_decode_gemv`,
@@ -58,14 +58,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_mul import (
     k3_situ_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv import (
-    k3_ctm_gemv,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_swiglu import (
-    k3_ctm_gemv_swiglu,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
@@ -82,6 +76,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.k3
 )
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import mpi_disabled
+
+from .norm import RMSNorm
+from .ops.gemm.k3_ctm_gemv import k3_ctm_gemv
+from .ops.gemm.k3_ctm_gemv_swiglu import k3_ctm_gemv_swiglu
 
 # The row limit of the decode GEMV and head kernels (one token tile), and of k3_ctm_gemv_wide (a decode step of 8
 # requests of 8 tokens).
@@ -228,19 +226,12 @@ def _head_takes_module(lm_head: nn.Module) -> bool:
 
 
 def _plain_rmsnorm(norm: nn.Module) -> bool:
-    """Whether ``norm`` is the stock RMSNorm that runs flashinfer's kernel, which ``k3_embed_norm`` reproduces bit for
-    bit. An unknown module fails closed."""
-    weight = getattr(norm, "weight", None)
+    """Whether ``norm`` is this target's `RMSNorm` with a bf16 weight: it runs flashinfer's kernel on bf16 rows, which
+    ``k3_embed_norm`` reproduces bit for bit. Any other module fails closed."""
     return (
         IS_FLASHINFER_AVAILABLE
-        and isinstance(weight, torch.Tensor)
-        and weight.dtype == torch.bfloat16
-        and not getattr(norm, "use_gemma", True)
-        and not getattr(norm, "is_nvfp4", True)
-        and not getattr(norm, "use_cuda_tile", True)
-        and not getattr(norm, "return_hp_output", True)
-        and getattr(norm, "nvfp4_scale", None) is None
-        and hasattr(norm, "variance_epsilon")
+        and isinstance(norm, RMSNorm)
+        and norm.weight.dtype == torch.bfloat16
     )
 
 

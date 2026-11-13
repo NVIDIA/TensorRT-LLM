@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the rms_norm_gated_token_major catalog entry."""
+"""GPU test for the rms_norm_gated_token_major op."""
 
 import zlib
 

@@ -72,6 +72,9 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # Modeling V2 all-reduce off MNNVL (x86 B200): the autotuned entry's cells and the Kimi K3 all-reduce module against the built-in one.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_autotuned_allreduce_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_allreduce_fallback_op_matrix.py
   - unittest/disaggregated/test_transfer_lifecycle_gpu.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-4-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-4-1]

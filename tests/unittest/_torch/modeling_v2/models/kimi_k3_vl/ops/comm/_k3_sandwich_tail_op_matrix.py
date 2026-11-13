@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the ``comm/k3_sandwich_tail`` catalog entry on a ``K3SandwichWorkspace``.
+"""GPU certification matrix for the ``comm/k3_sandwich_tail`` op on a ``K3SandwichWorkspace``.
 
 The pre-attention sandwich: this rank's row-parallel MoE tail ``[rmsnorm(latent)[:, lo:lo+224] | act] @
 tail_weight^T`` (the latent RMS taken over the whole reduced latent row and applied to the fp32 accumulator), the TP
@@ -10,7 +10,8 @@ picks the buffer half every rank pushes into), so beyond single calls this drive
 with the token count dipping and growing back and a random rank late, two workspaces interleaved, CUDA-graph capture
 and replay (with a tapping layer and a bank-row layer inside) mixed with eager calls, and a negative control in which
 one rank swaps two calls and every rank gets a wrong answer without an error. The workspace shared with
-``k3_sandwich_oproj`` and ``k3_sandwich_plain`` is certified by ``_k3_sandwich_oproj_op_matrix.py``.
+``k3_sandwich_oproj`` and the drafter's ``k3_sandwich_plain`` (target ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``) is
+certified by that target's ``_k3_sandwich_plain_op_matrix.py``.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _k3_sandwich_tail_op_matrix.py [--world-size 4]
     srun -n 16 --mpi=pmix python _k3_sandwich_tail_op_matrix.py --launcher srun --world-size 16
@@ -253,6 +254,7 @@ def _run_one_rank(args) -> int:
     R = ls.Rank(args)
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_tail import (
         K3SandwichWorkspace,
+        k3_sandwich_tail,
     )
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
@@ -261,7 +263,7 @@ def _run_one_rank(args) -> int:
     validating = validating_context
     WORKSPACE = K3SandwichWorkspace
     with torch.inference_mode():
-        cm.bind(R, {"tail": cm.WEIGHT_SETS})
+        cm.bind(R, {"tail": k3_sandwich_tail}, {"tail": cm.WEIGHT_SETS})
         WS_A = K3SandwichWorkspace.create(R.mapping, fabric_handle=R.fabric)
         WS_B = K3SandwichWorkspace.create(R.mapping, fabric_handle=R.fabric)
         code = ls.run_checks(R, CHECKS)

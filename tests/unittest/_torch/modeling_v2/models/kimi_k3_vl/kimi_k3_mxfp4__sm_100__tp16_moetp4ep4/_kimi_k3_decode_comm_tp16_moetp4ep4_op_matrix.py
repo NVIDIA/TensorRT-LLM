@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The decode-path collectives (``decode_comm.py``) of the Kimi K3 target ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``
-against its built-in path, and its route A MoE decode path (``decode_moe.py``), at W ranks of one GB200 tray (default
+against its built-in path, and its MoE decode path (``decode_moe.py``), at W ranks of one GB200 tray (default
 4), at the TP16 per-rank shapes.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _kimi_k3_decode_comm_tp16_moetp4ep4_op_matrix.py [--world-size 4]
@@ -11,12 +11,12 @@ Not a pytest module: one fixed sequence of checks inside one W-rank job, sharing
 collected entry point is ``test_modeling_v2_kimi_k3_decode_comm_tp16_moetp4ep4_op_matrix.py``.
 
 The decode_comm checks are ``_kimi_k3_decode_comm_checks.py`` of the family test directory, all of them at every step
-of its ``ALL_STEPS``, the speculative ones included. This file adds the checks of route A's MoE decode path:
+of its ``ALL_STEPS``, the speculative ones included. This file adds the checks of the target's MoE decode path:
   * decode MoE (first, outside inference mode with autograd on, as post_load_weights runs): the MoE decode path built
     from a MoE layer's own modules (the target's gate, whose parameters require grad, the latent projections, the
     stock RMSNorm and shared GatedMLP; zeroed routed experts) at this TP, every kernel warmed up, then a 3-token step
     and a wide 16-token step against the shared expert's forward.
-  * decode MoE push: the MoE decode path with random MXFP4 routed experts (route A's layout: 224 local experts of
+  * decode MoE push: the MoE decode path with random MXFP4 routed experts (this target's layout: 224 local experts of
     intermediate 768, every rank its own EP shard) on the TP group's latent exchange, its latent all-reduce as the
     routed experts' push form plus comm/k3_latent_reduce (``push=True``) against the routed experts' all-reduce
     (``push=False``), bit for bit: one call at every M 1..8, both tails; 3 layers x 12 steps with M dipping and growing
@@ -26,6 +26,7 @@ of its ``ALL_STEPS``, the speculative ones included. This file adds the checks o
     of it the exchange is empty and its call count has advanced by one per pushing call.
 """
 
+import importlib
 import math
 import random
 import sys
@@ -79,7 +80,9 @@ def _decode_moe_layer():
         hidden_size=H,
     )
     with torch.device("cuda"):
-        gate = dc.T.KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16)
+        gate = importlib.import_module(dc.T.__package__ + ".moe").KimiK3MoEGate(
+            cfg, logits_gemm_dtype=torch.bfloat16
+        )
         down = nn.Linear(H, LATENT, bias=False, dtype=torch.bfloat16)
         up = nn.Linear(LATENT, H, bias=False, dtype=torch.bfloat16)
         norm = RMSNorm(hidden_size=LATENT, eps=1e-5, dtype=torch.bfloat16)
@@ -202,7 +205,7 @@ def _rand_mxfp4(rows, k, gen):
 
 def _load_experts(backend, seed):
     """Random MXFP4 routed experts through the TRTLLM-Gen W4A8_MXFP4_MXFP8 loader into ``backend``'s buffers, at
-    route A's layout: intermediate 768 per rank (moe_tp 4), 224 local experts."""
+    this target's layout: intermediate 768 per rank (moe_tp 4), 224 local experts."""
     from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
 
     method = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
@@ -377,8 +380,6 @@ CHECKS = [
 
 def _run_one_rank(args) -> int:
     dc.start_rank(args)
-    import importlib
-
     modeling = importlib.import_module(
         "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling"

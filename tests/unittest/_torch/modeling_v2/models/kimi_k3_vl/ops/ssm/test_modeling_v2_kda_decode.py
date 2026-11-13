@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/kda_decode catalog entry, on a real cache object.
+"""GPU test for the ssm/kda_decode op, on a real cache object.
 
 Kimi K3's plain decode shape (6 heads, K = V = 128, conv width 4, the lower-bound gate, the output norm, beta sigmoid
 in the kernel) on the pools of a real ``KimiK3HybridCacheManager`` (``_kda_cells.build_manager``): its per-layer
 conv views (``[q | k | v]`` sections of one bf16 ``[slots, 2304, 3]`` pool) and fp32 state views, strided by the
 manager's per-slot coalescing, at the slots the manager assigned. The reference is an fp32 torch decode.
 B runs 1..8: on sm_100 B <= 5 selects the four-CTA cluster kernel and 6 <= B <= 24 the
-legacy compact-heads kernel (the one #19830 fixes).
+legacy compact-heads kernel. B = 16, 64 and 128 are Kimi K3's generic decode (more than 8
+requests): 16 stays on the compact-heads kernel, 64 and 128 take the architecture-specific one.
 """
 
 import zlib
@@ -27,12 +28,13 @@ pytestmark = pytest.mark.skipif(not kc.sm100(), reason="certified on SM100 and S
 
 LAYERS = 3
 STEPS = 3
+MAX_REQUESTS = max(cell.spec["num"] for cell in kda_decode.CELLS)
 
 
 @pytest.fixture(scope="module")
 def mgr():
     kc.load_ops()
-    m = kc.build_manager(LAYERS)
+    m = kc.build_manager(LAYERS, max_batch_size=MAX_REQUESTS, max_tokens=64 * MAX_REQUESTS)
     try:
         yield m
     finally:
@@ -41,7 +43,7 @@ def mgr():
 
 @pytest.fixture(scope="module")
 def slots(mgr):
-    return kc.request_slots(mgr, 8, first_id=100)
+    return kc.request_slots(mgr, MAX_REQUESTS, first_id=100)
 
 
 def _heads(cols: torch.Tensor) -> torch.Tensor:

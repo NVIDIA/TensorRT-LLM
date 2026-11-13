@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the ``comm/k3_latent_reduce`` catalog entry and its ``K3LatentExchange``.
+"""GPU certification matrix for the ``comm/k3_latent_reduce`` op and its ``K3LatentExchange``.
 
 The op is the consumer half of Kimi K3's latent all-reduce at decode size: every rank's producer pushes its routed
 partial into the exchange, and the op, on every rank, sums the ranks' rows. Its correctness depends on state that
@@ -259,9 +259,7 @@ def check_create_needs_only_the_tp_group() -> None:
     create() uses). With the job split into two TP groups of W / 2 (pipeline parallel 2), the first group's ranks make
     theirs while the second group's ranks do not call at all; each communicator holds exactly its group, in TP-rank
     order. The exchanges in use also hold their TP group's communicator."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
     from tensorrt_llm.mapping import Mapping
 
     for ex in (EX_A, EX_B):
@@ -318,9 +316,7 @@ def check_capture_refusals() -> None:
             return str(exc)
         return ""
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
 
     make = mnnvl_workspace.mnnvl_tp_group_comm
     comms = []

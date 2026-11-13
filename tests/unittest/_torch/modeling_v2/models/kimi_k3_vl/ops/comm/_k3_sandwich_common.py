@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared pieces of the Kimi K3 sandwich matrices (``_k3_sandwich_oproj_op_matrix.py``,
-``_k3_sandwich_tail_op_matrix.py``, ``_k3_sandwich_plain_op_matrix.py``): one class per op holding one call's
-arguments on every rank and its native-torch reference, a driver for call sequences (chained the way the model chains
-its residual streams; eager with a random rank late, or captured and replayed), and the state checks the three
-matrices run the same way on a ``K3SandwichWorkspace``.
+"""Shared pieces of the Kimi K3 sandwich matrices (the family's ``_k3_sandwich_oproj_op_matrix.py`` and
+``_k3_sandwich_tail_op_matrix.py``, and target ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``'s
+``_k3_sandwich_plain_op_matrix.py``): one class per op holding one call's arguments on every rank and its native-torch
+reference, a driver for call sequences (chained the way the model chains its residual streams; eager with a random
+rank late, or captured and replayed), and the state checks the three matrices run the same way on a
+``K3SandwichWorkspace``.
 
-Started by file path like ``_lockstep`` (this tree is not a package). Importing it pulls in torch only; ``bind``
-(called by the rank body) imports the catalog wrappers.
+Started by file path like ``_lockstep`` (this tree is not a package). Importing it pulls in torch only; it imports no
+op: the rank body passes the ops it certifies to ``bind``.
 """
 
 from __future__ import annotations
@@ -59,21 +60,14 @@ STATS = {"normed": 0.0, "tail_updated": 0.0, "tap": 0.0}
 ALLOCATIONS = [0]
 
 
-def bind(rank: ls.Rank, weight_sets: Dict[str, int]) -> None:
-    """Bind this rank and the three catalog wrappers, draw ``weight_sets[kind]`` weight sets of each kind ("oproj",
+def bind(rank: ls.Rank, ops: Dict[str, Callable], weight_sets: Dict[str, int]) -> None:
+    """Bind this rank and the sandwich ops the matrix certifies (``ops``: "oproj", "tail" and "plain" to the op
+    wrappers, whichever of them the matrix calls), draw ``weight_sets[kind]`` weight sets of each kind ("oproj",
     "tail", "plain", "down"), every rank's slice, from fixed seeds, and count from here on the multicast allocations
     ``create`` reaches (``ALLOCATIONS``), so that a refused ``create`` can be shown to allocate nothing."""
     global R
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        k3_sandwich_oproj,
-        k3_sandwich_plain,
-        k3_sandwich_tail,
-    )
-
     R = rank
-    OPS["oproj"] = k3_sandwich_oproj.k3_sandwich_oproj
-    OPS["tail"] = k3_sandwich_tail.k3_sandwich_tail
-    OPS["plain"] = k3_sandwich_plain.k3_sandwich_plain
+    OPS.update(ops)
     for kind, sets in weight_sets.items():
         WEIGHTS[kind] = []
         for s in range(sets):
@@ -481,9 +475,7 @@ def create_refuses_capture(workspace_type, ws, next_call: Call) -> None:
     capture, its peers saying another rank cannot. No rank reaches the allocation in either case (the counted
     multicast allocation, which the workspaces in use went through), each rank frees the communicator made for it, no
     stream is left capturing, and the workspace in use is untouched: the next call is correct."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
 
     assert ALLOCATIONS[0] > 0, "the counter did not see the workspaces in use being created"
     before = ALLOCATIONS[0]

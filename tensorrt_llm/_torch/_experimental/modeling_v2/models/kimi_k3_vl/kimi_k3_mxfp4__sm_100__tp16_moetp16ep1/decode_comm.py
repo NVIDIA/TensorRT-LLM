@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode path's residual-update collectives on the catalog's Kimi K3 MNNVL and sandwich entries.
+"""The decode path's residual-update collectives on the Kimi K3 MNNVL and sandwich ops.
 
 A layer's post-attention step adds the attention output to the running prefix sum, selects the attention residual
 and applies the post-attention RMSNorm. Under TP the attention output is a sum over the TP group, so the step is that
@@ -17,22 +17,14 @@ The pre-attention step after a MoE layer whose row-parallel tail was handed on (
 the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tail`, runs the tail GEMV, its
 all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
 
-The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
-
-* `K3DecodeComm.sandwich_plain`, `comm/k3_sandwich_plain`: a row-parallel projection of at most `SANDWICH_MAX_TOKENS`
-  tokens (a layer's attention output projection, or its MLP's SiLU-and-mul and down projection), its all-reduce, the
-  residual add and the RMSNorm in one kernel.
-* `K3DecodeComm.allreduce_norm`, `comm/mnnvl_fusion_allreduce`: the all-reduce of an unreduced projection output of
-  any token count the MNNVL workspace holds, with the residual add and the RMSNorm in its epilogue (the context
-  projection's with a zero residual).
-
 The state is one `MnnvlWorkspace` and one `K3SandwichWorkspace` of the TP group (`K3DecodeComm.create`): collective
 over the group and eager, built by the target in `post_load_weights` before any CUDA-graph capture. Every rank must
 make the same calls on each in the same order. Which call a step takes is decided from its token count and kind and
 from the load-time layout alone, which every rank of the group shares.
 
-The plain MNNVL all-reduces the decode path keeps (the stock modules') send one-shot up to
-`DECODE_AR_ONE_SHOT_MAX_BYTES` (`use_decode_one_shot`), except a wide decode step's (`wide_all_reduce`).
+The plain MNNVL all-reduces the decode path keeps (the layers' all-reduce modules, `ops/comm/k3_allreduce.K3AllReduce`)
+send one-shot up to `DECODE_AR_ONE_SHOT_MAX_BYTES` (`use_decode_one_shot`), except a wide decode step's
+(`wide_all_reduce`).
 """
 
 from __future__ import annotations
@@ -47,12 +39,12 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
     op as _sandwich_op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.mnnvl_workspace import (
+    MnnvlWorkspace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_oproj import (
     K3SandwichWorkspace,
     k3_sandwich_oproj,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_plain import (
-    k3_sandwich_plain,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_tail import (
     k3_sandwich_tail,
@@ -63,14 +55,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mn
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce_attn_res import (
     mnnvl_allreduce_attn_res,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_fusion_allreduce import (
-    mnnvl_fusion_allreduce,
-    required_buffer_bytes,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
-    MnnvlWorkspace,
-)
-from tensorrt_llm._torch.distributed import AllReduceParams
+from tensorrt_llm.functional import AllReduceParams
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16
@@ -81,8 +66,8 @@ SANDWICH_MAX_TOKENS = _sandwich_op.MAX_TOKENS
 # The MNNVL workspace's buffer size: a one-shot call pushes T x 7168 bf16 from each of 16 ranks, 3.5 MiB at T = 16.
 MNNVL_BUFFER_BYTES = 4 << 20
 
-# The one-shot ceiling of the stock MNNVL all-reduces on the decode path: 8 tokens x 7168 x 16 ranks x 2 B is
-# 1.75 MiB, which the stock 1 MiB ceiling would send two-shot.
+# The one-shot ceiling of the layers' MNNVL all-reduces on the decode path: 8 tokens x 7168 x 16 ranks x 2 B is
+# 1.75 MiB, which the default 1 MiB ceiling would send two-shot.
 DECODE_AR_ONE_SHOT_MAX_BYTES = 4 << 20
 
 # A wide decode step's ceiling: the stock 1 MiB. At 16 ranks two-shot is faster for every wide step's rows.
@@ -90,8 +75,10 @@ WIDE_AR_ONE_SHOT_MAX_BYTES = 1 << 20
 
 
 def use_decode_one_shot(model: nn.Module) -> None:
-    """Every stock MNNVL all-reduce of ``model`` sends one-shot up to `DECODE_AR_ONE_SHOT_MAX_BYTES`. Each grows its
-    workspace on its first eager call of a larger size, before the capture of that size."""
+    """Every MNNVL all-reduce of ``model`` (the ``mnnvl_allreduce`` of a ``K3AllReduce``) sends one-shot up to
+    `DECODE_AR_ONE_SHOT_MAX_BYTES`, with early trigger. Each grows its workspace on its first eager call of a larger
+    size, before the capture of that size. A module whose ``mnnvl_allreduce`` is another MNNVL all-reduce of the same
+    call signature (a built-in ``AllReduce``'s) gets a ``K3MnnvlAllReduce`` of its mapping and dtype in its place."""
     for module in model.modules():
         mnnvl = getattr(module, "mnnvl_allreduce", None)
         if mnnvl is not None:
@@ -102,15 +89,9 @@ def use_decode_one_shot(model: nn.Module) -> None:
             mnnvl.early_trigger = True
 
 
-def skip_all_reduce() -> AllReduceParams:
-    """All-reduce parameters under which a row-parallel module returns this rank's unreduced output (its projection
-    without its all-reduce): a ``Linear``'s ``all_reduce_params``, a ``GatedMLP``'s ``final_all_reduce_params``."""
-    return AllReduceParams(enable_allreduce=False)
-
-
 def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """``all_reduce(x)`` of a wide decode step (a stock ``AllReduce`` module, no fusion): its MNNVL all-reduce with
-    the `WIDE_AR_ONE_SHOT_MAX_BYTES` ceiling, else the module itself."""
+    """``all_reduce(x)`` of a wide decode step (a ``K3AllReduce``, no fusion): its MNNVL all-reduce with the
+    `WIDE_AR_ONE_SHOT_MAX_BYTES` ceiling, else the module itself."""
     mnnvl = getattr(all_reduce, "mnnvl_allreduce", None)
     if isinstance(mnnvl, K3MnnvlAllReduce):
         out = mnnvl(
@@ -327,83 +308,4 @@ class K3DecodeComm:
             block_residual,
             *_res_args(res_proj, res_norm, out_norm),
             self.sandwich,
-        )
-
-    def compile_plain(self, weight: torch.Tensor, swiglu: bool = False) -> bool:
-        """Compile the plain sandwich (``sandwich_plain``) for a projection of ``weight``'s shape (with ``swiglu``, a
-        down projection after the SiLU-and-mul) with one call on a zero row of a zero weight, before any capture;
-        False, with nothing launched, where the kernel does not take that shape. Collective: every rank of the group
-        makes the call; it advances the sandwich workspace on every rank alike."""
-        zero = torch.zeros_like(weight)
-        hidden, k_in = zero.shape
-        x = zero.new_zeros(1, 2 * k_in if swiglu else k_in)
-        residual = zero.new_zeros(1, hidden)
-        ones = zero.new_ones(hidden)
-        if not _sandwich_op.supports_plain(x, zero, residual, ones, swiglu):
-            return False
-        k3_sandwich_plain(x, zero, residual, ones, 1e-6, self.sandwich, swiglu=swiglu)
-        torch.cuda.synchronize(zero.device)
-        return True
-
-    @staticmethod
-    def takes_plain(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        residual: torch.Tensor,
-        norm: nn.Module,
-        swiglu: bool = False,
-    ) -> bool:
-        """Whether ``sandwich_plain`` takes the call: at most `SANDWICH_MAX_TOKENS` contiguous bf16 rows ``x`` of a
-        row-parallel slice ``weight`` [7168, K] (K a multiple of 128 up to 896; with ``swiglu`` K 896 and ``x`` the
-        ``[gate | up]`` rows, 2 K wide), ``residual`` [rows, 7168], and ``norm``'s bf16 [7168] weight."""
-        return _sandwich_op.supports_plain(x, weight, residual, norm.weight, swiglu)
-
-    def sandwich_plain(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        residual: torch.Tensor,
-        norm: nn.Module,
-        swiglu: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``(normed, updated)`` in one ``comm/k3_sandwich_plain`` call: ``updated = residual + allreduce(x @
-        weight.T)`` (with ``swiglu``, of ``silu_and_mul(x) @ weight.T``), ``normed = norm(updated)`` for a plain
-        RMSNorm ``norm``. Bit for bit, by the kernel's statement, the projection on ``k3_ctm_gemv`` at split 1 (with
-        ``swiglu``, ``k3_ctm_gemv_swiglu`` at split 2) followed by ``allreduce_norm``'s one-shot call."""
-        return k3_sandwich_plain(
-            x.contiguous(),
-            weight,
-            residual.contiguous(),
-            norm.weight,
-            _eps(norm),
-            self.sandwich,
-            swiglu=swiglu,
-        )
-
-    def takes_allreduce_norm(self, rows: int, hidden: int) -> bool:
-        """Whether ``allreduce_norm`` takes ``rows`` bf16 rows of ``hidden`` columns: the MNNVL workspace holds the
-        call at the decode path's one-shot ceiling (`DECODE_AR_ONE_SHOT_MAX_BYTES`, two-shot above it)."""
-        if rows <= 0 or hidden <= 0 or hidden % 8:
-            return False
-        world, buffer_bytes = self.mnnvl.world_size, self.mnnvl.buffer_bytes
-        need = required_buffer_bytes(
-            rows, hidden, world, torch.bfloat16, DECODE_AR_ONE_SHOT_MAX_BYTES
-        )
-        two_shot = rows * hidden * world * 2 > DECODE_AR_ONE_SHOT_MAX_BYTES
-        return need <= buffer_bytes and not (two_shot and buffer_bytes % 32)
-
-    def allreduce_norm(
-        self, partial: torch.Tensor, residual: torch.Tensor, norm: nn.Module
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``(normed, updated)`` in one ``comm/mnnvl_fusion_allreduce`` call: ``updated = residual +
-        allreduce(partial)``, ``normed = norm(updated)`` for a plain RMSNorm ``norm``, sent one-shot up to
-        `DECODE_AR_ONE_SHOT_MAX_BYTES`. ``partial`` is this rank's unreduced ``[rows, hidden]`` bf16 output of a
-        row-parallel projection, of a shape ``takes_allreduce_norm`` holds for."""
-        return mnnvl_fusion_allreduce(
-            partial.contiguous(),
-            self.mnnvl,
-            DECODE_AR_ONE_SHOT_MAX_BYTES,
-            residual.contiguous(),
-            norm.weight,
-            _eps(norm),
         )

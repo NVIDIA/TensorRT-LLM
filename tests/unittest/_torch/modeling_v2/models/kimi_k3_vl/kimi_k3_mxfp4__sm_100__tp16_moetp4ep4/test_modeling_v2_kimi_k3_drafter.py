@@ -1,34 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The Kimi K3 target's DSpark drafter (``K3DSparkDrafter`` of ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``) on one GPU,
-at one TP16 rank's drafter shapes: 6 query heads and 1 KV head of 64, hidden 7168, MLP width 896, context pages of
-64 rows, two layers.
+against Modeling V1's stock GQA DSpark drafter (``modeling_dspark.GQADSparkForCausalLM``), both loaded from the same
+draft checkpoint, at one TP16 rank's shapes, two layers, 64-row context pages.
 
-* A decode block of every split ``attention/k3_drafter_attn_qknorm`` certifies runs the drafter entries (the
-  attention once per layer) and matches the stock block forward (``DFlashForCausalLM.dflash_forward`` on the same
-  module and context), with the torch GEMMs and with the decode GEMV sites (which take the blocks of at most 8 rows).
-  The entries leave the cache untouched.
-* A split the entry does not certify runs the stock forward, bit for bit, without the entry.
-* Under CUDA-graph capture, the entries take a block only once its attention compile key has run eagerly.
-* Negative control: a weight changed between the two forwards fails the comparison.
-* With ``ctx_rows_start`` the entries read the batch's page-table rows as a view of a larger table (the manager's,
-  rows from the first gen request on), not a gathered copy, and give the gather's result bit for bit.
+Two drafter configs:
 
-On the TP group's collective state (``use_decode_comm``), here a group of one rank whose collectives are torch
-stand-ins counted per call (the ops themselves are certified by their multi-GPU op matrices). The layers' o_proj gets
-the group's TP all-reduce, the identity on one rank, which a one-rank Qwen3 layer does not build:
+* ``entries``: 6 query heads and 1 KV head of 64, plain NeoX RoPE, the layout the drafter entries take.
+* ``radixark``: 4 / 1 heads of 64 with YaRN RoPE (RadixArk-Kimi-K3-DSpark's at TP16), which the entries never take.
 
-* The context projection runs on the split ``fc`` (on one rank, the whole weight): up to a decode step's rows through
-  ``comm/mnnvl_fusion_allreduce`` with ``hidden_norm``, more rows through the drafter's TP all-reduce, and matches the
-  replicated projection.
-* A decode block of every certified split runs its residual adds and RMSNorms in its all-reduces and matches the
-  stock block forward: up to 8 rows ``comm/k3_sandwich_plain`` for o_proj (and, on the decode GEMV sites, its
-  SiLU-and-mul form for the down projection), else ``comm/mnnvl_fusion_allreduce``, two per layer, the last with the
-  final norm. Both sandwich forms compiled with the state.
-* The stock all-reduces and norms run without the collective state, where the workspace does not hold the block's
-  rows, or where the layers' norms do not take the fused form; a sandwich form that did not compile gives way to
-  ``comm/mnnvl_fusion_allreduce``.
-* A fused block captured in a CUDA graph makes the same collective calls and replays the eager result.
+Bit for bit against the stock drafter (the same kernels in the same order):
+
+* The weight load: every tensor (this rank's projections, norms, ``fc`` / ``hidden_norm``, the Markov and confidence
+  heads, the trained mask row).
+* The RoPE cos / sin cache, the fused context K / V weights and ``precompute_context_kv``.
+* The replicated ``project_target_hidden``.
+* The generic block on TRTLLM (uncertified splits of the ``entries`` drafter, every split of the ``radixark``
+  drafter): the output and the block's K / V the call leaves in the paged cache.
+* ``attention_backend`` VANILLA (flash-attn over the worker's private arena): the block of both drafters, every split,
+  the output and the block's K / V left in the arena; the context K / V.
+
+The drafter entries and the TP group's fused collectives (one-rank stand-ins, counted) run kernels the stock drafter
+does not: against its block forward within a bound, with the calls each path makes checked, the split context
+projection within a bound of the replicated one; the cache untouched; CUDA-graph capture taking only compiled keys;
+captured blocks replaying the eager result; a changed weight failing the comparison; ``ctx_rows_start`` reading
+page-table rows as a view.
 """
 
 import math
@@ -43,41 +39,51 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
     decode_gemv,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
-    modeling as target,
+    drafter as target,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="the K3 drafter entries run on sm_100 and sm_103",
 )
 
-HIDDEN, INTER, HEADS, KV_HEADS, HEAD_DIM, LAYERS, PAGE = 7168, 896, 6, 1, 64, 2, 64
+HIDDEN, INTER, HEAD_DIM, LAYERS, PAGE = 7168, 896, 64, 2, 64
 VOCAB, RANK = 1024, 16
+CONFIGS = {"entries": (6, 1, None), "radixark": (4, 1, "yarn")}
 # Context lengths per request: inside a page, on a page boundary, across pages, empty.
 CTX = (37, 64, 130, 0, 5, 200, 63, 1)
 REL_L2 = 1e-2
 SITES = ("drafter_qkv", "drafter_o", "drafter_gate_up", "drafter_down")
 
 
-def _config():
+def _config(name):
+    heads, kv_heads, rope = CONFIGS[name]
     return Qwen3Config.from_dict(
         dict(
-            architectures=["Qwen3ForCausalLM"],
+            architectures=["DSparkDraftModel"],
             model_type="qwen3",
             hidden_size=HIDDEN,
             intermediate_size=INTER,
             num_hidden_layers=LAYERS,
-            num_attention_heads=HEADS,
-            num_key_value_heads=KV_HEADS,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
             head_dim=HEAD_DIM,
             hidden_act="silu",
             rms_norm_eps=1e-5,
             vocab_size=VOCAB,
             max_position_embeddings=4096,
             rope_theta=10000.0,
-            rope_scaling=None,
+            rope_scaling=(
+                None
+                if rope is None
+                else {
+                    "rope_type": "yarn",
+                    "factor": 16.0,
+                    "original_max_position_embeddings": 256,
+                }
+            ),
             attention_bias=False,
             torch_dtype="bfloat16",
             tie_word_embeddings=False,
@@ -89,7 +95,8 @@ def _config():
     )
 
 
-def _weights(seed=11):
+def _weights(name, seed=11):
+    heads, kv_heads, _ = CONFIGS[name]
     g = torch.Generator().manual_seed(seed)
 
     def rnd(*shape, scale=0.02):
@@ -99,6 +106,7 @@ def _weights(seed=11):
         "fc.weight": rnd(HIDDEN, 2 * HIDDEN),
         "hidden_norm.weight": rnd(HIDDEN, scale=0.05) + 1.0,
         "norm.weight": rnd(HIDDEN, scale=0.05) + 1.0,
+        "embed_tokens.weight": rnd(VOCAB, HIDDEN),
         "markov_head.markov_w1.weight": rnd(VOCAB, RANK),
         "markov_head.markov_w2.weight": rnd(VOCAB, RANK),
         "confidence_head.proj.weight": rnd(1, HIDDEN + RANK),
@@ -106,10 +114,10 @@ def _weights(seed=11):
     }
     for i in range(LAYERS):
         p = f"layers.{i}."
-        w[p + "self_attn.q_proj.weight"] = rnd(HEADS * HEAD_DIM, HIDDEN)
-        w[p + "self_attn.k_proj.weight"] = rnd(KV_HEADS * HEAD_DIM, HIDDEN)
-        w[p + "self_attn.v_proj.weight"] = rnd(KV_HEADS * HEAD_DIM, HIDDEN)
-        w[p + "self_attn.o_proj.weight"] = rnd(HIDDEN, HEADS * HEAD_DIM)
+        w[p + "self_attn.q_proj.weight"] = rnd(heads * HEAD_DIM, HIDDEN)
+        w[p + "self_attn.k_proj.weight"] = rnd(kv_heads * HEAD_DIM, HIDDEN)
+        w[p + "self_attn.v_proj.weight"] = rnd(kv_heads * HEAD_DIM, HIDDEN)
+        w[p + "self_attn.o_proj.weight"] = rnd(HIDDEN, heads * HEAD_DIM)
         w[p + "self_attn.q_norm.weight"] = rnd(HEAD_DIM, scale=0.05) + 1.0
         w[p + "self_attn.k_norm.weight"] = rnd(HEAD_DIM, scale=0.05) + 1.0
         w[p + "input_layernorm.weight"] = rnd(HIDDEN, scale=0.05) + 1.0
@@ -120,17 +128,33 @@ def _weights(seed=11):
     return w
 
 
-def _load_drafter():
-    model_config = ModelConfig(pretrained_config=_config(), attn_backend="TRTLLM")
-    module = target.K3DSparkDrafter(model_config, dflash_attention_backend="TRTLLM").to("cuda")
-    module.load_weights(_weights())
-    assert module._k3_layers_take(), "the test drafter must be one the drafter entries take"
+def _load(cls, name, backend="TRTLLM"):
+    model_config = ModelConfig(pretrained_config=_config(name), attn_backend="TRTLLM")
+    module = cls(model_config, dflash_attention_backend=backend).to("cuda")
+    module.load_weights(dict(_weights(name)))
     return module
 
 
+def _pair(name, backend="TRTLLM"):
+    return SimpleNamespace(
+        new=_load(target.K3DSparkDrafter, name, backend),
+        old=_load(GQADSparkForCausalLM, name, backend),
+    )
+
+
 @pytest.fixture(scope="module")
-def drafter():
-    return _load_drafter()
+def drafters():
+    """Both drafters of both configs."""
+    pairs = {name: _pair(name) for name in CONFIGS}
+    assert pairs["entries"].new._k3_layers_take()
+    assert not pairs["radixark"].new._k3_layers_take()
+    return pairs
+
+
+@pytest.fixture(scope="module")
+def drafter(drafters):
+    """The new ``entries`` drafter (the decode entries take it)."""
+    return drafters["entries"].new
 
 
 # The TP group's collective state for a group of one rank: the workspaces' sizes are what the drafter reads; their
@@ -181,7 +205,7 @@ def _sandwich_plain_one_rank(x, weight, residual, norm_weight, eps, workspace, s
 
 
 def _one_rank_collectives(monkeypatch, calls):
-    """The drafter's collectives replaced by their one-rank stand-ins, each call recorded as (op, rows) or, for the
+    """The drafters' collectives replaced by their one-rank stand-ins, each call recorded as (op, rows) or, for the
     sandwich, (op, rows, swiglu)."""
 
     def fusion(input, *args, **kwargs):
@@ -206,31 +230,33 @@ class _OneRankTPAllReduce(torch.nn.Module):
         return False
 
 
-def _one_rank_tp_all_reduce(module):
-    """Every layer's o_proj reduces over the one-rank group, as it reduces over the TP group on more ranks
-    (``Qwen3DecoderLayer`` builds o_proj without an all-reduce when tp_size is 1). The drafter's fused path keys on that
-    all-reduce; the stock forward through o_proj keeps its bits."""
-    for layer in module.model.layers:
+def _one_rank_tp_all_reduce(new, old):
+    """Every layer's o_proj and down projection reduce over the one-rank group, as they reduce over the TP group on
+    more ranks (one rank builds them without an all-reduce). The fused path keys on that all-reduce."""
+    for layer in new.model.layers:
+        layer.self_attn.o_proj.all_reduce = _OneRankTPAllReduce()
+        layer.mlp.down_proj.all_reduce = _OneRankTPAllReduce()
+    for layer in old.model.layers:
         o_proj = layer.self_attn.o_proj
         o_proj.reduce_output = True
         o_proj.all_reduce = _OneRankTPAllReduce()
 
 
 @pytest.fixture(scope="module")
-def fused_drafter():
-    """The drafter on the one-rank collective state: its fc split over one rank, both sandwich forms compiled (their
-    compile calls run on the stand-in)."""
+def fused():
+    """Both ``entries`` drafters on the one-rank collective state: fc split over one rank, both sandwich forms
+    compiled (their compile calls run on the stand-in)."""
     with pytest.MonkeyPatch.context() as mp:
         _one_rank_collectives(mp, [])
-        module = _load_drafter()
-        _one_rank_tp_all_reduce(module)
-        module.use_decode_comm(ONE_RANK_COMM)
-    return module
+        pair = _pair("entries")
+        _one_rank_tp_all_reduce(pair.new, pair.old)
+        pair.new.use_decode_comm(ONE_RANK_COMM)
+    return pair
 
 
 @pytest.fixture
 def collectives(monkeypatch):
-    """The one-rank stand-ins of the drafter's collectives, counted: the list of (op, rows) calls."""
+    """The one-rank stand-ins of the drafters' collectives, counted: the list of (op, rows) calls."""
     calls = []
     _one_rank_collectives(monkeypatch, calls)
     return calls
@@ -241,16 +267,16 @@ def gemvs():
     return decode_gemv.K3DecodeGemvs.create(None, sites=SITES)
 
 
-def _block(batch, block, seed):
+def _block(batch, block, seed, kv_heads=1):
     """A block's inputs: noise rows, query positions after each request's context, and a paged context cache
     (random rows, the requests' pages scattered) with its page table."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    ctx = torch.tensor(CTX[:batch], dtype=torch.int32, device="cuda")
+    ctx = torch.tensor([CTX[i % len(CTX)] for i in range(batch)], dtype=torch.int32, device="cuda")
     width = math.ceil((int(ctx.max()) + block) / PAGE) + 1
     pages = batch * width + 3
     order = torch.randperm(pages, generator=g, device="cuda")[: batch * width]
     caches = [
-        (torch.randn(pages, 2, KV_HEADS, PAGE, HEAD_DIM, generator=g, device="cuda")).to(
+        (torch.randn(pages, 2, kv_heads, PAGE, HEAD_DIM, generator=g, device="cuda")).to(
             torch.bfloat16
         )
         for _ in range(LAYERS)
@@ -279,9 +305,18 @@ def _rel_l2(y, ref):
     return ((y.double() - ref.double()).norm() / ref.double().norm()).item()
 
 
+def _assert_bitwise(new, old, what):
+    assert new.shape == old.shape and new.dtype == old.dtype, f"{what}: {new.shape} vs {old.shape}"
+    if not torch.equal(new, old):
+        diff = (new.float() - old.float()).abs()
+        raise AssertionError(
+            f"{what}: {int((new != old).sum())} of {new.numel()} differ, max |diff| {float(diff.max())}"
+        )
+
+
 @pytest.fixture
 def attn_calls(monkeypatch):
-    """Counts the drafter's calls of the attention entry."""
+    """Counts the new drafter's calls of the attention entry."""
     calls = []
     entry = target.k3_drafter_attn_qknorm
 
@@ -293,11 +328,129 @@ def attn_calls(monkeypatch):
     return calls
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# The weight load and the context side.
+# ----------------------------------------------------------------------------------------------------------------------
+
+_PARAMS = (
+    "self_attn.qkv_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "mlp.gate_up_proj.weight",
+    "mlp.down_proj.weight",
+)
+
+
+@pytest.mark.parametrize("name", list(CONFIGS))
+def test_weight_load_matches_stock(drafters, name):
+    new, old = drafters[name].new, drafters[name].old
+    # Every alias: the stock drafter registers its backbone first as draft_model_full.model, the new one as model.
+    old_params = dict(old.named_parameters(remove_duplicate=False))
+    new_params = dict(new.named_parameters(remove_duplicate=False))
+    for i in range(LAYERS):
+        for param in _PARAMS:
+            key = f"model.layers.{i}.{param}"
+            _assert_bitwise(new_params[key], old_params[key], key)
+    for key in ("model.norm.weight", "fc.weight", "hidden_norm.weight"):
+        _assert_bitwise(new_params[key], old_params[key], key)
+    for attr in ("markov_w1", "markov_w2", "confidence_proj_weight", "confidence_proj_bias"):
+        _assert_bitwise(getattr(new, attr), getattr(old, attr), attr)
+    _assert_bitwise(new.mask_token_embedding, old.mask_token_embedding, "mask_token_embedding")
+    assert new.hidden_norm.eps == old.hidden_norm.eps
+    for field in ("mask_token_id", "target_layer_ids", "block_size", "_dspark_shift_label"):
+        assert getattr(new, field) == getattr(old, field), field
+    assert new.has_markov_head and old.has_markov_head
+    assert (new.logit_multiplier, new.logit_softcap) == (old.logit_multiplier, old.logit_softcap)
+
+
+@pytest.mark.parametrize("name", list(CONFIGS))
+def test_rope_cache_and_context_kv_match_stock(drafters, name):
+    new, old = drafters[name].new, drafters[name].old
+    _assert_bitwise(new._get_cos_sin_cache(), old._get_cos_sin_cache(), "cos / sin cache")
+    old._build_fused_kv_buffers()
+    new._build_fused_kv_buffers()
+    _assert_bitwise(new._fused_kv_weight, old._fused_kv_weight, "fused K / V weight")
+    _assert_bitwise(new._k_norm_stacked, old._k_norm_stacked, "stacked k_norm")
+    assert new._k_norm_eps == old._k_norm_eps
+    assert new._fused_kv_bias is None and old._fused_kv_bias is None
+    assert new._input_ln_eps is None and old._input_ln_eps is None
+    assert new._is_neox and old._is_neox
+    for field in ("_num_attn_layers", "_num_heads", "_num_kv_heads", "_head_dim", "_kv_factor"):
+        assert getattr(new, field) == getattr(old, field), field
+    assert new._use_fused_qk_norm_rope == old._use_fused_qk_norm_rope == (name == "entries")
+    g = torch.Generator(device="cuda").manual_seed(3)
+    for rows in (1, 7, 300):
+        projected = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+        positions = torch.randint(0, 4000, (rows,), generator=g, device="cuda")
+        k_new, v_new = new.precompute_context_kv(projected, positions)
+        k_old, v_old = old.precompute_context_kv(projected, positions)
+        _assert_bitwise(k_new, k_old, f"context K, {rows} rows")
+        _assert_bitwise(v_new, v_old, f"context V, {rows} rows")
+
+
+@pytest.mark.parametrize("rows", [1, 8, DECODE_ROWS, 200])
+def test_projection_matches_stock(drafters, fused, collectives, rows):
+    """Replicated: the stock projection, bit for bit. Split over one rank: the fused all-reduce up to a decode step's
+    rows, else the TP all-reduce, within a bound of the stock replicated projection (the stand-in norm rounds once)."""
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    features = torch.randn(rows, 2 * HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    pair = drafters["entries"]
+    _assert_bitwise(
+        pair.new.project_target_hidden(features),
+        pair.old.project_target_hidden(features),
+        "replicated projection",
+    )
+    assert collectives == []
+    fc = fused.new.fc
+    assert isinstance(fc, target.K3FcSlice) and (fc.start, fc.end) == (0, 2 * HIDDEN)
+    out = fused.new.project_target_hidden(features)
+    ref = fused.old.project_target_hidden(features)
+    assert collectives == ([("mnnvl_fusion_allreduce", rows)] if rows <= DECODE_ROWS else [])
+    assert _rel_l2(out, ref) <= REL_L2
+
+
+def test_fused_drafter_compiled_both_sandwich_forms(fused):
+    assert fused.new.decode_comm is ONE_RANK_COMM and fused.new._k3_norms_fuse
+    assert fused.new._k3_sandwich_forms == {"o_proj", "down"}
+
+
+def test_worker_fields(drafters):
+    """Every name the speculative worker reads off a drafter, on the new drafter. The stock drafter may lack one the
+    worker reads with a default (``getattr(draft_model, "lilicorr", None)``); where it has it, the values agree."""
+    for pair in drafters.values():
+        for name in target.WORKER_FIELDS:
+            assert hasattr(pair.new, name), name
+        for name in (
+            "lilicorr",
+            "is_dflash2",
+            "has_block_conv",
+            "has_candidate_selector",
+            "_paged_ctx_cache",
+        ):
+            if hasattr(pair.old, name):
+                assert getattr(pair.new, name) == getattr(pair.old, name), name
+        assert pair.new.dflash_attention_backend == pair.old.dflash_attention_backend == "TRTLLM"
+        assert pair.new.validate_block_attention_windows() == (
+            pair.old.validate_block_attention_windows()
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# The block forward.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("use_gemvs", [False, True], ids=["torch", "gemv"])
 @pytest.mark.parametrize("split", sorted(target.DRAFTER_ATTN_SPLITS))
-def test_block_matches_the_stock_forward(
-    drafter, gemvs, attn_calls, collectives, monkeypatch, use_gemvs, split
+def test_entries_within_the_stock_bound(
+    drafters, gemvs, attn_calls, collectives, monkeypatch, use_gemvs, split
 ):
+    """A certified split on the drafter entries (one attention launch per layer): within a bound of the stock block
+    forward; the GEMV sites take at most 8 rows; the cache is untouched."""
+    pair = drafters["entries"]
     batch, block = split
     projected = []
     project = gemvs.project
@@ -308,42 +461,72 @@ def test_block_matches_the_stock_forward(
         return y
 
     monkeypatch.setattr(gemvs, "project", recorded)
-    drafter.decode_gemvs = gemvs if use_gemvs else None
+    pair.new.decode_gemvs = gemvs if use_gemvs else None
     inputs = _block(batch, block, seed=batch * 10 + block)
     stock_inputs = _copy(inputs)
     before = [c.clone() for c in inputs["ctx_kv_cache"]]
-    out = drafter.dflash_forward(**inputs)
-    ref = DFlashForCausalLM.dflash_forward(drafter, **stock_inputs)
+    out = pair.new.dflash_forward(**inputs)
+    new_projected = list(projected)
+    stock = pair.old.dflash_forward(**stock_inputs)
     torch.cuda.synchronize()
     assert attn_calls == [batch * block] * LAYERS
-    assert out.shape == ref.shape == (batch * block, HIDDEN)
-    err = _rel_l2(out, ref)
-    assert err <= REL_L2, err
+    assert _rel_l2(out, stock) <= REL_L2
     assert all(torch.equal(c, b) for c, b in zip(inputs["ctx_kv_cache"], before))
-    # Without the TP group's collective state the module all-reduces and the stock norms run.
     assert collectives == []
     if use_gemvs:
-        # At most 8 rows every site takes its projection; above, each declines and its module runs (the down
-        # projection's site is not asked once gate / up's declined).
         takes = batch * block <= decode_gemv.MAX_ROWS
         asked = SITES if takes else SITES[:3]
-        assert sorted(projected) == sorted(
+        assert sorted(new_projected) == sorted(
             (site, takes) for site in asked for _ in range(LAYERS)
-        ), projected
+        ), new_projected
     else:
         assert projected == []
 
 
-def test_an_uncertified_split_runs_the_stock_forward(drafter, attn_calls):
-    drafter.decode_gemvs = None
-    batch, block = 4, 4
-    assert (batch, block) not in target.DRAFTER_ATTN_SPLITS
-    inputs = _block(batch, block, seed=44)
-    stock_inputs = _copy(inputs)
-    out = drafter.dflash_forward(**inputs)
-    ref = DFlashForCausalLM.dflash_forward(drafter, **stock_inputs)
+_GENERIC_SPLITS = {
+    # Splits DRAFTER_ATTN_SPLITS does not list (it lists every (r, 7) up to r = 8).
+    "entries": [(4, 4), (3, 5), (5, 2), (12, 7)],
+    "radixark": [(1, 1), (1, 7), (2, 7), (8, 7), (8, 8), (3, 4), (16, 7)],
+}
+
+
+@pytest.mark.parametrize(
+    "name,split",
+    [(name, split) for name, splits in _GENERIC_SPLITS.items() for split in splits],
+    ids=lambda v: str(v),
+)
+def test_generic_block_matches_stock(drafters, attn_calls, name, split):
+    """The generic block (a split the entries do not take, or a drafter they never take): the stock DFlash block
+    forward, bit for bit, both in the output and in the block's K / V it leaves in the context pages."""
+    pair = drafters[name]
+    for d in (pair.new, pair.old):
+        d.decode_gemvs = None
+    batch, block = split
+    kv_heads = CONFIGS[name][1]
+    inputs = _block(batch, block, seed=batch * 10 + block + 5, kv_heads=kv_heads)
+    old_inputs = _copy(inputs)
+    out = pair.new.dflash_forward(**inputs)
+    ref = pair.old.dflash_forward(**old_inputs)
+    torch.cuda.synchronize()
     assert attn_calls == []
-    assert torch.equal(out, ref)
+    _assert_bitwise(out, ref, f"{name} generic block {split}")
+    for layer, (c_new, c_old) in enumerate(zip(inputs["ctx_kv_cache"], old_inputs["ctx_kv_cache"])):
+        _assert_bitwise(c_new, c_old, f"{name} context pages of layer {layer} after {split}")
+
+
+def test_generic_block_replays_under_capture(drafters):
+    """The generic block captured after an eager call of its shape replays the eager result."""
+    pair = drafters["radixark"]
+    pair.new.decode_gemvs = None
+    inputs = _block(2, 7, seed=91)
+    eager = pair.new.dflash_forward(**_copy(inputs))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = pair.new.dflash_forward(**inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_bitwise(captured, eager, "replayed generic block")
 
 
 def test_capture_takes_only_compiled_keys(drafter):
@@ -361,20 +544,22 @@ def test_capture_takes_only_compiled_keys(drafter):
     assert taken is not None and taken <= drafter._k3_attn_ran
 
 
-def test_negative_control_a_changed_weight_fails(drafter):
-    drafter.decode_gemvs = None
+def test_negative_control_a_changed_weight_fails(drafters):
+    pair = drafters["entries"]
+    for d in (pair.new, pair.old):
+        d.decode_gemvs = None
     inputs = _block(1, 8, seed=81)
-    stock_inputs = _copy(inputs)
-    weight = drafter.model.layers[0].self_attn.o_proj.weight
+    old_inputs = _copy(inputs)
+    weight = pair.new.model.layers[0].self_attn.o_proj.weight
     saved = weight.detach().clone()
     try:
         with torch.no_grad():
             weight.add_(torch.randn_like(weight) * 0.02)
-        out = drafter.dflash_forward(**inputs)
+        out = pair.new.dflash_forward(**inputs)
     finally:
         with torch.no_grad():
             weight.copy_(saved)
-    ref = DFlashForCausalLM.dflash_forward(drafter, **stock_inputs)
+    ref = pair.old.dflash_forward(**old_inputs)
     assert _rel_l2(out, ref) > REL_L2
 
 
@@ -410,30 +595,6 @@ def test_page_table_rows_as_a_view(drafter, gemvs, monkeypatch, split):
     assert all(t.data_ptr() == padded[start].data_ptr() for t in tables[LAYERS:])
 
 
-@pytest.mark.parametrize("rows", [1, 8, DECODE_ROWS, 200])
-def test_split_fc_matches_the_replicated_projection(drafter, fused_drafter, collectives, rows):
-    """On one rank the block is the whole fc. Up to a decode step's rows the projection's all-reduce applies
-    hidden_norm; above, the drafter's TP all-reduce (the identity on one rank) runs and then hidden_norm."""
-    fc = fused_drafter.fc
-    assert isinstance(fc, target.K3FcSlice) and (fc.start, fc.end) == (0, 2 * HIDDEN)
-    assert torch.equal(fc.weight, drafter.fc.weight)
-    g = torch.Generator(device="cuda").manual_seed(rows)
-    features = torch.randn(rows, 2 * HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
-    out = fused_drafter.project_target_hidden(features)
-    ref = drafter.project_target_hidden(features)
-    torch.cuda.synchronize()
-    assert out.shape == ref.shape == (rows, HIDDEN)
-    err = _rel_l2(out, ref)
-    assert err <= REL_L2, err
-    assert collectives == ([("mnnvl_fusion_allreduce", rows)] if rows <= DECODE_ROWS else [])
-
-
-def test_fused_drafter_compiled_both_sandwich_forms(fused_drafter):
-    assert fused_drafter.decode_comm is ONE_RANK_COMM
-    assert fused_drafter._k3_norms_fuse
-    assert fused_drafter._k3_sandwich_forms == {"o_proj", "down"}
-
-
 def _fused_calls(rows, use_gemvs):
     """One layer's collective calls on the fused path: up to 8 rows the o_proj sandwich, and the down projection's
     sandwich where the gate / up site produced its input; else the projection then the fused all-reduce."""
@@ -445,89 +606,284 @@ def _fused_calls(rows, use_gemvs):
 
 @pytest.mark.parametrize("use_gemvs", [False, True], ids=["torch", "gemv"])
 @pytest.mark.parametrize("split", sorted(target.DRAFTER_ATTN_SPLITS))
-def test_fused_block_matches_the_stock_forward(
-    fused_drafter, gemvs, attn_calls, collectives, use_gemvs, split
+def test_fused_block_within_the_stock_bound(
+    fused, gemvs, attn_calls, collectives, use_gemvs, split
 ):
+    """A certified split on the entries with the residual adds and norms in the all-reduces: the expected collective
+    calls, within a bound of the stock block forward."""
     batch, block = split
     rows = batch * block
-    fused_drafter.decode_gemvs = gemvs if use_gemvs else None
+    fused.new.decode_gemvs = gemvs if use_gemvs else None
     inputs = _block(batch, block, seed=batch * 10 + block + 1)
     stock_inputs = _copy(inputs)
     before = [c.clone() for c in inputs["ctx_kv_cache"]]
     noise = inputs["noise_embedding"].clone()
-    out = fused_drafter.dflash_forward(**inputs)
+    out = fused.new.dflash_forward(**inputs)
     calls = list(collectives)
-    ref = DFlashForCausalLM.dflash_forward(fused_drafter, **stock_inputs)
+    stock = fused.old.dflash_forward(**stock_inputs)
     torch.cuda.synchronize()
     assert attn_calls == [rows] * LAYERS
     assert calls == _fused_calls(rows, use_gemvs) * LAYERS
-    assert out.shape == ref.shape == (rows, HIDDEN)
-    err = _rel_l2(out, ref)
-    assert err <= REL_L2, err
+    assert _rel_l2(out, stock) <= REL_L2
     # The block's input served as the first residual, read only; the cache is untouched.
     assert torch.equal(inputs["noise_embedding"], noise)
     assert all(torch.equal(c, b) for c, b in zip(inputs["ctx_kv_cache"], before))
 
 
-def _stock_norms_case(fused_drafter, monkeypatch, case):
+@pytest.mark.parametrize("case", ["workspace", "norms"])
+def test_fused_norms_fall_back_to_the_module_norms(fused, gemvs, collectives, monkeypatch, case):
+    """A block whose rows the MNNVL workspace does not hold, or layers whose norms the fused all-reduces do not
+    reproduce, keep the module all-reduces and norms (no fused call), within a bound of the stock block forward."""
+    d = fused.new
     if case == "workspace":
         small = decode_comm.K3DecodeComm(
             mnnvl=SimpleNamespace(world_size=1, buffer_bytes=1024),
             sandwich=ONE_RANK_COMM.sandwich,
         )
-        monkeypatch.setattr(fused_drafter, "decode_comm", small)
+        monkeypatch.setattr(d, "decode_comm", small)
     else:
-        monkeypatch.setattr(fused_drafter, "_k3_norms_fuse", False)
-
-
-@pytest.mark.parametrize("case", ["workspace", "norms"])
-def test_fused_norms_fall_back_to_the_stock_norms(
-    fused_drafter, gemvs, attn_calls, collectives, monkeypatch, case
-):
-    """A block whose rows the MNNVL workspace does not hold, or layers whose norms the fused all-reduces do not
-    reproduce, keep the module all-reduces and the stock norms."""
-    _stock_norms_case(fused_drafter, monkeypatch, case)
-    fused_drafter.decode_gemvs = gemvs
+        monkeypatch.setattr(d, "_k3_norms_fuse", False)
+    d.decode_gemvs = gemvs
     inputs = _block(1, 7, seed=17)
     stock_inputs = _copy(inputs)
-    out = fused_drafter.dflash_forward(**inputs)
-    ref = DFlashForCausalLM.dflash_forward(fused_drafter, **stock_inputs)
+    out = d.dflash_forward(**inputs)
+    stock = fused.old.dflash_forward(**stock_inputs)
     torch.cuda.synchronize()
     assert collectives == []
-    assert attn_calls == [7] * LAYERS
-    err = _rel_l2(out, ref)
-    assert err <= REL_L2, err
+    assert _rel_l2(out, stock) <= REL_L2
 
 
 def test_uncompiled_sandwich_gives_way_to_the_fused_all_reduce(
-    fused_drafter, gemvs, collectives, monkeypatch
+    fused, gemvs, collectives, monkeypatch
 ):
-    monkeypatch.setattr(fused_drafter, "_k3_sandwich_forms", frozenset({"down"}))
-    fused_drafter.decode_gemvs = gemvs
+    monkeypatch.setattr(fused.new, "_k3_sandwich_forms", frozenset({"down"}))
+    fused.new.decode_gemvs = gemvs
     inputs = _block(1, 8, seed=88)
     stock_inputs = _copy(inputs)
-    out = fused_drafter.dflash_forward(**inputs)
-    ref = DFlashForCausalLM.dflash_forward(fused_drafter, **stock_inputs)
+    out = fused.new.dflash_forward(**inputs)
+    calls = list(collectives)
+    stock = fused.old.dflash_forward(**stock_inputs)
     torch.cuda.synchronize()
-    assert collectives == [("mnnvl_fusion_allreduce", 8), ("k3_sandwich_plain", 8, True)] * LAYERS
-    err = _rel_l2(out, ref)
-    assert err <= REL_L2, err
+    assert calls == [("mnnvl_fusion_allreduce", 8), ("k3_sandwich_plain", 8, True)] * LAYERS
+    assert _rel_l2(out, stock) <= REL_L2
 
 
 @pytest.mark.parametrize("split", [(1, 7), (2, 7)])
-def test_fused_block_replays_under_capture(fused_drafter, gemvs, collectives, split):
+def test_fused_block_replays_under_capture(fused, gemvs, collectives, split):
     """Eager first (the attention compiles for the block's key), then captured and replayed."""
-    fused_drafter.decode_gemvs = gemvs
+    fused.new.decode_gemvs = gemvs
     inputs = _block(*split, seed=70 + split[0])
-    eager = fused_drafter.dflash_forward(**_copy(inputs))
+    eager = fused.new.dflash_forward(**_copy(inputs))
     torch.cuda.synchronize()
     eager_calls = list(collectives)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = fused_drafter.dflash_forward(**inputs)
+        captured = fused.new.dflash_forward(**inputs)
     graph.replay()
     torch.cuda.synchronize()
     assert eager_calls == _fused_calls(split[0] * split[1], True) * LAYERS
     assert collectives[len(eager_calls) :] == eager_calls
     err = _rel_l2(captured, eager)
     assert err <= 1e-3, err
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# attention_backend VANILLA: the worker's private context arena, flash-attn.
+# ----------------------------------------------------------------------------------------------------------------------
+
+_VANILLA_REASON = target._dense_attn_op.unavailability_reason()
+_needs_flash_attn = pytest.mark.skipif(
+    _VANILLA_REASON is not None, reason=f"VANILLA needs flash-attn: {_VANILLA_REASON}"
+)
+
+
+@pytest.fixture(scope="module")
+def vanilla_drafters():
+    """Both drafters of both configs on VANILLA."""
+    return {name: _pair(name, "VANILLA") for name in CONFIGS}
+
+
+def _arena_block(batch, block, seed, kv_heads=1):
+    """A block's inputs on the private arena: noise rows, positions after each request's context, and the arena
+    ([slots, layers, columns, KV, head_dim] K and V, random) with the requests' slots scattered."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    ctx = torch.tensor([CTX[i % len(CTX)] for i in range(batch)], dtype=torch.int32, device="cuda")
+    slots = batch + 3
+    columns = int(ctx.max()) + block + 5
+    shape = (slots, LAYERS, columns, kv_heads, HEAD_DIM)
+    return dict(
+        noise_embedding=torch.randn(batch, block, HIDDEN, generator=g, device="cuda").to(
+            torch.bfloat16
+        ),
+        query_positions=(ctx.long()[:, None] + torch.arange(block, device="cuda")),
+        num_ctx_per_req=ctx,
+        ctx_k_cache=torch.randn(*shape, generator=g, device="cuda").to(torch.bfloat16),
+        ctx_v_cache=torch.randn(*shape, generator=g, device="cuda").to(torch.bfloat16),
+        ctx_cache_batch_idx=torch.randperm(slots, generator=g, device="cuda")[:batch].to(
+            torch.int32
+        ),
+        ctx_kv_cache=None,
+        ctx_page_table=None,
+    )
+
+
+def _arena_copy(inputs):
+    out = dict(inputs)
+    out["ctx_k_cache"] = inputs["ctx_k_cache"].clone()
+    out["ctx_v_cache"] = inputs["ctx_v_cache"].clone()
+    return out
+
+
+@_needs_flash_attn
+def test_vanilla_drafters_resolve_like_stock(vanilla_drafters):
+    for pair in vanilla_drafters.values():
+        assert pair.new.dflash_attention_backend == pair.old.dflash_attention_backend == "VANILLA"
+        assert (
+            pair.new.validate_block_attention_windows()
+            == pair.old.validate_block_attention_windows()
+            == []
+        )
+        assert pair.new._paged_ctx_cache == pair.old._paged_ctx_cache
+
+
+_VANILLA_SPLITS = {
+    # The entries' certified splits too: they take TRTLLM only, so every VANILLA block is the generic one.
+    "entries": [(1, 7), (8, 7), (2, 8), (4, 4), (12, 7)],
+    "radixark": [(1, 1), (1, 7), (2, 7), (8, 7), (8, 8), (3, 4), (16, 7)],
+}
+
+
+@_needs_flash_attn
+@pytest.mark.parametrize(
+    "name,split",
+    [(name, split) for name, splits in _VANILLA_SPLITS.items() for split in splits],
+    ids=lambda v: str(v),
+)
+def test_vanilla_block_matches_stock(vanilla_drafters, attn_calls, name, split):
+    """VANILLA: the stock DFlash block forward on its arena path, bit for bit, both in the output and in the
+    block's K / V it leaves in the arena; the drafter entries never run."""
+    pair = vanilla_drafters[name]
+    batch, block = split
+    inputs = _arena_block(batch, block, seed=batch * 10 + block + 7, kv_heads=CONFIGS[name][1])
+    old_inputs = _arena_copy(inputs)
+    out = pair.new.dflash_forward(**inputs)
+    ref = pair.old.dflash_forward(**old_inputs)
+    torch.cuda.synchronize()
+    assert attn_calls == []
+    _assert_bitwise(out, ref, f"{name} VANILLA block {split}")
+    _assert_bitwise(
+        inputs["ctx_k_cache"], old_inputs["ctx_k_cache"], f"{name} arena K after {split}"
+    )
+    _assert_bitwise(
+        inputs["ctx_v_cache"], old_inputs["ctx_v_cache"], f"{name} arena V after {split}"
+    )
+
+
+@_needs_flash_attn
+def test_vanilla_context_kv_matches_stock(vanilla_drafters):
+    pair = vanilla_drafters["radixark"]
+    g = torch.Generator(device="cuda").manual_seed(4)
+    projected = torch.randn(9, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    positions = torch.randint(0, 4000, (9,), generator=g, device="cuda")
+    for new, old in zip(
+        pair.new.precompute_context_kv(projected, positions),
+        pair.old.precompute_context_kv(projected, positions),
+    ):
+        _assert_bitwise(new, old, "VANILLA context K / V")
+
+
+@_needs_flash_attn
+def test_vanilla_block_replays_under_capture(vanilla_drafters):
+    pair = vanilla_drafters["radixark"]
+    inputs = _arena_block(2, 7, seed=93)
+    eager = pair.new.dflash_forward(**_arena_copy(inputs))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = pair.new.dflash_forward(**inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_bitwise(captured, eager, "replayed VANILLA block")
+
+
+# RoPE settings a Qwen3-shaped drafter config can declare: the two drafters above, the other scalings the engine's
+# table builder serves, and the transformers 5 spelling (``rope_parameters``, also per layer type).
+_ROPE_SETTINGS = {
+    "plain": dict(rope_scaling=None),
+    "yarn": dict(
+        rope_scaling={"rope_type": "yarn", "factor": 16.0, "original_max_position_embeddings": 256}
+    ),
+    "yarn-mscale": dict(
+        rope_scaling={
+            "type": "yarn",
+            "factor": 40.0,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        }
+    ),
+    "linear": dict(rope_scaling={"type": "linear", "factor": 2.0}),
+    "llama3": dict(
+        rope_scaling={
+            "rope_type": "llama3",
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+        }
+    ),
+    "rope-parameters": dict(
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 1024,
+        }
+    ),
+    "per-layer-type": dict(
+        rope_parameters={"full_attention": {"rope_type": "default", "rope_theta": 50000.0}}
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_ROPE_SETTINGS))
+def test_draft_rope_matches_the_attention_backends_rope_params(name):
+    """``DraftRope`` reads the drafter config as ``RopeParams.from_config`` reads it, and its table is the
+    non-interleaved ``create_rope_const_params`` table, bit for bit."""
+    from tensorrt_llm._torch.attention.backends.interface import RopeParams
+
+    def config():
+        cfg = _config("entries")
+        for key in ("rope_scaling", "rope_parameters"):
+            if hasattr(cfg, key):
+                setattr(cfg, key, None)
+        for key, value in _ROPE_SETTINGS[name].items():
+            setattr(cfg, key, value)
+        return cfg
+
+    ours, theirs = target.DraftRope(config()), RopeParams.from_config(config())
+    for field in (
+        "dim",
+        "theta",
+        "alpha",
+        "scale_type",
+        "scale",
+        "low_freq_factor",
+        "high_freq_factor",
+        "max_positions",
+        "original_max_positions",
+        "beta_fast",
+        "beta_slow",
+        "mscale",
+        "mscale_all_dim",
+        "short_factor",
+        "long_factor",
+        "max_seq_len",
+        "duplicate_data",
+    ):
+        assert getattr(ours, field) == getattr(theirs, field), field
+    table = ours.cos_sin()
+    want = theirs.create_rope_const_params(interleave=False)[1]
+    assert table.dtype == want.dtype and table.shape == want.shape
+    assert torch.equal(table, want)

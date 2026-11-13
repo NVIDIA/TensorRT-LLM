@@ -56,7 +56,10 @@ class KdaPrefill(OpWrapper):
     or an upper bound on each sequence length. Optional seq_order and cu_chunks
     are a stable descending length permutation and prefix sums of ceil(L/16)
     in request order; both must be refreshed when lengths change. These
-    scheduling arguments do not change the reference recurrence.
+    scheduling arguments do not change the reference recurrence. sm_reserve
+    (the engine's cute_dsl_utils.sm_reserve(), SMs held by a kernel resident
+    for the whole step) must leave at least one SM; only the Small-BH grid,
+    which auto never selects, shrinks by it. It never changes the recurrence.
 
     Only selected state rows are written; slot padding and unselected rows
     remain unchanged. Every output is newly allocated. The tests compare
@@ -83,6 +86,7 @@ class KdaPrefill(OpWrapper):
         max_seqlen: int = 0,
         seq_order: Optional[torch.Tensor] = None,
         cu_chunks: Optional[torch.Tensor] = None,
+        sm_reserve: int = 0,
     ) -> torch.Tensor:
         return torch.ops.trtllm.kda_prefill(
             q,
@@ -101,6 +105,7 @@ class KdaPrefill(OpWrapper):
             max_seqlen,
             seq_order,
             cu_chunks,
+            sm_reserve,
         )
 
     def reference(
@@ -121,6 +126,7 @@ class KdaPrefill(OpWrapper):
         max_seqlen: int = 0,
         seq_order: Optional[torch.Tensor] = None,
         cu_chunks: Optional[torch.Tensor] = None,
+        sm_reserve: int = 0,
     ) -> torch.Tensor:
         qf = torch.nn.functional.normalize(q.float(), dim=-1, eps=1e-12) * scale
         kf = torch.nn.functional.normalize(k.float(), dim=-1, eps=1e-12)
@@ -163,6 +169,7 @@ class KdaPrefill(OpWrapper):
         max_seqlen: int = 0,
         seq_order: Optional[torch.Tensor] = None,
         cu_chunks: Optional[torch.Tensor] = None,
+        sm_reserve: int = 0,
     ) -> None:
         starts = cu_seqlens.tolist()
         lengths = [hi - lo for lo, hi in zip(starts, starts[1:])]

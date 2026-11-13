@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode path's latent MoE on the catalog's Kimi K3 MoE entries, with every expert on each rank (moe TP16 x EP1).
+"""The decode path's latent MoE on the Kimi K3 MoE ops, with every expert on each rank (moe TP16 x EP1).
 
 **At most 8 tokens** (`MAX_TOKENS`), a MoE layer runs:
 
 * `moe/k3_moe_front`, one kernel: this rank's slice of the MoE head (its latent-down rows and its router rows) as one
   GEMV, the slices' all-gather over the TP group's `K3MoeHeadWorkspace`, the top-16 routing, the MXFP8 latent, and
-  the shared experts' gate_up + SiTU. The routing is the noaux_tc arithmetic of `moe/kimi_k3_noaux_tc_mxfp8_quant`,
-  as the generic path's (`KimiK3MoeRoutingMethod`), on the router logits of the front's head GEMV;
+  the shared experts' gate_up + SiTU. The routing is the noaux_tc arithmetic of
+  ``trtllm::kimi_k3_noaux_tc_mxfp8_quant``, as the generic path's (`KimiK3MoeRoutingMethod`), on the router logits
+  of the front's head GEMV;
 * the routed experts of all 896 experts over this rank's intermediate slice: `moe/k3_moe_m1` at one token,
   `moe/k3_moe_m2` at two, `moe/k3_moe` (on a `K3MoeState`) at three to eight;
 * the latent all-reduce. On a pushing step (`DecodeStep.latent_push`: a pure decode step captured into a CUDA graph
@@ -49,6 +50,9 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.mnnvl_workspace import (
+    MnnvlWorkspace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_latent_reduce import (
     K3LatentExchange,
     k3_latent_reduce,
@@ -56,8 +60,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
-    MnnvlWorkspace,
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.dsv3_router_gemm import (
+    dsv3_router_gemm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe import (
     K3MoeHeadWorkspace,
@@ -76,9 +80,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import (
     k3_route_quant,
 )
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
+from .norm import run_in_parallel
 
 # The MoE engines of one and two tokens.
 from .ops.moe.k3_moe_m1 import K3MoeM1Layer, K3MoeM1State, k3_moe_m1, k3_moe_m1_push
@@ -322,6 +326,13 @@ class K3DecodeMoeLayer:
                 torch.cuda.synchronize(device)
                 self._routed(*args, offset, push=True)
                 k3_latent_reduce(rows, exchange)
+        # The generic path's route + quant build (moe.py routes up to 64 tokens on it, without the early trigger).
+        k3_route_quant(
+            torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device),
+            self.bias,
+            torch.zeros(1, moe.moe_hidden_size, dtype=torch.bfloat16, device=device),
+            float(moe.gate.routed_scaling_factor),
+        )
         torch.cuda.synchronize(device)
 
     def _front(self, moe: nn.Module, x: torch.Tensor):
@@ -426,13 +437,12 @@ class K3DecodeMoeLayer:
                 _gemv(gemvs, "moe_shared_gate_up", x, shared.gate_up_proj.weight)
             )
 
-        routed, shared_act = maybe_execute_in_parallel(
+        routed, shared_act = run_in_parallel(
             _routed_partial,
             _shared_activation,
             moe.moe_main_event,
             moe.moe_shared_event,
             moe.shared_expert_stream,
-            disable_on_compile=True,
         )
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's
         # columns.
@@ -448,7 +458,7 @@ def _gemv(
     gemvs, site: str, x: torch.Tensor, weight: torch.Tensor, out_fp32: bool = False
 ) -> torch.Tensor:
     """``x @ weight.T`` on ``site``'s decode GEMV where it takes the call (``decode_gemv.K3DecodeGemvs.project``),
-    else on the stock GEMM: cuBLAS through ``trtllm::dsv3_router_gemm_op`` for an fp32 output, ``F.linear`` else."""
+    else on the stock GEMM: ``gemm/dsv3_router_gemm`` for an fp32 output, ``F.linear`` else."""
     y = None if gemvs is None else gemvs.project(site, x, weight)
     if y is not None:
         return y
@@ -458,7 +468,5 @@ def _gemv(
             raise ValueError(
                 f"the fp32 GEMM needs a contiguous weight, got strides {weight.stride()}"
             )
-        return torch.ops.trtllm.dsv3_router_gemm_op(
-            x.contiguous(), weight.t(), bias=None, out_dtype=torch.float32
-        )
+        return dsv3_router_gemm(x.contiguous(), weight)
     return torch.nn.functional.linear(x, weight)

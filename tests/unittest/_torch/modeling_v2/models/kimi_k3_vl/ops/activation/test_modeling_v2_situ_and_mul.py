@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the situ_and_mul catalog entry."""
+"""GPU test for the situ_and_mul op."""
 
 import zlib
 from typing import Optional

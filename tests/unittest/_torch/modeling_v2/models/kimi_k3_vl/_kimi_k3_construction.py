@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Kimi K3 targets' construction-time checks, host-side, each run by the target's test directory on its own
 modules: the ModelConfig fields the construction checks read, the targets' architecture on any host, the routed
-experts' checkpoint spec against the shared loader and the DSpark worker's markov bias against the shared worker."""
+experts' quantization check and the DSpark worker's markov bias against the shared worker."""
 
 import inspect
 import types
@@ -10,7 +10,6 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.models import modeling_kimi_linear as shared
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -46,21 +45,13 @@ def sm_100(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
 
 
-def check_expert_ckpt_spec_meets_the_shared_loader_contract(modeling):
-    """The routed experts' checkpoint spec of a target's ``modeling`` module against the shared loader."""
-    spec = modeling._k3_expert_ckpt_spec(QuantAlgo.W4A8_MXFP4_MXFP8)
-    assert set(shared._K3ExpertCkptSpec._fields) <= set(spec._fields)
-    assert tuple(spec.optional_suffixes) == ()
-
-    loaded = {}
-    backend = types.SimpleNamespace(
-        quant_method=types.SimpleNamespace(
-            load_packed_mxfp4_expert=lambda backend, **kwargs: loaded.update(kwargs)
-        )
-    )
-    spec.loader(backend, "experts", 3, 0, lambda key: key, lambda key: None)
-    assert loaded["global_expert_id"] == 3
-    assert loaded["w1_weight"] == "experts.3.w1.weight_packed"
+def check_routed_quant_is_checked(moe):
+    """A target's ``moe`` module serves the MXFP4 checkpoint's routed-expert quantization (W4A8_MXFP4_MXFP8) and
+    rejects at construction any other, unquantized included."""
+    moe._check_routed_quant(QuantAlgo.W4A8_MXFP4_MXFP8)
+    for other in (None, QuantAlgo.NVFP4, QuantAlgo.W4A16_MXFP4):
+        with pytest.raises(NotImplementedError, match="no per-expert checkpoint layout"):
+            moe._check_routed_quant(other)
 
 
 def check_dspark_markov_bias_meets_the_shared_worker_contract(spec_worker, monkeypatch):

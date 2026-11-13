@@ -4,13 +4,13 @@
 of ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``), on one GPU.
 
 * Each GEMV site at every row count it takes (1..8, and 9..its ``wide_rows`` where k3_ctm_gemv_wide takes it): the
-  bits of its catalog entry's call (fp32 at an ``out_fp32`` site), within 8e-3 of ``max |ref|`` of a float64 product
+  bits of its op's call (fp32 at an ``out_fp32`` site), within 8e-3 of ``max |ref|`` of a float64 product
   (the sigmoid columns within 1e-2 of the sigmoid of it; a SiLU-and-mul site's product taken of torch's bf16
   ``silu(gate) * up``); declined above its rows, at another shape or dtype, and under capture before an eager call.
 * The LM head through ``K3LogitsProcessor`` on a real ``LMHead`` (one rank): fp32 logits from ``k3_head_gemv``
   within the same bound, the stock processor's rows selected, the stock path above 8 rows and before the state is
   built.
-* The embedding: bit-identical to ``nn.Embedding`` followed by the stock RMSNorm, the rows in the bank's slot 0.
+* The embedding: bit-identical to ``nn.Embedding`` followed by the target's RMSNorm, the rows in the bank's slot 0.
 * Layer 0's dense MLP at 1..8 rows: the bits of its three entries chained, within 3e-2 of ``max |ref|`` of the
   float64 SituAndMul MLP; declined above 8 rows, at linear_beta 0 and under capture before an eager call.
 * CUDA-graph replays give the eager bits.
@@ -24,18 +24,22 @@ from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     decode_gemv,
+    modeling,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    norm as norm_module,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.gemm.k3_ctm_gemv import (  # noqa: E501
+    k3_ctm_gemv,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.gemm.k3_ctm_gemv_swiglu import (  # noqa: E501
+    k3_ctm_gemv_swiglu,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_mul import (
     k3_situ_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv import (
-    k3_ctm_gemv,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_swiglu import (
-    k3_ctm_gemv_swiglu,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
@@ -46,7 +50,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm as BuiltinRMSNorm
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.skipif(
@@ -90,7 +94,7 @@ def _bits(t):
 
 
 def _entry(spec, rows, x, w):
-    """The site's catalog entry called directly: what ``project`` must reproduce bit for bit."""
+    """The site's op called directly: what ``project`` must reproduce bit for bit."""
     if rows > decode_gemv.MAX_ROWS or spec.small == "wide":
         return k3_ctm_gemv_wide(x, w, sig_col0=spec.sig_col0, out_fp32=spec.out_fp32)
     if spec.small == "decode":
@@ -120,7 +124,7 @@ def _product_input(spec, x):
 
 @pytest.mark.parametrize("site", list(decode_gemv.SITES))
 def test_site(site):
-    """Every row count the site takes runs its catalog entry: its bits, within TOL of the float64 product."""
+    """Every row count the site takes runs its op: its bits, within TOL of the float64 product."""
     spec = decode_gemv.SITES[site]
     w = _weight(spec.n, spec.k, seed=len(site))
     gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=[site])
@@ -236,11 +240,11 @@ def test_lm_head_capture_replays_the_eager_bits():
 
 @pytest.mark.parametrize("n", [1, 8, 64])
 def test_embed_norm(n):
-    """Layer 0's normed input is bit-identical to nn.Embedding followed by the stock RMSNorm; the bank's slot 0 holds
-    the embedding rows."""
+    """Layer 0's normed input is bit-identical to nn.Embedding followed by the target's RMSNorm and by the built-in
+    one; the bank's slot 0 holds the embedding rows."""
     vocab = 4096
     table = _weight(vocab, HIDDEN, seed=21)
-    norm = RMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.bfloat16).cuda()
+    norm = norm_module.RMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.bfloat16).cuda()
     with torch.no_grad():
         norm.weight.copy_(1 + _weight(1, HIDDEN, seed=22)[0])
     embedding = nn.Embedding(vocab, HIDDEN, dtype=torch.bfloat16).cuda()
@@ -255,13 +259,33 @@ def test_embed_norm(n):
     raw = embedding(ids)
     assert torch.equal(_bits(bank[0]), _bits(raw))
     assert torch.equal(_bits(normed), _bits(norm(raw)))
+    builtin = BuiltinRMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.bfloat16).cuda()
+    with torch.no_grad():
+        builtin.weight.copy_(norm.weight)
+    assert torch.equal(_bits(normed), _bits(builtin(raw)))
+
+
+def test_embed_norm_takes_the_norm_the_layers_build():
+    """The fused embedding takes the RMSNorm class the decoder layers build, with a bf16 weight; it declines that
+    class with another weight dtype and any other module, the built-in RMSNorm included."""
+    assert modeling.RMSNorm is norm_module.RMSNorm
+    table = _weight(4096, HIDDEN, seed=21)
+    ids = torch.arange(8, device="cuda", dtype=torch.int32)
+    bank = table.new_empty(3, 8, HIDDEN)
+    gemvs = decode_gemv.K3DecodeGemvs()
+    layer_norm = modeling.RMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.bfloat16).cuda()
+    assert gemvs.embed_norm(ids, table, layer_norm, bank) is not None
+    fp32_norm = modeling.RMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.float32).cuda()
+    assert gemvs.embed_norm(ids, table, fp32_norm, bank) is None
+    builtin = BuiltinRMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.bfloat16).cuda()
+    assert gemvs.embed_norm(ids, table, builtin, bank) is None
 
 
 def test_embed_norm_capture():
     """Under capture a token count that ran eagerly replays the eager bits; one that never ran is declined."""
     vocab = 4096
     table = _weight(vocab, HIDDEN, seed=31)
-    norm = RMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.bfloat16).cuda()
+    norm = norm_module.RMSNorm(hidden_size=HIDDEN, eps=1e-5, dtype=torch.bfloat16).cuda()
     gemvs = decode_gemv.K3DecodeGemvs()
     ids = torch.arange(4, dtype=torch.int32, device="cuda")
     bank = table.new_empty(2, 4, HIDDEN)

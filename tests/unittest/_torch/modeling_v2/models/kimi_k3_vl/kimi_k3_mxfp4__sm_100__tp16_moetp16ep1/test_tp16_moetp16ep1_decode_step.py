@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """How the tp16_moetp16ep1 target classifies a step for its decode kernels (host-side, no GPU): ``decode_step``, the
-attention-residual epilogue ceiling it sets, which steps the MoE layers push on, the one path the text model runs for a
-step through every layer, and the DSpark worker reading the current batch-to-slot buffer.
+attention-residual epilogue ceiling it sets, which steps the MoE layers push on, and the one path the text model runs
+for a step through every layer.
 
 The target decodes without speculation, so its classification checks take the steps it serves: one token per
 generation request, no verify or wide step, and no per-token KDA states (``kda_draft_records`` is False)."""
@@ -18,24 +18,18 @@ from _kimi_k3_decode_step import (  # noqa: E402
     LATENT_PUSH_STEPS,
     PURE_DECODE_STEPS,
     SHORT_STEPS,
-    SLOT_ORDERS,
     STEP_PATHS,
     check_attn_res_epilogue_ceiling,
-    check_drafter_inputs_use_current_slot_buffer,
     check_each_step_takes_one_path_through_every_layer,
     check_latent_push,
     check_pure_decode_step,
     check_short_step_is_small_only,
-    check_spec_accept_uses_current_slot_buffer,
     check_step_takes_the_generic_path,
 )
 
 try:
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
         modeling as target,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-        spec_worker,
     )
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
@@ -91,14 +85,3 @@ def test_latent_push(step, given, pushes):
 @pytest.mark.parametrize("seq_lens,num_contexts,rows,path", STEP_PATHS)
 def test_each_step_takes_one_path_through_every_layer(seq_lens, num_contexts, rows, path):
     check_each_step_takes_one_path_through_every_layer(target, seq_lens, num_contexts, rows, path)
-
-
-@pytest.mark.parametrize("request_ids,expected", SLOT_ORDERS)
-def test_spec_accept_uses_current_slot_buffer(monkeypatch, request_ids, expected):
-    check_spec_accept_uses_current_slot_buffer(monkeypatch, spec_worker, request_ids, expected)
-
-
-@pytest.mark.parametrize("num_contexts", [0, 1])
-@pytest.mark.parametrize("paged", [False, True])
-def test_drafter_inputs_use_current_slot_buffer(monkeypatch, num_contexts, paged):
-    check_drafter_inputs_use_current_slot_buffer(monkeypatch, spec_worker, num_contexts, paged)

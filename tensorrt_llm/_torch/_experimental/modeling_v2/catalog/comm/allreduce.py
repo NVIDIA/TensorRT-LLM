@@ -17,6 +17,12 @@ from .._op import Arch, Cell, OpWrapper
 #: `norm_out = rmsnorm(residual_out) * norm_weight`.
 RESIDUAL_RMS_NORM = int(AllReduceFusionOp.RESIDUAL_RMS_NORM)
 
+#: The plain sum, no fusion: the Kimi K3 targets' all-reduce module off MNNVL.
+NONE = int(AllReduceFusionOp.NONE)
+
+#: The sum RMS-normalized, no residual: the Kimi K3 drafter's context projection off MNNVL.
+RMS_NORM = int(AllReduceFusionOp.RMS_NORM)
+
 #: The strategy the default targets pass. The op picks a kernel by message
 #: size and topology: one-shot or two-shot over the IPC workspace inside one
 #: NVLink domain, NCCL plus a separate norm kernel when the message outgrows
@@ -96,6 +102,18 @@ class Allreduce(OpWrapper):
         hidden=7168, dtype=torch.bfloat16, eps=1e-6, op=RESIDUAL_RMS_NORM, strategy=AUTO
     )
 
+    # The Kimi K3 targets' all-reduce module (models/kimi_k3_vl/ops/comm/k3_allreduce.py) where its TP group does
+    # not run over MNNVL: the plain sum of a row-parallel output at the hidden width, and of the routed experts'
+    # latent output. The targets are TP16; four ranks of one tray are the closest one node holds.
+    _KIMI_K3 = dict(hidden=7168, dtype=torch.bfloat16, eps=1e-6, op=NONE, strategy=AUTO)
+    _KIMI_K3_LATENT = dict(hidden=3584, dtype=torch.bfloat16, eps=1e-6, op=NONE, strategy=AUTO)
+    # Its drafter's residual + RMSNorm off MNNVL (DSpark). The context projection's RMS_NORM is not a cell: on
+    # B200 at tp4 the raw op's AUTO crashes on it (SIGSEGV at 8 rows); the module reaches the raw op only with
+    # TLLM_DISABLE_ALLREDUCE_AUTOTUNE=1, and models/kimi_k3_vl/ops/comm/autotuned_allreduce certifies RMS_NORM.
+    _KIMI_K3_RES_NORM = dict(
+        hidden=7168, dtype=torch.bfloat16, eps=1e-6, op=RESIDUAL_RMS_NORM, strategy=AUTO
+    )
+
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode, one token, tp4", spec=dict(world=4, rows=1, **_GPT_OSS)),
         Cell(why="a decode batch, tp4", spec=dict(world=4, rows=64, **_GPT_OSS)),
@@ -152,12 +170,41 @@ class Allreduce(OpWrapper):
             why="deepseek, a full 8192-token prefill chunk, tp8 in one node",
             spec=dict(world=8, rows=8192, **_DEEPSEEK),
         ),
+        Cell(
+            why="kimi k3, plain sum at hidden 7168, decode, tp4",
+            spec=dict(world=4, rows=1, **_KIMI_K3),
+        ),
+        Cell(
+            why="kimi k3, plain sum at hidden 7168, an 8-token decode step, tp4",
+            spec=dict(world=4, rows=8, **_KIMI_K3),
+        ),
+        Cell(
+            why="kimi k3, plain sum at hidden 7168, a full 8192-token prefill chunk, tp4",
+            spec=dict(world=4, rows=8192, **_KIMI_K3),
+        ),
+        Cell(
+            why="kimi k3, plain sum at the routed latent width 3584, decode, tp4",
+            spec=dict(world=4, rows=1, **_KIMI_K3_LATENT),
+        ),
+        Cell(
+            why="kimi k3, plain sum at the routed latent width 3584, a full 8192-token prefill chunk, tp4",
+            spec=dict(world=4, rows=8192, **_KIMI_K3_LATENT),
+        ),
+        Cell(
+            why="kimi k3, drafter residual + RMSNorm at hidden 7168, a decode step, tp4",
+            spec=dict(world=4, rows=8, **_KIMI_K3_RES_NORM),
+        ),
     )
 
     note = """
-    Only `RESIDUAL_RMS_NORM` is certified: it is the one fusion the targets
-    call. `reference` also computes `NONE`; the quantizing fusions (FP8, NVFP4
-    outputs) are not modelled.
+    Certified: `RESIDUAL_RMS_NORM`, the fusion the gpt-oss and deepseek
+    default targets call, and `NONE`, which the Kimi K3 targets' all-reduce
+    module calls (with `RESIDUAL_RMS_NORM`) when its group does not run over
+    MNNVL and the autotuner is off (`models/kimi_k3_vl/ops/comm/autotuned_allreduce`
+    when it is on).
+    `reference` and `is_valid` also cover `RMS_NORM`, which is not certified:
+    on B200 at tp4 an 8-row call crashes the process (SIGSEGV). The quantizing
+    fusions (FP8, NVFP4 outputs) are not modelled.
 
     The cells run the `_pg` symbol, because the certification matrix starts its
     ranks without MPI. A served engine under `mpirun` or
@@ -244,7 +291,12 @@ class Allreduce(OpWrapper):
         dtype = inputs_in_rank_order[0].dtype
         if op == int(AllReduceFusionOp.NONE):
             return acc.to(dtype)
-        assert op == RESIDUAL_RMS_NORM, f"reference covers NONE and RESIDUAL_RMS_NORM, not {op}"
+        if op == RMS_NORM:
+            normed = acc * torch.rsqrt(acc.pow(2).mean(dim=-1, keepdim=True) + eps)
+            return (normed * norm_weight.float()).to(dtype)
+        assert op == RESIDUAL_RMS_NORM, (
+            f"reference covers NONE, RMS_NORM and RESIDUAL_RMS_NORM, not {op}"
+        )
         h = acc + residual.float()
         normed = h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + eps)
         return (normed * norm_weight.float()).to(dtype), h.to(dtype)
@@ -276,6 +328,11 @@ class Allreduce(OpWrapper):
                 "RESIDUAL_RMS_NORM reads residual and norm_weight; a None pointer is not rejected"
             )
             assert residual.shape == input.shape, (residual.shape, input.shape)
+            assert norm_weight.shape == (input.shape[-1],), (norm_weight.shape, input.shape)
+        if op == RMS_NORM:
+            assert norm_weight is not None, (
+                "RMS_NORM reads norm_weight; a None pointer is not rejected"
+            )
             assert norm_weight.shape == (input.shape[-1],), (norm_weight.shape, input.shape)
         assert strategy in _NO_WORKSPACE or workspace is not None, (
             f"strategy {strategy} reads the IPC workspace; build one with allreduce_group_args"
