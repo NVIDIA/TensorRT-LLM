@@ -105,6 +105,18 @@ void peerAddNormqOut(int64_t localPtr, int64_t peerPtr, torch::Tensor& interOut,
     TORCH_CHECK(err == cudaSuccess, "minimax_m31_tp2ctx_peer_add_normq_out: ", cudaGetErrorString(err));
 }
 
+//! Test helper: lets the current device read peer_device's memory directly (already-enabled is not an error).
+void enablePeer(int64_t peerDevice)
+{
+    cudaError_t const err = cudaDeviceEnablePeerAccess(static_cast<int>(peerDevice), 0);
+    if (err == cudaErrorPeerAccessAlreadyEnabled)
+    {
+        cudaGetLastError();
+        return;
+    }
+    TORCH_CHECK(err == cudaSuccess, "cudaDeviceEnablePeerAccess: ", cudaGetErrorString(err));
+}
+
 } // namespace
 
 } // namespace torch_ext
@@ -119,9 +131,15 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "fp4_out=None, "
         "Tensor(f!)? fp4_sf_out=None, Tensor? fp4_global_scale=None, Tensor(g!)? f32_out=None, int ctas_per_sm=1, "
         "bool enable_pdl=False) -> ()");
+    m.def("minimax_m31_sp_addnorm_enable_peer(int peer_device) -> ()");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
     m.impl("minimax_m31_tp2ctx_peer_add_normq_out", &TRTLLM_MV2_NS::torch_ext::peerAddNormqOut);
+}
+
+TRTLLM_MV2_LIBRARY_IMPL(CompositeExplicitAutograd, m)
+{
+    m.impl("minimax_m31_sp_addnorm_enable_peer", &TRTLLM_MV2_NS::torch_ext::enablePeer);
 }
